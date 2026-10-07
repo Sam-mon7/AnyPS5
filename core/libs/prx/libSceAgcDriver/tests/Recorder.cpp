@@ -27,6 +27,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "ResidentPresent.hpp"
 #include "SampleLod_spv.h"
+#include "BufferUpdate_spv.h"
 #include "SampleArray_spv.h"
 #include "Cover_vert_spv.h"
 #include "Cover_frag_spv.h"
@@ -304,6 +305,241 @@ private:
 };
 
 using Kind = Recorder::ReadKind;
+
+bool copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    context.nullDescriptors = device.NullDescriptors();
+    if (context.hostImportAlignment == 0 || !context.nullDescriptors || !AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "Host imports, null descriptors or write watching unavailable: copied/direct ordering test skipped\n";
+        return false;
+    }
+    recorder.Sync();
+    const auto bytes = static_cast<std::size_t>(std::max<VkDeviceSize>(131072, context.hostImportAlignment));
+    auto* block = static_cast<std::uint32_t*>(AllocateWatched(bytes, bytes));
+    Require(block != nullptr, "allocate copied/direct ordering memory");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::vector<std::shared_ptr<ShaderResources>> writers;
+    context.copiedWriters = &writers;
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        std::uint32_t* block;
+        std::size_t bytes;
+        std::vector<std::shared_ptr<ShaderResources>>& writers;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkShaderModule module = VK_NULL_HANDLE;
+        std::shared_ptr<ShaderResources> layoutOwner;
+        ~Release() {
+            recorder.Sync();
+            writers.clear();
+            DrawCopiedWriters()->clear();
+            if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+            if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+            if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            static_cast<void>(HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes));
+            recorder.Sync();
+            ReleaseWatched(block, bytes);
+        }
+    } release{context, recorder, block, bytes, writers};
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    std::memset(block, 0, bytes);
+    Require(HostImportFor(context, address, bytes) != nullptr, "import copied/direct ordering memory");
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, 1024, 0x31000000u};
+    binding.bufferWritten = {true};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto direct = std::make_shared<ShaderResources>(context, compute);
+    release.layoutOwner = direct;
+    Require(!direct->HasCopiedWrites(), "ordering consumer did not bind directly");
+    const auto setLayout = direct->Layout();
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t)};
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &setLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &push;
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &release.layout), "ordering pipeline layout");
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = sizeof(BUFFER_UPDATE_SPV);
+    moduleInfo.pCode = BUFFER_UPDATE_SPV;
+    Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &release.module), "ordering shader module");
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, release.module, "main", nullptr};
+    pipelineInfo.layout = release.layout;
+    Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &release.pipeline), "ordering pipeline");
+    const auto update = [&](const std::shared_ptr<ShaderResources>& resources, std::uint32_t delta, std::uint32_t count = 1) {
+        const auto commands = recorder.Commands();
+        recorder.Keep(resources);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, release.pipeline);
+        resources->Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, release.layout);
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, release.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(delta), &delta);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, count, 1, 1);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        resources->MarkGpuWrites(recorder);
+    };
+    for (int mode = 0; mode < 3; ++mode) {
+        *block = 10;
+        auto copiedContext = context;
+        copiedContext.hostImportAlignment = 0;
+        copiedContext.dmaBufImport = false;
+        auto copied = std::make_shared<ShaderResources>(copiedContext, compute);
+        Require(copied->HasCopiedWrites(), "ordering producer did not take the copied path");
+        auto& pending = mode == 2 ? *DrawCopiedWriters() : writers;
+        pending.push_back(copied);
+        update(copied, 1);
+        recorder.OnComplete([copied, &pending] {
+            copied->WriteBackBuffers();
+            std::erase(pending, copied);
+        });
+        Require(!recorder.Idle() && *block == 10, "copied producer was completed before the consumer test");
+        if (mode == 0) direct = std::make_shared<ShaderResources>(context, compute);
+        else Require(direct->Revalidate(std::span(&compute, 1)), "the imported template could not be revalidated");
+        update(direct, 2);
+        recorder.Sync();
+        Require(*block == 13, mode == 0 ? "fresh direct consumer ran before copied write-back" : "reused direct consumer ran before copied write-back");
+    }
+    *block = 20;
+    block[1024] = 30;
+    auto copiedContext = context;
+    copiedContext.hostImportAlignment = 0;
+    copiedContext.dmaBufImport = false;
+    auto copied = std::make_shared<ShaderResources>(copiedContext, compute);
+    writers.push_back(copied);
+    update(copied, 1);
+    recorder.OnComplete([copied, &writers] {
+        copied->WriteBackBuffers();
+        std::erase(writers, copied);
+    });
+    auto separateProgram = program;
+    separateProgram.bindings[0].guestDescriptor[0] += 4096;
+    const CompiledShader separateCompute{ShaderRecompiler::ShaderStage::Compute, &separateProgram, 0};
+    auto separate = std::make_shared<ShaderResources>(context, separateCompute);
+    Require(!writers.empty() && *block == 20, "a disjoint consumer waited for copied writes");
+    update(separate, 2);
+    recorder.Sync();
+    Require(*block == 21 && block[1024] == 32, "disjoint copied and direct writes changed each other");
+    const std::uint32_t label = 40;
+    static_cast<void>(recorder.Commands());
+    recorder.AfterCompletions(address, std::as_bytes(std::span(&label, 1)), 1000, 0, false);
+    Require(direct->Revalidate(std::span(&compute, 1)), "template reuse after a CPU completion label failed");
+    update(direct, 2);
+    recorder.Sync();
+    Require(*block == 42, "direct consumer preceded an overlapping CPU completion label");
+    update(direct, 1);
+    const auto submissions = recorder.Submissions();
+    Require(direct->Revalidate(std::span(&compute, 1)) && recorder.Submissions() == submissions, "ordinary direct work incurred a CPU write-back wait");
+    update(direct, 2);
+    recorder.Sync();
+    Require(*block == 45, "direct consumers lost GPU-ordered updates");
+    {
+        TextureDetiler detiler(context);
+        auto imageContext = context;
+        imageContext.detiler = &detiler;
+        TextureCache textureCache(imageContext);
+        imageContext.textureCache = &textureCache;
+        Buffer readback(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        struct Clear {
+            const Context& context;
+            Recorder& recorder;
+            ~Clear() { recorder.Sync(); ClearCachedTextures(context.device); }
+        } clear{context, recorder};
+        ShaderRecompiler::RecompileResult imageProgram;
+        ShaderRecompiler::DescriptorBinding imageBinding;
+        imageBinding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+        imageBinding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+        imageBinding.descriptorSet = 0;
+        imageBinding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding;
+        imageBinding.count = 1;
+        imageBinding.imageSamplers = {0};
+        imageBinding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+        imageBinding.guestDescriptor = {static_cast<std::uint32_t>(address >> 8), static_cast<std::uint32_t>(address >> 40) | (56u << 20) | (3u << 30), 15u | (63u << 14), 0x91b00fac, 0, 0, 0, 0};
+        imageProgram.bindings.push_back(imageBinding);
+        const CompiledShader imageCompute{ShaderRecompiler::ShaderStage::Compute, &imageProgram, 0};
+        auto sampled = std::make_shared<ShaderResources>(imageContext, imageCompute);
+        recorder.Sync();
+        for (int reuse = 0; reuse < 2; ++reuse) {
+            auto producer = std::make_shared<ShaderResources>(copiedContext, compute);
+            writers.push_back(producer);
+            update(producer, 1);
+            recorder.OnComplete([producer, &writers] {
+                producer->WriteBackBuffers();
+                std::erase(writers, producer);
+            });
+            if (reuse == 0) sampled = std::make_shared<ShaderResources>(imageContext, imageCompute);
+            else Require(sampled->Revalidate(std::span(&imageCompute, 1)), "sampled image template did not revalidate");
+            const auto images = sampled->StorageImages();
+            Require(images.size() == 1, "sampled image did not use imported texture storage");
+            const auto commands = recorder.Commands();
+            recorder.Keep(sampled);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {1, 1, 1};
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, images.front().first, VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            recorder.Sync();
+            std::uint32_t value = 0;
+            std::memcpy(&value, readback.Bytes().data(), sizeof(value));
+            Require(value == static_cast<std::uint32_t>(46 + reuse), "cached sampled image preceded a copied producer");
+        }
+        sampled.reset();
+        ClearCachedTextures(context.device);
+        const auto keys = address + 65536;
+        const auto keyBytes = DccKeyBytes(65536);
+        imageProgram.bindings[0].guestDescriptor[6] = (1u << 21) | (static_cast<std::uint32_t>((keys >> 8) & 0xffu) << 24);
+        imageProgram.bindings[0].guestDescriptor[7] = static_cast<std::uint32_t>(keys >> 16);
+        auto keyProgram = program;
+        keyProgram.bindings[0].guestDescriptor = {static_cast<std::uint32_t>(keys), static_cast<std::uint32_t>(keys >> 32u) & 0xffffu, static_cast<std::uint32_t>(keyBytes), 0x31000000u};
+        const CompiledShader keyCompute{ShaderRecompiler::ShaderStage::Compute, &keyProgram, 0};
+        for (int reuse = 0; reuse < 2; ++reuse) {
+            std::memset(reinterpret_cast<void*>(keys), 0, keyBytes);
+            AgcDriver::GuestMemory::MarkWritten(keys, keyBytes);
+            sampled = std::make_shared<ShaderResources>(imageContext, imageCompute);
+            recorder.Sync();
+            auto producer = std::make_shared<ShaderResources>(copiedContext, keyCompute);
+            writers.push_back(producer);
+            update(producer, 0x40404040, static_cast<std::uint32_t>(keyBytes / 4));
+            recorder.OnComplete([producer, &writers] {
+                producer->WriteBackBuffers();
+                std::erase(writers, producer);
+            });
+            if (reuse == 0) sampled = std::make_shared<ShaderResources>(imageContext, imageCompute);
+            else Require(sampled->Revalidate(std::span(&imageCompute, 1)), "metadata-only producer invalidated the sampled template");
+            const auto images = sampled->StorageImages();
+            Require(images.size() == 1, "metadata texture is not resident");
+            const auto commands = recorder.Commands();
+            recorder.Keep(sampled);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {1, 1, 1};
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, images.front().first, VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            recorder.Sync();
+            std::uint32_t value = 0;
+            std::memcpy(&value, readback.Bytes().data(), sizeof(value));
+            Require(value == 0xff000000, "cached sampled image ignored copied compression-metadata writes");
+        }
+    }
+    std::cout << "Copied producers precede fresh and reused direct consumers\n";
+    return true;
+}
 
 void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(Recorder::ReadTracking(), "read tracking is off (APS5_COPY_READ_TRACKING=0 set?)");
@@ -5564,6 +5800,7 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") return copiedDirectOrderingTests(device, recorder) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--resident-heap-only") {
             RunResidentHeapMirrorTests(device.GetContext(), recorder, false);
             RunResidentHeapMirrorTests(device.GetContext(), recorder, true);
