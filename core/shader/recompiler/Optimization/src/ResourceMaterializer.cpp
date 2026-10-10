@@ -357,6 +357,7 @@ struct ColumnRecords {
     bool outside = false;
     std::vector<RecordState> states;
     std::vector<std::uint32_t> words;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> readRanges;
 };
 
 struct TableTrace {
@@ -441,6 +442,13 @@ private:
         return accessible;
     }
 
+    bool AddressAccessible(std::uint64_t address) {
+        const auto page = address & ~(PageBytes - 1u);
+        const auto [found, inserted] = wholePages.try_emplace(page, false);
+        if (inserted) found->second = Accessible(page, PageBytes);
+        return found->second || Accessible(address, sizeof(std::uint32_t));
+    }
+
     std::uint32_t Read(std::uint64_t address) const {
         std::uint32_t word = 0;
         if (!runtime.readMemory(runtime.userContext, address, &word)) {
@@ -510,7 +518,7 @@ private:
                 records.states[record] = RecordState::Read;
                 continue;
             }
-            if (ImageTableAbi::ScalarBufferDword(relative + column.addend, column.offset, records.size).has_value()) records.outside = true;
+            if (column.address || ImageTableAbi::ScalarBufferDword(relative + column.addend, column.offset, records.size).has_value()) records.outside = true;
         }
         records.narrowed = true;
         if (positions != 0u) tables.ranges.emplace_back(base, size);
@@ -534,17 +542,25 @@ private:
             records.fault = ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::Inactive));
             return records;
         }
-        const auto heap = EvaluateBuffer(column.heapSource);
-        if (heap.Type() != 0u) {
-            records.fault = ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::NotBuffer));
-            return records;
+        if (column.address) {
+            DescriptorValue pointer;
+            walker.EvaluateDescriptorSource(plan, column.heapSource, runtime, pointer);
+            records.base = (static_cast<std::uint64_t>(pointer.dwords[1]) << 32u) | pointer.dwords[0];
+            records.records = ImageTableAbi::ScalarAddressRecords(column.stride);
+        } else {
+            const auto heap = EvaluateBuffer(column.heapSource);
+            if (heap.Type() != 0u) {
+                records.fault = ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::NotBuffer));
+                return records;
+            }
+            records.base = heap.Base48();
+            records.size = heap.GetSize();
+            records.records = ImageTableAbi::ScalarBufferRecords(column.addend, column.stride, column.offset, records.size);
+            if (records.size != 0u) tables.ranges.emplace_back(records.base, records.size);
         }
-        records.base = heap.Base48();
-        records.size = heap.GetSize();
-        records.records = ImageTableAbi::ScalarBufferRecords(column.addend, column.stride, column.offset, records.size);
+        records.records = std::min(records.records, ImageTableAbi::KeyRecords(column.maxKey, column.stride));
         records.keys = std::min(records.records, ImageTableAbi::MaxKeys);
         records.outside = records.keys < records.records;
-        if (records.size != 0u) tables.ranges.emplace_back(records.base, records.size);
         records.states.assign(records.keys, RecordState::Read);
         if (column.keyDomain.has_value() && records.keys != 0u) {
             Narrow(column, records);
@@ -556,14 +572,28 @@ private:
         std::vector<std::pair<std::uint32_t, std::array<std::uint32_t, 8>>> split;
         std::vector<std::pair<std::uint64_t, std::uint32_t>> runs;
         std::uint32_t total = 0;
+        std::uint64_t low = std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t high = 0;
         std::uint64_t checkedPage = std::numeric_limits<std::uint64_t>::max();
         bool checkedAccessible = false;
         const auto accessible = [&](std::uint64_t address) {
+            if (column.address) return AddressAccessible(address);
             if ((address & ~(PageBytes - 1u)) != checkedPage) {
                 checkedPage = address & ~(PageBytes - 1u);
                 checkedAccessible = PageAccessible(address, records.base, end);
             }
             return checkedAccessible;
+        };
+        const auto wholeAccessible = [&](std::uint64_t address) {
+            if (!column.address) return accessible(address);
+            const auto [found, inserted] = wholePages.try_emplace(address & ~(PageBytes - 1u), false);
+            if (inserted) found->second = Accessible(address & ~(PageBytes - 1u), PageBytes);
+            return found->second;
+        };
+        const auto locate = [&](std::uint32_t offset, std::uint32_t immediate) -> std::optional<std::uint64_t> {
+            if (column.address) return ImageTableAbi::ScalarAddressDword(records.base, offset, immediate);
+            const auto position = ImageTableAbi::ScalarBufferDword(offset, immediate, records.size);
+            return position.has_value() ? std::optional<std::uint64_t>(records.base + *position) : std::nullopt;
         };
         const auto take = [&](std::uint64_t address, std::uint32_t words) {
             if (!runs.empty() && address > runs.back().first && address - runs.back().first == static_cast<std::uint64_t>(runs.back().second) * 4u) {
@@ -571,6 +601,9 @@ private:
             } else {
                 runs.emplace_back(address, words);
             }
+            if (column.address) records.readRanges.emplace_back(address, static_cast<std::uint64_t>(words) * sizeof(std::uint32_t));
+            low = std::min(low, address);
+            high = std::max(high, address + static_cast<std::uint64_t>(words) * sizeof(std::uint32_t));
             total += words;
             return total - words;
         };
@@ -578,22 +611,23 @@ private:
         for (std::uint32_t record = 0; record < records.keys; record++) {
             if (records.states[record] != RecordState::Read) continue;
             const auto offset = column.addend + record * column.stride;
-            const auto head = ImageTableAbi::ScalarBufferDword(offset, column.offset, records.size);
-            const auto tail = ImageTableAbi::ScalarBufferDword(offset, column.offset + last, records.size);
-            if (head.has_value() && tail.has_value() && *tail - *head == last && accessible(records.base + *head) && accessible(records.base + *tail)) {
-                whole[record] = take(records.base + *head, column.dwordCount);
+            const auto head = locate(offset, column.offset);
+            const auto tail = locate(offset, column.offset + last);
+            if (head.has_value() && tail.has_value() && (*head & 3u) == 0u && *tail > *head && *tail - *head == last && wholeAccessible(*head) && wholeAccessible(*tail)) {
+                whole[record] = take(*head, column.dwordCount);
                 continue;
             }
             std::array<std::uint32_t, 8> slots;
             slots.fill(Unread);
             for (std::uint32_t dword = 0; dword < column.dwordCount; dword++) {
-                const auto position = ImageTableAbi::ScalarBufferDword(offset, column.offset + dword * 4u, records.size);
-                if (!position.has_value()) continue;
-                if (!accessible(records.base + *position)) {
+                auto address = locate(offset, column.offset + dword * 4u);
+                if (column.address && address.has_value() && (*address & 3u) != 0u) address.reset();
+                if (!address.has_value() && !column.address) continue;
+                if (!address.has_value() || !accessible(*address)) {
                     records.states[record] = RecordState::Unmapped;
                     break;
                 }
-                slots[dword] = take(records.base + *position, 1u);
+                slots[dword] = take(*address, 1u);
             }
             if (records.states[record] == RecordState::Read) split.emplace_back(record, slots);
         }
@@ -622,6 +656,18 @@ private:
             }
             records.words[record] = WordsIndex(value);
         }
+        if (column.address && low < high) tables.ranges.emplace_back(low, high - low);
+        std::sort(records.readRanges.begin(), records.readRanges.end());
+        std::size_t ranges = 0;
+        for (const auto& range : records.readRanges) {
+            if (ranges != 0u && range.first - records.readRanges[ranges - 1u].first <= records.readRanges[ranges - 1u].second) {
+                auto& previous = records.readRanges[ranges - 1u];
+                previous.second = std::max(previous.second, range.first - previous.first + range.second);
+            } else {
+                records.readRanges[ranges++] = range;
+            }
+        }
+        records.readRanges.resize(ranges);
         return records;
     }
 
@@ -636,6 +682,7 @@ private:
         out.fault = records.fault;
         out.outside = records.outside;
         out.codes.assign(records.keys, 0u);
+        out.readRanges = records.readRanges;
         TableTrace trace{records.base, records.size, records.records, records.keys, 0u, records.narrowed};
         auto& counters = tableCounters();
         if (records.fault != 0u) counters.poison[records.fault & ~ImageTableAbi::PoisonFlag].fetch_add(1, std::memory_order_relaxed);
@@ -673,6 +720,7 @@ private:
     };
     std::unordered_map<std::pair<std::array<std::uint32_t, 8>, std::uint32_t>, std::uint32_t, WordsHash> wordsIndex;
     std::unordered_map<std::uint64_t, bool> pages;
+    std::unordered_map<std::uint64_t, bool> wholePages;
 };
 
 void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, std::vector<std::uint8_t>& activeSources) {

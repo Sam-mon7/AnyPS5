@@ -65,8 +65,8 @@ namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(CompiledShaderArtifact) == 224, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 176, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 408, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(ShaderInvocation) == 200, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(RecompileResult) == 432, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 592, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -403,6 +403,12 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
         out.Value(range.first);
         out.Value(range.second);
     });
+    writer.List(invocation.imageTableReadRanges, [](Writer& out, const auto& ranges) {
+        out.List(ranges, [](Writer& rangeWriter, const auto& range) {
+            rangeWriter.Value(range.first);
+            rangeWriter.Value(range.second);
+        });
+    });
     writer.Value(invocation.imageTableShader);
     writer.Value(invocation.imageTableFaults);
 }
@@ -435,6 +441,12 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     reader.List(invocation.imageTableRanges, 16, [](Reader& in, std::pair<std::uint64_t, std::uint64_t>& range) {
         in.Value(range.first);
         in.Value(range.second);
+    });
+    reader.List(invocation.imageTableReadRanges, 8, [](Reader& in, auto& ranges) {
+        in.List(ranges, 16, [](Reader& rangeReader, auto& range) {
+            rangeReader.Value(range.first);
+            rangeReader.Value(range.second);
+        });
     });
     reader.Value(invocation.imageTableShader);
     reader.Value(invocation.imageTableFaults);
