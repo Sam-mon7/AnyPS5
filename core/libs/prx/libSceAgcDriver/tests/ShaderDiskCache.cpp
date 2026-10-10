@@ -98,6 +98,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
     require(left.workgroupMemoryDwords == right.workgroupMemoryDwords, prefix + "workgroup memory stride differs");
     require(left.poisonedSrtReads == right.poisonedSrtReads, prefix + "poisoned SRT read counts differ");
     require(left.imageTableRanges == right.imageTableRanges && left.imageTableShader == right.imageTableShader && left.imageTableFaults == right.imageTableFaults && left.imageTablePoison.size() == right.imageTablePoison.size(), prefix + "image table invocation data differs");
+    require(left.imageTableReadRanges == right.imageTableReadRanges, prefix + "image table read ranges differ");
     for (std::size_t i = 0; i < left.imageTablePoison.size(); ++i) {
         const auto& a = left.imageTablePoison[i];
         const auto& b = right.imageTablePoison[i];
@@ -185,6 +186,7 @@ RecompileResult sampleResult() {
     result.variantId = 99;
     result.imageTablePoison = {{{1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}, 8u, 2u, 6u}, {{9u, 0u, 0u, 0u, 0u, 0u, 0u, 0u}, 4u, 0xffffffffu, 19u}};
     result.imageTableRanges = {{0x1000u, 0x200u}, {0x5000000000ull, 48u}};
+    result.imageTableReadRanges = {{{0x1000u, 32u}, {0x1040u, 32u}}, {}, {{0x5000000000ull, 16u}}};
     result.imageTableShader = 0x80003aa700ull;
     result.imageTableFaults = 3u;
     return result;
@@ -1217,6 +1219,15 @@ std::vector<PlanFixture> planFixtures() {
     add("descriptor through a pointer", 64, {0xf4040280u, 0xfa000018u, 0xbf8cc07fu, 0xf4080105u, 0xfa000000u, 0xbf8cc07fu, 0x34040082u, 0xe0701000u, 0x80010002u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, chained}, {PlanPointerAddress, bufferWords(PlanOutputAddress, 0u, 256u, 0x30027facu)}});
     add("descriptor invariant phi", 32, {0xf4000400u, 0xfa000050u, 0xf4080500u, 0xfa000020u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf40c0200u, 0xfa000000u, 0xbf820002u, 0xf40c0200u, 0xfa000000u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, phis}});
 
+    std::vector<std::uint32_t> palette(0x50u + 257u * 8u, 0u);
+    place(palette, 0, bufferWords(PlanMaterialAddress, 0u, 32u));
+    place(palette, 4, bufferWords(PlanOutputAddress, 0u, 16u));
+    palette[12] = static_cast<std::uint32_t>(PlanSrtAddress + 0x140u);
+    palette[13] = static_cast<std::uint32_t>((PlanSrtAddress + 0x140u) >> 32u);
+    place(palette, 0x10u, imageWords(PlanTextureAddress));
+    place(palette, 0x18u, imageWords(PlanTextureAddress + 0x100u));
+    add("pointer image table", 64, {0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x7e200500u, 0x8f108210u, 0xf4200444u, 0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c0900u, 0x24000040u, 0xf09c0f08u, 0x01090000u, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, palette}, {PlanMaterialAddress, {0u, 1u, 0u, 1u, 0u, 0u, 0u, 0u}}});
+
     PlanFixture fragment;
     fragment.name = "fragment parameters";
     fragment.stage = ShaderStage::Fragment;
@@ -1326,7 +1337,7 @@ IrResourcePlan handBuiltPlan() {
     DescriptorSource table;
     table.dwordCount = 8u;
     table.dwords[0] = &readConst(3);
-    table.tableColumn = TableColumn{2u, 32u, 16u, 4u, 8u, false, {KeyDomain{3u, 4u, 16u, false}, KeyDomain{2u, 8u, 4u, true}}, false};
+    table.tableColumn = TableColumn{2u, 32u, 16u, 4u, 8u, 0xffu, false, true, {KeyDomain{3u, 4u, 16u, false}, KeyDomain{2u, 8u, 4u, true}}, false};
     DescriptorSource heap;
     heap.dwordCount = 4u;
     heap.dwords[1] = &readConst(6);
@@ -1411,7 +1422,7 @@ bool samePlan(const IrResourcePlan& left, const IrResourcePlan& right) {
     for (std::size_t index = 0; index < left.descriptorSources.size(); ++index) {
         const auto& a = left.descriptorSources[index];
         const auto& b = right.descriptorSources[index];
-        if (a.dwordCount != b.dwordCount || a.tableColumn != b.tableColumn || (a.tableColumn.has_value() && (a.tableColumn->keyDomains != b.tableColumn->keyDomains || a.tableColumn->unkeyed != b.tableColumn->unkeyed))) return false;
+        if (a.dwordCount != b.dwordCount || a.tableColumn != b.tableColumn || (a.tableColumn.has_value() && (a.tableColumn->keyDomains != b.tableColumn->keyDomains || a.tableColumn->unkeyed != b.tableColumn->unkeyed || a.tableColumn->maxKey != b.tableColumn->maxKey))) return false;
         for (std::size_t dword = 0; dword < a.dwords.size(); ++dword) {
             if (!sameValue(a.dwords[dword], b.dwords[dword])) return false;
         }
@@ -1637,6 +1648,7 @@ void verifyPlanRoundTrip() {
     };
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && source.tableColumn->keyDomains.empty(); }); }), "no fixture plans a whole image table");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && !source.tableColumn->keyDomains.empty(); }); }), "no fixture plans an image table with a key domain");
+    require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && source.tableColumn->address; }); }), "no fixture plans an image table through a pointer");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.controlFlow.begin(), plan.controlFlow.end(), [](const ResourceBlock& block) { return block.condition != nullptr; }); }), "no fixture plans a control-flow condition");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.valueStorage.begin(), plan.valueStorage.end(), [](const auto& value) { return value->IsPhi(); }); }), "no fixture plans a phi");
     require(covers([](const IrResourcePlan& plan) { return !plan.guardedSrtSlots.empty(); }), "no fixture plans a guarded SRT read");
