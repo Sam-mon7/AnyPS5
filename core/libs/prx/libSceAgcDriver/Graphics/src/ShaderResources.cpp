@@ -110,7 +110,15 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
+    // The collect epoch and write journal serial a snapshot was last proven current at.
+    std::uint64_t provenEpoch = 0;
+    std::uint64_t provenSerial = 0;
 };
+
+bool TextureCompareMemo() {
+    static const bool enabled = std::getenv("APS5_NO_TEXTURE_COMPARE_MEMO") == nullptr;
+    return enabled;
+}
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
 // eviction takes the back. APS5_NO_TEXTURE_HASH=1 finds entries by scanning the list (the index is
@@ -324,6 +332,7 @@ struct TextureCounters {
     std::atomic<std::uint64_t> fromStorage{0};
     std::atomic<std::uint64_t> snapshots{0};
     std::atomic<std::uint64_t> pendingReads{0};
+    std::atomic<std::uint64_t> provenReuses{0};
     std::atomic<std::uint64_t> storageFallbacks{0};
     std::atomic<std::uint64_t> records{0};
     std::atomic<std::uint64_t> fastHits{0};
@@ -349,7 +358,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks, %llu snapshots proven current within their collect epoch); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.provenReuses), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -657,8 +666,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
-            if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
+            const auto epoch = TextureCompareMemo() ? GuestMemory::CollectEpoch() : 0;
+            const auto serial = GuestMemory::WriteJournalSerial();
+            const auto proven = [&] {
+                if (epoch == 0 || it->provenEpoch != epoch || Recorder::SnapshotWriteOverlaps(address, bytes) || GuestMemory::JournalTouchedSince(it->provenSerial, address, it->bytes.size())) return false;
+                counters.provenReuses.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            };
+            if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || proven() || equalsCommitted()) {
                 it->generation = generation;
+                it->provenEpoch = epoch;
+                it->provenSerial = serial;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
                 reportTextureCounters();

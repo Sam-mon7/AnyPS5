@@ -413,8 +413,23 @@ void CheckCollectBoundaries() {
 }
 }
 
+void CheckWriteJournal() {
+    constexpr std::uint64_t base = 0x7000000000ull;
+    const auto start = WriteJournalSerial();
+    Require(!JournalTouchedSince(start, base, 0x1000), "an empty journal tail reports a touch");
+    JournalWrite(base + 0x2000, 0x100);
+    Require(!JournalTouchedSince(start, base, 0x1000), "a write after the range reports a touch");
+    Require(JournalTouchedSince(start, base + 0x1f00, 0x200), "a write overlapping the range is not reported");
+    const auto later = WriteJournalSerial();
+    Require(later == start + 1, "the journal serial does not count writes");
+    Require(!JournalTouchedSince(later, base + 0x2000, 0x100), "a write before the serial reports a touch");
+    for (int write = 0; write < 20000; ++write) JournalWrite(base + 0x100000, 0x10);
+    Require(JournalTouchedSince(later, base, 0x10), "an overflowed journal does not report a touch");
+}
+
 int main() {
     try {
+        CheckWriteJournal();
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;

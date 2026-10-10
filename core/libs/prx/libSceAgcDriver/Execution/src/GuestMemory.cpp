@@ -1184,6 +1184,48 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, false);
 }
 
+namespace {
+
+struct WriteJournal {
+    static constexpr std::size_t Capacity = 16384;
+    std::mutex mutex;
+    std::array<std::pair<std::uint64_t, std::uint64_t>, Capacity> ranges{};
+    std::uint64_t serial = 0;
+};
+
+WriteJournal& Journal() {
+    static auto* journal = new WriteJournal();
+    return *journal;
+}
+
+}
+
+std::uint64_t WriteJournalSerial() {
+    auto& journal = Journal();
+    std::lock_guard lock(journal.mutex);
+    return journal.serial;
+}
+
+void JournalWrite(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return;
+    auto& journal = Journal();
+    std::lock_guard lock(journal.mutex);
+    journal.ranges[journal.serial % WriteJournal::Capacity] = {address, address + bytes};
+    ++journal.serial;
+}
+
+bool JournalTouchedSince(std::uint64_t serial, std::uint64_t address, std::size_t bytes) {
+    auto& journal = Journal();
+    std::lock_guard lock(journal.mutex);
+    if (journal.serial < serial || journal.serial - serial > WriteJournal::Capacity) return true;
+    const auto end = address + bytes;
+    for (auto entry = serial; entry < journal.serial; ++entry) {
+        const auto& [begin, finish] = journal.ranges[entry % WriteJournal::Capacity];
+        if (begin < end && address < finish) return true;
+    }
+    return false;
+}
+
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
@@ -1278,6 +1320,7 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
 }
 
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
+    JournalWrite(address, bytes);
     if (bytes == 0) return 0;
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
@@ -1322,6 +1365,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+    JournalWrite(address, bytes);
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -1912,6 +1956,7 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
 }
 
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
+    JournalWrite(address, current.size());
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     if (Accessible(reinterpret_cast<const void*>(address), current.size(), true)) {
         WriteChanged(address, current, original);
@@ -1925,6 +1970,7 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
 }
 
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
+    JournalWrite(address, current.size());
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
@@ -1963,6 +2009,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 }
 
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
+    JournalWrite(address, source.size());
     if (source.empty()) return;
     // A store, as in WriteChanged.
     const ReadSiteScope site(ReadSite::Store);

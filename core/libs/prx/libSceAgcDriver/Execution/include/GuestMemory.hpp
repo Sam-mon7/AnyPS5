@@ -93,6 +93,12 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
+// Every range the driver stores to or the GPU is recorded to write, in order. A check proven within one
+// collect epoch (see above) stays proven while JournalTouchedSince reports no overlapping write after
+// the serial taken before it; an overflowed journal reports a touch.
+std::uint64_t WriteJournalSerial();
+void JournalWrite(std::uint64_t address, std::size_t bytes);
+bool JournalTouchedSince(std::uint64_t serial, std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
