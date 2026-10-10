@@ -78,8 +78,8 @@ namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(CompiledShaderArtifact) == 232, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 176, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 440, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(ShaderInvocation) == 200, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(RecompileResult) == 464, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 592, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -101,8 +101,8 @@ static_assert(sizeof(IrResourcePlan) == 712, "IrResourcePlan changed: update Enc
 static_assert(sizeof(IrValue) == 152, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
-static_assert(sizeof(DescriptorSource) == 136, "DescriptorSource changed: update the plan encoder");
-static_assert(sizeof(TableColumn) == 56, "TableColumn changed: update the plan encoder");
+static_assert(sizeof(DescriptorSource) == 144, "DescriptorSource changed: update the plan encoder");
+static_assert(sizeof(TableColumn) == 64, "TableColumn changed: update the plan encoder");
 static_assert(sizeof(KeyDomain) == 16, "KeyDomain changed: update the plan encoder");
 static_assert(sizeof(ResourceBlock) == 80, "ResourceBlock changed: update the plan encoder");
 static_assert(sizeof(SrtRead) == 16, "SrtRead changed: update the plan encoder");
@@ -142,7 +142,7 @@ static_assert(fieldCount<IrResourcePlan>() == 23, "IrResourcePlan changed: updat
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 30, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
-static_assert(fieldCount<TableColumn>() == 8, "TableColumn changed: update the plan encoder");
+static_assert(fieldCount<TableColumn>() == 10, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 4, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
@@ -494,6 +494,12 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
         out.Value(range.first);
         out.Value(range.second);
     });
+    writer.List(invocation.imageTableReadRanges, [](Writer& out, const auto& ranges) {
+        out.List(ranges, [](Writer& rangeWriter, const auto& range) {
+            rangeWriter.Value(range.first);
+            rangeWriter.Value(range.second);
+        });
+    });
     writer.Value(invocation.imageTableShader);
     writer.Value(invocation.imageTableFaults);
 }
@@ -526,6 +532,12 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     reader.List(invocation.imageTableRanges, 16, [](Reader& in, std::pair<std::uint64_t, std::uint64_t>& range) {
         in.Value(range.first);
         in.Value(range.second);
+    });
+    reader.List(invocation.imageTableReadRanges, 8, [](Reader& in, auto& ranges) {
+        in.List(ranges, 16, [](Reader& rangeReader, auto& range) {
+            rangeReader.Value(range.first);
+            rangeReader.Value(range.second);
+        });
     });
     reader.Value(invocation.imageTableShader);
     reader.Value(invocation.imageTableFaults);
@@ -927,7 +939,9 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Value(column.addend);
         out.Value(column.offset);
         out.Value(column.dwordCount);
+        out.Value(column.maxKey);
         out.Value(column.sampler);
+        out.Value(column.address);
         out.List(column.keyDomains, [](Writer& domains, const KeyDomain& domain) {
             domains.Value(domain.source);
             domains.Value(domain.offset);
@@ -1065,7 +1079,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         value.SetDetachedOperands(std::move(arguments), std::move(phiBlocks));
     }
     reader.List(plan.memoryInfo, 78, decodeMemoryInfo);
-    reader.List(plan.descriptorSources, 67, [&](Reader& in, DescriptorSource& source) {
+    reader.List(plan.descriptorSources, 72, [&](Reader& in, DescriptorSource& source) {
         for (auto& dword : source.dwords) dword = valueAt(in.Get<std::uint32_t>());
         in.Value(source.dwordCount);
         const bool table = in.Get<bool>();
@@ -1075,7 +1089,9 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         in.Value(column.addend);
         in.Value(column.offset);
         in.Value(column.dwordCount);
+        in.Value(column.maxKey);
         in.Value(column.sampler);
+        in.Value(column.address);
         in.List(column.keyDomains, 13, [](Reader& domains, KeyDomain& domain) {
             domains.Value(domain.source);
             domains.Value(domain.offset);

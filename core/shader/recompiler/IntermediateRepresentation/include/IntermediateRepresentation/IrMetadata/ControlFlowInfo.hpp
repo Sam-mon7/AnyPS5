@@ -34,12 +34,14 @@ struct TableColumn {
     std::uint32_t addend = 0;
     std::uint32_t offset = 0;
     std::uint32_t dwordCount = 0;
+    std::uint32_t maxKey = 0xffffffffu;
     bool sampler = false;
+    bool address = false;
     std::vector<KeyDomain> keyDomains;
     bool unkeyed = false;
 
     bool operator==(const TableColumn& other) const {
-        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler;
+        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler && address == other.address;
     }
 };
 
