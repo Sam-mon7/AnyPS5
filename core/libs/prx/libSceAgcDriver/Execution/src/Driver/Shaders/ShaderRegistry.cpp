@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <span>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -27,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 namespace AgcDriver::DriverDetail {
@@ -140,7 +142,14 @@ bool RawGraphicsDrawn() {
 
 namespace {
 
+void PromoteRegisteredPreparation(const PreparedShaders* prepared);
+
 void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
+    if (prepared.pending) {
+        lock.unlock();
+        PromoteRegisteredPreparation(&prepared);
+        lock.lock();
+    }
     prepared.settled.wait(lock, [&] { return !prepared.pending; });
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
 }
@@ -369,6 +378,37 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
 
 namespace {
 
+struct ShaderUseTrace {
+    std::mutex mutex;
+    std::unordered_set<std::uint64_t> used;
+    std::atomic<std::uint64_t> submitted{0};
+    std::atomic<std::uint64_t> finished{0};
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+    std::uint64_t usedWhilePending = 0;
+};
+
+ShaderUseTrace* TracedShaderUse() {
+    static ShaderUseTrace* trace = std::getenv("APS5_TRACE_SHADER_USE") != nullptr ? new ShaderUseTrace() : nullptr;
+    return trace;
+}
+
+void ReportShaderUse(ShaderUseTrace& trace) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - trace.reported < std::chrono::seconds(10)) return;
+    trace.reported = now;
+    const auto submitted = trace.submitted.load();
+    const auto finished = trace.finished.load();
+    std::fprintf(stderr, "[shader-use] registered for preparation %llu, prepared %llu, queued %llu; distinct shaders used by draws or dispatches %zu (%llu first used before their preparation finished)\n", static_cast<unsigned long long>(submitted), static_cast<unsigned long long>(finished), static_cast<unsigned long long>(submitted - finished), trace.used.size(), static_cast<unsigned long long>(trace.usedWhilePending));
+}
+
+void NoteShaderUse(const ShaderSnapshot& snapshot, bool pending) {
+    auto* trace = TracedShaderUse();
+    if (trace == nullptr) return;
+    std::lock_guard lock(trace->mutex);
+    if (trace->used.insert(snapshot.codeAddress).second && pending) ++trace->usedWhilePending;
+    ReportShaderUse(*trace);
+}
+
 void ReportPreparedAtUse(const ShaderSnapshot& snapshot, const ShaderRecompiler::RecompileRequest& request) {
     if (request.context.compute && request.context.compute->PartialGroups()) return;
     if (snapshot.codeAddress == NullPixelProgramAddress() && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && request.context.waveSize == 32u) {
@@ -403,6 +443,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
     ShaderRecompiler::BuildPreparedShaderKey(request, key);
     std::unique_lock lock(snapshot.prepared->mutex);
+    NoteShaderUse(snapshot, snapshot.prepared->pending);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
@@ -499,6 +540,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
     ShaderRecompiler::BuildPreparedShaderKey(source, key);
     std::unique_lock lock(snapshot.prepared->mutex);
+    NoteShaderUse(snapshot, snapshot.prepared->pending);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
@@ -762,11 +804,11 @@ private:
 
 public:
 
-    void Submit(std::function<void()> task) {
+    void Submit(const void* key, std::function<void()> task) {
         {
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
-                tasks.push_back(std::move(task));
+                tasks.push_back({key, std::move(task)});
                 lock.unlock();
                 ready.notify_one();
                 return;
@@ -779,6 +821,15 @@ public:
         std::unique_lock lock(mutex);
         closed = true;
         idle.wait(lock, [&] { return tasks.empty() && running == 0; });
+    }
+
+    void Promote(const void* key) {
+        std::lock_guard lock(mutex);
+        const auto found = std::ranges::find_if(tasks, [&](const Task& task) { return task.key == key; });
+        if (found == tasks.end() || found == tasks.begin()) return;
+        auto task = std::move(*found);
+        tasks.erase(found);
+        tasks.push_front(std::move(task));
     }
 
 private:
@@ -804,7 +855,7 @@ private:
             {
                 std::unique_lock lock(pool.mutex);
                 pool.ready.wait(lock, [&] { return !pool.tasks.empty(); });
-                task = std::move(pool.tasks.front());
+                task = std::move(pool.tasks.front().run);
                 pool.tasks.pop_front();
                 ++pool.running;
             }
@@ -819,14 +870,23 @@ private:
         return nullptr;
     }
 
+    struct Task {
+        const void* key = nullptr;
+        std::function<void()> run;
+    };
+
     std::mutex mutex;
     std::condition_variable ready;
     std::condition_variable idle;
-    std::deque<std::function<void()>> tasks;
+    std::deque<Task> tasks;
     unsigned threads = 0;
     unsigned running = 0;
     bool closed = false;
 };
+
+void PromoteRegisteredPreparation(const PreparedShaders* prepared) {
+    RegistrationPreparePool::Instance().Promote(prepared);
+}
 
 bool AsyncRegistrationPrepare() {
     static const bool sync = std::getenv("APS5_SYNC_SHADER_PREPARE") != nullptr;
@@ -834,7 +894,9 @@ bool AsyncRegistrationPrepare() {
 }
 
 void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
-    SubmitRegistrationPreparation([snapshot = std::move(snapshot), plan = std::move(plan)] {
+    if (auto* trace = TracedShaderUse()) trace->submitted.fetch_add(1);
+    const void* key = snapshot->prepared.get();
+    RegistrationPreparePool::Instance().Submit(key, [snapshot = std::move(snapshot), plan = std::move(plan)] {
         PerformanceContext timingContext(FrameTiming::Preparation());
         std::vector<PreparedShaders::Entry> entries;
         std::exception_ptr failure;
@@ -855,17 +917,22 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
             prepared.pending = false;
         }
         prepared.settled.notify_all();
+        if (auto* trace = TracedShaderUse()) {
+            trace->finished.fetch_add(1);
+            std::lock_guard lock(trace->mutex);
+            ReportShaderUse(*trace);
+        }
     });
 }
 
 }
 
 void SubmitRegistrationPreparation(std::function<void()> task) {
-    RegistrationPreparePool::Instance().Submit(std::move(task));
+    RegistrationPreparePool::Instance().Submit(nullptr, std::move(task));
 }
 
 void SubmitLibraryPrebuild(std::function<void()> task) {
-    RegistrationPreparePool::Prebuild().Submit(std::move(task));
+    RegistrationPreparePool::Prebuild().Submit(nullptr, std::move(task));
 }
 
 void CloseRegistrationPreparation() {
