@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -410,6 +411,11 @@ struct BarycentricEmulationLayout {
 
 [[nodiscard]] BarycentricEmulationLayout LayoutBarycentricEmulation(std::span<const FragmentParameter> parameters, const BarycentricEmulation& emulation);
 
+struct SpirvBacking {
+    virtual ~SpirvBacking() = default;
+    [[nodiscard]] virtual std::vector<std::uint32_t> Load() const = 0;
+};
+
 // Compiled SPIR-V shared between a cached variant and every result materialized from it: results
 // are copied per dispatch and draw, so the words are reference counted and only duplicated when a
 // holder writes to them (tests and tools patch modules in place). Reads look like a vector.
@@ -420,12 +426,16 @@ class SharedSpirv {
 public:
     SharedSpirv() = default;
     SharedSpirv(std::vector<std::uint32_t> words) : words(std::make_shared<std::vector<std::uint32_t>>(std::move(words))) {}
-    SharedSpirv& operator=(std::vector<std::uint32_t> other) {
-        words = std::make_shared<std::vector<std::uint32_t>>(std::move(other));
-        return *this;
-    }
+    SharedSpirv(const SharedSpirv& other) : words(std::const_pointer_cast<std::vector<std::uint32_t>>(other.Pin())) {}
+    SharedSpirv(SharedSpirv&& other) noexcept;
+    SharedSpirv& operator=(const SharedSpirv& other);
+    SharedSpirv& operator=(SharedSpirv&& other) noexcept;
+    SharedSpirv& operator=(std::vector<std::uint32_t> other);
+    ~SharedSpirv() = default;
 
-    [[nodiscard]] const std::vector<std::uint32_t>& Words() const { return words ? *words : Empty(); }
+    [[nodiscard]] const std::vector<std::uint32_t>& Words() const;
+    [[nodiscard]] std::shared_ptr<const std::vector<std::uint32_t>> Pin() const;
+    bool Evict(std::shared_ptr<const SpirvBacking> backing) const;
     operator const std::vector<std::uint32_t>&() const { return Words(); }
     [[nodiscard]] std::size_t size() const { return Words().size(); }
     [[nodiscard]] bool empty() const { return Words().empty(); }
@@ -439,20 +449,21 @@ public:
     [[nodiscard]] std::vector<std::uint32_t>::iterator end() { return Mutable().end(); }
     void resize(std::size_t count) { Mutable().resize(count); }
     std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
-    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return left.words == right.words || left.Words() == right.Words(); }
+    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) {
+        const auto leftWords = left.Pin();
+        const auto rightWords = right.Pin();
+        return leftWords == rightWords || *leftWords == *rightWords;
+    }
 
 private:
-    static const std::vector<std::uint32_t>& Empty() {
-        static const std::vector<std::uint32_t> empty;
-        return empty;
-    }
+    static std::mutex& Mutex();
+    static const std::shared_ptr<const std::vector<std::uint32_t>>& Empty();
     // Copy on write: a holder whose words are shared gets its own copy before the first write.
-    std::vector<std::uint32_t>& Mutable() {
-        if (words == nullptr || words.use_count() != 1) words = std::make_shared<std::vector<std::uint32_t>>(Words());
-        return *words;
-    }
+    std::vector<std::uint32_t>& Mutable();
 
-    std::shared_ptr<std::vector<std::uint32_t>> words;
+    mutable std::shared_ptr<std::vector<std::uint32_t>> words;
+    mutable std::shared_ptr<const SpirvBacking> backing;
+    mutable bool pinned = false;
 };
 
 struct VertexInput {

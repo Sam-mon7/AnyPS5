@@ -64,9 +64,9 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 200, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 224, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 112, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 320, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 344, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 568, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -290,7 +290,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.runtimeAbiVersion);
-    writer.Values(std::span<const std::uint32_t>(result.spirv.Words()));
+    writer.Values(std::span<const std::uint32_t>(*result.spirv.Pin()));
     writer.Value(result.bdaAbiVersion);
     writer.Value(result.memoryOffsetDword);
     writer.Value(result.shaderDataDwords);
@@ -697,6 +697,52 @@ const std::vector<std::byte>& switchKey() {
     return key;
 }
 
+std::size_t wordsOffset(std::size_t keyBytes) {
+    return sizeof(FileHeader) + keyBytes + sizeof(std::uint32_t) + sizeof(std::uint64_t);
+}
+
+bool residentOnly() {
+    static const bool resident = std::getenv("APS5_NO_PERF_SPIRV_EVICTION") != nullptr;
+    return resident;
+}
+
+class FileBacking final : public SpirvBacking {
+public:
+    FileBacking(std::filesystem::path path, std::size_t keyBytes, std::uint64_t wordCount, std::uint64_t fileBytes) : path(std::move(path)), keyBytes(keyBytes), wordCount(wordCount), fileBytes(fileBytes) {}
+
+    [[nodiscard]] std::vector<std::uint32_t> Load() const override {
+        std::vector<std::byte> file;
+        const auto offset = wordsOffset(keyBytes);
+        if (!ReadWholeFile(path, file) || file.size() != fileBytes || offset + wordCount * sizeof(std::uint32_t) > file.size()) throw std::runtime_error("shader disk cache: the entry holding a prepared shader's SPIR-V is gone: " + path.string());
+        FileHeader header;
+        std::memcpy(&header, file.data(), sizeof(header));
+        if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != SourceVersion() || header.keyBytes != keyBytes || sizeof(header) + header.keyBytes + header.payloadBytes != file.size()) throw std::runtime_error("shader disk cache: the entry holding a prepared shader's SPIR-V changed: " + path.string());
+        const auto payload = std::span<const std::byte>(file).subspan(sizeof(header) + keyBytes);
+        if (HashBytes(payload) != header.payloadHash) throw std::runtime_error("shader disk cache: the entry holding a prepared shader's SPIR-V is corrupt: " + path.string());
+        std::uint64_t storedCount;
+        std::memcpy(&storedCount, file.data() + offset - sizeof(std::uint64_t), sizeof(storedCount));
+        if (storedCount != wordCount) throw std::runtime_error("shader disk cache: the entry holding a prepared shader's SPIR-V changed: " + path.string());
+        std::vector<std::uint32_t> words(static_cast<std::size_t>(wordCount));
+        std::memcpy(words.data(), file.data() + offset, words.size() * sizeof(std::uint32_t));
+        return words;
+    }
+
+private:
+    std::filesystem::path path;
+    std::size_t keyBytes;
+    std::uint64_t wordCount;
+    std::uint64_t fileBytes;
+};
+
+void evictToEntry(const CompiledVariant& variant, const std::filesystem::path& path, std::size_t keyBytes, std::span<const std::byte> file) {
+    if (residentOnly()) return;
+    const auto offset = wordsOffset(keyBytes);
+    const auto pinned = variant.artifact.spirv.Pin();
+    const auto bytes = pinned->size() * sizeof(std::uint32_t);
+    if (offset + bytes > file.size() || std::memcmp(file.data() + offset, pinned->data(), bytes) != 0) return;
+    variant.artifact.spirv.Evict(std::make_shared<FileBacking>(path, keyBytes, pinned->size(), file.size()));
+}
+
 std::string hex(std::uint64_t value) {
     char text[17];
     std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(value));
@@ -729,6 +775,7 @@ public:
                 case LoadStatus::Loaded:
                     hits.fetch_add(1, std::memory_order_relaxed);
                     bytesRead.fetch_add(file.size(), std::memory_order_relaxed);
+                    evictToEntry(variant, directory / name, key.size(), file);
                     loaded = true;
                     break;
                 case LoadStatus::Absent:
@@ -807,6 +854,7 @@ private:
         if (WriteFileAtomically(directory / EntryName(job.key), file)) {
             writes.fetch_add(1, std::memory_order_relaxed);
             bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+            evictToEntry(*job.variant, directory / EntryName(job.key), job.key.size(), file);
         } else {
             const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
             if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / EntryName(job.key)).string().c_str());
@@ -931,7 +979,7 @@ bool DecodeResult(std::span<const std::byte> bytes, RecompileResult& result) {
 
 std::vector<std::byte> EncodeEntry(std::span<const std::byte> key, const CompiledVariant& variant) {
     std::vector<std::byte> payload;
-    payload.reserve(variant.artifact.spirv.size() * sizeof(std::uint32_t) + 4096);
+    payload.reserve(variant.artifact.spirv.Pin()->size() * sizeof(std::uint32_t) + 4096);
     Writer writer(payload);
     encodeArtifact(writer, variant.artifact);
     encodeInfo(writer, variant.info);

@@ -1251,6 +1251,95 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(con
     return result;
 }
 
+std::mutex& SharedSpirv::Mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+const std::shared_ptr<const std::vector<std::uint32_t>>& SharedSpirv::Empty() {
+    static const std::shared_ptr<const std::vector<std::uint32_t>> empty = std::make_shared<const std::vector<std::uint32_t>>();
+    return empty;
+}
+
+SharedSpirv::SharedSpirv(SharedSpirv&& other) noexcept {
+    std::lock_guard lock(Mutex());
+    words = std::move(other.words);
+    backing = std::move(other.backing);
+    pinned = false;
+    other.pinned = false;
+}
+
+SharedSpirv& SharedSpirv::operator=(const SharedSpirv& other) {
+    if (this == &other) return *this;
+    auto resident = other.Pin();
+    std::lock_guard lock(Mutex());
+    words = std::const_pointer_cast<std::vector<std::uint32_t>>(std::move(resident));
+    backing.reset();
+    pinned = false;
+    return *this;
+}
+
+SharedSpirv& SharedSpirv::operator=(SharedSpirv&& other) noexcept {
+    if (this == &other) return *this;
+    std::lock_guard lock(Mutex());
+    words = std::move(other.words);
+    backing = std::move(other.backing);
+    pinned = false;
+    other.pinned = false;
+    return *this;
+}
+
+SharedSpirv& SharedSpirv::operator=(std::vector<std::uint32_t> other) {
+    auto fresh = std::make_shared<std::vector<std::uint32_t>>(std::move(other));
+    std::lock_guard lock(Mutex());
+    words = std::move(fresh);
+    backing.reset();
+    pinned = false;
+    return *this;
+}
+
+std::shared_ptr<const std::vector<std::uint32_t>> SharedSpirv::Pin() const {
+    std::shared_ptr<const SpirvBacking> source;
+    {
+        std::lock_guard lock(Mutex());
+        if (words != nullptr) return words;
+        if (backing == nullptr) return Empty();
+        source = backing;
+    }
+    return std::make_shared<const std::vector<std::uint32_t>>(source->Load());
+}
+
+const std::vector<std::uint32_t>& SharedSpirv::Words() const {
+    std::shared_ptr<const SpirvBacking> source;
+    {
+        std::lock_guard lock(Mutex());
+        pinned = true;
+        if (words != nullptr) return *words;
+        if (backing == nullptr) return *Empty();
+        source = backing;
+    }
+    auto loaded = std::make_shared<std::vector<std::uint32_t>>(source->Load());
+    std::lock_guard lock(Mutex());
+    if (words == nullptr) words = std::move(loaded);
+    return *words;
+}
+
+bool SharedSpirv::Evict(std::shared_ptr<const SpirvBacking> target) const {
+    std::lock_guard lock(Mutex());
+    if (pinned || words == nullptr || target == nullptr) return false;
+    backing = std::move(target);
+    words.reset();
+    return true;
+}
+
+std::vector<std::uint32_t>& SharedSpirv::Mutable() {
+    static_cast<void>(Words());
+    std::lock_guard lock(Mutex());
+    if (words == nullptr || words.use_count() != 1) words = std::make_shared<std::vector<std::uint32_t>>(words != nullptr ? *words : std::vector<std::uint32_t>{});
+    backing.reset();
+    return *words;
+}
+
 const CompiledShaderArtifact& GetPreparedArtifact(const SourceHandle& handle) {
     if (handle.artifact == nullptr) throw std::runtime_error("ShaderRecompiler: prepared artifact is missing");
     return handle.artifact->artifact;

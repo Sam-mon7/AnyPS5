@@ -586,6 +586,43 @@ void verifyStore() {
     require(ShaderDiskCache::Load(key, loaded), "a rewritten entry does not load");
 }
 
+void verifySpirvEviction() {
+    SampleRequest sample;
+    sample.code.push_back(0x9abcdef0u);
+    const auto key = sample.Key();
+    const auto variant = std::make_shared<const CompiledVariant>(sampleVariant());
+    const std::vector<std::uint32_t> words = *variant->artifact.spirv.Pin();
+    require(!words.empty(), "the sample artifact has no SPIR-V");
+    ShaderDiskCache::Store(key, variant);
+    ShaderDiskCache::Flush();
+    const auto path = ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key);
+    require(*variant->artifact.spirv.Pin() == words, "evicted SPIR-V reloads differently");
+    const SharedSpirv copy = variant->artifact.spirv;
+    std::vector<std::byte> file;
+    require(ReadWholeFile(path, file), "cannot read the entry back");
+    require(std::filesystem::remove(path), "cannot remove the entry");
+    require(copy.Words() == words, "a copy of evicted SPIR-V is not resident");
+    bool threw = false;
+    try {
+        static_cast<void>(variant->artifact.spirv.Pin());
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    require(threw, "the SPIR-V stayed resident after its entry was written");
+    require(WriteFileAtomically(path, file), "cannot restore the entry");
+    require(*variant->artifact.spirv.Pin() == words, "SPIR-V does not reload from a restored entry");
+
+    SampleRequest heldSample;
+    heldSample.code.push_back(0x0fedcba9u);
+    const auto heldKey = heldSample.Key();
+    const auto held = std::make_shared<const CompiledVariant>(sampleVariant());
+    const auto& reference = held->artifact.spirv.Words();
+    ShaderDiskCache::Store(heldKey, held);
+    ShaderDiskCache::Flush();
+    require(std::filesystem::remove(ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(heldKey)), "cannot remove the held entry");
+    require(reference == words && *held->artifact.spirv.Pin() == words, "SPIR-V with a live reference was evicted");
+}
+
 struct ComputeRequest {
     std::vector<std::uint32_t> code{0xe0700000u, 0x80000000u, 0xbf810000u};
     std::array<std::uint32_t, 4> userData{0x10000000u, 0x00000000u, 0x40u, 0x00027facu};
@@ -1109,6 +1146,7 @@ int main(int argc, char** argv) {
         verifyKeySensitivity();
         verifyFloatModeSerialization();
         verifyStore();
+        verifySpirvEviction();
         verifyAcrossProcesses(argv[0]);
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);
