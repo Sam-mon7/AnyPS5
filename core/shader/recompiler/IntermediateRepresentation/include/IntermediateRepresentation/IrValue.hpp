@@ -122,6 +122,10 @@ inline bool IrValue::IsIdentity() const {
     return opcode == IrOpcode::Identity;
 }
 
+inline bool IrValue::HasUses() const {
+    return !uses.empty();
+}
+
 inline std::size_t IrValue::ArgumentCount() const {
     return arguments.size();
 }

@@ -859,7 +859,9 @@ bool IsFloat64Opcode(IrOpcode opcode) {
     return opcode >= IrOpcode::FPAdd64 && opcode <= IrOpcode::ConvertU32F64;
 }
 
-bool IrOpcodeHasSideEffects(IrOpcode opcode) {
+namespace {
+
+bool computeIrOpcodeHasSideEffects(IrOpcode opcode) {
     const BufferAccess bufferAccess = BufferAccessOf(opcode);
     if (bufferAccess == BufferAccess::Write || bufferAccess == BufferAccess::Atomic) {
         return true;
@@ -915,6 +917,18 @@ bool IrOpcodeHasSideEffects(IrOpcode opcode) {
         default:
             return false;
     }
+}
+
+}
+
+bool IrOpcodeHasSideEffects(IrOpcode opcode) {
+    static const auto table = [] {
+        std::array<bool, static_cast<std::size_t>(IrOpcode::Count)> result{};
+        for (std::size_t index = 0; index < result.size(); ++index) result[index] = computeIrOpcodeHasSideEffects(static_cast<IrOpcode>(index));
+        return result;
+    }();
+    const auto index = static_cast<std::size_t>(opcode);
+    return index < table.size() ? table[index] : computeIrOpcodeHasSideEffects(opcode);
 }
 
 std::string_view IrOpcodeName(IrOpcode opcode) {

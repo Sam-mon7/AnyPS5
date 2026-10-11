@@ -1,5 +1,6 @@
 #include "IntermediateRepresentation/IrValue.hpp"
 #include <algorithm>
+#include <iterator>
 #include <bit>
 #include <stdexcept>
 
@@ -43,15 +44,15 @@ void IrValue::ReplaceArgument(std::size_t index, IrValue* argument) {
     }
     IrValue* previous = arguments[index];
     if (previous != nullptr) {
-        const auto useIt = std::find(previous->uses.begin(), previous->uses.end(), this);
-        if (useIt != previous->uses.end()) {
-            previous->uses.erase(useIt);
+        const auto useIt = std::find(previous->uses.rbegin(), previous->uses.rend(), this);
+        if (useIt != previous->uses.rend()) {
+            previous->uses.erase(std::next(useIt).base());
         }
-        const auto operandIt = std::find_if(previous->operandUses.begin(), previous->operandUses.end(), [this, index](const IrUse& use) {
+        const auto operandIt = std::find_if(previous->operandUses.rbegin(), previous->operandUses.rend(), [this, index](const IrUse& use) {
             return use.user == this && use.operand == index;
         });
-        if (operandIt != previous->operandUses.end()) {
-            previous->operandUses.erase(operandIt);
+        if (operandIt != previous->operandUses.rend()) {
+            previous->operandUses.erase(std::next(operandIt).base());
         }
     }
     arguments[index] = argument;
@@ -90,10 +91,6 @@ bool IrValue::IsPhi() const {
 
 bool IrValue::MayHaveSideEffects() const {
     return IrOpcodeHasSideEffects(opcode);
-}
-
-bool IrValue::HasUses() const {
-    return !uses.empty();
 }
 
 std::size_t IrValue::UseCount() const {
