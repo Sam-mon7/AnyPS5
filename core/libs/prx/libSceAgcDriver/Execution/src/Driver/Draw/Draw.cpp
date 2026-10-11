@@ -66,9 +66,19 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
+    std::uint64_t drawIdentity = 0, drawAlias = 0;
+    std::vector<DrawUserPatch> userPatches;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
+        std::shared_ptr<const DrawRelocation> relocation;
+        if (drawRelocationEnabled()) {
+            drawIdentity = drawIdentityKey(queue, *submission.shaders);
+            std::lock_guard cacheLock(drawCacheMutex);
+            learnPendingRelocation();
+            const auto known = drawRelocations.find(drawIdentity);
+            if (known != drawRelocations.end()) relocation = known->second;
+        }
+        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), relocation.get(), &drawAlias);
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -79,9 +89,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             decode = entry->decode;
         } else {
             ++drawEntryCounters.absent;
+            if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
+            if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
         }
     }
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
+        userPatches.clear();
         std::lock_guard cacheLock(drawCacheMutex);
         eraseDrawEntry(drawKey, entry);
         ++drawEntryCounters.absent;
@@ -94,6 +107,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;
+    for (const auto& patch : userPatches) programs[patch.program].userData[patch.index] = patch.value;
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
         auto& words = programs.front().userData;
@@ -169,6 +183,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool drawHit = false;
     bool verifyHit = false;
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
+    for (auto& variant : matched) {
+        if (variant != nullptr) applyShaderDataPatches(*variant);
+    }
+    const auto relocatedDecode = decode;
+    if (!userPatches.empty()) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        if (drawHit) ++drawRelocationCounters.hits;
+        if (profile && drawRelocationCounters.lookups >= 100000) reportDrawRelocation();
+    }
+    if (!userPatches.empty() && !drawHit) {
+        auto current = std::make_shared<DrawDecode>(*decode);
+        for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
+        decode = std::move(current);
+    }
 
     if (registerKey) {
 

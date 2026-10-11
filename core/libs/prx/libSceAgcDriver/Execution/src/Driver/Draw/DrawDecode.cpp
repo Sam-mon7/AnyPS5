@@ -66,6 +66,7 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
         const auto initializeMerged = [&](DrawProgram& program, std::uint32_t pointerBase, bool pointerRequired) {
             program.firstUserSgpr = 0;
             program.userData.insert(program.userData.begin(), 8, 0);
+            program.hiddenUserWords = 8;
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase);
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase + 1);
             if (staticAbi) return;

@@ -118,7 +118,15 @@ private:
     std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
     void reportDrawCache(DrawEntryCounters& counters);
-    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
+    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, const DrawRelocation* relocation = nullptr, std::uint64_t* alias = nullptr);
+    static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
+    static bool drawRelocationEnabled();
+    static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable);
+    static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords);
+    static void applyShaderDataPatches(DispatchVariant& variant);
+    void learnPendingRelocation();
+    void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
+    void reportDrawRelocation();
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);
@@ -307,6 +315,10 @@ private:
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
     std::list<std::uint64_t> drawOrder;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const DrawRelocation>> drawRelocations;
+    std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawAliases;
+    DrawRelocationPending drawRelocationPending;
+    DrawRelocationCounters drawRelocationCounters;
     std::mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
 

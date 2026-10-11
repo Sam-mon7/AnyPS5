@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAWCACHE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAWCACHE_HPP
 
+#include "UserDataUse.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include <array>
@@ -23,6 +24,7 @@ struct DrawProgram {
 
     std::shared_ptr<const ShaderSnapshot> snapshot;
     std::size_t codeOffset = 0;
+    std::uint32_t hiddenUserWords = 0;
 };
 
 struct DrawDecode {
@@ -82,6 +84,30 @@ struct StageCapture {
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
+    ShaderRecompiler::SrtUserDataUse userDataUse;
+};
+
+struct RelocatableUserWord {
+    std::uint32_t reg;
+    std::vector<std::pair<std::int64_t, std::uint32_t>> reads;
+};
+
+struct DrawRelocation {
+    std::vector<RelocatableUserWord> words;
+    std::vector<std::uint32_t> banned;
+};
+
+struct DrawUserPatch {
+    std::size_t program;
+    std::uint32_t index, value;
+};
+
+struct DrawRelocationPending {
+    std::uint64_t key = 0, alias = 0, identity = 0;
+};
+
+struct DrawRelocationCounters {
+    std::uint64_t lookups = 0, donors = 0, refused = 0, hits = 0;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
