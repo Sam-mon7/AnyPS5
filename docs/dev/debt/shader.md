@@ -1,5 +1,9 @@
 # shader technical debt
 
+### Build
+
+- The bundled [SPIRV-Tools build](../../../core/shader/recompiler/PatchSpirvTools.cmake) replaces the redundancy-elimination source with a build-directory copy that releases processed traversal maps. Remove this patch when the pinned revision includes [SPIRV-Tools #6962](https://github.com/KhronosGroup/SPIRV-Tools/pull/6962). System-dependency builds need the fix in their installed SPIRV-Tools package.
+
 ### Unknown function info
 
 - [Packed pixel ancillary word](../../../core/shader/recompiler/Optimization/src/ConstantFolder.cpp) (shader recompiler) - the sample index at bits 8-11 and the render target index at bits 16-28 follow #295, and their equality with the SampleId and Layer builtins is inferred, not measured. A value passed through a select, move or phi is rebuilt from those two fields with bits 0-7, 12-15 and 29-31 zero. That is exact only because every read of the word must be an extract inside one modelled field; any other read throws. The other bits are unmodelled and their RDNA 2 layout is unknown: the RDNA 3.5 ISA is reported to give prim type at bits 0-1, VRS rates at bits 2-5 and eye id at bit 7, which was not checked against RDNA 2
