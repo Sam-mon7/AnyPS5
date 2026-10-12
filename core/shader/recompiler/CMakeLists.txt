@@ -35,6 +35,7 @@ function(add_shader_recompiler target runtimeTarget)
 
     add_library(${target} STATIC EXCLUDE_FROM_ALL
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Recompiler.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SharedSpirv.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderDiskCache.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/RectListShaders.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/BarycentricGeometryShader.cpp

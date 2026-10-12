@@ -373,7 +373,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.runtimeAbiVersion);
-    writer.Values(std::span<const std::uint32_t>(result.spirv.Words()));
+    writer.Values(result.spirv.Read());
     writer.Value(result.bdaAbiVersion);
     writer.Value(result.memoryOffsetDword);
     writer.Value(result.shaderDataDwords);

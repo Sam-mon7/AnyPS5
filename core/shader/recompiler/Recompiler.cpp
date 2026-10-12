@@ -571,7 +571,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
     std::map<std::uint32_t, std::uint32_t> values;
     std::set<std::uint32_t> specializedIds;
-    const auto& words = source.Words();
+    const auto words = source.Read();
     if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid prepared specialization module");
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
