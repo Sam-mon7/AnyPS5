@@ -232,7 +232,7 @@ int main(int argc, char** argv) {
                 std::memcmp(buffer, payload, sizeof(payload)) == 0, "receive into watched sender outputs");
             Require(*length == senderAddress.size() && std::memcmp(address, senderAddress.data(), *length) == 0,
                 "watched sender outputs are correct");
-            const auto expectedPages = static_cast<std::size_t>(((mask & 1) != 0) + ((mask & 2) != 0)) * (page / 4096);
+            const auto expectedPages = static_cast<std::size_t>(((mask & 1) != 0) + ((mask & 2) != 0));
             Require(collectOutputs() == expectedPages, "each watched sender output is tracked");
             Require(collectOutputs() == 0, "sender output writes cleared");
             if (mask & 1) Require(Protection(address) == PAGE_READONLY, "sender address rearmed");

@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -55,7 +56,7 @@ public:
                 const auto mapped = views.find(cursor & ~(pageBytes - 1));
                 if (mapped != views.end()) {
                     mapped->second.protection = protection;
-                    mapped->second.armed = false;
+                    mapped->second.armed = 0;
                     invalidate(*mapped->second.page);
                 }
                 DWORD previous;
@@ -95,7 +96,7 @@ public:
             }
             const auto base = cursor + done;
             shared->aliases.push_back(base);
-            views.emplace(base, View{shared, protection, 0, false, owned, offset + done, 0});
+            views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0});
             invalidate(*shared);
         }
     }
@@ -104,7 +105,7 @@ public:
         std::lock_guard lock(mutex);
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
-            it->second.armed = false;
+            it->second.armed = 0;
             invalidate(*it->second.page);
         }
     }
@@ -116,10 +117,9 @@ public:
             ++page.pins;
             for (const auto alias : page.aliases) {
                 auto& view = views.at(alias);
-                if (!view.armed) continue;
-                DWORD previous;
-                if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, view.protection, &previous)) fail("pin shared guest page writable");
-                view.armed = false;
+                if (view.armed == 0) continue;
+                protectSubpages(alias, view.armed, view.protection, "pin shared guest page writable");
+                view.armed = 0;
             }
             invalidate(page);
         }
@@ -140,10 +140,10 @@ public:
         const auto found = views.find(base);
         if (found == views.end() || !writable(found->second.protection)) return false;
         auto& view = found->second;
-        invalidate(*view.page);
-        DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume shared memory write");
-        view.armed = false;
+        const auto written = subpagesOf(base, address, address + 1);
+        invalidate(*view.page, written);
+        protectSubpages(base, written, view.protection, "resume shared memory write");
+        view.armed &= static_cast<std::uint8_t>(~written);
         return true;
     }
 
@@ -157,11 +157,12 @@ public:
         for (auto it = first; it != views.end() && it->first < end; ++it) {
             auto& view = it->second;
             ++view.hostWrites;
-            invalidate(*view.page);
-            if (!view.armed) continue;
-            DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(it->first), pageBytes, view.protection, &previous)) fail("open shared memory to a host write");
-            view.armed = false;
+            const auto written = subpagesOf(it->first, address, end);
+            invalidate(*view.page, written);
+            const auto opened = static_cast<std::uint8_t>(view.armed & written);
+            if (opened == 0) continue;
+            protectSubpages(it->first, opened, view.protection, "open shared memory to a host write");
+            view.armed &= static_cast<std::uint8_t>(~opened);
         }
         return true;
     }
@@ -171,7 +172,7 @@ public:
         const auto end = address + bytes;
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             --it->second.hostWrites;
-            invalidate(*it->second.page);
+            invalidate(*it->second.page, subpagesOf(it->first, address, end));
         }
     }
 
@@ -241,26 +242,54 @@ public:
                 const auto stop = std::min(std::min(end, base + pageBytes), nextClean == cleanRanges.end() ? end : nextClean->first);
                 if (view.protection == PAGE_NOACCESS) return false;
                 const bool pinned = view.page->pins != 0;
-                if (pinned || view.seen != view.page->generation) {
-                    const auto needed = (stop - cursor + 4095) / 4096;
-                    if (needed > capacity - *count) {
-                        for (auto at = cursor; *count < capacity; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
-                        return true;
+                std::uint8_t settled = 0;
+                auto settledEnd = cursor;
+                bool full = false;
+                for (std::size_t sub = 0; sub < subpages; ++sub) {
+                    const auto from = std::max(cursor, base + sub * subpageBytes);
+                    const auto to = std::min(stop, base + (sub + 1) * subpageBytes);
+                    if (from >= to) continue;
+                    if (pinned || view.seen[sub] != view.page->generation[sub]) {
+                        if (*count == capacity) {
+                            full = true;
+                            break;
+                        }
+                        pages[(*count)++] = reinterpret_cast<void*>(from);
                     }
-                    for (auto at = cursor; at < stop; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
+                    settled |= static_cast<std::uint8_t>(1u << sub);
+                    settledEnd = to;
                 }
-                if (clear && !pinned) {
+                if (clear && !pinned && settled != 0) {
+                    std::uint8_t untracked = 0;
                     for (const auto alias : view.page->aliases) {
                         auto& other = views.at(alias);
-                        if (!writable(other.protection) || other.armed || other.hostWrites != 0) continue;
-                        DWORD previous;
+                        const auto arming = static_cast<std::uint8_t>(settled & ~other.armed);
+                        if (!writable(other.protection) || arming == 0) continue;
+                        if (other.hostWrites != 0) {
+                            untracked |= arming;
+                            continue;
+                        }
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
-                        if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, protection, &previous)) fail("arm shared memory write tracking");
-                        other.armed = true;
+                        protectSubpages(alias, arming, protection, "arm shared memory write tracking");
+                        other.armed |= arming;
                     }
-                    if (cursor == base && stop == base + pageBytes) view.seen = view.page->generation;
-                    rememberClean(cursor, stop);
+                    const auto tracked = static_cast<std::uint8_t>(settled & ~untracked);
+                    auto cleanFrom = cursor;
+                    auto cleanTo = cursor;
+                    for (std::size_t sub = 0; sub < subpages; ++sub) {
+                        if ((tracked & (1u << sub)) == 0) continue;
+                        const auto from = std::max(cursor, base + sub * subpageBytes);
+                        const auto to = std::min(settledEnd, base + (sub + 1) * subpageBytes);
+                        if (from == base + sub * subpageBytes && to == base + (sub + 1) * subpageBytes) view.seen[sub] = view.page->generation[sub];
+                        if (from != cleanTo) {
+                            if (cleanFrom != cleanTo) rememberClean(cleanFrom, cleanTo);
+                            cleanFrom = from;
+                        }
+                        cleanTo = to;
+                    }
+                    if (cleanFrom != cleanTo) rememberClean(cleanFrom, cleanTo);
                 }
+                if (full) return true;
                 cursor = stop;
             } else {
                 const auto memory = query(cursor);
@@ -295,8 +324,16 @@ private:
     }
 
     static constexpr std::size_t pageBytes = 0x4000;
+    static constexpr std::size_t subpageBytes = 0x1000;
+    static_assert(subpageBytes == 4096, "Collect reports one page per subpage");
+    static constexpr std::size_t subpages = pageBytes / subpageBytes;
+    static constexpr std::uint8_t allSubpages = (1u << subpages) - 1;
     struct SharedPage {
-        std::uint64_t generation = 1;
+        std::array<std::uint64_t, subpages> generation = [] {
+            std::array<std::uint64_t, subpages> initial{};
+            initial.fill(1);
+            return initial;
+        }();
         std::vector<std::uintptr_t> aliases;
         std::uint32_t pins = 0;
     };
@@ -310,8 +347,8 @@ private:
     struct View {
         std::shared_ptr<SharedPage> page;
         DWORD protection;
-        std::uint64_t seen;
-        bool armed;
+        std::array<std::uint64_t, subpages> seen;
+        std::uint8_t armed;
         std::shared_ptr<Section> section;
         std::uint64_t offset;
         std::uint32_t hostWrites;
@@ -339,9 +376,35 @@ private:
         cleanRanges.emplace(start, end);
     }
 
-    void invalidate(SharedPage& page) {
-        ++page.generation;
-        for (const auto alias : page.aliases) forgetClean(alias, alias + pageBytes);
+    void invalidate(SharedPage& page, std::uint8_t mask = allSubpages) {
+        for (std::size_t sub = 0; sub < subpages; ++sub) {
+            if ((mask & (1u << sub)) == 0) continue;
+            ++page.generation[sub];
+            for (const auto alias : page.aliases) forgetClean(alias + sub * subpageBytes, alias + (sub + 1) * subpageBytes);
+        }
+    }
+
+    static std::uint8_t subpagesOf(std::uintptr_t base, std::uintptr_t address, std::uintptr_t end) {
+        const auto from = std::max(address, base);
+        const auto to = std::min(end, base + pageBytes);
+        if (to <= from) return 0;
+        const auto first = (from - base) / subpageBytes;
+        const auto last = (to - 1 - base) / subpageBytes;
+        return static_cast<std::uint8_t>(((1u << (last + 1)) - 1) & ~((1u << first) - 1));
+    }
+
+    static void protectSubpages(std::uintptr_t base, std::uint8_t mask, DWORD protection, const char* operation) {
+        for (std::size_t sub = 0; sub < subpages;) {
+            if ((mask & (1u << sub)) == 0) {
+                ++sub;
+                continue;
+            }
+            auto stop = sub;
+            while (stop < subpages && (mask & (1u << stop)) != 0) ++stop;
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
+            sub = stop;
+        }
     }
 
     bool sameSection(HANDLE first, HANDLE second) const {

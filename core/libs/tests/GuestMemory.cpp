@@ -1193,20 +1193,20 @@ static void CheckSharedWriteTracking() {
     auto* right = static_cast<volatile unsigned char*>(second);
     left[page + 5] = 21;
     Require(right[page + 5] == 21);
-    Require(collect(first, page * 3, false) == 4);
-    Require(collect(first, page * 3, false) == 4);
-    Require(collect(first, page * 3) == 4);
-    Require(collect(second, page * 3) == 4);
+    Require(collect(first, page * 3, false) == 1);
+    Require(collect(first, page * 3, false) == 1);
+    Require(collect(first, page * 3) == 1);
+    Require(collect(second, page * 3) == 1);
     Require(collect(first, page * 3) == 0);
     right[page * 2] = 42;
-    Require(collect(first, page * 3) == 4);
-    Require(collect(second, page * 3) == 4);
+    Require(collect(first, page * 3) == 1);
+    Require(collect(second, page * 3) == 1);
     Require(collect(second, page * 3) == 0);
     Require(sceKernelMprotect(first, page * 3, 1) == 0);
     collect(first, page * 3);
     collect(second, page * 3);
     right[0] = 63;
-    Require(left[0] == 63 && collect(first, page * 3) == 4);
+    Require(left[0] == 63 && collect(first, page * 3) == 1);
     Require(sceKernelMprotect(first, page * 3, 3) == 0);
     collect(first, page * 3);
     left[0] = 84;
@@ -1216,11 +1216,98 @@ static void CheckSharedWriteTracking() {
     collect(first, page * 3);
     collect(second, page * 3);
     static_cast<volatile unsigned char*>(third)[0] = 105;
-    Require(collect(first, page * 3) == 4 && collect(second, page * 3) == 4);
+    Require(collect(first, page * 3) == 1 && collect(second, page * 3) == 1);
     Require(sceKernelMunmap(third, page) == 0);
     Require(sceKernelMunmap(first, page * 3) == 0);
     Require(sceKernelMunmap(second, page * 3) == 0);
     Require(sceKernelReleaseDirectMemory(phys, page * 3) == 0);
+#endif
+}
+
+static void CheckSharedWritePages() {
+#ifdef _WIN32
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t small = 0x1000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, page * 2, 3, 0, phys, 0) == 0);
+    auto* bytes = static_cast<unsigned char*>(mapped);
+    const auto collect = [&](std::size_t offset, std::size_t size) {
+        std::array<void*, 32> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(mapped) + offset, size, pages.data(), &count, true));
+        Require(count == 0 || reinterpret_cast<std::uintptr_t>(pages[0]) >= reinterpret_cast<std::uintptr_t>(mapped) + offset);
+        return count;
+    };
+    collect(0, page * 2);
+    Require(collect(0, page * 2) == 0);
+    static_cast<volatile unsigned char*>(bytes)[small + 3] = 1;
+    Require(collect(small * 2, small * 2) == 0);
+    Require(collect(0, page * 2) == 1);
+    Require(collect(0, page * 2) == 0);
+    std::memset(bytes + small * 2 - 8, 7, 16);
+    Require(collect(0, page * 2) == 2);
+    Require(collect(0, page * 2) == 0);
+    const auto path = std::filesystem::path("anyps5-shared-pages-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+    {
+        std::ofstream stream(path, std::ios::binary);
+        const std::vector<char> seed(small, 5);
+        stream.write(seed.data(), static_cast<std::streamsize>(seed.size()));
+    }
+    const int fd = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Require(fd >= 0);
+    Require(sceKernelPread(fd, bytes + page + small, small, 0) == static_cast<std::int64_t>(small));
+    Require(sceKernelClose(fd) == 0);
+    Require(bytes[page + small] == 5 && bytes[page + small * 2 - 1] == 5);
+    Require(collect(page, small) == 0);
+    Require(collect(0, page * 2) == 1);
+    Require(sceKernelMunmap(mapped, page * 2) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page * 2) == 0);
+    std::filesystem::remove(path);
+#endif
+}
+
+static void CheckSharedWritesDuringHostWrite() {
+#ifdef _WIN32
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t small = 0x1000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &phys) == 0);
+    void* first = nullptr;
+    void* second = nullptr;
+    Require(sceKernelMapDirectMemory(&first, page, 3, 0, phys, 0) == 0);
+    Require(sceKernelMapDirectMemory(&second, page, 3, 0, phys, 0) == 0);
+    auto* left = static_cast<volatile unsigned char*>(first);
+    auto* right = static_cast<volatile unsigned char*>(second);
+    const auto collect = [](void* address) {
+        std::array<void*, 32> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(address), page, pages.data(), &count, true));
+        std::vector<std::size_t> offsets;
+        for (std::size_t i = 0; i < count; ++i) offsets.push_back(reinterpret_cast<std::uintptr_t>(pages[i]) - reinterpret_cast<std::uintptr_t>(address));
+        return offsets;
+    };
+    const std::vector<std::size_t> open{small, small * 2};
+    collect(first);
+    collect(second);
+    Require(collect(first).empty() && collect(second).empty());
+    left[small] = 1;
+    auto* target = const_cast<unsigned char*>(left + small * 2);
+    Require(GuestArena::GuestArenaBeginHostWrite_nid_postfix(target, small));
+    Require(collect(first) == open);
+    Require(collect(second) == open);
+    left[small + 8] = 2;
+    Require(collect(first) == open);
+    Require(collect(second) == open);
+    GuestArena::GuestArenaEndHostWrite_nid_postfix(target, small);
+    Require(collect(first) == open && collect(second) == open);
+    Require(collect(first).empty() && collect(second).empty());
+    left[small + 16] = 3;
+    Require(right[small + 16] == 3 && collect(second) == std::vector<std::size_t>{small});
+    Require(sceKernelMunmap(first, page) == 0);
+    Require(sceKernelMunmap(second, page) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
 #endif
 }
 
@@ -1251,7 +1338,7 @@ static void CheckFailedCollectKeepsWrites() {
     shared[8] = 2;
     Require(sceKernelMprotect(const_cast<unsigned char*>(shared + page), page, 0) == 0);
     Require(!collect(mapped, page * 2, count));
-    Require(collect(mapped, page, count) && count == 4);
+    Require(collect(mapped, page, count) && count == 1);
     Require(sceKernelMunmap(mapped, page * 2) == 0);
     Require(sceKernelReleaseDirectMemory(phys, page * 2) == 0);
 #endif
@@ -1286,7 +1373,7 @@ static void CheckPinnedSharedPages() {
     Require(protection(page) == PAGE_READWRITE);
     bytes[page + 8] = 7;
     bytes[0] = 9;
-    Require(collect() == 8);
+    Require(collect() == 5);
     Require(collect() == 4);
     Require(protection(0) == PAGE_READONLY && protection(page) == PAGE_READWRITE);
     GuestArena::GuestArenaUnpinWritable_nid_postfix(const_cast<unsigned char*>(bytes + page), page);
@@ -1294,7 +1381,7 @@ static void CheckPinnedSharedPages() {
     Require(collect() == 0);
     Require(protection(page) == PAGE_READONLY);
     bytes[page + 8] = 11;
-    Require(collect() == 4);
+    Require(collect() == 1);
     Require(sceKernelMunmap(mapped, page * 3) == 0);
     Require(sceKernelReleaseDirectMemory(phys, page * 3) == 0);
 #endif
@@ -1947,6 +2034,8 @@ int main() {
     CheckArenaReusesAFreedRange();
     CheckArenaHonoursHintsWithoutGoingBelowThem();
     CheckSharedWriteTracking();
+    CheckSharedWritePages();
+    CheckSharedWritesDuringHostWrite();
     CheckReadsIntoSharedWriteTracking();
     CheckPinnedSharedPages();
     CheckFailedCollectKeepsWrites();
