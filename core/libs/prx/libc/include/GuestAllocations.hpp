@@ -21,7 +21,33 @@ struct Range {
     bool gpu = false;
 };
 
-using Lease = std::vector<std::shared_ptr<const Range>>;
+class Lease {
+public:
+    using Ranges = std::vector<std::shared_ptr<const Range>>;
+    using value_type = Ranges::value_type;
+    using const_iterator = Ranges::const_iterator;
+    using iterator = const_iterator;
+
+    Lease() = default;
+    explicit Lease(std::shared_ptr<const Ranges> ranges) : ranges(std::move(ranges)) {}
+
+    const_iterator begin() const { return held().begin(); }
+    const_iterator end() const { return held().end(); }
+    std::size_t size() const { return held().size(); }
+    bool empty() const { return held().empty(); }
+    const value_type& operator[](std::size_t index) const { return held()[index]; }
+    const value_type& front() const { return held().front(); }
+    const value_type& back() const { return held().back(); }
+    void clear() { ranges.reset(); }
+
+private:
+    const Ranges& held() const {
+        static const Ranges none;
+        return ranges != nullptr ? *ranges : none;
+    }
+
+    std::shared_ptr<const Ranges> ranges;
+};
 using Mapped = std::vector<std::weak_ptr<const Range>>;
 
 extern "C" {
