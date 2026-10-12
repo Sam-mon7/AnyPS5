@@ -633,14 +633,11 @@ bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::u
     return !run.ranges.empty() && end <= run.base + run.bytes;
 }
 
-ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
-    const auto window = importWindow.load(std::memory_order_relaxed);
+ImportRun crossedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
     auto last = leasedIndexContaining(lease, begin);
-    if (window == 0 || last == lease.size()) return {};
+    if (last == lease.size()) return {};
     const auto first = last;
-    for (;;) {
-        if (lease[last]->bytes <= window) return {};
-        if (lease[last]->address + lease[last]->bytes >= end) break;
+    while (lease[last]->address + lease[last]->bytes < end) {
         if (last + 1 == lease.size() || !continuesRun(*lease[last], *lease[last + 1])) return {};
         ++last;
     }
@@ -650,8 +647,18 @@ ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, s
     return run;
 }
 
+ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    const auto window = importWindow.load(std::memory_order_relaxed);
+    if (window == 0) return {};
+    auto run = crossedRun(lease, begin, end);
+    if (run.ranges.empty()) return run;
+    if (std::all_of(run.ranges.begin(), run.ranges.end(), [window](const auto& range) { return range->bytes > window; })) return run;
+    if (begin == run.base && end == run.base + run.bytes) return run;
+    return {};
+}
+
 bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
-    return !joinedRun(lease, begin, end).ranges.empty();
+    return !crossedRun(lease, begin, end).ranges.empty();
 }
 
 template<typename Entry>
