@@ -24,6 +24,7 @@ public:
     PipelineCache(const PipelineCache&) = delete;
     PipelineCache& operator=(const PipelineCache&) = delete;
     VkPipelineCache Handle() const { return cache; }
+    PipelineCacheSynchronization& Synchronization() { return synchronization; }
 
 private:
     struct FileHeader {
@@ -51,6 +52,7 @@ private:
     Context context;
     VkPhysicalDeviceProperties properties{};
     VkPipelineCache cache = VK_NULL_HANDLE;
+    PipelineCacheSynchronization synchronization;
     std::filesystem::path path;
     std::size_t loadedBytes = 0;
     std::size_t settledBytes = 0;

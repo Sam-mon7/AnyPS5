@@ -168,7 +168,10 @@ void PipelineCache::save(bool final) {
     std::lock_guard pathLock(pathMutex(path));
     const auto getData = context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     std::size_t liveBytes = 0;
-    if (getData(context.device, cache, &liveBytes, nullptr) != VK_SUCCESS || liveBytes == 0) return;
+    {
+        auto synchronizationLock = synchronization.LockForSnapshot();
+        if (getData(context.device, cache, &liveBytes, nullptr) != VK_SUCCESS || liveBytes == 0) return;
+    }
     if (liveBytes == settledBytes && readHeader() == settledFile) return;
     const auto started = std::chrono::steady_clock::now();
     const auto settle = [&](const std::optional<FileHeader>& file) {
@@ -205,6 +208,7 @@ void PipelineCache::save(bool final) {
         }
     }
     if (merged != VK_NULL_HANDLE) {
+        auto synchronizationLock = synchronization.LockForSnapshot();
         const auto result = context.Function<PFN_vkMergePipelineCaches>("vkMergePipelineCaches")(context.device, merged, 1, &cache);
         if (result != VK_SUCCESS) {
             std::fprintf(stderr, "[pipeline-cache] cannot merge into %s (Vulkan result %d); not saving over it\n", path.string().c_str(), static_cast<int>(result));
@@ -213,15 +217,19 @@ void PipelineCache::save(bool final) {
     }
     const auto source = merged != VK_NULL_HANDLE ? merged : cache;
     std::size_t size = 0;
-    if (getData(context.device, source, &size, nullptr) != VK_SUCCESS || size == 0) return;
-    if (merged != VK_NULL_HANDLE && size == disk.header.dataBytes) {
-        settle(disk.header);
-        return;
+    std::vector<std::byte> file;
+    {
+        auto synchronizationLock = synchronization.LockForSnapshot();
+        if (getData(context.device, source, &size, nullptr) != VK_SUCCESS || size == 0) return;
+        if (merged != VK_NULL_HANDLE && size == disk.header.dataBytes) {
+            settle(disk.header);
+            return;
+        }
+        file.resize(sizeof(FileHeader) + size);
+        const auto result = getData(context.device, source, &size, file.data() + sizeof(FileHeader));
+        if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;
+        file.resize(sizeof(FileHeader) + size);
     }
-    std::vector<std::byte> file(sizeof(FileHeader) + size);
-    const auto result = getData(context.device, source, &size, file.data() + sizeof(FileHeader));
-    if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;
-    file.resize(sizeof(FileHeader) + size);
     if (size < floor) {
         std::fprintf(stderr, "[pipeline-cache] keeping %s: the merged cache has %.1f KiB, less than the %.1f KiB on disk or loaded at start\n", path.string().c_str(), static_cast<double>(size) / 1024.0, static_cast<double>(floor) / 1024.0);
         settle(disk.header);
