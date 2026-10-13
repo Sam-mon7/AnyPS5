@@ -733,7 +733,12 @@ std::uint64_t evictableBytes(const HostImports& state, std::uint64_t begin, std:
     return bytes;
 }
 
-const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true) {
+const HostImport* rejectImport(HostImportFailure* failure, HostImportFailureKind kind) {
+    if (failure != nullptr) failure->kind = kind;
+    return nullptr;
+}
+
+const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true, HostImportFailure* failure = nullptr) {
     const bool fresh = !importsStale(context, state);
     if (fresh && end != 0) {
         if (const auto* current = findImport(state, address, end)) return current;
@@ -745,14 +750,22 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         if (const auto* current = findImport(state, address, run.ranges.empty() ? address + 1 : run.base + run.bytes)) return current;
     }
     if (end != 0) run = windowRun(state, std::move(run), address, end, context.hostImportAlignment);
-    if (run.ranges.empty()) return nullptr;
+    if (run.ranges.empty()) return rejectImport(failure, HostImportFailureKind::Unregistered);
     const auto base = run.base;
     const auto bytes = run.bytes;
+    if (failure != nullptr) {
+        failure->base = base;
+        failure->bytes = bytes;
+        failure->alignment = context.hostImportAlignment;
+        failure->registeredBytes = run.ranges.front()->bytes;
+        failure->writable = run.ranges.front()->writable;
+        failure->gpu = run.ranges.front()->gpu;
+    }
     if (const auto found = state.imports.find(base); found != state.imports.end() && sameRun(found->second, run)) return &found->second;
     const auto alignment = context.hostImportAlignment;
-    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return nullptr;
+    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return rejectImport(failure, HostImportFailureKind::Alignment);
     if (const auto failed = state.failed.find(base); failed != state.failed.end()) {
-        if (sameRun(failed->second, run)) return nullptr;
+        if (sameRun(failed->second, run)) return rejectImport(failure, HostImportFailureKind::CachedFailure);
         state.failed.erase(failed);
     }
     // The imports this one replaces overlap it; none may be held by a build, and the import must fit the budget (with
@@ -762,16 +775,23 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     std::uint64_t replaced = 0;
     bool addressRequired = false;
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
-        if (pointerHeld(state, it->second)) return nullptr;
+        if (pointerHeld(state, it->second)) return rejectImport(failure, HostImportFailureKind::HeldOverlap);
         replaced += it->second.bytes;
         addressRequired = addressRequired || it->second.addressRequired;
     }
     // Map observers run without the GPU lock. Replacing an overlapping window retires its buffer to the recorder,
     // just like budget eviction, so leave it for the next locked use even when the replacement fits the budget.
-    if (replaced != 0 && !GuestMemory::GpuMutex().HeldByThisThread()) return nullptr;
+    if (replaced != 0 && !GuestMemory::GpuMutex().HeldByThisThread()) return rejectImport(failure, HostImportFailureKind::UnlockedReplacement);
     const auto budget = importBudget();
     const auto live = state.liveBytes - replaced;
-    if (live + bytes > budget && (!evict || live + bytes - evictableBytes(state, base, base + bytes) > budget)) {
+    const auto available = live + bytes > budget && evict ? evictableBytes(state, base, base + bytes) : 0;
+    if (live + bytes > budget && (!evict || live + bytes - available > budget)) {
+        if (failure != nullptr) {
+            failure->live = state.liveBytes;
+            failure->budget = budget;
+            failure->replaced = replaced;
+            failure->evictable = available;
+        }
         // A refused import turns every later use of the range into CPU copies, so say so.
         static std::uint64_t refused = 0, refusedBytes = 0;
         static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
@@ -781,7 +801,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
             lastReport = std::chrono::steady_clock::now();
             std::fprintf(stderr, "[gpu] host import budget: %llu MiB live of %llu MiB (APS5_HOST_IMPORT_MIB); %llu imports (%llu MiB) refused so far, last 0x%llx+0x%llx\n", static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
         }
-        return nullptr;
+        return rejectImport(failure, HostImportFailureKind::Budget);
     }
     for (auto it = first; it != state.imports.end() && it->first < base + bytes;) {
         const auto next = std::next(it);
@@ -802,7 +822,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
             state.failed.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-            return nullptr;
+            return rejectImport(failure, HostImportFailureKind::Inaccessible);
         }
         const auto protection = info.Protect & 0xffu;
         const bool pageWritable = (info.Type == MEM_PRIVATE || info.Type == MEM_IMAGE) && (protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_WRITECOPY);
@@ -814,7 +834,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     if (!writable && readOnly) {
         state.failed.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-        return nullptr;
+        return rejectImport(failure, HostImportFailureKind::ReadOnly);
     }
     if (!writable) {
         if (refused.BaseAddress != nullptr) {
@@ -827,7 +847,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         } catch (const std::runtime_error&) {
             if (entry.ranges.size() == 1) throw;
             state.unaliasedSpans.insert(base);
-            const auto* replacement = importAllocation(context, state, address, lease, end, evict);
+            const auto* replacement = importAllocation(context, state, address, lease, end, evict, failure);
             if (replacement != nullptr && addressRequired) replacement->addressRequired = true;
             return replacement;
         }
@@ -835,7 +855,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #else
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) {
         state.failed.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-        return nullptr;
+        return rejectImport(failure, HostImportFailureKind::Inaccessible);
     }
 #endif
     decideImportWatch(context, state);
@@ -851,6 +871,10 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #endif
     if (entry.unwatched) GuestMemory::Unwatch(base, bytes);
     if (step != nullptr) {
+        if (failure != nullptr) {
+            failure->driverStep = step;
+            failure->driverResult = result;
+        }
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
@@ -878,7 +902,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
             std::fclose(maps);
         }
 #endif
-        return nullptr;
+        return rejectImport(failure, HostImportFailureKind::DriverFailure);
     }
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
@@ -949,10 +973,11 @@ const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint6
     return &entry;
 }
 
-const HostImport* importAccess(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
-    if (!runCovers(lease, begin, end)) return nullptr;
-    const auto* entry = importAllocation(context, state, begin, lease, end);
-    return entry != nullptr && findImport(state, begin, end) == entry ? entry : nullptr;
+const HostImport* importAccess(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease, HostImportFailure* failure = nullptr) {
+    if (!runCovers(lease, begin, end)) return rejectImport(failure, HostImportFailureKind::Unregistered);
+    const auto* entry = importAllocation(context, state, begin, lease, end, true, failure);
+    if (entry == nullptr) return nullptr;
+    return findImport(state, begin, end) == entry ? entry : rejectImport(failure, HostImportFailureKind::LostCoverage);
 }
 
 // Whether the imports need reconciling before a lookup: the registry changed since the last walk.
@@ -2266,8 +2291,10 @@ std::uint64_t HostImportLiveBytes() {
     return state.liveBytes;
 }
 
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
-    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, HostImportFailure* failure) {
+    if (failure != nullptr) *failure = {};
+    if (context.hostImportAlignment == 0) return rejectImport(failure, HostImportFailureKind::Disabled);
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return rejectImport(failure, HostImportFailureKind::InvalidAccess);
     ensurePinWaiter();
     auto& state = Imports();
     std::unique_lock lock(state.mutex);
@@ -2276,7 +2303,8 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
         lock.unlock();
         prepareMirrorImport(address, bytes);
         lock.lock();
-        return findImport(state, address, address + bytes);
+        const auto* resolved = findImport(state, address, address + bytes);
+        return resolved != nullptr ? resolved : rejectImport(failure, HostImportFailureKind::LostCoverage);
     };
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
@@ -2284,7 +2312,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    return ready(importAccess(context, state, address, address + bytes, lease));
+    return ready(importAccess(context, state, address, address + bytes, lease, failure));
 }
 
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {

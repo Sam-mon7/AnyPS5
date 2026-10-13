@@ -1922,6 +1922,64 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
     return state->recorder && (state->recorder->PendingWriteOverlaps(address, bytes) || state->recorder->PendingLabelIn(address, bytes));
 }
 
+namespace {
+
+void ReportLabelImportFailure(std::uint64_t address, std::size_t bytes, std::uint32_t queue, const Graphics::HostImportFailure& failure) {
+    using Kind = Graphics::HostImportFailureKind;
+    static constexpr std::array names{"none", "disabled", "invalid", "unregistered", "alignment", "cached-failure", "held-overlap", "unlocked-replacement", "budget", "inaccessible", "read-only", "driver-failure", "lost-coverage"};
+    static_assert(names.size() == static_cast<std::size_t>(Kind::Count));
+    struct Sample {
+        std::uint64_t page = 0, count = 0;
+        std::size_t requested = 0;
+        std::uint32_t queue = 0;
+        Graphics::HostImportFailure last;
+    };
+    struct Counters {
+        std::array<std::uint64_t, names.size()> reasons{};
+        // ponytail: first 16 distinct start-page/queue pairs per interval, not a top-N estimate;
+        // overflow counts events, not unique pages. Increase only if overflow obscures the cause.
+        std::array<Sample, 16> samples{};
+        std::size_t used = 0;
+        std::uint64_t requested = 0, overflow = 0;
+        std::chrono::steady_clock::time_point since{};
+    };
+    static constinit thread_local Counters counters;
+    ++counters.reasons[static_cast<std::size_t>(failure.kind)];
+    counters.requested += bytes;
+    const auto page = address & ~std::uint64_t{4095};
+    std::size_t index = 0;
+    while (index < counters.used && (counters.samples[index].page != page || counters.samples[index].queue != queue)) ++index;
+    if (index == counters.samples.size()) {
+        ++counters.overflow;
+    } else {
+        if (index == counters.used) ++counters.used;
+        auto& sample = counters.samples[index];
+        sample.page = page;
+        ++sample.count;
+        sample.requested = bytes;
+        sample.queue = queue;
+        sample.last = failure;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (counters.since == std::chrono::steady_clock::time_point{}) counters.since = now;
+    if (now - counters.since < std::chrono::seconds(10)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[label-import] worker %p interval %.3f s, requested %llu bytes, sampled %zu distinct 4 KiB start-page/queue pairs, %llu events outside sample; reasons none/disabled/invalid/unregistered/alignment/cached/held/unlocked/budget/inaccessible/read-only/driver/lost: %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu\n",
+        static_cast<void*>(&counters), std::chrono::duration<double>(now - counters.since).count(), static_cast<unsigned long long>(counters.requested), counters.used, static_cast<unsigned long long>(counters.overflow),
+        static_cast<unsigned long long>(counters.reasons[0]), static_cast<unsigned long long>(counters.reasons[1]), static_cast<unsigned long long>(counters.reasons[2]), static_cast<unsigned long long>(counters.reasons[3]), static_cast<unsigned long long>(counters.reasons[4]), static_cast<unsigned long long>(counters.reasons[5]), static_cast<unsigned long long>(counters.reasons[6]), static_cast<unsigned long long>(counters.reasons[7]), static_cast<unsigned long long>(counters.reasons[8]), static_cast<unsigned long long>(counters.reasons[9]), static_cast<unsigned long long>(counters.reasons[10]), static_cast<unsigned long long>(counters.reasons[11]), static_cast<unsigned long long>(counters.reasons[12]));
+    for (std::size_t i = 0; i < counters.used; ++i) {
+        const auto& sample = counters.samples[i];
+        const auto& last = sample.last;
+        AgcDriver::ProfilePrint_nid_no_patch("[label-import] worker %p page 0x%llx queue 0x%x count %llu; last %s requested %zu candidate 0x%llx+0x%llx align 0x%llx registered 0x%llx writable %u gpu %u; budget bytes live %llu cap %llu replaced %llu evictable %llu; driver %s (%d)\n",
+            static_cast<void*>(&counters), static_cast<unsigned long long>(sample.page), sample.queue, static_cast<unsigned long long>(sample.count), names[static_cast<std::size_t>(last.kind)], sample.requested,
+            static_cast<unsigned long long>(last.base), static_cast<unsigned long long>(last.bytes), static_cast<unsigned long long>(last.alignment), static_cast<unsigned long long>(last.registeredBytes), static_cast<unsigned>(last.writable), static_cast<unsigned>(last.gpu),
+            static_cast<unsigned long long>(last.live), static_cast<unsigned long long>(last.budget), static_cast<unsigned long long>(last.replaced), static_cast<unsigned long long>(last.evictable), last.driverStep != nullptr ? last.driverStep : "none", static_cast<int>(last.driverResult));
+    }
+    counters = {};
+    counters.since = now;
+}
+
+}
+
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
     auto& recorder = *state->recorder;
@@ -1936,8 +1994,13 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
-    const auto* import = Graphics::HostImportFor(context, address, bytes.size());
-    if (import == nullptr) return 3;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    Graphics::HostImportFailure failure;
+    const auto* import = Graphics::HostImportFor(context, address, bytes.size(), profile ? &failure : nullptr);
+    if (import == nullptr) {
+        if (profile) ReportLabelImportFailure(address, bytes.size(), queue, failure);
+        return 3;
+    }
     // A unit shadow's results in the label's unit reach the import before the store lands over
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
     // FlushPending of their own.

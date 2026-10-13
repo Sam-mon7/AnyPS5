@@ -118,6 +118,9 @@ void importSpanTests(const Context& context) {
     const auto* alone = HostImportFor(importing, first, piece);
     Require(alone != nullptr && alone->base == first && alone->bytes == piece, "the span outlived the removal of one of its ranges");
     Require(HostImportFor(importing, first + piece, 16) == nullptr, "the removed range is still imported");
+    HostImportFailure failure;
+    Require(HostImportFor(importing, first + piece, 16, &failure) == nullptr && failure.kind == HostImportFailureKind::Unregistered,
+            "an uncovered removed range was not diagnosed as unregistered");
     change(guest, false, false);
     change(guest + 2 * piece, false, false);
     ::operator delete(block, std::align_val_t{piece});
@@ -390,6 +393,37 @@ private:
 
     void* block = nullptr;
 };
+
+// Failure details come from the same admission attempt: diagnosing a rejection must not allocate,
+// and a budget refusal must remain retryable after the cap changes.
+void importFailureDetailTests(const Context& context) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    ClearHostImports(context.device);
+    constexpr auto piece = WindowedRange::piece;
+    WindowedRange range(context, 2 * piece, 2, piece);
+    const auto first = range.First();
+    HostImportFailure failure;
+    auto misaligned = range.importing;
+    misaligned.hostImportAlignment = 8 * piece;
+    Require(HostImportFor(misaligned, first + 16, 32, &failure) == nullptr && failure.kind == HostImportFailureKind::Alignment,
+            "an import whose registered length violates alignment was not diagnosed as alignment");
+    Require(failure.base == first && failure.bytes == range.bytes && failure.alignment == 8 * piece && HostImportLiveBytes() == 0,
+            "alignment diagnostics lost the whole-run candidate or allocated an import");
+    Require(HostImportFor(range.importing, first + 16, 32) == nullptr && HostImportLiveBytes() == 0,
+            "the default import call admitted a window larger than the budget");
+    Require(HostImportFor(range.importing, first + 16, 32, &failure) == nullptr && failure.kind == HostImportFailureKind::Budget,
+            "a window larger than the budget was not diagnosed as budget");
+    Require(failure.base == first && failure.bytes == range.window && failure.registeredBytes == range.bytes &&
+                failure.alignment == piece && !failure.writable && failure.gpu && failure.live == 0 && failure.budget == piece &&
+                failure.replaced == 0 && failure.evictable == 0 && HostImportLiveBytes() == 0,
+            "budget diagnostics did not describe the refused window and unchanged residency");
+    SetHostImportBudget(range.window);
+    const auto* imported = HostImportFor(range.importing, first + 16, 32, &failure);
+    Require(imported != nullptr && failure.kind == HostImportFailureKind::None && imported->base == first && imported->bytes == range.window,
+            "diagnostics retained an old failure or a budget refusal prevented later admission");
+    Require(HostImportFor(range.importing, first + 16, 32) == imported && HostImportLiveBytes() == range.window,
+            "diagnostic and default calls did not reuse the same imported window within budget");
+}
 
 // A registered range larger than the import window, its first window imported by an earlier access: an address-based
 // build (AcquireRegistered) must import the whole range, so a view in its last window binds (Demon's Souls threw
@@ -1686,6 +1720,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     spaceWritableWritesTests(context);
     importWindowTests(context);
     directImportIdentityTests(context);
+    importFailureDetailTests(context);
     importWholeRangeOverWindowTests(context);
     importRefusedWholeRangeTests(context);
     importAddressSpaceRetentionTests(context);

@@ -70,7 +70,22 @@ bool WatchedImportsStampPages();
 // The host import of the registered allocation containing [address, address + bytes), made on demand
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+// Optional failure diagnostics, populated by the same admission attempt; no extra lookup or import.
+enum class HostImportFailureKind : std::uint8_t {
+    None, Disabled, InvalidAccess, Unregistered, Alignment, CachedFailure, HeldOverlap,
+    UnlockedReplacement, Budget, Inaccessible, ReadOnly, DriverFailure, LostCoverage, Count
+};
+struct HostImportFailure {
+    HostImportFailureKind kind = HostImportFailureKind::None;
+    // registeredBytes describes the first registration in a possibly coalesced candidate.
+    std::uint64_t base = 0, bytes = 0, alignment = 0, registeredBytes = 0;
+    bool writable = false, gpu = false;
+    // Budget fields are valid for Budget only; evictable excludes overlaps already counted as replaced.
+    std::uint64_t live = 0, budget = 0, replaced = 0, evictable = 0;
+    const char* driverStep = nullptr;
+    VkResult driverResult = VK_SUCCESS;
+};
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, HostImportFailure* failure = nullptr);
 void SetHostImportWindow(std::uint64_t bytes);
 // Tests: the window of one large registered range (64 MiB) and the import budget (0: the configured one).
 void SetHostImportRangeWindow(std::uint64_t bytes);
