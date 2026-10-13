@@ -8,6 +8,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -33,10 +34,13 @@ THandle newHandle() {
 }
 
 VkFormat lastImageFormat = VK_FORMAT_UNDEFINED;
+VkImage lastImage = VK_NULL_HANDLE;
+std::vector<VkImage> clearedImages;
 
 VKAPI_ATTR VkResult VKAPI_CALL createImage(VkDevice, const VkImageCreateInfo* info, const VkAllocationCallbacks*, VkImage* image) {
     lastImageFormat = info->format;
     *image = newHandle<VkImage>();
+    lastImage = *image;
     return VK_SUCCESS;
 }
 
@@ -94,7 +98,9 @@ VKAPI_ATTR void VKAPI_CALL destroyImageView(VkDevice, VkImageView, const VkAlloc
 VKAPI_ATTR void VKAPI_CALL destroyImage(VkDevice, VkImage, const VkAllocationCallbacks*) {}
 VKAPI_ATTR void VKAPI_CALL freeMemory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
 VKAPI_ATTR void VKAPI_CALL cmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
-VKAPI_ATTR void VKAPI_CALL cmdClearDepthStencilImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearDepthStencilValue*, std::uint32_t, const VkImageSubresourceRange*) {}
+VKAPI_ATTR void VKAPI_CALL cmdClearDepthStencilImage(VkCommandBuffer, VkImage image, VkImageLayout, const VkClearDepthStencilValue*, std::uint32_t, const VkImageSubresourceRange*) {
+    clearedImages.push_back(image);
+}
 
 VKAPI_ATTR void VKAPI_CALL formatProperties(VkPhysicalDevice, VkFormat, VkFormatProperties* properties) {
     *properties = {};
@@ -291,6 +297,43 @@ void RunDepthSurfaceReuseTests() {
         copyRefused = std::string_view(error.what()).find("multisampled depth plane") != std::string_view::npos;
     }
     Require(copyRefused, "a multisampled plane must not use a single-sample depth copy");
+
+    {
+        constexpr std::uint64_t arrayBase = 0x80000000;
+        constexpr std::uint64_t htile = 0x81000000;
+        constexpr VkExtent2D extent{1024, 512};
+        const auto sliceHtile = HtileMetadataBytes(extent);
+        DepthTarget first{arrayBase, 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        first.htileAddress = htile;
+        DepthTarget second{arrayBase + DepthSliceBytes(extent, 4u), 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        second.htileAddress = htile + sliceHtile;
+        DepthSurfaceView(context, first);
+        const auto firstImage = lastImage;
+        DepthSurfaceView(context, second);
+        const auto secondImage = lastImage;
+        const auto clearsAfter = [&](std::uint64_t address, std::size_t bytes) {
+            clearedImages.clear();
+            NoteHtileDepthClear(address, bytes);
+            DepthSurfaceView(context, first);
+            DepthSurfaceView(context, second);
+            return clearedImages;
+        };
+        Require(clearsAfter(htile, sliceHtile - 4u).empty(), "an incomplete HTILE slice must not clear depth");
+        Require(clearsAfter(htile, 0).empty(), "an empty HTILE clear must not clear depth");
+        Require(clearsAfter(htile, sliceHtile) == std::vector<VkImage>{firstImage}, "an HTILE clear of the first slice must clear that slice alone");
+        Require(clearsAfter(htile + sliceHtile, sliceHtile) == std::vector<VkImage>{secondImage}, "an HTILE clear of the second slice must leave the first alone");
+        Require(clearsAfter(htile, 2u * sliceHtile) == std::vector<VkImage>{firstImage, secondImage}, "an HTILE clear over both slices must clear both");
+
+        first.address += 0x1000000;
+        first.htileAddress += 0x1000000;
+        NoteHtileDepthClear(first.htileAddress - sliceHtile, 2u * sliceHtile);
+        clearedImages.clear();
+        DepthSurfaceView(context, first);
+        Require(clearedImages.size() == 1u, "a clear before creating an interior slice must initialize its depth");
+        clearedImages.clear();
+        DepthSurfaceView(context, first);
+        Require(clearedImages.empty(), "a consumed clear before creation must not clear the slice again");
+    }
 
     ClearDepthSurfaces(context.device);
 }

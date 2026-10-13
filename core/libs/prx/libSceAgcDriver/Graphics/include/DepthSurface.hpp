@@ -20,7 +20,7 @@ void ClearDepthSurfaces(VkDevice device);
 bool DepthSurfaceAt(std::uint64_t address);
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource);
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);
-void NoteHtileDepthClear(std::uint64_t htileAddress);
+void NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes);
 bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resource, const Texture* texture);
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern);
 VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile);

@@ -39,6 +39,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice = device;
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
+    const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads);
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
     bool fromAhead = false;
@@ -56,7 +57,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         resolved = ahead.packet;
         packet = resolved;
         indirectArguments = ahead.indirectArguments;
-    } else if (indirectArguments != 0 && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
+    }
+    // Ahead capture can park an unresolved HTILE dispatch. Its clear span needs the
+    // ordered argument read too, after any queued producer labels have been recorded.
+    if (indirectArguments != 0 && ((!fromAhead && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) || (!resolving && htile != 0))) {
 
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
@@ -74,7 +78,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
     } else {
-        if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) Graphics::NoteHtileDepthClear(htile);
+        if (htile != 0 && packet[1] != 0 && packet[2] != 0 && packet[3] != 0) {
+            const auto threads = partialLastGroup ? static_cast<std::uint64_t>(partialGroups[0]) : (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
+            Graphics::NoteHtileDepthClear(htile, static_cast<std::size_t>(threads * 16u));
+        }
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
