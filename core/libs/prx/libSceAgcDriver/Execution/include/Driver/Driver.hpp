@@ -309,7 +309,7 @@ private:
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
     std::list<std::uint64_t> drawOrder;
     std::mutex drawCacheMutex;
-    std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
+    std::uint64_t drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
 
     DrawEntryCounters drawEntryCounters;
 

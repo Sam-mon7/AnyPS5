@@ -128,7 +128,6 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             if (drawHit) {
                 ++counters.hits;
                 if (registerKey) ++counters.registerKeyHits;
-                ++drawCacheHits;
                 bool rotate = false;
                 for (std::size_t i = 0; i < programs.size(); ++i) {
                     if (matched[i] == nullptr) continue;
@@ -149,13 +148,11 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             variants.erase(variants.begin() + static_cast<std::ptrdiff_t>(ranks[i]));
                             variants.insert(variants.begin(), matched[i]);
                         }
-                        rotated->touched = entry->touched;
                         rotated->order = entry->order;
                         again->second = std::move(rotated);
                     }
-                    if (drawCacheHits - again->second->touched > drawCacheEntries() / 8) {
+                    if (again->second->order != drawOrder.begin()) {
                         drawOrder.splice(drawOrder.begin(), drawOrder, again->second->order);
-                        again->second->touched = drawCacheHits;
                         ++counters.touches;
                     }
                 }

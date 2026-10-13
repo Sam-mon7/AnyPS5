@@ -87,7 +87,6 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
             ++counters.variantsEvicted;
         }
     }
-    replacement->touched = drawCacheHits;
     if (found == drawCache.end()) {
         drawOrder.push_front(key);
         replacement->order = drawOrder.begin();

@@ -10,6 +10,7 @@
 #include <exception>
 #include <initializer_list>
 #include <iostream>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,7 +49,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-std::vector<std::uint32_t> DrawTwice() {
+std::vector<std::uint32_t> DrawCommands(std::span<const float> values) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
@@ -81,15 +82,18 @@ std::vector<std::uint32_t> DrawTwice() {
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
-    Append(commands, 0x2d, {3, 2});
-    Append(commands, 0x2d, {3, 2});
+    for (const auto value : values) {
+        Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(value)});
+        Append(commands, 0x2d, {3, 2});
+    }
     return commands;
 }
 
 void SecondDrawHitsTheCache(bool libraries) {
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
-    auto commands = DrawTwice();
+    const std::array values{1.0f, 1.0f};
+    auto commands = DrawCommands(values);
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
@@ -99,6 +103,23 @@ void SecondDrawHitsTheCache(bool libraries) {
     Require(counters.lookups == 2 && counters.absent == 1, mode + ": the two draws made " + std::to_string(counters.lookups) + " draw-cache lookups (" + std::to_string(counters.absent) + " without an entry), expected 2 lookups with 1 absent");
     Require(layout == 0, mode + ": the repeated draw missed the draw cache on its push offset (" + std::to_string(layout) + " layout misses)");
     Require(counters.hits == 1, mode + ": the repeated draw did not reuse the cached draw (" + std::to_string(counters.hits) + " hits)");
+}
+
+void RecentlyHitDrawSurvivesColdInsertions() {
+    const char* capacity = std::getenv("APS5_DRAW_CACHE_ENTRIES");
+    Require(capacity != nullptr && std::string(capacity) == "16", "draw-cache recency test requires APS5_DRAW_CACHE_ENTRIES=16");
+    std::vector<float> values;
+    for (unsigned key = 2; key <= 16; ++key) values.push_back(static_cast<float>(key));
+    values.insert(values.end(), {1.0f, 17.0f, 1.0f, 1.0f, 2.0f});
+    auto commands = DrawCommands(values);
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw-cache recency submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(after.lookups - before.lookups == 20, "draw-cache recency workload did not execute all draws");
+    Require(after.hits - before.hits == 3 && after.absent - before.absent == 17, "a recently hit draw was evicted before a cold entry");
+    Require(after.touches - before.touches == 2, "draw-cache hits did not promote two non-front entries exactly once");
 }
 
 }
@@ -113,8 +134,9 @@ int main() {
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         SecondDrawHitsTheCache(libraries);
+        RecentlyHitDrawSurvivesColdInsertions();
         AgcDriverShutdown_nid_postfix();
-        std::cout << "A repeated draw reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
+        std::cout << "Repeated and recently hit draws reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

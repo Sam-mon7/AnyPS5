@@ -1,5 +1,7 @@
 # libSceAgcDriver technical debt
 
+- [Draw-cache recency](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawLookup.cpp) now moves each successfully validated current entry to the front unless it is already there. The former hit-count threshold ignored cold insertions and could evict a recently reused key; the existing mutex and entry-identity check still guard the list. Capacity, keys, stage validation and the dispatch-cache policy are unchanged. Native reuse tests cover cold insertion pressure with graphics pipeline libraries enabled and disabled; full-game performance remains unmeasured.
+
 - [Optional Aftermath capture](../../../core/libs/prx/libSceAgcDriver/Graphics/src/AftermathCapture.cpp) - Windows x64 only, explicitly built with a local SDK path and enabled by APS5_AFTERMATH plus APS5_AFTERMATH_DIR. Records local basic/resource-tracking dumps without shader debug generation or cache changes. The callback module stays pinned in opted-in processes; failed/incomplete capture and static teardown deliberately retain the SDK/context until exit instead of draining under the loader lock. Three seconds bounds status polling, not undocumented SDK call latency. Precise shader-PC mapping still needs exact SPIR-V and matching nvdbg in a separate diagnostic phase.
 
 ### Unknown function info
