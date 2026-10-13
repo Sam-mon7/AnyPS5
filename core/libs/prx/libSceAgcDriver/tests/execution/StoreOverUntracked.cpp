@@ -58,8 +58,9 @@ std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
 }
 
-std::array<std::uint32_t, 8> TextureDescriptor(const std::uint32_t* texels) {
+std::array<std::uint32_t, 8> TextureDescriptor(const std::uint32_t* texels, const std::uint8_t* keys = nullptr) {
     const auto address = AddressOf(texels);
+    const auto meta = AddressOf(keys) >> 8u;
     return {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((Side - 1u) & 3u) << 30u),
@@ -67,8 +68,8 @@ std::array<std::uint32_t, 8> TextureDescriptor(const std::uint32_t* texels) {
         0xfacu | (TileR64KBX << 20u) | (Type2D << 28u),
         0u,
         0u,
-        0u,
-        0u,
+        keys == nullptr ? 0u : (1u << 20u) | (1u << 21u) | (static_cast<std::uint32_t>(meta & 0xffu) << 24u),
+        static_cast<std::uint32_t>(meta >> 8u),
     };
 }
 
@@ -92,9 +93,9 @@ void Dispatch(std::span<const std::uint32_t> code, std::uint32_t threads, std::u
     AgcDriver::Submit(&packet, 0);
 }
 
-void Store(const std::uint32_t* texels) {
+void Store(const std::uint32_t* texels, const std::uint8_t* keys = nullptr) {
     std::array<std::uint32_t, 16> userData{};
-    const auto texture = TextureDescriptor(texels);
+    const auto texture = TextureDescriptor(texels, keys);
     std::copy(texture.begin(), texture.end(), userData.begin() + 8);
     Dispatch(StoreCode, Side, (static_cast<std::uint32_t>(userData.size()) << 1u) | 0x80u, userData, Side);
 }
@@ -242,7 +243,7 @@ void Settle(THold& hold, const Surface& surface, std::uint32_t result) {
     hold.unlock();
 }
 
-enum class Kind { ReadAfter, ReadBefore, Discard, Filled, Copied, PartialWatchSaved, LeftWatch, PartialLeftWatch, ShadowGap };
+enum class Kind { ReadAfter, ReadBefore, Discard, Filled, Copied, PartialWatchSaved, LeftWatch, PartialLeftWatch, ShadowGap, SingleReadBefore };
 
 struct Case {
     const char* name;
@@ -260,7 +261,13 @@ Outcome Run(const Case& test, std::vector<std::unique_ptr<Surface>>& surfaces) {
     }
     Surface* source = nullptr;
     if (test.kind == Kind::Copied) source = surfaces.emplace_back(std::make_unique<Surface>()).get();
+    Surface* singleKeys = nullptr;
+    if (test.kind == Kind::SingleReadBefore) singleKeys = surfaces.emplace_back(std::make_unique<Surface>()).get();
     auto& surface = *surfaces.emplace_back(std::make_unique<Surface>(watched));
+    if (singleKeys != nullptr) {
+        std::fill_n(singleKeys->Bytes(), SurfaceBytes / 256, 0x10);
+        for (std::size_t word = 0; word < SurfaceBytes / 4; ++word) surface.Texels()[word] = 0x01000000u + static_cast<std::uint32_t>(word);
+    }
     // Main retains every allocation through driver shutdown, including failed attempts. The hold
     // below ends first; cleanup drops any deliberately refused results without freeing GPU inputs.
     struct Discard {
@@ -286,7 +293,7 @@ Outcome Run(const Case& test, std::vector<std::unique_ptr<Surface>>& surfaces) {
         Settle(hold, *source, Filled);
         ExpectBlock(*source, 3, Filled);
     }
-    Store(surface.Texels());
+    Store(surface.Texels(), singleKeys == nullptr ? nullptr : singleKeys->Bytes());
     if (test.kind == Kind::Filled || test.kind == Kind::PartialWatchSaved) {
         Settle(hold, surface, Stored);
         hold.lock();
@@ -355,10 +362,16 @@ Outcome Run(const Case& test, std::vector<std::unique_ptr<Surface>>& surfaces) {
         AgcDriver::GuestMemory::Unwatch(address, test.kind == Kind::PartialLeftWatch ? Block : SurfaceBytes);
         if (test.kind == Kind::PartialLeftWatch) Require(AgcDriver::GuestMemory::Watched(address + Block, 3 * Block), "store over untracked: unwatching one unit also excluded its neighbors");
     }
+    if (singleKeys != nullptr) {
+        const auto image = StorageTexture::FindPending(address, SurfaceBytes);
+        Require(image != nullptr && image->UploadedKeys() == AgcDriver::Graphics::DccKeys::Uncompressed && image->GuestSnapshotValid(), "single-key store: the first write did not retain its raw guest baseline under uncompressed keys");
+        for (std::size_t offset = 0; offset < Page; ++offset) static_cast<volatile std::uint8_t*>(bytes)[offset] = Pattern(offset);
+    }
     std::array<std::byte, Page> read{};
-    if (test.kind == Kind::ReadBefore) {
+    if (test.kind == Kind::ReadBefore || test.kind == Kind::SingleReadBefore) {
         AgcDriver::GuestMemory::Read(address + Block + Page, read);
         ExpectBlock(surface, 1, Stored);
+        if (singleKeys != nullptr) Require(LostBytes(bytes) == 0, "single-key store: a partial store overwrote the CPU-edited neighboring unit");
         Require(!Pending(surface, Block, Block) && Pending(surface, 2 * Block, Block), "store over untracked: a partial store did not leave its neighbor pending");
     }
     if (test.kind == Kind::Discard) {
@@ -428,9 +441,10 @@ int main(int argc, char** argv) {
         struct ShutdownGuard {
             ~ShutdownGuard() { try { AgcDriverShutdown_nid_postfix(); } catch (...) {} }
         } shutdown;
-        constexpr std::array<Case, 9> cases{{
+        constexpr std::array<Case, 10> cases{{
             {"read-after", Kind::ReadAfter, Block + Page},
             {"read-before", Kind::ReadBefore, 0xe000},
+            {"single-read-before", Kind::SingleReadBefore, 0xe000},
             {"discard", Kind::Discard, 0xe000},
             {"fill", Kind::Filled, 0xe000},
             {"copy", Kind::Copied, 0xe000},

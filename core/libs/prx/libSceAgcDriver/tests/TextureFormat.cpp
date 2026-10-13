@@ -3,12 +3,15 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -96,6 +99,49 @@ void convertedDccClearTests() {
     Require(read(20, 0x40) == DccKeys::Clear0001 && read(20, 0x80) == DccKeys::Clear1110, "format 20 must keep its 0001 and 1110 DCC clear codes");
 }
 
+void singleDccKeysTests() {
+    alignas(256) std::array<std::uint32_t, 256> texels{};
+    for (std::size_t index = 0; index < texels.size(); ++index) texels[index] = 0x01000000u + static_cast<std::uint32_t>(index);
+    alignas(64) std::array<std::uint8_t, sizeof(texels) / 256> keys{};
+    keys.fill(0x10);
+    GuestTextureResource resource{};
+    resource.baseAddress = reinterpret_cast<std::uint64_t>(texels.data());
+    resource.dccAddress = reinterpret_cast<std::uint64_t>(keys.data());
+    const auto read = [&](std::uint32_t format) {
+        resource.format = format;
+        return TextureClearKeys(resource, sizeof(texels));
+    };
+    const auto originalTexels = texels;
+    const auto originalKeys = keys;
+    const auto* original = reinterpret_cast<const std::byte*>(originalTexels.data());
+    for (const std::uint32_t format : {1u, 56u, 62u, 71u, 77u}) {
+        Require(read(format) == DccKeys::ClearSingle, "comp-to-single keys of format " + std::to_string(format) + " must read as single");
+        const auto elementBytes = BytesPerElement(format);
+        std::vector<std::byte> surface(sizeof(texels));
+        ReadTextureSurface(resource, DccKeys::ClearSingle, surface);
+        bool expanded = true;
+        for (std::size_t offset = 0; offset < surface.size(); ++offset) expanded = expanded && surface[offset] == original[offset / 256 * 256 + offset % elementBytes];
+        Require(expanded, "a read of format " + std::to_string(format) + " under comp-to-single keys must give every 256-byte block its first element");
+    }
+    Require(texels == originalTexels && keys == originalKeys, "reading comp-to-single keys must not change guest texels or metadata");
+    const auto stored = [&](std::uint32_t format, const char* reason) {
+        const auto heldKeys = keys;
+        const auto decoded = read(format);
+        Require(decoded == DccKeys::Uncompressed, reason);
+        std::vector<std::byte> surface(sizeof(texels));
+        ReadTextureSurface(resource, decoded, surface);
+        Require(std::equal(surface.begin(), surface.end(), original), "stored-key fallback must preserve distinct non-first texels");
+        Require(texels == originalTexels && keys == heldKeys, "stored-key fallback must not change guest texels or metadata");
+    };
+    stored(74, "comp-to-single keys of a 12-byte format must preserve stored bytes");
+    keys[1] = 0xff;
+    stored(56, "comp-to-single keys mixed with uncompressed ones must read as stored");
+    keys.fill(0x5a);
+    stored(56, "unknown DCC keys must read as stored");
+    keys.fill(0xff);
+    stored(56, "uncompressed DCC keys must read as stored");
+}
+
 }
 
 void RunTextureFormatTests() {
@@ -145,4 +191,5 @@ void RunTextureFormatTests() {
     for (const std::uint32_t format : {128u, 129u, 130u, 170u, 172u, 174u, 182u}) Require(IsSrgbTextureFormat(format), "guest format " + std::to_string(format) + " must be an sRGB texture format");
     for (const std::uint32_t format : {1u, 14u, 56u, 71u, 169u, 171u, 173u, 181u}) Require(!IsSrgbTextureFormat(format), "guest format " + std::to_string(format) + " must not be an sRGB texture format");
     convertedDccClearTests();
+    singleDccKeysTests();
 }

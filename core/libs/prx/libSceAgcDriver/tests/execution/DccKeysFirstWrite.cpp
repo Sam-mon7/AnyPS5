@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -26,12 +27,23 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#ifndef _WIN32
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
+#endif
 
 namespace {
 
@@ -66,6 +78,13 @@ alignas(256) constexpr std::array<std::uint32_t, 7> CopyKeysCode{
 alignas(256) constexpr std::array<std::uint32_t, 6> ClearKeysCode{
     0x34020083, 0x7e040280, 0x7e060280, 0xe0741000, 0x80000201, 0xbf810000,
 };
+
+alignas(256) constexpr std::array<std::uint32_t, 11> SampleSecondTexelCode{
+    0x34060084, 0x7e2802ff, 0x3c400000, 0x7e2a02ff, 0x3b800000, 0xf09c0f08, 0x00610a14, 0xbf8c3f70,
+    0xe0781000, 0x80000a03, 0xbf810000,
+};
+
+constexpr std::array<std::uint32_t, 4> PointSampler{0x00000092u, 0x00fff000u, 0u, 0u};
 
 std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
@@ -396,7 +415,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
         const std::array<std::uint32_t, 4> pattern{word, word, word, word};
         return device.FillBuffer(AddressOf(keys + offset), bytes, pattern);
     };
-    if (!fill(0, KeyBytes, 0x10)) {
+    if (!fill(0, KeyBytes, 0x5a)) {
         std::puts("the key range has no host import: pending key fills are not tested");
         return;
     }
@@ -404,7 +423,9 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
         std::puts("host imports are compared, not watched: the write-watched block runs as unwatched");
         watched = false;
     }
-    readPending(DccKeys::Uncompressed, false, "a pending fill of the keys with 0x10, which is no clear code");
+    readPending(DccKeys::Uncompressed, false, "a pending fill of the keys with 0x5a, which is no clear code");
+    Require(fill(0, KeyBytes, 0x10), "the comp-to-single fill of the keys was not recorded");
+    readPending(DccKeys::ClearSingle, true, "a pending comp-to-single fill of the keys");
     Require(fill(0, KeyBytes / 2, 0x00) && fill(KeyBytes / 2, KeyBytes / 2, 0x00), "the 0000 fills of the key halves were not recorded");
     readPending(DccKeys::Clear0000, true, "pending 0000 fills over both halves of the keys");
     Require(fill(0, KeyBytes / 2, 0x40), "the 0001 fill of the first key half was not recorded");
@@ -454,6 +475,118 @@ void RunReusedKeys(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     device.WaitIdle();
     RequireKeys(keys, 0x5a, "the key bytes the title reused after the first write, after the image's write-back");
     Require(Count(texels, SurfaceBytes, 0xff) == Threads * 4u, "reused keys: the write-back lost the image's results");
+}
+
+void RunSingleKeys(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    auto* texels = block;
+    auto* keys = block + KeysOffset;
+    const auto surface = AddressOf(texels);
+    std::vector<std::uint32_t> original(SurfaceBytes / 4);
+    for (std::size_t index = 0; index < original.size(); ++index) original[index] = 0x01000000u + static_cast<std::uint32_t>(index);
+    std::memcpy(texels, original.data(), SurfaceBytes);
+    std::memset(keys, 0x10, KeyBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto texture = TextureDescriptor(texels, keys);
+    std::vector<std::uint32_t> writeData(16, 0u);
+    std::copy(texture.begin(), texture.end(), writeData.begin() + 4);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Dispatch(device, WriteCode, writeData);
+    const auto image = StorageTexture::FindPending(surface, SurfaceBytes);
+    Require(image != nullptr && image->UploadedKeys() == DccKeys::Uncompressed, "comp-to-single keys: the first write did not store the keys uncompressed");
+    RequireKeys(keys, 0xff, "comp-to-single keys: the keys after the first write");
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test comp-to-single keys");
+    device.WaitIdle();
+    const AgcDriver::Graphics::ColorTargetLayout layout(Side, Side, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4);
+    std::size_t wrong = 0;
+    for (std::uint32_t y = 0; y < Side; ++y) {
+        for (std::uint32_t x = 0; x < Side; ++x) {
+            const auto offset = layout.Offset(x, y);
+            std::uint32_t texel = 0;
+            std::memcpy(&texel, texels + offset, 4);
+            const auto expected = y == 0 && x < Threads ? 0xffffffffu : original[offset / 256 * 64];
+            if (texel != expected) ++wrong;
+        }
+    }
+    char message[256];
+    std::snprintf(message, sizeof(message), "comp-to-single keys: %zu of %u written-back texels are neither the kernel's write nor the first texel of their 256-byte block", wrong, Side * Side);
+    Require(wrong == 0, message);
+}
+
+void RunSingleKeysSampled(AgcDriver::VulkanDevice& device, std::uint8_t* block, std::uint8_t* outputBlock, const char* memory) {
+    auto* texels = block;
+    auto* keys = block + KeysOffset;
+    auto* output = reinterpret_cast<std::uint32_t*>(outputBlock);
+    const bool watched = AgcDriver::GuestMemory::Watched(AddressOf(texels), SurfaceBytes);
+    const AgcDriver::Graphics::ColorTargetLayout layout(Side, Side, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4);
+    const auto first = layout.Offset(1, 0) / 256 * 256;
+    std::memset(texels, 0x00, SurfaceBytes);
+    std::memset(texels + first, 0xff, 4);
+    std::memset(keys, 0x10, KeyBytes);
+    const auto texture = TextureDescriptor(texels, keys);
+    const auto results = BufferDescriptor(output, Threads * 16u);
+    std::vector<std::uint32_t> userData(24, 0u);
+    std::copy(results.begin(), results.end(), userData.begin());
+    std::copy(texture.begin(), texture.end(), userData.begin() + 4);
+    std::copy(PointSampler.begin(), PointSampler.end(), userData.begin() + 12);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto sample = [&](std::uint32_t expected, const char* when) {
+        std::fill(output, output + Threads * 4u, 0xdeadbeefu);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Dispatch(device, SampleSecondTexelCode, userData);
+        for (std::uint32_t index = 0; index < Threads * 4u; ++index) {
+            char message[256];
+            std::snprintf(message, sizeof(message), "comp-to-single keys sampled %s from %s memory: component %u of thread %u is 0x%08x, expected 0x%08x", when, memory, index % 4u, index / 4u, output[index], expected);
+            Require(output[index] == expected, message);
+        }
+    };
+    sample(0x3f800000u, "before the first texel of the block changed");
+    Require(!watched || AgcDriver::GuestMemory::Watched(AddressOf(texels), SurfaceBytes), "comp-to-single keys sampled from write-watched memory: the first sampling left the surface unwatched");
+    std::memset(texels + first, 0x00, 4);
+    sample(0u, "after the first texel of the block changed");
+}
+
+void RunSingleKeysOverPendingImage(AgcDriver::VulkanDevice& device, std::uint8_t* block, std::uint8_t* outputBlock) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+#ifndef _WIN32
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
+    AgcDriver::Graphics::SetImportWatch(context, AgcDriver::Graphics::ImportWatch::Watch);
+    struct Restore {
+        const AgcDriver::Graphics::Context& context;
+        AgcDriver::Graphics::ImportWatch decided;
+        ~Restore() { AgcDriver::Graphics::SetImportWatch(context, decided); }
+    } restore{context, decided};
+#endif
+    auto* texels = block;
+    auto* keys = block + KeysOffset;
+    auto* output = reinterpret_cast<std::uint32_t*>(outputBlock);
+    const auto surface = AddressOf(texels);
+    const AgcDriver::Graphics::ColorTargetLayout layout(Side, Side, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4);
+    std::memset(texels, 0x00, SurfaceBytes);
+    std::memset(texels + layout.Offset(1, 0) / 256 * 256, 0xff, 4);
+    std::memset(keys, 0xff, KeyBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto texture = TextureDescriptor(texels, keys);
+    std::vector<std::uint32_t> writeData(16, 0u);
+    std::copy(texture.begin(), texture.end(), writeData.begin() + 4);
+    const auto results = BufferDescriptor(output, Threads * 16u);
+    std::vector<std::uint32_t> sampleData(24, 0u);
+    std::copy(results.begin(), results.end(), sampleData.begin());
+    std::copy(texture.begin(), texture.end(), sampleData.begin() + 4);
+    std::copy(PointSampler.begin(), PointSampler.end(), sampleData.begin() + 12);
+    Dispatch(device, WriteRowCode, writeData);
+    const auto image = StorageTexture::FindPending(surface, SurfaceBytes);
+    Require(image != nullptr && image->UploadedKeys() == DccKeys::Uncompressed, "comp-to-single keys over a pending storage image: the row write left no image pending under uncompressed keys");
+    Require(AgcDriver::GuestMemory::Watched(surface, SurfaceBytes), "comp-to-single keys over a pending storage image: the image's host import left the surface unwatched");
+    std::memset(keys, 0x10, KeyBytes);
+    std::fill(output, output + Threads * 4u, 0xdeadbeefu);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Dispatch(device, SampleSecondTexelCode, sampleData);
+    for (std::uint32_t index = 0; index < Threads * 4u; ++index) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "comp-to-single keys stored over a pending storage image: component %u of thread %u is 0x%08x, expected 0x3f800000", index % 4u, index / 4u, output[index]);
+        Require(output[index] == 0x3f800000u, message);
+    }
 }
 
 void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
@@ -588,7 +721,17 @@ int main(int argc, char** argv) {
         std::optional<GuestBlock> untracked;
         std::optional<GuestBlock> shared;
         std::optional<GuestBlock> window;
-        const auto device = OpenVulkanTestDevice();
+        std::optional<GuestBlock> single;
+        std::optional<GuestBlock> sampled;
+        std::optional<GuestBlock> sampledOutput;
+        std::optional<GuestBlock> sampledWatched;
+        std::optional<GuestBlock> pendingSingle;
+        std::optional<GuestBlock> reused;
+        const auto destroyDevice = [](AgcDriver::VulkanDevice* value) {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            delete value;
+        };
+        const std::unique_ptr<AgcDriver::VulkanDevice, decltype(destroyDevice)> device(OpenVulkanTestDevice().release(), destroyDevice);
         if (!device) return VulkanTestSkipped;
         block.emplace(false);
         if (argc == 2 && std::string_view(argv[1]) == "--refresh-memo-only") {
@@ -602,9 +745,13 @@ int main(int argc, char** argv) {
         Run(*device, block->Data());
         untracked.emplace(false);
         RunUntrackedReuse(*device, untracked->Data());
-        std::optional<GuestBlock> reused;
         reused.emplace(false);
         RunReusedKeys(*device, reused->Data());
+        single.emplace(false);
+        RunSingleKeys(*device, single->Data());
+        sampled.emplace(false);
+        sampledOutput.emplace(false);
+        RunSingleKeysSampled(*device, sampled->Data(), sampledOutput->Data(), "unwatched");
 #ifdef _WIN32
         shared.emplace(true, true);
         RunSharedImport(*device, shared->Data());
@@ -613,6 +760,14 @@ int main(int argc, char** argv) {
         if (AgcDriver::GuestMemory::WriteWatched()) {
             watched.emplace(true);
             Run(*device, watched->Data());
+            sampledWatched.emplace(true);
+            RunSingleKeysSampled(*device, sampledWatched->Data(), sampledOutput->Data(), "write-watched");
+#ifdef _WIN32
+            pendingSingle.emplace(true, true);
+#else
+            pendingSingle.emplace(true);
+#endif
+            RunSingleKeysOverPendingImage(*device, pendingSingle->Data(), sampledOutput->Data());
 #ifndef _WIN32
             window.emplace(true);
             RunImportWindow(*device, window->Data());

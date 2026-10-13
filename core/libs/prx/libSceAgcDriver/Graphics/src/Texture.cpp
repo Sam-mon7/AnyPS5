@@ -1774,7 +1774,7 @@ bool StorageTexture::Refresh() {
     // drop rule. Debug aid: APS5_KEYFLIP_DROP=1 drops as before.
     static const bool keyFlipDrop = std::getenv("APS5_KEYFLIP_DROP") != nullptr;
     static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
-    const bool keyFlip = keysChanged && blockUnits && !keyFlipDrop && IsDccClear(uploadedKeys) && keys == DccKeys::Uncompressed && stampedBlocks.size() >= trackedLayers;
+    const bool keyFlip = keysChanged && blockUnits && !keyFlipDrop && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && keys == DccKeys::Uncompressed && stampedBlocks.size() >= trackedLayers;
     if (traceKeys && keysChanged) {
         std::size_t pendingUnits = 0, stampedUnits = 0;
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
@@ -1807,7 +1807,7 @@ bool StorageTexture::Refresh() {
         stored[layer] = true;
         anyStored = true;
     }
-    if (anyStored && !keysChanged && descriptor.dccAddress != 0 && IsDccClear(uploadedKeys)) stored.assign(trackedLayers, true);
+    if (anyStored && !keysChanged && descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle)) stored.assign(trackedLayers, true);
     if (pendingResults) {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx: guest memory changed while GPU results were pending; keeping the CPU's blocks\n", static_cast<unsigned long long>(descriptor.baseAddress));
@@ -2842,7 +2842,7 @@ bool StorageTexture::keysFillMatches(std::uint64_t address, std::size_t bytes, b
 }
 
 void StorageTexture::MarkDirty() {
-    if (descriptor.dccAddress != 0 && IsDccClear(uploadedKeys) && !IsDccClear(filledKeys)) {
+    if (descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
         MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
         uploadedKeys = DccKeys::Uncompressed;
