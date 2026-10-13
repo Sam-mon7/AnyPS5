@@ -3930,14 +3930,14 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
         const bool fixedMirror = region.mirror != nullptr && !region.mirror->writable && !region.mirror->heap;
         const bool staged = region.gpuCopy && region.deviceLocal;
         if (region.direct == nullptr && !fixedMirror && !staged) return std::nullopt;
-        if (staged) {
-            // A later use copies from `copySource` again, so it must still be the import serving
-            // the range (the flush before the copy-in can retire and remake imports): the serial
-            // the caller records names the current import, and its buffer must be that one.
+        if (staged || region.direct != nullptr) {
+            // The caller records the current import's serial, so the selected direct buffer or
+            // staged copy source must still belong to that import when reuse is nominated.
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
             const auto* entry = state.device == context.device ? findImport(state, region.begin, region.end) : nullptr;
-            if (entry == nullptr || entry->buffer != region.copySource) return std::nullopt;
+            if (region.direct != nullptr && entry != region.direct) return std::nullopt;
+            if (staged && (entry == nullptr || entry->buffer != region.copySource)) return std::nullopt;
         }
         result.emplace_back(region.begin, region.end);
     }

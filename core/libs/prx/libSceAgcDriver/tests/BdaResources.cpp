@@ -293,6 +293,65 @@ void importWindowTests(const Context& context) {
     ::operator delete(block, std::align_val_t{window});
 }
 
+void directImportIdentityTests(const Context& context) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    constexpr std::size_t half = 4u << 20u;
+    auto importing = context;
+    importing.hostImportAlignment = 65536;
+    ClearHostImports(importing.device);
+    struct Release {
+        Context importing;
+        std::byte* block;
+        Recorder* previous;
+        std::size_t half;
+        bool first = false;
+        bool second = false;
+        ~Release() {
+            ClearHostImports(importing.device);
+            {
+                GuestAllocations::Mutation mutation;
+                if (second) mutation.Remove(block + half);
+                if (first) mutation.Remove(block);
+            }
+            SetHostImportWindow(0);
+            ::operator delete(block, std::align_val_t{2 * half});
+            if (previous != nullptr) previous->Activate();
+        }
+    } release{importing, static_cast<std::byte*>(::operator new(2 * half, std::align_val_t{2 * half})), Recorder::Active(), half};
+    std::memset(release.block, 0x33, 2 * half);
+    SetHostImportWindow(2 * half);
+    GuestAllocations::Mutation().Add(release.block, half, true, true, true);
+    release.first = true;
+    Recorder recorder(importing);
+    recorder.Activate();
+    const auto base = reinterpret_cast<std::uintptr_t>(release.block);
+    constexpr std::size_t bytes = 1024;
+    const auto address = base + 4096;
+    GuestBufferMemory selected(importing);
+    selected.AddReadable(address, bytes);
+    selected.Upload(false);
+    std::uint32_t adjustment = 0;
+    const auto descriptor = selected.Descriptor(address, bytes, adjustment);
+    const auto* original = HostImportFor(importing, address, bytes);
+    Require(original != nullptr && original->base == base && original->bytes == half && original->buffer == descriptor.buffer, "the identity fixture did not bind the first whole registered range directly");
+    const auto originalSerial = HostImportSerial(importing, address, bytes, false);
+    Require(originalSerial != 0 && selected.DirectRegions().has_value(), "an unchanged direct import was refused for reuse");
+
+    GuestAllocations::Mutation().Add(release.block + half, half, true, true, true);
+    release.second = true;
+    const auto* replacement = HostImportFor(importing, base + half, bytes);
+    Require(replacement != nullptr && replacement->base == base && replacement->bytes == 2 * half && replacement->buffer != descriptor.buffer, "adjacent registration did not reconcile the selected import into a replacement spanning both halves");
+    const auto currentSerial = HostImportSerial(importing, address, bytes, false);
+    Require(currentSerial != 0 && currentSerial != originalSerial, "the replacement kept the selected import's serial");
+    Require(original->buffer == descriptor.buffer && selected.Descriptor(address, bytes, adjustment).buffer == descriptor.buffer, "reconciliation changed the descriptor already selected in this GPU hold");
+    Require(!selected.DirectRegions().has_value(), "a retired direct import was admitted for reuse under the replacement's serial");
+
+    GuestBufferMemory fresh(importing);
+    fresh.AddReadable(address, bytes);
+    fresh.Upload(false);
+    Require(fresh.Descriptor(address, bytes, adjustment).buffer == replacement->buffer && fresh.DirectRegions().has_value(), "a fresh direct binding to the replacement was refused for reuse");
+}
+
 // One registered range of `cells` import windows of `window` bytes, with the window and the import budget set for the
 // test and reset after it.
 class WindowedRange {
@@ -1626,6 +1685,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     failedImportRemapTests(context, access);
     spaceWritableWritesTests(context);
     importWindowTests(context);
+    directImportIdentityTests(context);
     importWholeRangeOverWindowTests(context);
     importRefusedWholeRangeTests(context);
     importAddressSpaceRetentionTests(context);
