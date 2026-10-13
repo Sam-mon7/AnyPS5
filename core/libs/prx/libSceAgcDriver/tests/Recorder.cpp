@@ -2198,6 +2198,245 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+void readonlyFallbackReuseTests(const Device& device, Recorder& recorder, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 262144;
+    Require(context.hostImportAlignment != 0, "readonly fallback fixture requires host import support");
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "readonly fallback fixture requires tracked memory");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    Require(HostImportFor(context, address, bytes) == nullptr, "fixture must use the actual unregistered copy fallback");
+    std::memset(block, 0x11, bytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto read = [&] {
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddReadable(address, bytes);
+        memory->Upload(false);
+        return memory;
+    };
+    const auto descriptor = [&](const std::shared_ptr<GuestBufferMemory>& memory) {
+        std::uint32_t adjustment = 0;
+        const auto result = memory->Descriptor(address, bytes, adjustment);
+        Require(adjustment == 0 && result.offset == 0 && result.range == bytes, "fallback copy lost descriptor extent or alignment");
+        return result;
+    };
+    const auto first = read();
+    const auto firstView = descriptor(first);
+    Require(descriptor(read()).buffer == firstView.buffer, "unchanged readonly fallback was copied again");
+
+    auto oldOutput = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, firstView.buffer, 0, oldOutput->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(first);
+    recorder.Keep(oldOutput);
+
+    std::memset(block, 0x22, bytes);
+    const auto afterCpu = read();
+    const auto cpuView = descriptor(afterCpu);
+    Require(cpuView.buffer != firstView.buffer, "CPU overwrite mutated a copy still held by a queued reader");
+    Require(descriptor(read()).buffer == cpuView.buffer, "new readonly fallback copy was not retained");
+    auto cpuOutput = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, cpuView.buffer, 0, cpuOutput->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(afterCpu);
+    recorder.Keep(cpuOutput);
+    recorder.Sync();
+    Require(std::all_of(oldOutput->Bytes().begin(), oldOutput->Bytes().end(), [](std::byte value) { return value == std::byte{0x11}; }),
+            "queued GPU reader lost its original bytes after CPU overwrite");
+    Require(std::all_of(cpuOutput->Bytes().begin(), cpuOutput->Bytes().end(), [](std::byte value) { return value == std::byte{0x22}; }),
+            "new GPU reader did not receive the CPU overwrite");
+
+    auto written = std::make_shared<GuestBufferMemory>(context);
+    written->AddWritable(address, bytes);
+    written->Upload(false);
+    Require(descriptor(written).buffer != cpuView.buffer, "writable fallback bound an immutable reader's cached buffer");
+
+    auto gpuResult = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    commands = recorder.Commands();
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, gpuResult->Handle(), 0, bytes, 0x33333333u);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(gpuResult);
+    recorder.OnComplete([gpuResult, address] { AgcDriver::GuestMemory::Write(address, gpuResult->Bytes()); });
+    recorder.NotePendingWrite(address, bytes);
+    const auto afterGpu = read();
+    Require(descriptor(afterGpu).buffer != cpuView.buffer, "fallback cache reused bytes before a pending GPU result was published");
+    Require(std::all_of(static_cast<std::byte*>(block), static_cast<std::byte*>(block) + bytes,
+                        [](std::byte value) { return value == std::byte{0x33}; }), "pending GPU producer did not publish its bytes");
+    Require(descriptor(read()).buffer == descriptor(afterGpu).buffer, "published GPU result was not retained for a second reader");
+    auto gpuOutput = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, descriptor(afterGpu).buffer, 0, gpuOutput->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(afterGpu);
+    recorder.Keep(gpuOutput);
+    recorder.Sync();
+    Require(std::all_of(gpuOutput->Bytes().begin(), gpuOutput->Bytes().end(), [](std::byte value) { return value == std::byte{0x33}; }),
+            "new GPU reader did not receive the published GPU result");
+
+    std::vector<std::byte> plain(4096, std::byte{0x44});
+    const auto plainAddress = reinterpret_cast<std::uint64_t>(plain.data());
+    Require(AgcDriver::GuestMemory::CollectWritesUncached(plainAddress, plain.size()) == 0,
+            "untracked fixture unexpectedly has a generation");
+    GuestBufferMemory untrackedFirst(context), untrackedSecond(context);
+    untrackedFirst.AddReadable(plainAddress, plain.size());
+    untrackedSecond.AddReadable(plainAddress, plain.size());
+    untrackedFirst.Upload(false);
+    untrackedSecond.Upload(false);
+    std::uint32_t firstAdjustment = 0, secondAdjustment = 0;
+    Require(untrackedFirst.Descriptor(plainAddress, plain.size(), firstAdjustment).buffer !=
+            untrackedSecond.Descriptor(plainAddress, plain.size(), secondAdjustment).buffer,
+            "untracked generation-zero bytes were cached");
+    auto prepareContext = context;
+    prepareContext.hostImportAlignment = 0;
+    gpu.unlock();
+    std::shared_ptr<GuestBufferMemory> unlockedFirst, unlockedSecond;
+    try {
+        unlockedFirst = std::make_shared<GuestBufferMemory>(prepareContext);
+        unlockedSecond = std::make_shared<GuestBufferMemory>(prepareContext);
+        unlockedFirst->AddReadable(address, bytes);
+        unlockedSecond->AddReadable(address, bytes);
+        unlockedFirst->UploadPrepare(false);
+        unlockedSecond->UploadPrepare(false);
+    } catch (...) {
+        gpu.lock();
+        throw;
+    }
+    gpu.lock();
+    unlockedFirst->UploadFinish(false);
+    unlockedSecond->UploadFinish(false);
+    Require(descriptor(unlockedFirst).buffer != descriptor(unlockedSecond).buffer &&
+            descriptor(unlockedFirst).buffer != descriptor(afterGpu).buffer,
+            "unlocked upload reused a recorder's cached buffer");
+
+    const auto cached = recorder.ReusableDrawSnapshot(address, bytes);
+    Require(cached != nullptr, "fallback copy was not retained for eviction test");
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto generation = AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+    for (std::size_t size = 1; size <= Recorder::DrawSnapshotEntries; ++size) {
+        recorder.KeepDrawSnapshot(address, size, generation, registry, cached);
+    }
+    Require(recorder.ReusableDrawSnapshot(address, bytes) == nullptr, "fallback copy survived entry-budget eviction");
+    auto evictedOutput = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, descriptor(afterGpu).buffer, 0, evictedOutput->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(afterGpu);
+    recorder.Keep(evictedOutput);
+    recorder.Sync();
+    Require(std::all_of(evictedOutput->Bytes().begin(), evictedOutput->Bytes().end(),
+                        [](std::byte value) { return value == std::byte{0x33}; }),
+            "eviction invalidated a live GPU consumer's copy");
+
+#ifdef _WIN32
+    const auto beforeReset = read();
+    const auto beforeResetView = descriptor(beforeReset);
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, bytes);
+    std::memset(block, 0x55, bytes);
+    const auto afterReset = read();
+    Require(descriptor(afterReset).buffer != beforeResetView.buffer,
+            "private recommit reused bytes from the previous mapping at the same address");
+    Require(std::all_of(cached->Bytes().begin(), cached->Bytes().end(),
+                        [](std::byte value) { return value == std::byte{0x33}; }),
+            "private recommit overwrote an earlier consumer's immutable bytes");
+
+    struct Section {
+        HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+        ~Section() { if (handle != nullptr) CloseHandle(handle); }
+    } firstSection, secondSection;
+    Require(firstSection.handle != nullptr && secondSection.handle != nullptr, "cannot allocate mapped fallback sections");
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaMap_nid_postfix(block, bytes, firstSection.handle, 0, PAGE_READWRITE);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, bytes);
+    MEMORY_BASIC_INFORMATION mapping{};
+    Require(VirtualQuery(block, &mapping, sizeof mapping) == sizeof mapping && mapping.Type == MEM_MAPPED,
+            "mapped fallback fixture is not backed by a shared section");
+    std::memset(block, 0x77, bytes);
+    const auto mappedFirst = read();
+    const auto mappedFirstView = descriptor(mappedFirst);
+    Require(descriptor(read()).buffer == mappedFirstView.buffer, "unchanged mapped fallback was copied again");
+    auto mappedOldOutput = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, mappedFirstView.buffer, 0, mappedOldOutput->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(mappedFirst);
+    recorder.Keep(mappedOldOutput);
+    std::memset(block, 0x88, bytes);
+    const auto mappedCpu = read();
+    Require(descriptor(mappedCpu).buffer != mappedFirstView.buffer,
+            "mapped CPU overwrite reused a held immutable copy");
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaMap_nid_postfix(block, bytes, secondSection.handle, 0, PAGE_READWRITE);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, bytes);
+    std::memset(block, 0x99, bytes);
+    const auto mappedRemap = read();
+    Require(descriptor(mappedRemap).buffer != descriptor(mappedCpu).buffer,
+            "shared-section remap reused bytes from the previous mapping at the same address");
+    auto remapOutput = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, descriptor(mappedRemap).buffer, 0, remapOutput->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(mappedRemap);
+    recorder.Keep(remapOutput);
+    recorder.Sync();
+    Require(std::all_of(mappedOldOutput->Bytes().begin(), mappedOldOutput->Bytes().end(),
+                        [](std::byte value) { return value == std::byte{0x77}; }),
+            "mapped overwrite or remap changed a queued consumer's original bytes");
+    Require(std::all_of(remapOutput->Bytes().begin(), remapOutput->Bytes().end(),
+                        [](std::byte value) { return value == std::byte{0x99}; }),
+            "new GPU reader did not receive the remapped section's bytes");
+    const auto currentMapped = recorder.ReusableDrawSnapshot(address, bytes);
+    Require(currentMapped != nullptr && std::all_of(currentMapped->Bytes().begin(), currentMapped->Bytes().end(),
+                        [](std::byte value) { return value == std::byte{0x99}; }),
+            "remapped section's current cached bytes are incorrect");
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes / 2, PAGE_READWRITE, bytes / 2);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, bytes);
+    std::memset(block, 0x66, bytes / 2);
+    const auto sparseFirst = read();
+    const auto sparseSecond = read();
+    std::uint32_t sparseAdjustment = 0;
+    const auto sparseFirstView = sparseFirst->Descriptor(address, bytes, sparseAdjustment);
+    const auto sparseSecondView = sparseSecond->Descriptor(address, bytes, sparseAdjustment);
+    Require(sparseFirstView.range == bytes / 2 && sparseSecondView.range == bytes / 2 && sparseAdjustment == 0,
+            "sparse fallback did not clip the descriptor to committed backing");
+    Require(sparseFirstView.buffer != sparseSecondView.buffer,
+            "sparse fallback buffer was retained for reuse");
+    Require(recorder.ReusableDrawSnapshot(address, bytes) == nullptr,
+            "sparse upload left a previous full-span snapshot reusable");
+    std::cout << "Mapped CPU writes, shared-section remap, private recommit and sparse bypass tests passed\n";
+#endif
+
+    recorder.Sync();
+    std::cout << "Readonly fallback reuse, CPU overwrite, held reader, writer bypass, pending GPU publication and untracked tests passed\n";
+}
+
 void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 65536;
@@ -6661,6 +6900,11 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--readonly-fallback-only") {
+            if (device.GetContext().hostImportAlignment == 0 || !AgcDriver::GuestMemory::WriteWatched()) return 77;
+            readonlyFallbackReuseTests(device, recorder, gpu);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
             return 0;

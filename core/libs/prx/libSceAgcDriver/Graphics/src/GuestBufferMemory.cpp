@@ -3271,8 +3271,33 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
 
 void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool noReuse = std::getenv("APS5_NO_READONLY_FALLBACK_REUSE") != nullptr;
     const auto bytes = region.end - region.begin;
-    const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (addressable ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::BufferUpload);
+    auto* snapshots = !noReuse && GuestMemory::GpuMutex().HeldByThisThread() ? Recorder::Active() : nullptr;
+    if (snapshots != nullptr && (snapshots->Device() != context.device || addressable || region.sparse ||
+        !(region.hostBacked || region.writable) || WritesOverlap(region.begin, static_cast<std::size_t>(bytes)))) snapshots = nullptr;
+    std::uint64_t generation = 0, registryGeneration = 0;
+    if (snapshots != nullptr) {
+        GuestMemory::FlushGpuWrites(region.begin, static_cast<std::size_t>(bytes));
+        generation = GuestMemory::CollectWritesUncached(region.begin, static_cast<std::size_t>(bytes));
+        registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        if (generation != 0) {
+            if (auto cached = snapshots->ReusableDrawSnapshot(region.begin, static_cast<std::size_t>(bytes), Recorder::SnapshotUse::Storage, nullptr, generation)) {
+                region.buffer = std::move(cached);
+                region.snapshot.clear();
+                if (profile) {
+                    static std::atomic<std::uint64_t> hits{0}, savedBytes{0};
+                    const auto saved = savedBytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+                    const auto count = hits.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (count % 1000 == 0) AgcDriver::ProfilePrint_nid_no_patch("[buffers] readonly fallback reuse: %llu copies avoided (%.0f MiB)\n", static_cast<unsigned long long>(count), saved / 1048576.0);
+                }
+                return;
+            }
+        }
+    }
+    const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (addressable ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u) |
+        (snapshots != nullptr && generation != 0 ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : 0u);
     std::uint64_t readBytes = 0;
     bool inImport = false;
     if (profile && context.hostImportAlignment != 0) {
@@ -3294,8 +3319,6 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(allocated), usage);
     const auto readStart = std::chrono::steady_clock::now();
     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
-    // Named for the [hooksync] attribution: the reads below go through the flush hook.
-    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::BufferUpload);
     if (region.hostBacked || region.writable) {
         // Only ranges a descriptor may write need the copy the write-back diffs against; the
         // registered ranges of an address-based shader are read-only to it (AddressRanges).
@@ -3325,6 +3348,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         readBytes += region.snapshot.size();
     }
     region.snapshot.clear();
+    if (snapshots != nullptr && generation != 0) snapshots->KeepDrawSnapshot(region.begin, static_cast<std::size_t>(bytes), generation, registryGeneration, region.buffer);
     if (profile) readUs.fetch_add(microsecondsSince(readStart), std::memory_order_relaxed);
     if (profile) {
         static std::mutex reasonsMutex;
