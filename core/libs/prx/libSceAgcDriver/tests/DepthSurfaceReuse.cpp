@@ -179,6 +179,13 @@ void TestD16StencilFallback(const Context& context) {
     Require(lastImageFormat == VK_FORMAT_D24_UNORM_S8_UINT, "a D16_UNORM_S8_UINT surface was not created as D24_UNORM_S8_UINT on a device without it");
     Require(lookup(without, {d16s8, FormatR16Unorm, 256, 256}) != nullptr, "an R16 view of a D16 surface stored as D24 must still sample its depth plane");
     Require(lookup(without, {d16s8Stencil, FormatR8Uint, 256, 256}) != nullptr, "an 8-bit view of the stencil plane of a D16 surface stored as D24 must sample it");
+    bool arrayRefused = false;
+    try {
+        lookup(without, {d16s8, FormatR16Unorm, 256, 256, TileDepth64KB, Type2DArray, 1});
+    } catch (const std::runtime_error& error) {
+        arrayRefused = std::string_view(error.what()).find("widened D16") != std::string_view::npos;
+    }
+    Require(arrayRefused, "a widened D16 plane must not be copied as packed 16-bit depth");
     Require(HostDepthBiasConstant(without, VK_FORMAT_D16_UNORM_S8_UINT, 2.0f) == 512.0f, "a 16-bit depth bias must be scaled by 256 for D24 storage");
     Require(HostDepthBiasConstant(without, VK_FORMAT_D32_SFLOAT_S8_UINT, 2.0f) == 2.0f, "a D32 depth bias must not be scaled");
     ClearDepthSurfaces(without.device);
@@ -254,6 +261,17 @@ void RunDepthSurfaceReuseTests() {
     Require(storageAliasesDepth(context, {depth16, FormatR16Unorm, 128, 128}), "the newest depth extent must still reject actual storage access");
     Require(storageAliasesDepth(context, {stencil16, FormatR8Uint, 128, 128}), "storage access to the actual stencil plane must remain rejected");
     Require(!storageAliasesDepth(context, {stencil16, FormatR11G11B10Float, 128, 128}), "a stencil address reused for color is not a stencil storage alias");
+
+    auto multisampled = DepthTarget{0x71000000, 0, {128, 128}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    multisampled.samples = 4;
+    DepthSurfaceView(context, multisampled);
+    bool copyRefused = false;
+    try {
+        lookup(context, {multisampled.address, FormatR32Float, 128, 128, TileDepth64KB, Type2DArray, 1});
+    } catch (const std::runtime_error& error) {
+        copyRefused = std::string_view(error.what()).find("multisampled depth plane") != std::string_view::npos;
+    }
+    Require(copyRefused, "a multisampled plane must not use a single-sample depth copy");
 
     ClearDepthSurfaces(context.device);
 }
