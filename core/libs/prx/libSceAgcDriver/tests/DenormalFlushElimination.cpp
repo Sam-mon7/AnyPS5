@@ -57,6 +57,20 @@ struct Builder {
         return created;
     }
 
+    IrValue& select(IrOpcode opcode, IrType type, IrValue& condition, IrValue& whenTrue, IrValue& whenFalse, SelectFlags flags = {}) {
+        auto& created = emit(opcode, type, {&condition, &whenTrue, &whenFalse});
+        created.SetFlags(flags);
+        return created;
+    }
+
+    IrValue& asF32(IrValue& bits) {
+        return emit(IrOpcode::BitCastF32U32, IrType::F32, {&bits});
+    }
+
+    IrValue& asU32(IrValue& value) {
+        return emit(IrOpcode::BitCastU32F32, IrType::U32, {&value});
+    }
+
     void keep(IrValue& value) {
         (void)emit(IrOpcode::ReferenceU32, IrType::Void, {&value});
     }
@@ -190,6 +204,42 @@ int main() {
             return !next.HasUses();
         };
         return loop(true) && !loop(false);
+    });
+
+    passed &= run("a product flushed when tiny needs no flush", [] {
+        Builder b;
+        auto& lhs = b.asF32(b.flush(b.unknown()));
+        auto& product = b.emit(IrOpcode::FPMul32, IrType::F32, {&lhs, &lhs});
+        auto& tiny = b.emit(IrOpcode::ULessThan32, IrType::Bool, {&b.unknown(), &b.constant(0x207fffffu)});
+        auto& flushed = b.flush(b.asU32(b.select(IrOpcode::SelectF32, IrType::F32, tiny, b.asF32(b.constant(0u)), product, SelectFlags{true})));
+        auto& unflagged = b.flush(b.asU32(b.select(IrOpcode::SelectF32, IrType::F32, tiny, b.asF32(b.constant(0u)), product)));
+        b.keep(flushed);
+        b.keep(unflagged);
+        return b.eliminate() == 1u && !flushed.HasUses() && unflagged.HasUses();
+    });
+
+    passed &= run("a NaN choice of a quieted operand is as denormal-free as its fallback", [] {
+        Builder b;
+        auto& candidate = b.unknown();
+        auto& isNan = b.emit(IrOpcode::FPIsNan32, IrType::Bool, {&b.asF32(candidate)});
+        auto& quieted = b.emit(IrOpcode::BitwiseOr32, IrType::U32, {&candidate, &b.constant(0x00400000u)});
+        auto& flushedFallback = b.flush(b.select(IrOpcode::SelectU32, IrType::U32, isNan, quieted, b.flush(b.unknown())));
+        auto& unknownFallback = b.flush(b.select(IrOpcode::SelectU32, IrType::U32, isNan, quieted, b.unknown()));
+        auto& otherValue = b.flush(b.select(IrOpcode::SelectU32, IrType::U32, isNan, b.unknown(), b.flush(b.unknown())));
+        b.keep(flushedFallback);
+        b.keep(unknownFallback);
+        b.keep(otherValue);
+        return b.eliminate() == 1u && !flushedFallback.HasUses() && unknownFallback.HasUses() && otherValue.HasUses();
+    });
+
+    passed &= run("a flushed value times a constant of at least one needs no flush, times a half it does", [] {
+        Builder b;
+        auto& value = b.asF32(b.flush(b.unknown()));
+        auto& scaled = b.flush(b.asU32(b.emit(IrOpcode::FPMul32, IrType::F32, {&value, &b.constant(0x40000000u)})));
+        auto& halved = b.flush(b.asU32(b.emit(IrOpcode::FPMul32, IrType::F32, {&b.constant(0x3f000000u), &value})));
+        b.keep(scaled);
+        b.keep(halved);
+        return b.eliminate() == 1u && !scaled.HasUses() && halved.HasUses();
     });
 
     return passed ? 0 : 1;

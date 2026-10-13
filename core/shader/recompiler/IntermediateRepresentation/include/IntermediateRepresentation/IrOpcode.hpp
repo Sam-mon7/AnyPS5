@@ -524,6 +524,10 @@ struct ExportFlags {
     std::uint32_t pc = 0;
 };
 
+struct SelectFlags {
+    bool notDenormal = false;
+};
+
 [[nodiscard]] std::size_t IrOpcodeOperandCount(IrOpcode opcode);
 
 [[nodiscard]] IrType IrOpcodeType(IrOpcode opcode);

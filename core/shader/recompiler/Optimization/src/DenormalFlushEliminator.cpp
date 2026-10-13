@@ -27,6 +27,22 @@ IrValue* flushedSource(const IrValue& value) {
     return maskedOperand(value.Argument(1)->Resolve(), IrOpcode::BitwiseAnd32, 0x80000000u) == source ? source : nullptr;
 }
 
+const IrValue* bitsOf(const IrValue* value) {
+    value = value->Resolve();
+    while (value->Opcode() == IrOpcode::BitCastF32U32 || value->Opcode() == IrOpcode::BitCastU32F32) value = value->Argument(0)->Resolve();
+    return value;
+}
+
+bool nanOnlyTrueArm(const IrValue& select) {
+    const IrValue* condition = select.Argument(0)->Resolve();
+    if (condition->Opcode() != IrOpcode::FPIsNan32) return false;
+    const IrValue* tested = bitsOf(condition->Argument(0));
+    const IrValue* chosen = bitsOf(select.Argument(1));
+    if (chosen == tested) return true;
+    const IrValue* quieted = maskedOperand(chosen, IrOpcode::BitwiseOr32, 0x00400000u);
+    return quieted != nullptr && bitsOf(quieted) == tested;
+}
+
 class DenormalFreeValues {
 public:
     bool Contains(const IrValue* value) {
@@ -64,9 +80,22 @@ private:
             case IrOpcode::BitwiseAnd32:
                 if (const IrValue* operand = maskedOperand(&value, IrOpcode::BitwiseAnd32, 0x7fffffffu)) return Contains(operand);
                 return false;
+            case IrOpcode::FPMul32: {
+                const auto keepsMagnitude = [&](const IrValue* factor, const IrValue* other) {
+                    factor = factor->Resolve();
+                    if (!factor->HasImmediate()) return false;
+                    const std::uint32_t bits = factor->ImmediateU32();
+                    return ((bits & 0x7fffffffu) == 0u || ((bits >> 23u) & 0xffu) >= 127u) && Contains(other);
+                };
+                return keepsMagnitude(value.Argument(0), value.Argument(1)) || keepsMagnitude(value.Argument(1), value.Argument(0));
+            }
             case IrOpcode::SelectU32:
-            case IrOpcode::SelectF32:
+            case IrOpcode::SelectF32: {
+                const auto flags = value.Opcode() == IrOpcode::SelectF32 ? value.Flags<SelectFlags>() : SelectFlags{};
+                if (flags.notDenormal) return true;
+                if (nanOnlyTrueArm(value)) return Contains(value.Argument(2));
                 return Contains(value.Argument(1)) && Contains(value.Argument(2));
+            }
             case IrOpcode::Phi:
                 for (std::size_t index = 0; index < value.ArgumentCount(); ++index) {
                     if (!Contains(value.Argument(index))) return false;

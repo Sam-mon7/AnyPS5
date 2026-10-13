@@ -240,6 +240,15 @@ constexpr std::uint32_t TinyLegacyExpected[32] = {
     0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0x80000000u, 0x80000000u,
     0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u
 };
+constexpr std::uint32_t CancelRows[Threads][Inputs] = {
+    {0x00800001u, 0x3f800000u, 0x80800000u, 0x00000000u},
+    {0x80800001u, 0x3f800000u, 0x00800000u, 0x00000000u},
+    {0x3f800000u, 0x00800003u, 0x80800000u, 0x00000000u},
+    {0x00ffffffu, 0x3f800000u, 0x80800000u, 0x00000000u},
+    {0x3f000000u, 0x01000001u, 0x80800000u, 0x00000000u},
+    {0xbf000000u, 0x01000001u, 0x00800000u, 0x00000000u},
+};
+constexpr std::uint32_t CancelExpected[6] = {0x00000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x80000000u};
 constexpr const char* TinyLegacyNames[2] = {
     "v_mad_legacy_f32 v18, v4, v5, v6",
     "v_mac_legacy_f32 v19, v4, v5"
@@ -463,6 +472,13 @@ void CheckTinyLegacy(const std::string& mode) {
     }
 }
 
+void CheckCancel(const std::string& mode) {
+    for (std::uint32_t tid = 0; tid < std::size(CancelExpected); ++tid) {
+        for (const std::uint32_t i : {2u, 3u, 6u}) Expect(tid, Output[tid * TinyResults + i], CancelExpected[tid], (mode + " " + TinyNames[i]).c_str());
+        for (std::uint32_t i = 0; i < 2; ++i) Expect(tid, Output[tid * TinyResults + 8u + i], CancelExpected[tid], (mode + " " + TinyLegacyNames[i]).c_str());
+    }
+}
+
 void CheckTinyDirected(std::uint32_t round) {
     const std::string mode = "round mode " + std::to_string(round) + " ";
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
@@ -502,6 +518,12 @@ int main() {
         Run(*device, ShaderRecompiler::ShaderFloatMode{0x00u, false, true, false}, TinyCode, TinyRows);
         CheckTinyLegacy("IEEE=1 all denormals flushed");
         CheckTiny("IEEE=1 all denormals flushed");
+        Run(*device, std::nullopt, TinyCode, CancelRows);
+        CheckCancel("no float mode cancelled sum");
+        Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}, TinyCode, CancelRows);
+        CheckCancel("IEEE=0 cancelled sum");
+        Run(*device, ShaderRecompiler::ShaderFloatMode{0x00u, false, true, false}, TinyCode, CancelRows);
+        CheckCancel("IEEE=1 cancelled sum");
         for (std::uint32_t round = 1u; round < 4u; ++round) {
             Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u | round, true, false, false}, TinyCode, TinyRows);
             CheckTinyLegacy("round mode " + std::to_string(round));
