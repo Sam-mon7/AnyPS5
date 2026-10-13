@@ -42,17 +42,34 @@ public:
         count = std::min(count, static_cast<std::uint32_t>(checkpoints.size()));
         if (count != 0) query(queue, &count, checkpoints.data());
         std::fprintf(output, "[gpu-checkpoint] device lost at %s; %u/%u stage markers, newest recorded=%llu\n", operation, count, available, static_cast<unsigned long long>(next));
+        std::uintptr_t latest = 0;
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto serial = reinterpret_cast<std::uintptr_t>(checkpoints[i].pCheckpointMarker);
             const auto& entry = history[serial % Capacity];
             std::fprintf(output, "[gpu-checkpoint] stage=0x%x serial=%llu", static_cast<unsigned>(checkpoints[i].stage), static_cast<unsigned long long>(serial));
             if (serial != 0 && entry.serial == serial) {
+                latest = std::max(latest, serial);
                 std::fprintf(output, " %s", entry.operation);
                 for (std::size_t j = 0; j < entry.count; ++j) std::fprintf(output, " 0x%llx", static_cast<unsigned long long>(entry.shaders[j]));
             } else {
                 std::fprintf(output, " history expired or unavailable");
             }
             std::fputc('\n', output);
+        }
+        if (latest != 0 && latest < next) {
+            const auto end = latest + std::min<std::uintptr_t>(next - latest, 32);
+            std::fprintf(output, "[gpu-checkpoint] following recorded markers (CPU order, GPU completion unknown): %llu of %llu\n", static_cast<unsigned long long>(end - latest), static_cast<unsigned long long>(next - latest));
+            for (auto serial = latest + 1; serial <= end; ++serial) {
+                const auto& entry = history[serial % Capacity];
+                std::fprintf(output, "[gpu-checkpoint] recorded serial=%llu", static_cast<unsigned long long>(serial));
+                if (entry.serial == serial) {
+                    std::fprintf(output, " %s", entry.operation);
+                    for (std::size_t j = 0; j < entry.count; ++j) std::fprintf(output, " 0x%llx", static_cast<unsigned long long>(entry.shaders[j]));
+                } else {
+                    std::fprintf(output, " history expired or unavailable");
+                }
+                std::fputc('\n', output);
+            }
         }
         std::fflush(output);
     }

@@ -77,6 +77,12 @@ void gpuCheckpointTests() {
     const std::array<std::uint64_t, 2> shaders{0x248a05b00, 0x12345678};
     for (std::size_t i = 0; i <= GpuCheckpoints::Capacity; ++i) checkpoints->Record(VK_NULL_HANDLE, "dispatch address/variant", shaders);
     Require(reinterpret_cast<std::uintptr_t>(checkpointMarker) == GpuCheckpoints::Capacity + 1, "checkpoint markers do not alias overwritten entries");
+    const auto reached = checkpointMarker;
+    for (std::uint64_t i = 0; i < 40; ++i) {
+        const std::array payload{i};
+        checkpoints->Record(VK_NULL_HANDLE, "future resource", payload);
+    }
+    checkpointMarker = reached;
     checkpoints->Report(VK_SUCCESS, "success");
     checkpoints->Report(VK_TIMEOUT, "timeout");
     Require(checkpointQueries == 0, "checkpoint query requires a lost device");
@@ -85,12 +91,15 @@ void gpuCheckpointTests() {
     checkpoints->Report(VK_ERROR_DEVICE_LOST, "test submit", output.get());
     Require(checkpointQueries == 2, "checkpoint query uses count and bounded data calls");
     std::rewind(output.get());
-    std::array<char, 2048> bytes{};
+    std::array<char, 8192> bytes{};
     const auto size = std::fread(bytes.data(), 1, bytes.size(), output.get());
     const std::string_view text(bytes.data(), size);
     Require(text.find("2/40 stage markers") != text.npos, "checkpoint report respects returned count");
     Require(text.find("dispatch address/variant 0x248a05b00 0x12345678") != text.npos, "checkpoint report preserves shader identity");
     Require(text.find("serial=1 history expired or unavailable") != text.npos, "overwritten checkpoint does not report the replacement shader");
+    Require(text.find("CPU order, GPU completion unknown): 32 of 40") != text.npos, "recorded history distinguishes CPU records from GPU progress and bounds output");
+    Require(text.find("future resource 0x0\n") < text.find("future resource 0x1f\n") && text.find("future resource 0x1f\n") != text.npos, "recorded history begins immediately after the last reported GPU marker");
+    Require(text.find("future resource 0x20\n") == text.npos, "recorded history stops at its output bound");
     Context context{};
     context.gpuCheckpoints = checkpoints;
     bool threw = false;

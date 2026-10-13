@@ -597,12 +597,18 @@ void copyDepthPlane(const Context& context, const GuestTextureResource& resource
     depth.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
     auto color = depth;
     color.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    const std::array<std::uint64_t, 4> checkpointData{resource.baseAddress, resource.width, resource.height, texelBytes};
+    const auto checkpoint = [&](const char* operation) {
+        if (context.gpuCheckpoints != nullptr) context.gpuCheckpoints->Record(commands, operation, checkpointData);
+    };
     constexpr VkAccessFlags accesses = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    checkpoint(toDepth ? "storage-to-depth begin address/width/height/texel-bytes" : "depth-to-storage begin address/width/height/texel-bytes");
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, accesses, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, toDepth ? colorImage : surface.image, VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, toDepth ? &color : &depth);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     context.Resolved(&DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage")(commands, staging->Handle(), toDepth ? surface.image : colorImage, VK_IMAGE_LAYOUT_GENERAL, 1, toDepth ? &depth : &color);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, accesses);
+    checkpoint(toDepth ? "storage-to-depth end address/width/height/texel-bytes" : "depth-to-storage end address/width/height/texel-bytes");
     if (batch != nullptr) batch->SubmitAndWait();
 }
 

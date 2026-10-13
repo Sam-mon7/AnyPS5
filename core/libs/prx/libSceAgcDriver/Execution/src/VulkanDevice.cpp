@@ -4028,6 +4028,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     recorder.EndGpuTiming(gpuTiming);
+    if (context.gpuCheckpoints != nullptr) {
+        const std::array ids{record.programAddress, record.shader->program->PipelineVariantId()};
+        context.gpuCheckpoints->Record(commands, "dispatch end address/variant", ids);
+    }
     const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
