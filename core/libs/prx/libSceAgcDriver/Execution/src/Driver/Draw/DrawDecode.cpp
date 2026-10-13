@@ -127,6 +127,7 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     product->pixel.targetExportPacking = Graphics::ExportPackings(product->state);
     product->pixel.dualSourceBlend = product->state.dualSourceBlend;
     product->pixel.alphaToCoverage = product->state.alphaToCoverage;
+    if (!product->state.stencilTest) product->pixel.stencilRefExportEnable = false;
     if (product->pixel.ancillary) product->pixel.rasterPrimitive = Graphics::RasterPrimitiveOf(product->state);
     if (product->pixel.ancillary) product->pixel.layerExported = product->state.layerExports != 0;
     return product;

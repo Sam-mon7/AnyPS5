@@ -27,6 +27,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <spirv/unified1/spirv.hpp>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 namespace AgcDriver::DriverDetail {
@@ -681,6 +682,8 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         const auto count = RegisterValue(state.context, 0x1b6) & 0x3fu;
         if (registration && count != 0) return nullptr;
         pixel = Graphics::DecodePixelStageInfo(state.context, {});
+        const auto& capabilities = device.Target().supportedCapabilities;
+        if (pixel->stencilRefExportEnable && std::ranges::find(capabilities, static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == capabilities.end()) return nullptr;
         wave = pixel->wave32 ? 32u : 64u;
     } else {
         const auto routing = RegisterValue(state.context, 0x2d5);
