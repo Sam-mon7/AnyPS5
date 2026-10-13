@@ -425,6 +425,128 @@ void importFailureDetailTests(const Context& context) {
             "diagnostic and default calls did not reuse the same imported window within budget");
 }
 
+// Eager and whole address-space admissions share the ordinary cap, and a refused whole import
+// still supplies correct bytes through the existing fallback (well below the address-copy guard).
+void importLabelReserveWholeTests(const Context& context, const BdaTestAccess& access) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    ClearHostImports(context.device);
+    constexpr auto piece = WindowedRange::piece;
+    WindowedRange range(context, piece, 5, 6 * piece);
+    SetHostImportLabelReserve(2 * piece);
+    struct Reset { ~Reset() { SetHostImportLabelReserve(0); } } reset;
+    const auto first = range.First();
+    GuestAllocations::Mapped mapped;
+    {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        for (const auto& entry : lease) if (entry->address == first) mapped.push_back(entry);
+    }
+    Require(mapped.size() == 1, "the reserve whole-import fixture is not registered");
+    static_cast<void>(ImportMappedRanges(range.importing, mapped, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true));
+    Require(HostImportLiveBytes() == 0 && !HostImportCovers(range.importing, first, range.bytes),
+            "an eager whole import consumed the label reserve");
+    GuestBufferMemory leased(range.importing);
+    leased.AcquireRegistered();
+    leased.Upload(true);
+    Require(HostImportLiveBytes() == 0 && !HostImportCovers(range.importing, first, range.bytes),
+            "an address-required whole import consumed the label reserve");
+    std::uint32_t adjustment = 0;
+    const auto view = leased.Descriptor(first + range.bytes - 32, 32, adjustment);
+    const auto bytes = access.bytes(view.buffer);
+    Require(view.offset + adjustment + 32 <= bytes.size() &&
+                std::all_of(bytes.begin() + view.offset + adjustment, bytes.begin() + view.offset + adjustment + 32,
+                            [](std::byte value) { return value == std::byte{0x33}; }),
+            "a whole import displaced by the label reserve lost its fallback bytes");
+    leased.WriteBack();
+}
+
+// Scaled B=12/R=4 pressure: labels charge only the excess actually retained after eviction.
+// Ordinary admissions retain that charge without reserving it twice or increasing it on growth.
+void importLabelReservePressureTests(const Context& context) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    constexpr auto piece = WindowedRange::piece;
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    ClearHostImports(importing.device);
+    SetHostImportWindow(0);
+    SetHostImportRangeWindow(3 * piece);
+    SetHostImportBudget(12 * piece);
+    SetHostImportLabelReserve(4 * piece);
+    struct Release {
+        Context importing;
+        std::byte* block;
+        std::array<std::size_t, 12> offsets{};
+        std::size_t registered = 0;
+        ~Release() {
+            ClearHostImports(importing.device);
+            for (std::size_t i = 0; i < registered; ++i) GuestAllocations::Mutation().Remove(block + offsets[i]);
+            SetHostImportLabelReserve(0);
+            SetHostImportBudget(0);
+            SetHostImportWindow(0);
+            SetHostImportRangeWindow(std::uint64_t{64} << 20u);
+            ::operator delete(block, std::align_val_t{WindowedRange::piece});
+        }
+    } release{importing, static_cast<std::byte*>(::operator new(32 * piece, std::align_val_t{piece}))};
+    std::memset(release.block, 0x33, 32 * piece);
+    const auto first = reinterpret_cast<std::uintptr_t>(release.block);
+    const auto at = [&](std::size_t offset) { return first + offset * piece; };
+    const auto add = [&](std::size_t offset, std::size_t size) {
+        GuestAllocations::Mutation().Add(release.block + offset * piece, size * piece, true, false, true);
+        release.offsets[release.registered++] = offset * piece;
+    };
+    for (std::size_t i = 0; i < 8; ++i) add(2 * i, 1);
+    add(16, 6); // Initially import only its first three-unit window.
+    add(24, 2);
+    add(28, 1);
+    add(30, 1);
+    for (std::size_t i = 0; i < 8; ++i) Require(HostImportFor(importing, at(2 * i), 32) != nullptr,
+            "the reserve fixture could not fill ordinary capacity");
+    Require(HostImportLiveBytes() == 8 * piece, "ordinary imports did not fill the expected capacity");
+    const auto advance = [&] {
+        GuestBufferMemory next(importing);
+        next.Upload(false);
+        next.WriteBack();
+        for (int use = 0; use < 300; ++use) Require(HostImportFor(importing, at(14), 32) != nullptr,
+                "the hot ordinary import disappeared while aging candidates");
+    };
+    advance();
+    HostImportFailure failure;
+    const auto* label = HostImportFor(importing, at(16), 32, &failure, true);
+    Require(label != nullptr && failure.kind == HostImportFailureKind::None && label->labelReservedBytes == 3 * piece && HostImportLiveBytes() == 11 * piece,
+            "a priority label did not consume only its required reserve bytes");
+    const auto labelBuffer = label->buffer;
+    Require(HostImportFor(importing, at(28), 32) != nullptr && HostImportLiveBytes() == 11 * piece &&
+                !HostImportCovers(importing, at(0), 32),
+            "ordinary admission double-reserved charged label bytes or evicted more than one unit");
+    label = HostImportFor(importing, at(16), 32);
+    Require(label != nullptr && label->buffer == labelBuffer && label->labelReservedBytes == 3 * piece,
+            "ordinary LRU evicted or recharged the reserved label import");
+    const auto* second = HostImportFor(importing, at(24), 32, &failure, true);
+    Require(second != nullptr && failure.kind == HostImportFailureKind::None && second->labelReservedBytes == piece && HostImportLiveBytes() == 12 * piece &&
+                !HostImportCovers(importing, at(2), 32) && HostImportCovers(importing, at(4), 32),
+            "a label charged its pre-eviction size instead of its final excess residency");
+    for (std::size_t i = 2; i < 8; ++i) Require(HostImportFor(importing, at(2 * i), 32) != nullptr,
+            "a remaining ordinary import disappeared before exhaustion");
+    Require(HostImportFor(importing, at(30), 32, &failure, true) == nullptr && failure.kind == HostImportFailureKind::Budget &&
+                failure.budget == 12 * piece && failure.evictable == 0 && HostImportLiveBytes() == 12 * piece,
+            "exhausted label reserve did not refuse without changing residency");
+    Require(HostImportFor(importing, at(16), 32)->labelReservedBytes == 3 * piece &&
+                HostImportFor(importing, at(24), 32)->labelReservedBytes == piece,
+            "reserve exhaustion changed existing charges");
+    advance();
+    // Cross the two windows of the unchanged registration: this replaces the old import without a remap.
+    const auto* grown = HostImportFor(importing, at(19) - 16, 32);
+    Require(grown != nullptr && grown->base == at(16) && grown->bytes == 6 * piece && grown->labelReservedBytes == 3 * piece &&
+                HostImportLiveBytes() == 12 * piece && !HostImportCovers(importing, at(28), 32) &&
+                !HostImportCovers(importing, at(4), 32) && !HostImportCovers(importing, at(6), 32),
+            "ordinary replacement growth gained reserve charge or failed to evict its extra ordinary byte units");
+    ClearHostImports(importing.device);
+    for (std::size_t i = 0; i < 8; ++i) Require(HostImportFor(importing, at(2 * i), 32) != nullptr,
+            "clearing charged imports did not restore ordinary admission");
+    Require(HostImportFor(importing, at(30), 32, &failure) == nullptr && failure.kind == HostImportFailureKind::Budget &&
+                failure.budget == 8 * piece && HostImportLiveBytes() == 8 * piece,
+            "clearing charged imports retained reserve accounting");
+}
+
 // A registered range larger than the import window, its first window imported by an earlier access: an address-based
 // build (AcquireRegistered) must import the whole range, so a view in its last window binds (Demon's Souls threw
 // "guest buffer view ... exceeds its GPU owner" with the 64 MiB windows).
@@ -1721,6 +1843,8 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importWindowTests(context);
     directImportIdentityTests(context);
     importFailureDetailTests(context);
+    importLabelReserveWholeTests(context, access);
+    importLabelReservePressureTests(context);
     importWholeRangeOverWindowTests(context);
     importRefusedWholeRangeTests(context);
     importAddressSpaceRetentionTests(context);

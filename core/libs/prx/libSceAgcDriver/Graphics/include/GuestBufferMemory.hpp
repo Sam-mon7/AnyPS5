@@ -41,6 +41,8 @@ struct HostImport {
     mutable std::uint64_t lastUse = 0;
     // A whole import used by an address-space build must remain available: that path cannot evict to restore it.
     mutable bool addressRequired = false;
+    // Bytes charged to the optional label reserve; retained until replacement or registry retirement.
+    std::uint64_t labelReservedBytes = 0;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -85,11 +87,13 @@ struct HostImportFailure {
     const char* driverStep = nullptr;
     VkResult driverResult = VK_SUCCESS;
 };
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, HostImportFailure* failure = nullptr);
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, HostImportFailure* failure = nullptr, bool labelPriority = false);
 void SetHostImportWindow(std::uint64_t bytes);
 // Tests: the window of one large registered range (64 MiB) and the import budget (0: the configured one).
 void SetHostImportRangeWindow(std::uint64_t bytes);
 void SetHostImportBudget(std::uint64_t bytes);
+// Tests: label reserve override (0 restores APS5_HOST_IMPORT_LABEL_RESERVE_MIB, default 0).
+void SetHostImportLabelReserve(std::uint64_t bytes);
 std::uint64_t HostImportLiveBytes();
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports

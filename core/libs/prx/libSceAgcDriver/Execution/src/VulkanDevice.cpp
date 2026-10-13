@@ -1996,7 +1996,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     const auto context = graphicsContext();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     Graphics::HostImportFailure failure;
-    const auto* import = Graphics::HostImportFor(context, address, bytes.size(), profile ? &failure : nullptr);
+    const auto* import = Graphics::HostImportFor(context, address, bytes.size(), profile ? &failure : nullptr, true);
     if (import == nullptr) {
         if (profile) ReportLabelImportFailure(address, bytes.size(), queue, failure);
         return 3;

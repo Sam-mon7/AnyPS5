@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -76,11 +77,63 @@ int StoreLabel(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint
     return reason;
 }
 
+void LabelReserve(AgcDriver::VulkanDevice& device, GuestBlock& preceding, GuestBlock& reserved, GuestBlock& exhausted) {
+    using namespace AgcDriver::Graphics;
+    // The baseline has drained all work. Start with one ordinary block and room for one label block.
+    struct RestoreImportWindow {
+        ~RestoreImportWindow() { SetHostImportWindow(0); }
+    } restoreWindow;
+    SetHostImportWindow(BlockBytes);
+    ClearHostImports(device.Device());
+    SetHostImportBudget(2 * BlockBytes);
+    SetHostImportLabelReserve(BlockBytes);
+    const std::array<std::uint32_t, 4> pattern{0xa5a5a5a5u, 0xa5a5a5a5u, 0xa5a5a5a5u, 0xa5a5a5a5u};
+    Require(device.FillBuffer(preceding.Address() + 8192, 4096, pattern), "label reserve: ordinary capacity cannot import its first block");
+    Require(HostImportLiveBytes() == BlockBytes, "label reserve: the ordinary fixture did not occupy exactly one block");
+    Require(!device.FillBuffer(reserved.Address() + 4096, 4096, pattern), "label reserve: an ordinary fill consumed unused label reserve");
+    Require(HostImportLiveBytes() == BlockBytes, "label reserve: refusing an ordinary fill changed residency");
+    Require(StoreLabel(device, reserved.Address(), 3, 3) == 0, "label reserve: a busy recorder could not import and record a reserved label");
+    Require(HostImportLiveBytes() == 2 * BlockBytes, "label reserve: the label did not consume exactly the reserved block");
+    device.SubmitRecorded(true);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (reserved.Words()[0] != 3) {
+        Require(std::chrono::steady_clock::now() < deadline, "label reserve: the GPU label never landed");
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    for (std::size_t i = 8192 / 4; i < (8192 + 4096) / 4; ++i)
+        Require(preceding.Words()[i] == pattern[0], "label reserve: a label became visible before the preceding GPU fill");
+    device.WaitIdle();
+
+    // Both blocks remain protected by recent use. Exhaustion must keep StoreLabel's synchronous fallback.
+    const std::array<std::uint32_t, 4> later{0x5a5a5a5au, 0x5a5a5a5au, 0x5a5a5a5au, 0x5a5a5a5au};
+    Require(device.FillBuffer(preceding.Address() + 12288, 4096, later), "label reserve: the existing ordinary import was not reusable at the total cap");
+    Require(StoreLabel(device, exhausted.Address(), 4, 4) == 3, "label reserve: exhaustion did not use the unimported-label fallback");
+    Require(HostImportLiveBytes() == 2 * BlockBytes, "label reserve: exhaustion exceeded the total import budget");
+    Require(exhausted.Words()[0] == 4, "label reserve: the fallback label did not land synchronously");
+    for (std::size_t i = 12288 / 4; i < (12288 + 4096) / 4; ++i)
+        Require(preceding.Words()[i] == later[0], "label reserve: fallback returned before the preceding GPU fill completed");
+    exhausted.Words()[0] = ReleaseMemHeader;
+    Require(device.FillBuffer(preceding.Address() + 16384, 4096, pattern), "label reserve: cannot record work after the exhaustion fallback");
+    Require(StoreLabel(device, reserved.Address() + 4, 5, 5) == 0, "label reserve: an existing reserved import was not reused");
+    device.WaitIdle();
+    Require(reserved.Words()[1] == 5 && exhausted.Words()[0] == ReleaseMemHeader,
+            "label reserve: a later GPU label overwrote the guest's reused fallback word");
+}
+
 }
 
 int main() {
     try {
+        struct RestoreImportLimits {
+            ~RestoreImportLimits() {
+                AgcDriver::Graphics::SetHostImportLabelReserve(0);
+                AgcDriver::Graphics::SetHostImportBudget(0);
+            }
+        } restore;
+        AgcDriver::Graphics::SetHostImportLabelReserve(0);
         GuestBlock labels;
+        GuestBlock reserved;
+        GuestBlock exhausted;
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
@@ -104,6 +157,7 @@ int main() {
         std::array<char, 256> message{};
         std::snprintf(message.data(), message.size(), "unimported label order: the label held 0x%08x when a later label had landed, and the guest's reused word holds 0x%08x instead of 0x%08x", seen, reused, ReleaseMemHeader);
         Require(seen == 1 && reused == ReleaseMemHeader, message.data());
+        LabelReserve(*device, labels, reserved, exhausted);
         std::puts("unimported label order tests passed");
         return 0;
     } catch (const std::exception& error) {

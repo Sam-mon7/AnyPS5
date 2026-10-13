@@ -163,6 +163,7 @@ struct HostImports {
     std::map<std::uint64_t, HostImport> imports;
     std::map<VkDevice, std::vector<std::shared_ptr<RetiredImport>>> parked;
     std::uint64_t liveBytes = 0;
+    std::uint64_t labelReservedBytes = 0;
     std::map<std::uint64_t, ImportFailure> failed;
     std::set<std::uint64_t> unaliasedSpans;
     // Registry generation the imports were last reconciled with.
@@ -227,6 +228,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     RetireShadow(device, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end); });
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
+    state.labelReservedBytes -= it->second.labelReservedBytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return;
@@ -660,7 +662,7 @@ bool pointerHeld(const HostImports& state, const HostImport& entry) {
 
 bool evictable(const HostImports& state, const HostImport& entry) {
     constexpr std::uint64_t protectedUses = 256;
-    return !entry.addressRequired && !pointerHeld(state, entry) && entry.lastUse + protectedUses < state.useCounter;
+    return !entry.addressRequired && entry.labelReservedBytes == 0 && !pointerHeld(state, entry) && entry.lastUse + protectedUses < state.useCounter;
 }
 
 std::uint64_t retireLeastRecent(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t wanted) {
@@ -678,6 +680,16 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
 }
 
 std::atomic<std::uint64_t> budgetOverride{0};
+std::atomic<std::uint64_t> labelReserveOverride{0};
+
+std::uint64_t labelImportReserve() {
+    if (const auto set = labelReserveOverride.load(std::memory_order_relaxed); set != 0) return set;
+    static const std::uint64_t configured = [] {
+        const char* value = std::getenv("APS5_HOST_IMPORT_LABEL_RESERVE_MIB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) << 20u;
+    }();
+    return configured;
+}
 
 std::uint64_t importBudget() {
     if (const auto set = budgetOverride.load(std::memory_order_relaxed); set != 0) return set;
@@ -738,7 +750,7 @@ const HostImport* rejectImport(HostImportFailure* failure, HostImportFailureKind
     return nullptr;
 }
 
-const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true, HostImportFailure* failure = nullptr) {
+const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true, HostImportFailure* failure = nullptr, bool labelPriority = false, std::uint64_t inheritedReserve = 0) {
     const bool fresh = !importsStale(context, state);
     if (fresh && end != 0) {
         if (const auto* current = findImport(state, address, end)) return current;
@@ -772,17 +784,23 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     // what may be evicted) before any of them is retired.
     auto first = state.imports.lower_bound(base);
     if (first != state.imports.begin() && std::prev(first)->second.base + std::prev(first)->second.bytes > base) --first;
-    std::uint64_t replaced = 0;
+    std::uint64_t replaced = 0, replacedReserve = 0;
     bool addressRequired = false;
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
         if (pointerHeld(state, it->second)) return rejectImport(failure, HostImportFailureKind::HeldOverlap);
         replaced += it->second.bytes;
+        replacedReserve += it->second.labelReservedBytes;
         addressRequired = addressRequired || it->second.addressRequired;
     }
     // Map observers run without the GPU lock. Replacing an overlapping window retires its buffer to the recorder,
     // just like budget eviction, so leave it for the next locked use even when the replacement fits the budget.
     if (replaced != 0 && !GuestMemory::GpuMutex().HeldByThisThread()) return rejectImport(failure, HostImportFailureKind::UnlockedReplacement);
-    const auto budget = importBudget();
+    const auto totalBudget = importBudget();
+    const auto reserve = std::min(labelImportReserve(), totalBudget);
+    // An ordinary replacement inherits only the old charge: growing it cannot consume more reserve.
+    const auto carriedReserve = std::min(bytes, inheritedReserve + replacedReserve);
+    const auto projectedReserve = state.labelReservedBytes - replacedReserve + carriedReserve;
+    const auto budget = labelPriority ? totalBudget : totalBudget - reserve + std::min(reserve, projectedReserve);
     const auto live = state.liveBytes - replaced;
     const auto available = live + bytes > budget && evict ? evictableBytes(state, base, base + bytes) : 0;
     if (live + bytes > budget && (!evict || live + bytes - available > budget)) {
@@ -811,6 +829,12 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     if (state.liveBytes + bytes > budget) retireLeastRecent(context, state, lease, state.liveBytes + bytes - budget);
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
     entry.addressRequired = addressRequired;
+    entry.labelReservedBytes = carriedReserve;
+    if (labelPriority && reserve != 0) {
+        // Charge only the excess after ordinary LRU eviction, not the pre-eviction request size.
+        const auto ordinaryBudget = totalBudget - reserve + std::min(reserve, state.labelReservedBytes + carriedReserve);
+        if (state.liveBytes + bytes > ordinaryBudget) entry.labelReservedBytes += state.liveBytes + bytes - ordinaryBudget;
+    }
     entry.range = run.ranges.front();
     entry.ranges = std::move(run.ranges);
 #ifdef _WIN32
@@ -847,7 +871,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         } catch (const std::runtime_error&) {
             if (entry.ranges.size() == 1) throw;
             state.unaliasedSpans.insert(base);
-            const auto* replacement = importAllocation(context, state, address, lease, end, evict, failure);
+            const auto* replacement = importAllocation(context, state, address, lease, end, evict, failure, labelPriority, carriedReserve);
             if (replacement != nullptr && addressRequired) replacement->addressRequired = true;
             return replacement;
         }
@@ -908,6 +932,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     state.liveBytes += bytes;
+    state.labelReservedBytes += entry.labelReservedBytes;
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (GPU 0x%llx, %zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(entry.address), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0);
     entry.lastUse = ++state.useCounter;
     return &state.imports.emplace(base, entry).first->second;
@@ -936,6 +961,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
 #endif
         }
         state.liveBytes = 0;
+        state.labelReservedBytes = 0;
         state.failed.clear();
         state.device = context.device;
         state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
@@ -973,9 +999,9 @@ const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint6
     return &entry;
 }
 
-const HostImport* importAccess(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease, HostImportFailure* failure = nullptr) {
+const HostImport* importAccess(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease, HostImportFailure* failure = nullptr, bool labelPriority = false) {
     if (!runCovers(lease, begin, end)) return rejectImport(failure, HostImportFailureKind::Unregistered);
-    const auto* entry = importAllocation(context, state, begin, lease, end, true, failure);
+    const auto* entry = importAllocation(context, state, begin, lease, end, true, failure, labelPriority);
     if (entry == nullptr) return nullptr;
     return findImport(state, begin, end) == entry ? entry : rejectImport(failure, HostImportFailureKind::LostCoverage);
 }
@@ -2067,6 +2093,7 @@ void ClearHostImports(VkDevice device) {
     }
     state.imports.clear();
     state.liveBytes = 0;
+    state.labelReservedBytes = 0;
     state.failed.clear();
     state.device = VK_NULL_HANDLE;
     state.refreshedGeneration = 0;
@@ -2285,13 +2312,17 @@ void SetHostImportBudget(std::uint64_t bytes) {
     budgetOverride.store(bytes, std::memory_order_relaxed);
 }
 
+void SetHostImportLabelReserve(std::uint64_t bytes) {
+    labelReserveOverride.store(bytes, std::memory_order_relaxed);
+}
+
 std::uint64_t HostImportLiveBytes() {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     return state.liveBytes;
 }
 
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, HostImportFailure* failure) {
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, HostImportFailure* failure, bool labelPriority) {
     if (failure != nullptr) *failure = {};
     if (context.hostImportAlignment == 0) return rejectImport(failure, HostImportFailureKind::Disabled);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return rejectImport(failure, HostImportFailureKind::InvalidAccess);
@@ -2312,7 +2343,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    return ready(importAccess(context, state, address, address + bytes, lease, failure));
+    return ready(importAccess(context, state, address, address + bytes, lease, failure, labelPriority));
 }
 
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
