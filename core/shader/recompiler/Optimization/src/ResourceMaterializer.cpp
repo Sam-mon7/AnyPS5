@@ -336,10 +336,12 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     std::uint64_t entryBytes = TableEntryBytes;
     std::uint32_t entries = 0u;
     if (table.indexed) {
-        if (heap.SwizzleEnabled() || heap.AddTid() || heap.OutOfBounds() > 1u) throw std::runtime_error("bindless image table indexed through a V# with swizzling, ADD_TID or an unbounded range check is not implemented");
-        entryBytes = heap.Stride();
-        if (entryBytes < static_cast<std::uint64_t>(table.entryOffset) + TableEntryBytes) throw std::runtime_error("bindless heap record is smaller than its descriptor");
-        entries = heap.NumRecords();
+        if (heap.NumRecords() != 0u) {
+            if (heap.SwizzleEnabled() || heap.AddTid() || heap.OutOfBounds() > 1u) throw std::runtime_error("bindless image table indexed through a V# with swizzling, ADD_TID or an unbounded range check is not implemented");
+            entryBytes = heap.Stride();
+            if (entryBytes < static_cast<std::uint64_t>(table.entryOffset) + TableEntryBytes) throw std::runtime_error("bindless heap record is smaller than its descriptor");
+            entries = heap.NumRecords();
+        }
     } else {
         if (heapSize != 0u && (heapSize < table.entryOffset || (heapSize - table.entryOffset) % TableEntryBytes != 0u)) throw std::runtime_error("bindless heap contains a partial descriptor");
         entries = heapSize > table.entryOffset ? static_cast<std::uint32_t>(std::min<std::uint64_t>((heapSize - table.entryOffset) / TableEntryBytes, std::numeric_limits<std::uint32_t>::max())) : 0u;
@@ -415,8 +417,11 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         valid[i] = 1u;
     }
     if (table.laneKey && table.implicitDerivatives) {
-        for (std::size_t i = 1u; i < keys.size(); ++i) {
-            if (valid[i] != 0u && modes[i] != modes[0]) throw std::runtime_error("bindless image table keyed per lane holds images of different runtime modes under an implicit-derivative access, which is not implemented");
+        std::optional<std::uint32_t> boundMode;
+        for (std::size_t i = 0u; i < keys.size(); ++i) {
+            if (valid[i] == 0u) continue;
+            if (boundMode.has_value() && modes[i] != *boundMode) throw std::runtime_error("bindless image table keyed per lane holds images of different runtime modes under an implicit-derivative access, which is not implemented");
+            boundMode = modes[i];
         }
     }
     resolution.mapping.clear();
