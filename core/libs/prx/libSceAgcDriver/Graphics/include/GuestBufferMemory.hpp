@@ -13,6 +13,10 @@
 namespace AgcDriver::Graphics {
 
 void ShutdownGuestBufferWorkers();
+bool ResidentHeapMirrors();
+bool HeapMirrorExportInProgress();
+void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force = false);
+bool StoreHeapMirrorResults(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
 
 struct GuestMemorySnapshot {
     std::uint64_t address;
