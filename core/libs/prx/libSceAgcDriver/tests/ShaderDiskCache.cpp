@@ -75,6 +75,9 @@ void requireSameArtifact(const CompiledShaderArtifact& left, const CompiledShade
     require(left.vertexOffsetSgpr == right.vertexOffsetSgpr && left.instanceOffsetSgpr == right.instanceOffsetSgpr, prefix + "offset SGPRs differ");
     require(left.vertexOffsetShared == right.vertexOffsetShared && left.instanceOffsetShared == right.instanceOffsetShared && left.vertexOffsetConflict == right.vertexOffsetConflict && left.instanceOffsetConflict == right.instanceOffsetConflict, prefix + "offset flags differ");
     require(left.parameterExports == right.parameterExports, prefix + "parameter exports differ");
+    require(left.stencilReferences == right.stencilReferences, prefix + "stencil reference set differs");
+    require(left.stencilReplaySafe == right.stencilReplaySafe, prefix + "stencil replay proof differs");
+    require(left.stencilReferenceDword == right.stencilReferenceDword, prefix + "stencil replay push offset differs");
     require(left.fragmentParameters.size() == right.fragmentParameters.size(), prefix + "fragment parameter count differs");
     for (std::size_t i = 0; i < left.fragmentParameters.size(); ++i) {
         const auto& a = left.fragmentParameters[i];
@@ -167,6 +170,9 @@ RecompileResult sampleResult() {
     result.instanceOffsetConflict = true;
     result.parameterExports = {0, 3, 7};
     result.fragmentParameters = {{0, 1, true, false, true}, {2, 3, false, true}};
+    result.stencilReferences = {0u, 17u, 255u};
+    result.stencilReplaySafe = true;
+    result.stencilReferenceDword = 23u;
     result.poisonedSrtReads = 3;
     result.barycentricEmulation = {true, false, true};
     result.variantId = 99;
@@ -250,6 +256,7 @@ CompiledVariant sampleVariant() {
     info.bindings.pushDataStartDword = 2;
     info.bindings.memoryOffsetDword = 1;
     info.bindings.memoryOffsetCount = 5;
+    info.bindings.stencilReferenceDword = 23u;
     info.bindings.userDataRegisters = {4, 5, 9};
     info.bindings.descriptors = {{DescriptorBindingKind::Buffers, {0, 1}}, {DescriptorBindingKind::FlattenedSrt, {}}};
     variant.bindings.layout = info.bindings;
