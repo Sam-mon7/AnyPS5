@@ -21,6 +21,7 @@
 #include <deque>
 #include <initializer_list>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -259,8 +260,14 @@ void HtileKernelClearsSlices(AgcDriver::VulkanDevice& device, const Shaders& sha
 }
 
 int main() {
+    const auto destroyDevice = [](AgcDriver::VulkanDevice* device) {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        delete device;
+    };
+    // Keep the standalone device alive until success or failure has stopped the driver.
+    std::unique_ptr<AgcDriver::VulkanDevice, decltype(destroyDevice)> device(nullptr, destroyDevice);
     try {
-        const auto device = OpenVulkanTestDevice();
+        device.reset(OpenVulkanTestDevice().release());
         if (!device) return VulkanTestSkipped;
         const auto shaders = Compile(*device);
         DmaFillClearsDepth(*device, shaders);

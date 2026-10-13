@@ -218,6 +218,13 @@ public:
         std::vector<std::byte> bytes;
         std::size_t replaced = 0, reused = 0, proved = 0, detiled = 0;
         static const bool memo = std::getenv("APS5_NO_DEPTH_UPLOAD_MEMO") == nullptr;
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        enum Reject : std::size_t { Layout, Missing, Size, NoEpoch, Epoch, Forget, Journal, RecorderOverlap, StorageOverlap, RejectCount };
+        std::array<std::size_t, RejectCount> rejected{};
+        const auto checked = [&](bool accepted, Reject reason) {
+            if (!accepted && profile) ++rejected[reason];
+            return accepted;
+        };
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             auto& upload = guestUploads[layer];
             auto& proof = uploadProofs[layer];
@@ -233,10 +240,15 @@ public:
             const auto serial = GuestMemory::WriteJournalSerial();
             const auto forget = GuestMemory::ForgetSerial();
             const std::array range{std::pair{address, address + size}};
-            const bool current = !layoutChanged && upload != nullptr && upload->Bytes().size() == size && epoch != 0 &&
-                proof.epoch == epoch && proof.forget == forget && (forget & 1u) == 0 &&
-                !GuestMemory::JournalTouchedSince(proof.serial, address, size) &&
-                !Recorder::SnapshotWriteOverlaps(address, size) && !StorageTexture::AnyPendingOverlaps(range);
+            const bool current = checked(!layoutChanged, Layout) &&
+                checked(upload != nullptr, Missing) &&
+                checked(upload->Bytes().size() == size, Size) &&
+                checked(epoch != 0, NoEpoch) &&
+                checked(proof.epoch == epoch, Epoch) &&
+                checked(proof.forget == forget && (forget & 1u) == 0, Forget) &&
+                checked(!GuestMemory::JournalTouchedSince(proof.serial, address, size), Journal) &&
+                checked(!Recorder::SnapshotWriteOverlaps(address, size), RecorderOverlap) &&
+                checked(!StorageTexture::AnyPendingOverlaps(range), StorageOverlap);
             if (current) {
                 ++proved;
             } else {
@@ -258,8 +270,7 @@ public:
                 ++detiled;
             }
         }
-        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        if (profile && reused != 0) AgcDriver::ProfilePrint_nid_no_patch("[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu proved=%zu detiled=%zu bytes-per-layer=%llu\n", static_cast<unsigned long long>(resource.baseAddress), layers, reused - replaced, replaced, proved, detiled, static_cast<unsigned long long>(geometry.layerBytes));
+        if (profile && reused != 0) AgcDriver::ProfilePrint_nid_no_patch("[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu proved=%zu detiled=%zu bytes-per-layer=%llu reject-layout=%zu reject-missing=%zu reject-size=%zu reject-no-epoch=%zu reject-epoch=%zu reject-forget=%zu reject-journal=%zu reject-recorder=%zu reject-storage=%zu\n", static_cast<unsigned long long>(resource.baseAddress), layers, reused - replaced, replaced, proved, detiled, static_cast<unsigned long long>(geometry.layerBytes), rejected[Layout], rejected[Missing], rejected[Size], rejected[NoEpoch], rejected[Epoch], rejected[Forget], rejected[Journal], rejected[RecorderOverlap], rejected[StorageOverlap]);
         if (detiled != 0) {
             Require(context.detiler != nullptr, "depth plane copy requires a texture detiler");
             context.detiler->BeginBatch();

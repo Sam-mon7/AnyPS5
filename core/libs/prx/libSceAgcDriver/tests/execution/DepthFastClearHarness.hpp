@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_TESTS_EXECUTION_DEPTHFASTCLEARHARNESS_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
@@ -9,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <vector>
@@ -105,6 +107,9 @@ inline Shaders Compile(AgcDriver::VulkanDevice& device) {
 }
 
 inline std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& compiled, const Surface& surface, const DrawOptions& options) {
+    // Standalone draws share recorder state with any PM4 queue workers in the fixture.
+    std::unique_lock gpuLock(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+    if (!AgcDriver::GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
     Pixels.fill(std::byte{0});
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {ShaderStage::Vertex, &compiled.vertex, 0},
