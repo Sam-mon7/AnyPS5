@@ -165,6 +165,20 @@ std::shared_ptr<Texture> lookup(const Context& context, const View& view) {
     return DepthSurfaceTexture(context, words, DecodeTextureResource(words), VkComponentMapping{});
 }
 
+void rejectStorageCopy(const Context& context, const View& view, std::string_view reason) {
+    const auto resource = DecodeTextureResource(tsharp(view));
+    for (bool toDepth : {false, true}) {
+        bool rejected = false;
+        try {
+            if (toDepth) CopyImageToDepthPlane(context, resource, VK_NULL_HANDLE);
+            else CopyDepthPlaneToImage(context, resource, VK_NULL_HANDLE);
+        } catch (const std::runtime_error& error) {
+            rejected = std::string_view(error.what()).find(reason) != std::string_view::npos;
+        }
+        Require(rejected, "unsupported storage depth copy must fail before recording Vulkan commands");
+    }
+}
+
 void TestD16StencilFallback(const Context& context) {
     Require(HostDepthFormat(context, VK_FORMAT_D16_UNORM_S8_UINT) == VK_FORMAT_D16_UNORM_S8_UINT && HostDepthBiasConstant(context, VK_FORMAT_D16_UNORM_S8_UINT, 2.0f) == 2.0f, "a device with D16_UNORM_S8_UINT must keep it and its depth bias");
     static int withoutTag = 0;
@@ -177,6 +191,7 @@ void TestD16StencilFallback(const Context& context) {
     Require(HostDepthFormat(without, VK_FORMAT_D32_SFLOAT_S8_UINT) == VK_FORMAT_D32_SFLOAT_S8_UINT && HostDepthFormat(without, VK_FORMAT_D16_UNORM) == VK_FORMAT_D16_UNORM, "only D16_UNORM_S8_UINT is replaced");
     DepthSurfaceView(without, {d16s8, d16s8Stencil, {256, 256}, VK_FORMAT_D16_UNORM_S8_UINT, 1.0f, 0});
     Require(lastImageFormat == VK_FORMAT_D24_UNORM_S8_UINT, "a D16_UNORM_S8_UINT surface was not created as D24_UNORM_S8_UINT on a device without it");
+    rejectStorageCopy(without, {d16s8, FormatR16Unorm, 256, 256}, "widened depth");
     Require(lookup(without, {d16s8, FormatR16Unorm, 256, 256}) != nullptr, "an R16 view of a D16 surface stored as D24 must still sample its depth plane");
     Require(lookup(without, {d16s8Stencil, FormatR8Uint, 256, 256}) != nullptr, "an 8-bit view of the stencil plane of a D16 surface stored as D24 must sample it");
     bool arrayRefused = false;
@@ -245,8 +260,10 @@ void RunDepthSurfaceReuseTests() {
         const auto words = tsharp(view);
         return DepthSurfaceAt(owner, words, DecodeTextureResource(words));
     };
-    Require(storageAliasesDepth(context, {depth32, FormatR32Float, 384, 384}), "storage access to the actual D32 plane must remain rejected");
-    Require(storageAliasesDepth(context, {depth16, FormatR16Uint, 256, 256}), "raw D16 storage access must remain rejected");
+    Require(storageAliasesDepth(context, {depth32, FormatR32Float, 384, 384}), "storage access to the actual D32 plane must identify the depth alias");
+    Require(storageAliasesDepth(context, {depth16, FormatR16Uint, 256, 256}), "raw D16 storage access must identify the depth alias");
+    rejectStorageCopy(context, {depth32, FormatR32Float, 128, 128}, "matching single-sample 2D");
+    rejectStorageCopy(context, {depth32, FormatR32Float, 384, 384, TileDepth64KB, Type2DArray, 1}, "matching single-sample 2D");
     Require(!storageAliasesDepth(context, {depth32, FormatR32Float, 128, 128}), "temporary memory reused at a different extent is not a depth storage alias");
     Require(!storageAliasesDepth(context, {depth32, FormatR11G11B10Float, 384, 384}), "temporary memory reused for a color format is not a depth storage alias");
     Require(!storageAliasesDepth(context, {depth32, FormatR32Uint, 384, 384, TileRenderTarget64KB}), "raw integer color memory without a depth layout is not a depth storage alias");
@@ -258,13 +275,15 @@ void RunDepthSurfaceReuseTests() {
     constexpr std::uint64_t stencil16 = 0x60000000;
     DepthSurfaceView(context, {depth16, stencil16, {128, 128}, VK_FORMAT_D16_UNORM_S8_UINT, 1.0f, 0});
     Require(!storageAliasesDepth(context, {depth16, FormatR16Unorm, 256, 256}), "an older depth extent at the same address must not override the newest surface");
-    Require(storageAliasesDepth(context, {depth16, FormatR16Unorm, 128, 128}), "the newest depth extent must still reject actual storage access");
+    Require(storageAliasesDepth(context, {depth16, FormatR16Unorm, 128, 128}), "the newest depth extent must identify actual storage access");
     Require(storageAliasesDepth(context, {stencil16, FormatR8Uint, 128, 128}), "storage access to the actual stencil plane must remain rejected");
+    rejectStorageCopy(context, {stencil16, FormatR8Uint, 128, 128}, "stencil plane");
     Require(!storageAliasesDepth(context, {stencil16, FormatR11G11B10Float, 128, 128}), "a stencil address reused for color is not a stencil storage alias");
 
     auto multisampled = DepthTarget{0x71000000, 0, {128, 128}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
     multisampled.samples = 4;
     DepthSurfaceView(context, multisampled);
+    rejectStorageCopy(context, {multisampled.address, FormatR32Float, 128, 128}, "matching single-sample 2D");
     bool copyRefused = false;
     try {
         lookup(context, {multisampled.address, FormatR32Float, 128, 128, TileDepth64KB, Type2DArray, 1});

@@ -500,6 +500,8 @@ private:
     std::vector<bool> textureFirstLayer;
     std::vector<bool> textureBaseLevel;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
+    std::vector<bool> storageDepth;
+    void WriteBackDepthPlanes();
     std::vector<std::uint32_t> storageMips;
     std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;

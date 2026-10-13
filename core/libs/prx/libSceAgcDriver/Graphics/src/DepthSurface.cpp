@@ -571,6 +571,51 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
     }
 }
 
+namespace {
+
+void copyDepthPlane(const Context& context, const GuestTextureResource& resource, VkImage colorImage, bool toDepth) {
+    std::lock_guard lock(surfacesMutex());
+    const auto& list = surfaces();
+    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress)); });
+    Require(found != list.rend() && (*found)->target.address == resource.baseAddress && (*found)->target.stencilAddress != resource.baseAddress, "storage image access to a stencil plane or missing depth surface is not implemented");
+    auto& surface = **found;
+    const bool d16 = surface.target.format == VK_FORMAT_D16_UNORM || surface.target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+    const bool hostD16 = surface.hostFormat == VK_FORMAT_D16_UNORM || surface.hostFormat == VK_FORMAT_D16_UNORM_S8_UINT;
+    const auto texelBytes = d16 ? 2u : 4u;
+    Require(d16 == hostD16 && surface.hostFormat != VK_FORMAT_D24_UNORM_S8_UINT, "storage access to a widened depth format is not implemented");
+    Require(surface.target.samples == 1 && resource.dimension == TextureDimension::k2D && resource.width == surface.target.extent.width && resource.height == surface.target.extent.height && resource.baseLevel == 0 && resource.baseArray == 0 && resource.depthOrLastArray == 0 && BytesPerElement(resource.format) == texelBytes, "storage depth plane requires a matching single-sample 2D level-zero view");
+    surface.ApplyFastClear();
+    auto* recorder = RecorderFor(context);
+    std::unique_ptr<CommandBatch> batch;
+    if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+    const auto bytes = static_cast<std::size_t>(resource.width) * resource.height * texelBytes;
+    auto staging = std::make_shared<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+    if (recorder != nullptr) recorder->Keep(staging, staging->Size());
+    VkBufferImageCopy depth{};
+    depth.imageExtent = {resource.width, resource.height, 1};
+    depth.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    auto color = depth;
+    color.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    constexpr VkAccessFlags accesses = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, accesses, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, toDepth ? colorImage : surface.image, VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, toDepth ? &color : &depth);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    context.Resolved(&DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage")(commands, staging->Handle(), toDepth ? surface.image : colorImage, VK_IMAGE_LAYOUT_GENERAL, 1, toDepth ? &depth : &color);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, accesses);
+    if (batch != nullptr) batch->SubmitAndWait();
+}
+
+}
+
+void CopyDepthPlaneToImage(const Context& context, const GuestTextureResource& resource, VkImage destination) {
+    copyDepthPlane(context, resource, destination, false);
+}
+
+void CopyImageToDepthPlane(const Context& context, const GuestTextureResource& resource, VkImage source) {
+    copyDepthPlane(context, resource, source, true);
+}
+
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource) {
     std::lock_guard lock(surfacesMutex());
     const auto& list = surfaces();
