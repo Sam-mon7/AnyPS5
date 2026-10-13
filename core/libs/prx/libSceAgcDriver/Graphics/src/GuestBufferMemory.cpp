@@ -3283,7 +3283,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         generation = GuestMemory::CollectWritesUncached(region.begin, static_cast<std::size_t>(bytes));
         registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         if (generation != 0) {
-            if (auto cached = snapshots->ReusableDrawSnapshot(region.begin, static_cast<std::size_t>(bytes), Recorder::SnapshotUse::Storage, nullptr, generation)) {
+            if (auto cached = snapshots->ReusableDrawSnapshot(region.begin, static_cast<std::size_t>(bytes), Recorder::SnapshotUse::Storage, nullptr, nullptr, generation)) {
                 region.buffer = std::move(cached);
                 region.snapshot.clear();
                 if (profile) {
