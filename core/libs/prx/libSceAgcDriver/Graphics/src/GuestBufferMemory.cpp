@@ -659,7 +659,7 @@ bool pointerHeld(const HostImports& state, const HostImport& entry) {
 
 bool evictable(const HostImports& state, const HostImport& entry) {
     constexpr std::uint64_t protectedUses = 256;
-    return !pointerHeld(state, entry) && entry.lastUse + protectedUses < state.useCounter;
+    return !entry.addressRequired && !pointerHeld(state, entry) && entry.lastUse + protectedUses < state.useCounter;
 }
 
 std::uint64_t retireLeastRecent(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t wanted) {
@@ -759,9 +759,11 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     auto first = state.imports.lower_bound(base);
     if (first != state.imports.begin() && std::prev(first)->second.base + std::prev(first)->second.bytes > base) --first;
     std::uint64_t replaced = 0;
+    bool addressRequired = false;
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
         if (pointerHeld(state, it->second)) return nullptr;
         replaced += it->second.bytes;
+        addressRequired = addressRequired || it->second.addressRequired;
     }
     // Map observers run without the GPU lock. Replacing an overlapping window retires its buffer to the recorder,
     // just like budget eviction, so leave it for the next locked use even when the replacement fits the budget.
@@ -787,6 +789,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     if (state.liveBytes + bytes > budget) retireLeastRecent(context, state, lease, state.liveBytes + bytes - budget);
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+    entry.addressRequired = addressRequired;
     entry.range = run.ranges.front();
     entry.ranges = std::move(run.ranges);
 #ifdef _WIN32
@@ -823,7 +826,9 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         } catch (const std::runtime_error&) {
             if (entry.ranges.size() == 1) throw;
             state.unaliasedSpans.insert(base);
-            return importAllocation(context, state, address, lease, end, evict);
+            const auto* replacement = importAllocation(context, state, address, lease, end, evict);
+            if (replacement != nullptr && addressRequired) replacement->addressRequired = true;
+            return replacement;
         }
     }
 #else
@@ -2405,7 +2410,10 @@ void GuestBufferMemory::AcquireRegistered() {
             if (hit) {
                 const auto stamp = ++state.useCounter;
                 for (const auto& region : current->base) {
-                    if (region.direct != nullptr) region.direct->lastUse = stamp;
+                    if (region.direct != nullptr) {
+                        region.direct->lastUse = stamp;
+                        region.direct->addressRequired = true;
+                    }
                 }
             }
         }
@@ -2470,6 +2478,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
                 entry = importAllocation(context, state, range->address, lease, 0, false);
+                if (entry != nullptr) entry->addressRequired = true;
             }
             lap(timing.importsUs, at);
             if (entry != nullptr) {

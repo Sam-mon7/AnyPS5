@@ -372,6 +372,77 @@ void importRefusedWholeRangeTests(const Context& context) {
     Require(kept != nullptr && kept->buffer == buffer, "the range's window was imported again after a refused whole-range import");
 }
 
+// A whole import once used by an address-space build cannot be restored by budget eviction on that path. Ordinary
+// descriptor builds must retire another eligible import, even after its current-build and recency protection expire.
+void importAddressSpaceRetentionTests(const Context& context) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    constexpr auto piece = WindowedRange::piece;
+    auto* block = static_cast<std::byte*>(::operator new(10 * piece, std::align_val_t{piece}));
+    std::memset(block, 0x33, 10 * piece);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    const auto cold = first + 5 * piece;
+    const auto hot = first + 7 * piece;
+    const auto next = first + 9 * piece;
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    ClearHostImports(importing.device);
+    SetHostImportRangeWindow(piece);
+    SetHostImportBudget(6 * piece);
+    GuestAllocations::Mutation().Add(block, 4 * piece, true, true, true);
+    for (const auto offset : {5u, 7u, 9u}) {
+        // Descriptor imports need readable registration; only the first range is globally BDA-mapped.
+        GuestAllocations::Mutation().Add(block + offset * piece, piece, true, false, false);
+    }
+    const auto buildAddressSpace = [&] {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddWritable(first + 16, 32);
+        leased.Upload(true);
+        Require(HostImportCovers(importing, first, 4 * piece) && !leased.HasCopiedWrites(), "an address-required whole import fell back to copies");
+        std::uint32_t adjustment = 0;
+        const auto* whole = HostImportFor(importing, first, 4 * piece);
+        Require(whole != nullptr && leased.Descriptor(first + 16, 32, adjustment).buffer == whole->buffer, "the address-based view lost its whole import");
+        leased.WriteBack();
+    };
+    buildAddressSpace();
+    const auto serial = HostImportSerial(importing, first, 4 * piece, false);
+    const auto built = AddressSpaceCounters();
+    buildAddressSpace();
+    if (built.enabled) Require(AddressSpaceCounters().hits == built.hits + 1, "the retention fixture did not acquire a cached address space");
+    Require(serial != 0 && HostImportFor(importing, cold, 32) != nullptr && HostImportFor(importing, hot, 32) != nullptr, "the retention fixture did not fill its import budget");
+    {
+        GuestBufferMemory ordinary(importing);
+        ordinary.AddReadable(hot, 32);
+        ordinary.Upload(false);
+        for (int use = 0; use < 300; ++use) Require(HostImportFor(importing, hot, 32) != nullptr, "the hot import disappeared while aging the address-required import");
+        Require(HostImportFor(importing, next, 32) != nullptr, "protecting an address-required import prevented ordinary LRU admission");
+        Require(HostImportSerial(importing, first, 4 * piece, false) == serial && HostImportCovers(importing, first, 4 * piece), "ordinary LRU retired a previously address-required whole import");
+        Require(!HostImportCovers(importing, cold, 32) && HostImportCovers(importing, hot, 32) && HostImportLiveBytes() == 6 * piece, "ordinary LRU did not retire the unprotected cold import within budget");
+        ordinary.WriteBack();
+    }
+    // The ordinary eviction changed the import epoch; rebuilding must still find the same whole import.
+    buildAddressSpace();
+    Require(HostImportSerial(importing, first, 4 * piece, false) == serial, "the next address-space build replaced its protected import");
+    GuestAllocations::Mutation().Remove(block);
+    GuestAllocations::Mutation().Add(block, 4 * piece, true, true, false);
+    Require(HostImportFor(importing, first, 4 * piece) != nullptr && HostImportSerial(importing, first, 4 * piece, false) != serial, "registry replacement retained the old address-required import");
+    {
+        GuestBufferMemory ordinary(importing);
+        ordinary.AddReadable(hot, 32);
+        ordinary.AddReadable(next, 32);
+        ordinary.Upload(false);
+        for (int use = 0; use < 300; ++use) Require(HostImportFor(importing, hot, 32) != nullptr, "the hot import disappeared after remapping");
+        Require(HostImportFor(importing, cold, 32) != nullptr && !HostImportCovers(importing, first, 4 * piece), "a new ordinary import inherited a retired registration's address-required role");
+        ordinary.WriteBack();
+    }
+    GuestAllocations::Mutation().Remove(block);
+    for (const auto offset : {5u, 7u, 9u}) GuestAllocations::Mutation().Remove(block + offset * piece);
+    ClearHostImports(importing.device);
+    SetHostImportBudget(0);
+    SetHostImportRangeWindow(std::uint64_t{64} << 20u);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 // Two uses across neighbouring cell edges of one range, each in a build of its own, share one import: the second grows
 // the first's window to their union, and later rounds of both keep it. Before, each replaced the other's window at
 // every use.
@@ -1557,6 +1628,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importWindowTests(context);
     importWholeRangeOverWindowTests(context);
     importRefusedWholeRangeTests(context);
+    importAddressSpaceRetentionTests(context);
     importNeighbouringEdgesTests(context);
     importAtMapOverBudgetTests(context);
     importAtMapOverlapTests(context);

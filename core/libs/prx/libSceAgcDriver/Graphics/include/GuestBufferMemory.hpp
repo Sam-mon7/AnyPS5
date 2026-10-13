@@ -39,6 +39,8 @@ struct HostImport {
     bool dmaBuf = false;
     std::shared_ptr<void> chunk;
     mutable std::uint64_t lastUse = 0;
+    // A whole import used by an address-space build must remain available: that path cannot evict to restore it.
+    mutable bool addressRequired = false;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
