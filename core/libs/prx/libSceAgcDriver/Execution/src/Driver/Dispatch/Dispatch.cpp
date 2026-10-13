@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -82,6 +83,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
+        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
             return;
@@ -95,7 +97,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     if (partialLastGroup) compute.partialThreads = partialGroups;
     ShaderRecompiler::RecompileRequest request{
-        {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
+        {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header, SnapshotCodeHash(snapshot, codeOffset)},
         {(packet[4] & 0x8000u) != 0 ? 32u : 64u, 0, userData, compute, std::nullopt, std::nullopt, memory, RegisteredFloatMode(snapshot)},
         localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
         {0, 0, 0, 128}

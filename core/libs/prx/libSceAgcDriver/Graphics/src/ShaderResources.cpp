@@ -2847,6 +2847,34 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
     return {set, pool, chain.size() - 1, updateAfterBind};
 }
 
+DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes) {
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = recycled.find(layout); found != recycled.end() && !found->second.empty()) {
+            const auto allocation = found->second.back();
+            found->second.pop_back();
+            return allocation;
+        }
+    }
+    return Allocate(layout, sizes);
+}
+
+void DescriptorCache::Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept {
+    if (allocation.set == VK_NULL_HANDLE || allocation.pool == VK_NULL_HANDLE) return;
+    {
+        std::lock_guard lock(mutex);
+        try {
+            auto& list = recycled[layout];
+            if (list.size() < 4096) {
+                list.push_back(allocation);
+                return;
+            }
+        } catch (...) {
+        }
+    }
+    Free(allocation);
+}
+
 void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
     if (allocation.set == VK_NULL_HANDLE || allocation.pool == VK_NULL_HANDLE) return;
     std::lock_guard lock(mutex);
@@ -3485,8 +3513,14 @@ bool ShaderResources::LayoutUpdateAfterBind() const {
 }
 
 ShaderResources::DrawBindings::~DrawBindings() {
-    if (cache != nullptr && allocation.set != VK_NULL_HANDLE) cache->Free(allocation);
-    if (cache != nullptr && fragmentAllocation.set != VK_NULL_HANDLE) cache->Free(fragmentAllocation);
+    if (cache == nullptr) return;
+    const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
+        if (set.set == VK_NULL_HANDLE) return;
+        if (setLayout != VK_NULL_HANDLE) cache->Recycle(setLayout, set);
+        else cache->Free(set);
+    };
+    release(layout, allocation);
+    release(fragmentLayout, fragmentAllocation);
 }
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
@@ -3543,24 +3577,34 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
+constexpr std::size_t FreshCopyLimit = 4096;
+constexpr std::size_t PatchedSnapshotBytes = 65536;
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = MaxDrawSnapshotBytes();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
-    std::vector<std::size_t> selected;
+    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
+    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    selected.clear();
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+            Recorder::SnapshotSlice slice{};
+            static const bool movedRing = std::getenv("APS5_MOVED_RING") == nullptr || std::strcmp(std::getenv("APS5_MOVED_RING"), "0") != 0;
+            if (movedRing && Recorder::SnapshotRingEnabled()) slice = recorder.AllocateDrawSnapshot(override->size);
+            auto buffer = slice.buffer != nullptr ? std::move(slice.buffer) : std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            const VkDeviceSize offset = buffer != nullptr && slice.offset != 0 ? slice.offset : 0;
+            auto* bytes = buffer->Bytes().data() + offset;
+            std::memcpy(bytes, override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer)});
+            result->snapshots.push_back({0, std::move(buffer), offset, override->size});
             continue;
         }
         std::uint64_t address = item.address;
@@ -3576,16 +3620,37 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
         if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        static const bool freshCopy = [] { const char* text = std::getenv("APS5_SNAPSHOT_FRESH_COPY"); return text == nullptr || std::strcmp(text, "0") != 0; }();
+        if (freshCopy && bytes <= FreshCopyLimit && Recorder::SnapshotRingEnabled()) {
+            auto slice = recorder.AllocateDrawSnapshot(bytes);
+            if (slice.buffer != nullptr) {
+                std::memcpy(slice.buffer->Bytes().data() + slice.offset, reinterpret_cast<const void*>(begin), bytes);
+                selected.push_back(index);
+                result->snapshots.push_back({begin, std::move(slice.buffer), slice.offset, bytes});
+                totalSnapshotBytes += bytes;
+                CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+                continue;
+            }
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
-        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+        VkDeviceSize offset = 0;
+        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, &offset, generation);
         if (buffer == nullptr) {
-            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-            recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+            if (Recorder::SnapshotRingEnabled() && bytes < PatchedSnapshotBytes) {
+                auto slice = recorder.AllocateDrawSnapshot(bytes);
+                buffer = std::move(slice.buffer);
+                offset = slice.offset;
+            }
+            if (buffer == nullptr) {
+                buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                offset = 0;
+            }
+            std::memcpy(buffer->Bytes().data() + offset, reinterpret_cast<const void*>(begin), bytes);
+            recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer, Recorder::SnapshotUse::Storage, 0, offset);
         }
         selected.push_back(index);
-        result->snapshots.push_back({begin, std::move(buffer)});
+        result->snapshots.push_back({begin, std::move(buffer), offset, bytes});
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -3595,11 +3660,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (const auto& binding : bindings) descriptions[setOf(binding)].push_back(binding.layout);
     result->cache = context.descriptorCache;
     if (!descriptions[0].empty() || splitSets) {
-        result->allocation = result->cache->Allocate(_layout, PoolSizes(descriptions[0]));
+        result->allocation = result->cache->AllocateRewritten(_layout, PoolSizes(descriptions[0]));
+        result->layout = _layout;
         Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     if (!descriptions[1].empty() || splitSets) {
-        result->fragmentAllocation = result->cache->Allocate(fragment.layout, PoolSizes(descriptions[1]));
+        result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, PoolSizes(descriptions[1]));
+        result->fragmentLayout = fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     auto buffers = descriptorBuffers;
@@ -3617,7 +3684,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
             const auto& snapshot = result->snapshots[snapshotIndex];
-            buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+            buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
         }
     }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);

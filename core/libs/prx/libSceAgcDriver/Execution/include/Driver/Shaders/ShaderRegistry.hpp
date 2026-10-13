@@ -77,6 +77,16 @@ struct RegisteredShaderState {
     Registers userConfig;
 };
 
+struct CodeHashMemo {
+    struct CodeHash {
+        std::size_t offset = ~std::size_t{0};
+        std::uint64_t hash = 0;
+    };
+    std::mutex mutex;
+    std::array<CodeHash, 4> codeHashes;
+    std::size_t nextCodeHash = 0;
+};
+
 struct ShaderSnapshot {
     std::uint64_t codeAddress;
     std::uint64_t headerAddress;
@@ -85,6 +95,7 @@ struct ShaderSnapshot {
     std::vector<std::byte> header;
     std::shared_ptr<PreparedShaders> prepared = std::make_shared<PreparedShaders>();
     std::shared_ptr<const RegisteredShaderState> registeredState;
+    std::shared_ptr<CodeHashMemo> codeHashes = std::make_shared<CodeHashMemo>();
     std::shared_ptr<std::atomic<std::uint8_t>> workgroupUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<std::uint8_t>> positionVectorUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
 };
@@ -117,6 +128,8 @@ void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<
 
 ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, std::uint64_t vertexId, std::uint64_t fragmentId);
 ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint64_t vertexId, std::uint64_t fragmentId, const ShaderRecompiler::SpirvTarget& target);
+
+std::uint64_t SnapshotCodeHash(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);

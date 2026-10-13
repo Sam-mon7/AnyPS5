@@ -1,3 +1,4 @@
+#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -5,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -854,8 +856,27 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
+    std::uint64_t generation = 1;
+    std::uint64_t identityHits = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
+
+bool pipelineIdentity() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_PIPELINE_IDENTITY"); return text == nullptr || std::strcmp(text, "0") != 0; }();
+    return enabled;
+}
+
+struct LastPipeline {
+    std::vector<std::byte> key;
+    std::vector<std::byte> scratch;
+    std::list<PipelineStore::Entry>::iterator entry;
+    std::uint64_t generation = 0;
+};
+
+LastPipeline& ThreadLastPipeline() {
+    thread_local LastPipeline* last = nullptr;
+    return ShaderRecompiler::ThreadOwned(last);
+}
 
 // Never destroyed: the pipelines belong to a device that may already be gone when statics die, and
 // the device's teardown (ClearCachedPipelines) is the place to destroy them.
@@ -875,6 +896,7 @@ bool alive(const PipelineStore::Entry& entry, const Context& context) {
 // not destroyed.
 std::list<PipelineStore::Entry>::iterator abandon(PipelineStore& store, std::list<PipelineStore::Entry>::iterator it) {
     it->pipeline->Abandon();
+    ++store.generation;
     store.index.erase(it->hash);
     return store.entries.erase(it);
 }
@@ -886,8 +908,8 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
-    store.hits = store.misses = store.uncached = store.evicted = 0;
+    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%; %llu repeats of the thread's previous key), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.identityHits), static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
+    store.hits = store.misses = store.uncached = store.evicted = store.identityHits = 0;
 }
 
 }
@@ -902,8 +924,27 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     reportPipelines(store);
-    auto& key = store.scratchKey;
-    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    const bool identity = pipelineIdentity();
+    auto* last = identity ? &ThreadLastPipeline() : nullptr;
+    if (identity) {
+        pipelineKey(last->scratch, context, state, vertexInput, resources, shaders, attachmentLayout);
+        if (!last->scratch.empty() && last->generation == store.generation && last->scratch == last->key && alive(*last->entry, context)) {
+            ++store.hits;
+            ++store.identityHits;
+            store.entries.splice(store.entries.end(), store.entries, last->entry);
+            return last->entry->pipeline;
+        }
+        last->generation = 0;
+    } else {
+        pipelineKey(store.scratchKey, context, state, vertexInput, resources, shaders, attachmentLayout);
+    }
+    const auto& key = identity ? last->scratch : store.scratchKey;
+    const auto remember = [&](std::list<PipelineStore::Entry>::iterator entry) {
+        if (!identity) return;
+        last->key = key;
+        last->entry = entry;
+        last->generation = store.generation;
+    };
     if (key.empty()) {
         ++store.uncached;
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
@@ -917,6 +958,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             if (alive(*it, context)) {
                 ++store.hits;
                 store.entries.splice(store.entries.end(), store.entries, it);
+                remember(it);
                 return it->pipeline;
             }
             abandon(store, it);
@@ -942,8 +984,10 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         if (victim == store.entries.end()) break;
         store.index.erase(victim->hash);
         store.entries.erase(victim);
+        ++store.generation;
         ++store.evicted;
     }
+    if (const auto found = store.index.find(hash); found != store.index.end() && found->second->pipeline == pipeline) remember(found->second);
     return pipeline;
 }
 
@@ -957,6 +1001,7 @@ void ClearCachedPipelines(VkDevice device) {
         }
         store.index.erase(it->hash);
         it = store.entries.erase(it);
+        ++store.generation;
     }
     ClearPipelineLibraries(device);
 }
