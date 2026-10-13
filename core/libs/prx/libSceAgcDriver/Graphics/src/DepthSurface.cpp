@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -219,6 +220,7 @@ public:
         std::size_t replaced = 0, reused = 0, proved = 0, detiled = 0;
         static const bool memo = std::getenv("APS5_NO_DEPTH_UPLOAD_MEMO") == nullptr;
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        static const bool traceCoverage = std::getenv("APS5_TRACE_DEPTH_COVERAGE") != nullptr;
         enum Reject : std::size_t { Layout, Missing, Size, NoEpoch, Epoch, Forget, Journal, RecorderOverlap, StorageOverlap, RejectCount };
         std::array<std::size_t, RejectCount> rejected{};
         const auto checked = [&](bool accepted, Reject reason) {
@@ -269,6 +271,10 @@ public:
                 uploads[layer] = upload;
                 ++detiled;
             }
+        }
+        if (traceCoverage && !coverageSampled && !layoutChanged && replaced == 0 && reused > proved) {
+            coverageSampled = true;
+            TraceCoverage(slices, resource, geometry);
         }
         if (profile && reused != 0) AgcDriver::ProfilePrint_nid_no_patch("[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu proved=%zu detiled=%zu bytes-per-layer=%llu reject-layout=%zu reject-missing=%zu reject-size=%zu reject-no-epoch=%zu reject-epoch=%zu reject-forget=%zu reject-journal=%zu reject-recorder=%zu reject-storage=%zu\n", static_cast<unsigned long long>(resource.baseAddress), layers, reused - replaced, replaced, proved, detiled, static_cast<unsigned long long>(geometry.layerBytes), rejected[Layout], rejected[Missing], rejected[Size], rejected[NoEpoch], rejected[Epoch], rejected[Forget], rejected[Journal], rejected[RecorderOverlap], rejected[StorageOverlap]);
         if (detiled != 0) {
@@ -349,7 +355,54 @@ private:
     std::vector<bool> guestDirty;
     std::array<std::uint32_t, 5> guestLayout{};
     bool initialized = false;
+    bool coverageSampled = false;
     std::map<std::array<std::uint32_t, 5>, std::shared_ptr<Texture>> textures;
+
+    void TraceCoverage(std::span<const VkImage> slices, const GuestTextureResource& resource, const SurfaceGeometry& geometry) const noexcept {
+        try {
+            constexpr std::uint64_t maxBytes = 512ull * 1024 * 1024;
+            if (layers == 0 || layers > 128 || geometry.layerBytes == 0 || geometry.layerBytes > maxBytes ||
+                geometry.GuestLayerOffset(layers - 1) > maxBytes - geometry.layerBytes) {
+                std::fprintf(stderr, "[depth-coverage] base=0x%llx layers=%u status=outside-sample-bounds\n", static_cast<unsigned long long>(resource.baseAddress), layers);
+                return;
+            }
+            const auto envelopeBytes = geometry.GuestLayerOffset(layers - 1) + geometry.layerBytes;
+            if (resource.baseAddress > std::numeric_limits<std::uint64_t>::max() - envelopeBytes) {
+                std::fprintf(stderr, "[depth-coverage] base=0x%llx layers=%u status=address-overflow\n", static_cast<unsigned long long>(resource.baseAddress), layers);
+                return;
+            }
+            const auto forgetBefore = GuestMemory::ForgetSerial();
+            const auto unwatchBefore = GuestMemory::UnwatchSerial();
+            const auto commitment = GuestMemory::DescribeCommitted(resource.baseAddress, static_cast<std::size_t>(envelopeBytes));
+            std::uint64_t arrayReadable = 0, guestReadable = 0;
+            for (const auto& [begin, end] : commitment.ranges) arrayReadable += end - begin;
+            // Coverage only: false can mean partial tracking; readable absence does not prove reservation.
+            std::array<std::array<std::size_t, 3>, 2> counts{};
+            std::size_t guestLayers = 0, run = 0;
+            for (std::uint32_t layer = 0; layer < layers; ++layer) {
+                if (slices[layer] != VK_NULL_HANDLE) continue;
+                const auto address = resource.baseAddress + geometry.GuestLayerOffset(layer);
+                const auto end = address + geometry.layerBytes;
+                while (run < commitment.ranges.size() && commitment.ranges[run].second <= address) ++run;
+                std::uint64_t readable = 0;
+                for (auto i = run; i < commitment.ranges.size() && commitment.ranges[i].first < end; ++i) {
+                    readable += std::min(end, commitment.ranges[i].second) - std::max(address, commitment.ranges[i].first);
+                }
+                const bool watched = GuestMemory::Watched(address, static_cast<std::size_t>(geometry.layerBytes));
+                ++counts[watched ? 0 : 1][readable == geometry.layerBytes ? 0 : readable != 0 ? 1 : 2];
+                guestReadable += readable;
+                ++guestLayers;
+            }
+            const auto forgetAfter = GuestMemory::ForgetSerial();
+            const auto unwatchAfter = GuestMemory::UnwatchSerial();
+            const bool stable = forgetBefore == forgetAfter && (forgetAfter & 1u) == 0 && unwatchBefore == unwatchAfter;
+            std::fprintf(stderr, "[depth-coverage] base=0x%llx layers=%u guest-layers=%zu bytes-per-layer=%llu envelope-bytes=%llu array-readable-bytes=%llu guest-readable-bytes=%llu serials-stable=%u fully-watched-all-readable=%zu fully-watched-some-readable=%zu fully-watched-no-readable=%zu not-fully-watched-all-readable=%zu not-fully-watched-some-readable=%zu not-fully-watched-no-readable=%zu\n",
+                static_cast<unsigned long long>(resource.baseAddress), layers, guestLayers, static_cast<unsigned long long>(geometry.layerBytes), static_cast<unsigned long long>(envelopeBytes), static_cast<unsigned long long>(arrayReadable), static_cast<unsigned long long>(guestReadable), static_cast<unsigned>(stable), counts[0][0], counts[0][1], counts[0][2], counts[1][0], counts[1][1], counts[1][2]);
+        } catch (...) {
+            // A failed diagnostic consumes the sample without changing the refresh's proof or result.
+            std::fprintf(stderr, "[depth-coverage] base=0x%llx layers=%u status=sample-failed\n", static_cast<unsigned long long>(resource.baseAddress), layers);
+        }
+    }
 
     VkDeviceSize sliceBytes() const {
         return static_cast<VkDeviceSize>(extent.width) * extent.height * (format == VK_FORMAT_D32_SFLOAT ? 4u : 2u);
