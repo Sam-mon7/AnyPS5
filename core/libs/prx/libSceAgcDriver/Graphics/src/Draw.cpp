@@ -1837,6 +1837,24 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
+void PrewarmPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    if (shaders.empty() || shaders.front().program == nullptr || context.descriptorCache == nullptr) return;
+    try {
+        bool memoized = false, hit = false;
+        const auto fragmentOutputs = CachedFragmentOutputs(context, shaders, state, memoized, hit);
+        const auto masked = maskedState(state, fragmentOutputs);
+        const State& pipelineState = masked.has_value() ? *masked : state;
+        const auto& attributes = shaders.front().program->vertexAttributes;
+        const auto vertexInput = BuildVertexInputLayout(context, attributes);
+        const auto described = DescribeSetLayouts(context, shaders);
+        static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
+        static const bool recordDraws = std::getenv("APS5_SYNC_DRAWS") == nullptr;
+        const bool lean = recordDraws && !drawTransitions;
+        CachedPipeline(context, pipelineState, vertexInput, described.View(), shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    } catch (...) {
+    }
+}
+
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     PerformanceTimer timing("Graphics.Draw");
