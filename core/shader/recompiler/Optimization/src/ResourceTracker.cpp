@@ -643,7 +643,63 @@ private:
         return true;
     }
 
-    bool TryMakeLaneTableImage(IrValue& handle, IndirectImagePlan& plan) {
+    bool MayHoldDescriptor(std::array<IrValue*, 8> tuple, std::uint32_t depth, std::vector<std::array<IrValue*, 8>>& visited) const {
+        for (IrValue*& value : tuple) {
+            value = value->Resolve();
+        }
+        if (std::ranges::find(visited, tuple) != visited.end()) {
+            return false;
+        }
+        visited.push_back(tuple);
+        if (std::ranges::all_of(tuple, [](const IrValue* value) { return value->HasImmediate() && value->Type() == IrType::U32 && value->ImmediateU32() == 0u; })) {
+            return false;
+        }
+        constexpr SrtWalker walker;
+        LaneTableRead read;
+        const bool runtime = std::ranges::all_of(tuple, [&](const IrValue* value) { return value->Type() == IrType::U32 && walker.ValidateRuntimeValue(m_program.Resources(), value); });
+        if (runtime || std::ranges::all_of(tuple, [&](IrValue* value) { return MatchLaneTableRead(value, read); })) {
+            return true;
+        }
+        if (depth == phiSearchDepth) {
+            return true;
+        }
+        const IrValue& first = *tuple[0];
+        if (first.Opcode() == IrOpcode::SelectU32 && first.ArgumentCount() == 3u) {
+            const IrValue* condition = first.Argument(0)->Resolve();
+            std::array<IrValue*, 8> selected {};
+            std::array<IrValue*, 8> kept {};
+            for (std::size_t dword = 0; dword < tuple.size(); dword++) {
+                const IrValue& value = *tuple[dword];
+                if (value.Opcode() != IrOpcode::SelectU32 || value.ArgumentCount() != 3u || value.Argument(0)->Resolve() != condition) {
+                    return false;
+                }
+                selected[dword] = value.Argument(1);
+                kept[dword] = value.Argument(2);
+            }
+            return MayHoldDescriptor(selected, depth + 1u, visited) || MayHoldDescriptor(kept, depth + 1u, visited);
+        }
+        if (!first.IsPhi()) {
+            return false;
+        }
+        for (std::size_t edge = 0; edge < first.ArgumentCount(); edge++) {
+            std::array<IrValue*, 8> incoming {};
+            for (std::size_t dword = 0; dword < tuple.size(); dword++) {
+                if (!tuple[dword]->IsPhi() || tuple[dword]->Parent() != first.Parent()) {
+                    return false;
+                }
+                incoming[dword] = PhiIncoming(*tuple[dword], first.PhiBlock(edge));
+                if (incoming[dword] == nullptr) {
+                    return true;
+                }
+            }
+            if (MayHoldDescriptor(incoming, depth + 1u, visited)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool TryMakeLaneTableImage(IrValue& handle, bool implicitDerivatives, IndirectImagePlan& plan) {
         if (handle.Opcode() != IrOpcode::GetImageResource || handle.ArgumentCount() != 8u || handle.Parent() == nullptr) {
             return false;
         }
@@ -672,19 +728,11 @@ private:
                 return false;
             }
         }
-        const bool nullOther = std::ranges::all_of(reads, [](const LaneTableRead& read) {
-            return read.other == nullptr || (read.other->HasImmediate() && read.other->Type() == IrType::U32 && read.other->ImmediateU32() == 0u);
-        });
-        if (!nullOther) {
-            constexpr SrtWalker walker;
-            bool descriptor = true;
-            bool table = true;
-            for (const auto& read : reads) {
-                LaneTableRead other;
-                descriptor = descriptor && read.other->Type() == IrType::U32 && walker.ValidateRuntimeValue(m_program.Resources(), read.other);
-                table = table && MatchLaneTableRead(read.other, other);
-            }
-            if (descriptor || table) {
+        if (reads[0].other != nullptr) {
+            std::array<IrValue*, 8> others {};
+            std::ranges::transform(reads, others.begin(), &LaneTableRead::other);
+            std::vector<std::array<IrValue*, 8>> visited;
+            if (MayHoldDescriptor(others, 0u, visited)) {
                 return false;
             }
         }
@@ -716,10 +764,21 @@ private:
         table.entryOffset = static_cast<std::uint32_t>(entryOffset);
         table.laneKey = true;
         table.indexed = true;
+        table.implicitDerivatives = implicitDerivatives;
         DescriptorSource imageSource;
         imageSource.dwordCount = 8u;
         std::copy(heapSource.dwords.begin(), heapSource.dwords.begin() + 4u, imageSource.dwords.begin());
         std::copy(heapSource.dwords.begin(), heapSource.dwords.begin() + 4u, imageSource.dwords.begin() + 4u);
+        for (auto& known : m_sources) {
+            if (!known.indirectImage.has_value() || !known.indirectImage->laneKey) {
+                continue;
+            }
+            auto shared = *known.indirectImage;
+            shared.implicitDerivatives = table.implicitDerivatives;
+            if (shared == table) {
+                table.implicitDerivatives = known.indirectImage->implicitDerivatives = known.indirectImage->implicitDerivatives || table.implicitDerivatives;
+            }
+        }
         imageSource.indirectImage = table;
 
         plan.handle = &handle;
@@ -728,6 +787,15 @@ private:
         plan.roots = imageSource.dwords;
         plan.planningReads = false;
         return true;
+    }
+
+    bool ImplicitDerivatives(const IrValue& inst) const {
+        if (inst.Opcode() == IrOpcode::ImageQueryLod) {
+            return true;
+        }
+        const auto& memoryInfo = m_program.Resources().memoryInfo;
+        const auto index = inst.Flags<MemoryFlags>().index;
+        return inst.Opcode() == IrOpcode::ImageSampleRaw && (index >= memoryInfo.size() || !ImageSampleExplicitLod(memoryInfo[index].imageSampleFlags, m_program.Resources().stage));
     }
 
     static bool LaneRead(const IrValue& value) {
@@ -837,7 +905,7 @@ private:
         });
         static const bool tables = std::getenv("APS5_NO_BINDLESS_IMAGES") == nullptr;
         IndirectImagePlan plan;
-        if (!accepted && tables && expected == IrOpcode::GetImageResource && TryMakeLaneTableImage(*copy, plan)) {
+        if (!accepted && tables && expected == IrOpcode::GetImageResource && TryMakeLaneTableImage(*copy, ImplicitDerivatives(inst), plan)) {
             m_indirectImages.push_back(std::move(plan));
             accepted = true;
         }

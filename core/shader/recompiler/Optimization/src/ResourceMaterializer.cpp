@@ -397,6 +397,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     const std::uint64_t heapBase = heap.Base48();
     std::vector<DescriptorValue> candidates(keys.size());
     std::vector<std::uint8_t> valid(keys.size(), 0u);
+    std::vector<std::uint32_t> modes(keys.size(), 0u);
     std::uint32_t paddedNull = 0u;
     for (std::size_t i = 0u; i < keys.size(); ++i) {
         auto& candidate = candidates[i];
@@ -410,8 +411,13 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         if (!validImageDescriptor(candidate, image.r128)) throw std::runtime_error("bindless image table contains an invalid descriptor");
         const auto decoded = decodeImageDescriptor(candidate, image, plan.srgbDecodeFormats);
         if (decoded.fmask) throw std::runtime_error("bindless FMASK images are unsupported");
-        static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, candidate, plan.info.runtimeImageModes.at(imageIndex)));
+        modes[i] = ResourceMaterializer::RuntimeImageMode(image, candidate, plan.info.runtimeImageModes.at(imageIndex));
         valid[i] = 1u;
+    }
+    if (table.laneKey && table.implicitDerivatives) {
+        for (std::size_t i = 1u; i < keys.size(); ++i) {
+            if (valid[i] != 0u && modes[i] != modes[0]) throw std::runtime_error("bindless image table keyed per lane holds images of different runtime modes under an implicit-derivative access, which is not implemented");
+        }
     }
     resolution.mapping.clear();
     for (std::size_t i = 0u; i < keys.size(); ++i) {

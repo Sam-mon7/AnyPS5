@@ -20,8 +20,9 @@ struct BlockInfo {
 };
 
 struct DescriptorSource {
-    // A T# loaded from a table buffer (`heapSource`) at `entryOffset + key * 32`, the key a
-    // wave-uniform runtime value (handle argument `keyArg`). With `hasMaterial` the key is itself
+    // A T# loaded from a table buffer (`heapSource`) at `entryOffset + key * 32` (the table V#'s
+    // stride when `indexed`), the key a wave-uniform runtime value (handle argument `keyArg`), or
+    // each lane's own value when `laneKey`. With `hasMaterial` the key is itself
     // `M[readfirstlane(i) * selectorStride + selectorOffset]` over `materialSource`, so the key
     // set can be enumerated from the material records (see ResourceMaterializer).
     struct IndirectImage {
@@ -34,6 +35,7 @@ struct DescriptorSource {
         bool hasMaterial = false;
         bool laneKey = false;
         bool indexed = false;
+        bool implicitDerivatives = false;
 
         bool operator==(const IndirectImage& other) const = default;
     };
