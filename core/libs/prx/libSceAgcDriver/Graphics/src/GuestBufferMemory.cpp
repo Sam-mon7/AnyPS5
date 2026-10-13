@@ -3084,6 +3084,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
                 if (runCovers(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, region.begin, importRanges());
+                if (entry != nullptr && region.end > entry->base + entry->bytes) entry = importJoined(context, state, region.begin, region.end, importRanges());
+                if (entry != nullptr && (region.begin < entry->base || region.end > entry->base + entry->bytes)) entry = nullptr;
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
