@@ -778,7 +778,14 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
 class RegistrationPreparePool {
 public:
     static RegistrationPreparePool& Instance() {
-        static auto* pool = new RegistrationPreparePool(std::max(2u, std::thread::hardware_concurrency() / 2u));
+        static auto* pool = [] {
+            const auto hardware = std::max(1u, std::thread::hardware_concurrency());
+            const char* text = std::getenv("APS5_PREPARE_THREADS");
+            const auto requested = text != nullptr ? std::strtoul(text, nullptr, 10) : std::max(2u, hardware / 2u);
+            const auto count = static_cast<unsigned>(std::clamp<unsigned long>(requested, 1, hardware));
+            std::fprintf(stderr, "[shader-prepare] %u workers (APS5_PREPARE_THREADS)\n", count);
+            return new RegistrationPreparePool(count);
+        }();
         return *pool;
     }
 
