@@ -288,6 +288,9 @@ OpFunctionEnd
         } catch (const std::exception& error) {
             check(false, label + ": " + error.what());
         }
+    }
+}
+
 void testLargeFunctionArray() {
     constexpr std::uint32_t elementCount = 1000;
     const auto source = std::string(R"(OpCapability Shader
