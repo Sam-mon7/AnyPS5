@@ -1,5 +1,6 @@
 #include "BdaTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -13,14 +14,17 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <string>
+#include <string_view>
 
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -205,6 +209,328 @@ void importWindowTests(const Context& context) {
     for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, false);
     SetHostImportWindow(0);
     ::operator delete(block, std::align_val_t{window});
+}
+
+// One registered range of `cells` import windows of `window` bytes, with the window and the import budget set for the
+// test and reset after it.
+class WindowedRange {
+public:
+    WindowedRange(const Context& context, std::size_t window, std::size_t cells, std::uint64_t budget = 0) : window(window), bytes(window * cells), importing(context) {
+        block = ::operator new(bytes, std::align_val_t{piece});
+        std::memset(block, 0x33, bytes);
+        importing.hostImportAlignment = piece;
+        SetHostImportRangeWindow(window);
+        SetHostImportBudget(budget);
+        change(true);
+    }
+    ~WindowedRange() {
+        change(false);
+        SetHostImportBudget(0);
+        SetHostImportRangeWindow(std::uint64_t{64} << 20u);
+        ::operator delete(block, std::align_val_t{piece});
+    }
+    WindowedRange(const WindowedRange&) = delete;
+    WindowedRange& operator=(const WindowedRange&) = delete;
+
+    std::uintptr_t First() const { return reinterpret_cast<std::uintptr_t>(block); }
+
+    static constexpr std::size_t piece = 65536;
+    const std::size_t window;
+    const std::size_t bytes;
+    Context importing;
+
+private:
+    void change(bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+
+    void* block = nullptr;
+};
+
+// A registered range larger than the import window, its first window imported by an earlier access: an address-based
+// build (AcquireRegistered) must import the whole range, so a view in its last window binds (Demon's Souls threw
+// "guest buffer view ... exceeds its GPU owner" with the 64 MiB windows).
+void importWholeRangeOverWindowTests(const Context& context) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    WindowedRange range(context, 2 * WindowedRange::piece, 2);
+    const auto first = range.First();
+    const auto* windowed = HostImportFor(range.importing, first + 16, 32);
+    Require(windowed != nullptr && windowed->base == first && windowed->bytes == range.window, "an access to the first window of a large range was not imported as that window");
+    GuestBufferMemory leased(range.importing);
+    leased.AcquireRegistered();
+    leased.Upload(true);
+    std::uint32_t adjustment = 0;
+    const auto view = leased.Descriptor(first + range.bytes - WindowedRange::piece + 16, 32, adjustment);
+    Require(view.range == 32 + adjustment, "a view in the last window of a large registered range has no descriptor");
+    const auto* whole = HostImportFor(range.importing, first, range.bytes);
+    Require(whole != nullptr && whole->base == first && whole->bytes == range.bytes && view.buffer == whole->buffer, "an address-based build was served by the range's first window, not an import of the whole range");
+    leased.WriteBack();
+}
+
+// An address-based build whose whole-range import does not fit the budget leaves the range's window alone: before,
+// every such build retired the window and the next access imported it again.
+void importRefusedWholeRangeTests(const Context& context) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    WindowedRange range(context, 2 * WindowedRange::piece, 4, 3 * 2 * WindowedRange::piece);
+    const auto first = range.First();
+    const auto* windowed = HostImportFor(range.importing, first + 16, 32);
+    Require(windowed != nullptr && windowed->bytes == range.window, "the first window of a range over the budget was not imported");
+    const auto buffer = windowed->buffer;
+    for (int build = 0; build < 3; ++build) {
+        GuestBufferMemory leased(range.importing);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        leased.WriteBack();
+        Require(HostImportCovers(range.importing, first + 16, 32), "an address-based build refused its whole-range import and retired the range's window (build " + std::to_string(build) + ")");
+    }
+    const auto* kept = HostImportFor(range.importing, first + 16, 32);
+    Require(kept != nullptr && kept->buffer == buffer, "the range's window was imported again after a refused whole-range import");
+}
+
+// Two uses across neighbouring cell edges of one range, each in a build of its own, share one import: the second grows
+// the first's window to their union, and later rounds of both keep it. Before, each replaced the other's window at
+// every use.
+void importNeighbouringEdgesTests(const Context& context) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    WindowedRange range(context, 2 * WindowedRange::piece, 3);
+    const auto first = range.First();
+    const auto use = [&](std::uintptr_t address) {
+        GuestBufferMemory leased(range.importing);
+        leased.AddReadable(address, 32);
+        leased.Upload(false);
+        leased.WriteBack();
+    };
+    const auto acrossFirst = first + range.window - 16;
+    const auto acrossSecond = first + 2 * range.window - 16;
+    use(acrossFirst);
+    Require(HostImportCovers(range.importing, acrossFirst, 32), "a use across the first cell edge was not imported");
+    use(acrossSecond);
+    Require(HostImportCovers(range.importing, first, range.bytes), "a use across the second cell edge did not grow the first use's window to their union");
+    const auto serial = HostImportSerial(range.importing, first, range.bytes, false);
+    for (int round = 0; round < 10; ++round) {
+        use(acrossFirst);
+        use(acrossSecond);
+        Require(HostImportSerial(range.importing, first, range.bytes, false) == serial, "a use across a cell edge replaced the shared window (round " + std::to_string(round) + ")");
+    }
+}
+
+// A range mapped while the imports are at the budget is refused at map time without retiring an import: the map
+// observer holds no GPU lock, so it must not evict (before, it evicted the least recently used import to fit).
+void importAtMapOverBudgetTests(const Context& context) {
+    constexpr std::size_t bytes = 65536;
+    auto importing = context;
+    importing.hostImportAlignment = bytes;
+    void* kept = ::operator new(bytes, std::align_val_t{bytes});
+    void* used = ::operator new(bytes, std::align_val_t{bytes});
+    void* mapped = ::operator new(bytes, std::align_val_t{bytes});
+    const auto change = [&](void* block, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(kept, true);
+    change(used, true);
+    const auto keptAddress = reinterpret_cast<std::uintptr_t>(kept);
+    const auto usedAddress = reinterpret_cast<std::uintptr_t>(used);
+    Require(HostImportFor(importing, keptAddress, 16) != nullptr, "the import to keep was not made");
+    for (int use = 0; use < 300; ++use) Require(HostImportFor(importing, usedAddress, 16) != nullptr, "the import in use was not made");
+    {
+        GuestBufferMemory leased(importing);
+        leased.AddReadable(usedAddress, 16);
+        leased.Upload(false);
+        leased.WriteBack();
+    }
+    const auto live = HostImportLiveBytes();
+    SetHostImportBudget(live + bytes - 1);
+    change(mapped, true);
+    GuestAllocations::Mapped ranges;
+    {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        for (const auto& range : lease) {
+            if (range->address == reinterpret_cast<std::uintptr_t>(mapped)) ranges.push_back(range);
+        }
+    }
+    Require(ranges.size() == 1, "the mapped range is not registered");
+    static_cast<void>(ImportMappedRanges(importing, ranges, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true));
+    SetHostImportBudget(0);
+    Require(HostImportLiveBytes() == live, "a range mapped at the budget retired an import at map time (an eviction without the GPU lock)");
+    Require(HostImportCovers(importing, keptAddress, 16) && !HostImportCovers(importing, reinterpret_cast<std::uintptr_t>(mapped), 16), "a range mapped at the budget was imported, or the import to keep was retired");
+    for (auto* block : {kept, used, mapped}) change(block, false);
+    for (auto* block : {kept, used, mapped}) ::operator delete(block, std::align_val_t{bytes});
+}
+
+// An adjacent registration grows a run across an old interior window. The unlocked map observer must leave that
+// window's node and buffer alone, even after a newer build makes its raw pointer eligible for replacement.
+void importAtMapOverlapTests(const Context& context) {
+    constexpr auto piece = WindowedRange::piece;
+    constexpr auto window = 2 * piece;
+    auto* block = static_cast<std::byte*>(::operator new(5 * piece, std::align_val_t{piece}));
+    std::memset(block, 0x33, 5 * piece);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(0);
+    SetHostImportRangeWindow(window);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    const HostImport* windowed = nullptr;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    std::uint64_t serial = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        ClearHostImports(importing.device);
+        GuestAllocations::Mutation().Add(block, 4 * piece, true, false, true);
+        windowed = HostImportFor(importing, first + 16, 32);
+        Require(windowed != nullptr && windowed->bytes == window, "the map overlap fixture did not import a window");
+        buffer = windowed->buffer;
+        serial = HostImportSerial(importing, first, window, false);
+        GuestBufferMemory next(importing);
+        next.Upload(false);
+        next.WriteBack();
+    }
+    GuestAllocations::Mutation().Add(block + 4 * piece, piece, true, false, true);
+    GuestAllocations::Mapped mapped;
+    {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        for (const auto& range : lease) if (range->address == first + 4 * piece) mapped.push_back(range);
+    }
+    Require(mapped.size() == 1 && !AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "the overlap callback must run unlocked with its adjacent registration");
+    Require(ImportMappedRanges(importing, mapped, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), false), "the unlocked map observer could not use the existing device");
+    Require(HostImportLiveBytes() == window && HostImportSerial(importing, first, window, false) == serial,
+            "the unlocked map observer retired an overlapping window");
+    Require(windowed->base == first && windowed->bytes == window && windowed->buffer == buffer, "the unlocked map observer changed the retained import node");
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto* whole = HostImportFor(importing, first, 5 * piece);
+        Require(whole != nullptr && whole->base == first && whole->bytes == 5 * piece && HostImportLiveBytes() == 5 * piece,
+                "the deferred overlapping replacement was not retried by locked use");
+        Require(HostImportSerial(importing, first, 5 * piece, false) != serial, "locked replacement reused the old window's identity");
+        ClearHostImports(importing.device);
+    }
+    GuestAllocations::Mutation().Remove(block);
+    GuestAllocations::Mutation().Remove(block + 4 * piece);
+    SetHostImportRangeWindow(std::uint64_t{64} << 20u);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
+struct ImportLifetimeState {
+    PFN_vkGetDeviceProcAddr proc;
+    VkBuffer observed = VK_NULL_HANDLE;
+    std::atomic<unsigned> destroyed{0};
+    bool signaled = false;
+};
+
+ImportLifetimeState* importLifetime = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL importFenceStatus(VkDevice, VkFence) {
+    return importLifetime->signaled ? VK_SUCCESS : VK_NOT_READY;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL importWaitFences(VkDevice, std::uint32_t, const VkFence*, VkBool32, std::uint64_t) {
+    importLifetime->signaled = true;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL importDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* callbacks) {
+    if (buffer == importLifetime->observed) importLifetime->destroyed.fetch_add(1);
+    reinterpret_cast<PFN_vkDestroyBuffer>(importLifetime->proc(device, "vkDestroyBuffer"))(device, buffer, callbacks);
+}
+
+PFN_vkVoidFunction VKAPI_CALL importLifetimeProc(VkDevice device, const char* name) {
+    const std::string_view function(name);
+    if (function == "vkGetFenceStatus") return reinterpret_cast<PFN_vkVoidFunction>(importFenceStatus);
+    if (function == "vkWaitForFences") return reinterpret_cast<PFN_vkVoidFunction>(importWaitFences);
+    if (function == "vkDestroyBuffer") return reinterpret_cast<PFN_vkVoidFunction>(importDestroyBuffer);
+    return importLifetime->proc(device, name);
+}
+
+void importEvictionLifetimeTests(const Context& context) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto originalWatch = PrepareImportWatch(context);
+    ClearHostImports(context.device);
+    ImportLifetimeState lifetime{context.deviceProc};
+    importLifetime = &lifetime;
+    auto importing = context;
+    // Imports cache destruction functions by device. The shared mock's null device would retain its old callbacks.
+    importing.device = reinterpret_cast<VkDevice>(&lifetime);
+    importing.deviceProc = importLifetimeProc;
+    SetImportWatch(importing, originalWatch);
+    auto original = context;
+    original.hostImportAlignment = WindowedRange::piece;
+    struct Restore {
+        Context original;
+        ImportWatch watch;
+        VkDevice device;
+        Recorder* previous;
+        void Clear() {
+            // Switch callbacks back before destroying the parked test-device imports while their counter is alive.
+            static_cast<void>(ImportMappedRanges(original, {}, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true));
+            ClearHostImports(device);
+            SetImportWatch(original, watch);
+        }
+        ~Restore() {
+            Clear();
+            importLifetime = nullptr;
+            if (previous != nullptr) previous->Activate();
+        }
+    } restore{original, originalWatch, importing.device, Recorder::Active()};
+    constexpr auto window = 2 * WindowedRange::piece;
+    WindowedRange range(importing, window, 4, 3 * window);
+    const auto first = range.First();
+    const auto second = first + window;
+    const auto hot = first + 2 * window;
+    const auto fourth = first + 3 * window;
+    {
+        Recorder recorder(range.importing);
+        recorder.Activate();
+        const auto* oldest = HostImportFor(range.importing, first + 16, 32);
+        Require(oldest != nullptr, "the LRU victim was not imported");
+        lifetime.observed = oldest->buffer;
+        Require(HostImportFor(range.importing, second + 16, 32) != nullptr && HostImportFor(range.importing, hot + 16, 32) != nullptr, "the protected imports were not made");
+        recorder.NotePendingRead(first + 16, 32, Recorder::ReadKind::DrawInput);
+        recorder.Commands();
+        recorder.Submit();
+        Require(!recorder.Reap(), "the import reader was not left in flight");
+
+        GuestBufferMemory building(range.importing);
+        building.AddReadable(second + 16, 32);
+        building.Upload(false);
+        for (int use = 0; use < 300; ++use) Require(HostImportFor(range.importing, hot + 16, 32) != nullptr, "the hot import disappeared while aging the victim");
+        Require(HostImportFor(range.importing, fourth + 16, 32) != nullptr, "an eligible old import was not evicted to admit a new window");
+        Require(!HostImportCovers(range.importing, first, 32) && HostImportCovers(range.importing, second, 32) && HostImportCovers(range.importing, hot, 32) && HostImportCovers(range.importing, fourth, 32), "LRU eviction lost the hot or current-build import instead of the oldest eligible one");
+        Require(HostImportLiveBytes() == 3 * window, "LRU admission exceeded the active import budget");
+        Require(lifetime.destroyed.load() == 0 && oldest->buffer == lifetime.observed && oldest->base == first, "eviction destroyed or relocated an import used by an unsignaled reader");
+        std::uint32_t adjustment = 0;
+        Require(building.Descriptor(second + 16, 32, adjustment).range == 32 + adjustment, "eviction invalidated a view selected by the current build");
+        for (int use = 0; use < 300; ++use) Require(HostImportFor(range.importing, hot + 16, 32) != nullptr, "the hot import disappeared while aging protected imports");
+        {
+            WindowedRange blocked(importing, window, 1, 3 * window);
+            Require(HostImportFor(blocked.importing, blocked.First(), 32) == nullptr && HostImportLiveBytes() == 3 * window, "LRU evicted a current-build import after its recency protection expired");
+        }
+        SetHostImportBudget(3 * window);
+        building.WriteBack();
+
+        GuestBufferMemory following(range.importing);
+        following.AddReadable(hot + 16, 32);
+        following.Upload(false);
+        for (int use = 0; use < 300; ++use) Require(HostImportFor(range.importing, hot + 16, 32) != nullptr, "the hot import disappeared before refusal preflight");
+
+        {
+            WindowedRange tooLarge(importing, window, 4, 3 * window);
+            Require(HostImportFor(tooLarge.importing, tooLarge.First(), tooLarge.bytes) == nullptr, "an import larger than the entire budget was admitted");
+            Require(HostImportLiveBytes() == 3 * window && HostImportCovers(range.importing, second, 32) && HostImportCovers(range.importing, hot, 32) && HostImportCovers(range.importing, fourth, 32), "an impossible import retired existing windows");
+        }
+        following.WriteBack();
+        recorder.Submit();
+        Require(!recorder.Reap() && lifetime.destroyed.load() == 0, "an unsignaled reader lost its retired import during reaping");
+        recorder.Sync();
+    }
+    Require(lifetime.signaled && lifetime.destroyed.load() == 1,
+            "the retired import was not released exactly once after its readers completed (signaled=" + std::to_string(lifetime.signaled) + ", destroyed=" + std::to_string(lifetime.destroyed.load()) + ")");
+    restore.Clear();
+    Require(HostImportLiveBytes() == 0 && !HostImportCovers(range.importing, fourth, 32), "clearing after eviction retained a window");
 }
 
 ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
@@ -1141,6 +1467,12 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importSpanTests(context);
     failedImportRemapTests(context, access);
     importWindowTests(context);
+    importWholeRangeOverWindowTests(context);
+    importRefusedWholeRangeTests(context);
+    importNeighbouringEdgesTests(context);
+    importAtMapOverBudgetTests(context);
+    importAtMapOverlapTests(context);
+    importEvictionLifetimeTests(context);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();

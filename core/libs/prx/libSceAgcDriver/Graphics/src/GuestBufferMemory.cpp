@@ -176,6 +176,8 @@ struct HostImports {
     // writtenAtImport): its import window then stamps a range the import leaves watched.
     bool importsStampPages = true;
     bool dmaBufImportsStampPages = true;
+    std::uint64_t useCounter = 0;
+    std::uint64_t buildFloor = 0;
 };
 
 HostImports& Imports() {
@@ -576,6 +578,13 @@ std::shared_ptr<const GuestAllocations::Range> leasedRangeOwner(const GuestAlloc
     return found != lease.end() && (*found)->address == base ? *found : nullptr;
 }
 
+std::shared_ptr<const GuestAllocations::Range> leasedRangeOwner(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    const auto found = std::upper_bound(lease.begin(), lease.end(), begin, [](std::uint64_t value, const auto& range) { return value < range->address; });
+    if (found == lease.begin()) return nullptr;
+    const auto& range = *std::prev(found);
+    return begin >= range->address && end <= range->address + range->bytes ? range : nullptr;
+}
+
 struct ImportRun {
     std::uint64_t base = 0;
     std::uint64_t bytes = 0;
@@ -637,45 +646,129 @@ bool sameRun(const Entry& entry, const ImportRun& run) {
 }
 
 bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
+    if (entry.ranges.size() == 1 && entry.bytes < entry.ranges.front()->bytes) {
+        const auto current = leasedRangeOwner(lease, entry.base, entry.base + entry.bytes);
+        return current != nullptr && !entry.ranges.front().owner_before(current) && !current.owner_before(entry.ranges.front());
+    }
     return sameRun(entry, importRun(lease, entry.base));
+}
+
+bool pointerHeld(const HostImports& state, const HostImport& entry) {
+    return entry.lastUse >= state.buildFloor;
+}
+
+bool evictable(const HostImports& state, const HostImport& entry) {
+    constexpr std::uint64_t protectedUses = 256;
+    return !pointerHeld(state, entry) && entry.lastUse + protectedUses < state.useCounter;
+}
+
+std::uint64_t retireLeastRecent(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t wanted) {
+    std::uint64_t freed = 0;
+    while (freed < wanted) {
+        auto oldest = state.imports.end();
+        for (auto it = state.imports.begin(); it != state.imports.end(); ++it) {
+            if (evictable(state, it->second) && (oldest == state.imports.end() || it->second.lastUse < oldest->second.lastUse)) oldest = it;
+        }
+        if (oldest == state.imports.end()) break;
+        freed += oldest->second.bytes;
+        retireImport(context.device, state, oldest, lease);
+    }
+    return freed;
+}
+
+std::atomic<std::uint64_t> budgetOverride{0};
+
+std::uint64_t importBudget() {
+    if (const auto set = budgetOverride.load(std::memory_order_relaxed); set != 0) return set;
+    static const std::uint64_t configured = []() -> std::uint64_t {
+        const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
+    }();
+    return configured;
+}
+
+std::atomic<std::uint64_t> rangeImportWindow{64ull << 20u};
+
+// The import of an access to a registered range larger than the range window: the cells the access touches, grown to
+// the union of the range's imports it overlaps, so accesses across neighbouring cell edges share one import instead of
+// replacing each other's.
+ImportRun windowRun(const HostImports& state, ImportRun run, std::uint64_t begin, std::uint64_t end, std::uint64_t alignment) {
+    const auto window = rangeImportWindow.load(std::memory_order_relaxed);
+    if (run.ranges.size() != 1 || window == 0 || alignment == 0 || window % alignment != 0) return run;
+    const auto& range = *run.ranges.front();
+    if (range.bytes <= window || begin < range.address || end > range.address + range.bytes || end <= begin) return run;
+    const auto lastCell = range.bytes / window - 1;
+    const auto cell = [&](std::uint64_t address) { return std::min((address - range.address) / window, lastCell); };
+    auto windowBegin = range.address + cell(begin) * window;
+    const auto endCell = cell(end - 1);
+    auto windowEnd = endCell == lastCell ? range.address + range.bytes : range.address + (endCell + 1) * window;
+    for (bool grown = true; grown;) {
+        grown = false;
+        auto it = state.imports.upper_bound(windowBegin);
+        if (it != state.imports.begin()) --it;
+        for (; it != state.imports.end() && it->first < windowEnd; ++it) {
+            const auto importEnd = it->second.base + it->second.bytes;
+            if (importEnd <= windowBegin || it->second.base < range.address || importEnd > range.address + range.bytes) continue;
+            if (it->second.base < windowBegin || importEnd > windowEnd) grown = true;
+            windowBegin = std::min(windowBegin, it->second.base);
+            windowEnd = std::max(windowEnd, importEnd);
+        }
+    }
+    if (windowBegin % alignment != 0 || (windowEnd - windowBegin) % alignment != 0) return run;
+    run.base = windowBegin;
+    run.bytes = windowEnd - windowBegin;
+    return run;
 }
 
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 bool importsStale(const Context& context, const HostImports& state);
 
-const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease) {
-    if (!importsStale(context, state)) {
-        if (const auto* current = findImport(state, address, address + 1)) return current;
+// The bytes retireLeastRecent could free outside [begin, end).
+std::uint64_t evictableBytes(const HostImports& state, std::uint64_t begin, std::uint64_t end) {
+    std::uint64_t bytes = 0;
+    for (const auto& [base, entry] : state.imports) {
+        if ((entry.base + entry.bytes <= begin || entry.base >= end) && evictable(state, entry)) bytes += entry.bytes;
+    }
+    return bytes;
+}
+
+const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true) {
+    const bool fresh = !importsStale(context, state);
+    if (fresh && end != 0) {
+        if (const auto* current = findImport(state, address, end)) return current;
     }
     auto run = importRun(lease, address);
+    // Without an end the caller views the whole run through the import (AcquireRegistered): a window that holds the
+    // first byte is shorter than that, so only an import of the whole run is a hit; a window is replaced below.
+    if (fresh && end == 0) {
+        if (const auto* current = findImport(state, address, run.ranges.empty() ? address + 1 : run.base + run.bytes)) return current;
+    }
+    if (end != 0) run = windowRun(state, std::move(run), address, end, context.hostImportAlignment);
     if (run.ranges.empty()) return nullptr;
     const auto base = run.base;
     const auto bytes = run.bytes;
-    if (const auto found = state.imports.find(base); found != state.imports.end()) {
-        if (sameRun(found->second, run)) return &found->second;
-        retireImport(context.device, state, found, lease);
-    }
-    for (auto it = state.imports.lower_bound(base); it != state.imports.end() && it->first < base + bytes;) {
-        const auto next = std::next(it);
-        retireImport(context.device, state, it, lease);
-        it = next;
-    }
-    if (auto it = state.imports.lower_bound(base); it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > base) retireImport(context.device, state, std::prev(it), lease);
+    if (const auto found = state.imports.find(base); found != state.imports.end() && sameRun(found->second, run)) return &found->second;
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return nullptr;
     if (const auto failed = state.failed.find(base); failed != state.failed.end()) {
         if (sameRun(failed->second, run)) return nullptr;
         state.failed.erase(failed);
     }
-    // Pinned imports count against the driver's system memory budget; past it ordinary host
-    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
-    // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
-    static const std::uint64_t budget = [] {
-        const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
-        return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
-    }();
-    const auto live = state.liveBytes;
-    if (live + bytes > budget) {
+    // The imports this one replaces overlap it; none may be held by a build, and the import must fit the budget (with
+    // what may be evicted) before any of them is retired.
+    auto first = state.imports.lower_bound(base);
+    if (first != state.imports.begin() && std::prev(first)->second.base + std::prev(first)->second.bytes > base) --first;
+    std::uint64_t replaced = 0;
+    for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
+        if (pointerHeld(state, it->second)) return nullptr;
+        replaced += it->second.bytes;
+    }
+    // Map observers run without the GPU lock. Replacing an overlapping window retires its buffer to the recorder,
+    // just like budget eviction, so leave it for the next locked use even when the replacement fits the budget.
+    if (replaced != 0 && !GuestMemory::GpuMutex().HeldByThisThread()) return nullptr;
+    const auto budget = importBudget();
+    const auto live = state.liveBytes - replaced;
+    if (live + bytes > budget && (!evict || live + bytes - evictableBytes(state, base, base + bytes) > budget)) {
         // A refused import turns every later use of the range into CPU copies, so say so.
         static std::uint64_t refused = 0, refusedBytes = 0;
         static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
@@ -683,10 +776,16 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         refusedBytes += bytes;
         if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
             lastReport = std::chrono::steady_clock::now();
-            std::fprintf(stderr, "[gpu] host import budget: %llu MiB live of %llu MiB (APS5_HOST_IMPORT_MIB); %llu imports (%llu MiB) refused so far, last 0x%llx+0x%llx\n", static_cast<unsigned long long>(live >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
+            std::fprintf(stderr, "[gpu] host import budget: %llu MiB live of %llu MiB (APS5_HOST_IMPORT_MIB); %llu imports (%llu MiB) refused so far, last 0x%llx+0x%llx\n", static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
         }
         return nullptr;
     }
+    for (auto it = first; it != state.imports.end() && it->first < base + bytes;) {
+        const auto next = std::next(it);
+        retireImport(context.device, state, it, lease);
+        it = next;
+    }
+    if (state.liveBytes + bytes > budget) retireLeastRecent(context, state, lease, state.liveBytes + bytes - budget);
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
     entry.range = run.ranges.front();
     entry.ranges = std::move(run.ranges);
@@ -724,7 +823,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         } catch (const std::runtime_error&) {
             if (entry.ranges.size() == 1) throw;
             state.unaliasedSpans.insert(base);
-            return importAllocation(context, state, address, lease);
+            return importAllocation(context, state, address, lease, end, evict);
         }
     }
 #else
@@ -780,13 +879,8 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     state.liveBytes += bytes;
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0);
+    entry.lastUse = ++state.useCounter;
     return &state.imports.emplace(base, entry).first->second;
-}
-
-// The lease is in address order (it is built from the registry map), so a range is found by binary search.
-const GuestAllocations::Range* leasedRangeAt(const GuestAllocations::Lease& lease, std::uint64_t base) {
-    const auto found = std::lower_bound(lease.begin(), lease.end(), base, [](const auto& range, std::uint64_t value) { return range->address < value; });
-    return found != lease.end() && (*found)->address == base ? found->get() : nullptr;
 }
 
 // The readable registered range containing [begin, end), or null.
@@ -825,14 +919,13 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     if (generation == state.refreshedGeneration) return;
     state.refreshedGeneration = generation;
     for (auto it = state.imports.begin(); it != state.imports.end();) {
-        const auto* range = leasedRangeAt(lease, it->first);
-        if (range != nullptr && sameRange(it->second, lease)) {
+        if (sameRange(it->second, lease)) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
         }
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
-        if (trace && range != nullptr && range->bytes == it->second.bytes) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: the range was mapped again\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.bytes));
+        if (trace && leasedRangeOwner(lease, it->first, it->first + it->second.bytes) != nullptr) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: the range was mapped again\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.bytes));
         const auto next = std::next(it);
         retireImport(context.device, state, it, lease);
         it = next;
@@ -845,7 +938,15 @@ const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint6
     if (found == state.imports.begin()) return nullptr;
     --found;
     const auto& entry = found->second;
-    return begin >= entry.base && end <= entry.base + entry.bytes ? &entry : nullptr;
+    if (begin < entry.base || end > entry.base + entry.bytes) return nullptr;
+    entry.lastUse = ++state.useCounter;
+    return &entry;
+}
+
+const HostImport* importAccess(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
+    if (!runCovers(lease, begin, end)) return nullptr;
+    const auto* entry = importAllocation(context, state, begin, lease, end);
+    return entry != nullptr && findImport(state, begin, end) == entry ? entry : nullptr;
 }
 
 // Whether the imports need reconciling before a lookup: the registry changed since the last walk.
@@ -2145,6 +2246,20 @@ void SetHostImportWindow(std::uint64_t bytes) {
     importWindow.store(bytes, std::memory_order_relaxed);
 }
 
+void SetHostImportRangeWindow(std::uint64_t bytes) {
+    rangeImportWindow.store(bytes, std::memory_order_relaxed);
+}
+
+void SetHostImportBudget(std::uint64_t bytes) {
+    budgetOverride.store(bytes, std::memory_order_relaxed);
+}
+
+std::uint64_t HostImportLiveBytes() {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return state.liveBytes;
+}
+
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
@@ -2163,9 +2278,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    if (!runCovers(lease, address, address + bytes)) return nullptr;
-    const auto* entry = importAllocation(context, state, address, lease);
-    return ready(entry != nullptr && findImport(state, address, address + bytes) == entry ? entry : nullptr);
+    return ready(importAccess(context, state, address, address + bytes, lease));
 }
 
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
@@ -2187,7 +2300,7 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
         const auto range = mapped.lock();
         if (range == nullptr || leasedRangeOwner(current, range->address) != range) continue;
         try {
-            if (importAllocation(context, state, range->address, current) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(importRun(current, range->address).base);
+            if (importAllocation(context, state, range->address, current, 0, false) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(importRun(current, range->address).base);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] import of GPU memory mapped at 0x%llx+0x%zx failed: %s\n", static_cast<unsigned long long>(range->address), range->bytes, error.what());
         }
@@ -2288,6 +2401,13 @@ void GuestBufferMemory::AcquireRegistered() {
             else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
             else if (ResidentHeapMirrors() && current->importAlignment != context.hostImportAlignment) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
             else hit = true;
+            importFloor = state.useCounter + 1;
+            if (hit) {
+                const auto stamp = ++state.useCounter;
+                for (const auto& region : current->base) {
+                    if (region.direct != nullptr) region.direct->lastUse = stamp;
+                }
+            }
         }
         if (hit) {
             for (auto* mirror : current->sparseMirrors) {
@@ -2326,6 +2446,8 @@ void GuestBufferMemory::AcquireRegistered() {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
             if (importable) refreshImports(context, state, lease);
+            if (importFloor == 0) importFloor = state.useCounter + 1;
+            state.buildFloor = importFloor;
             // Taken before the pass: the imports it takes are the registry's ones (just reconciled, so
             // none is retired by a make below), and a mirror's preparation may sync the recorder, whose
             // completions can retire an import already taken; that moves the epoch, and Upload then
@@ -2347,7 +2469,7 @@ void GuestBufferMemory::AcquireRegistered() {
             if (importable) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
-                entry = importAllocation(context, state, range->address, lease);
+                entry = importAllocation(context, state, range->address, lease, 0, false);
             }
             lap(timing.importsUs, at);
             if (entry != nullptr) {
@@ -2979,6 +3101,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
+        if (importFloor == 0) importFloor = state.useCounter + 1;
         const bool stale = importsStale(context, state);
         for (auto& region : regions) {
             if (region.mirror != nullptr) continue;
@@ -3056,6 +3179,11 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     uploaded = true;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
+    if (context.hostImportAlignment != 0) {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        state.buildFloor = importFloor != 0 ? importFloor : state.useCounter + 1;
+    }
     // Registered ranges to import from. Address-based shaders hold their lease until write-back;
     // descriptor-only uploads acquire one only when the registry changed or an import must be made
     // (a lease copies every registered range's shared_ptr under the registry lock), so the guest can
@@ -3142,7 +3270,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
-                if (runCovers(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, region.begin, importRanges());
+                entry = importAccess(context, state, region.begin, region.end, importRanges());
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
