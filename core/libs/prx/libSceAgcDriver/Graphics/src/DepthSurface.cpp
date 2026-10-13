@@ -300,7 +300,14 @@ public:
     std::shared_ptr<Texture> Refresh(std::span<const DepthPlaneSlice> slices, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer) {
         Require(slices.size() == layers, "depth plane copy slices do not match its layers");
         const auto geometry = DescribeSurface(resource);
-        Require(geometry.layers == layers && geometry.sliceLinearBytes == sliceBytes() && !geometry.mips.empty(), "depth plane copy geometry does not match its layers");
+        Require(geometry.layers == layers && !geometry.mips.empty(), "depth plane copy geometry does not match its layers");
+        const auto& plane = geometry.mips.front();
+        Require(plane.pitchBytes % texelBytes() == 0 && plane.pitchBytes >= extent.width * texelBytes() && plane.height >= extent.height, "depth plane copy geometry does not match its layers");
+        const auto stagingBytes = static_cast<std::size_t>(geometry.LinearLayerOffset(layers - 1) + plane.linearOffset + static_cast<std::uint64_t>(plane.pitchBytes) * plane.height);
+        if (staging->Size() < stagingBytes) {
+            Require(!filled, "depth plane copy geometry does not match its layers");
+            staging = std::make_unique<DeviceBuffer>(context, stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        }
         std::vector<std::shared_ptr<Buffer>> uploads;
         std::vector<std::uint32_t> uploadLayers;
         std::vector<std::uint32_t> copiedLayers;
@@ -370,9 +377,12 @@ private:
         const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         std::vector<VkBufferImageCopy> regions;
+        const auto& plane = geometry.mips.front();
         const auto region = [&](std::uint32_t layer, VkImageAspectFlags aspectMask, std::uint32_t imageLayer) {
             VkBufferImageCopy copy{};
-            copy.bufferOffset = sliceBytes() * layer;
+            copy.bufferOffset = geometry.LinearLayerOffset(layer) + plane.linearOffset;
+            copy.bufferRowLength = plane.pitchBytes / texelBytes();
+            copy.bufferImageHeight = plane.height;
             copy.imageSubresource = {aspectMask, 0, imageLayer, 1};
             copy.imageExtent = {extent.width, extent.height, 1};
             return copy;
@@ -386,7 +396,7 @@ private:
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             for (std::size_t upload = 0; upload < uploads.size(); ++upload) {
                 const auto layer = uploadLayers[upload];
-                context.detiler->Dispatch(commands, resource.tileMode, format == VK_FORMAT_D32_SFLOAT ? 4u : 2u, uploads[upload]->Handle(), 0, staging->Handle(), geometry.LinearLayerOffset(layer), geometry.mips.front(), false, layer, geometry.thick);
+                context.detiler->Dispatch(commands, resource.tileMode, texelBytes(), uploads[upload]->Handle(), 0, staging->Handle(), geometry.LinearLayerOffset(layer), plane, false, layer, geometry.thick);
                 regions.push_back(region(layer, aspect(), layer));
             }
             if (recorder != nullptr) {
@@ -416,8 +426,12 @@ private:
         else Recorder::CountBarriers(Recorder::CommandClass::Draw, 3);
     }
 
+    std::uint32_t texelBytes() const {
+        return format == VK_FORMAT_D32_SFLOAT ? 4u : 2u;
+    }
+
     VkDeviceSize sliceBytes() const {
-        return static_cast<VkDeviceSize>(extent.width) * extent.height * (format == VK_FORMAT_D32_SFLOAT ? 4u : 2u);
+        return static_cast<VkDeviceSize>(extent.width) * extent.height * texelBytes();
     }
 
     VkImageAspectFlags aspect() const {
