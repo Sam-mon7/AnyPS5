@@ -99,7 +99,7 @@ bool clearToTexel(StorageTexture& image, const std::array<std::byte, 16>& texel,
     for (std::size_t offset = 0; offset + elementBytes <= repeated.size(); offset += elementBytes) std::memcpy(repeated.data() + offset, texel.data(), elementBytes);
     std::array<std::uint32_t, 4> pattern{};
     std::memcpy(pattern.data(), repeated.data(), repeated.size());
-    return image.FillClear(std::span<const std::uint32_t, 4>(pattern), StorageTexture::WholeImage, refusal);
+    return image.FillClear(std::span<const std::uint32_t, 4>(pattern), StorageTexture::WholeImage, refusal, true);
 }
 
 void writeTexels(const ColorTarget& color, const std::array<std::byte, 16>& texel) {

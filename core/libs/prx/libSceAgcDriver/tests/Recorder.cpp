@@ -4815,7 +4815,9 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
         Require(keys[0] == 0xff, "the recorded key fill landed before its batch ran");
         Require(CurrentDccKeys(color.dccAddress, surfaceBytes) == DccKeys::ClearRegister, "the keys read past a pending fast-clear fill");
     }
+    std::memset(texels, 0x77, surfaceBytes);
     RunColorMetadataPass(context, pass);
+    Require(StorageTexture::FindPending(address, surfaceBytes) != nullptr && texels[0] == 0x77, "a fast clear recorded before the pass fell back to CPU write-back");
     Require(keysUncompressed() && memoryHolds({0x10, 0x20, 0x40, 0x80}), "a fast clear recorded before the pass was not eliminated");
     std::memset(texels, 0x66, surfaceBytes);
     RunColorMetadataPass(context, pass);
@@ -6410,6 +6412,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--cmask-only") {
             cmaskPassTests(device, recorder);
             std::cout << "CMASK copied clear, write-back and failure tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--metadata-pass-only") {
+            metadataPassTests(device, recorder);
+            std::cout << "Color metadata pass tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-inputs-in-place-only") {
