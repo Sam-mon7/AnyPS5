@@ -1,17 +1,18 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostStack.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include <mutex>
 
 namespace AgcDriver {
 
 void Submit(const Packet* packet, std::uint32_t queue) try {
-    DriverDetail::Driver::Get().Submit(packet, queue);
+    WithHostStack([&] { DriverDetail::Driver::Get().Submit(packet, queue); });
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 void WaitIdle() {
-    DriverDetail::Driver::Get().WaitIdle();
+    WithHostStack([&] { DriverDetail::Driver::Get().WaitIdle(); });
 }
 
 void Shutdown() {
@@ -19,11 +20,11 @@ void Shutdown() {
 }
 
 void RegisterShader(const Shader* shader) {
-    DriverDetail::Driver::Get().RegisterShader(shader);
+    WithHostStack([&] { DriverDetail::Driver::Get().RegisterShader(shader); });
 }
 
 void SuspendPoint() {
-    DriverDetail::Driver::Get().SuspendPoint();
+    WithHostStack([&] { DriverDetail::Driver::Get().SuspendPoint(); });
 }
 
 void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
@@ -124,18 +125,18 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
 }
 
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
-    AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
+    AgcDriver::WithHostStack([&] { AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive); });
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
-    AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
+    AgcDriver::WithHostStack([&] { AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType); });
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
-    AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
+    AgcDriver::WithHostStack([&] { AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive); });
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
