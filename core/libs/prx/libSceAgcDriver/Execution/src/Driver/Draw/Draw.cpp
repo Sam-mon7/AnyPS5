@@ -1,9 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -191,6 +194,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto fold = [&](const ShaderRecompiler::RecompileResult& main, Pm4::DrawParameters& parameters) { FoldDrawOffsets(main, programs.front(), parameters); };
 
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
+    std::vector<Pm4::DrawArguments> records;
+    double indirectReadMs = 0;
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
     std::vector<std::size_t> resultIndex(programs.size(), 0);
     for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -218,6 +223,30 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            if (indirectCpu) {
+                // ShaderMemory caches whole pages: publish queued labels and restart before
+                // an early argument read can hide a write from the remaining stage captures.
+                if (!deferredLabels().labels.empty()) {
+                    recordQueuedLabelsBeforeRead(submission.queue);
+                    ++captureRetries;
+                    return draw(queue, packet, submission, rejected);
+                }
+                const auto& indirect = *drawParameters.indirect;
+                const auto readStart = std::chrono::steady_clock::now();
+                const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
+                for (std::uint32_t record = 0; record < count; ++record) records.push_back(Pm4::ReadDrawArguments(indirect, record));
+                indirectReadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count();
+                if (traceIndirect) {
+                    for (std::uint32_t record = 0; record < records.size(); ++record) {
+                        const auto& arguments = records[record];
+                        std::fprintf(stderr, "[draw]   record %u: count %u instances %u first %u vertexOffset %u startInstance %u\n", record, arguments.count, arguments.instances, arguments.firstVertexOrIndex, arguments.vertexOffset, arguments.firstInstance);
+                    }
+                }
+                if (std::none_of(records.begin(), records.end(), [](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0; })) {
+                    Graphics::CountIndirectDraw(*indirectCpu, indirectReadMs);
+                    return drawn();
+                }
+            }
         } else if (i == 0) {
             fold(result, drawParameters);
         }
@@ -302,18 +331,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 programResults[i] = &results[resultIndex[i]];
             }
         }
-        recordQueuedLabelsBeforeRead(submission.queue);
-        const auto readStart = std::chrono::steady_clock::now();
-        const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
-        std::vector<Pm4::DrawArguments> records;
-        for (std::uint32_t record = 0; record < count; ++record) records.push_back(Pm4::ReadDrawArguments(indirect, record));
-        Graphics::CountIndirectDraw(*indirectCpu, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
+        Graphics::CountIndirectDraw(*indirectCpu, indirectReadMs);
         const auto baseVertexWord = locate(indirect.baseVertexLocation);
         const auto startInstanceWord = locate(indirect.startInstanceLocation);
         const auto drawIndexWord = indirect.drawIndexEnabled ? locate(indirect.drawIndexLocation) : std::nullopt;
         for (std::uint32_t record = 0; record < records.size(); ++record) {
             const auto& arguments = records[record];
-            if (traceIndirect) std::fprintf(stderr, "[draw]   record %u: count %u instances %u first %u vertexOffset %u startInstance %u\n", record, arguments.count, arguments.instances, arguments.firstVertexOrIndex, arguments.vertexOffset, arguments.firstInstance);
             if (arguments.count == 0 || arguments.instances == 0) continue;
             std::set<std::size_t> patched;
             const auto patch = [&](const std::optional<std::pair<std::size_t, std::size_t>>& word, std::uint32_t value) {
