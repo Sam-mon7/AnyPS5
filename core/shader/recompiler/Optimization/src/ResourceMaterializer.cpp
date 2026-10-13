@@ -756,6 +756,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     cursor += plan.info.buffers.size();
 
     snapshot.images.resize(plan.info.images.size());
+    snapshot.invalidImages.resize(plan.info.images.size());
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
         const auto& image = plan.info.images[i];
         if (image.source >= plan.descriptorSources.size()) {
@@ -780,7 +781,9 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         }
         if ((descriptor.dwords[3] >> 28u) == 0u) descriptor.dwords.fill(0u);
         if (!validImageDescriptor(descriptor, image.r128) && !nullImageDescriptor(descriptor)) {
-            throw std::runtime_error("runtime image descriptor is invalid");
+            if (!plan.info.usesDma && !plan.info.usesFaultBuffer) throw std::runtime_error("runtime image descriptor is invalid");
+            snapshot.invalidImages[i] = 1u;
+            descriptor.dwords.fill(0u);
         }
         snapshot.images[i] = descriptor;
     }

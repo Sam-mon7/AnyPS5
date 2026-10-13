@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -318,6 +319,161 @@ void RunBufferTypeTests(AgcDriver::VulkanDevice& device, bool formatted, bool ex
     Require(rejected, "guarded V#: a target without the fault ABI silently accepted an invalid descriptor");
 }
 
+void RunImageTypeTests(AgcDriver::VulkanDevice& device, bool exec) {
+    alignas(4096) static std::array<std::uint32_t, 4096> texels{};
+    const auto textureAddress = reinterpret_cast<std::uintptr_t>(texels.data());
+    const std::array<std::uint32_t, 8> valid{static_cast<std::uint32_t>(textureAddress >> 8u), static_cast<std::uint32_t>((textureAddress >> 40u) & 0xffu) | (20u << 20u), 0u, 0x90000facu, 0u, 0u, 0u, 0u};
+    constexpr std::array<std::uint32_t, 8> invalid{0x3f000000u, 0x3d4ccccdu, 0x3f000000u, 0x3f000000u, 0x69300ee0u, 2u, 0x71u, 0u};
+    auto nullType = valid;
+    nullType[3] = 0x249u;
+    const auto descriptor = [](const void* data, std::uint32_t bytes) {
+        const auto address = reinterpret_cast<std::uintptr_t>(data);
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
+    };
+    const auto output = descriptor(Output.data(), sizeof(Output));
+    const auto guard = descriptor(&BufferGuard, sizeof(BufferGuard));
+    const std::array<std::uint32_t, 6> operations{0xf0001108u, 0xf0900108u, 0xf0380108u, 0xf0201108u, 0xf03c2108u, 0xf1000108u};
+    for (const auto operation : operations) {
+        const bool sample = operation == operations[1] || operation == operations[5];
+        const bool query = operation == operations[2];
+        const bool write = operation == operations[3];
+        std::vector<std::uint32_t> code{
+            0x34020082u, 0xe0300000u, 0x80030300u, 0xbf8c3f70u, 0x7e200503u, 0xbf068010u, 0xbf850000u,
+            0x7e080280u, 0x7e0a0280u, 0x7e0c0280u, 0x7e0402ffu, Payload,
+            0xbe900380u, 0xbe910380u, 0xbe920380u, 0xbe930380u,
+            operation, 0x00000204u | (sample ? 0x00800000u : 0u),
+            0xbf8c3f70u, 0xe0701000u, 0x80020201u, 0xbf810000u,
+        };
+        code[6] |= static_cast<std::uint32_t>(code.size() - 8u);
+        if (exec) {
+            code[5] = 0x7da80010u;
+            code[6] = 0xbf800000u;
+        }
+        std::array<std::uint32_t, 16> userData{};
+        std::copy(output.begin(), output.end(), userData.begin() + 8);
+        std::copy(guard.begin(), guard.end(), userData.begin() + 12);
+        const ShaderRecompiler::ShaderComputeStageInfo compute{{Lanes, 1, 1}, 0u, {false, false, false}, false, 1};
+        ShaderRecompiler::RecompileRequest request{
+            {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+            {Lanes, 0, userData, compute, std::nullopt, std::nullopt, {}}, device.ComputeTarget(Lanes), {0, 0, 0, 128}
+        };
+        for (const auto& image : {valid, invalid, nullType}) {
+            const bool bad = image == invalid;
+            const bool null = image == nullType;
+            std::copy(image.begin(), image.end(), userData.begin());
+            for (const bool active : {false, true}) {
+                BufferGuard = active ? 1u : 0u;
+                texels.fill(Payload);
+                Output.fill(0xdeadbeefu);
+                AgcDriver::ShaderMemory shaderMemory({});
+                const auto capture = shaderMemory.Capture(request);
+                const auto result = ShaderRecompiler::Recompile(request, *capture);
+                Require(result->invalidResourceDescriptors == (bad ? 1u : 0u), "guarded T#: invalid descriptor count differs");
+                Outcome outcome;
+                StderrCapture log;
+                try {
+                    device.Dispatch(*result, 1, 1, 1, {}, request.shader.codeAddress);
+                    device.WaitIdle();
+                } catch (...) {
+                    static_cast<void>(log.Finish());
+                    throw;
+                }
+                outcome.log = log.Finish();
+                Require(Faulted(outcome) == (bad && active), "guarded T#: descriptor fault did not follow the GPU branch/EXEC:\n" + outcome.log);
+                if (bad && active) Require(outcome.log.find("reason=8") != std::string::npos && outcome.log.find(Fault(0xcd3f00000000ull, 0x40u, 0u)) != std::string::npos, "guarded T#: fault lost the original descriptor address or image PC:\n" + outcome.log);
+                const auto value = write ? Payload : null ? 0u : query ? 1u : Payload;
+                for (std::uint32_t lane = 0u; lane < Lanes; ++lane) Require(Output[lane] == (active && !bad && (!exec || lane == 0u) ? value : 0xdeadbeefu), "guarded T#: skipped/invalid image changed output, or valid result differs");
+                Require(std::ranges::all_of(texels, [](std::uint32_t word) { return word == Payload; }), "guarded T#: image store/atomic changed a backing sentinel");
+            }
+        }
+    }
+}
+
+void RunRegisteredImageTests(AgcDriver::VulkanDevice& device) {
+    using namespace ShaderRecompiler;
+    const auto target = device.Target();
+    if (!target.registrationModules) {
+        std::puts("registered image metadata test skipped: graphics pipeline libraries unavailable");
+        return;
+    }
+    constexpr std::uint32_t Extent = 16u;
+    alignas(256) static std::array<std::uint32_t, Extent * Extent * 4u> pixels{};
+    alignas(4096) static std::array<std::uint32_t, 4096> texels{};
+    constexpr std::array<std::array<float, 4>, 3> positions{{{-1, -1, 0, 1}, {3, -1, 0, 1}, {-1, 3, 0, 1}}};
+    constexpr std::array<std::uint32_t, 6> vertexCode{0xe0382000u, 0x80000005u, 0xbf8c3f70u, 0xf80008cfu, 0x03020100u, 0xbf810000u};
+    const auto vertexAddress = reinterpret_cast<std::uintptr_t>(positions.data());
+    const std::array<std::uint32_t, 4> vertexUsers{static_cast<std::uint32_t>(vertexAddress), static_cast<std::uint32_t>(vertexAddress >> 32u) | (16u << 16u), 3u, 0x01016facu};
+    const RecompileRequest vertexRequest{{ShaderStage::Vertex, 0x33000u, vertexCode, 0, {}}, {32, 0, vertexUsers, {}, {}, ShaderVertexStageInfo{}, {}}, target, {0, 0, 0, 128}};
+    const auto vertex = Recompile(vertexRequest);
+    const std::array<std::uint32_t, 16> code{0x7e000280u, 0x7e020280u, 0x7e0402ffu, Payload, 0xe0300000u, 0x80020300u, 0xbf8c3f70u, 0x7e180503u, 0xbf06800cu, 0xbf850003u, 0xf0001108u, 0x00000200u, 0xbf8c3f70u, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    const auto textureAddress = reinterpret_cast<std::uintptr_t>(texels.data());
+    const std::array<std::uint32_t, 8> valid{static_cast<std::uint32_t>(textureAddress >> 8u), static_cast<std::uint32_t>((textureAddress >> 40u) & 0xffu) | (22u << 20u), 0u, 0x90000facu, 0u, 0u, 0u, 0u};
+    auto invalid = valid;
+    invalid[3] = 0x30000facu;
+    auto null = valid;
+    null[3] = 0x249u;
+    const auto guardAddress = reinterpret_cast<std::uintptr_t>(&BufferGuard);
+    std::array<std::uint32_t, 12> users{};
+    const std::array<std::uint32_t, 4> guard{static_cast<std::uint32_t>(guardAddress), static_cast<std::uint32_t>(guardAddress >> 32u), sizeof(BufferGuard), 0x31016facu};
+    std::copy(guard.begin(), guard.end(), users.begin() + 8);
+    AgcDriver::Registers context{{0x1b6, 0x8000}, {0x1b3, 0}, {0x1b4, 0}, {0x203, 0}, {0x1c5, 9u}};
+    RecompileRequest request{{ShaderStage::Fragment, 0x34000u, code, 0, {}}, {32, 0, users, {}, AgcDriver::Graphics::DecodePixelStageInfo(context, {}), {}, {}}, target, PixelPushLayout(0u, target)};
+    AgcDriver::Graphics::State state{};
+    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0, 32, 32, {}, {}};
+    state.color = {reinterpret_cast<std::uintptr_t>(pixels.data()), {Extent, Extent}, VK_FORMAT_R32G32B32A32_SFLOAT, sizeof(pixels), 0};
+    state.color.elementBytes = 16u;
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {Extent, Extent};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, static_cast<float>(Extent), static_cast<float>(Extent), -static_cast<float>(Extent), 0, 1};
+    state.scissor = {{0, 0}, {Extent, Extent}};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15u;
+    state.blends = {state.blend};
+    const AgcDriver::Pm4::DrawParameters draw{0, 3, 0, 1, 0, false};
+    std::uint64_t pipeline = 0u;
+    for (const auto& image : {valid, invalid, null, valid}) {
+        std::copy(image.begin(), image.end(), users.begin());
+        for (const bool active : {false, true}) {
+            BufferGuard = active ? 1u : 0u;
+            texels.fill(0x3e800000u);
+            pixels.fill(0xdeadbeefu);
+            const auto pixel = Recompile(request);
+            Require(pixel.registrationModule && pixel.invalidResourceDescriptors == (image == invalid ? 1u : 0u), "registered image: descriptor flag was lost");
+            if (pipeline == 0u) pipeline = pixel.PipelineVariantId();
+            Require(pixel.PipelineVariantId() == pipeline, "registered image: descriptor state specialized the module");
+            const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::Fragment, &pixel, PixelPushOffset(0u, target)}}};
+            Outcome outcome;
+            const bool fault = active && image == invalid;
+            StderrCapture log;
+            try {
+                device.Draw(state, draw, shaders);
+                device.WaitIdle();
+            } catch (const std::runtime_error& error) {
+                if (!fault) {
+                    static_cast<void>(log.Finish());
+                    throw;
+                }
+                outcome.log = error.what();
+            } catch (...) {
+                static_cast<void>(log.Finish());
+                throw;
+            }
+            outcome.log += log.Finish();
+            Require(Faulted(outcome) == fault, "registered image: metadata fault did not follow the GPU branch:\n" + outcome.log);
+            if (fault) Require(outcome.log.find("reason=8") != std::string::npos && outcome.log.find(Fault(textureAddress, 0x28u, 0u)) != std::string::npos, "registered image: fault lost original address or PC:\n" + outcome.log);
+            else {
+                const auto expected = !active ? Payload : image == null ? 0u : 0x3e800000u;
+                const auto mismatch = std::ranges::find_if(pixels, [&](std::uint32_t word) { return word != expected; });
+                Require(mismatch == pixels.end(), "registered image: valid, skipped, or TYPE0 pixel differs: active=" + std::to_string(active) + " type=" + std::to_string(image[3] >> 28u) + " expected=" + std::to_string(expected) + " first=" + std::to_string(pixels[0]) + " index=" + std::to_string(mismatch - pixels.begin()));
+            }
+        }
+    }
+    std::puts("registered image metadata GPU tests passed");
+}
+
 }
 
 int main() {
@@ -328,6 +484,8 @@ int main() {
         for (const bool formatted : {false, true}) {
             for (const bool exec : {false, true}) RunBufferTypeTests(*device, formatted, exec);
         }
+        for (const bool exec : {false, true}) RunImageTypeTests(*device, exec);
+        RunRegisteredImageTests(*device);
         std::puts("guarded null pointer tests passed");
         return 0;
     } catch (const std::exception& error) {

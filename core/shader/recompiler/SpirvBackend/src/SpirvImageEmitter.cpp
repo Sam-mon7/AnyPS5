@@ -1745,6 +1745,22 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto& memory = ctx.Memory(inst);
     const auto& base = ImageResourceOf(state, memory);
+    if (base.table == NoTable && (state.program.Info().usesDma || state.program.Info().usesFaultBuffer)) {
+        const auto u32 = TypeU32(state);
+        const auto flag = state.registrationModules
+            ? Binary(state, spv::OpBitwiseAnd, u32, RuntimeImageDword(state, memory.resource, offsetof(RuntimeAbi::ResourceMetadata, flags) / sizeof(std::uint32_t)), ConstantU32(state, RuntimeAbi::InvalidImage))
+            : state.module.SpecializationConstant(u32, PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords + 5u, 0u);
+        const auto invalid = Binary(state, spv::OpLogicalAnd, TypeBool(state), ctx.Arg(inst, inst.ArgumentCount() - 1u), Binary(state, spv::OpINotEqual, TypeBool(state), flag, ConstantU32(state, 0u)));
+        EmitIfCondition(state, invalid, [&] {
+            const auto* handle = inst.Argument(0)->Resolve();
+            const auto low = Binary(state, spv::OpShiftLeftLogical, u32, ctx.Arg(*handle, 0u), ConstantU32(state, 8u));
+            const auto high = Binary(state, spv::OpBitwiseOr, u32,
+                Binary(state, spv::OpShiftRightLogical, u32, ctx.Arg(*handle, 0u), ConstantU32(state, 24u)),
+                Binary(state, spv::OpShiftLeftLogical, u32, Binary(state, spv::OpBitwiseAnd, u32, ctx.Arg(*handle, 1u), ConstantU32(state, 0xffu)), ConstantU32(state, 8u)));
+            RecordBdaFaultWords(state, low, high, ConstantU32(state, 0u), BdaInstructionPc(state, inst), BdaAbi::FaultReason::InvalidDescriptor);
+        });
+        StopBdaInvocationIf(state, invalid);
+    }
     const auto imageInfo = ImageOpcodeInfoOf(inst.Opcode());
     const auto& samplers = state.program.Info().samplers;
     const bool tableSampler = imageInfo.needsSampler && memory.sampler < samplers.size() && samplers[memory.sampler].table != NoTable;

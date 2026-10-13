@@ -1,4 +1,5 @@
 #include "ShaderDiskCache.hpp"
+#include "BdaAbi.hpp"
 #include "CacheKey.hpp"
 #include "VertexInputSpecialization.hpp"
 #include "SpirvBackend/SpirvSpecialization.hpp"
@@ -91,7 +92,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
     require(left.specialization == right.specialization, prefix + "specialization constants differ");
     require(left.workgroupMemoryDwords == right.workgroupMemoryDwords, prefix + "workgroup memory stride differs");
     require(left.poisonedSrtReads == right.poisonedSrtReads, prefix + "poisoned SRT read counts differ");
-    require(left.invalidBufferDescriptors == right.invalidBufferDescriptors, prefix + "invalid buffer descriptor counts differ");
+    require(left.invalidResourceDescriptors == right.invalidResourceDescriptors, prefix + "invalid buffer descriptor counts differ");
     require(left.imageTableRanges == right.imageTableRanges && left.imageTableShader == right.imageTableShader && left.imageTableFaults == right.imageTableFaults && left.imageTablePoison.size() == right.imageTablePoison.size(), prefix + "image table invocation data differs");
     require(left.imageTableReadRanges == right.imageTableReadRanges, prefix + "image table read ranges differ");
     for (std::size_t i = 0; i < left.imageTablePoison.size(); ++i) {
@@ -177,7 +178,7 @@ RecompileResult sampleResult() {
     result.parameterExports = {0, 3, 7};
     result.fragmentParameters = {{0, 1, true, false, true}, {2, 3, false, true}};
     result.poisonedSrtReads = 3;
-    result.invalidBufferDescriptors = 2;
+    result.invalidResourceDescriptors = 2;
     result.barycentricEmulation = {true, false, true};
     result.variantId = 99;
     result.imageTablePoison = {{{1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}, 8u, 2u, 6u}, {{9u, 0u, 0u, 0u, 0u, 0u, 0u, 0u}, 4u, 0xffffffffu, 19u}};
@@ -894,7 +895,7 @@ void verifyInvocationIsolation() {
     request.userData = original;
     request.userData[3] |= 0x40000000u;
     const auto deferred = Recompile(request.request);
-    require(deferred.invalidBufferDescriptors == 1u, "an invalid V# did not request completion fault checking");
+    require(deferred.invalidResourceDescriptors == 1u, "an invalid V# did not request completion fault checking");
     const auto buffers = std::ranges::find_if(deferred.bindings, [](const auto& binding) { return binding.role == DescriptorRole::GuestBuffers; });
     require(buffers == deferred.bindings.end() || buffers->guestDescriptor == std::vector<std::uint32_t>(4u, 0u), "an invalid V# exposed its range to the host binding");
     require(std::ranges::any_of(deferred.bindings, [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; }), "an invalid V# has no deferred fault binding");
@@ -903,6 +904,49 @@ void verifyInvocationIsolation() {
     try { static_cast<void>(Recompile(request.request)); }
     catch (const std::runtime_error&) { rejected = true; }
     require(rejected, "an unsupported buffer descriptor type was accepted without the fault ABI");
+}
+
+void verifyInvalidImageSpecialization() {
+    ComputeRequest fixture(true);
+    fixture.code = {0x7e000280u, 0x7e020280u, 0x7e0402ffu, 0x3f800000u, 0xf0201108u, 0x00000200u, 0xbf810000u};
+    fixture.request.shader.code = fixture.code;
+    std::array<std::uint32_t, 8> descriptor{0x100000u, 20u << 20u, 0u, 0x90000facu, 0u, 0u, 0u, 0u};
+    fixture.request.context.userData = descriptor;
+    const auto valid = Recompile(fixture.request);
+    require(valid.invalidResourceDescriptors == 0u && valid.bdaAbiVersion == 0u, "valid image specialization retained the fault ABI");
+    require(std::ranges::none_of(valid.bindings, [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; }), "valid image specialization retained a fault-buffer binding");
+    for (std::size_t cursor = 5u; cursor < valid.spirv.size();) {
+        const auto count = valid.spirv[cursor] >> 16u;
+        require(count != 0u && count <= valid.spirv.size() - cursor, "invalid specialized image instruction");
+        const auto opcode = valid.spirv[cursor] & 0xffffu;
+        require(opcode < spv::OpAtomicLoad || opcode > spv::OpAtomicXor, "valid image specialization retained fault atomics");
+        cursor += count;
+    }
+    descriptor[3] = 0x30000facu;
+    const auto invalid = Recompile(fixture.request);
+    require(invalid.invalidResourceDescriptors == 1u && invalid.bdaAbiVersion == BdaAbi::Version, "an image-only shader lost its deferred descriptor fault");
+    require(std::ranges::any_of(invalid.bindings, [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; }), "an invalid T# has no fault binding");
+    for (const auto& binding : invalid.bindings) {
+        if (binding.role == DescriptorRole::GuestImages) require(std::ranges::all_of(binding.guestDescriptor, [](std::uint32_t word) { return word == 0u; }), "an invalid T# exposed its range to the host binding");
+    }
+    std::vector<std::byte> bytes;
+    ShaderDiskCache::EncodeResult(invalid, bytes);
+    RecompileResult decoded;
+    require(ShaderDiskCache::DecodeResult(bytes, decoded), "an invalid-image invocation did not deserialize");
+    requireSameResult(invalid, decoded, "invalid image invocation round trip");
+    fixture.request.useCache = false;
+    requireSameResult(invalid, Recompile(fixture.request), "invalid image fresh against cached");
+    descriptor[3] = 0x249u;
+    const auto null = Recompile(fixture.request);
+    require(null.invalidResourceDescriptors == 0u && null.bdaAbiVersion == 0u, "TYPE0 reused an invalid image's fault specialization");
+    descriptor[3] = 0x90000facu;
+    requireSameResult(valid, Recompile(fixture.request), "valid image restored after invalid and null");
+    descriptor[3] = 0x30000facu;
+    fixture.request.target.bdaAbiVersion = 0u;
+    bool rejected = false;
+    try { static_cast<void>(Recompile(fixture.request)); }
+    catch (const std::runtime_error& error) { rejected = std::string(error.what()).find("runtime image descriptor is invalid") != std::string::npos; }
+    require(rejected, "an invalid image-only shader was accepted without the fault ABI");
 }
 
 void verifyBufferAlignmentSpecialization() {
@@ -1248,6 +1292,7 @@ int main(int argc, char** argv) {
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);
         verifyInvocationIsolation();
+        verifyInvalidImageSpecialization();
         verifyBufferAlignmentSpecialization();
         verifyBindingPlanSelection();
         verifyVertexTypeSpecialization();

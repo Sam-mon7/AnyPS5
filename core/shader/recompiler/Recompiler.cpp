@@ -266,7 +266,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     resourceTracker.Track(program);
     // A CPU-resolved V# can still be used only behind a GPU-controlled branch.
     // Keep its type check at the instruction when the target can report the fault.
-    if (!program.Info().buffers.empty() && request.target.bdaAbiVersion == BdaAbi::Version) program.Info().usesFaultBuffer = true;
+    if ((!program.Info().buffers.empty() || !program.Info().images.empty()) && request.target.bdaAbiVersion == BdaAbi::Version) program.Info().usesFaultBuffer = true;
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
@@ -688,6 +688,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     for (std::size_t index = 0; index < variant.info.info.images.size(); ++index) {
         const auto& descriptor = snapshot.images.at(index);
+        key.push_back(index < snapshot.invalidImages.size() ? snapshot.invalidImages[index] : 0u);
         key.push_back(descriptor.dwordCount);
         key.push_back(descriptor.dwords[0] != 0u || (descriptor.dwords[1] & 0xffu) != 0u);
         key.push_back(descriptor.dwords[1] & ~0xffu);
@@ -886,7 +887,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         }
     }
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
-    result.invalidBufferDescriptors = static_cast<std::uint32_t>(std::ranges::count_if(snapshot.buffers, [](const auto& descriptor) { return descriptor.dwords[3] >> 30u != 0u; }));
+    result.invalidResourceDescriptors = static_cast<std::uint32_t>(std::ranges::count_if(snapshot.buffers, [](const auto& descriptor) { return descriptor.dwords[3] >> 30u != 0u; }) + std::ranges::count(snapshot.invalidImages, 1u));
     if (!tables.map.empty()) {
         result.imageTablePoison.reserve(tables.poison.size());
         for (const auto& poison : tables.poison) result.imageTablePoison.push_back({poison.words, poison.dwordCount, poison.resource, static_cast<std::uint32_t>(poison.reason)});
@@ -1031,6 +1032,8 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     };
     mixDescriptors(snapshot.buffers);
     mixDescriptors(snapshot.images);
+    mix(snapshot.invalidImages.size());
+    for (const auto invalid : snapshot.invalidImages) mix(invalid);
     mixDescriptors(snapshot.samplers);
     mixWords(snapshot.flattenedSrt);
     mixWords(snapshot.userData);

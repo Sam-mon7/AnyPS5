@@ -67,6 +67,7 @@ struct ResourceSnapshot {
     std::vector<SrtReadPoison> srtPoison;
     std::uint32_t nullRootReads = 0;
     ImageTableSnapshot tables;
+    std::vector<std::uint8_t> invalidImages;
 };
 
 struct UniformFillPlan {

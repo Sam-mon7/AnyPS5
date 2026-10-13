@@ -664,8 +664,17 @@ void verifyGuardedDescriptorSources() {
     fill(invalid, 1u);
     {
         AgcDriver::ShaderMemory memory({});
-        expectFailure([&] { static_cast<void>(memory.Capture(request)); }, "runtime image descriptor is invalid", "guarded sources: an invalid T# behind a taken branch was accepted");
+        const auto capture = memory.Capture(request);
+        require(capture->snapshot.invalidImages == std::vector<std::uint8_t>{1u} && std::ranges::all_of(capture->snapshot.images[0].dwords, [](std::uint32_t word) { return word == 0u; }), "guarded sources: an invalid T# was not deferred with a safe host descriptor");
+        const auto result = Recompile(request, *capture);
+        require(result->invalidResourceDescriptors == 1u, "guarded sources: the deferred T# did not request fault completion checking");
     }
+    request.target.bdaAbiVersion = 0u;
+    {
+        AgcDriver::ShaderMemory memory({});
+        expectFailure([&] { static_cast<void>(memory.Capture(request)); }, "runtime image descriptor is invalid", "guarded sources: an invalid T# was accepted without the fault ABI");
+    }
+    request.target.bdaAbiVersion = BdaAbi::Version;
     fill(valid, 1u);
     {
         AgcDriver::ShaderMemory memory({});

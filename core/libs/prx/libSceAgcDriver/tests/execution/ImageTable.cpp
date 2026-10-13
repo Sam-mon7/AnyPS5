@@ -320,7 +320,7 @@ struct Outcome {
     std::uint32_t imageTableCount = 0;
     std::uint32_t imageTableFaults = 0;
     std::uint32_t poisonedSrtReads = 0;
-    std::uint32_t invalidBufferDescriptors = 0;
+    std::uint32_t invalidResourceDescriptors = 0;
     bool cacheable = false;
     std::vector<std::array<std::uint32_t, 4>> samplers;
     std::vector<std::array<std::uint32_t, 4>> samplerTable;
@@ -350,7 +350,7 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
     outcome.artifactId = result.variantId;
     outcome.imageTableFaults = result.imageTableFaults;
     outcome.poisonedSrtReads = result.poisonedSrtReads;
-    outcome.invalidBufferDescriptors = result.invalidBufferDescriptors;
+    outcome.invalidResourceDescriptors = result.invalidResourceDescriptors;
     outcome.cacheable = AgcDriver::DriverDetail::CacheableResult(result);
     outcome.imageTableReadRanges = result.imageTableReadRanges;
     for (const auto& binding : result.bindings) {
@@ -899,8 +899,21 @@ void RunGuardedTableTests(AgcDriver::VulkanDevice& device) {
     Require(poisoned.artifactId == mapped.artifactId && poisoned.variantId == mapped.variantId, "image table guard: a poisoned nested read changed the pipeline");
     Require(poisoned.log.find("BDA access failed") != std::string::npos && poisoned.log.find("address=0x0 instruction=0x24 bytes=4") != std::string::npos, "image table guard: a valid table suppressed the nested read's completion fault:\n" + poisoned.log);
     const auto invalidBuffer = Run(device, TableCode, 1, Lanes, 64, false, 2u);
-    Require(invalidBuffer.imageTableCount != 0u && invalidBuffer.imageTableFaults == 0u && invalidBuffer.poisonedSrtReads == 0u && invalidBuffer.invalidBufferDescriptors == 1u, "image table guard: an invalid static output V# was not recorded");
+    Require(invalidBuffer.imageTableCount != 0u && invalidBuffer.imageTableFaults == 0u && invalidBuffer.poisonedSrtReads == 0u && invalidBuffer.invalidResourceDescriptors == 1u, "image table guard: an invalid static output V# was not recorded");
     Require(invalidBuffer.log.find("BDA access failed") != std::string::npos && invalidBuffer.log.find("reason=8") != std::string::npos && Zeros(invalidBuffer), "image table guard: a valid table suppressed the static buffer's completion fault:\n" + invalidBuffer.log);
+    std::array<std::uint32_t, TableCode.size() + 18u> invalidImageCode{};
+    auto next = std::copy(TableCode.begin(), TableCode.end() - 1, invalidImageCode.begin());
+    constexpr std::array<std::uint32_t, 8> invalidImageWords{0x3f000000u, 0x3d4ccccdu, 0x3f000000u, 0x3f000000u, 0x69300ee0u, 2u, 0x71u, 0u};
+    for (std::uint32_t word = 0u; word < invalidImageWords.size(); ++word) {
+        *next++ = 0xbe8003ffu | ((80u + word) << 16u);
+        *next++ = invalidImageWords[word];
+    }
+    *next++ = 0xf0201108u;
+    *next++ = 0x00140401u;
+    *next = 0xbf810000u;
+    const auto invalidImage = Run(device, invalidImageCode, 1, Lanes, 64);
+    Require(invalidImage.imageTableCount != 0u && invalidImage.imageTableFaults == 0u && invalidImage.poisonedSrtReads == 0u && invalidImage.invalidResourceDescriptors == 1u, "image table guard: an invalid static T# was not recorded");
+    Require(invalidImage.log.find("BDA access failed") != std::string::npos && invalidImage.log.find("reason=8") != std::string::npos && invalidImage.log.find("0xcd3f00000000") != std::string::npos, "image table guard: a valid table suppressed the static image's completion fault:\n" + invalidImage.log);
     SetClassRecords();
 }
 
