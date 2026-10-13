@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -206,12 +208,27 @@ public:
         const auto geometry = DescribeSurface(resource);
         Require(geometry.layers == layers && geometry.sliceLinearBytes == sliceBytes() && !geometry.mips.empty(), "depth plane copy geometry does not match its layers");
         std::vector<std::shared_ptr<Buffer>> uploads;
+        guestUploads.resize(layers);
+        std::vector<std::byte> bytes;
+        std::size_t replaced = 0;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
-            if (slices[layer] != VK_NULL_HANDLE) continue;
-            auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            GuestMemory::ReadCommitted(resource.baseAddress + geometry.GuestLayerOffset(layer), upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
-            uploads.push_back(std::move(upload));
+            auto& upload = guestUploads[layer];
+            if (slices[layer] != VK_NULL_HANDLE) {
+                upload.reset();
+                continue;
+            }
+            bytes.resize(static_cast<std::size_t>(geometry.layerBytes));
+            GuestMemory::ReadCommitted(resource.baseAddress + geometry.GuestLayerOffset(layer), bytes);
+            if (upload == nullptr || upload->Bytes().size() != bytes.size() || std::memcmp(upload->Bytes().data(), bytes.data(), bytes.size()) != 0) {
+                auto replacement = std::make_shared<Buffer>(context, bytes.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                std::memcpy(replacement->Bytes().data(), bytes.data(), bytes.size());
+                upload = std::move(replacement);
+                ++replaced;
+            }
+            uploads.push_back(upload);
         }
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile && !uploads.empty()) std::fprintf(stderr, "[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu bytes-per-layer=%llu\n", static_cast<unsigned long long>(resource.baseAddress), layers, uploads.size() - replaced, replaced, static_cast<unsigned long long>(geometry.layerBytes));
         if (!uploads.empty()) {
             Require(context.detiler != nullptr, "depth plane copy requires a texture detiler");
             context.detiler->BeginBatch();
@@ -281,6 +298,7 @@ private:
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     std::unique_ptr<DeviceBuffer> staging;
+    std::vector<std::shared_ptr<Buffer>> guestUploads;
     std::map<std::array<std::uint32_t, 5>, std::shared_ptr<Texture>> textures;
 
     VkDeviceSize sliceBytes() const {
@@ -293,6 +311,7 @@ private:
 
     void release() noexcept {
         textures.clear();
+        guestUploads.clear();
         staging.reset();
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);

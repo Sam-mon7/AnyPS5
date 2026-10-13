@@ -219,7 +219,7 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
 }
 
 // Loads row 0 of `slice` of the texture `shape` describes at `texels` into `output` (one dword per thread).
-void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& shape, std::uint32_t slice, std::span<std::uint32_t> output) {
+void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& shape, std::uint32_t slice, std::span<std::uint32_t> output, bool wait = true) {
     const auto& code = shape.type == TypeCube ? LoadCube : shape.type == Type2DArray ? LoadArray : Load2D;
     std::vector<std::uint32_t> userData(16, 0u);
     const auto out = std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(output.data())), static_cast<std::uint32_t>((reinterpret_cast<std::uintptr_t>(output.data()) >> 32u) & 0xffffu), static_cast<std::uint32_t>(output.size_bytes()), 0x31016facu};
@@ -239,7 +239,7 @@ void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& sh
     std::fill(output.begin(), output.end(), 0xdeadbeefu);
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
-    device.WaitIdle();
+    if (wait) device.WaitIdle();
 }
 
 void Expect(std::span<const std::uint32_t> output, std::uint32_t expected, const std::string& what) {
@@ -300,10 +300,10 @@ void DepthBitsArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std:
     Expect(output, 0x1234u, "D16 depth-bits array slice 1");
 }
 
-void DemonsSoulsArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block) {
+void DemonsSoulsArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block, GuestBlock& outputBlock) {
     constexpr std::size_t sliceBytes = 1024u * 1024u * 4u;
     auto* base = block.At(65536);
-    const std::span<std::uint32_t> output(reinterpret_cast<std::uint32_t*>(block.At(0)), Threads);
+    const std::span<std::uint32_t> output(reinterpret_cast<std::uint32_t*>(outputBlock.At(0)), Threads);
     FillSlice(base, 80u * sliceBytes, Bits(0.375f), 4u);
     DrawDepth(device, reinterpret_cast<std::uintptr_t>(base), {1024, 1024}, VK_FORMAT_D32_SFLOAT, 0.25f);
     DrawDepth(device, reinterpret_cast<std::uintptr_t>(base + 79u * sliceBytes), {1024, 1024}, VK_FORMAT_D32_SFLOAT, 0.625f);
@@ -315,6 +315,16 @@ void DemonsSoulsArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block) {
     DrawDepth(device, reinterpret_cast<std::uintptr_t>(base), {1024, 1024}, VK_FORMAT_D32_SFLOAT, 0.75f);
     Load(device, base, shape, 0, output);
     Expect(output, Bits(0.75f), "Demon's Souls depth array after another GPU write");
+    constexpr std::uint32_t queued = 6u;
+    const auto queuedOutput = [&](std::uint32_t index) {
+        return std::span<std::uint32_t>(reinterpret_cast<std::uint32_t*>(outputBlock.At(256u + index * 256u)), Threads);
+    };
+    for (std::uint32_t index = 0; index < queued; ++index) Load(device, base, shape, 39u, queuedOutput(index), false);
+    FillSlice(base + 39u * sliceBytes, sliceBytes, Bits(0.875f), 4u);
+    Load(device, base, shape, 39u, queuedOutput(queued), false);
+    device.WaitIdle();
+    for (std::uint32_t index = 0; index < queued; ++index) Expect(queuedOutput(index), Bits(0.375f), "queued depth upload retained its old contents");
+    Expect(queuedOutput(queued), Bits(0.875f), "changed guest depth layer replaced its upload");
     AgcDriver::Graphics::ClearDepthSurfaces(device.Device());
     std::puts("Demon's Souls 1024x1024x80 depth array values and refresh passed");
 }
@@ -347,7 +357,7 @@ int main() {
         IntegerCase(*device, block, output);
         DepthBitsArrayCase(*device, block, output);
         RefusalCase(*device, block, output);
-        DemonsSoulsArrayCase(*device, largeBlock);
+        DemonsSoulsArrayCase(*device, largeBlock, block);
         std::puts("depth plane sampling tests passed");
         return 0;
     } catch (const std::exception& error) {
