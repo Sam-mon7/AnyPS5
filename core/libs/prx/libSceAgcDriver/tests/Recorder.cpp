@@ -3,6 +3,7 @@
 #include "Triangle_vert_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -51,9 +52,12 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -279,6 +283,11 @@ public:
     bool NullDescriptors() const { return nullDescriptors; }
     const Context& GetContext() const { return context; }
     bool Graphics() const { return graphics; }
+    VkPhysicalDeviceProperties Properties() const {
+        VkPhysicalDeviceProperties properties{};
+        function<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(context.physical, &properties);
+        return properties;
+    }
     void WaitQueue() const { Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle"); }
 
 private:
@@ -6335,6 +6344,134 @@ void pipelineCacheTests(const Device& device, bool benchmark) {
     std::cout << "Pipeline cache key and retained lifetime tests passed\n";
 }
 
+int pipelineCacheFileTests(const Device& device) {
+    const auto& context = device.GetContext();
+    const auto directory = std::filesystem::temp_directory_path() / ("aps5-pipeline-cache-file-test-" + std::to_string(std::random_device{}()));
+    struct RemoveDirectory {
+        std::filesystem::path directory;
+        ~RemoveDirectory() {
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+        }
+    } removeDirectory{directory};
+#ifdef _WIN32
+    _putenv_s("ANYPS5_NO_SHADER_CACHE", "0");
+    _putenv_s("ANYPS5_SHADER_CACHE_DIR", directory.string().c_str());
+#else
+    setenv("ANYPS5_NO_SHADER_CACHE", "0", 1);
+    setenv("ANYPS5_SHADER_CACHE_DIR", directory.string().c_str(), 1);
+#endif
+    const auto properties = device.Properties();
+    struct Objects {
+        const Context& context;
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        std::array<VkShaderModule, 2> modules{};
+        ~Objects() {
+            for (const auto module : modules) {
+                if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            }
+            if (layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+            if (setLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, setLayout, nullptr);
+        }
+    } objects{context};
+    const std::array bindings{VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, VkDescriptorSetLayoutBinding{1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo setLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    setLayoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    setLayoutInfo.pBindings = bindings.data();
+    Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &setLayoutInfo, nullptr, &objects.setLayout), "vkCreateDescriptorSetLayout");
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 2};
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &objects.setLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &push;
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout");
+    const std::array<std::span<const std::uint32_t>, 2> codes{std::span<const std::uint32_t>(SAMPLE_LOD_SPV), std::span<const std::uint32_t>(SAMPLE_ARRAY_SPV)};
+    for (std::size_t index = 0; index < codes.size(); ++index) {
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = codes[index].size_bytes();
+        moduleInfo.pCode = codes[index].data();
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &objects.modules[index]), "vkCreateShaderModule");
+    }
+    const auto build = [&](VkPipelineCache cache, std::size_t index) {
+        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, objects.modules[index], "main", nullptr};
+        info.layout = objects.layout;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, cache, 1, &info, nullptr, &pipeline), "vkCreateComputePipelines");
+        context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+    };
+    const auto bytes = [&](VkPipelineCache cache) {
+        std::size_t size = 0;
+        Check(context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData")(context.device, cache, &size, nullptr), "vkGetPipelineCacheData");
+        return size;
+    };
+    const auto holds = [&](VkPipelineCache cache, std::size_t index) {
+        const auto before = bytes(cache);
+        build(cache, index);
+        return bytes(cache) == before;
+    };
+    const auto cacheFile = [&] {
+        std::vector<std::filesystem::path> found;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) found.push_back(entry.path());
+        Require(found.size() == 1 && found.front().filename().string().starts_with("vk-pipelines-"), "the pipeline cache directory does not hold exactly one cache file");
+        return found.front();
+    };
+    const auto contents = [](const std::filesystem::path& path) {
+        std::ifstream stream(path, std::ios::binary);
+        return std::vector<char>(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+    };
+    {
+        VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        VkPipelineCache probe = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(context.device, &info, nullptr, &probe), "vkCreatePipelineCache");
+        const bool stored = !holds(probe, 0);
+        context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, probe, nullptr);
+        if (!stored) {
+            std::cout << "skipped, the driver keeps no pipelines in a pipeline cache\n";
+            return 77;
+        }
+    }
+    for (const bool firstSavesFirst : {true, false}) {
+        std::filesystem::remove_all(directory);
+        auto first = std::make_unique<PipelineCache>(context, properties);
+        auto second = std::make_unique<PipelineCache>(context, properties);
+        build(first->Handle(), 0);
+        build(second->Handle(), 1);
+        if (firstSavesFirst) {
+            first.reset();
+            second.reset();
+        } else {
+            second.reset();
+            first.reset();
+        }
+        PipelineCache third(context, properties);
+        Require(holds(third.Handle(), 0), firstSavesFirst ? "the cache file lost the pipeline of the object that saved first" : "the cache file lost the pipeline of the object that saved last");
+        Require(holds(third.Handle(), 1), firstSavesFirst ? "the cache file lost the pipeline of the object that saved last" : "the cache file lost the pipeline of the object that saved first");
+    }
+    const auto path = cacheFile();
+    const auto stored = contents(path);
+    {
+        PipelineCache idle(context, properties);
+    }
+    Require(contents(path) == stored, "an object that added no pipelines rewrote the cache file");
+    {
+        std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);
+        corrupt << "not a pipeline cache";
+    }
+    {
+        PipelineCache replacing(context, properties);
+        build(replacing.Handle(), 1);
+    }
+    {
+        PipelineCache reloaded(context, properties);
+        Require(holds(reloaded.Handle(), 1), "an invalid cache file was not replaced by the saving object's pipelines");
+    }
+    std::cout << "Pipeline cache file merge tests passed\n";
+    return 0;
+}
+
 void descriptorPoolTests(const Device& device) {
     DescriptorCache cache(device.GetContext());
     const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -6878,6 +7015,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && (std::string_view(argv[1]) == "--benchmark-pipeline-cache" || std::string_view(argv[1]) == "--pipeline-cache-only")) {
             pipelineCacheTests(device, std::string_view(argv[1]) == "--benchmark-pipeline-cache");
             return 0;
+        }
+
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-cache-file-only") {
+            return pipelineCacheFileTests(device);
         }
 
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-only") {
