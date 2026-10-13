@@ -216,6 +216,7 @@ thread_local PacketTag currentPacket{NoPacket, 0xffffffffu};
 thread_local ReadSite currentReadSite = ReadSite::Unknown;
 // Sampled reads by site (every 256th Read/ReadCommitted, like the callers), for the [guestmem] line.
 std::atomic<std::uint64_t> readSiteSamples[static_cast<std::size_t>(ReadSite::Count)] = {};
+std::array<MemoryCounter, static_cast<std::size_t>(ReadSite::Count)> compareSites;
 
 void SetCurrentPacket(std::uint32_t opcode, std::uint32_t queue) {
     currentPacket = {opcode, queue};
@@ -297,7 +298,9 @@ public:
     ~TimedAccess() {
         if (!MemoryProfiled()) return;
         const auto now = std::chrono::steady_clock::now();
-        CounterFor(kind).Add(bytes, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), SharedMemoryCounters());
+        const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+        CounterFor(kind).Add(bytes, nanoseconds, SharedMemoryCounters());
+        if (kind == CounterCompare) compareSites[static_cast<std::size_t>(currentReadSite)].Add(bytes, nanoseconds, true);
         auto& state = Profile();
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
         auto last = state.lastReport.load();
@@ -325,6 +328,13 @@ public:
         for (std::size_t site = 0; site < static_cast<std::size_t>(ReadSite::Count); ++site) {
             const auto count = readSiteSamples[site].load(std::memory_order_relaxed);
             if (count != 0) AgcDriver::ProfilePrint_nid_no_patch(" %s=%llu", ReadSiteName(static_cast<ReadSite>(site)), static_cast<unsigned long long>(count));
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("\n");
+        AgcDriver::ProfilePrint_nid_no_patch("[guestmem-compare] totals by read site:");
+        for (std::size_t site = 0; site < compareSites.size(); ++site) {
+            const auto& counter = compareSites[site];
+            const auto calls = counter.calls.load(std::memory_order_relaxed);
+            if (calls != 0) AgcDriver::ProfilePrint_nid_no_patch(" %s=%llu/%.0fMiB/%.3fs", ReadSiteName(static_cast<ReadSite>(site)), static_cast<unsigned long long>(calls), counter.bytes.load(std::memory_order_relaxed) / 1048576.0, counter.nanoseconds.load(std::memory_order_relaxed) / 1000000000.0);
         }
         AgcDriver::ProfilePrint_nid_no_patch("\n");
     }
