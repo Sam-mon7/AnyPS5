@@ -129,6 +129,7 @@ public:
         int value;
     };
     std::vector<PendingWrite> PendingWritesOver(std::uint64_t address, std::size_t bytes) const;
+    void PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
     // Batch read tracking: the guest ranges the recorded work reads IN PLACE through a host import
     // and the GPU has not executed yet (a V# element bound in place, a region the GPU copies out of
     // an import, an address-based build's leased heaps, indirect arguments, a GPU-direct storage

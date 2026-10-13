@@ -2840,6 +2840,12 @@ std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t ad
     return found;
 }
 
+void Recorder::PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+    ranges.clear();
+    if (open != nullptr) ranges.insert(ranges.end(), open->writes.begin(), open->writes.end());
+    for (const auto& batch : inFlight) ranges.insert(ranges.end(), batch->writes.begin(), batch->writes.end());
+}
+
 bool Recorder::ReadTracking() {
     return ReadTrackingEnabled();
 }

@@ -4,8 +4,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,6 +78,17 @@ std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
 class Recorder;
+
+template<typename TRange>
+void OverlappedRanges(std::span<const TRange> sorted, std::size_t first, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::vector<std::size_t>& indices) {
+    indices.clear();
+    for (const auto& [begin, end] : writes) {
+        auto it = std::partition_point(sorted.begin() + static_cast<std::ptrdiff_t>(first), sorted.end(), [&](const TRange& range) { return range.end <= begin; });
+        for (; it != sorted.end() && it->begin < end; ++it) indices.push_back(static_cast<std::size_t>(it - sorted.begin()));
+    }
+    std::sort(indices.begin(), indices.end());
+    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+}
 
 // Identity of the import serving [address, address + bytes): a serial unique for the life of one
 // import, 0 when no import serves the range. An equal serial later means the same VkBuffer still
@@ -328,6 +343,7 @@ private:
     // drops the space: for a region that partially overlaps a base region, and for a build whose
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
     void dissolveSpace(bool resolve);
+    void completeSpaceWrites() const;
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address) const;

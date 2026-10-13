@@ -2289,21 +2289,23 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     return OwnRefreshFallback::Count;
 }
 
-void CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0 || Recorder::InCompletion()) return;
+bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || Recorder::InCompletion()) return false;
     auto* recorder = Recorder::Active();
-    if (recorder == nullptr) return;
+    if (recorder == nullptr) return false;
     const auto drawWriters = DrawCopiedWriters();
     const bool labels = Recorder::PendingCompletionLabels() != 0;
-    if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && drawWriters->empty() && !labels) return;
-    if (!recorder->PendingWriteOverlaps(address, bytes)) return;
+    if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && drawWriters->empty() && !labels) return false;
+    if (!recorder->PendingWriteOverlaps(address, bytes)) return false;
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); });
     };
     if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
         Recorder::CountSync(4);
         recorder->SyncThrough(address, bytes);
+        return true;
     }
+    return false;
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {

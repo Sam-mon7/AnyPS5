@@ -3009,14 +3009,31 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
     }
 }
 
+void GuestBufferMemory::completeSpaceWrites() const {
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || Recorder::InCompletion()) return;
+    const auto& base = space->base;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    std::vector<std::size_t> candidates;
+    std::size_t next = 0;
+    while (next < base.size()) {
+        recorder->PendingWriteRanges(writes);
+        OverlappedRanges(std::span<const Region>(base), next, writes, candidates);
+        next = base.size();
+        for (const auto index : candidates) {
+            if (!CompletePendingCpuWrites(context, base[index].begin, static_cast<std::size_t>(base[index].end - base[index].begin))) continue;
+            next = index + 1;
+            break;
+        }
+    }
+}
+
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
     for (const auto& region : regions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
-    if (space != nullptr) {
-        for (const auto& region : space->base) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
-    }
+    if (space != nullptr) completeSpaceWrites();
     uploaded = true;
     for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
     // Registered ranges to import from. Address-based shaders hold their lease until write-back;

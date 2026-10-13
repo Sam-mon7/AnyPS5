@@ -577,6 +577,116 @@ void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x20000, 0x1000, false), "noted ranges outlived their batch");
 }
 
+struct TestRange {
+    std::uint64_t begin;
+    std::uint64_t end;
+};
+
+void overlappedRangeTests(Recorder& recorder) {
+    Require(recorder.Idle(), "the recorder is busy before the overlap tests");
+    recorder.NotePendingWrite(0x210000, 0x100);
+    recorder.NotePendingWrite(0x210400, 0x10);
+    recorder.Submit();
+    recorder.NotePendingWrite(0x210800, 0x200);
+    recorder.NotePendingWrite(0x210900, 0x200);
+    const std::array<TestRange, 10> ranges{{{0x20f000, 0x210000}, {0x210000, 0x210080}, {0x210080, 0x210400}, {0x210400, 0x210410}, {0x210410, 0x210800}, {0x210800, 0x210801}, {0x210801, 0x210a00}, {0x210a00, 0x210b00}, {0x210b00, 0x211000}, {0x300000, 0x300010}}};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    recorder.PendingWriteRanges(writes);
+    Require(writes.size() == 4, "the pending write ranges miss a batch's writes");
+    std::vector<std::size_t> indices;
+    std::size_t matched = 0;
+    for (const std::size_t first : {0u, 3u, 6u, 10u}) {
+        OverlappedRanges(std::span<const TestRange>(ranges), first, writes, indices);
+        Require(std::is_sorted(indices.begin(), indices.end()) && std::adjacent_find(indices.begin(), indices.end()) == indices.end(), "the overlapped ranges are not sorted and unique");
+        for (std::size_t index = 0; index < ranges.size(); ++index) {
+            const bool listed = std::find(indices.begin(), indices.end(), index) != indices.end();
+            const bool pending = index >= first && recorder.PendingWriteOverlaps(ranges[index].begin, static_cast<std::size_t>(ranges[index].end - ranges[index].begin));
+            Require(listed == pending, "a range is listed as overlapped differently from PendingWriteOverlaps");
+            matched += listed ? 1 : 0;
+        }
+    }
+    Require(matched == 12, "the overlap comparison covered too few overlapped ranges");
+    recorder.Sync();
+    recorder.PendingWriteRanges(writes);
+    Require(writes.empty(), "pending write ranges outlived their batches");
+}
+
+void spaceWriteSyncTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: address space pending writes not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 0x10000;
+    constexpr std::size_t count = 4;
+    void* block = ::operator new(2 * count * bytes, std::align_val_t{65536});
+    std::memset(block, 0, 2 * count * bytes);
+    auto* memory = static_cast<std::byte*>(block);
+    const auto registry = [&](bool add) {
+        GuestAllocations::Mutation mutation;
+        for (std::size_t index = 0; index < count; ++index) {
+            if (add) mutation.Add(memory + 2 * index * bytes, bytes, true, false, true);
+            else mutation.Remove(memory + 2 * index * bytes);
+        }
+    };
+    const auto rangeAt = [&](std::size_t index) { return reinterpret_cast<std::uint64_t>(memory + 2 * index * bytes); };
+    const auto build = [&] {
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        leased.AddReadable(rangeAt(0) + 64, 16);
+        leased.Upload(true);
+        const auto reads = leased.DeviceReads();
+        leased.WriteBack();
+        return reads.size();
+    };
+    registry(true);
+    Require(recorder.Idle(), "the recorder is busy before the address space tests");
+    const auto regions = build();
+    if (regions < count) {
+        registry(false);
+        ::operator delete(block, std::align_val_t{65536});
+        std::cout << "the registered ranges are not served in place: address space pending writes not tested\n";
+        return;
+    }
+    const std::array<std::byte, 4> value{std::byte{0x5a}, std::byte{0xa5}, std::byte{0x5a}, std::byte{0xa5}};
+    const auto landed = [&](std::uint64_t address) { return std::memcmp(reinterpret_cast<const void*>(address), value.data(), value.size()) == 0; };
+    const auto inside = rangeAt(2) + 0x100;
+    static_cast<void>(recorder.Commands());
+    recorder.AfterCompletions(inside, value, 7000, 0, false);
+    Require(Recorder::PendingCompletionLabels() == 1 && !landed(inside), "the label inside a registered range is not pending");
+    build();
+    Require(landed(inside) && Recorder::PendingCompletionLabels() == 0, "a build over the address space did not complete the label pending in one of its ranges");
+    recorder.Sync();
+    const auto gap = rangeAt(2) + bytes + 0x100;
+    static_cast<void>(recorder.Commands());
+    recorder.AfterCompletions(gap, value, 7001, 0, false);
+    build();
+    Require(!landed(gap) && Recorder::PendingCompletionLabels() == 1, "a build over the address space completed a label outside its ranges");
+    recorder.Sync();
+    Require(landed(gap) && Recorder::PendingCompletionLabels() == 0, "the label outside the ranges did not land");
+    static_cast<void>(recorder.Commands());
+    recorder.AfterCompletions(rangeAt(1) + 0x40, value, 7002, 0, false);
+    recorder.Submit();
+    static_cast<void>(recorder.Commands());
+    recorder.AfterCompletions(rangeAt(3) + 0x40, value, 7003, 0, false);
+    build();
+    Require(landed(rangeAt(1) + 0x40) && landed(rangeAt(3) + 0x40) && Recorder::PendingCompletionLabels() == 0, "a build over the address space missed a label behind an earlier sync");
+    recorder.Sync();
+    static_cast<void>(recorder.Commands());
+    recorder.AfterCompletions(rangeAt(1) + 0x80, value, 7004, 0, false);
+    bool noted = false;
+    recorder.OnComplete([&] {
+        static_cast<void>(recorder.Commands());
+        recorder.AfterCompletions(rangeAt(3) + 0x80, value, 7005, 0, false);
+        noted = true;
+    });
+    build();
+    Require(noted && landed(rangeAt(1) + 0x80) && landed(rangeAt(3) + 0x80) && Recorder::PendingCompletionLabels() == 0, "a build over the address space missed a label a completion noted during its sync");
+    recorder.Sync();
+    registry(false);
+    ::operator delete(block, std::align_val_t{65536});
+}
+
 void writeSettledTests(const Device& device, Recorder& recorder) {
     Require(recorder.PendingWriteSettled(0x50000, 0x100), "an unwritten range is not settled");
     recorder.NotePendingWrite(0x50000, 0x100);
@@ -6465,6 +6575,12 @@ int main(int argc, char** argv) {
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--space-pending-writes-only") {
+            overlappedRangeTests(recorder);
+            spaceWriteSyncTests(device, recorder);
+            std::cout << "Address space pending write tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-cap-only") {
             drawSnapshotCapTests(device, recorder);
             std::cout << "Draw snapshot cap tests passed\n";
@@ -6476,6 +6592,8 @@ int main(int argc, char** argv) {
         }
 
         readTrackingTests(device, recorder);
+        overlappedRangeTests(recorder);
+        spaceWriteSyncTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
