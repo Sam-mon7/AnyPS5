@@ -204,6 +204,100 @@ void gpuFaultTests() {
     }
 }
 
+void gpuAddressBindingTests() {
+    using namespace AgcDriver::Graphics;
+    using History = GpuAddressBindings;
+    auto history = std::make_shared<History>(73);
+    std::array<VkDebugUtilsObjectNameInfoEXT, 10> objects{};
+    for (std::size_t i = 0; i < objects.size(); ++i) {
+        objects[i].sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+        objects[i].objectType = i == 0 ? VK_OBJECT_TYPE_BUFFER : VK_OBJECT_TYPE_IMAGE;
+        objects[i].objectHandle = 0xa0 + i;
+    }
+    VkDeviceAddressBindingCallbackDataEXT binding{VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT};
+    binding.baseAddress = 0x12345000;
+    binding.size = 1;
+    binding.bindingType = VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT;
+    binding.flags = VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT;
+    VkBaseInStructure prefix{VK_STRUCTURE_TYPE_APPLICATION_INFO, reinterpret_cast<const VkBaseInStructure*>(&binding)};
+    VkDebugUtilsMessengerCallbackDataEXT data{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CALLBACK_DATA_EXT};
+    data.pNext = &prefix;
+    data.objectCount = 2;
+    data.pObjects = objects.data();
+    const auto emit = [&] {
+        Require(History::Callback(VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT, VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT, &data, history.get()) == VK_FALSE, "address binding callback never aborts Vulkan");
+    };
+    History::Callback(VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT, VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT, &data, history.get());
+    History::Callback(VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT, VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT, &data, history.get());
+    Require(history->Find(0, UINT64_MAX).newest == 0, "binding history filters unrelated messages");
+    emit();
+    binding.bindingType = VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT;
+    data.objectCount = 1;
+    emit();
+    binding.baseAddress = 0x12346000;
+    emit();
+    auto matches = history->Find(0x12345000, 0x12345fff);
+    Require(matches.total == 3 && matches.count == 3, "binding history preserves aliases and unbinds without merging live ownership");
+    Require(matches.entries[0].bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT && matches.entries[1].object == 0xa1 && matches.entries[1].objectType == VK_OBJECT_TYPE_IMAGE && matches.entries[2].flags == VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT, "binding history copies object handles, types and internal flags");
+    History::Entry boundary{};
+    boundary.base = 4;
+    boundary.size = 4;
+    Require(!History::Overlaps(boundary, 8, 8) && History::Overlaps(boundary, 7, 7), "binding ranges exclude the end address");
+    boundary.base = UINT64_MAX - 3;
+    boundary.size = 8;
+    Require(History::Overlaps(boundary, UINT64_MAX, UINT64_MAX) && !History::Overlaps(boundary, 0, 0), "binding range overlap does not wrap at UINT64_MAX");
+    boundary.size = 0;
+    Require(!History::Overlaps(boundary, 0, UINT64_MAX), "empty bindings never overlap");
+    const auto output = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
+    Require(output != nullptr, "binding diagnostic capture file");
+    history->Report({VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT, 0x12345678, 0x1000}, output.get());
+    history->Report({VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT, UINT64_MAX, 0}, output.get());
+    history->Report({VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT, UINT64_MAX, 3}, output.get());
+    std::rewind(output.get());
+    std::array<char, 8192> bytes{};
+    const auto size = std::fread(bytes.data(), 1, bytes.size(), output.get());
+    const std::string_view text(bytes.data(), size);
+    Require(text.find("instance=73 interval=0x12345000..0x12345fff newest overlaps=3/3") != text.npos, "fault precision uses aligned inclusive bounds, not reportedAddress plus precision");
+    Require(text.find("invalid precision=0x0") != text.npos && text.find("invalid precision=0x3") != text.npos, "invalid fault precision is reported explicitly");
+    Require(text.find("CPU callback order; no GPU progress or fault causality") != text.npos && text.find("No match does not prove no allocation") != text.npos, "binding reports retain their evidence limits");
+    data.objectCount = objects.size();
+    emit();
+    data.pNext = nullptr;
+    emit();
+    data.pNext = &prefix;
+    data.pObjects = nullptr;
+    emit();
+    matches = history->Find(0, UINT64_MAX);
+    Require(matches.omittedObjects == 2 && matches.droppedCallbacks == 2, "binding diagnostic accounts separately for object caps and malformed callbacks");
+    data.objectCount = 1;
+    data.pObjects = objects.data();
+    for (std::size_t i = 0; i < History::MatchLimit + 1; ++i) emit();
+    const auto filtered = history->Find(0, UINT64_MAX, VK_OBJECT_TYPE_IMAGE, 0xa1);
+    Require(filtered.total == 2 && filtered.count == 2 && filtered.entries[0].object == 0xa1 && filtered.entries[1].object == 0xa1, "native smoke object filtering precedes the diagnostic output cap");
+    for (std::size_t i = 0; i < History::Capacity + 3; ++i) emit();
+    matches = history->Find(0, UINT64_MAX);
+    Require(matches.total == History::Capacity && matches.count == History::MatchLimit && matches.overwritten == 48 && matches.oldest == 49, "binding ring and match output remain bounded and count overwritten records");
+    Require(matches.entries[0].serial == matches.newest && matches.entries.back().serial == matches.newest - History::MatchLimit + 1 && history->Find(0x12345000, 0x12345fff).total == 0, "binding ring reports the newest retained matches and never stale replacements");
+    auto concurrent = std::make_shared<History>(74);
+    const auto write = [&] {
+        for (int i = 0; i < 256; ++i) History::Callback(VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT, VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT, &data, concurrent.get());
+    };
+    std::thread first(write), second(write);
+    first.join();
+    second.join();
+    Require(concurrent->Find(0, UINT64_MAX).total == 512 && history->Find(0, UINT64_MAX).newest == matches.newest, "concurrent callbacks are serialized per instance without shared history");
+    faultMode = FaultQueryMode::Normal;
+    faultQueries = 0;
+    auto diagnostics = std::make_shared<GpuCheckpoints>(nullptr, nullptr, VK_NULL_HANDLE, faultDevice, mockDeviceFault, concurrent);
+    const auto integrated = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
+    Require(integrated != nullptr, "integrated binding capture file");
+    diagnostics->Report(VK_ERROR_DEVICE_LOST, "binding fault", integrated.get());
+    std::rewind(integrated.get());
+    const auto integratedSize = std::fread(bytes.data(), 1, bytes.size(), integrated.get());
+    Require(std::string_view(bytes.data(), integratedSize).find("instance=74 interval=0x12345000..0x12345fff") != text.npos, "EXT-only device faults include their own binding history");
+}
+
+
 alignas(256) std::array<std::byte, 1024> colorMemory{};
 alignas(256) std::array<std::byte, 2048> sliceMemory{};
 
@@ -5494,6 +5588,7 @@ int main(int argc, char** argv) {
     try {
         gpuCheckpointTests();
         gpuFaultTests();
+        gpuAddressBindingTests();
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
             descriptorLayoutFlagTests();
             std::cout << "Descriptor layout native and captured binding flags passed\n";

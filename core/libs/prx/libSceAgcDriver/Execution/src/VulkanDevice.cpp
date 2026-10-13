@@ -230,6 +230,9 @@ struct WorkgroupMemory {
 struct VulkanDevice::State {
     bool compileOnly = false;
     std::shared_ptr<Graphics::GpuCheckpoints> gpuCheckpoints;
+    std::shared_ptr<Graphics::GpuAddressBindings> addressBindings;
+    VkDebugUtilsMessengerEXT addressMessenger = VK_NULL_HANDLE;
+    PFN_vkDestroyDebugUtilsMessengerEXT destroyAddressMessenger = nullptr;
     void* library = nullptr;
     PFN_vkGetInstanceProcAddr instanceProc = nullptr;
     PFN_vkGetDeviceProcAddr deviceProc = nullptr;
@@ -720,6 +723,7 @@ struct VulkanDevice::State {
         }
         if (instance != VK_NULL_HANDLE) {
             if (surface) reinterpret_cast<PFN_vkDestroySurfaceKHR>(instanceProc(instance, "vkDestroySurfaceKHR"))(instance, surface, nullptr);
+            if (addressMessenger != VK_NULL_HANDLE) destroyAddressMessenger(instance, addressMessenger, nullptr);
             reinterpret_cast<PFN_vkDestroyInstance>(instanceProc(instance, "vkDestroyInstance"))(instance, nullptr);
         }
         if (library != nullptr) {
@@ -910,11 +914,15 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     application.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo create{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     create.pApplicationInfo = &application;
+    const bool addressBindingsRequested = std::getenv("APS5_GPU_ADDRESS_BINDINGS") != nullptr;
+    bool debugUtils = false;
     std::vector<const char*> instanceExtensions;
     if (window != nullptr) {
         APS5_LOG_OUT("Presentation window context=%p extent=%ux%u extensions=%zu", window->context, window->width, window->height, window->extensions.size());
         require(window->context && window->createSurface && window->getDrawableSize && window->width && window->height, "invalid window descriptor");
         instanceExtensions.assign(window->extensions.begin(), window->extensions.end());
+    }
+    if (window != nullptr || addressBindingsRequested) {
         std::uint32_t availableCount = 0;
         const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties");
         check(enumerateExtensions(nullptr, &availableCount, nullptr), "vkEnumerateInstanceExtensionProperties");
@@ -926,11 +934,30 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
                 throw std::runtime_error(std::string("Vulkan presentation: required instance extension missing: ") + name);
             }
         }
+        if (addressBindingsRequested) {
+            debugUtils = std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; });
+            if (debugUtils && std::none_of(instanceExtensions.begin(), instanceExtensions.end(), [](const char* name) { return std::strcmp(name, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; })) instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            if (!debugUtils) std::fputs("[gpu-binding] VK_EXT_debug_utils unavailable\n", stderr);
+        }
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
     }
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));
+    if (debugUtils) {
+        const auto createMessenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(state->instanceProc(state->instance, "vkCreateDebugUtilsMessengerEXT"));
+        state->destroyAddressMessenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(state->instanceProc(state->instance, "vkDestroyDebugUtilsMessengerEXT"));
+        require(createMessenger != nullptr && state->destroyAddressMessenger != nullptr, "address-binding debug-utils entry points unavailable");
+        state->addressBindings = std::make_shared<Graphics::GpuAddressBindings>(serial);
+        VkDebugUtilsMessengerCreateInfoEXT messenger{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+        messenger.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT;
+        messenger.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+        messenger.pfnUserCallback = Graphics::GpuAddressBindings::Callback;
+        messenger.pUserData = state->addressBindings.get();
+        VkDebugUtilsMessengerEXT handle = VK_NULL_HANDLE;
+        check(createMessenger(state->instance, &messenger, nullptr, &handle), "vkCreateDebugUtilsMessengerEXT address bindings");
+        state->addressMessenger = handle;
+    }
     if (window != nullptr) {
         state->surface = window->createSurface(window->context, state->instance);
         require(state->surface != VK_NULL_HANDLE, "window returned a null surface");
@@ -1109,12 +1136,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (checkpoints) deviceExtensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
     else if (gpuDiagnostics) std::fprintf(stderr, "[gpu-checkpoint] VK_NV_device_diagnostic_checkpoints unavailable\n");
     VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
-    if (gpuDiagnostics && hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+    if ((gpuDiagnostics || addressBindingsRequested) && hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &faultFeatures};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
     }
     const bool deviceFault = faultFeatures.deviceFault == VK_TRUE;
-    if (gpuDiagnostics && !deviceFault) std::fprintf(stderr, "[gpu-fault] VK_EXT_device_fault reporting unavailable\n");
+    if ((gpuDiagnostics || addressBindingsRequested) && !deviceFault) std::fprintf(stderr, "[gpu-fault] VK_EXT_device_fault reporting unavailable\n");
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT bindingFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+    if (state->addressMessenger != VK_NULL_HANDLE && hasExtension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &bindingFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+    }
+    const bool addressBindings = bindingFeatures.reportAddressBinding == VK_TRUE;
+    if (addressBindingsRequested && !addressBindings) std::fprintf(stderr, "[gpu-binding] instance=%llu address-binding reporting unavailable\n", static_cast<unsigned long long>(serial));
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
@@ -1612,10 +1646,20 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
+    if (addressBindings) {
+        bindingFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+        bindingFeatures.reportAddressBinding = VK_TRUE;
+        bindingFeatures.pNext = bdaFeatures.pNext;
+        bdaFeatures.pNext = &bindingFeatures;
+        deviceExtensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+    }
     deviceInfo.pNext = &bdaFeatures;
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->shaderProfile = std::move(shaderProfile);
+    if (addressBindings) std::fprintf(stderr, "[gpu-binding] instance=%llu VK_EXT_device_address_binding_report enabled; %zu records, %zu objects/callback; CPU history only\n", static_cast<unsigned long long>(serial), Graphics::GpuAddressBindings::Capacity, Graphics::GpuAddressBindings::ObjectLimit);
     if (compileOnly) return;
     if (calibratedTimestamps != nullptr) {
         const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
@@ -1639,10 +1683,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     const auto queryFault = deviceFault ? reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(state->deviceProc(state->device, "vkGetDeviceFaultInfoEXT")) : nullptr;
     if (deviceFault) std::fputs(queryFault != nullptr ? "[gpu-fault] VK_EXT_device_fault reporting enabled (no vendor binary)\n" : "[gpu-fault] vkGetDeviceFaultInfoEXT unavailable\n", stderr);
-    if (checkpoints || queryFault != nullptr) {
+    if (checkpoints || queryFault != nullptr || addressBindings) {
         const auto record = checkpoints ? state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV") : nullptr;
         const auto query = checkpoints ? state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV") : nullptr;
-        state->gpuCheckpoints = std::make_shared<Graphics::GpuCheckpoints>(record, query, state->queue, state->device, queryFault);
+        state->gpuCheckpoints = std::make_shared<Graphics::GpuCheckpoints>(record, query, state->queue, state->device, queryFault, addressBindings ? state->addressBindings : nullptr);
         if (checkpoints) std::fprintf(stderr, "[gpu-checkpoint] NVIDIA device diagnostic checkpoints enabled\n");
     }
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);

@@ -5,6 +5,9 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include "GpuAddressBindings.hpp"
+#include <memory>
+#include <utility>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -19,7 +22,9 @@ class GpuCheckpoints {
 public:
     static constexpr std::size_t Capacity = 16384;
 
-    GpuCheckpoints(PFN_vkCmdSetCheckpointNV record, PFN_vkGetQueueCheckpointDataNV query, VkQueue queue, VkDevice device = VK_NULL_HANDLE, PFN_vkGetDeviceFaultInfoEXT queryFault = nullptr) : record(record), query(query), queue(queue), device(device), queryFault(queryFault) {}
+    GpuCheckpoints(PFN_vkCmdSetCheckpointNV record, PFN_vkGetQueueCheckpointDataNV query, VkQueue queue, VkDevice device = VK_NULL_HANDLE, PFN_vkGetDeviceFaultInfoEXT queryFault = nullptr, std::shared_ptr<GpuAddressBindings> bindings = {}) : record(record), query(query), queue(queue), device(device), queryFault(queryFault), bindings(std::move(bindings)) {}
+
+    std::shared_ptr<GpuAddressBindings> AddressBindings() const { return bindings; }
 
     void Record(VkCommandBuffer commands, const char* operation, std::span<const std::uint64_t> shaders) {
         if (record == nullptr) return;
@@ -114,6 +119,7 @@ private:
             for (std::uint32_t i = 0; i < addressCount; ++i) {
                 const auto& address = addresses[i];
                 std::fprintf(output, "[gpu-fault] address type=%d reported=0x%llx precision=0x%llx\n", static_cast<int>(address.addressType), static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision));
+                if (bindings) bindings->Report(address, output);
             }
             for (std::uint32_t i = 0; i < vendorCount; ++i) {
                 const auto& vendor = vendors[i];
@@ -135,6 +141,7 @@ private:
     VkQueue queue;
     VkDevice device;
     PFN_vkGetDeviceFaultInfoEXT queryFault;
+    std::shared_ptr<GpuAddressBindings> bindings;
     bool faultReported = false;
     std::mutex mutex;
     std::uintptr_t next = 0;
