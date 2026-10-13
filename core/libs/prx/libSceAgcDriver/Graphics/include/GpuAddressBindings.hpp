@@ -10,13 +10,14 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 
 namespace AgcDriver::Graphics {
 
 class GpuAddressBindings {
 public:
-    static constexpr std::size_t Capacity = 16384;
+    static constexpr std::size_t Capacity = 1048576;
     static constexpr std::size_t ObjectLimit = 8;
     static constexpr std::size_t MatchLimit = 32;
 
@@ -113,7 +114,7 @@ public:
 private:
     const std::uint64_t instanceSerial;
     mutable std::mutex mutex;
-    std::array<Entry, Capacity> history{};
+    std::unique_ptr<Entry[]> history = std::make_unique<Entry[]>(Capacity);
     std::uint64_t nextSerial = 0;
     std::uint64_t omittedObjects = 0;
     std::atomic<std::uint64_t> droppedCallbacks{0};

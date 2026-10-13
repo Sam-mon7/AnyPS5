@@ -207,6 +207,7 @@ void gpuFaultTests() {
 void gpuAddressBindingTests() {
     using namespace AgcDriver::Graphics;
     using History = GpuAddressBindings;
+    static_assert(sizeof(History) < 1024, "binding history entries must not consume the caller's stack");
     auto history = std::make_shared<History>(73);
     std::array<VkDebugUtilsObjectNameInfoEXT, 10> objects{};
     for (std::size_t i = 0; i < objects.size(); ++i) {
