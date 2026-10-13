@@ -27,6 +27,7 @@ Throughout the project, every function at every stage either **does exactly what
 
 ### Functional
 
+- [Static descriptor faults](debt/shader.md) remain available in generic shader templates; valid final modules specialize them away, but the template compilation overhead remains unmeasured.
 - [Narrow formatted buffer stores](debt/shader.md) use byte stores only in compute shaders with storage-buffer byte access; graphics stages and targets without that capability retain the DWORD patch fallback.
 - The opt-in [host-import label reserve](debt/libSceAgcDriver.md) redistributes the existing import budget and may displace ordinary imports into mirrors or copies; the address-copy guard and ordered label fallback remain in force. Title benefit and displaced-import cost remain unverified.
 - [Cancellation coverage](ARCHITECTURE.md#thread-cancellation) checks deferred request handling and recovery, not full asynchronous support or console ABI compatibility. Cancellation during file/socket I/O, sleep interruption, cancellation versus exit/detach, condition signal conservation under cancellation, and safe rejection of non-null invalid or reclaimed thread handles remain unverified. No console title or homebrew establishes the cleanup NIDs or buffer layout. Accepted asynchronous mode currently has no diagnostic for its deferred behavior.

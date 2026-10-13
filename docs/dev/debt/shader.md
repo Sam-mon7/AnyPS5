@@ -16,6 +16,7 @@
 
 ### Functional
 
+- [Static descriptor validity](../../../core/shader/recompiler/Optimization/src/DescriptorBindingBuilder.cpp) specializes fault predicates for registered and ordinary modules. Valid and invalid captures use different pipeline variants while preserving branch and EXEC guards; GPU-selected descriptors retain runtime checks. Generic prepared templates still contain optional fault code, whose compilation overhead remains unmeasured. This does not defer other eager descriptor validation or prove a title-level performance improvement.
 - [Narrow formatted buffer stores](../../../core/shader/recompiler/SpirvBackend/src/SpirvRuntimeBuffer.cpp) use an aliased byte view only for compute shaders with `StorageBuffer8BitAccess`, following upstream commit `066a8fbe3076fadae3d31d3948168db45ff5601d`. Graphics stages and targets without that capability retain the compare-exchange fallback; GPU-selected descriptors retain the BDA path. Native checks cover misaligned store offsets and unchanged neighboring bytes, not misaligned descriptor bases or console hardware.
 - Specialized SPIR-V now shares the prepared-artifact disk store, keyed by its complete input module, specialization constants, optimizer target, switches and source version. Cross-process reload and corrupt-entry recovery are tested, but resource plans still rebuild at startup, and first-use specialization remains expensive on a cold cache. Its keys also duplicate the input words on disk; no disk quota or migration of older source versions is implemented.
 

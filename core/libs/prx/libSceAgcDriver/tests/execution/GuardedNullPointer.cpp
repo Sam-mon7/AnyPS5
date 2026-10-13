@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "Recompiler.hpp"
+#include "Optimization/ResourceProgram.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
@@ -389,11 +391,11 @@ void RunImageTypeTests(AgcDriver::VulkanDevice& device, bool exec) {
     }
 }
 
-void RunRegisteredImageTests(AgcDriver::VulkanDevice& device) {
+void RunRegisteredResourceTests(AgcDriver::VulkanDevice& device, bool rawBuffer = false, bool exec = false) {
     using namespace ShaderRecompiler;
     const auto target = device.Target();
     if (!target.registrationModules) {
-        std::puts("registered image metadata test skipped: graphics pipeline libraries unavailable");
+        std::puts("registered resource metadata test skipped: graphics pipeline libraries unavailable");
         return;
     }
     constexpr std::uint32_t Extent = 16u;
@@ -405,13 +407,25 @@ void RunRegisteredImageTests(AgcDriver::VulkanDevice& device) {
     const std::array<std::uint32_t, 4> vertexUsers{static_cast<std::uint32_t>(vertexAddress), static_cast<std::uint32_t>(vertexAddress >> 32u) | (16u << 16u), 3u, 0x01016facu};
     const RecompileRequest vertexRequest{{ShaderStage::Vertex, 0x33000u, vertexCode, 0, {}}, {32, 0, vertexUsers, {}, {}, ShaderVertexStageInfo{}, {}}, target, {0, 0, 0, 128}};
     const auto vertex = Recompile(vertexRequest);
-    const std::array<std::uint32_t, 16> code{0x7e000280u, 0x7e020280u, 0x7e0402ffu, Payload, 0xe0300000u, 0x80020300u, 0xbf8c3f70u, 0x7e180503u, 0xbf06800cu, 0xbf850003u, 0xf0001108u, 0x00000200u, 0xbf8c3f70u, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    std::vector<std::uint32_t> code{0x7e000280u, 0x7e020280u, 0x7e0402ffu, Payload, 0xe0300000u, 0x80020300u, 0xbf8c3f70u, 0x7e180503u, 0xbf06800cu, 0xbf850003u, 0xf0001108u, 0x00000200u, 0xbf8c3f70u, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    if (rawBuffer) {
+        code[10] = 0xe0300000u;
+        code[11] = 0x80000200u;
+        if (exec) {
+            code[8] = 0x7da8000cu;
+            code[9] = 0xbf800000u;
+            code.insert(code.begin() + 13, 0xbefe04c1u);
+        }
+    }
     const auto textureAddress = reinterpret_cast<std::uintptr_t>(texels.data());
-    const std::array<std::uint32_t, 8> valid{static_cast<std::uint32_t>(textureAddress >> 8u), static_cast<std::uint32_t>((textureAddress >> 40u) & 0xffu) | (22u << 20u), 0u, 0x90000facu, 0u, 0u, 0u, 0u};
+    const std::array<std::uint32_t, 8> valid = rawBuffer
+        ? std::array<std::uint32_t, 8>{static_cast<std::uint32_t>(textureAddress), static_cast<std::uint32_t>((textureAddress >> 32u) & 0xffffu), sizeof(texels), 0x31016facu, 0u, 0u, 0u, 0u}
+        : std::array<std::uint32_t, 8>{static_cast<std::uint32_t>(textureAddress >> 8u), static_cast<std::uint32_t>((textureAddress >> 40u) & 0xffu) | (22u << 20u), 0u, 0x90000facu, 0u, 0u, 0u, 0u};
     auto invalid = valid;
-    invalid[3] = 0x30000facu;
+    invalid[3] = rawBuffer ? valid[3] | 0x40000000u : 0x30000facu;
     auto null = valid;
-    null[3] = 0x249u;
+    if (rawBuffer) null.fill(0u);
+    else null[3] = 0x249u;
     const auto guardAddress = reinterpret_cast<std::uintptr_t>(&BufferGuard);
     std::array<std::uint32_t, 12> users{};
     const std::array<std::uint32_t, 4> guard{static_cast<std::uint32_t>(guardAddress), static_cast<std::uint32_t>(guardAddress >> 32u), sizeof(BufferGuard), 0x31016facu};
@@ -433,7 +447,13 @@ void RunRegisteredImageTests(AgcDriver::VulkanDevice& device) {
     state.blend.colorWriteMask = 15u;
     state.blends = {state.blend};
     const AgcDriver::Pm4::DrawParameters draw{0, 3, 0, 1, 0, false};
-    std::uint64_t pipeline = 0u;
+    const auto handle = PrepareShader(request);
+    const auto registration = RegistrationResult(request, *handle);
+    Require(registration != nullptr && registration->registrationModule, "registered resource: default prebuild result is missing");
+    Require(std::ranges::none_of(registration->bindings, [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; }), "registered resource: default prebuild retained a descriptor fault buffer");
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> prebuild{{{ShaderStage::Fragment, registration.get(), PixelPushOffset(0u, target)}}};
+    static_cast<void>(device.PrebuildGraphicsLibraries(state.stages, prebuild));
+    std::array<std::uint64_t, 2> pipelines{};
     for (const auto& image : {valid, invalid, null, valid}) {
         std::copy(image.begin(), image.end(), users.begin());
         for (const bool active : {false, true}) {
@@ -441,10 +461,41 @@ void RunRegisteredImageTests(AgcDriver::VulkanDevice& device) {
             texels.fill(0x3e800000u);
             pixels.fill(0xdeadbeefu);
             const auto pixel = Recompile(request);
-            Require(pixel.registrationModule && pixel.invalidResourceDescriptors == (image == invalid ? 1u : 0u), "registered image: descriptor flag was lost");
-            if (pipeline == 0u) pipeline = pixel.PipelineVariantId();
-            Require(pixel.PipelineVariantId() == pipeline, "registered image: descriptor state specialized the module");
-            const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::Fragment, &pixel, PixelPushOffset(0u, target)}}};
+            Require(pixel.registrationModule && pixel.invalidResourceDescriptors == (image == invalid ? 1u : 0u), "registered resource: descriptor flag was lost");
+            const auto faultVariant = image == invalid ? 1u : 0u;
+            if (pipelines[faultVariant] == 0u) pipelines[faultVariant] = pixel.PipelineVariantId();
+            Require(pixel.PipelineVariantId() == pipelines[faultVariant], "registered resource: descriptor validity failed to reuse its specialized module");
+            Require(pipelines[0] == 0u || pipelines[1] == 0u || pipelines[0] != pipelines[1], "registered resource: invalid descriptor reused the fault-free module");
+            Require((pixel.PipelineVariantId() == registration->PipelineVariantId()) == (image != invalid), "registered resource: captured descriptor selected the wrong default-prebuild validity module");
+            Require(std::ranges::any_of(pixel.bindings, [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; }) == (image == invalid), "registered resource: fault buffer did not follow captured descriptor validity");
+            if (rawBuffer && image == invalid) {
+                for (const auto& binding : pixel.bindings) {
+                    if (binding.role != DescriptorRole::GuestBuffers) continue;
+                    Require(binding.guestDescriptor.size() % 4u == 0u, "registered resource: incomplete raw buffer binding");
+                    for (std::size_t word = 0u; word < binding.guestDescriptor.size(); word += 4u) {
+                        const auto address = static_cast<std::uint64_t>(binding.guestDescriptor[word]) | (static_cast<std::uint64_t>(binding.guestDescriptor[word + 1u] & 0xffffu) << 32u);
+                        Require(address != textureAddress, "registered resource: invalid raw V# exposed its backing range to the GPU");
+                    }
+                }
+            }
+            if (image != invalid) {
+                for (std::size_t cursor = 5u; cursor < pixel.spirv.size();) {
+                    const auto count = pixel.spirv[cursor] >> 16u;
+                    Require(count != 0u && count <= pixel.spirv.size() - cursor, "registered resource: malformed specialized module");
+                    const auto opcode = pixel.spirv[cursor] & 0xffffu;
+                    Require(opcode < spv::OpAtomicLoad || opcode > spv::OpAtomicXor, "registered resource: valid descriptors retained fault atomics");
+                    cursor += count;
+                }
+            }
+            const auto invocation = PreparedShaderInvocation::TryCreate(request, handle);
+            Require(invocation.has_value(), "registered resource: prepared invocation did not match");
+            AgcDriver::ShaderMemory shaderMemory({});
+            const auto capture = shaderMemory.Capture(*invocation);
+            const auto preparedPixel = invocation->Materialize(*capture);
+            const auto materializedPixel = MaterializeShader(request, *capture, *handle);
+            Require(preparedPixel->PipelineVariantId() == pixel.PipelineVariantId() && materializedPixel->PipelineVariantId() == pixel.PipelineVariantId(), "registered resource: prepared materialization changed descriptor validity specialization");
+            Require(preparedPixel->invalidResourceDescriptors == pixel.invalidResourceDescriptors && materializedPixel->invalidResourceDescriptors == pixel.invalidResourceDescriptors, "registered resource: prepared materialization lost invalid descriptor state");
+            const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::Fragment, preparedPixel.get(), PixelPushOffset(0u, target)}}};
             Outcome outcome;
             const bool fault = active && image == invalid;
             StderrCapture log;
@@ -462,16 +513,25 @@ void RunRegisteredImageTests(AgcDriver::VulkanDevice& device) {
                 throw;
             }
             outcome.log += log.Finish();
-            Require(Faulted(outcome) == fault, "registered image: metadata fault did not follow the GPU branch:\n" + outcome.log);
-            if (fault) Require(outcome.log.find("reason=8") != std::string::npos && outcome.log.find(Fault(textureAddress, 0x28u, 0u)) != std::string::npos, "registered image: fault lost original address or PC:\n" + outcome.log);
+            Require(std::ranges::all_of(texels, [](std::uint32_t word) { return word == 0x3e800000u; }), "registered resource: descriptor access modified the backing sentinel");
+            Require(Faulted(outcome) == fault, "registered resource: descriptor fault did not follow the GPU branch/EXEC:\n" + outcome.log);
+            if (fault) Require(outcome.log.find("reason=8") != std::string::npos && outcome.log.find(Fault(textureAddress, 0x28u, 0u)) != std::string::npos, "registered resource: fault lost original address or PC:\n" + outcome.log);
             else {
                 const auto expected = !active ? Payload : image == null ? 0u : 0x3e800000u;
                 const auto mismatch = std::ranges::find_if(pixels, [&](std::uint32_t word) { return word != expected; });
-                Require(mismatch == pixels.end(), "registered image: valid, skipped, or TYPE0 pixel differs: active=" + std::to_string(active) + " type=" + std::to_string(image[3] >> 28u) + " expected=" + std::to_string(expected) + " first=" + std::to_string(pixels[0]) + " index=" + std::to_string(mismatch - pixels.begin()));
+                Require(mismatch == pixels.end(), "registered resource: valid, skipped, or TYPE0 pixel differs: active=" + std::to_string(active) + " type=" + std::to_string(image[3] >> 28u) + " expected=" + std::to_string(expected) + " first=" + std::to_string(pixels[0]) + " index=" + std::to_string(mismatch - pixels.begin()));
             }
         }
     }
-    std::puts("registered image metadata GPU tests passed");
+    std::copy(invalid.begin(), invalid.end(), users.begin());
+    request.target.bdaAbiVersion = 0u;
+    bool rejected = false;
+    try { static_cast<void>(Recompile(request)); }
+    catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()).find(rawBuffer ? "buffer descriptor uses an unsupported type" : "runtime image descriptor is invalid") != std::string::npos;
+    }
+    Require(rejected, "registered resource: invalid descriptor was accepted without the fault ABI");
+    std::printf("registered %s metadata GPU tests passed (%s)\n", rawBuffer ? "raw buffer" : "image", exec ? "EXEC" : "branch");
 }
 
 }
@@ -485,7 +545,8 @@ int main() {
             for (const bool exec : {false, true}) RunBufferTypeTests(*device, formatted, exec);
         }
         for (const bool exec : {false, true}) RunImageTypeTests(*device, exec);
-        RunRegisteredImageTests(*device);
+        RunRegisteredResourceTests(*device);
+        for (const bool exec : {false, true}) RunRegisteredResourceTests(*device, true, exec);
         std::puts("guarded null pointer tests passed");
         return 0;
     } catch (const std::exception& error) {

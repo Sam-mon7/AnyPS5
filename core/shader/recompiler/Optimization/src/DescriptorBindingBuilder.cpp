@@ -311,7 +311,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         auto alignment = static_cast<std::uint32_t>(buffer.typedAlignment);
         if (buffer.descriptorFormatted && format != 0u) alignment = std::max(alignment, std::min(GetFormatInfo(static_cast<IrBufferFormat>(format)).byteSize, 4u));
         if (alignment == 0u || misalignment % alignment != 0u) fail("is a formatted buffer access through a V# whose base is not aligned to its element");
-        if (registrationModules && buffer.descriptorFormatted) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, descriptor.dwords[3]});
+        if (registrationModules) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, buffer.descriptorFormatted ? descriptor.dwords[3] : descriptor.dwords[3] & (stage == IrShaderStage::Compute ? 0xc0000000u : 0xc0800000u)});
         if (registrationModules) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 3u, misalignment});
         if (!registrationModules) {
             const auto first = PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords;
@@ -328,11 +328,13 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
             }
         }
     }
-    for (std::uint32_t index = 0; index < info.images.size() && !registrationModules; ++index) {
+    for (std::uint32_t index = 0; index < info.images.size(); ++index) {
         if (info.images[index].table != NoTable) continue;
         const auto first = PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords;
-        plan.specialization.push_back({first, imageModes[index]});
-        for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
+        if (!registrationModules) {
+            plan.specialization.push_back({first, imageModes[index]});
+            for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
+        }
         plan.specialization.push_back({first + 5u, index < snapshot.invalidImages.size() ? snapshot.invalidImages[index] : 0u});
     }
     for (std::uint32_t target = 0; target < exportMappings.size() && !registrationModules; ++target) {

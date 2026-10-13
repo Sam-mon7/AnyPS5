@@ -264,8 +264,8 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
 
     constexpr ResourceTracker resourceTracker;
     resourceTracker.Track(program);
-    // A CPU-resolved V# can still be used only behind a GPU-controlled branch.
-    // Keep its type check at the instruction when the target can report the fault.
+    // Templates retain deferred descriptor faults for GPU-controlled uses;
+    // captured validity specializes the checks out of valid final modules.
     if ((!program.Info().buffers.empty() || !program.Info().images.empty()) && request.target.bdaAbiVersion == BdaAbi::Version) program.Info().usesFaultBuffer = true;
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
