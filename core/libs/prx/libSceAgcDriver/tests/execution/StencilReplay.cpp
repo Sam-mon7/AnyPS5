@@ -5,6 +5,7 @@
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <functional>
 #include <iostream>
@@ -13,10 +14,38 @@
 #include <string_view>
 #include <vector>
 
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
+
 namespace {
 
 using AgcDriver::Graphics::Require;
 using ShaderRecompiler::ShaderStage;
+
+PFN_vkCmdBindPipeline NativeBind = nullptr;
+std::atomic<std::uint64_t> GraphicsBinds{0u};
+
+VKAPI_ATTR void VKAPI_CALL CountBind(VkCommandBuffer commands, VkPipelineBindPoint point, VkPipeline pipeline) {
+    if (point == VK_PIPELINE_BIND_POINT_GRAPHICS) ++GraphicsBinds;
+    NativeBind(commands, point, pipeline);
+}
+
+struct BindTrace {
+    AgcDriver::Graphics::DeviceFunctions* functions;
+    explicit BindTrace(const AgcDriver::VulkanDevice& device) {
+        const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+        functions = const_cast<AgcDriver::Graphics::DeviceFunctions*>(context.functions);
+        Require(functions != nullptr && functions->cmdBindPipeline != nullptr, "native pipeline bind table is unavailable");
+        NativeBind = functions->cmdBindPipeline;
+        functions->cmdBindPipeline = CountBind;
+    }
+    ~BindTrace() { functions->cmdBindPipeline = NativeBind; }
+};
 
 constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 16;
@@ -129,8 +158,10 @@ void Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelC
     if (alter) alter(state);
     AgcDriver::Pm4::DrawParameters draw{0, vertices, 0, instances, 0, false};
     if (alterDraw) alterDraw(draw);
+    const auto bindsBefore = GraphicsBinds.load();
     device.Draw(state, draw, shaders);
     device.WaitIdle();
+    if (!pixelResult.stencilReferences.empty()) Require(GraphicsBinds.load() - bindsBefore == 1u, "stencil replay rebound its shader pipeline within an original draw");
 }
 
 void Check(const std::function<bool(std::uint32_t, std::uint32_t)>& drawn, std::string_view what) {
@@ -150,6 +181,7 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        const BindTrace binds(*device);
         constexpr std::uint32_t exported = 0x52u;
         constexpr std::uint32_t plain = 0x50u;
         constexpr std::array<std::uint32_t, 12> alternating{
