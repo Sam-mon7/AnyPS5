@@ -30,6 +30,7 @@
 #include <thread>
 #include <unordered_set>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include <spirv/unified1/spirv.hpp>
 
 namespace AgcDriver::DriverDetail {
 
@@ -702,6 +703,11 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         const auto count = RegisterValue(state.context, 0x1b6) & 0x3fu;
         if (registration && count != 0) return nullptr;
         pixel = Graphics::DecodePixelStageInfo(state.context, {});
+        const auto capabilities = device.Target().supportedCapabilities;
+        if (pixel->stencilRefExportEnable && std::ranges::find(capabilities, spv::CapabilityStencilExportEXT) == capabilities.end()) {
+            if (deferred != nullptr) return defer("stencil reference export requires draw-time preparation on this device");
+            return {};
+        }
         wave = pixel->wave32 ? 32u : 64u;
     } else {
         const auto routing = RegisterValue(state.context, 0x2d5);

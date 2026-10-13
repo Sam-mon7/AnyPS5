@@ -585,6 +585,46 @@ void RegisteredVertexWorkgroup(const ShaderRecompiler::SpirvTarget& target, bool
     std::cout << "registered NGG wave64 preparation passed; subgroup=" << target.subgroupSize << '\n';
 }
 
+void DeferredStencilExport(const ShaderRecompiler::SpirvTarget& target) {
+    alignas(256) static const std::array<std::uint32_t, 4> code{0x7e0e02f2u, 0xf8001882u, 0x700u, 0xbf810000u};
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 3> shaderRegisters{};
+        std::array<ShaderRegister, 6> contextRegisters{};
+    } header;
+    const auto address = reinterpret_cast<std::uintptr_t>(code.data());
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18;
+    header.shader.type = 1;
+    header.shader.header_size = sizeof(header);
+    header.shader.shader_size = sizeof(code);
+    header.shader.code = code.data();
+    header.shader.sh_registers = header.shaderRegisters.data();
+    header.shader.num_sh_registers = header.shaderRegisters.size();
+    header.shader.cx_registers = header.contextRegisters.data();
+    header.shader.num_cx_registers = header.contextRegisters.size();
+    header.shaderRegisters = {{{0x008, static_cast<std::uint32_t>(address >> 8u)}, {0x009, static_cast<std::uint32_t>(address >> 40u)}, {0x00b, 0}}};
+    header.contextRegisters = {{{0x1b3, 0x300}, {0x1b4, 0x300}, {0x1b6, 0}, {0x203, 0x52}, {0x1c4, 2}, {0x1c5, 0}}};
+    for (const auto interpolators : {0u, 1u}) {
+        header.contextRegisters[2].value = interpolators;
+        AgcDriverRegisterShader_nid_postfix(&header.shader);
+        AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, {});
+        AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, {});
+    }
+    AgcDriver::DriverDetail::ShaderSnapshot snapshot{address, 0, 1, {code.begin(), code.end()}, {}};
+    auto withoutStencil = target;
+    std::vector<std::uint32_t> capabilities(target.supportedCapabilities.begin(), target.supportedCapabilities.end());
+    std::erase(capabilities, static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT));
+    withoutStencil.supportedCapabilities = capabilities;
+    AgcDriver::Registers context;
+    for (const auto reg : header.contextRegisters) context[reg.offset] = reg.value;
+    context[0x1b6] = 0;
+    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(context, {});
+    const ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Fragment, address, snapshot.code, 0, {}}, {64, 0, {}, {}, pixel, {}, {}}, withoutStencil, {0, 0, 0, 128}};
+    ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request)); }, "VK_EXT_shader_stencil_export");
+    Require(snapshot.prepared->entries.empty(), "unsupported stencil export was cached as a usable draw shader");
+}
+
 void DeferredRegistration() {
     alignas(256) std::array<std::uint32_t, 2> code{0xbe842104u, 0xbf810000u};
     struct Header {
@@ -673,6 +713,7 @@ int main(int argc, char** argv) {
         PendingRegistrationPreparation(*device);
         Require(argc != 2 || std::string_view(argv[1]) != "--fail-before-registration", "injected failure before registration");
         PrepareMultisampledStorage(*device);
+        DeferredStencilExport(device->Target());
         device.reset();
         SharedCodeHeaders();
         RegistrationWithoutSpecials();
