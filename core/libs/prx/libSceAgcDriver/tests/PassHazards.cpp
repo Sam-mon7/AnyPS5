@@ -30,12 +30,13 @@ VkImage image(std::uint64_t id) {
 struct Use {
     Ranges reads;
     Ranges writes;
+    Ranges inputReads;
     Images images;
     Images attachments;
     bool anyReads = false;
     bool anyWrites = false;
 
-    PassAccess View() const { return {reads, writes, images, attachments, anyReads, anyWrites}; }
+    PassAccess View() const { return {reads, writes, images, attachments, anyReads, anyWrites, inputReads}; }
 };
 
 void testRangeSet() {
@@ -83,6 +84,41 @@ void testRanges() {
     Expect(hazards.Check(empty.View(), true) == PassHazard::None, "empty ranges touch nothing");
     hazards.Clear();
     Expect(hazards.Empty() && hazards.Check(writer.View(), true) == PassHazard::None, "a barrier clears the accesses");
+}
+
+void testDrawInputs() {
+    PassHazards hazards;
+    Use reader;
+    reader.reads = {{0x2000, 0x2020}};
+    reader.inputReads = {{0x1000, 0x1030}};
+    Use writer;
+    writer.writes = {{0x1000, 0x1030}};
+    hazards.Add(writer.View());
+    Expect(hazards.Check(reader.View(), true) == PassHazard::ReadAfterWrite, "imported vertex reads after a GPU write");
+    Use inputOnly;
+    inputOnly.inputReads = reader.inputReads;
+    Expect(hazards.Check(inputOnly.View(), true) == PassHazard::ReadAfterWrite, "draw input reads without shader-resource reads");
+    hazards.Clear();
+    hazards.Add(reader.View());
+    Expect(hazards.Check(writer.View(), true) == PassHazard::WriteAfterRead, "a GPU write after imported vertex reads");
+    writer.writes = {{0x2000, 0x2020}};
+    Expect(hazards.Check(writer.View(), true) == PassHazard::WriteAfterRead, "shader-resource reads are retained beside input reads");
+    writer.writes = {{0x3000, 0x3030}};
+    Expect(hazards.Check(writer.View(), true) == PassHazard::None, "a disjoint write does not end the draw pass");
+    hazards.Clear();
+    Use unknownWriter;
+    unknownWriter.anyWrites = true;
+    hazards.Add(unknownWriter.View());
+    Expect(hazards.Check(inputOnly.View(), true) == PassHazard::UnknownWrite, "an unknown GPU write before imported vertex reads");
+    Use empty;
+    empty.inputReads = {{0x1000, 0x1000}};
+    Expect(hazards.Check(empty.View(), true) == PassHazard::None, "empty input ranges touch no memory");
+    hazards.Clear();
+    hazards.Add(inputOnly.View());
+    Expect(hazards.Check(unknownWriter.View(), true) == PassHazard::UnknownWrite, "an unknown GPU write after imported vertex reads");
+    Use imageOnly;
+    imageOnly.images = {{image(31), true}};
+    Expect(hazards.Check(imageOnly.View(), true) == PassHazard::None, "buffer input reads do not create an image dependency");
 }
 
 void testUnknown() {
@@ -187,6 +223,7 @@ void testAttachments() {
 int main() {
     testRangeSet();
     testRanges();
+    testDrawInputs();
     testUnknown();
     testImages();
     testAttachments();

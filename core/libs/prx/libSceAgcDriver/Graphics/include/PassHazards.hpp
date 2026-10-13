@@ -22,6 +22,7 @@ struct PassAccess {
     std::span<const std::pair<VkImage, bool>> attachments;
     bool anyReads = false;
     bool anyWrites = false;
+    GuestRangeList inputReads{};
 };
 
 enum class PassHazard : std::uint8_t { None, ReadAfterWrite, WriteAfterWrite, WriteAfterRead, Image, UnknownRead, UnknownWrite };

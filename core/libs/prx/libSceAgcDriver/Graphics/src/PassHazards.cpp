@@ -34,13 +34,13 @@ bool PassHazards::overlapsAny(const GuestRangeSet& set, GuestRangeList ranges) c
 PassHazard PassHazards::Check(const PassAccess& access, bool samePass) const {
     const auto touchesMemory = [](const PassAccess& use) {
         const auto nonEmpty = [](GuestRangeList ranges) { return std::any_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
-        return use.anyReads || use.anyWrites || nonEmpty(use.reads) || nonEmpty(use.writes);
+        return use.anyReads || use.anyWrites || nonEmpty(use.reads) || nonEmpty(use.inputReads) || nonEmpty(use.writes);
     };
     const bool earlierTouches = anyReads || anyWrites || !reads.Empty() || !writes.Empty();
     if ((access.anyWrites && earlierTouches) || (anyWrites && touchesMemory(access))) return PassHazard::UnknownWrite;
     const bool writesRanges = std::any_of(access.writes.begin(), access.writes.end(), [](const auto& range) { return range.first < range.second; });
     if ((access.anyReads && !writes.Empty()) || (anyReads && writesRanges)) return PassHazard::UnknownRead;
-    if (overlapsAny(writes, access.reads)) return PassHazard::ReadAfterWrite;
+    if (overlapsAny(writes, access.reads) || overlapsAny(writes, access.inputReads)) return PassHazard::ReadAfterWrite;
     if (overlapsAny(writes, access.writes)) return PassHazard::WriteAfterWrite;
     if (overlapsAny(reads, access.writes)) return PassHazard::WriteAfterRead;
     const auto conflicts = [](bool earlier, bool later) { return earlier || later; };
@@ -59,6 +59,7 @@ PassHazard PassHazards::Check(const PassAccess& access, bool samePass) const {
 
 void PassHazards::Add(const PassAccess& access) {
     for (const auto& [begin, end] : access.reads) reads.Insert(begin, end);
+    for (const auto& [begin, end] : access.inputReads) reads.Insert(begin, end);
     for (const auto& [begin, end] : access.writes) writes.Insert(begin, end);
     for (const auto& [image, written] : access.images) {
         if (image == VK_NULL_HANDLE) continue;
