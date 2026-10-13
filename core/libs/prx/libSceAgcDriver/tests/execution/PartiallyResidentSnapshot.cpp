@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
@@ -19,6 +20,7 @@
 #endif
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +31,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -258,9 +262,50 @@ void Run(const Context& context, ReservedSurface& surface) {
     AgcDriver::GuestMemory::SetFlushHook(nullptr);
 }
 
+void PendingStores(const Context& context, ReservedSurface& surface) {
+    const auto address = surface.Address();
+    const auto words = Descriptor(address);
+    surface.Commit(0, BlockBytes);
+    std::memset(surface.Data(), 0x5a, BlockBytes);
+    Recorder recorder(context);
+    recorder.Activate();
+    const auto lookup = [&] {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        return CachedSampledTexture(context, words);
+    };
+    auto previous = lookup();
+    Require(previous != nullptr && !previous->ViewsStorageImage(), "the pending-store surface did not produce a snapshot");
+    Require(lookup() == previous, "the unchanged pending-store surface did not reuse its snapshot");
+    for (const bool submitted : {false, true}) {
+        const auto landed = std::make_shared<bool>(false);
+        const auto value = submitted ? std::byte{0x99} : std::byte{0x77};
+        std::vector<std::byte> original(reinterpret_cast<const std::byte*>(surface.Data()), reinterpret_cast<const std::byte*>(surface.Data()) + 0x1000);
+        recorder.NotePendingWrite(address, 0x1000);
+        recorder.OnComplete([address, landed, value, original = std::move(original)] {
+            const std::vector<std::byte> current(0x1000, value);
+            AgcDriver::GuestMemory::WriteChanged(address, current, original);
+            *landed = true;
+        });
+        if (submitted) recorder.Submit();
+        const auto next = lookup();
+        Require(*landed, "the partially resident lookup returned before its pending copied store completed");
+        Require(next != previous, "the partially resident lookup reused the snapshot from before its pending copied store");
+        Require(surface.Data()[0] == std::to_integer<std::uint8_t>(value), "the pending copied store did not update guest memory");
+        Require(lookup() == next, "the partially resident lookup did not reuse the snapshot after its pending copied store");
+        previous = next;
+    }
+    const auto unrelated = std::make_shared<bool>(false);
+    recorder.NotePendingWrite(address + SurfaceBytes, BlockBytes);
+    recorder.OnComplete([unrelated] { *unrelated = true; });
+    Require(lookup() == previous, "an unrelated pending write replaced the partially resident snapshot");
+    Require(!*unrelated, "a partially resident lookup waited for an unrelated pending write");
+    recorder.Sync();
+    Require(*unrelated, "the unrelated pending completion did not run when synchronized");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
         if (!AgcDriver::GuestMemory::WriteWatched()) {
             std::puts("skipped, guest memory has no write watch");
@@ -280,7 +325,8 @@ int main() {
             context.detiler = &detiler;
             ReservedSurface surface;
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
-            Run(context, surface);
+            if (argc == 2 && std::string_view(argv[1]) == "--pending-stores") PendingStores(context, surface);
+            else Run(context, surface);
             ClearCachedTextures(context.device);
         }
         device.reset();
