@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -258,7 +259,7 @@ public:
             }
         }
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        if (profile && reused != 0) std::fprintf(stderr, "[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu proved=%zu detiled=%zu bytes-per-layer=%llu\n", static_cast<unsigned long long>(resource.baseAddress), layers, reused - replaced, replaced, proved, detiled, static_cast<unsigned long long>(geometry.layerBytes));
+        if (profile && reused != 0) AgcDriver::ProfilePrint_nid_no_patch("[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu proved=%zu detiled=%zu bytes-per-layer=%llu\n", static_cast<unsigned long long>(resource.baseAddress), layers, reused - replaced, replaced, proved, detiled, static_cast<unsigned long long>(geometry.layerBytes));
         if (detiled != 0) {
             Require(context.detiler != nullptr, "depth plane copy requires a texture detiler");
             context.detiler->BeginBatch();
