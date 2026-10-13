@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include "BdaAbi.hpp"
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
 #include "VertexInputSpecialization.hpp"
@@ -266,6 +267,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
 
     constexpr ResourceTracker resourceTracker;
     resourceTracker.Track(program);
+    if (!program.Info().buffers.empty() && request.target.bdaAbiVersion == BdaAbi::Version) program.Info().usesFaultBuffer = true;
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
@@ -875,6 +877,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
+    if (std::ranges::none_of(result.bindings, [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; })) result.bdaAbiVersion = 0u;
     result.pushConstants = std::move(bindings.pushConstants);
     const auto& layout = variant.bindings.layout;
     if (artifact.registrationModule && request.shader.stage != ShaderStage::Fragment && layout.runtimeStateDwords != 0u) {

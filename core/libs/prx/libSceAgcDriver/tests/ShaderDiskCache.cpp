@@ -744,7 +744,7 @@ void verifyInvocationIsolation() {
     const auto restored = Recompile(request.request);
     requireSameResult(first, restored, "restored invocation");
     const auto original = request.userData;
-    const std::array<std::array<std::uint32_t, 4>, 10> descriptors{{
+    const std::array<std::array<std::uint32_t, 4>, 11> descriptors{{
         {original[0] + 0x20000u, original[1], original[2], original[3]},
         {original[0] + 1u, original[1], original[2], original[3]},
         {original[0] + 2u, original[1], original[2], original[3]},
@@ -754,7 +754,8 @@ void verifyInvocationIsolation() {
         {original[0], original[1] | (16u << 16u), original[2], original[3]},
         {original[0], original[1], original[2], 0x31004688u},
         {original[0], original[1] | 0x80100000u, original[2], original[3] | 0x00600000u},
-        {0u, 0u, 0u, 0u}
+        {0u, 0u, 0u, 0u},
+        {original[0], original[1], original[2], original[3] | 0x40000000u}
     }};
     for (const auto& descriptor : descriptors) {
         request.userData = descriptor;
@@ -771,10 +772,15 @@ void verifyInvocationIsolation() {
     }
     request.userData = original;
     request.userData[3] |= 0x40000000u;
+    const auto deferred = Recompile(request.request);
+    const auto buffers = std::ranges::find_if(deferred.bindings, [](const auto& binding) { return binding.role == DescriptorRole::GuestBuffers; });
+    require(buffers == deferred.bindings.end() || buffers->guestDescriptor == std::vector<std::uint32_t>(4u, 0u), "an invalid V# exposed its range to the host binding");
+    require(std::ranges::any_of(deferred.bindings, [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; }), "an invalid V# has no deferred fault binding");
+    request.request.target.bdaAbiVersion = 0u;
     bool rejected = false;
     try { static_cast<void>(Recompile(request.request)); }
     catch (const std::runtime_error&) { rejected = true; }
-    require(rejected, "an unsupported buffer descriptor type was accepted");
+    require(rejected, "an unsupported buffer descriptor type was accepted without the fault ABI");
 }
 
 void verifyBufferAlignmentSpecialization() {
@@ -796,6 +802,8 @@ void verifyBufferAlignmentSpecialization() {
         return atomics;
     };
     require(countAtomics(aligned) == 0u, "aligned DWORD store retained unaligned atomic updates");
+    require(aligned.bdaAbiVersion == 0u, "a specialized buffer without a fault binding retained the BDA ABI");
+    require(std::ranges::none_of(aligned.bindings, [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; }), "valid buffer specialization retained a fault-buffer binding");
     for (std::uint32_t offset = 1; offset < 4u; ++offset) {
         request.userData[0] = 0x10000000u + offset;
         const auto unaligned = Recompile(request.request);

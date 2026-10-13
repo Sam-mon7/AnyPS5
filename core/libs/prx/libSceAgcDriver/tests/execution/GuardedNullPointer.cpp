@@ -39,6 +39,12 @@ alignas(256) std::array<std::uint32_t, 16> Root{};
 alignas(256) std::array<std::uint32_t, 4> Data{Payload, 0u, 0u, 0u};
 alignas(256) std::array<std::uint64_t, 1> Indirect{};
 alignas(256) std::array<std::uint32_t, 8> Table{};
+alignas(256) std::uint32_t BufferGuard = 0;
+
+alignas(256) constexpr std::array<std::uint32_t, 13> BufferBranchCode{
+    0x34020082u, 0xe0300000u, 0x80020300u, 0xbf8c3f70u, 0x7e180503u, 0xbf06800cu, 0xbf850005u,
+    0xe0300000u, 0x80000200u, 0xbf8c3f70u, 0xe0701000u, 0x80010201u, 0xbf810000u,
+};
 
 alignas(256) constexpr std::array<std::uint32_t, 19> BranchCode{
     0xf4080100u, 0xfa000000u, 0xf4000200u, 0xfa000010u, 0xf4040280u, 0xfa000018u, 0xbe8c03ffu, 0x11111111u,
@@ -165,9 +171,9 @@ bool Faulted(const Outcome& outcome) {
     return outcome.log.find("BDA access failed") != std::string::npos;
 }
 
-std::string Fault(std::uint64_t address, std::uint32_t pc) {
+std::string Fault(std::uint64_t address, std::uint32_t pc, std::uint32_t bytes = 4u) {
     char text[96];
-    std::snprintf(text, sizeof(text), "address=0x%llx instruction=0x%x bytes=4", static_cast<unsigned long long>(address), pc);
+    std::snprintf(text, sizeof(text), "address=0x%llx instruction=0x%x bytes=%u", static_cast<unsigned long long>(address), pc, bytes);
     return text;
 }
 
@@ -252,6 +258,64 @@ void RunTests(AgcDriver::VulkanDevice& device) {
 #endif
 }
 
+void RunBufferTypeTests(AgcDriver::VulkanDevice& device, bool formatted, bool exec) {
+    const auto descriptor = [](const void* data, std::uint32_t bytes) {
+        const auto address = reinterpret_cast<std::uintptr_t>(data);
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
+    };
+    const auto valid = descriptor(Data.data(), sizeof(Data));
+    constexpr std::array<std::uint32_t, 4> invalid{0x027a5a00u, 0xc1600000u, 0x007040c7u, 0x90900924u};
+    const auto output = descriptor(Output.data(), sizeof(Output));
+    const auto guard = descriptor(&BufferGuard, sizeof(BufferGuard));
+    auto code = BufferBranchCode;
+    if (formatted) code[7] = 0xe0000000u;
+    if (exec) {
+        code[5] = 0x7da8000cu;
+        code[6] = 0xbf800000u;
+    }
+    std::array<std::uint32_t, 12> userData{};
+    std::copy(output.begin(), output.end(), userData.begin() + 4);
+    std::copy(guard.begin(), guard.end(), userData.begin() + 8);
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{Lanes, 1, 1}, 0u, {false, false, false}, false, 1};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))}}};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {Lanes, 0, userData, compute, std::nullopt, std::nullopt, memory}, device.ComputeTarget(Lanes), {0, 0, 0, 128}
+    };
+    for (const bool bad : {false, true}) {
+        for (const bool active : {false, true}) {
+            const auto& input = bad ? invalid : valid;
+            std::copy(input.begin(), input.end(), userData.begin());
+            BufferGuard = active ? 1u : 0u;
+            Output.fill(0xdeadbeefu);
+            AgcDriver::ShaderMemory shaderMemory({});
+            const auto capture = shaderMemory.Capture(request);
+            const auto result = ShaderRecompiler::Recompile(request, *capture);
+            Outcome outcome;
+            StderrCapture log;
+            try {
+                device.Dispatch(*result, 1, 1, 1, {}, request.shader.codeAddress);
+                device.WaitIdle();
+            } catch (...) {
+                static_cast<void>(log.Finish());
+                throw;
+            }
+            outcome.log = log.Finish();
+            Require(Faulted(outcome) == (bad && active), "guarded V#: descriptor fault did not follow the GPU branch:\n" + outcome.log);
+            if (bad && active) Require(outcome.log.find("reason=8") != std::string::npos && outcome.log.find(Fault(0x027a5a00u, 0x1cu, 0u)) != std::string::npos, "guarded V#: fault did not identify the descriptor and instruction:\n" + outcome.log);
+            for (std::uint32_t lane = 0u; lane < Lanes; ++lane) Require(Output[lane] == (active && !bad && (!exec || lane == 0u) ? Payload : 0xdeadbeefu), "guarded V#: skipped or invalid buffer accessed output");
+        }
+    }
+    request.target.bdaAbiVersion = 0u;
+    bool rejected = false;
+    try {
+        static_cast<void>(ShaderRecompiler::Recompile(request));
+    } catch (const std::exception& error) {
+        rejected = std::string(error.what()).find("buffer descriptor uses an unsupported type") != std::string::npos;
+    }
+    Require(rejected, "guarded V#: a target without the fault ABI silently accepted an invalid descriptor");
+}
+
 }
 
 int main() {
@@ -259,6 +323,9 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         RunTests(*device);
+        for (const bool formatted : {false, true}) {
+            for (const bool exec : {false, true}) RunBufferTypeTests(*device, formatted, exec);
+        }
         std::puts("guarded null pointer tests passed");
         return 0;
     } catch (const std::exception& error) {
