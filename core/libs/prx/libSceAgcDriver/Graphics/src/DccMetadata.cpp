@@ -51,7 +51,10 @@ DccKeys ByteKeys(std::uint8_t key) {
         case 0x80: return DccKeys::Clear1110;
         case 0xc0: return DccKeys::Clear1111;
         case 0x20: return DccKeys::ClearRegister;
-        case 0x10: return DccKeys::ClearSingle;
+        case 0x10: {
+            static const bool noSingle = std::getenv("APS5_NO_COMP_TO_SINGLE") != nullptr;
+            return noSingle ? DccKeys::Mixed : DccKeys::ClearSingle;
+        }
         case 0xff: return DccKeys::Uncompressed;
         default: return DccKeys::Mixed;
     }
