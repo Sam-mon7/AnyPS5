@@ -156,6 +156,9 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
         }
         if (allowFolding) optimizer.RegisterPass(spvtools::CreateSimplificationPass());
     }
+    // Valid buffer specializations fold away their descriptor faults. Drop the now-unused
+    // reporting helper as well, so it does not retain atomics and a fault-buffer binding.
+    if (specialize) optimizer.RegisterPass(spvtools::CreateEliminateDeadFunctionsPass()).RegisterPass(spvtools::CreateAggressiveDCEPass(true));
     // Validating after every pass costs more than the passes on large shaders; the result is validated below.
     optimizer.SetValidateAfterAll(false);
     spvtools::OptimizerOptions options;

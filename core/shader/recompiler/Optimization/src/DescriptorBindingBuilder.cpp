@@ -122,7 +122,8 @@ std::vector<std::uint32_t> GuestBuffersDescriptor(const std::vector<std::uint32_
             fail("DescriptorBindingBuilder::Populate guest buffer descriptor has an invalid width");
         }
         for (std::uint32_t dword = 0; dword < 4u; dword++) {
-            result.push_back(value.dwords[dword]);
+            // Invalid V# types fault at GPU use, and must never bind their guest ranges.
+            result.push_back(value.dwords[3] >> 30u != 0u ? 0u : value.dwords[dword]);
         }
     }
     return result;
@@ -293,8 +294,14 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (info.images[index].table == NoTable) imageModes[index] = ResourceMaterializer::RuntimeImageMode(info.images[index], snapshot.images.at(index), info.runtimeImageModes.at(index));
     }
     for (std::uint32_t index = 0; index < info.buffers.size(); ++index) {
-        const auto& descriptor = snapshot.buffers.at(index);
+        auto descriptor = snapshot.buffers.at(index);
         if (descriptor.dwordCount != 4u) fail("buffer specialization requires four descriptor words");
+        if (const auto type = descriptor.dwords[3] & 0xc0000000u; type != 0u) {
+            // These are not buffer format/stride/swizzle fields. Retain only the type
+            // for the instruction's deferred fault; the original words remain in the SRT.
+            descriptor.dwords.fill(0u);
+            descriptor.dwords[3] = type;
+        }
         const auto& buffer = info.buffers[index];
         const auto format = (descriptor.dwords[3] >> 12u) & 0x7fu;
         const bool present = descriptor.dwords[2] != 0u && (descriptor.dwords[0] != 0u || (descriptor.dwords[1] & 0xffffu) != 0u);

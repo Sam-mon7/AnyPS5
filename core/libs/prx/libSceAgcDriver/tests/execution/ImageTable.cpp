@@ -320,6 +320,7 @@ struct Outcome {
     std::uint32_t imageTableCount = 0;
     std::uint32_t imageTableFaults = 0;
     std::uint32_t poisonedSrtReads = 0;
+    std::uint32_t invalidBufferDescriptors = 0;
     bool cacheable = false;
     std::vector<std::array<std::uint32_t, 4>> samplers;
     std::vector<std::array<std::uint32_t, 4>> samplerTable;
@@ -349,6 +350,7 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
     outcome.artifactId = result.variantId;
     outcome.imageTableFaults = result.imageTableFaults;
     outcome.poisonedSrtReads = result.poisonedSrtReads;
+    outcome.invalidBufferDescriptors = result.invalidBufferDescriptors;
     outcome.cacheable = AgcDriver::DriverDetail::CacheableResult(result);
     outcome.imageTableReadRanges = result.imageTableReadRanges;
     for (const auto& binding : result.bindings) {
@@ -370,10 +372,11 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
 }
 
 template <std::size_t CodeWords>
-Outcome Run(AgcDriver::VulkanDevice& device, const std::array<std::uint32_t, CodeWords>& code, std::uint32_t groups, std::uint32_t threads, std::uint32_t waveSize, bool outputIntoTable = false) {
+Outcome Run(AgcDriver::VulkanDevice& device, const std::array<std::uint32_t, CodeWords>& code, std::uint32_t groups, std::uint32_t threads, std::uint32_t waveSize, bool outputIntoTable = false, std::uint32_t outputType = 0u) {
     const auto table = Buffer(Table.data(), static_cast<std::uint32_t>(sizeof(Table)));
     const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
-    const auto output = outputIntoTable ? Buffer(Table.data(), static_cast<std::uint32_t>(sizeof(Table))) : Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+    auto output = outputIntoTable ? Buffer(Table.data(), static_cast<std::uint32_t>(sizeof(Table))) : Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+    output[3] |= outputType << 30u;
     std::copy(table.begin(), table.end(), Srt.begin());
     std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
     std::copy(output.begin(), output.end(), Srt.begin() + 8);
@@ -895,6 +898,9 @@ void RunGuardedTableTests(AgcDriver::VulkanDevice& device) {
     Require(poisoned.imageTableCount != 0u && poisoned.imageTableFaults == 0u && poisoned.poisonedSrtReads == 1u && !poisoned.cacheable, "image table guard: a poisoned nested read was not captured or stayed cacheable");
     Require(poisoned.artifactId == mapped.artifactId && poisoned.variantId == mapped.variantId, "image table guard: a poisoned nested read changed the pipeline");
     Require(poisoned.log.find("BDA access failed") != std::string::npos && poisoned.log.find("address=0x0 instruction=0x24 bytes=4") != std::string::npos, "image table guard: a valid table suppressed the nested read's completion fault:\n" + poisoned.log);
+    const auto invalidBuffer = Run(device, TableCode, 1, Lanes, 64, false, 2u);
+    Require(invalidBuffer.imageTableCount != 0u && invalidBuffer.imageTableFaults == 0u && invalidBuffer.poisonedSrtReads == 0u && invalidBuffer.invalidBufferDescriptors == 1u, "image table guard: an invalid static output V# was not recorded");
+    Require(invalidBuffer.log.find("BDA access failed") != std::string::npos && invalidBuffer.log.find("reason=8") != std::string::npos && Zeros(invalidBuffer), "image table guard: a valid table suppressed the static buffer's completion fault:\n" + invalidBuffer.log);
     SetClassRecords();
 }
 
