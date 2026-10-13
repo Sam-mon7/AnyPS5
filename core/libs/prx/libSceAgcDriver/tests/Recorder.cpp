@@ -1669,6 +1669,162 @@ void readWrittenStagingTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+bool sparseRunImportTests(const Device& device) {
+    const auto& context = device.GetContext();
+    const bool inPlace = std::getenv("APS5_NO_SPARSE_RUN_IMPORT") == nullptr;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t heap = 8 * unit;
+    struct Heap {
+        const Context& context;
+        void* area = nullptr;
+        std::uint8_t* guest = nullptr;
+        std::size_t mapped = 0;
+        ~Heap() {
+            ClearHostImports(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                for (std::size_t index = 0; index < mapped; ++index) mutation.Remove(guest + index * unit);
+            }
+            SetHostImportWindow(0);
+#ifdef _WIN32
+            if (area != nullptr) VirtualFree(area, 0, MEM_RELEASE);
+#else
+            if (area != nullptr) munmap(area, heap + unit);
+#endif
+        }
+    } state{context};
+#ifdef _WIN32
+    state.area = VirtualAlloc(nullptr, heap, MEM_RESERVE, PAGE_NOACCESS);
+    Require(state.area != nullptr, "cannot reserve the sparse run heap");
+    state.guest = static_cast<std::uint8_t*>(state.area);
+#else
+    void* area = mmap(nullptr, heap + unit, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(area != MAP_FAILED, "cannot reserve the sparse run heap");
+    state.area = area;
+    state.guest = reinterpret_cast<std::uint8_t*>((reinterpret_cast<std::uintptr_t>(area) + unit - 1) & ~std::uintptr_t{unit - 1});
+#endif
+    auto* guest = state.guest;
+    const auto address = reinterpret_cast<std::uint64_t>(guest);
+    const auto map = [&] {
+        auto* piece = guest + state.mapped * unit;
+#ifdef _WIN32
+        Require(VirtualAlloc(piece, unit, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot map a piece of the sparse run heap");
+#else
+        Require(mprotect(piece, unit, PROT_READ | PROT_WRITE) == 0, "cannot map a piece of the sparse run heap");
+#endif
+        for (std::size_t at = 0; at < unit; ++at) piece[at] = static_cast<std::uint8_t>((state.mapped * unit + at) * 7u + 3u);
+        GuestAllocations::Mutation mutation;
+        mutation.Add(piece, unit, true, true, true);
+        ++state.mapped;
+    };
+    for (int piece = 0; piece < 3; ++piece) map();
+    PrepareImportWatch(context);
+    SetHostImportWindow(unit);
+    if (HostImportFor(context, address, unit) == nullptr) {
+        std::cout << "host import of the sparse run heap refused: sparse run imports not tested\n";
+        return false;
+    }
+    Recorder recorder(context);
+    recorder.Activate();
+    const auto run = [&] { return HostImportFor(context, address, state.mapped * unit); };
+    const auto bound = [&](GuestBufferMemory& memory, std::uint64_t begin, std::uint64_t bytes) {
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(begin, bytes, adjustment);
+        const auto* import = run();
+        return import != nullptr && view.buffer == import->buffer;
+    };
+    const auto upload = [&](bool written, std::uint64_t pastRun, const std::function<void(GuestBufferMemory&)>& check) {
+        GuestBufferMemory memory(context);
+        if (written) memory.AddWritable(address, heap);
+        else memory.AddReadable(address, heap);
+        if (pastRun != 0) memory.AddReadable(address + pastRun, 16);
+        memory.Upload(true);
+        check(memory);
+        memory.WriteBack();
+    };
+    const auto committed = 3 * unit;
+    upload(false, 0, [&](GuestBufferMemory& memory) {
+        Require(!bound(memory, address, heap) && memory.InPlaceReads().empty(), "a sparse run heap was joined the first time its run was seen");
+    });
+    upload(false, 0, [&](GuestBufferMemory& memory) {
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(address, heap, adjustment);
+        const auto ranges = memory.AddressRanges();
+        Require(adjustment == 0 && view.range == committed && ranges.size() == 1 && ranges[0].begin == address && ranges[0].end == address + committed, "a sparse run heap's view or address range is not cut at its last committed byte");
+        if (!inPlace) {
+            Require(!bound(memory, address, heap) && memory.InPlaceReads().empty(), "a sparse run heap is bound in place under APS5_NO_SPARSE_RUN_IMPORT");
+            return;
+        }
+        const auto* import = run();
+        Require(import != nullptr && view.buffer == import->buffer && view.offset == address - import->base && ranges[0].deviceAddress == import->address + (address - import->base), "a sparse run heap is not bound in place from its run's import");
+        const auto direct = memory.DirectRegions();
+        const auto reads = memory.InPlaceReads();
+        const auto cuts = memory.CutRegions();
+        Require(direct.has_value() && direct->size() == 1 && direct->front() == std::pair<std::uint64_t, std::uint64_t>{address, address + committed} && reads.size() == 1 && reads.front() == direct->front(), "a sparse run heap bound in place is not named up to its import's end for reuse");
+        Require(cuts.size() == 1 && cuts.front().begin == address && cuts.front().end == address + heap && cuts.front().committedEnd == address + committed, "a sparse run heap bound in place does not report its cut");
+        Buffer readback(context, committed, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        {
+            std::unique_lock gpu(GpuMutex());
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            CopyBuffer(context, commands, view.buffer, view.offset, readback.Handle(), 0, committed);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            recorder.Sync();
+        }
+        readback.Invalidate();
+        Require(std::memcmp(readback.Bytes().data(), guest, committed) == 0, "the GPU does not read a sparse run heap's bytes through its in-place view");
+    });
+    upload(true, 0, [&](GuestBufferMemory& memory) {
+        Require(!bound(memory, address, heap), "a written sparse run heap is bound in place");
+    });
+    upload(false, 5 * unit, [&](GuestBufferMemory& memory) {
+        Require(!bound(memory, address, heap), "a sparse run heap with a view past its run is bound in place");
+    });
+    if (inPlace) {
+        auto regionContext = context;
+        DescriptorCache cache(regionContext);
+        regionContext.descriptorCache = &cache;
+        Recorder regionRecorder(regionContext);
+        regionRecorder.Activate();
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, static_cast<std::uint32_t>(heap), 0x31000000u};
+        binding.bufferWritten = {false};
+        program.bindings.push_back(binding);
+        program.pushConstants.resize(16);
+        program.memoryOffsetDword = 0;
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        {
+            ShaderResources resources(regionContext, compute);
+            const auto reads = resources.InPlaceReads();
+            Require(resources.Reusable() && reads.size() == 1 && reads.front() == std::pair<std::uint64_t, std::uint64_t>{address, address + committed}, "a set over a sparse run heap bound in place is not reusable");
+            Require(resources.Revalidate(compute), "a set over an unchanged sparse run heap failed its proof");
+            map();
+            Require(!resources.Revalidate(compute), "a set over a sparse run heap mapped past its cut was reused");
+            regionRecorder.Submit();
+            device.WaitQueue();
+            regionRecorder.Sync();
+        }
+        recorder.Activate();
+        upload(false, 0, [&](GuestBufferMemory& memory) {
+            Require(!bound(memory, address, heap), "a grown sparse run heap was joined again the first time its grown run was seen");
+        });
+        upload(false, 0, [&](GuestBufferMemory& memory) {
+            std::uint32_t adjustment = 0;
+            const auto view = memory.Descriptor(address, heap, adjustment);
+            Require(bound(memory, address, heap) && view.range == 4 * unit, "a grown sparse run heap is not joined again over its grown run");
+        });
+    }
+    recorder.Sync();
+    std::cout << "sparse run import tests passed (" << (inPlace ? "in place" : "copied") << ")\n";
+    return true;
+}
+
 void misalignedRegionTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
@@ -6132,6 +6288,13 @@ int main(int argc, char** argv) {
             }
             hostImportRetirementTests(device);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--sparse-run-import-only") {
+            if (device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, sparse run imports require host imports\n";
+                return 77;
+            }
+            return sparseRunImportTests(device) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-only") {
             pipelineLibraryTests(device);

@@ -163,6 +163,8 @@ struct HostImports {
     std::uint64_t liveBytes = 0;
     std::map<std::uint64_t, ImportFailure> failed;
     std::map<std::uint64_t, ImportFailure> failedJoins;
+    std::map<std::uint64_t, std::uint64_t> sparseRunEnds;
+    std::map<std::uint64_t, std::uint32_t> sparseRunJoins;
     std::set<std::uint64_t> unaliasedSpans;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
@@ -897,6 +899,8 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         state.liveBytes = 0;
         state.failed.clear();
         state.failedJoins.clear();
+        state.sparseRunEnds.clear();
+        state.sparseRunJoins.clear();
         state.device = context.device;
         state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
         state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
@@ -908,6 +912,12 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
     state.refreshedGeneration = generation;
+    const auto starts = [&](std::uint64_t address) {
+        const auto index = leasedIndexContaining(lease, address);
+        return index != lease.size() && lease[index]->address == address;
+    };
+    std::erase_if(state.sparseRunEnds, [&](const auto& entry) { return !starts(entry.first); });
+    std::erase_if(state.sparseRunJoins, [&](const auto& entry) { return !starts(entry.first); });
     for (auto it = state.imports.begin(); it != state.imports.end();) {
         const auto* range = leasedRangeAt(lease, it->first);
         if (range != nullptr && sameRange(it->second, lease)) {
@@ -1267,6 +1277,13 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
 
 bool sparseMirrorsEnabled() {
     static const bool disabled = std::getenv("APS5_NO_SPARSE_HEAP_MIRROR") != nullptr;
+    return !disabled;
+}
+
+constexpr std::uint32_t MaxSparseRunJoins = 64;
+
+bool sparseRunImportsEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_SPARSE_RUN_IMPORT") != nullptr;
     return !disabled;
 }
 
@@ -3082,14 +3099,41 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch ? region.direct : nullptr;
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
-            if (entry == nullptr) {
+            const bool sparseRun = region.sparseHeap && region.sparse && sparseRunImportsEnabled();
+            if (entry == nullptr && !sparseRun) {
                 if (runCovers(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, region.begin, importRanges());
+            }
+            bool runImport = false;
+            if (entry == nullptr && sparseRun && !region.backed.empty() && region.backed.front().first == region.begin && !WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) {
+                const auto committedEnd = region.backed.back().second;
+                const auto neededEnd = std::min(region.end, std::max(committedEnd, std::max(region.lastView, region.begin) + 4u));
+                const auto covers = [&](const HostImport* candidate) { return candidate != nullptr && candidate->base <= region.begin && candidate->base + candidate->bytes >= neededEnd; };
+                entry = findImport(state, region.begin, neededEnd);
+                if (entry == nullptr && runCovers(importRanges(), region.begin, neededEnd)) entry = importAllocation(context, state, region.begin, importRanges());
+                if (!covers(entry)) entry = nullptr;
+                const auto& lease = importRanges();
+                const auto index = leasedIndexContaining(lease, region.begin);
+                if (entry == nullptr && index != lease.size() && lease[index]->address == region.begin) {
+                    const auto* low = findImport(state, region.begin, region.begin + 1);
+                    const auto joinBase = low != nullptr && low->joined ? low->base : region.begin;
+                    const auto joins = state.sparseRunJoins.find(joinBase);
+                    const auto made = joins == state.sparseRunJoins.end() ? 0u : joins->second;
+                    const auto seen = state.sparseRunEnds.find(region.begin);
+                    if (seen != state.sparseRunEnds.end() && seen->second == committedEnd && made < MaxSparseRunJoins) {
+                        entry = importJoined(context, state, region.begin, neededEnd, lease);
+                        if (covers(entry) && ++state.sparseRunJoins[entry->base] == MaxSparseRunJoins) std::fprintf(stderr, "[gpu] the sparse heap at 0x%llx was joined into one import %u times; it is not joined again and is copied once its run outgrows the import\n", static_cast<unsigned long long>(entry->base), MaxSparseRunJoins);
+                    }
+                    state.sparseRunEnds[region.begin] = committedEnd;
+                }
+                if (!covers(entry)) entry = nullptr;
+                runImport = entry != nullptr;
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
             const bool staged = recorder != nullptr && stagingEligible(region, addressable);
             if (entry != nullptr && !staged && bindableInPlace(region.begin - entry->base, addressable)) {
                 region.direct = entry;
+                region.runCut = runImport;
                 region.snapshot.clear();
                 // A buffer UploadPrepare made for a GPU copy is not needed: the import serves the
                 // region in place (Descriptor prefers `direct`), and a kept buffer would count as copied.
@@ -3436,7 +3480,7 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     adjustment = static_cast<std::uint32_t>(offset % std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4));
     auto range = ViewBytes(bytes, adjustment);
     const auto end = region.direct != nullptr ? region.direct->base + region.direct->bytes : servedEnd(region);
-    const bool cut = region.direct == nullptr && end < region.end;
+    const bool cut = (region.direct == nullptr || region.runCut) && end < region.end;
     if (cut) {
         Require(address - adjustment < end, "guest buffer view starts past its copy");
         range = std::min<std::uint64_t>(range, end - (address - adjustment));
@@ -3456,7 +3500,7 @@ ShaderRecompiler::BdaAbi::Range GuestBufferMemory::addressRange(const Region& re
     const auto address = region.direct != nullptr ? region.direct->address + (region.begin - region.direct->base) : region.mirror != nullptr ? region.mirror->buffer->DeviceAddress() + (region.begin - region.mirror->base) : region.buffer->DeviceAddress();
     Require(region.end - region.begin <= std::numeric_limits<std::uint64_t>::max() - address, "GPU address range overflow");
     const auto permissions = ShaderRecompiler::BdaAbi::Read | (region.direct != nullptr && region.writable ? ShaderRecompiler::BdaAbi::Write : 0u);
-    return {region.begin, region.direct != nullptr ? region.end : servedEnd(region), address, permissions, 0};
+    return {region.begin, region.direct != nullptr ? inPlaceEnd(region) : servedEnd(region), address, permissions, 0};
 }
 
 std::uint64_t GuestBufferMemory::servedEnd(const Region& region) {
@@ -3743,6 +3787,9 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
             result.emplace_back(region.begin, region.end);
         }
     }
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    const bool sameDevice = state.device == context.device;
     for (const auto& region : regions) {
         // A read-only mirror is as fixed as an import: its bytes and VkBuffer never change while its
         // A staged region is keyed by its import like one bound in place: the import is the source
@@ -3754,14 +3801,27 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
             // A later use copies from `copySource` again, so it must still be the import serving
             // the range (the flush before the copy-in can retire and remake imports): the serial
             // the caller records names the current import, and its buffer must be that one.
-            auto& state = Imports();
-            std::lock_guard lock(state.mutex);
-            const auto* entry = state.device == context.device ? findImport(state, region.begin, region.end) : nullptr;
+            const auto* entry = sameDevice ? findImport(state, region.begin, region.end) : nullptr;
             if (entry == nullptr || entry->buffer != region.copySource) return std::nullopt;
         }
-        result.emplace_back(region.begin, region.end);
+        if (region.direct != nullptr && (!sameDevice || findImport(state, region.begin, region.begin + 1) != region.direct)) return std::nullopt;
+        result.emplace_back(region.begin, inPlaceEnd(region));
     }
     return result;
+}
+
+std::vector<GuestBufferMemory::CutRegion> GuestBufferMemory::CutRegions() const {
+    std::vector<CutRegion> result;
+    if (!uploaded || committed) return result;
+    for (const auto& region : regions) {
+        if (region.direct == nullptr || !region.runCut) continue;
+        result.push_back({region.begin, region.end, inPlaceEnd(region)});
+    }
+    return result;
+}
+
+std::uint64_t GuestBufferMemory::inPlaceEnd(const Region& region) {
+    return region.direct != nullptr && region.runCut ? std::min(region.end, region.direct->base + region.direct->bytes) : region.end;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
@@ -3773,7 +3833,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
         }
     }
     for (const auto& region : regions) {
-        if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+        if (region.direct != nullptr) result.emplace_back(region.begin, inPlaceEnd(region));
     }
     return result;
 }

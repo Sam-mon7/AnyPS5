@@ -308,6 +308,8 @@ private:
         std::uint64_t begin;
         std::uint64_t end;
         std::uint64_t serial;
+        std::uint64_t regionEnd = 0;
+        std::uint64_t committedEnd = 0;
     };
 
     // The build is two stages. A (buildPrepare, no device lock): the binding plan with its layout
