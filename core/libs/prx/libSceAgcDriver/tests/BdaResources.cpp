@@ -123,6 +123,88 @@ void importSpanTests(const Context& context) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void spaceWritableWritesTests(const Context& context) {
+    if (!AddressSpaceCounters().enabled) return;
+    std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+    constexpr std::size_t piece = 65536;
+    auto* block = static_cast<std::uint8_t*>(::operator new(4 * piece, std::align_val_t{piece}));
+    std::memset(block, 0x11, 4 * piece);
+    const auto address = reinterpret_cast<std::uintptr_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](std::size_t index, bool add) {
+        GuestAllocations::Mutation mutation;
+        if (add) mutation.Add(block + index * piece, piece, true, index != 1, true);
+        else mutation.Remove(block + index * piece);
+    };
+    // Writable, read-only, an unregistered gap, then writable again.
+    for (const auto index : {0u, 1u, 3u}) change(index, true);
+    const auto same = [](const std::vector<ShaderRecompiler::BdaAbi::Range>& left, const std::vector<ShaderRecompiler::BdaAbi::Range>& right) {
+        return left.size() == right.size() && (left.empty() || std::memcmp(left.data(), right.data(), left.size() * sizeof(left.front())) == 0);
+    };
+    struct Built {
+        std::uint64_t serial;
+        std::uint64_t importSerial;
+        std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    };
+    const auto build = [&](std::initializer_list<std::pair<std::size_t, std::size_t>> written, const char* step) {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        for (const auto& [offset, bytes] : written) leased.AddWritable(address + offset, bytes);
+        leased.Upload(true);
+        const auto cached = leased.CachedAddressTable();
+        Require(cached.has_value() && cached->ranges != nullptr, std::string("a build of the space alone has no cached table: ") + step);
+        Built result{cached->serial, HostImportSerial(importing, address, piece, false), leased.AddressRanges()};
+        Require(result.importSerial != 0, "the writable table fixture was not imported");
+        Require(same(*cached->ranges, result.ranges), std::string("the cached table differs from AddressRanges(): ") + step);
+        leased.WriteBack();
+        return result;
+    };
+    const auto plain = build({}, "no writes");
+    const auto once = build({{256, 512}}, "one write in a writable import");
+    const auto twice = build({{3 * piece + 64, 128}, {4096, 64}}, "writes on both sides of a gap");
+    Require(once.serial == plain.serial && twice.serial == plain.serial, "writes in writable imports did not bind the space's table");
+    Require(same(once.ranges, plain.ranges) && same(twice.ranges, plain.ranges), "writes in writable imports changed the BDA table");
+    for (const auto index : {0u, 1u, 3u}) {
+        const auto begin = address + index * piece;
+        const auto found = std::find_if(twice.ranges.begin(), twice.ranges.end(), [&](const auto& range) { return range.begin == begin; });
+        Require(found != twice.ranges.end() && found->end == begin + piece, "the writable table fixture is missing a registered range");
+        Require(((found->permissions & ShaderRecompiler::BdaAbi::Write) != 0u) == (index != 1), "the space's table changed a range's write permission");
+    }
+    Require(std::none_of(twice.ranges.begin(), twice.ranges.end(), [&](const auto& range) { return range.begin < address + 3 * piece && range.end > address + 2 * piece; }), "the space's table mapped an unregistered gap");
+    {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddWritable(address + piece + 16, 32);
+        leased.Upload(true);
+        reject([&] { static_cast<void>(leased.CachedAddressTable()); }, "runtime buffer write has no writable GPU owner");
+    }
+    // A view spanning owners dissolves the shared space before table selection, including a view
+    // crossing a read-only owner or the gap. It must never take the shared writable-table path.
+    for (const auto offset : {piece - 16, 3 * piece - 16}) {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddWritable(address + offset, 32);
+        Require(!leased.SpaceOwner() && !leased.CachedAddressTable().has_value(), "a write crossing owners retained the shared table");
+    }
+    change(0, false);
+    change(0, true);
+    const auto remapped = build({}, "same-address registry replacement");
+    const auto remappedWrite = build({{256, 512}}, "write after registry replacement");
+    Require(remapped.serial != plain.serial && remapped.importSerial != plain.importSerial, "registry replacement reused a stale space or import identity");
+    Require(remappedWrite.serial == remapped.serial && same(remappedWrite.ranges, remapped.ranges), "a remapped writable import did not use its new space's table");
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    ClearHostImports(importing.device);
+    const auto reimported = build({}, "imports cleared without registry change");
+    const auto reimportedWrite = build({{8192, 128}}, "write after import replacement");
+    Require(GuestAllocations::GuestAllocationsGeneration_nid_postfix() == generation, "the import replacement fixture changed the registry");
+    Require(reimported.serial != remapped.serial && reimported.importSerial != remapped.importSerial, "import replacement reused a stale space or import identity");
+    Require(reimportedWrite.serial == reimported.serial && same(reimportedWrite.ranges, reimported.ranges), "a replaced writable import did not use its new space's table");
+    for (const auto index : {0u, 1u, 3u}) change(index, false);
+    ClearHostImports(importing.device);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void failedImportRemapTests(const Context& context, const BdaTestAccess& access) {
     constexpr std::size_t piece = 65536;
     auto* block = static_cast<std::byte*>(::operator new(4 * piece, std::align_val_t{piece}));
@@ -736,6 +818,11 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
         const auto ranges = leased.AddressRanges();
         const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == address; });
         Require(found != ranges.end() && found->deviceAddress != 0u, "the heap range is missing from the BDA table");
+        if (AddressSpaceCounters().enabled) {
+            const auto cached = leased.CachedAddressTable();
+            Require(cached.has_value() && cached->ranges != nullptr, "the heap mirror has no cached address table");
+            Require(cached->ranges->size() == ranges.size() && std::memcmp(cached->ranges->data(), ranges.data(), ranges.size() * sizeof(ranges.front())) == 0, "the cached table widened or lost a heap mirror's written sub-range");
+        }
         const auto device = found->deviceAddress;
         auto cursor = address;
         std::uint64_t writableBytes = 0;
@@ -1466,6 +1553,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importCrossingTests(context, access);
     importSpanTests(context);
     failedImportRemapTests(context, access);
+    spaceWritableWritesTests(context);
     importWindowTests(context);
     importWholeRangeOverWindowTests(context);
     importRefusedWholeRangeTests(context);
