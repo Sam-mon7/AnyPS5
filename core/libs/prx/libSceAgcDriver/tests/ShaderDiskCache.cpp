@@ -373,6 +373,43 @@ void verifyArtifactStorageIsolation() {
     require(ShaderDiskCache::EncodeEntry(key, variant) != before, "the stored artifact ignores vertex input metadata");
 }
 
+void verifySpecializedKeySensitivity() {
+    const std::vector<std::uint32_t> source{spv::MagicNumber, 0x00010300u, 0u, 1u, 0u};
+    const std::vector<PipelineSpecializationConstant> constants{{7u, 11u}, {9u, 13u}};
+    SpirvTarget target{};
+    target.vulkanVersion = 0x00401000u;
+    target.spirvVersion = 0x00010300u;
+    const auto makeKey = [](const auto& words, const auto& values, const auto& environment) {
+        std::vector<std::byte> key;
+        ShaderDiskCache::BuildSpecializedKey(words, values, environment, key);
+        return key;
+    };
+    const auto key = makeKey(source, constants, target);
+    require(makeKey(source, constants, target) == key, "specialized key is not deterministic");
+    require(key != SampleRequest{}.Key(), "specialized and prepared key domains overlap");
+    auto changedSource = source;
+    changedSource.back() ^= 1u;
+    require(makeKey(changedSource, constants, target) != key, "specialized key ignores source words");
+    auto changedConstants = constants;
+    changedConstants[0].value++;
+    require(makeKey(source, changedConstants, target) != key, "specialized key ignores a constant value");
+    changedConstants = constants;
+    changedConstants[0].id++;
+    require(makeKey(source, changedConstants, target) != key, "specialized key ignores a constant ID");
+    changedConstants = constants;
+    changedConstants.pop_back();
+    require(makeKey(source, changedConstants, target) != key, "specialized key ignores the constant count");
+    auto changedTarget = target;
+    changedTarget.vulkanVersion++;
+    require(makeKey(source, constants, changedTarget) != key, "specialized key ignores the Vulkan version");
+    changedTarget = target;
+    changedTarget.spirvVersion++;
+    require(makeKey(source, constants, changedTarget) != key, "specialized key ignores the SPIR-V version");
+    changedTarget = target;
+    changedTarget.nonConstantImageOffsets = true;
+    require(makeKey(source, constants, changedTarget) != key, "specialized key ignores non-constant offsets");
+}
+
 void verifyKeySensitivity() {
     SampleRequest base;
     const auto key = base.Key();
@@ -664,14 +701,16 @@ struct ComputeRequest {
     }
 };
 
-int runLoadingProcess() {
+int runLoadingProcess(bool corrupt = false) {
     ComputeRequest cached(true);
     const auto loaded = Recompile(cached.request);
+    ShaderDiskCache::Flush();
     const auto totals = ShaderDiskCache::Totals();
-    require(totals.hits == 1 && totals.misses == 0 && totals.loadFailures == 0, "the second process did not load the stored variant (hits " + std::to_string(totals.hits) + ", misses " + std::to_string(totals.misses) + ")");
+    require(totals.hits == (corrupt ? 1u : 2u) && totals.misses == 0 && totals.loadFailures == (corrupt ? 1u : 0u) && totals.writes == (corrupt ? 1u : 0u), "the second process did not load or repair the prepared and specialized modules (hits " + std::to_string(totals.hits) + ", misses " + std::to_string(totals.misses) + ")");
     ComputeRequest fresh(false);
     const auto compiled = Recompile(fresh.request);
     requireSameResult(compiled, loaded, "loaded against compiled");
+    require(ShaderDiskCache::Totals().hits == totals.hits && ShaderDiskCache::Totals().misses == totals.misses, "uncached compilation accessed the disk cache");
     require(!loaded.spirv.empty(), "the loaded SPIR-V is empty");
     std::cout << "second process loaded " << loaded.spirv.size() << " SPIR-V words from the disk cache\n";
     return 0;
@@ -683,10 +722,25 @@ void verifyAcrossProcesses(const char* self) {
     const auto compiled = Recompile(request.request);
     ShaderDiskCache::Flush();
     const auto after = ShaderDiskCache::Totals();
-    require(after.misses == before.misses + 1 && after.writes == before.writes + 1, "the first compile was not looked up and stored");
+    require(after.misses == before.misses + 2 && after.writes == before.writes + 2, "the first compile did not store both prepared and specialized modules");
     require(!compiled.spirv.empty(), "the compile produced no SPIR-V");
     const std::string command = "\"" + std::string(self) + "\" --load";
     require(std::system(command.c_str()) == 0, "the loading process failed");
+    std::size_t corrupted = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(ShaderDiskCache::EntryDirectory())) {
+        std::vector<std::byte> file;
+        require(ReadWholeFile(entry.path(), file), "cannot read the entry to test corruption");
+        std::uint32_t domain = 0;
+        if (file.size() >= 52u) std::memcpy(&domain, file.data() + 48u, sizeof(domain));
+        if (domain != 0x53535041u) continue;
+        file.back() ^= std::byte{1};
+        require(WriteFileAtomically(entry.path(), file), "cannot corrupt the specialized entry");
+        ++corrupted;
+    }
+    require(corrupted == 1u, "expected exactly one specialized module to corrupt");
+    const std::string repair = "\"" + std::string(self) + "\" --load-corrupt";
+    require(std::system(repair.c_str()) == 0, "the process rebuilding a corrupt specialized entry failed");
+    require(std::system(command.c_str()) == 0, "the repaired specialized entry did not load");
 }
 
 struct ClockRequest {
@@ -851,7 +905,7 @@ void verifyBufferAlignmentSpecialization() {
     for (std::uint32_t offset = 1; offset < 4u; ++offset) {
         request.userData[0] = 0x10000000u + offset;
         const auto unaligned = Recompile(request.request);
-        require(unaligned.variantId == aligned.variantId && diskMisses() == misses, "base alignment repeated static shader preparation");
+        require(unaligned.variantId == aligned.variantId && diskMisses() == misses + 1u + offset, "base alignment did not reuse preparation and specialize once per alignment");
         require(countAtomics(unaligned) == 2u, "unaligned DWORD store did not split into two atomic updates");
         request.userData[0] += 0x10000u;
         const auto relocated = Recompile(request.request);
@@ -1150,6 +1204,7 @@ void verifyDefaultDirectory(const char* self) {
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--load-corrupt") return runLoadingProcess(true);
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
@@ -1161,6 +1216,7 @@ int main(int argc, char** argv) {
         verifyEntryRoundTrip();
         verifyArtifactStorageIsolation();
         verifyKeySensitivity();
+        verifySpecializedKeySensitivity();
         verifyFloatModeSerialization();
         verifyStore();
         verifySpirvEviction();

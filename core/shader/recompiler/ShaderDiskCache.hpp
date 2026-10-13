@@ -34,6 +34,7 @@ struct Counters {
 [[nodiscard]] std::uint64_t SourceVersion();
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key);
+void BuildSpecializedKey(std::span<const std::uint32_t> source, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, std::vector<std::byte>& key);
 
 [[nodiscard]] std::string EntryName(std::span<const std::byte> key);
 

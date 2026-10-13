@@ -957,6 +957,27 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, s
     key.insert(key.end(), switches.begin(), switches.end());
 }
 
+void BuildSpecializedKey(std::span<const std::uint32_t> source, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, std::vector<std::byte>& key) {
+    key.clear();
+    Writer writer(key);
+    // A separate key domain from prepared artifacts; the checked entry format is shared.
+    writer.Value<std::uint32_t>(0x53535041u);
+    writer.Value(FormatVersion);
+    writer.Value(SourceVersion());
+    writer.Values(source);
+    writer.Value<std::uint64_t>(constants.size());
+    for (const auto& constant : constants) {
+        writer.Value(constant.id);
+        writer.Value(constant.value);
+    }
+    // The other target properties have already been applied to the source module.
+    writer.Value(target.vulkanVersion);
+    writer.Value(target.spirvVersion);
+    writer.Value(target.nonConstantImageOffsets);
+    const auto& switches = switchKey();
+    key.insert(key.end(), switches.begin(), switches.end());
+}
+
 std::string EntryName(std::span<const std::byte> key) {
     return hex(HashBytes(key, 0x5eed0001ull)) + hex(HashBytes(key, 0x5eed0002ull)) + ".bin";
 }
