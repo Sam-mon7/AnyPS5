@@ -512,6 +512,38 @@ void testCopyIntoHostMemory() {
     GuestHeap::GuestHeapFree_nid_postfix(produced);
 }
 
+void testSmallCopyBehindPendingSource() {
+    alignas(64) static volatile std::uint32_t copied = 0, settledCopied = 0;
+    constexpr std::size_t words = 32768;
+    constexpr auto bytes = static_cast<std::uint32_t>(words * 4);
+    constexpr std::size_t smallWords = 1024;
+    constexpr auto smallBytes = static_cast<std::uint32_t>(smallWords * 4);
+    auto* produced = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, bytes));
+    auto* source = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, bytes));
+    auto* destination = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, smallBytes));
+    for (std::size_t i = 0; i < words; ++i) {
+        produced[i] = 0xc3000000u | static_cast<std::uint32_t>(i);
+        source[i] = 0x3c000000u | static_cast<std::uint32_t>(i);
+    }
+    std::fill(destination, destination + smallWords, 0u);
+    const auto before = AgcDriver::DriverDetail::copiesBehindPendingSources.load();
+    submit(0, commands(memoryCopy(source, produced, bytes), memoryCopy(destination, source, smallBytes), writeData(&copied, 1)));
+    waitFor(&copied, 1, "the label after a small copy behind a pending source never landed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::equal(destination, destination + smallWords, produced), "a small copy did not see the GPU copy into its source before it");
+    check(AgcDriver::DriverDetail::copiesBehindPendingSources.load() == before + 1, "a small copy whose source the GPU still stores into was not recorded on the GPU");
+    std::fill(destination, destination + smallWords, 0u);
+    const auto settled = AgcDriver::DriverDetail::copiesBehindPendingSources.load();
+    submit(0, commands(memoryCopy(destination, produced, smallBytes), writeData(&settledCopied, 1)));
+    waitFor(&settledCopied, 1, "the label after a small copy of a settled source never landed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::equal(destination, destination + smallWords, produced), "a small copy of a settled source lost bytes");
+    check(AgcDriver::DriverDetail::copiesBehindPendingSources.load() == settled, "a small copy of a settled source was recorded on the GPU");
+    GuestHeap::GuestHeapFree_nid_postfix(destination);
+    GuestHeap::GuestHeapFree_nid_postfix(source);
+    GuestHeap::GuestHeapFree_nid_postfix(produced);
+}
+
 void testShaderHeaderAlignment() {
     alignas(256) static const std::array<std::uint32_t, 64> code{0xbf810000};
     struct Header {
@@ -800,6 +832,7 @@ int main(int argc, char** argv) {
         testShaderHeaderAlignment();
         testHeaderWithoutProgramAddress();
         testCopyIntoHostMemory();
+        testSmallCopyBehindPendingSource();
         testRegisteredFloatMode();
         testReadOnlyResummarize();
         testWorkerFailure();
