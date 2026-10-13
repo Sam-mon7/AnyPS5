@@ -944,6 +944,34 @@ void verifyBindlessTable() {
     AgcDriver::ShaderMemory partialMemory({});
     expectFailure([&] { static_cast<void>(partialMemory.Capture(request)); }, "partial descriptor", "bindless: a partial heap descriptor was accepted");
     fillSrt(4u);
+
+    std::vector<std::array<std::uint32_t, 8>> fullHeap(slots + 1u, heap[0]);
+    std::vector<std::array<std::uint32_t, 4>> fullMaterials(slots + 1u);
+    for (std::uint32_t key = 0u; key <= slots; ++key) fullMaterials[key][1] = key;
+    const auto fullHeapV = bufferDescriptor(fullHeap.data(), 32u, slots + 1u);
+    std::copy(fullHeapV.begin(), fullHeapV.end(), srt.begin());
+    const auto setMaterialCount = [&](std::uint32_t count) {
+        const auto fullMaterialV = bufferDescriptor(fullMaterials.data(), 16u, count);
+        std::copy(fullMaterialV.begin(), fullMaterialV.end(), srt.begin() + 8);
+    };
+    auto fullRequest = makeRequest(materialCode);
+    for (const auto count : {18u, slots}) {
+        setMaterialCount(count);
+        AgcDriver::ShaderMemory fullMemory({});
+        const auto fullCapture = fullMemory.Capture(fullRequest);
+        const auto fullMapping = mappingOf(fullCapture->snapshot);
+        require(fullMapping.front() == count, "bindless: a supported material table lost keys");
+        for (std::uint32_t key = 0u; key < count; ++key) {
+            require(fullMapping[1u + 2u * key] == key && fullMapping[2u + 2u * key] == key, "bindless: a full material table has the wrong mapping");
+        }
+        const auto fullRegions = fullMemory.Regions();
+        fullRequest.context.memory = fullRegions;
+        require(!Recompile(fullRequest, *fullCapture)->spirv.empty(), "bindless: a supported material table did not compile");
+        fullRequest.context.memory = {};
+    }
+    setMaterialCount(slots + 1u);
+    AgcDriver::ShaderMemory overflowMemory({});
+    expectFailure([&] { static_cast<void>(overflowMemory.Capture(fullRequest)); }, "distinct keys exceed", "bindless: material table overflow was accepted");
 }
 
 
