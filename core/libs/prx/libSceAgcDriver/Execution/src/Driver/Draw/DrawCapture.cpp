@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "ImageTableAbi.hpp"
 #include <cstdlib>
 #include <cstring>
 
@@ -15,6 +16,8 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
     const auto& program = programs[i];
+    static const bool traceIndirect = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
+    const bool patchedStage = drawParameters.indirect && (drawHit || recompiled[i]);
     const auto waveSize = program.binary.stage == Stage::Fragment ? graphics.stages.fragmentWaveSize : graphics.stages.vertexWaveSize;
     ShaderRecompiler::RecompileRequest request{
         program.binary,
@@ -94,6 +97,28 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     timing.Mark("capture_resources");
     stageCapture.compiled = invocation.Materialize(*capture);
     timing.Mark("materialize");
+    if (traceIndirect && !capture->snapshot.tables.tables.empty()) {
+        const auto& tables = capture->snapshot.tables;
+        const auto& plan = *capture->plan;
+        const bool cacheable = CacheableResult(*stageCapture.compiled);
+        const auto traceTable = [&](std::uint32_t table, std::uint32_t source) {
+            if (table == ShaderRecompiler::NoTable) return;
+            const auto& snapshot = tables.tables.at(table);
+            const auto& column = *plan.descriptorSources.at(source).tableColumn;
+            std::uint32_t readable = 0, outsideDomain = 0, unmapped = 0, otherPoison = 0;
+            for (const auto code : snapshot.codes) {
+                const auto reason = code & ~ShaderRecompiler::ImageTableAbi::PoisonFlag;
+                if ((code & ShaderRecompiler::ImageTableAbi::PoisonFlag) == 0u) ++readable;
+                else if (reason == static_cast<std::uint32_t>(ShaderRecompiler::ImageTableAbi::PoisonReason::OutsideDomain)) ++outsideDomain;
+                else if (reason == static_cast<std::uint32_t>(ShaderRecompiler::ImageTableAbi::PoisonReason::Unmapped)) ++unmapped;
+                else ++otherPoison;
+            }
+            const char* domain = !column.keyDomain ? "none" : column.keyDomain->value ? "value" : "buffer";
+            std::fprintf(stderr, "[draw-table] queue %u shader 0x%llx stage %zu indirect %u args 0x%llx capture %s table %u source %u %s %s base 0x%llx size 0x%llx stride %u maxKey %u domain %s records %u keys %u nonpoison %u outsideDomain %u unmapped %u otherPoison %u fault 0x%x snapshotWords %zu cacheable %u\n", submission.queue, static_cast<unsigned long long>(program.binary.codeAddress), i, drawParameters.indirect ? 1u : 0u, static_cast<unsigned long long>(drawParameters.indirect ? drawParameters.indirect->arguments : 0u), patchedStage ? "patched" : "initial", table, source, column.sampler ? "sampler" : "image", column.address ? "address" : "buffer", static_cast<unsigned long long>(snapshot.base), static_cast<unsigned long long>(snapshot.size), column.stride, column.maxKey, domain, snapshot.records, snapshot.keys, readable, outsideDomain, unmapped, otherPoison, snapshot.fault, tables.words.size(), cacheable ? 1u : 0u);
+        };
+        for (const auto& image : plan.info.images) traceTable(image.table, image.source);
+        for (const auto& sampler : plan.info.samplers) traceTable(sampler.table, sampler.source);
+    }
     ShaderRecompiler::RecompileResult result = *stageCapture.compiled;
     phaseTiming.Phase(DrawRowRecompile);
     return result;
