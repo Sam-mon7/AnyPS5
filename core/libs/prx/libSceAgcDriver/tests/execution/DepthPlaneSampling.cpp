@@ -17,6 +17,8 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -319,12 +321,33 @@ void DemonsSoulsArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block, Gu
     const auto queuedOutput = [&](std::uint32_t index) {
         return std::span<std::uint32_t>(reinterpret_cast<std::uint32_t*>(outputBlock.At(256u + index * 256u)), Threads);
     };
+    static std::uint64_t countedLayer = 0;
+    static std::atomic<std::size_t> layerReads{0};
+    countedLayer = reinterpret_cast<std::uintptr_t>(base + 39u * sliceBytes);
+    layerReads = 0;
+    AgcDriver::GuestMemory::SetReadGuard([](std::uint64_t address, std::size_t bytes) {
+        if (address == countedLayer && bytes == sliceBytes) ++layerReads;
+    });
+    struct ResetReadGuard {
+        ~ResetReadGuard() { AgcDriver::GuestMemory::SetReadGuard(nullptr); }
+    } resetReadGuard;
+    AgcDriver::GuestMemory::BumpCollectEpoch();
     for (std::uint32_t index = 0; index < queued; ++index) Load(device, base, shape, 39u, queuedOutput(index), false);
-    FillSlice(base + 39u * sliceBytes, sliceBytes, Bits(0.875f), 4u);
+    const auto expectedReads = std::getenv("APS5_NO_DEPTH_UPLOAD_MEMO") != nullptr ? queued : 1u;
+    Require(layerReads == expectedReads, "unchanged depth layer read count " + std::to_string(layerReads.load()) + ", expected " + std::to_string(expectedReads));
+    AgcDriver::GuestMemory::StoreOwnBytes(reinterpret_cast<std::uintptr_t>(base + 39u * sliceBytes), sliceBytes, [&] {
+        FillSlice(base + 39u * sliceBytes, sliceBytes, Bits(0.875f), 4u);
+    });
     Load(device, base, shape, 39u, queuedOutput(queued), false);
     device.WaitIdle();
     for (std::uint32_t index = 0; index < queued; ++index) Expect(queuedOutput(index), Bits(0.375f), "queued depth upload retained its old contents");
     Expect(queuedOutput(queued), Bits(0.875f), "changed guest depth layer replaced its upload");
+    FillSlice(base + 39u * sliceBytes, sliceBytes, Bits(0.5f), 4u);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Load(device, base, shape, 39u, output);
+    Expect(output, Bits(0.5f), "raw guest depth write was detected in the next submission");
+    Load(device, base, shape, 40u, output);
+    Expect(output, Bits(0.375f), "incremental copies preserved an untouched guest layer");
     AgcDriver::Graphics::ClearDepthSurfaces(device.Device());
     std::puts("Demon's Souls 1024x1024x80 depth array values and refresh passed");
 }

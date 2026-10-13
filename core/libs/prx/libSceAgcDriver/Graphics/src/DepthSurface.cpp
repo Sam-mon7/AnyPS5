@@ -207,29 +207,59 @@ public:
         Require(slices.size() == layers, "depth plane copy slices do not match its layers");
         const auto geometry = DescribeSurface(resource);
         Require(geometry.layers == layers && geometry.sliceLinearBytes == sliceBytes() && !geometry.mips.empty(), "depth plane copy geometry does not match its layers");
-        std::vector<std::shared_ptr<Buffer>> uploads;
+        const std::array layout{static_cast<std::uint32_t>(resource.tileMode), static_cast<std::uint32_t>(resource.dimension), resource.mipCount, resource.allocatedMipCount, resource.pipeBankXor};
+        const bool layoutChanged = !initialized || layout != guestLayout;
+        std::vector<std::shared_ptr<Buffer>> uploads(layers);
+        std::vector<bool> changed(layers, layoutChanged);
         guestUploads.resize(layers);
+        uploadProofs.resize(layers);
+        guestDirty.resize(layers);
         std::vector<std::byte> bytes;
-        std::size_t replaced = 0;
+        std::size_t replaced = 0, reused = 0, proved = 0, detiled = 0;
+        static const bool memo = std::getenv("APS5_NO_DEPTH_UPLOAD_MEMO") == nullptr;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             auto& upload = guestUploads[layer];
+            auto& proof = uploadProofs[layer];
             if (slices[layer] != VK_NULL_HANDLE) {
                 upload.reset();
+                proof = {};
+                changed[layer] = true;
                 continue;
             }
-            bytes.resize(static_cast<std::size_t>(geometry.layerBytes));
-            GuestMemory::ReadCommitted(resource.baseAddress + geometry.GuestLayerOffset(layer), bytes);
-            if (upload == nullptr || upload->Bytes().size() != bytes.size() || std::memcmp(upload->Bytes().data(), bytes.data(), bytes.size()) != 0) {
-                auto replacement = std::make_shared<Buffer>(context, bytes.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-                std::memcpy(replacement->Bytes().data(), bytes.data(), bytes.size());
-                upload = std::move(replacement);
-                ++replaced;
+            const auto address = resource.baseAddress + geometry.GuestLayerOffset(layer);
+            const auto size = static_cast<std::size_t>(geometry.layerBytes);
+            const auto epoch = memo && GuestMemory::GpuMutex().HeldByThisThread() ? GuestMemory::CollectEpoch() : 0;
+            const auto serial = GuestMemory::WriteJournalSerial();
+            const auto forget = GuestMemory::ForgetSerial();
+            const std::array range{std::pair{address, address + size}};
+            const bool current = !layoutChanged && upload != nullptr && upload->Bytes().size() == size && epoch != 0 &&
+                proof.epoch == epoch && proof.forget == forget && (forget & 1u) == 0 &&
+                !GuestMemory::JournalTouchedSince(proof.serial, address, size) &&
+                !Recorder::SnapshotWriteOverlaps(address, size) && !StorageTexture::AnyPendingOverlaps(range);
+            if (current) {
+                ++proved;
+            } else {
+                bytes.resize(size);
+                GuestMemory::ReadCommitted(address, bytes);
+                if (upload == nullptr || upload->Bytes().size() != size || std::memcmp(upload->Bytes().data(), bytes.data(), size) != 0) {
+                    auto replacement = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                    std::memcpy(replacement->Bytes().data(), bytes.data(), size);
+                    upload = std::move(replacement);
+                    guestDirty[layer] = true;
+                    ++replaced;
+                }
             }
-            uploads.push_back(upload);
+            proof = {epoch, serial, forget};
+            changed[layer] = changed[layer] || guestDirty[layer];
+            ++reused;
+            if (changed[layer]) {
+                uploads[layer] = upload;
+                ++detiled;
+            }
         }
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        if (profile && !uploads.empty()) std::fprintf(stderr, "[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu bytes-per-layer=%llu\n", static_cast<unsigned long long>(resource.baseAddress), layers, uploads.size() - replaced, replaced, static_cast<unsigned long long>(geometry.layerBytes));
-        if (!uploads.empty()) {
+        if (profile && reused != 0) std::fprintf(stderr, "[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu proved=%zu detiled=%zu bytes-per-layer=%llu\n", static_cast<unsigned long long>(resource.baseAddress), layers, reused - replaced, replaced, proved, detiled, static_cast<unsigned long long>(geometry.layerBytes));
+        if (detiled != 0) {
             Require(context.detiler != nullptr, "depth plane copy requires a texture detiler");
             context.detiler->BeginBatch();
         }
@@ -239,30 +269,30 @@ public:
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
         const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        std::vector<VkBufferImageCopy> regions(layers);
+        std::vector<VkBufferImageCopy> regions;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
-            auto& region = regions[layer];
+            if (!changed[layer]) continue;
+            auto& region = regions.emplace_back();
             region.bufferOffset = sliceBytes() * layer;
             region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
             region.imageExtent = {extent.width, extent.height, 1};
             if (slices[layer] != VK_NULL_HANDLE) context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, slices[layer], VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &region);
             region.imageSubresource = {aspect(), 0, layer, 1};
         }
-        if (!uploads.empty()) {
+        if (detiled != 0) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-            std::size_t next = 0;
             for (std::uint32_t layer = 0; layer < layers; ++layer) {
-                if (slices[layer] != VK_NULL_HANDLE) continue;
-                context.detiler->Dispatch(commands, resource.tileMode, format == VK_FORMAT_D32_SFLOAT ? 4u : 2u, uploads[next++]->Handle(), 0, staging->Handle(), geometry.LinearLayerOffset(layer), geometry.mips.front(), false, layer, geometry.thick);
+                if (uploads[layer] == nullptr) continue;
+                context.detiler->Dispatch(commands, resource.tileMode, format == VK_FORMAT_D32_SFLOAT ? 4u : 2u, uploads[layer]->Handle(), 0, staging->Handle(), geometry.LinearLayerOffset(layer), geometry.mips.front(), false, layer, geometry.thick);
             }
             if (recorder != nullptr) {
-                for (auto& upload : uploads) recorder->Keep(upload);
+                for (auto& upload : uploads) if (upload != nullptr) recorder->Keep(upload);
             }
         }
         VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         toTransfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
         toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toTransfer.oldLayout = initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
         toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -271,7 +301,7 @@ public:
         const VkBufferMemoryBarrier staged{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, staging->Handle(), 0, VK_WHOLE_SIZE};
         const auto copyCommands = commands;
         barrier(copyCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &staged, 1, &toTransfer);
-        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(copyCommands, staging->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, layers, regions.data());
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(copyCommands, staging->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
         VkImageMemoryBarrier toGeneral = toTransfer;
         toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -280,6 +310,9 @@ public:
         barrier(copyCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
         if (batch) batch->SubmitAndWait();
         else Recorder::CountBarriers(Recorder::CommandClass::Draw, 3);
+        initialized = true;
+        guestLayout = layout;
+        std::fill(guestDirty.begin(), guestDirty.end(), false);
         const std::array<std::uint32_t, 5> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType)};
         auto& texture = textures[key];
         if (texture == nullptr) {
@@ -299,6 +332,11 @@ private:
     VkDeviceMemory memory = VK_NULL_HANDLE;
     std::unique_ptr<DeviceBuffer> staging;
     std::vector<std::shared_ptr<Buffer>> guestUploads;
+    struct UploadProof { std::uint64_t epoch = 0, serial = 0, forget = 0; };
+    std::vector<UploadProof> uploadProofs;
+    std::vector<bool> guestDirty;
+    std::array<std::uint32_t, 5> guestLayout{};
+    bool initialized = false;
     std::map<std::array<std::uint32_t, 5>, std::shared_ptr<Texture>> textures;
 
     VkDeviceSize sliceBytes() const {
