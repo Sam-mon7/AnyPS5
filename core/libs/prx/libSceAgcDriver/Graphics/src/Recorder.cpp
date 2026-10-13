@@ -2810,14 +2810,23 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
     readsNoted.fetch_add(1, std::memory_order_relaxed);
 }
 
-void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
+void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind, std::shared_ptr<const void> owner) {
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
+    if (owner != nullptr) {
+        if (ReadsNotedBy(owner.get())) return;
+        open->readOwners.push_back(std::move(owner));
+    }
     for (const auto& [begin, end] : ranges) {
         CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
         if (end > begin) open->reads.push_back({begin, end, kind});
     }
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
+}
+
+bool Recorder::ReadsNotedBy(const void* owner) const {
+    if (open == nullptr || owner == nullptr) return false;
+    return std::any_of(open->readOwners.begin(), open->readOwners.end(), [&](const auto& noted) { return noted.get() == owner; });
 }
 
 const Recorder::Batch::Read* Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {

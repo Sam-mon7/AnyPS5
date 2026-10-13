@@ -336,6 +336,29 @@ void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(Recorder::ReadCounts().hits[static_cast<std::size_t>(Kind::AddressBased)] >= 2, "address-based hits are not counted");
     recorder.Sync();
     Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x20000, 0x1000, false), "noted ranges outlived their batch");
+    auto owner = std::make_shared<int>(0);
+    auto otherOwner = std::make_shared<int>(0);
+    const std::weak_ptr<int> lifetime = owner, otherLifetime = otherOwner;
+    const auto noted = Recorder::ReadCounts().noted;
+    recorder.NotePendingReads(ranges, Kind::AddressBased, owner);
+    recorder.NotePendingReads(ranges, Kind::AddressBased, owner);
+    Require(recorder.ReadsNotedBy(owner.get()) && !recorder.ReadsNotedBy(otherOwner.get()) && !recorder.ReadsNotedBy(nullptr), "read ownership does not match the open batch");
+    Require(Recorder::ReadCounts().noted == noted + ranges.size(), "one owner's ranges were noted twice");
+    recorder.NotePendingReads(ranges, Kind::AddressBased, otherOwner);
+    Require(Recorder::ReadCounts().noted == noted + 2 * ranges.size(), "distinct read owners were deduplicated");
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> localRanges{{{0x50000, 0x50010}}};
+    recorder.NotePendingReads(localRanges, Kind::DispatchElement);
+    recorder.NotePendingReads(localRanges, Kind::DispatchElement);
+    Require(Recorder::ReadCounts().noted == noted + 2 * ranges.size() + 2 && recorder.PendingReadOverlaps(0x50000, 16), "per-use reads were lost to owner deduplication");
+    recorder.Submit();
+    Require(!recorder.ReadsNotedBy(owner.get()), "a submitted batch suppressed a new batch's reads");
+    recorder.NotePendingReads(ranges, Kind::AddressBased, owner);
+    Require(Recorder::ReadCounts().noted == noted + 3 * ranges.size() + 2 && recorder.PendingReadOverlaps(0x20000, 16), "a new batch did not note the owner's reads again");
+    owner.reset();
+    otherOwner.reset();
+    Require(!lifetime.expired() && !otherLifetime.expired(), "a read owner was released before its batch finished");
+    recorder.Sync();
+    Require(lifetime.expired() && otherLifetime.expired() && recorder.Idle(), "read owners outlived their batches");
 }
 
 void recordedWriteJournalTests(Recorder& recorder) {
