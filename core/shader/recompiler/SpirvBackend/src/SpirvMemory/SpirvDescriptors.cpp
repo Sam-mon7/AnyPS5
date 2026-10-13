@@ -72,6 +72,18 @@ std::uint32_t RuntimeMipCount(SpirvEmitterState& state, std::uint32_t resource) 
     return Binary(state, spv::OpIAdd, TypeU32(state), Binary(state, spv::OpISub, TypeU32(state), last, first), ConstantU32(state, 1u));
 }
 
+namespace {
+
+bool TableKeyPerLane(const SpirvEmitterState& state, std::uint32_t resource) {
+    const auto& images = state.program.Info().images;
+    const auto& sources = state.program.Resources().descriptorSources;
+    if (resource >= images.size() || images[resource].source >= sources.size()) return false;
+    const auto& table = sources[images[resource].source].indirectImage;
+    return table.has_value() && table->laneKey;
+}
+
+}
+
 std::uint32_t TableImageIndex(SpirvEmitterState& state, DescriptorBindingKind kind, std::uint32_t resource) {
     const bool storage = ImageBindingResourceClass(kind) == ImageResourceClass::Storage;
     const auto supported = [&](std::uint32_t capability) {
@@ -88,7 +100,7 @@ std::uint32_t TableImageIndex(SpirvEmitterState& state, DescriptorBindingKind ki
     state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), metadata, state.shaderDataStorageVariable, ConstantU32(state, 0u), offset);
     const auto index = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, TypeU32(state), index, metadata);
-    if (!state.tableIndexNonUniform) {
+    if (!state.tableIndexNonUniform && !TableKeyPerLane(state, resource)) {
         return index;
     }
     const auto nonUniform = storage ? spv::CapabilityStorageImageArrayNonUniformIndexing : spv::CapabilitySampledImageArrayNonUniformIndexing;
@@ -104,8 +116,8 @@ std::uint32_t TableImageIndex(SpirvEmitterState& state, DescriptorBindingKind ki
     return index;
 }
 
-void DecorateTableNonUniform(SpirvEmitterState& state, std::uint32_t slotId, std::uint32_t id) {
-    if (slotId != 0 && state.tableIndexNonUniform) state.module.AddAnnotation(spv::OpDecorate, id, spv::DecorationNonUniform);
+void DecorateTableNonUniform(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t slotId, std::uint32_t id) {
+    if (slotId != 0 && (state.tableIndexNonUniform || TableKeyPerLane(state, resource))) state.module.AddAnnotation(spv::OpDecorate, id, spv::DecorationNonUniform);
 }
 
 std::uint32_t ImageScalarType(SpirvEmitterState& state, IrTextureNumericClass numericClass) {
@@ -184,11 +196,11 @@ std::uint32_t LoadSampledImageDescriptor(SpirvEmitterState& state, std::uint32_t
     } else {
         pointer = state.module.AllocateId();
         state.module.AddFunction(spv::OpAccessChain, pointerType, pointer, variable, TableImageIndex(state, kind, resource));
-        DecorateTableNonUniform(state, slotId, pointer);
+        DecorateTableNonUniform(state, resource, slotId, pointer);
     }
     const auto image = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, imageType, image, pointer);
-    DecorateTableNonUniform(state, slotId, image);
+    DecorateTableNonUniform(state, resource, slotId, image);
     return image;
 }
 
@@ -210,7 +222,7 @@ std::uint32_t MakeSampledImage(SpirvEmitterState& state, std::uint32_t resource,
     const auto sampledImage = state.module.AllocateId();
     const auto sampledType = state.module.Type(spv::OpTypeSampledImage, ImageType(state, imageResource));
     state.module.AddFunction(spv::OpSampledImage, sampledType, sampledImage, image, samplerId);
-    DecorateTableNonUniform(state, slotId, sampledImage);
+    DecorateTableNonUniform(state, resource, slotId, sampledImage);
     return sampledImage;
 }
 

@@ -32,6 +32,8 @@ struct DescriptorSource {
         std::uint32_t keyArg = 0;
         std::uint32_t entryOffset = 0;
         bool hasMaterial = false;
+        bool laneKey = false;
+        bool indexed = false;
 
         bool operator==(const IndirectImage& other) const = default;
     };
