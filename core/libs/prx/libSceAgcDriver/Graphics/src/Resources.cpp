@@ -379,7 +379,7 @@ void CommandBatch::Submit() {
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    context.CheckResult(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
     timing.Mark("queue_submit");
     pending = true;
     submitted = true;
@@ -392,7 +392,7 @@ void CommandBatch::Wait() {
     const auto result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 5'000'000'000ULL);
     timing.Mark("fence_wait");
     if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST) pending = false;
-    Check(result, "vkWaitForFences graphics");
+    context.CheckResult(result, "vkWaitForFences graphics");
     // Recorded batches preceded this one, so their completions (write-backs) can run now.
     if (auto* recorder = Recorder::Active()) recorder->Reap();
 }

@@ -37,6 +37,7 @@ struct CompiledShader {
     ShaderRecompiler::ShaderStage stage;
     const ShaderRecompiler::RecompileResult* program;
     std::uint32_t pushConstantOffset;
+    std::uint64_t guestAddress = 0;
 };
 
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {

@@ -1352,7 +1352,16 @@ struct IndirectRecord {
 
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
-void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset) {
+void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset, std::span<const CompiledShader> shaders) {
+    if (context.gpuCheckpoints != nullptr) {
+        std::array<std::uint64_t, 16> ids{};
+        const auto count = std::min(shaders.size(), ids.size() / 2);
+        for (std::size_t i = 0; i < count; ++i) {
+            ids[2 * i] = shaders[i].guestAddress;
+            ids[2 * i + 1] = shaders[i].program->PipelineVariantId();
+        }
+        context.gpuCheckpoints->Record(commands, "draw address/variant pairs", std::span(ids).first(2 * count));
+    }
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && args != nullptr) {
@@ -1791,14 +1800,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
-    recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+    recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, shaders);
     if (record.pipeline->SplitsFaces()) {
         record.pipeline->ContinueBackFaces(commands, state);
-        recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+        recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, shaders);
     }
     if (record.pipeline->SplitsSecondChannel()) {
         record.pipeline->ContinueSecondChannel(commands);
-        recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+        recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, shaders);
     }
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
@@ -2298,14 +2307,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
-    recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
+    recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset, shaders);
     if (pipeline->SplitsFaces()) {
         pipeline->ContinueBackFaces(commands, state);
-        recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
+        recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset, shaders);
     }
     if (pipeline->SplitsSecondChannel()) {
         pipeline->ContinueSecondChannel(commands);
-        recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
+        recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset, shaders);
     }
     if (meshArguments != nullptr && recorded) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, rewritten);

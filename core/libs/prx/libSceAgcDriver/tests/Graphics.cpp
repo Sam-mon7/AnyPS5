@@ -49,6 +49,59 @@ namespace {
 
 using AgcDriver::Graphics::Require;
 
+const void* checkpointMarker = nullptr;
+std::uint32_t checkpointQueries = 0;
+
+VKAPI_ATTR void VKAPI_CALL mockCheckpoint(VkCommandBuffer, const void* marker) {
+    checkpointMarker = marker;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCheckpointQuery(VkQueue, std::uint32_t* count, VkCheckpointDataNV* data) {
+    ++checkpointQueries;
+    if (data == nullptr) {
+        *count = 40;
+        return;
+    }
+    Require(*count == 32, "checkpoint query bounds the driver output");
+    Require(data[0].sType == VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV && data[31].sType == VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV, "checkpoint query initializes Vulkan structures");
+    *count = 2;
+    data[0].stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    data[0].pCheckpointMarker = const_cast<void*>(checkpointMarker);
+    data[1].stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    data[1].pCheckpointMarker = reinterpret_cast<void*>(1);
+}
+
+void gpuCheckpointTests() {
+    using namespace AgcDriver::Graphics;
+    auto checkpoints = std::make_shared<GpuCheckpoints>(mockCheckpoint, mockCheckpointQuery, VK_NULL_HANDLE);
+    const std::array<std::uint64_t, 2> shaders{0x248a05b00, 0x12345678};
+    for (std::size_t i = 0; i <= GpuCheckpoints::Capacity; ++i) checkpoints->Record(VK_NULL_HANDLE, "dispatch address/variant", shaders);
+    Require(reinterpret_cast<std::uintptr_t>(checkpointMarker) == GpuCheckpoints::Capacity + 1, "checkpoint markers do not alias overwritten entries");
+    checkpoints->Report(VK_SUCCESS, "success");
+    checkpoints->Report(VK_TIMEOUT, "timeout");
+    Require(checkpointQueries == 0, "checkpoint query requires a lost device");
+    const auto output = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
+    Require(output != nullptr, "checkpoint capture file");
+    checkpoints->Report(VK_ERROR_DEVICE_LOST, "test submit", output.get());
+    Require(checkpointQueries == 2, "checkpoint query uses count and bounded data calls");
+    std::rewind(output.get());
+    std::array<char, 2048> bytes{};
+    const auto size = std::fread(bytes.data(), 1, bytes.size(), output.get());
+    const std::string_view text(bytes.data(), size);
+    Require(text.find("2/40 stage markers") != text.npos, "checkpoint report respects returned count");
+    Require(text.find("dispatch address/variant 0x248a05b00 0x12345678") != text.npos, "checkpoint report preserves shader identity");
+    Require(text.find("serial=1 history expired or unavailable") != text.npos, "overwritten checkpoint does not report the replacement shader");
+    Context context{};
+    context.gpuCheckpoints = checkpoints;
+    bool threw = false;
+    try {
+        context.CheckResult(VK_ERROR_DEVICE_LOST, "test submit");
+    } catch (const std::runtime_error& error) {
+        threw = std::string_view(error.what()).find("Vulkan result -4") != std::string_view::npos;
+    }
+    Require(threw && checkpointQueries == 4, "checkpoint diagnostics preserve the fatal Vulkan error");
+}
+
 alignas(256) std::array<std::byte, 1024> colorMemory{};
 alignas(256) std::array<std::byte, 2048> sliceMemory{};
 
@@ -5328,6 +5381,7 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "8", 1);
 #endif
     try {
+        gpuCheckpointTests();
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
             descriptorLayoutFlagTests();
             std::cout << "Descriptor layout native and captured binding flags passed\n";

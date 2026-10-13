@@ -5,6 +5,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include "GpuCheckpoints.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -183,6 +184,12 @@ struct Context {
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
+    std::shared_ptr<GpuCheckpoints> gpuCheckpoints;
+
+    void CheckResult(VkResult result, const char* operation) const {
+        if (gpuCheckpoints != nullptr) gpuCheckpoints->Report(result, operation);
+        Check(result, operation);
+    }
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

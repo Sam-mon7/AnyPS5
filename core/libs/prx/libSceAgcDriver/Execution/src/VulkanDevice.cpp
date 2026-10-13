@@ -229,6 +229,7 @@ struct WorkgroupMemory {
 
 struct VulkanDevice::State {
     bool compileOnly = false;
+    std::shared_ptr<Graphics::GpuCheckpoints> gpuCheckpoints;
     void* library = nullptr;
     PFN_vkGetInstanceProcAddr instanceProc = nullptr;
     PFN_vkGetDeviceProcAddr deviceProc = nullptr;
@@ -618,14 +619,14 @@ struct VulkanDevice::State {
     void WaitPresentFence(VkFence fence) {
         static const bool poll = std::getenv("APS5_PRESENT_POLL_FENCE") != nullptr;
         if (!poll) {
-            check(DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences")(device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences present");
+            context.CheckResult(DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences")(device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences present");
             return;
         }
         const auto status = DeviceFunction<PFN_vkGetFenceStatus>("vkGetFenceStatus");
         for (;;) {
             const auto result = status(device, fence);
             if (result == VK_SUCCESS) return;
-            if (result != VK_NOT_READY) check(result, "vkGetFenceStatus present");
+            if (result != VK_NOT_READY) context.CheckResult(result, "vkGetFenceStatus present");
             const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(50);
             while (std::chrono::steady_clock::now() < until) std::this_thread::yield();
         }
@@ -1103,6 +1104,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     std::vector<const char*> deviceExtensions;
     if (window != nullptr) deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
+    const bool checkpoints = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr && hasExtension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    if (checkpoints) deviceExtensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    else if (std::getenv("APS5_GPU_CHECKPOINTS") != nullptr) std::fprintf(stderr, "[gpu-checkpoint] VK_NV_device_diagnostic_checkpoints unavailable\n");
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
@@ -1616,6 +1620,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
+    if (checkpoints) {
+        state->gpuCheckpoints = std::make_shared<Graphics::GpuCheckpoints>(state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV"), state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV"), state->queue);
+        std::fprintf(stderr, "[gpu-checkpoint] NVIDIA device diagnostic checkpoints enabled\n");
+    }
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -2648,7 +2656,7 @@ bool VulkanDevice::AcquireImage() {
     if (acquired != VK_SUBOPTIMAL_KHR) check(acquired, "vkAcquireNextImageKHR");
     timing.Mark("acquire_image");
     APS5_LOG_OUT_DEBUG("vkAcquireNextImageKHR index=%u imageCount=%zu", index, state->images.size());
-    check(wait(state->device, 1, &state->acquireFence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences acquire");
+    state->context.CheckResult(wait(state->device, 1, &state->acquireFence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences acquire");
     timing.Mark("acquire_fence_wait");
     APS5_LOG_OUT_DEBUG("Acquire fence complete index=%u", index);
     require(index < state->images.size() && index < state->rendered.size(), "acquired image index is out of range");
@@ -2835,7 +2843,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    state->context.CheckResult(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -2924,7 +2932,7 @@ double VulkanDevice::RetirePresents(std::size_t keepInFlight) {
         if (inFlight <= keepInFlight) {
             const auto result = status(state->device, slot.fence);
             if (result == VK_NOT_READY) break;
-            check(result, "vkGetFenceStatus present");
+            state->context.CheckResult(result, "vkGetFenceStatus present");
             timing.Mark("poll");
         } else {
             const auto start = std::chrono::steady_clock::now();
@@ -2958,7 +2966,7 @@ void VulkanDevice::QueuePresent() {
     present.pImageIndices = &index;
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
-    else check(presented, "vkQueuePresentKHR");
+    else state->context.CheckResult(presented, "vkQueuePresentKHR");
     timing.Mark("queue_present");
     APS5_LOG_OUT_DEBUG("vkQueuePresentKHR queued imageIndex=%u", index);
 }
@@ -3103,6 +3111,7 @@ Graphics::Context VulkanDevice::buildContext() const {
         state->hostImportAlignment
     };
     context.dmaBufImport = state->dmaBufImport;
+    context.gpuCheckpoints = state->gpuCheckpoints;
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
     context.samplerCache = state->samplerCache.get();
@@ -3984,6 +3993,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    if (context.gpuCheckpoints != nullptr) {
+        const std::array ids{record.programAddress, record.shader->program->PipelineVariantId()};
+        context.gpuCheckpoints->Record(commands, "dispatch address/variant", ids);
+    }
     if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
     } else {
