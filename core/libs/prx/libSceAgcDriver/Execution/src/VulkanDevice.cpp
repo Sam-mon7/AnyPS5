@@ -1104,9 +1104,17 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     std::vector<const char*> deviceExtensions;
     if (window != nullptr) deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
-    const bool checkpoints = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr && hasExtension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    const bool gpuDiagnostics = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr;
+    const bool checkpoints = gpuDiagnostics && hasExtension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
     if (checkpoints) deviceExtensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
-    else if (std::getenv("APS5_GPU_CHECKPOINTS") != nullptr) std::fprintf(stderr, "[gpu-checkpoint] VK_NV_device_diagnostic_checkpoints unavailable\n");
+    else if (gpuDiagnostics) std::fprintf(stderr, "[gpu-checkpoint] VK_NV_device_diagnostic_checkpoints unavailable\n");
+    VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (gpuDiagnostics && hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &faultFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+    }
+    const bool deviceFault = faultFeatures.deviceFault == VK_TRUE;
+    if (gpuDiagnostics && !deviceFault) std::fprintf(stderr, "[gpu-fault] VK_EXT_device_fault reporting unavailable\n");
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
@@ -1595,6 +1603,15 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
+    if (deviceFault) {
+        faultFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+        faultFeatures.deviceFault = VK_TRUE;
+        faultFeatures.pNext = bdaFeatures.pNext;
+        bdaFeatures.pNext = &faultFeatures;
+        deviceExtensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+    }
     deviceInfo.pNext = &bdaFeatures;
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
@@ -1620,9 +1637,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
-    if (checkpoints) {
-        state->gpuCheckpoints = std::make_shared<Graphics::GpuCheckpoints>(state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV"), state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV"), state->queue);
-        std::fprintf(stderr, "[gpu-checkpoint] NVIDIA device diagnostic checkpoints enabled\n");
+    const auto queryFault = deviceFault ? reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(state->deviceProc(state->device, "vkGetDeviceFaultInfoEXT")) : nullptr;
+    if (deviceFault) std::fputs(queryFault != nullptr ? "[gpu-fault] VK_EXT_device_fault reporting enabled (no vendor binary)\n" : "[gpu-fault] vkGetDeviceFaultInfoEXT unavailable\n", stderr);
+    if (checkpoints || queryFault != nullptr) {
+        const auto record = checkpoints ? state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV") : nullptr;
+        const auto query = checkpoints ? state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV") : nullptr;
+        state->gpuCheckpoints = std::make_shared<Graphics::GpuCheckpoints>(record, query, state->queue, state->device, queryFault);
+        if (checkpoints) std::fprintf(stderr, "[gpu-checkpoint] NVIDIA device diagnostic checkpoints enabled\n");
     }
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};

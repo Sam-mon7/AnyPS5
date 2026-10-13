@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <mutex>
 #include <span>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -18,9 +19,10 @@ class GpuCheckpoints {
 public:
     static constexpr std::size_t Capacity = 16384;
 
-    GpuCheckpoints(PFN_vkCmdSetCheckpointNV record, PFN_vkGetQueueCheckpointDataNV query, VkQueue queue) : record(record), query(query), queue(queue) {}
+    GpuCheckpoints(PFN_vkCmdSetCheckpointNV record, PFN_vkGetQueueCheckpointDataNV query, VkQueue queue, VkDevice device = VK_NULL_HANDLE, PFN_vkGetDeviceFaultInfoEXT queryFault = nullptr) : record(record), query(query), queue(queue), device(device), queryFault(queryFault) {}
 
     void Record(VkCommandBuffer commands, const char* operation, std::span<const std::uint64_t> shaders) {
+        if (record == nullptr) return;
         std::lock_guard lock(mutex);
         const auto serial = ++next;
         auto& entry = history[serial % Capacity];
@@ -34,6 +36,11 @@ public:
     void Report(VkResult result, const char* operation, FILE* output = stderr) {
         if (result != VK_ERROR_DEVICE_LOST) return;
         std::lock_guard lock(mutex);
+        reportFault(operation, output);
+        if (query == nullptr) {
+            std::fflush(output);
+            return;
+        }
         std::uint32_t count = 0;
         query(queue, &count, nullptr);
         std::array<VkCheckpointDataNV, 32> checkpoints{};
@@ -75,6 +82,47 @@ public:
     }
 
 private:
+    void reportFault(const char* operation, FILE* output) noexcept {
+        if (queryFault == nullptr || faultReported) return;
+        faultReported = true;
+        try {
+            VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+            auto result = queryFault(device, &counts, nullptr);
+            if (result != VK_SUCCESS) {
+                std::fprintf(output, "[gpu-fault] device lost at %s; count query failed: Vulkan result %d\n", operation, static_cast<int>(result));
+                return;
+            }
+            const auto availableAddresses = counts.addressInfoCount;
+            const auto availableVendors = counts.vendorInfoCount;
+            std::vector<VkDeviceFaultAddressInfoEXT> addresses(std::min(availableAddresses, 256u));
+            std::vector<VkDeviceFaultVendorInfoEXT> vendors(std::min(availableVendors, 256u));
+            counts.addressInfoCount = static_cast<std::uint32_t>(addresses.size());
+            counts.vendorInfoCount = static_cast<std::uint32_t>(vendors.size());
+            counts.vendorBinarySize = 0;
+            VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+            info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+            info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+            result = queryFault(device, &counts, &info);
+            if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+                std::fprintf(output, "[gpu-fault] device lost at %s; data query failed: Vulkan result %d\n", operation, static_cast<int>(result));
+                return;
+            }
+            const auto addressCount = std::min(counts.addressInfoCount, static_cast<std::uint32_t>(addresses.size()));
+            const auto vendorCount = std::min(counts.vendorInfoCount, static_cast<std::uint32_t>(vendors.size()));
+            std::fprintf(output, "[gpu-fault] device lost at %s; %.*s; addresses %u/%u, vendor entries %u/%u; Vulkan result %d%s\n", operation, static_cast<int>(VK_MAX_DESCRIPTION_SIZE), info.description, addressCount, availableAddresses, vendorCount, availableVendors, static_cast<int>(result), result == VK_INCOMPLETE || addressCount < availableAddresses || vendorCount < availableVendors ? " (partial)" : "");
+            for (std::uint32_t i = 0; i < addressCount; ++i) {
+                const auto& address = addresses[i];
+                std::fprintf(output, "[gpu-fault] address type=%d reported=0x%llx precision=0x%llx\n", static_cast<int>(address.addressType), static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision));
+            }
+            for (std::uint32_t i = 0; i < vendorCount; ++i) {
+                const auto& vendor = vendors[i];
+                std::fprintf(output, "[gpu-fault] vendor %.*s code=0x%llx data=0x%llx\n", static_cast<int>(VK_MAX_DESCRIPTION_SIZE), vendor.description, static_cast<unsigned long long>(vendor.vendorFaultCode), static_cast<unsigned long long>(vendor.vendorFaultData));
+            }
+        } catch (...) {
+            std::fprintf(output, "[gpu-fault] device lost at %s; diagnostic collection failed\n", operation);
+        }
+    }
+
     struct Entry {
         std::uintptr_t serial = 0;
         const char* operation = nullptr;
@@ -84,6 +132,9 @@ private:
     PFN_vkCmdSetCheckpointNV record;
     PFN_vkGetQueueCheckpointDataNV query;
     VkQueue queue;
+    VkDevice device;
+    PFN_vkGetDeviceFaultInfoEXT queryFault;
+    bool faultReported = false;
     std::mutex mutex;
     std::uintptr_t next = 0;
     std::array<Entry, Capacity> history{};

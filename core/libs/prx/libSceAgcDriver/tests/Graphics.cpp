@@ -111,6 +111,85 @@ void gpuCheckpointTests() {
     Require(threw && checkpointQueries == 4, "checkpoint diagnostics preserve the fatal Vulkan error");
 }
 
+enum class FaultQueryMode { Normal, Truncated, Empty, CountFailure, DataFailure, Exception };
+FaultQueryMode faultMode = FaultQueryMode::Normal;
+std::uint32_t faultQueries = 0;
+const auto faultDevice = reinterpret_cast<VkDevice>(std::uintptr_t{0x1234});
+
+VKAPI_ATTR VkResult VKAPI_CALL mockDeviceFault(VkDevice device, VkDeviceFaultCountsEXT* counts, VkDeviceFaultInfoEXT* info) {
+    ++faultQueries;
+    Require(device == faultDevice && counts->sType == VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT && counts->pNext == nullptr, "fault query preserves the device and initializes counts");
+    if (faultMode == FaultQueryMode::Exception) throw std::runtime_error("mock fault diagnostic failure");
+    if (info == nullptr) {
+        Require(faultQueries == 1, "fault counts are queried first and once");
+        if (faultMode == FaultQueryMode::CountFailure) return VK_ERROR_UNKNOWN;
+        counts->addressInfoCount = counts->vendorInfoCount = faultMode == FaultQueryMode::Truncated ? 400 : faultMode == FaultQueryMode::Empty ? 0 : 2;
+        counts->vendorBinarySize = 999;
+        return VK_SUCCESS;
+    }
+    Require(faultQueries == 2 && info->sType == VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT && info->pNext == nullptr, "fault data follows the counts query");
+    Require(counts->vendorBinarySize == 0 && info->pVendorBinaryData == nullptr, "fault report does not request vendor binaries");
+    const auto expected = faultMode == FaultQueryMode::Truncated ? 256u : faultMode == FaultQueryMode::Empty ? 0u : 2u;
+    Require(counts->addressInfoCount == expected && counts->vendorInfoCount == expected, "fault arrays are sized from bounded counts");
+    Require((info->pAddressInfos != nullptr) == (expected != 0) && (info->pVendorInfos != nullptr) == (expected != 0), "empty fault arrays use null pointers");
+    if (faultMode == FaultQueryMode::DataFailure) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    std::snprintf(info->description, sizeof(info->description), "mock device fault");
+    if (expected != 0) {
+        info->pAddressInfos[0] = {VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT, 0x12345678, 0x1000};
+        auto& vendor = info->pVendorInfos[0];
+        std::snprintf(vendor.description, sizeof(vendor.description), "mock vendor fault");
+        vendor.vendorFaultCode = 0xab;
+        vendor.vendorFaultData = 0xcd;
+    }
+    counts->addressInfoCount = counts->vendorInfoCount = expected != 0 ? 1 : 0;
+    return faultMode == FaultQueryMode::Truncated ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+void gpuFaultTests() {
+    using namespace AgcDriver::Graphics;
+    for (const auto mode : {FaultQueryMode::Normal, FaultQueryMode::Truncated, FaultQueryMode::Empty, FaultQueryMode::CountFailure, FaultQueryMode::DataFailure, FaultQueryMode::Exception}) {
+        faultMode = mode;
+        faultQueries = 0;
+        auto diagnostics = std::make_shared<GpuCheckpoints>(nullptr, nullptr, VK_NULL_HANDLE, faultDevice, mockDeviceFault);
+        diagnostics->Record(VK_NULL_HANDLE, "no NV markers", {});
+        diagnostics->Report(VK_SUCCESS, "success");
+        diagnostics->Report(VK_TIMEOUT, "timeout");
+        Require(faultQueries == 0, "fault reporting requires device loss");
+        const auto output = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
+        Require(output != nullptr, "fault capture file");
+        diagnostics->Report(VK_ERROR_DEVICE_LOST, "test submit", output.get());
+        diagnostics->Report(VK_ERROR_DEVICE_LOST, "repeated loss", output.get());
+        const auto expectedQueries = mode == FaultQueryMode::CountFailure || mode == FaultQueryMode::Exception ? 1u : 2u;
+        Require(faultQueries == expectedQueries, "fault reporting repeats only the data query");
+        std::rewind(output.get());
+        std::array<char, 8192> bytes{};
+        const auto size = std::fread(bytes.data(), 1, bytes.size(), output.get());
+        const std::string_view text(bytes.data(), size);
+        Require(text.find("[gpu-fault] device lost at test submit;") != text.npos && text.find("repeated loss") == text.npos, "fault report records the original operation once");
+        if (mode == FaultQueryMode::CountFailure) Require(text.find("count query failed: Vulkan result -13") != text.npos, "fault count failure is logged");
+        else if (mode == FaultQueryMode::DataFailure) Require(text.find("data query failed: Vulkan result -1") != text.npos, "fault data failure is logged");
+        else if (mode == FaultQueryMode::Exception) Require(text.find("diagnostic collection failed") != text.npos, "fault diagnostic exceptions are contained");
+        else {
+            Require(text.find("mock device fault") != text.npos, "fault report preserves the description");
+            if (mode == FaultQueryMode::Empty) Require(text.find("addresses 0/0, vendor entries 0/0") != text.npos && text.find("address type=") == text.npos, "empty fault report has no entries");
+            else {
+                Require(text.find("address type=2 reported=0x12345678 precision=0x1000") != text.npos && text.find("vendor mock vendor fault code=0xab data=0xcd") != text.npos, "fault report preserves address and vendor details");
+                Require(text.find("address type=0") == text.npos && text.find("code=0x0") == text.npos, "fault report respects returned counts");
+                Require(text.find(mode == FaultQueryMode::Truncated ? "addresses 1/400, vendor entries 1/400; Vulkan result 5 (partial)" : "addresses 1/2, vendor entries 1/2") != text.npos, "fault report identifies bounded partial output");
+            }
+        }
+        Context context{};
+        context.gpuCheckpoints = diagnostics;
+        bool threw = false;
+        try {
+            context.CheckResult(VK_ERROR_DEVICE_LOST, "test submit");
+        } catch (const std::runtime_error& error) {
+            threw = std::string_view(error.what()).find("Vulkan result -4") != std::string_view::npos;
+        }
+        Require(threw && faultQueries == expectedQueries, "fault diagnostics preserve the original device loss");
+    }
+}
+
 alignas(256) std::array<std::byte, 1024> colorMemory{};
 alignas(256) std::array<std::byte, 2048> sliceMemory{};
 
@@ -5391,6 +5470,7 @@ int main(int argc, char** argv) {
 #endif
     try {
         gpuCheckpointTests();
+        gpuFaultTests();
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
             descriptorLayoutFlagTests();
             std::cout << "Descriptor layout native and captured binding flags passed\n";
