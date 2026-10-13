@@ -170,7 +170,12 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
                     ++stats.writtenBefore;
                     break;
                 }
-                if (found->second.compiledResult != nullptr) appendWrittenRanges(*found->second.compiledResult, writes);
+                try {
+                    if (found->second.compiledResult != nullptr) appendWrittenRanges(*found->second.compiledResult, writes);
+                } catch (const std::exception&) {
+                    ++stats.failures;
+                    break;
+                }
                 if (found->second.compiledResult == nullptr || WritesThroughPointers(*found->second.compiledResult)) unknownWrites = true;
             } else {
                 unknownWrites = true;

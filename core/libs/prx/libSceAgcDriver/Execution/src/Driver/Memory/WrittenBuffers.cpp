@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 
 namespace AgcDriver::DriverDetail {
@@ -22,6 +24,19 @@ void Driver::forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compi
 
 void Driver::appendWrittenRanges(const ShaderRecompiler::RecompileResult& compiled, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
     forEachWrittenBuffer(compiled, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { ranges.emplace_back(begin, end); });
+    for (const auto& binding : compiled.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            if (element < binding.imageWritten.size() && !binding.imageWritten[element]) continue;
+            if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) continue;
+            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
+            if (Graphics::IsNullTextureResource(words)) continue;
+            const auto resource = Graphics::DecodeTextureResource(words);
+            const auto bytes = Graphics::DescribeSurface(resource).guestBytes;
+            if (resource.baseAddress != 0 && bytes != 0) ranges.emplace_back(resource.baseAddress, resource.baseAddress + bytes);
+            if (resource.dccAddress != 0 && bytes != 0) ranges.emplace_back(resource.dccAddress, resource.dccAddress + (bytes + 255) / 256);
+        }
+    }
 }
 
 void Driver::noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled) {

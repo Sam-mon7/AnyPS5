@@ -1097,6 +1097,20 @@ endforeach()
 target_link_libraries(agc_driver_gpu_map_on_fiber_tests PRIVATE libSceFiber)
 target_link_libraries(agc_driver_host_stack_tests PRIVATE libSceFiber)
 
+if(BUILD_TESTING)
+    foreach(mode IN ITEMS thread-dimensions null-base null-type unsupported)
+        string(REPLACE "-" "_" suffix "${mode}")
+        set(imageIndirectTest "agc_driver_image_indirect_arguments_written_ahead_${suffix}")
+        add_test(NAME ${imageIndirectTest} COMMAND agc_driver_image_indirect_arguments_written_ahead_tests --${mode})
+        set_tests_properties(${imageIndirectTest} PROPERTIES
+                ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${imageIndirectTest} PROPERTIES
+                    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+endif()
+
 target_include_directories(agc_driver_alpha_to_coverage_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 target_include_directories(agc_driver_dual_source_blend_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
