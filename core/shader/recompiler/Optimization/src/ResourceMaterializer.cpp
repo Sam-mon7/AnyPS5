@@ -66,7 +66,7 @@ ShaderBufferResource decodeBufferDescriptor(const DescriptorValue& value) {
 }
 
 bool nullImageDescriptor(const DescriptorValue& descriptor) {
-    return descriptor.dwords[0] == 0u && (descriptor.dwords[1] & 0xffu) == 0u;
+    return (descriptor.dwords[0] == 0u && (descriptor.dwords[1] & 0xffu) == 0u) || (descriptor.dwords[3] >> 28u) == 0u;
 }
 
 ImageType rawImageType(const DescriptorValue& descriptor) {
@@ -778,6 +778,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
             descriptor = DescriptorValue{};
             descriptor.dwordCount = 8u;
         }
+        if ((descriptor.dwords[3] >> 28u) == 0u) descriptor.dwords.fill(0u);
         if (!validImageDescriptor(descriptor, image.r128) && !nullImageDescriptor(descriptor)) {
             throw std::runtime_error("runtime image descriptor is invalid");
         }

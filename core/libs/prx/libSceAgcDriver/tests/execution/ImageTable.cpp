@@ -505,7 +505,7 @@ void SetClassRecords() {
     SetRecord(4, LinearWrap, uintImage);
     SetRecord(5, LinearWrap, sintImage);
     SetRecord(6, {0u, 0u, 0u, 0u}, {0u, 0u, 0u, 0u});
-    SetRecord(7, PointClamp, {0x1234u, 0x5678u, 0x9abcu, 0x0000ffacu});
+    SetRecord(7, PointClamp, {0x1234u, 0x5678u, 0x9abcu, 0x1000ffacu});
     for (std::uint32_t record = 8; record < Records; ++record) SetRecord(record, PointClamp, floatImage);
 }
 
@@ -967,7 +967,7 @@ void RunPointerTests(AgcDriver::VulkanDevice& device) {
     const auto floatImage = Image(FloatTexels.data(), Format32Float);
     const auto uintImage = Image(UintTexels.data(), Format32UInt);
     const auto sintImage = Image(SintTexels.data(), Format32SInt);
-    const std::array<std::uint32_t, 4> invalid{0x1234u, 0x5678u, 0x9abcu, 0x0000ffacu};
+    const std::array<std::uint32_t, 4> invalid{0x1234u, 0x5678u, 0x9abcu, 0x1000ffacu};
     std::fill(Root.begin(), Root.end(), 0u);
     SetEntry(0, floatImage);
     SetEntry(1, uintImage);
@@ -1197,6 +1197,30 @@ std::pair<std::uint64_t, std::uint64_t> DrawTables(AgcDriver::VulkanDevice& devi
     return {vertexResult.PipelineVariantId(), pixelResult.PipelineVariantId()};
 }
 
+void RunNullTypeTests(AgcDriver::VulkanDevice& device) {
+    Fill();
+    Keys = {};
+    const std::array<std::array<std::uint32_t, 8>, 2> descriptors{{
+        {0x48880010u, 2u, 0x7281c970u, 3u, 0x4ed7fcb0u, 2u, 0u, 0u},
+        {0x1234u, 0xffffffffu, 0xffffffffu, 0x00000249u, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu}
+    }};
+    const auto check = [&](const Outcome& outcome, const std::string& name) {
+        Require(!Faulted(outcome), name + ": a type-0 descriptor faulted:\n" + outcome.log);
+        const auto words = Group(outcome, 0);
+        Require(std::all_of(words.begin(), words.end(), [](std::uint32_t word) { return word == 0u; }), name + ": a type-0 descriptor did not return four zeros");
+    };
+    for (const auto& descriptor : descriptors) {
+        check(RunDirectCode(device, DirectCode, PointClamp, descriptor), "direct sample");
+        SetRecord(0, PointClamp, {});
+        std::copy(descriptor.begin(), descriptor.end(), Table.begin() + 4);
+        check(Run(device, TableCode, 1, Lanes, 64), "table sample");
+        check(Run(device, ReadTableCode, 1, Lanes, 64), "table load");
+        std::fill(Root.begin(), Root.end(), 0u);
+        std::copy(descriptor.begin(), descriptor.end(), Root.begin() + PaletteOffset / 4u);
+        check(RunPointer(device, PointerCode, 1), "pointer sample");
+    }
+}
+
 void RunGraphicsTests(AgcDriver::VulkanDevice& device) {
     const auto floatImage = Image(FloatTexels.data(), Format32Float);
     const auto uintImage = Image(UintTexels.data(), Format32UInt);
@@ -1236,6 +1260,7 @@ int main() {
         RunPointerTests(*device);
         RunPointerStorageWriteTests(*device);
         RunGraphicsTests(*device);
+        RunNullTypeTests(*device);
         std::puts("image table tests passed");
         return 0;
     } catch (const std::exception& error) {

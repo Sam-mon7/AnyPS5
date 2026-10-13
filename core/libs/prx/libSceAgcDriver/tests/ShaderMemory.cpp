@@ -620,7 +620,7 @@ void verifyGuardedDescriptorSources() {
     static Texture texture;
     const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
     const std::array<std::uint32_t, 8> valid{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
-    const std::array<std::uint32_t, 8> invalid{0x12345678u, 0xffffffffu, 0xffffffffu, 0u, 0u, 0u, 0u, 0u};
+    const std::array<std::uint32_t, 8> invalid{0x12345678u, 0xffffffffu, 0xffffffffu, 0x10000000u, 0u, 0u, 0u, 0u};
     const std::array<std::uint32_t, 4> sampler{0u, 0u, 0u, 0u};
     std::array<std::uint32_t, 4> output{};
     const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
@@ -671,6 +671,14 @@ void verifyGuardedDescriptorSources() {
         AgcDriver::ShaderMemory memory({});
         const auto capture = memory.Capture(request);
         require(capture->snapshot.images.size() == 1u && std::equal(valid.begin(), valid.end(), capture->snapshot.images[0].dwords.begin()), "guarded sources: the T# behind a taken branch was not read");
+    }
+    auto nullType = valid;
+    nullType[3] = 0x00000249u;
+    fill(nullType, 1u);
+    {
+        AgcDriver::ShaderMemory memory({});
+        const auto capture = memory.Capture(request);
+        require(capture->snapshot.images.size() == 1u && std::ranges::all_of(capture->snapshot.images[0].dwords, [](std::uint32_t word) { return word == 0u; }), "type-0 image: a nonzero base and constant-one swizzle were not normalized to null");
     }
     fill(valid, 0u);
     {
@@ -1081,7 +1089,7 @@ void verifyImageTables() {
     heap = saved;
 
 
-    heap[0][3] &= 0x0fffffffu;
+    heap[0][3] = (heap[0][3] & 0x0fffffffu) | 0x10000000u;
     const auto invalid = CompileTable(request);
     const auto& invalidMap = TableMap(*invalid.result);
     const auto invalidCodes = TableCodes(invalidMap, 0);
@@ -1099,7 +1107,7 @@ void verifyImageTables() {
     const auto& tail = partialTables.words.at(partialTables.tables[0].codes.at(3));
     require(tail.dwords[0] == heap[3][0] && std::all_of(tail.dwords.begin() + 1, tail.dwords.end(), [](std::uint32_t word) { return word == 0u; }), "image tables: the straddling record's tail is not zero");
     const auto& partialMap = TableMap(*partial.result);
-    require((partialMap.at(TableCodes(partialMap, 0).at(3) + Abi::ImageRecordFlags) & Abi::PoisonFlag) != 0u, "image tables: a straddling record was bound");
+    require(TableCodes(partialMap, 0).at(3) == Abi::NullCode, "image tables: a partial record with an out-of-range TYPE word did not become null");
     FillTableSrt(guest, heap.data(), 32u, 4u);
 
     void* reserved = nullptr;
@@ -1266,7 +1274,7 @@ void verifyPointerImageTable() {
     entry(0, TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D));
     entry(1, TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D));
     entry(2, TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D));
-    entry(4, {0x1234u, 0x5678u, 0x9abcu, 0x0000ffacu, 0u, 0u, 0u, 0u});
+    entry(4, {0x1234u, 0x5678u, 0x9abcu, 0x1000ffacu, 0u, 0u, 0u, 0u});
     entry(255, TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D));
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(root));
     const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
