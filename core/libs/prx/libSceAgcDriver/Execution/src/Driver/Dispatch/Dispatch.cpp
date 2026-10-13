@@ -370,7 +370,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::shared_ptr<PreparedDispatch> prepared;
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
             try {
-                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads);
+                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads, address);
             } catch (const std::exception& error) {
                 if (rethrow(error)) return;
             }
