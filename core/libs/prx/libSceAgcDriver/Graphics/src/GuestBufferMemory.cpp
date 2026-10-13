@@ -884,7 +884,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     state.liveBytes += bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0);
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (GPU 0x%llx, %zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(entry.address), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0);
     entry.lastUse = ++state.useCounter;
     return &state.imports.emplace(base, entry).first->second;
 }

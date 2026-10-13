@@ -63,10 +63,11 @@ public:
             }
             std::fputc('\n', output);
         }
-        if (latest != 0 && latest < next) {
-            const auto end = latest + std::min<std::uintptr_t>(next - latest, 32);
-            std::fprintf(output, "[gpu-checkpoint] following recorded markers (CPU order, GPU completion unknown): %llu of %llu\n", static_cast<unsigned long long>(end - latest), static_cast<unsigned long long>(next - latest));
-            for (auto serial = latest + 1; serial <= end; ++serial) {
+        if (latest < next) {
+            const auto begin = latest != 0 ? latest : next - std::min<std::uint64_t>(next, 32);
+            const auto end = begin + std::min<std::uint64_t>(next - begin, 32);
+            std::fprintf(output, latest != 0 ? "[gpu-checkpoint] following recorded markers (CPU order, GPU completion unknown): %llu of %llu\n" : "[gpu-checkpoint] recent recorded markers (CPU order, no GPU progress available): %llu of %llu\n", static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(next - latest));
+            for (auto serial = begin + 1; serial <= end; ++serial) {
                 const auto& entry = history[serial % Capacity];
                 std::fprintf(output, "[gpu-checkpoint] recorded serial=%llu", static_cast<unsigned long long>(serial));
                 if (entry.serial == serial) {

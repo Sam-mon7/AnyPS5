@@ -51,6 +51,7 @@ using AgcDriver::Graphics::Require;
 
 const void* checkpointMarker = nullptr;
 std::uint32_t checkpointQueries = 0;
+bool checkpointEmpty = false;
 
 VKAPI_ATTR void VKAPI_CALL mockCheckpoint(VkCommandBuffer, const void* marker) {
     checkpointMarker = marker;
@@ -59,7 +60,7 @@ VKAPI_ATTR void VKAPI_CALL mockCheckpoint(VkCommandBuffer, const void* marker) {
 VKAPI_ATTR void VKAPI_CALL mockCheckpointQuery(VkQueue, std::uint32_t* count, VkCheckpointDataNV* data) {
     ++checkpointQueries;
     if (data == nullptr) {
-        *count = 40;
+        *count = checkpointEmpty ? 0 : 40;
         return;
     }
     Require(*count == 32, "checkpoint query bounds the driver output");
@@ -109,6 +110,19 @@ void gpuCheckpointTests() {
         threw = std::string_view(error.what()).find("Vulkan result -4") != std::string_view::npos;
     }
     Require(threw && checkpointQueries == 4, "checkpoint diagnostics preserve the fatal Vulkan error");
+    checkpointEmpty = true;
+    const auto emptyOutput = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
+    Require(emptyOutput != nullptr, "empty checkpoint capture file");
+    checkpoints->Report(VK_ERROR_DEVICE_LOST, "empty test submit", emptyOutput.get());
+    checkpointEmpty = false;
+    Require(checkpointQueries == 5, "empty checkpoint result needs only the count query");
+    std::rewind(emptyOutput.get());
+    const auto emptySize = std::fread(bytes.data(), 1, bytes.size(), emptyOutput.get());
+    const std::string_view emptyText(bytes.data(), emptySize);
+    Require(emptyText.find("0/0 stage markers") != emptyText.npos, "empty checkpoint report preserves missing GPU evidence");
+    Require(emptyText.find("recent recorded markers (CPU order, no GPU progress available): 32 of") != emptyText.npos, "empty checkpoints report a bounded CPU history without claiming GPU progress");
+    Require(emptyText.find("future resource 0x8\n") < emptyText.find("future resource 0x27\n") && emptyText.find("future resource 0x27\n") != emptyText.npos, "empty checkpoints retain the newest CPU records in order");
+    Require(emptyText.find("future resource 0x7\n") == emptyText.npos, "empty checkpoint history stops at its output bound");
 }
 
 enum class FaultQueryMode { Normal, Truncated, Empty, CountFailure, DataFailure, Exception };
