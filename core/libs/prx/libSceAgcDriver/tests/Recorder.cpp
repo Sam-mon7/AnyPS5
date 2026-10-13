@@ -4503,6 +4503,32 @@ void imageMemoTests(const Device& device, Recorder& recorder) {
     program.bindings[0].count = 1;
     program.bindings[0].imageDepthCompare.clear();
     program.bindings[0].imageSamplers.assign(1, 0u);
+    // Direct imports on Windows are unwatched: a comparison may be reused only inside the
+    // submission, and driver stores, GPU writes and remaps must invalidate that proof.
+    namespace Memory = AgcDriver::GuestMemory;
+    const auto address = reinterpret_cast<std::uint64_t>(first);
+    Memory::Unwatch(address, surfaceBytes);
+    Memory::BumpCollectEpoch();
+    auto previous = sample(first);
+    Require(sample(first) == previous, "unchanged unwatched texture was rebuilt");
+    const std::array<std::byte, 1> changed{std::byte{0x55}};
+    Memory::Write(address, changed);
+    auto updated = sample(first);
+    Require(updated != previous, "texture compare memo hid a driver store");
+    Require(sample(first) == updated, "driver-updated texture was rebuilt again");
+    first[0] = 0x66;
+    Memory::MarkWritten(address, 1);
+    previous = sample(first);
+    Require(previous != updated, "texture compare memo hid a marked GPU write");
+    Require(sample(first) == previous, "GPU-updated texture was rebuilt again");
+    first[0] = 0x77;
+    Memory::BumpCollectEpoch();
+    updated = sample(first);
+    Require(updated != previous, "texture compare memo crossed a submission boundary");
+    Require(sample(first) == updated, "new submission texture was rebuilt again");
+    first[0] = 0x88;
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, surfaceBytes);
+    Require(sample(first) != updated, "texture compare memo hid remapped memory");
     recorder.Submit();
     device.WaitQueue();
     recorder.Sync();

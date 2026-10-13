@@ -1210,11 +1210,13 @@ void JournalWrite(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0) return;
     auto& journal = Journal();
     std::lock_guard lock(journal.mutex);
-    journal.ranges[journal.serial % WriteJournal::Capacity] = {address, address + bytes};
+    journal.ranges[journal.serial % WriteJournal::Capacity] = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::pair<std::uint64_t, std::uint64_t>{0, std::numeric_limits<std::uint64_t>::max()} : std::pair{address, address + bytes};
     ++journal.serial;
 }
 
 bool JournalTouchedSince(std::uint64_t serial, std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return false;
+    if (bytes > std::numeric_limits<std::uint64_t>::max() - address) return true;
     auto& journal = Journal();
     std::lock_guard lock(journal.mutex);
     if (journal.serial < serial || journal.serial - serial > WriteJournal::Capacity) return true;

@@ -113,6 +113,7 @@ struct CachedTexture {
     // The collect epoch and write journal serial a snapshot was last proven current at.
     std::uint64_t provenEpoch = 0;
     std::uint64_t provenSerial = 0;
+    std::uint64_t provenForgetSerial = 0;
 };
 
 bool TextureCompareMemo() {
@@ -668,8 +669,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             };
             const auto epoch = TextureCompareMemo() ? GuestMemory::CollectEpoch() : 0;
             const auto serial = GuestMemory::WriteJournalSerial();
+            const auto forget = GuestMemory::ForgetSerial();
             const auto proven = [&] {
-                if (epoch == 0 || it->provenEpoch != epoch || Recorder::SnapshotWriteOverlaps(address, bytes) || GuestMemory::JournalTouchedSince(it->provenSerial, address, it->bytes.size())) return false;
+                if (epoch == 0 || it->provenEpoch != epoch || (forget & 1u) != 0 || it->provenForgetSerial != forget || Recorder::SnapshotWriteOverlaps(address, bytes) || GuestMemory::JournalTouchedSince(it->provenSerial, address, it->bytes.size())) return false;
                 counters.provenReuses.fetch_add(1, std::memory_order_relaxed);
                 return true;
             };
@@ -677,6 +679,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 it->generation = generation;
                 it->provenEpoch = epoch;
                 it->provenSerial = serial;
+                it->provenForgetSerial = forget;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
                 reportTextureCounters();

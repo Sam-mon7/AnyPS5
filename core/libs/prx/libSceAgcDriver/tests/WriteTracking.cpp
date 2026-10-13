@@ -423,6 +423,13 @@ void CheckWriteJournal() {
     const auto later = WriteJournalSerial();
     Require(later == start + 1, "the journal serial does not count writes");
     Require(!JournalTouchedSince(later, base + 0x2000, 0x100), "a write before the serial reports a touch");
+    Require(!JournalTouchedSince(start, base + 0x2000, 0), "an empty range reports a touch");
+    JournalWrite(base, 0);
+    Require(WriteJournalSerial() == later, "an empty write advances the journal");
+    Require(!JournalTouchedSince(start, base + 0x2100, 1), "an adjacent range reports a touch");
+    Require(JournalTouchedSince(later, UINT64_MAX - 3, 8), "a wrapping query was accepted");
+    JournalWrite(UINT64_MAX - 3, 8);
+    Require(JournalTouchedSince(later, base, 1), "a wrapping write was lost");
     for (int write = 0; write < 20000; ++write) JournalWrite(base + 0x100000, 0x10);
     Require(JournalTouchedSince(later, base, 0x10), "an overflowed journal does not report a touch");
 }
