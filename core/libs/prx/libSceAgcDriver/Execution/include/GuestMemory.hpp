@@ -95,10 +95,14 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 void BumpCollectEpoch();
 // Every range the driver stores to or the GPU is recorded to write, in order. A check proven within one
 // collect epoch (see above) stays proven while JournalTouchedSince reports no overlapping write after
-// the serial taken before it; an overflowed journal reports a touch.
+// the serial taken before it; an overflowed journal reports a touch. An owner identifies logical
+// writes to that resource's device image, not arbitrary stores into its guest address range. A
+// resource may exclude its own logical writes; CPU stores and recorded buffer stores have no owner.
+// Actual driver stores journal both entry and completion, including a partially throwing store:
+// a proof made while a store is waiting or running must be invalidated after its bytes land.
 std::uint64_t WriteJournalSerial();
-void JournalWrite(std::uint64_t address, std::size_t bytes);
-bool JournalTouchedSince(std::uint64_t serial, std::uint64_t address, std::size_t bytes);
+void JournalWrite(std::uint64_t address, std::size_t bytes, const void* owner = nullptr);
+bool JournalTouchedSince(std::uint64_t serial, std::uint64_t address, std::size_t bytes, const void* exceptOwner = nullptr);
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);

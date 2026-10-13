@@ -30,6 +30,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -170,6 +171,92 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> co
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     if (wait) device.WaitIdle();
+}
+
+void RunRefreshMemo(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    using namespace AgcDriver::GuestMemory;
+    using namespace AgcDriver::Graphics;
+    const auto address = AddressOf(block);
+    std::memset(block, 0, SurfaceBytes);
+    std::memset(block + KeysOffset, 0xff, KeyBytes);
+    BumpCollectEpoch();
+    const auto texture = TextureDescriptor(block, block + KeysOffset);
+    std::vector<std::uint32_t> data(16, 0u);
+    std::copy(texture.begin(), texture.end(), data.begin() + 4);
+    std::lock_guard gpu(GpuMutex());
+    Dispatch(device, WriteCode, data, false);
+    const auto image = StorageTexture::FindPending(address, SurfaceBytes);
+    Require(image != nullptr, "memo test dispatch has no pending storage image");
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "memo test has no recorder");
+    image->Refresh();
+    const auto proofCalls = [] {
+        const auto counts = KeyProofCounts();
+        return counts.proved + counts.scanned;
+    };
+    const bool enabled = std::getenv("APS5_NO_STORAGE_REFRESH_MEMO") == nullptr;
+    const auto checkRefresh = [&](bool reused, const char* what, bool allowTrackedProof = false) {
+        const auto before = proofCalls();
+        const auto trackedBefore = StorageTexture::RefreshesProved();
+        image->Refresh();
+        const bool tracked = allowTrackedProof && StorageTexture::RefreshesProved() != trackedBefore;
+        Require((proofCalls() == before) == ((reused && enabled) || tracked), what);
+    };
+    const auto journal = WriteJournalSerial();
+    Dispatch(device, WriteRowCode, data, false);
+    Require(JournalTouchedSince(journal, address, SurfaceBytes), "recorded image dispatch was not journaled");
+    Require(!JournalTouchedSince(journal, address, SurfaceBytes, image.get()), "image dispatch was tagged as foreign");
+    const auto submissions = recorder->Submissions();
+    const auto version = image->Version();
+    checkRefresh(true, "own recorded dispatch repeated Refresh validation within the epoch", true);
+    Require(image->Version() == version && recorder->Submissions() == submissions, "own dispatch refresh uploaded or submitted work");
+    Require(StorageTexture::FindPending(address, SurfaceBytes) == image, "memo reuse flushed its own pending image");
+
+    const std::array<std::byte, 4> cpu{std::byte{0x11}, std::byte{0x11}, std::byte{0x11}, std::byte{0x11}};
+    Write(address + SurfaceBytes / 2, cpu);
+    checkRefresh(false, "a CPU Write did not force Refresh validation");
+    image->Refresh();
+    MarkWritten(address + SurfaceBytes / 2, cpu.size());
+    checkRefresh(false, "MarkWritten did not force Refresh validation");
+    image->Refresh();
+    recorder->NotePendingWrite(address + SurfaceBytes / 2, cpu.size());
+    checkRefresh(false, "a foreign recorded buffer write did not force Refresh validation");
+    const bool settled = !recorder->PendingWriteOverlaps(address, SurfaceBytes);
+    checkRefresh(settled, "a foreign write pending before the proof serial was ignored", settled);
+    device.WaitIdle();
+    image->Refresh();
+
+    auto foreignData = data;
+    foreignData[5] = (foreignData[5] & ~(0x3ffu << 20u)) | (60u << 20u);
+    const auto foreignSerial = WriteJournalSerial();
+    Dispatch(device, WriteRowCode, foreignData, false);
+    const auto foreignImage = StorageTexture::FindPending(address, SurfaceBytes);
+    Require(foreignImage != nullptr && foreignImage != image, "foreign dispatch did not create another storage image");
+    Require(JournalTouchedSince(foreignSerial, address, SurfaceBytes, image.get()), "another image's dispatch was excluded from the journal");
+    checkRefresh(false, "another storage image's recorded dispatch did not force Refresh validation");
+    if (StorageTexture::FindPending(address, SurfaceBytes) == foreignImage) {
+        checkRefresh(false, "a pending alias predating the proof serial was ignored");
+    }
+    StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "memo foreign image");
+    device.WaitIdle();
+    image->Refresh();
+
+    const std::array<std::byte, 1> clear{std::byte{0x00}};
+    Write(address + KeysOffset, clear);
+    checkRefresh(false, "a metadata Write did not force Refresh validation");
+    const std::vector<std::byte> uncompressed(KeyBytes, std::byte{0xff});
+    Write(address + KeysOffset, uncompressed);
+    image->Refresh();
+    image->Refresh();
+    BumpCollectEpoch();
+    checkRefresh(false, "a new collect epoch reused the old Refresh proof", true);
+    image->Refresh();
+    const auto overflow = address + BlockBytes;
+    for (int write = 0; write < 20000; ++write) JournalWrite(overflow, 1);
+    checkRefresh(false, "an overflowed journal reused the Refresh proof", true);
+    StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "memo test");
+    device.WaitIdle();
+    std::puts("storage refresh epoch memo: ok");
 }
 
 std::size_t Count(const std::uint8_t* bytes, std::size_t size, std::uint8_t value) {
@@ -494,7 +581,7 @@ void RunSharedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         std::optional<GuestBlock> block;
         std::optional<GuestBlock> watched;
@@ -504,6 +591,14 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         block.emplace(false);
+        if (argc == 2 && std::string_view(argv[1]) == "--refresh-memo-only") {
+            RunRefreshMemo(*device, block->Data());
+#ifdef _WIN32
+            shared.emplace(true, true);
+            RunRefreshMemo(*device, shared->Data());
+#endif
+            return 0;
+        }
         Run(*device, block->Data());
         untracked.emplace(false);
         RunUntrackedReuse(*device, untracked->Data());

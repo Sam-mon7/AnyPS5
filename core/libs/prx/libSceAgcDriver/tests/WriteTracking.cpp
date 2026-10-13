@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -430,8 +431,46 @@ void CheckWriteJournal() {
     Require(JournalTouchedSince(later, UINT64_MAX - 3, 8), "a wrapping query was accepted");
     JournalWrite(UINT64_MAX - 3, 8);
     Require(JournalTouchedSince(later, base, 1), "a wrapping write was lost");
+    const int image = 0, otherImage = 0;
+    const auto own = WriteJournalSerial();
+    JournalWrite(base, 0x100, &image);
+    Require(JournalTouchedSince(own, base, 0x100), "an ordinary query ignored an owned write");
+    Require(!JournalTouchedSince(own, base, 0x100, &image), "the owner's own write invalidated its proof");
+    JournalWrite(base, 0x100, &otherImage);
+    Require(JournalTouchedSince(own, base, 0x100, &image), "another image's write did not invalidate the proof");
+    const auto foreign = WriteJournalSerial();
+    MarkWritten(base, 0x100);
+    Require(JournalTouchedSince(foreign, base, 0x100, &image), "MarkWritten was mistaken for an owned write");
+    std::array<std::byte, 16> memory{};
+    const auto address = reinterpret_cast<std::uint64_t>(memory.data());
+    const auto cpu = WriteJournalSerial();
+    const std::array<std::byte, 1> value{std::byte{1}};
+    Write(address, value);
+    Require(JournalTouchedSince(cpu, address, memory.size(), &image), "a CPU Write was mistaken for an owned write");
+    std::uint64_t during = 0;
+    StoreOwnBytes(address, memory.size(), [&] {
+        during = WriteJournalSerial();
+        memory[0] = std::byte{2};
+    });
+    Require(JournalTouchedSince(during, address, memory.size(), &image), "a proof during a driver store survived its completion");
+    try {
+        StoreOwnBytes(address, memory.size(), [&] {
+            during = WriteJournalSerial();
+            memory[0] = std::byte{3};
+            throw std::runtime_error("partial store");
+        });
+    } catch (const std::runtime_error&) {}
+    Require(JournalTouchedSince(during, address, memory.size(), &image), "a throwing store did not invalidate its partial result");
+    const auto metadata = WriteJournalSerial();
+    JournalWrite(base + 0x1000, 0x100, &image);
+    Require(!JournalTouchedSince(metadata, base, 0x100, &image), "disjoint metadata invalidated the surface range");
+    Require(JournalTouchedSince(metadata, base + 0x1000, 0x100), "metadata validation excluded an owned write");
+    const auto overflowWrite = WriteJournalSerial();
+    JournalWrite(std::numeric_limits<std::uint64_t>::max() - 2, 8, &image);
+    Require(JournalTouchedSince(overflowWrite, base, 1, &image), "owner exclusion hid an overflowing write range");
     for (int write = 0; write < 20000; ++write) JournalWrite(base + 0x100000, 0x10);
     Require(JournalTouchedSince(later, base, 0x10), "an overflowed journal does not report a touch");
+    Require(JournalTouchedSince(own, base, 0x10, &image), "owner exclusion hid a journal overflow");
 }
 
 int main() {

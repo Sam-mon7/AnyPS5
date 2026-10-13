@@ -1500,7 +1500,7 @@ VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
-    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush"};
+    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "refresh epoch memo"};
     return kind < Count ? names[kind] : "?";
 }
 
@@ -1538,8 +1538,46 @@ bool StorageTexture::Refresh() {
     } exempt{refreshing};
     // This image's own pending results stay on the GPU, where the next dispatch wants them (the
     // flush below and the compare through the hook skip it).
+    // A Refresh proven in this worker's collect epoch stays current through its own image writes:
+    // the next consumer uses that same VkImage. Guest-memory stores, keys writers and other pending
+    // images must still take the flush/merge/alias rules below. No memo is used outside the GPU
+    // mutex or without an ordering epoch; the serial precedes validation so writes during it cannot
+    // be hidden. APS5_NO_STORAGE_REFRESH_MEMO=1 restores validation on every call.
     refreshing = this;
     NoteProved();
+    static const bool memo = std::getenv("APS5_NO_STORAGE_REFRESH_MEMO") == nullptr;
+    const auto epoch = memo && GuestMemory::GpuMutex().HeldByThisThread() ? GuestMemory::CollectEpoch() : 0;
+    const auto serial = GuestMemory::WriteJournalSerial();
+    const auto forgetSerial = GuestMemory::ForgetSerial();
+    const auto keyBytes = descriptor.dccAddress != 0 ? DccKeyCount(descriptor, guestBytes) : 0;
+    const auto touched = [&] {
+        return GuestMemory::JournalTouchedSince(refreshedSerial, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), this) ||
+               (keyBytes != 0 && GuestMemory::JournalTouchedSince(refreshedSerial, descriptor.dccAddress, keyBytes));
+    };
+    if (epoch != 0 && refreshedEpoch == epoch && refreshedForgetSerial == forgetSerial && (forgetSerial & 1u) == 0 &&
+        uploadedKeys == refreshedKeys && filledKeys == refreshedFilledKeys && !touched() &&
+        !Recorder::SnapshotWriteOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) &&
+        (keyBytes == 0 || !Recorder::SnapshotWriteOverlaps(descriptor.dccAddress, keyBytes))) {
+        std::array<PendingQuery, 2> queries{{
+            {descriptor.baseAddress, descriptor.baseAddress + guestBytes, this, nullptr, false},
+            {descriptor.dccAddress, descriptor.dccAddress + keyBytes, nullptr, nullptr, false}
+        }};
+        ScanPending(std::span(queries).first(keyBytes != 0 ? 2 : 1));
+        if (!queries[0].overlaps && !queries[1].overlaps) {
+            refreshedSerial = serial;
+            ++Profile().storageReused;
+            if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshMemo, start);
+            return true;
+        }
+    }
+    refreshedEpoch = 0;
+    const auto remember = [&] {
+        refreshedEpoch = epoch;
+        refreshedSerial = serial;
+        refreshedForgetSerial = forgetSerial;
+        refreshedKeys = uploadedKeys;
+        refreshedFilledKeys = filledKeys;
+    };
     // Results of other images pending in this memory must reach it first, except an alias's: its
     // units are taken on the device below (borrowUnits), so it stays pending. The keys read for
     // that decision are read again after the flush, which may store keys itself. The exemption
@@ -1693,6 +1731,7 @@ bool StorageTexture::Refresh() {
         refreshGeneration();
         takeRefreshProof(alias != nullptr);
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
+        remember();
         return true;
     }
     CaptureTrace::Log("refresh image=%llx bytes=%llu generation=%llu dirty=%d keysChanged=%d cpuWrote=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), dirty, keysChanged, cpuWrote);
@@ -1791,6 +1830,7 @@ bool StorageTexture::Refresh() {
     } else {
         uploadedKeys = keys;
     }
+    remember();
     return false;
 }
 
@@ -1818,12 +1858,14 @@ bool StorageTexture::refreshProved() {
     if (refreshProof.generation == 0) return false;
     if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
     const auto bytes = static_cast<std::size_t>(guestBytes);
+    if (Recorder::SnapshotWriteOverlaps(descriptor.baseAddress, bytes)) return false;
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
     if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
+        if (Recorder::SnapshotWriteOverlaps(descriptor.dccAddress, keyCount)) return false;
         if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return false;
         if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
@@ -2806,6 +2848,11 @@ void StorageTexture::refreshGeneration() {
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    if (count != 0) {
+        const auto begin = layerBegin(first);
+        const auto end = layerBegin(first + count - 1) + layerBytes(first + count - 1);
+        GuestMemory::JournalWrite(begin, static_cast<std::size_t>(end - begin), this);
+    }
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;

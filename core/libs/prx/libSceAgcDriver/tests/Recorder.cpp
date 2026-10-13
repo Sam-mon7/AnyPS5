@@ -336,6 +336,22 @@ void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x20000, 0x1000, false), "noted ranges outlived their batch");
 }
 
+void recordedWriteJournalTests(Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    alignas(64) std::array<std::byte, 64> memory{};
+    const auto address = reinterpret_cast<std::uint64_t>(memory.data());
+    const auto serial = WriteJournalSerial();
+    recorder.NotePendingWrite(address, 4);
+    Require(JournalTouchedSince(serial, address, 4, memory.data()), "a recorded buffer write was mistaken for a logical image write");
+    recorder.Submit();
+    const auto submitted = WriteJournalSerial();
+    const std::array<std::byte, 4> value{std::byte{1}};
+    recorder.AfterCompletions(address + 8, value, 0, 0, false);
+    Require(JournalTouchedSince(submitted, address + 8, 4), "an in-flight completion write was not journaled");
+    recorder.Sync();
+    Require(memory[8] == std::byte{1}, "the journaled in-flight completion did not store its result");
+}
+
 void writeSettledTests(const Device& device, Recorder& recorder) {
     Require(recorder.PendingWriteSettled(0x50000, 0x100), "an unwritten range is not settled");
     recorder.NotePendingWrite(0x50000, 0x100);
@@ -5598,6 +5614,7 @@ int main(int argc, char** argv) {
         }
 
         readTrackingTests(device, recorder);
+        recordedWriteJournalTests(recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
