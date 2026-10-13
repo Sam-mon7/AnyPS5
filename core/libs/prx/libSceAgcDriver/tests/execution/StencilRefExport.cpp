@@ -50,14 +50,14 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t st
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
 }
 
-ShaderRecompiler::ShaderPixelStageInfo PixelInfo(std::uint32_t shaderControl) {
+ShaderRecompiler::ShaderPixelStageInfo PixelInfo(std::uint32_t shaderControl, bool stencilTest) {
     const AgcDriver::Registers context{
         {0x1b3, 0x300u}, {0x1b4, 0x300u}, {0x1b6, 0u}, {0x1c5, 9u}, {0x203, shaderControl},
     };
-    return AgcDriver::Graphics::DecodePixelStageInfo(context, {0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u});
+    return AgcDriver::Graphics::DecodePixelStageInfo(context, {0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u}, false, stencilTest);
 }
 
-void Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::uint32_t shaderControl, const VkStencilOpState& stencil) {
+void Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::uint32_t shaderControl, const VkStencilOpState& stencil, bool stencilTest = true) {
     Pixels.fill(Kept);
     const auto target = device.Target();
 
@@ -79,7 +79,7 @@ void Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelC
     const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(pixelCode.data()), std::as_bytes(pixelCode)}}};
     ShaderRecompiler::RecompileRequest fragment{
         {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}},
-        {WaveSize, 0, pixelUserData, std::nullopt, PixelInfo(shaderControl), std::nullopt, pixelMemory},
+        {WaveSize, 0, pixelUserData, std::nullopt, PixelInfo(shaderControl, stencilTest), std::nullopt, pixelMemory},
         target,
         PixelPushLayout(vertexPush, target)
     };
@@ -96,7 +96,7 @@ void Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelC
     state.colors = {state.color};
     state.hasColorTarget = true;
     state.depth = AgcDriver::Graphics::DepthTarget{reinterpret_cast<std::uintptr_t>(DepthMemory.data()), reinterpret_cast<std::uintptr_t>(StencilMemory.data()), {Width, Height}, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0};
-    state.stencilTest = true;
+    state.stencilTest = stencilTest;
     state.stencilFront = stencil;
     state.stencilBack = stencil;
     state.renderExtent = {Width, Height};
@@ -126,10 +126,18 @@ void Check(const std::function<bool(std::uint32_t, std::uint32_t)>& drawn, std::
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        Require(argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--disabled"), "invalid test arguments");
+        if (argc == 2) {
+            const VkStencilOpState never{VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_NEVER, 0xffu, 0xffu, 200u};
+            Draw(*device, ColumnPixelCode, 0x52u, never, false);
+            Check([](std::uint32_t, std::uint32_t) { return true; }, "disabled stencil testing must not reject fragments or require stencil export");
+            std::puts("disabled stencil reference export test passed");
+            return 0;
+        }
         if (!TargetHasCapability(device->Target(), spv::CapabilityStencilExportEXT)) {
             std::puts("skipped, the device lacks VK_EXT_shader_stencil_export");
             return VulkanTestSkipped;

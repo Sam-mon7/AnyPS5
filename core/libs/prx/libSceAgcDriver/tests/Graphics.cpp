@@ -3994,6 +3994,10 @@ void stencilRefExportTests() {
     const auto depthOnly = stencilRefShape(ShaderRecompiler::Recompile(stencilRefExportRequest(0x51u, stencilExport, DepthStencilRefExportCode)).spirv.Words());
     Require(depthOnly == "depth ", "an MRTZ stencil channel without STENCIL_TEST_VAL_EXPORT_ENABLE declared the wrong outputs: " + depthOnly);
     expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(stencilRefExportRequest(0x52u, plain))); }, "VK_EXT_shader_stencil_export");
+    auto disabledStencil = stencilRefExportRequest(0x52u, plain);
+    disabledStencil.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(stencilRefExportQueue(0x52u, 2u).context, IdentityExports, false, false);
+    Require(!disabledStencil.context.pixel->stencilRefExportEnable && !disabledStencil.context.pixel->earlyZ, "disabled stencil testing retained its export or changed fragment-test ordering");
+    Require(stencilRefShape(ShaderRecompiler::Recompile(disabledStencil).spirv.Words()).empty(), "disabled stencil testing still needs the stencil-export extension");
     auto queue = stencilRefExportQueue(0x52u, 2u);
     queue.context[0x000] = 0;
     queue.context[0x002] = 0;

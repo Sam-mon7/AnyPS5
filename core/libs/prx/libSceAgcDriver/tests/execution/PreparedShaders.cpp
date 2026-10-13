@@ -199,7 +199,7 @@ void FailureCapture(AgcDriver::VulkanDevice& device) {
     const auto expected = failure([&] { static_cast<void>(PrepareShader(request)); });
     const char* previous = std::getenv("APS5_DUMP_SHADERS");
     const std::string saved = previous != nullptr ? previous : "";
-    const std::string path = "shader_12345cafe.req";
+    const std::string path = "shader_12345cafe_failed.req";
     std::remove(path.c_str());
 #ifdef _WIN32
     Require(_putenv_s("APS5_DUMP_SHADERS", "") == 0, "cannot disable shader capture");
@@ -221,6 +221,9 @@ void FailureCapture(AgcDriver::VulkanDevice& device) {
     std::ostringstream dumpedPrefix;
     dumpedPrefix << "shader 0x" << std::hex << request.shader.codeAddress << " stage " << static_cast<unsigned>(request.shader.stage) << " (" << path << "): ";
     Require(actual == dumpedPrefix.str() + expected, "enabled shader capture changed the diagnosed failure");
+    const std::array<std::uint32_t, 1> changedUserData{0x13572468u};
+    request.context.userData = changedUserData;
+    static_cast<void>(failure([&] { static_cast<void>(AgcDriver::DriverDetail::PrepareShaderWithDiagnostics(request)); }));
 #ifdef _WIN32
     Require(_putenv_s("APS5_DUMP_SHADERS", saved.c_str()) == 0, "cannot restore shader capture");
 #else

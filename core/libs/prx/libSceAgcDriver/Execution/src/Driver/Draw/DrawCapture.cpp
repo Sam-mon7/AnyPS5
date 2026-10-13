@@ -24,7 +24,24 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
-    const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
+    const auto invocation = [&] {
+        try {
+            return InvocationFor(*program.snapshot, program.codeOffset, request);
+        } catch (...) {
+            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) {
+                char name[64];
+                std::snprintf(name, sizeof(name), "draw_%llx_failed.regs", static_cast<unsigned long long>(program.binary.codeAddress));
+                if (std::FILE* file = std::fopen(name, "w")) {
+                    std::fprintf(file, "depthTest %u depthWrite %u stencilTest %u depthBound %u\n", graphics.depthTest, graphics.depthWrite, graphics.stencilTest, graphics.depth.has_value());
+                    for (const auto& [offset, value] : queue.context) std::fprintf(file, "context %x %08x\n", offset, value);
+                    for (const auto& [offset, value] : queue.userConfig) std::fprintf(file, "uconfig %x %08x\n", offset, value);
+                    for (const auto& [offset, value] : queue.shader) std::fprintf(file, "shader %x %08x\n", offset, value);
+                    std::fclose(file);
+                }
+            }
+            throw;
+        }
+    }();
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
