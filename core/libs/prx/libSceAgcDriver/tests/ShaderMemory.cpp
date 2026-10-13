@@ -3205,11 +3205,16 @@ void verifyBdaReadFallbackFunctions() {
             std::map<std::string, std::uint32_t> definitions;
             const auto reader = std::string("read_bda_dword_bytes") + (barrier ? "" : "_stop") + (coherent ? "_coherent" : "");
             const auto span = std::string("read_bda_span") + (barrier ? "" : "_stop") + (coherent ? "_coherent" : "");
+            const auto loader = std::string("load_bda_span") + (coherent ? "_coherent" : "");
             std::string function;
             std::size_t compareExchanges = 0;
             std::size_t mainLookups = 0;
             std::size_t mainProbes = 0;
             std::size_t spanCalls = 0;
+            std::size_t spanLoads = 0;
+            std::size_t spanLoaderCalls = 0;
+            std::size_t loaderLoads = 0;
+            std::size_t loaderCalls = 0;
             std::array<std::size_t, 2> readerLoads{};
             for (std::size_t cursor = 5; cursor < five.size();) {
                 const auto length = five[cursor] >> 16u;
@@ -3218,7 +3223,7 @@ void verifyBdaReadFallbackFunctions() {
                 if (op == spv::OpName) names[five[cursor + 1]] = reinterpret_cast<const char*>(&five[cursor + 2]);
                 if (op == spv::OpFunction) {
                     function = names[five[cursor + 2]];
-                    if (function == "record_bda_fault" || function.starts_with("read_bda_dword_bytes") || function.starts_with("read_bda_span")) {
+                    if (function == "record_bda_fault" || function.starts_with("read_bda_dword_bytes") || function.starts_with("read_bda_span") || function.starts_with("load_bda_span")) {
                         require((five[cursor + 3] & spv::FunctionControlDontInlineMask) != 0u, "BDA read functions: a fault, byte read or span read function may be inlined");
                         ++definitions[function];
                     }
@@ -3230,10 +3235,16 @@ void verifyBdaReadFallbackFunctions() {
                     if (callee == "probe_bda_pointer" || callee.starts_with("read_bda_dword_bytes")) ++mainProbes;
                     if (callee == span) ++spanCalls;
                 }
+                if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && function == span) ++spanLoads;
+                if (op == spv::OpFunctionCall && function == span && names[five[cursor + 3]] == loader) ++spanLoaderCalls;
+                if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && function == loader) ++loaderLoads;
+                if (op == spv::OpFunctionCall && function == loader) ++loaderCalls;
                 if (op == spv::OpLoad && function == reader) ++readerLoads[length > 4u && (five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
                 cursor += length;
             }
             require(definitions["record_bda_fault"] == 1u && definitions[reader] == 1u && definitions[span] == 1u, "BDA read functions: the fault, byte read and span read functions are not defined");
+            require(definitions[loader] == 1u && loaderLoads == 4u && loaderCalls == 0u, "BDA read functions: the span load function does not hold the four in-place loads and nothing else");
+            require(spanLoads == 0u && spanLoaderCalls == 1u, "BDA read functions: a span read function loads in place itself");
             for (const auto& [name, count] : definitions) require(count == 1u, "BDA read functions: a function is defined twice");
             require(compareExchanges == 1u, "BDA read functions: a fault is recorded outside record_bda_fault");
             require(mainLookups == 0u, "BDA read functions: a read site looks up its bytes inline");
