@@ -111,6 +111,7 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -631,6 +632,15 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         ReadTextureSurface(resource, *keys, snapshot);
         return std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
     }
+    auto snapshotGeneration = generation;
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
+    if (source == nullptr && generation == 0) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        if (const auto partial = GuestMemory::CollectCommittedWrites(address, bytes, ranges); partial != 0) {
+            snapshotGeneration = partial;
+            committed = std::move(ranges);
+        }
+    }
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::lock_guard lock(cache.mutex);
@@ -659,8 +669,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
-                it->generation = generation;
+            const auto unchanged = [&] {
+                if (it->committed != committed) return false;
+                return committed.has_value() ? GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation);
+            };
+            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || equalsCommitted()) {
+                it->generation = snapshotGeneration;
+                it->committed = std::move(committed);
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
                 reportTextureCounters();
@@ -671,7 +686,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
+    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, snapshotGeneration};
+    entry.committed = std::move(committed);
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
@@ -3268,7 +3284,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     auto& cache = Textures();
     std::lock_guard lock(cache.mutex);
     const auto it = findSampledEntry(cache, context.device, record.words, record.components);
-    if (it == cache.entries.end() || it->texture != record.texture) return nullptr;
+    if (it == cache.entries.end() || it->texture != record.texture || it->committed.has_value()) return nullptr;
     if (it->source == nullptr) it->generation = record.generation;
     touchTexture(cache, it);
     logLookup({record.texture.get(), record.resource, record.guestBytes, keys, record.source != nullptr ? 0 : record.generation, record.source.get()});

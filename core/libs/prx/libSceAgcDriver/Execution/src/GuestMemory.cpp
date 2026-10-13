@@ -1263,6 +1263,30 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     return true;
 }
 
+std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    ranges.clear();
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !WriteWatched()) return 0;
+    auto committed = CommittedRanges(address, bytes);
+    auto generation = TrackerGeneration();
+    for (const auto& [begin, end] : committed) {
+        generation = CollectWrites(begin, static_cast<std::size_t>(end - begin));
+        if (generation == 0) return 0;
+    }
+    ranges = std::move(committed);
+    return generation;
+}
+
+bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || generation == 0) return false;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin || !tracker.covers(begin, static_cast<std::size_t>(end - begin)) || tracker.newestStamp(begin, end) > generation) return false;
+    }
+    return true;
+}
+
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
