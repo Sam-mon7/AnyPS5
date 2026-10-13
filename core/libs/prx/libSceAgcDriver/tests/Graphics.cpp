@@ -3995,7 +3995,8 @@ void stencilRefExportTests() {
     Require(depthOnly == "depth ", "an MRTZ stencil channel without STENCIL_TEST_VAL_EXPORT_ENABLE declared the wrong outputs: " + depthOnly);
     expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(stencilRefExportRequest(0x52u, plain))); }, "VK_EXT_shader_stencil_export");
     auto disabledStencil = stencilRefExportRequest(0x52u, plain);
-    disabledStencil.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(stencilRefExportQueue(0x52u, 2u).context, IdentityExports, false, false);
+    const AgcDriver::Graphics::State disabledStencilState{};
+    disabledStencil.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(stencilRefExportQueue(0x52u, 2u).context, IdentityExports, false, &disabledStencilState);
     Require(!disabledStencil.context.pixel->stencilRefExportEnable && !disabledStencil.context.pixel->earlyZ, "disabled stencil testing retained its export or changed fragment-test ordering");
     Require(stencilRefShape(ShaderRecompiler::Recompile(disabledStencil).spirv.Words()).empty(), "disabled stencil testing still needs the stencil-export extension");
     auto queue = stencilRefExportQueue(0x52u, 2u);
@@ -4026,6 +4027,39 @@ void stencilRefExportTests() {
     expectFailure([&] { static_cast<void>(AgcDriver::Graphics::DecodeState(queue)); }, "stencil clear with a pixel shader that exports the stencil test value");
     queue.context[0x203] = 0x50u;
     static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
+    queue.context[0x000] = 0;
+    queue.context[0x200] = 0x007007e7;
+    queue.context[0x203] = 0x52;
+    queue.context[0x1c4] = 9;
+    queue.context[0x10b] = 0;
+    queue.context[0x10c] = 0x01ffffff;
+    queue.context[0x10d] = 0x01ffffff;
+    const auto unused = AgcDriver::Graphics::DecodeState(queue);
+    Require(unused.stencilTest && unused.depthTest && unused.depthWrite && unused.depthCompare == VK_COMPARE_OP_GREATER_OR_EQUAL, "the unused reference fixture lost its depth or stencil tests");
+    const auto checkReference = [&](const AgcDriver::Graphics::State& draw, bool expected) {
+        auto request = stencilRefExportRequest(0x52u, plain);
+        request.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports, false, &draw);
+        Require(request.context.pixel->stencilRefExportEnable == expected && !request.context.pixel->earlyZ, "stencil reference consumption or fragment-test ordering is wrong");
+        if (expected) expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(request)); }, "VK_EXT_shader_stencil_export");
+        else Require(stencilRefShape(ShaderRecompiler::Recompile(request).spirv.Words()).empty(), "an unused stencil reference still needs its extension");
+    };
+    checkReference(unused, false);
+    for (const bool back : {false, true}) {
+        auto changed = unused;
+        auto& face = back ? changed.stencilBack : changed.stencilFront;
+        face.compareOp = VK_COMPARE_OP_EQUAL;
+        checkReference(changed, true);
+        face.compareMask = 0;
+        checkReference(changed, false);
+        for (auto* op : {&face.failOp, &face.passOp, &face.depthFailOp}) {
+            *op = VK_STENCIL_OP_REPLACE;
+            checkReference(changed, true);
+            face.writeMask = 0;
+            checkReference(changed, false);
+            face.writeMask = 0xff;
+            *op = VK_STENCIL_OP_KEEP;
+        }
+    }
 }
 
 void ProvokingVertexTests() {
