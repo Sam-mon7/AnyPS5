@@ -1306,7 +1306,7 @@ std::shared_ptr<const std::vector<std::uint32_t>> SharedSpirv::Pin() const {
         if (backing == nullptr) return Empty();
         source = backing;
     }
-    return std::make_shared<const std::vector<std::uint32_t>>(source->Load());
+    return std::make_shared<std::vector<std::uint32_t>>(source->Load());
 }
 
 const std::vector<std::uint32_t>& SharedSpirv::Words() const {

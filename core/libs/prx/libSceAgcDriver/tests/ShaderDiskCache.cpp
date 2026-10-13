@@ -612,6 +612,23 @@ void verifySpirvEviction() {
     require(WriteFileAtomically(path, file), "cannot restore the entry");
     require(*variant->artifact.spirv.Pin() == words, "SPIR-V does not reload from a restored entry");
 
+    SharedSpirv editable = variant->artifact.spirv;
+    editable[0] ^= 1u;
+    require(editable[0] == (words[0] ^ 1u) && *variant->artifact.spirv.Pin() == words, "editing reloaded SPIR-V changed its backing");
+    SharedSpirv shared = editable;
+    shared[0] ^= 2u;
+    require(editable[0] == (words[0] ^ 1u), "editing a resident copy changed the original SPIR-V");
+
+    std::vector<std::future<void>> readers;
+    for (unsigned i = 0; i < 4; ++i) {
+        readers.push_back(std::async(std::launch::async, [&] {
+            for (unsigned read = 0; read < 64; ++read) require(*variant->artifact.spirv.Pin() == words, "SPIR-V changed while its cache entry was replaced");
+        }));
+    }
+    for (unsigned write = 0; write < 64; ++write) ShaderDiskCache::Store(key, variant);
+    ShaderDiskCache::Flush();
+    for (auto& reader : readers) reader.get();
+
     SampleRequest heldSample;
     heldSample.code.push_back(0x0fedcba9u);
     const auto heldKey = heldSample.Key();

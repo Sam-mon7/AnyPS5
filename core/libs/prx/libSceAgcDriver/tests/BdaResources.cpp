@@ -466,6 +466,7 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
         guest[16 + 8] = 0x55;
     });
     Require(guest[16] == 0x77 && guest[16 + 8] == 0x55, "a writable heap mirror's write-back lost the GPU's store or rolled back the CPU's");
+    Require(MirrorCounters().heapBytes == before.heapBytes + 2 * bytes, "the writable heap mirror budget omits its shadow");
     Require(build(0, {}) == device && access.addressBytes(device)[16] == std::byte{0x77} && access.addressBytes(device)[16 + 8] == std::byte{0x55}, "the writable heap mirror missed the stores");
     Require(build(address + 40, [&](GuestBufferMemory& leased) {
         std::uint32_t adjustment = 0;
@@ -588,7 +589,7 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
     }
 #endif
     {
-        constexpr std::size_t large = 36 * 65536;
+        constexpr std::size_t large = 72 * 65536;
         constexpr std::size_t small = 17 * 65536;
         constexpr std::size_t total = 2 * large + small;
         void* raw = GuestArena::GuestArenaAllocate_nid_postfix(total, 65536);
@@ -875,7 +876,7 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
         guest[24] = 0x55;
     });
     const auto made = MirrorCounters();
-    Require(made.heapMirrors == before.heapMirrors + 1 && made.heapBytes == before.heapBytes + extent && made.rebuilds == before.rebuilds + 1 && made.sparseBinds == before.sparseBinds + 1, "a sparse heap was not mirrored once");
+    Require(made.heapMirrors == before.heapMirrors + 1 && made.heapBytes == before.heapBytes + 2 * extent && made.rebuilds == before.rebuilds + 1 && made.sparseBinds == before.sparseBinds + 1, "a sparse heap and its shadow were not mirrored once");
     Require(guest[8] == 0x77 && guest[24] == 0x55, "a sparse heap mirror's write-back lost the GPU's store or rolled back the CPU's");
     const auto second = bind(false, [&](std::span<std::byte> bytes, const VkDescriptorBufferInfo& view) {
         Require(bytes[view.offset + 8] == std::byte{0x77} && bytes[view.offset + 24] == std::byte{0x55}, "the sparse heap mirror missed the stores");
