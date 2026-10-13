@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
+#include "PipelineSpecialization.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
@@ -93,6 +94,18 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
         state.module.AddFunction(spv::OpEndInvocationInterlockEXT);
     }
     EmitKillIfPixelValidMaskInactive(state);
+    if (state.stencilReplay) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeI32(state), value, state.stencilRefVariable);
+        const auto reference = Unary(state, spv::OpBitcast, TypeU32(state), value);
+        const auto masked = Binary(state, spv::OpBitwiseAnd, TypeU32(state), reference, ConstantU32(state, 0xffu));
+        const auto offset = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::StencilReferenceOffset, state.program.Metadata().bindings.stencilReferenceDword);
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), offset);
+        const auto expected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), expected, pointer);
+        EmitKillIfBoolFalse(state, Binary(state, spv::OpIEqual, TypeBool(state), masked, expected));
+    }
     state.module.AddFunction(spv::OpReturn);
 }
 

@@ -405,6 +405,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         PipelineLibraryKeys keys;
         libraries = libraryKeys(keys, context, state, vertexInput, resources, shaders);
         std::vector<VkDynamicState> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        if (state.stencilReplayReference) dynamicStates.push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
         if (depthBounds) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
         if (depthBias) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
         if (libraries) dynamicStates.assign(PipelineLibraryDynamicStates().begin(), PipelineLibraryDynamicStates().end());
@@ -521,6 +522,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
 }
 
 bool Pipeline::Prebuild(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
+    if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return !shader.program->stencilReferences.empty(); })) return false;
     struct Scope {
         Scope() { prebuilding = true; prebuilt = false; }
         ~Scope() { prebuilding = false; }
@@ -672,6 +674,7 @@ void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
+    if (state.stencilReplayReference) context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
     if (libraries) {
         setLibraryState(commands, state);
         return;
@@ -806,8 +809,12 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
         append(key, state.depthBias);
         append(key, state.depthBiasPerFace);
         append(key, state.stencilTest);
-        append(key, state.stencilFront);
-        append(key, state.stencilBack);
+        auto front = state.stencilFront;
+        auto back = state.stencilBack;
+        if (state.stencilReplayReference) front.reference = back.reference = 0u;
+        append(key, state.stencilReplayReference.has_value());
+        append(key, front);
+        append(key, back);
     }
     append(key, state.stages.mesh.has_value());
     if (state.stages.mesh) {
