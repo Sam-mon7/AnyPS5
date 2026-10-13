@@ -60,7 +60,7 @@ ShaderBufferResource decodeBufferDescriptor(const DescriptorValue& value) {
 }
 
 bool nullImageDescriptor(const DescriptorValue& descriptor) {
-    return descriptor.dwords[0] == 0u && (descriptor.dwords[1] & 0xffu) == 0u;
+    return ((descriptor.dwords[3] >> 28u) & 0xfu) == 0u || (descriptor.dwords[0] == 0u && (descriptor.dwords[1] & 0xffu) == 0u);
 }
 
 ImageType rawImageType(const DescriptorValue& descriptor) {
