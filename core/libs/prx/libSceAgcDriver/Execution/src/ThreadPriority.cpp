@@ -271,6 +271,8 @@ void Raise(const char* role) {
 #else
 
 void Raise(const char* role) {
+    const std::wstring description(role, role + std::strlen(role));
+    SetThreadDescription(GetCurrentThread(), description.c_str());
     const int priority = RequestedMode() == ThreadPriorityMode::Realtime ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_HIGHEST;
     if (!SetThreadPriority(GetCurrentThread(), priority)) {
         throw std::runtime_error(std::string("APS5_THREAD_PRIORITY: ") + role + " SetThreadPriority failed (error " + std::to_string(GetLastError()) + ")");
