@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -208,6 +209,7 @@ void gpuAddressBindingTests() {
     using namespace AgcDriver::Graphics;
     using History = GpuAddressBindings;
     static_assert(sizeof(History) < 1024, "binding history entries must not consume the caller's stack");
+    static_assert(sizeof(History::Entry) <= 56, "the opt-in binding ring must stay within 56 MiB per instance");
     auto history = std::make_shared<History>(73);
     std::array<VkDebugUtilsObjectNameInfoEXT, 10> objects{};
     for (std::size_t i = 0; i < objects.size(); ++i) {
@@ -231,15 +233,19 @@ void gpuAddressBindingTests() {
     History::Callback(VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT, VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT, &data, history.get());
     History::Callback(VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT, VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT, &data, history.get());
     Require(history->Find(0, UINT64_MAX).newest == 0, "binding history filters unrelated messages");
+    const auto beforeCallbacks = std::chrono::steady_clock::now();
     emit();
     binding.bindingType = VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT;
     data.objectCount = 1;
     emit();
     binding.baseAddress = 0x12346000;
     emit();
+    const auto afterCallbacks = std::chrono::steady_clock::now();
     auto matches = history->Find(0x12345000, 0x12345fff);
     Require(matches.total == 3 && matches.count == 3, "binding history preserves aliases and unbinds without merging live ownership");
     Require(matches.entries[0].bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT && matches.entries[1].object == 0xa1 && matches.entries[1].objectType == VK_OBJECT_TYPE_IMAGE && matches.entries[2].flags == VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT, "binding history copies object handles, types and internal flags");
+    Require(matches.entries[2].observedAt >= beforeCallbacks && matches.entries[0].observedAt <= afterCallbacks && matches.entries[0].observedAt >= matches.entries[1].observedAt, "binding timestamps follow callback recording order within the observed interval");
+    Require(matches.entries[1].observedAt == matches.entries[2].observedAt, "all objects from one callback share its clock sample");
     History::Entry boundary{};
     boundary.base = 4;
     boundary.size = 4;
@@ -251,7 +257,9 @@ void gpuAddressBindingTests() {
     Require(!History::Overlaps(boundary, 0, UINT64_MAX), "empty bindings never overlap");
     const auto output = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
     Require(output != nullptr, "binding diagnostic capture file");
+    const auto beforeReport = std::chrono::steady_clock::now();
     history->Report({VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT, 0x12345678, 0x1000}, output.get());
+    const auto afterReport = std::chrono::steady_clock::now();
     history->Report({VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT, UINT64_MAX, 0}, output.get());
     history->Report({VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT, UINT64_MAX, 3}, output.get());
     std::rewind(output.get());
@@ -261,6 +269,18 @@ void gpuAddressBindingTests() {
     Require(text.find("instance=73 interval=0x12345000..0x12345fff newest overlaps=3/3") != text.npos, "fault precision uses aligned inclusive bounds, not reportedAddress plus precision");
     Require(text.find("invalid precision=0x0") != text.npos && text.find("invalid precision=0x3") != text.npos, "invalid fault precision is reported explicitly");
     Require(text.find("CPU callback order; no GPU progress or fault causality") != text.npos && text.find("No match does not prove no allocation") != text.npos, "binding reports retain their evidence limits");
+    Require(text.find("CPU ages measure callback recording to diagnostic collection, not GPU fault time") != text.npos, "binding report ages do not claim GPU execution timing");
+    for (std::size_t i = 0; i < matches.count; ++i) {
+        const auto& entry = matches.entries[i];
+        const auto line = text.find("instance=73 serial=" + std::to_string(entry.serial) + " ");
+        Require(line != text.npos, "binding report includes the timestamped object");
+        const auto ageField = text.find("cpu-age-at-report-ms=", line);
+        unsigned long long ageMs = 0;
+        Require(ageField != text.npos && ageField < text.find('\n', line) && std::sscanf(text.data() + ageField, "cpu-age-at-report-ms=%llu", &ageMs) == 1, "each binding record reports its CPU age");
+        const auto minimum = std::chrono::duration_cast<std::chrono::milliseconds>(beforeReport - entry.observedAt).count();
+        const auto maximum = std::chrono::duration_cast<std::chrono::milliseconds>(afterReport - entry.observedAt).count();
+        Require(ageMs >= static_cast<unsigned long long>(minimum) && ageMs <= static_cast<unsigned long long>(maximum), "binding ages are relative to diagnostic collection without timing thresholds");
+    }
     data.objectCount = objects.size();
     emit();
     data.pNext = nullptr;
@@ -286,7 +306,9 @@ void gpuAddressBindingTests() {
     std::thread first(write), second(write);
     first.join();
     second.join();
-    Require(concurrent->Find(0, UINT64_MAX).total == 512 && history->Find(0, UINT64_MAX).newest == matches.newest, "concurrent callbacks are serialized per instance without shared history");
+    const auto concurrentMatches = concurrent->Find(0, UINT64_MAX);
+    Require(concurrentMatches.total == 512 && history->Find(0, UINT64_MAX).newest == matches.newest, "concurrent callbacks are serialized per instance without shared history");
+    for (std::size_t i = 1; i < concurrentMatches.count; ++i) Require(concurrentMatches.entries[i - 1].observedAt >= concurrentMatches.entries[i].observedAt, "concurrent binding timestamps follow the serialized record order");
     faultMode = FaultQueryMode::Normal;
     faultQueries = 0;
     auto diagnostics = std::make_shared<GpuCheckpoints>(nullptr, nullptr, VK_NULL_HANDLE, faultDevice, mockDeviceFault, concurrent);

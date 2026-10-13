@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -29,6 +30,7 @@ public:
         VkObjectType objectType = VK_OBJECT_TYPE_UNKNOWN;
         VkDeviceAddressBindingTypeEXT bindingType = VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT;
         VkDeviceAddressBindingFlagsEXT flags = 0;
+        std::chrono::steady_clock::time_point observedAt{};
     };
     struct Matches {
         std::array<Entry, MatchLimit> entries{};
@@ -56,12 +58,13 @@ public:
             }
             const auto& binding = *reinterpret_cast<const VkDeviceAddressBindingCallbackDataEXT*>(next);
             std::lock_guard lock(self.mutex);
+            const auto observedAt = std::chrono::steady_clock::now();
             const auto count = std::min<std::size_t>(data->objectCount, ObjectLimit);
             self.omittedObjects += data->objectCount - count;
             for (std::size_t i = 0; i < count; ++i) {
                 const auto serial = ++self.nextSerial;
                 const auto& object = data->pObjects[i];
-                self.history[serial % Capacity] = {serial, binding.baseAddress, binding.size, object.objectHandle, object.objectType, binding.bindingType, binding.flags};
+                self.history[serial % Capacity] = {serial, binding.baseAddress, binding.size, object.objectHandle, object.objectType, binding.bindingType, binding.flags, observedAt};
             }
         } catch (...) {
             self.droppedCallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -102,13 +105,15 @@ public:
         const auto first = fault.reportedAddress & ~(precision - 1);
         const auto last = fault.reportedAddress | (precision - 1);
         const auto matches = Find(first, last);
+        const auto reportedAt = std::chrono::steady_clock::now();
         std::fprintf(output, "[gpu-binding] instance=%llu interval=0x%llx..0x%llx newest overlaps=%zu/%llu retained serials=%llu..%llu overwritten=%llu omitted-objects=%llu dropped-callbacks=%llu (CPU callback order; no GPU progress or fault causality)\n", static_cast<unsigned long long>(instanceSerial), static_cast<unsigned long long>(first), static_cast<unsigned long long>(last), matches.count, static_cast<unsigned long long>(matches.total), static_cast<unsigned long long>(matches.oldest), static_cast<unsigned long long>(matches.newest), static_cast<unsigned long long>(matches.overwritten), static_cast<unsigned long long>(matches.omittedObjects), static_cast<unsigned long long>(matches.droppedCallbacks));
         for (std::size_t i = 0; i < matches.count; ++i) {
             const auto& entry = matches.entries[i];
             const char* operation = entry.bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT ? "bind" : entry.bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT ? "unbind" : "unknown";
-            std::fprintf(output, "[gpu-binding] instance=%llu serial=%llu %s base=0x%llx size=0x%llx object-type=%d object=0x%llx flags=0x%x\n", static_cast<unsigned long long>(instanceSerial), static_cast<unsigned long long>(entry.serial), operation, static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.size), static_cast<int>(entry.objectType), static_cast<unsigned long long>(entry.object), static_cast<unsigned>(entry.flags));
+            const auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(reportedAt - entry.observedAt).count();
+            std::fprintf(output, "[gpu-binding] instance=%llu serial=%llu %s base=0x%llx size=0x%llx object-type=%d object=0x%llx flags=0x%x cpu-age-at-report-ms=%llu\n", static_cast<unsigned long long>(instanceSerial), static_cast<unsigned long long>(entry.serial), operation, static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.size), static_cast<int>(entry.objectType), static_cast<unsigned long long>(entry.object), static_cast<unsigned>(entry.flags), static_cast<unsigned long long>(ageMs));
         }
-        std::fputs("[gpu-binding] Historical aliases and unbinds are candidates, not live ownership; old bindings may have rolled out, and sparse or driver-private ranges may be unreported. No match does not prove no allocation.\n", output);
+        std::fputs("[gpu-binding] Historical aliases and unbinds are candidates, not live ownership; old bindings may have rolled out, and sparse or driver-private ranges may be unreported. No match does not prove no allocation. CPU ages measure callback recording to diagnostic collection, not GPU fault time.\n", output);
     }
 
 private:
