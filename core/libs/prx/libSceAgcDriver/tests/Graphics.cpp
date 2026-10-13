@@ -1295,6 +1295,13 @@ void DepthStencilTests() {
     AgcDriver::Graphics::RegisterReadLog() = nullptr;
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks an HTILE register the decoder reads: " + std::to_string(read.offset));
     Require(state.depth->htileAddress == (0x30000ull | (1ull << 40u)), "the HTILE address was not decoded from DB_HTILE_DATA_BASE and its high byte");
+    {
+        const auto view = queue.context[0x002];
+        queue.context[0x002] = 2u | (2u << 13u);
+        const auto slice = AgcDriver::Graphics::DecodeState(queue);
+        Require(slice.depth->htileAddress == (0x30000ull | (1ull << 40u)) + 2u * AgcDriver::Graphics::HtileMetadataBytes(slice.depth->extent), "slice 2 of a depth array must use the third slice of its HTILE");
+        queue.context[0x002] = view;
+    }
     queue.context[0x010] &= ~0x20000000u;
     state = AgcDriver::Graphics::DecodeState(queue);
     Require(state.depth->htileAddress == 0, "a surface without TILE_SURFACE_ENABLE decoded an HTILE address");
