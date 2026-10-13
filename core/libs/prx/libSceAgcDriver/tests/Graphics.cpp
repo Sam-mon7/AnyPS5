@@ -79,12 +79,26 @@ VKAPI_ATTR void VKAPI_CALL mockCheckpointQuery(VkQueue, std::uint32_t* count, Vk
 
 void gpuCheckpointTests() {
     using namespace AgcDriver::Graphics;
+    const auto readOutput = [](FILE* output) {
+        std::rewind(output);
+        std::string text;
+        std::array<char, 4096> bytes{};
+        while (const auto size = std::fread(bytes.data(), 1, bytes.size(), output)) text.append(bytes.data(), size);
+        Require(std::ferror(output) == 0, "checkpoint report reads completely");
+        return text;
+    };
+    const auto recordedCount = [](std::string_view text) {
+        std::size_t count = 0;
+        for (std::size_t offset = 0; (offset = text.find("[gpu-checkpoint] recorded serial=", offset)) != text.npos; ++offset) ++count;
+        return count;
+    };
     auto checkpoints = std::make_shared<GpuCheckpoints>(mockCheckpoint, mockCheckpointQuery, VK_NULL_HANDLE);
     const std::array<std::uint64_t, 2> shaders{0x248a05b00, 0x12345678};
     for (std::size_t i = 0; i <= GpuCheckpoints::Capacity; ++i) checkpoints->Record(VK_NULL_HANDLE, "dispatch address/variant", shaders);
     Require(reinterpret_cast<std::uintptr_t>(checkpointMarker) == GpuCheckpoints::Capacity + 1, "checkpoint markers do not alias overwritten entries");
     const auto reached = checkpointMarker;
-    for (std::uint64_t i = 0; i < 40; ++i) {
+    // Run041's unresolved Aftermath marker was 56 records behind the newest one.
+    for (std::uint64_t i = 0; i < 56; ++i) {
         const std::array payload{i};
         checkpoints->Record(VK_NULL_HANDLE, "future resource", payload);
     }
@@ -96,16 +110,20 @@ void gpuCheckpointTests() {
     Require(output != nullptr, "checkpoint capture file");
     checkpoints->Report(VK_ERROR_DEVICE_LOST, "test submit", output.get());
     Require(checkpointQueries == 2, "checkpoint query uses count and bounded data calls");
-    std::rewind(output.get());
-    std::array<char, 8192> bytes{};
-    const auto size = std::fread(bytes.data(), 1, bytes.size(), output.get());
-    const std::string_view text(bytes.data(), size);
+    const auto text = readOutput(output.get());
     Require(text.find("2/40 stage markers") != text.npos, "checkpoint report respects returned count");
     Require(text.find("dispatch address/variant 0x248a05b00 0x12345678") != text.npos, "checkpoint report preserves shader identity");
     Require(text.find("serial=1 history expired or unavailable") != text.npos, "overwritten checkpoint does not report the replacement shader");
-    Require(text.find("CPU order, GPU completion unknown): 32 of 40") != text.npos, "recorded history distinguishes CPU records from GPU progress and bounds output");
-    Require(text.find("future resource 0x0\n") < text.find("future resource 0x1f\n") && text.find("future resource 0x1f\n") != text.npos, "recorded history begins immediately after the last reported GPU marker");
-    Require(text.find("future resource 0x20\n") == text.npos, "recorded history stops at its output bound");
+    const auto newest = GpuCheckpoints::Capacity + 57;
+    const auto summary = "retained recorded markers (CPU order, GPU completion unknown): " + std::to_string(GpuCheckpoints::Capacity) + " of " + std::to_string(newest) + "; range=58.." + std::to_string(newest);
+    const auto history = text.find(summary);
+    Require(history != text.npos, "wrapped checkpoint history reports its exact retained count and range");
+    const std::string_view records = std::string_view(text).substr(history);
+    Require(recordedCount(records) == GpuCheckpoints::Capacity, "wrapped checkpoint history prints exactly its retained capacity");
+    Require(records.find("recorded serial=58 ") < records.find("recorded serial=" + std::to_string(newest) + " "), "retained checkpoint history is in CPU recording order");
+    Require(records.find("recorded serial=57 ") == records.npos && records.find("recorded serial=0 ") == records.npos && records.find("history expired or unavailable") == records.npos, "retained range includes no overwritten or uninitialized entries");
+    Require(records.find("recorded serial=" + std::to_string(GpuCheckpoints::Capacity + 1) + " dispatch address/variant") != records.npos, "retained CPU history includes the marker 56 records behind newest");
+    Require(records.find("future resource 0x0\n") < records.find("future resource 0x37\n") && records.find("future resource 0x37\n") != records.npos, "retained history includes all following CPU records without claiming completion");
     Context context{};
     context.gpuCheckpoints = checkpoints;
     bool threw = false;
@@ -115,19 +133,39 @@ void gpuCheckpointTests() {
         threw = std::string_view(error.what()).find("Vulkan result -4") != std::string_view::npos;
     }
     Require(threw && checkpointQueries == 4, "checkpoint diagnostics preserve the fatal Vulkan error");
+    const auto repeatOutput = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
+    Require(repeatOutput != nullptr, "repeated checkpoint capture file");
+    checkpoints->Report(VK_ERROR_DEVICE_LOST, "repeat test submit", repeatOutput.get());
+    const auto repeatText = readOutput(repeatOutput.get());
+    Require(checkpointQueries == 6 && repeatText.find("2/40 stage markers") != repeatText.npos, "repeated loss preserves the NVIDIA stage query");
+    Require(recordedCount(repeatText) == 0 && repeatText.find("retained recorded markers") == repeatText.npos, "retained CPU history is printed only once per checkpoint instance");
+
     checkpointEmpty = true;
+    auto emptyCheckpoints = std::make_shared<GpuCheckpoints>(mockCheckpoint, mockCheckpointQuery, VK_NULL_HANDLE);
     const auto emptyOutput = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
     Require(emptyOutput != nullptr, "empty checkpoint capture file");
-    checkpoints->Report(VK_ERROR_DEVICE_LOST, "empty test submit", emptyOutput.get());
-    checkpointEmpty = false;
-    Require(checkpointQueries == 5, "empty checkpoint result needs only the count query");
-    std::rewind(emptyOutput.get());
-    const auto emptySize = std::fread(bytes.data(), 1, bytes.size(), emptyOutput.get());
-    const std::string_view emptyText(bytes.data(), emptySize);
+    emptyCheckpoints->Report(VK_ERROR_DEVICE_LOST, "empty test submit", emptyOutput.get());
+    Require(checkpointQueries == 7, "empty checkpoint result needs only the count query");
+    const auto emptyText = readOutput(emptyOutput.get());
     Require(emptyText.find("0/0 stage markers") != emptyText.npos, "empty checkpoint report preserves missing GPU evidence");
-    Require(emptyText.find("recent recorded markers (CPU order, no GPU progress available): 32 of") != emptyText.npos, "empty checkpoints report a bounded CPU history without claiming GPU progress");
-    Require(emptyText.find("future resource 0x8\n") < emptyText.find("future resource 0x27\n") && emptyText.find("future resource 0x27\n") != emptyText.npos, "empty checkpoints retain the newest CPU records in order");
-    Require(emptyText.find("future resource 0x7\n") == emptyText.npos, "empty checkpoint history stops at its output bound");
+    Require(emptyText.find("retained recorded markers (CPU order, GPU completion unknown): 0 of 0\n") != emptyText.npos, "empty history reports zero without inventing a retained range");
+    Require(recordedCount(emptyText) == 0 && emptyText.find("range=") == emptyText.npos, "empty history contains no zero or uninitialized marker");
+
+    auto shortCheckpoints = std::make_shared<GpuCheckpoints>(mockCheckpoint, mockCheckpointQuery, VK_NULL_HANDLE);
+    shortCheckpoints->Record(VK_NULL_HANDLE, "aftermath marker candidate", shaders);
+    for (std::uint64_t i = 0; i < 56; ++i) {
+        const std::array payload{i};
+        shortCheckpoints->Record(VK_NULL_HANDLE, "after candidate", payload);
+    }
+    const auto shortOutput = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
+    Require(shortOutput != nullptr, "short checkpoint capture file");
+    shortCheckpoints->Report(VK_ERROR_DEVICE_LOST, "no GPU progress test submit", shortOutput.get());
+    checkpointEmpty = false;
+    const auto shortText = readOutput(shortOutput.get());
+    Require(checkpointQueries == 8 && shortText.find("0/0 stage markers") != shortText.npos, "missing stage evidence does not suppress retained CPU history");
+    Require(shortText.find("retained recorded markers (CPU order, GPU completion unknown): 57 of 57; range=1..57\n") != shortText.npos, "short history reports only initialized entries");
+    Require(recordedCount(shortText) == 57 && shortText.find("recorded serial=0 ") == shortText.npos && shortText.find("history expired or unavailable") == shortText.npos, "short history does not print unused ring slots");
+    Require(shortText.find("recorded serial=1 aftermath marker candidate") < shortText.find("recorded serial=57 after candidate 0x37\n") && shortText.find("recorded serial=57 after candidate 0x37\n") != shortText.npos, "no-progress history retains the Aftermath candidate 56 records behind newest in CPU order");
 }
 
 enum class FaultQueryMode { Normal, Truncated, Empty, CountFailure, DataFailure, Exception };

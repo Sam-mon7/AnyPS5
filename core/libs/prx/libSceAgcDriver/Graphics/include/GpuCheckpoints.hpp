@@ -54,13 +54,11 @@ public:
         count = std::min(count, static_cast<std::uint32_t>(checkpoints.size()));
         if (count != 0) query(queue, &count, checkpoints.data());
         std::fprintf(output, "[gpu-checkpoint] device lost at %s; %u/%u stage markers, newest recorded=%llu\n", operation, count, available, static_cast<unsigned long long>(next));
-        std::uintptr_t latest = 0;
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto serial = reinterpret_cast<std::uintptr_t>(checkpoints[i].pCheckpointMarker);
             const auto& entry = history[serial % Capacity];
             std::fprintf(output, "[gpu-checkpoint] stage=0x%x serial=%llu", static_cast<unsigned>(checkpoints[i].stage), static_cast<unsigned long long>(serial));
             if (serial != 0 && entry.serial == serial) {
-                latest = std::max(latest, serial);
                 std::fprintf(output, " %s", entry.operation);
                 for (std::size_t j = 0; j < entry.count; ++j) std::fprintf(output, " 0x%llx", static_cast<unsigned long long>(entry.shaders[j]));
             } else {
@@ -68,11 +66,14 @@ public:
             }
             std::fputc('\n', output);
         }
-        if (latest < next) {
-            const auto begin = latest != 0 ? latest : next - std::min<std::uint64_t>(next, 32);
-            const auto end = begin + std::min<std::uint64_t>(next - begin, 32);
-            std::fprintf(output, latest != 0 ? "[gpu-checkpoint] following recorded markers (CPU order, GPU completion unknown): %llu of %llu\n" : "[gpu-checkpoint] recent recorded markers (CPU order, no GPU progress available): %llu of %llu\n", static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(next - latest));
-            for (auto serial = begin + 1; serial <= end; ++serial) {
+        if (!historyReported) {
+            historyReported = true;
+            const auto retained = std::min<std::uint64_t>(next, Capacity);
+            const auto begin = next - retained;
+            std::fprintf(output, "[gpu-checkpoint] retained recorded markers (CPU order, GPU completion unknown): %llu of %llu", static_cast<unsigned long long>(retained), static_cast<unsigned long long>(next));
+            if (retained != 0) std::fprintf(output, "; range=%llu..%llu", static_cast<unsigned long long>(begin + 1), static_cast<unsigned long long>(next));
+            std::fputc('\n', output);
+            for (auto serial = begin + 1; serial <= next; ++serial) {
                 const auto& entry = history[serial % Capacity];
                 std::fprintf(output, "[gpu-checkpoint] recorded serial=%llu", static_cast<unsigned long long>(serial));
                 if (entry.serial == serial) {
@@ -143,6 +144,7 @@ private:
     PFN_vkGetDeviceFaultInfoEXT queryFault;
     std::shared_ptr<GpuAddressBindings> bindings;
     bool faultReported = false;
+    bool historyReported = false;
     std::mutex mutex;
     std::uintptr_t next = 0;
     std::array<Entry, Capacity> history{};
