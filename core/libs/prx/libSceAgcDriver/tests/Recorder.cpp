@@ -5241,6 +5241,23 @@ void keysFillTests(const Device& device, Recorder& recorder) {
         draw({{1.0f, 0.0f, 0.0f, 1.0f}});
         Require(fill(0x00) == 1, "a 0000 key fill did not cover the surface");
         Require(image->FilledKeys() == DccKeys::Clear0000, "a key fill over pending results was not recorded");
+        auto words = linearTextureWords(address, side, side, 56);
+        words[3] |= 0x1bu << 20u;
+        const auto meta = keysAddress >> 8u;
+        words[6] = (1u << 21u) | (static_cast<std::uint32_t>(meta & 0xffu) << 24u);
+        words[7] = static_cast<std::uint32_t>(meta >> 8u);
+        const auto black = CachedSampledTexture(context, words);
+        Require(CachedSampledTexture(context, words) == black, "an unchanged fast-clear texture was rebuilt");
+        SampleProgram sampled(context, recorder);
+        expectRed(sampled.Red(black->View(), black->Layout(), 0.0f), 0.0f, "a cached 0000 clear sampled stale texels");
+        Require(fill(0xc0) == 1, "a 1111 key fill did not cover the surface");
+        const auto white = CachedSampledTexture(context, words);
+        Require(white != black, "a 1111 clear reused a 0000 clear");
+        expectRed(sampled.Red(white->View(), white->Layout(), 0.0f), 1.0f, "a cached 1111 clear sampled stale texels");
+        Require(fill(0x00) == 1, "a repeated 0000 key fill did not cover the surface");
+        const auto blackAgain = CachedSampledTexture(context, words);
+        if (std::getenv("APS5_NO_CLEAR_TEXTURE_CACHE") == nullptr) Require(blackAgain == black, "alternating fast clears replaced each other's cache entries");
+        expectRed(sampled.Red(blackAgain->View(), blackAgain->Layout(), 0.0f), 0.0f, "returning to 0000 retained another clear's texels");
         image->Refresh();
         Require(holds({0, 0, 0, 0}), "a key fill did not clear the results made before it at the next refresh");
         Require(image->FilledKeys() == DccKeys::Uncompressed, "the image cleared by a refresh still holds the fill");
@@ -5258,6 +5275,7 @@ void keysFillTests(const Device& device, Recorder& recorder) {
         Require(holds({0, 255, 0, 255}), "results drawn after a key fill cleared at once were lost");
     }
     recorder.Sync();
+    ClearCachedTextures(context.device);
 }
 
 void integerClearTests(const Device& device) {

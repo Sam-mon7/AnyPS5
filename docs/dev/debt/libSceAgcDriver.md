@@ -26,6 +26,8 @@
 
 ### Functional
 
+- Fast-clear snapshots now include their DCC clear code in the ordinary texture-cache key, so clear snapshots and storage views do not replace each other. They share the existing byte budget and LRU eviction, and discard their redundant CPU texel copy. `APS5_NO_CLEAR_TEXTURE_CACHE=1` restores the old shared entry. Synthetic Vulkan tests cover alternating clear codes and sampled values; performance in a full Demon's Souls level remains unverified.
+
 - Texture snapshot comparison reuse follows the existing per-worker collect epoch. Driver stores and recorded GPU writes invalidate it through a bounded write journal; memory remaps invalidate it through `ForgetSerial`. Raw CPU stores during a submission become visible at its next ordering boundary, as with collect memoization. Tests cover stores, remaps and submission boundaries, but Demon's Souls gameplay and cross-queue performance remain unverified. `APS5_NO_TEXTURE_COMPARE_MEMO=1` restores comparisons on every lookup; profile output counts reused proofs and attributes comparison bytes and time to read sites.
 
 - [Reused depth storage](../../../core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp): a storage view with another extent or a format that cannot hold the cached depth plane uses guest memory. Depth rendering is not written back to those guest bytes; this admission rule does not prove allocation reuse or preserve a depth writer through an incompatible view. Matching depth/stencil storage access still throws.
