@@ -35,7 +35,6 @@ namespace {
 // serial: a build served by that space alone binds it by the serial, with no hash and no compare.
 struct TableEntry {
     std::uint64_t hash;
-    std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::weak_ptr<Buffer> buffer;
     std::uint64_t spaceSerial = 0;
 };
@@ -49,11 +48,12 @@ struct TableCache {
     BdaResources::TableCacheStats classes;
 };
 
-bool sameRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& left, const std::vector<ShaderRecompiler::BdaAbi::Range>& right);
+bool sameRanges(Buffer& table, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges);
+std::span<const ShaderRecompiler::BdaAbi::Range> tableRanges(Buffer& table);
 
 // APS5_PROFILE_DRAW: why the most recently used entry did not serve this build (see
 // TableCacheStats). Under the cache mutex.
-void classifyFirstEntry(TableCache& cache, std::uint64_t hash, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
+void classifyFirstEntry(TableCache& cache, std::uint64_t hash, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::shared_ptr<Buffer>& held) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
     auto& classes = cache.classes;
@@ -62,19 +62,20 @@ void classifyFirstEntry(TableCache& cache, std::uint64_t hash, const std::vector
         return;
     }
     const auto& first = cache.entries.front();
-    if (first.hash == hash) {
-        if (first.buffer.expired()) ++classes.firstExpired;
-        else if (!sameRanges(first.ranges, ranges)) ++classes.firstSameHash;
-        return;
-    }
-    if (first.buffer.expired()) {
+    held = first.buffer.lock();
+    if (held == nullptr) {
         ++classes.firstExpired;
         return;
     }
-    const auto common = std::min(first.ranges.size(), ranges.size());
+    if (first.hash == hash) {
+        if (!sameRanges(*held, ranges)) ++classes.firstSameHash;
+        return;
+    }
+    const auto firstRanges = tableRanges(*held);
+    const auto common = std::min(firstRanges.size(), ranges.size());
     std::size_t at = 0;
-    while (at < common && std::memcmp(&first.ranges[at], &ranges[at], sizeof(ranges[at])) == 0) ++at;
-    const auto begin = at < ranges.size() ? ranges[at].begin : at < first.ranges.size() ? first.ranges[at].begin : 0;
+    while (at < common && std::memcmp(&firstRanges[at], &ranges[at], sizeof(ranges[at])) == 0) ++at;
+    const auto begin = at < ranges.size() ? ranges[at].begin : at < firstRanges.size() ? firstRanges[at].begin : 0;
     ++(begin < 0x10000000ull ? classes.firstDiffersLow : classes.firstDiffersHeap);
 }
 
@@ -97,8 +98,16 @@ std::size_t tableCacheEntries() {
     return entries;
 }
 
-bool sameRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& left, const std::vector<ShaderRecompiler::BdaAbi::Range>& right) {
-    return left.size() == right.size() && (left.empty() || std::memcmp(left.data(), right.data(), left.size() * sizeof(left.front())) == 0);
+std::span<const ShaderRecompiler::BdaAbi::Range> tableRanges(Buffer& table) {
+    const auto bytes = table.Bytes();
+    ShaderRecompiler::BdaAbi::Header header{};
+    std::memcpy(&header, bytes.data(), sizeof(header));
+    return {reinterpret_cast<const ShaderRecompiler::BdaAbi::Range*>(bytes.data() + sizeof(header)), header.count};
+}
+
+bool sameRanges(Buffer& table, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
+    const auto held = tableRanges(table);
+    return held.size() == ranges.size() && (ranges.empty() || std::memcmp(held.data(), ranges.data(), ranges.size() * sizeof(ranges.front())) == 0);
 }
 
 // A 64-bit mix of the table's words: a table is ~1200 ranges of four words, and comparing the bytes
@@ -129,8 +138,8 @@ BdaResources::BdaResources(const Context& context) {
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
     const auto cached = memory.CachedAddressTable();
-    std::vector<ShaderRecompiler::BdaAbi::Range> built;
-    if (!cached.has_value()) built = memory.AddressRanges();
+    thread_local std::vector<ShaderRecompiler::BdaAbi::Range> built;
+    if (!cached.has_value()) memory.AddressRanges(built);
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
@@ -139,6 +148,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
     auto& cache = Tables();
     std::uint64_t hash = 0;
+    std::shared_ptr<Buffer> held;
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
         // Another device's tables are not this one's (their buffers are dead or foreign).
@@ -161,7 +171,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             }
         }
         hash = hashRanges(ranges);
-        classifyFirstEntry(cache, hash, ranges);
+        classifyFirstEntry(cache, hash, ranges, held);
         for (auto it = cache.entries.begin(); it != cache.entries.end();) {
             // Compare the hash before taking a strong reference: locking a non-matching entry's
             // buffer could make this thread its last owner (a concurrent reap releasing it) and
@@ -180,7 +190,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 it = cache.entries.erase(it);
                 continue;
             }
-            if (sameRanges(it->ranges, ranges)) {
+            if (sameRanges(*shared, ranges)) {
                 ++cache.hits;
                 // An equal table of an earlier space (a rebuild that mapped the same ranges the
                 // same way): the next build of this space binds it by the serial.
@@ -204,7 +214,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial});
+        cache.entries.push_front({hash, table, serial});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
 }

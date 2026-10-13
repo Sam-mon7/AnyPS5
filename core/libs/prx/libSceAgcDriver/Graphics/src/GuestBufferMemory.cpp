@@ -3376,17 +3376,25 @@ std::uint64_t GuestBufferMemory::servedEnd(const Region& region) {
 }
 
 std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() const {
-    Require(uploaded && !committed, "guest GPU address ranges are not available");
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
-    result.reserve(regions.size() + (space != nullptr ? space->ranges.size() : 0));
-    for (const auto& region : regions) result.push_back(addressRange(region));
+    AddressRanges(result);
+    return result;
+}
+
+void GuestBufferMemory::AddressRanges(std::vector<ShaderRecompiler::BdaAbi::Range>& result) const {
+    Require(uploaded && !committed, "guest GPU address ranges are not available");
+    thread_local std::vector<ShaderRecompiler::BdaAbi::Range> own;
+    thread_local std::vector<ShaderRecompiler::BdaAbi::Range> merged;
+    own.clear();
+    for (const auto& region : regions) own.push_back(addressRange(region));
+    result.clear();
     if (space != nullptr) {
-        std::vector<ShaderRecompiler::BdaAbi::Range> combined;
-        combined.reserve(result.size() + space->ranges.size());
-        std::merge(space->ranges.begin(), space->ranges.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
-        result = std::move(combined);
+        result.reserve(own.size() + space->ranges.size());
+        std::merge(space->ranges.begin(), space->ranges.end(), own.begin(), own.end(), std::back_inserter(result), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+    } else {
+        result.assign(own.begin(), own.end());
     }
-    if (writes.empty()) return result;
+    if (writes.empty()) return;
     auto sortedWrites = writes;
     std::sort(sortedWrites.begin(), sortedWrites.end());
     std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
@@ -3394,7 +3402,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
         if (!intervals.empty() && interval.first <= intervals.back().second) intervals.back().second = std::max(intervals.back().second, interval.second);
         else intervals.push_back(interval);
     }
-    std::vector<ShaderRecompiler::BdaAbi::Range> merged;
+    merged.clear();
     merged.reserve(result.size() + intervals.size() * 2u);
     std::size_t firstWrite = 0;
     for (const auto& range : result) {
@@ -3424,7 +3432,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
         }
         append(range.end, false);
     }
-    return merged;
+    result.swap(merged);
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
