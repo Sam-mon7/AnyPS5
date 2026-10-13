@@ -96,6 +96,12 @@ void Run(AgcDriver::VulkanDevice& device) {
     ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}}, {32, 0, users, compute, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
     RunUnregistered(device, request);
     {
+        auto partial = request;
+        partial.context.compute->numThreads = {4, 1, 1};
+        partial.context.compute->partialThreads = {2, 1, 1};
+        RunUnregistered(device, partial);
+    }
+    {
         AgcDriver::DriverDetail::ShaderSnapshot unpredicted{request.shader.codeAddress, 0, 0, {code.begin(), code.end()}, {}};
         unpredicted.header.resize(sizeof(Shader));
         const auto prepared = AgcDriver::DriverDetail::SourceHandleFor(unpredicted, 0, request);
