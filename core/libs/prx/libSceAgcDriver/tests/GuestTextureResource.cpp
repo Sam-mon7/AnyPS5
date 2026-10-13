@@ -96,6 +96,14 @@ void rejectFields(const Fields& f, std::string_view reason) {
 
 void RunGuestTextureResourceTests() {
     Fields base;
+    const auto baseWords = pack(base);
+    Require(!IsNullTextureResource(baseWords), "a nonzero 2D texture was classified as null");
+    Fields nullBase = base;
+    nullBase.base40 = 0;
+    Require(IsNullTextureResource(pack(nullBase)), "a zero-base texture was not classified as null");
+    Fields nullType = base;
+    nullType.typeRaw = 0;
+    Require(IsNullTextureResource(pack(nullType)), "a type-0 texture with a nonzero base was not classified as null");
     auto result = DecodeTextureResource(pack(base));
     Require(result.baseAddress == (base.base40 << 8u), "decoded base address changed");
     Require(result.width == 16 && result.height == 16, "decoded width or height changed");
