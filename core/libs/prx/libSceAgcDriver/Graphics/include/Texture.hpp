@@ -316,7 +316,7 @@ public:
     // GuestMemory::GpuMutex only, as Refresh is; never from a build's stage A.
     DccKeys UploadedKeys() const { return uploadedKeys; }
     DccKeys FilledKeys() const { return filledKeys; }
-    bool GuestSnapshotValid() const { return originalValid; }
+    bool GuestSnapshotValid() const { return originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); }
     DccKeyProof& KeyProof() const { return keyProof; }
     DccRangeProof& TargetKeyProof() const { return targetKeyProof; }
     DccKeys ProvedKeys() const;
@@ -338,6 +338,7 @@ private:
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
     void captureGuestBytes(const std::vector<bool>* layers);
+    bool originalHolds(std::uint64_t address, std::size_t bytes) const;
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
     // each, 64 KiB blocks the CPU wrote since the layer's generation keep the CPU's bytes. Block
@@ -548,8 +549,9 @@ private:
     // Results are on the GPU only (guarded by the pending-write registry lock).
     bool dirty = false;
     std::uint64_t version = 0;
-    // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
-    bool originalValid = true;
+    // Per tracked unit, `original` holds the bytes saved before pending results. A direct store
+    // or discard invalidates only its units; watched uploads/clears may omit the saved bytes.
+    std::vector<bool> layerOriginal;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;

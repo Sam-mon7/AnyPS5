@@ -175,14 +175,14 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
 // One tracker query over units [first, last]: `changed[k]` (k = unit - first) whether a block
 // stamp exceeds the unit's generation (a generation of 0 reads as changed), `cpu[k]` whether a
 // collect made it (a CPU store).
-void changedUnits(const UnitShadow& shadow, std::uint64_t first, std::uint64_t last, std::vector<std::uint8_t>& changed, std::vector<std::uint8_t>& cpu) {
+bool changedUnits(const UnitShadow& shadow, std::uint64_t first, std::uint64_t last, std::vector<std::uint8_t>& changed, std::vector<std::uint8_t>& cpu) {
     const auto count = static_cast<std::size_t>(last - first + 1);
     changed.assign(count, 1);
     cpu.assign(count, 1);
     const auto begin = std::max(shadow.UnitBegin(first), shadow.importBase);
     const auto end = std::min(shadow.UnitBegin(last + 1), shadow.ImportEnd());
-    if (end <= begin) return;
-    GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), std::span(shadow.generation).subspan(static_cast<std::size_t>(first), count), changed, cpu);
+    if (end <= begin) return false;
+    return GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), std::span(shadow.generation).subspan(static_cast<std::size_t>(first), count), changed, cpu);
 }
 
 std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t firstUnit, std::uint32_t units) {
@@ -296,6 +296,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::uint64_t bytes = 0;
     std::size_t units = 0;
+    std::vector<std::uint8_t> uncollected;
     {
         // The stamps judged below see every CPU store into the live selected units up to now: a
         // store no collect walked yet would read as fresh and the copy would land over it. Every
@@ -312,15 +313,35 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         if (walkFirst > walkLast) return 0;
         const auto walkBegin = std::max(shadow->UnitBegin(walkFirst), shadow->importBase);
         const auto walkEnd = std::min(shadow->UnitBegin(walkLast + 1), shadow->ImportEnd());
-        if (walkEnd > walkBegin) GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+        if (walkEnd <= walkBegin || GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin)) == 0) {
+            // An unwatched hole must not prevent collecting the live watched neighbors.
+            uncollected.assign(static_cast<std::size_t>(last - first + 1), 0);
+            for (auto unit = walkFirst; unit <= walkLast; ++unit) {
+                const auto k = static_cast<std::size_t>(unit - first);
+                if (!selected[k] || !shadow->Live(unit)) continue;
+                const auto [begin, end] = shadow->UnitRange(unit);
+                uncollected[k] = end <= begin || GuestMemory::CollectWritesUncached(begin, static_cast<std::size_t>(end - begin)) == 0;
+            }
+        }
     }
     {
         std::lock_guard lock(registry.mutex);
         std::vector<std::uint8_t> changed, cpu;
-        changedUnits(*shadow, first, last, changed, cpu);
+        const bool tracked = changedUnits(*shadow, first, last, changed, cpu);
         for (auto unit = first; unit <= last; ++unit) {
             const auto k = static_cast<std::size_t>(unit - first);
             if (!selected[k] || !shadow->Live(unit)) continue;
+            const bool missed = !uncollected.empty() && uncollected[k];
+            // Retry only publication's successfully collected units. Other shadow readers retain
+            // the conservative whole-span proof; they have not necessarily collected each unit.
+            if (!tracked && !missed) {
+                const auto [begin, end] = shadow->UnitRange(unit);
+                if (end > begin) GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), std::span(shadow->generation).subspan(static_cast<std::size_t>(unit), 1), std::span(changed).subspan(k, 1), std::span(cpu).subspan(k, 1));
+            }
+            if (missed) {
+                changed[k] = GuestMemory::BlockWritten;
+                cpu[k] = 1;
+            }
             if (changed[k] == GuestMemory::BlockWritten) {
                 // Newer bytes reached the import since the retile: the slab's are dead.
                 shadow->generation[unit] = 0;
