@@ -24,6 +24,9 @@
 #include <cstring>
 #include <deque>
 #include <iostream>
+#include <limits>
+#include <mutex>
+#include <string_view>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -84,10 +87,10 @@ alignas(256) std::array<std::byte, 1024 * 1024 * 4> Pixels{};
 
 class GuestBlock {
 public:
-    explicit GuestBlock(std::size_t bytes = BlockBytes) : bytes(bytes) {
+    explicit GuestBlock(std::size_t bytes = BlockBytes, std::size_t granule = 0) : bytes(bytes), granule(granule == 0 ? bytes : granule) {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, this->granule);
 #else
         constexpr std::uintptr_t alignment = 65536;
         void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -102,12 +105,18 @@ public:
 #endif
         Require(block != nullptr, "depth plane sampling: cannot allocate the guest block");
         std::memset(block, 0, bytes);
-        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+        {
+            GuestAllocations::Mutation mutation;
+            for (std::size_t offset = 0; offset < bytes; offset += this->granule) mutation.Add(block + offset, std::min(this->granule, bytes - offset), true, true, true);
+        }
         AgcDriver::GuestMemory::CollectWritesUncached(reinterpret_cast<std::uintptr_t>(block), bytes);
     }
 
     ~GuestBlock() {
-        GuestAllocations::Mutation().Remove(block);
+        {
+            GuestAllocations::Mutation mutation;
+            for (std::size_t offset = 0; offset < bytes; offset += granule) mutation.Remove(block + offset);
+        }
 #ifdef _WIN32
         GuestArena::GuestArenaReset_nid_postfix(block, bytes);
         GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
@@ -124,6 +133,7 @@ public:
 
 private:
     const std::size_t bytes;
+    const std::size_t granule;
     std::uint8_t* block = nullptr;
 };
 
@@ -366,10 +376,208 @@ void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<s
     Require(refused, "a depth plane array from base slice 1 was not refused");
 }
 
+#ifdef _WIN32
+void InvalidateZeroPage(std::uint8_t* page) {
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(page), SliceBytes);
 }
 
-int main() {
+void ProtectZeroPage(std::uint8_t* page, DWORD protection) {
+    DWORD old = 0;
+    Require(VirtualProtect(page, SliceBytes, protection, &old) != 0, "zero reads: protection change failed");
+    GuestArena::GuestArenaSetProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(page), SliceBytes, protection);
+    InvalidateZeroPage(page);
+}
+
+void CommitZeroPage(std::uint8_t* page, std::uint32_t value) {
+    GuestArena::GuestArenaCommit_nid_postfix(page, SliceBytes, PAGE_READWRITE, SliceBytes);
+    FillSlice(page, SliceBytes, value, 4);
+    InvalidateZeroPage(page);
+}
+
+void MapZeroPage(std::uint8_t* page, std::uint32_t value) {
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, SliceBytes, nullptr);
+    Require(section != nullptr, "zero reads: cannot create shared section");
     try {
+        GuestArena::GuestArenaMap_nid_postfix(page, SliceBytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    FillSlice(page, SliceBytes, value, 4);
+    InvalidateZeroPage(page);
+}
+
+void ZeroReadApiCases() {
+    using namespace AgcDriver::GuestMemory;
+    GuestBlock block(2 * SliceBytes, SliceBytes);
+    auto* page = block.At(0);
+    const auto address = reinterpret_cast<std::uintptr_t>(page);
+    std::vector<std::byte> snapshot(17, std::byte{0x5a});
+    const auto unchanged = snapshot;
+    const auto* allocation = snapshot.data();
+    const auto capacity = snapshot.capacity();
+    struct ResetHooks {
+        ~ResetHooks() { SetReadGuard(nullptr); SetFlushHook(nullptr); }
+    } reset;
+    static unsigned guards = 0, flushes = 0;
+    guards = flushes = 0;
+    SetReadGuard([](std::uint64_t, std::size_t) { ++guards; });
+    SetFlushHook([](std::uint64_t, std::size_t) { ++flushes; });
+    Require(!ReadCommittedIfAny(std::numeric_limits<std::uint64_t>::max(), 0, snapshot) && guards == 0 && flushes == 0 && snapshot == unchanged, "zero reads: zero bytes performed a read");
+    bool overflow = false;
+    try { static_cast<void>(ReadCommittedIfAny(std::numeric_limits<std::uint64_t>::max() - 1, 4, snapshot)); }
+    catch (const std::runtime_error& error) { overflow = std::string_view(error.what()).find("address range overflow") != std::string_view::npos; }
+    Require(overflow && snapshot == unchanged && guards == 1 && flushes == 1, "zero reads: overflowing range was not refused after its hooks");
+    GuestArena::GuestArenaReset_nid_postfix(page, SliceBytes);
+    InvalidateZeroPage(page);
+    for (unsigned i = 0; i < 3; ++i) Require(!ReadCommittedIfAny(address, SliceBytes, snapshot), "zero reads: reserved page was readable");
+    Require(snapshot == unchanged && snapshot.data() == allocation && snapshot.capacity() == capacity, "zero reads: empty snapshot materialized or changed its destination");
+    SetReadGuard([](std::uint64_t, std::size_t) { ++guards; throw std::runtime_error("zero read guard refusal"); });
+    const auto beforeGuard = guards;
+    const auto beforeFlush = flushes;
+    bool refused = false;
+    try { static_cast<void>(ReadCommittedIfAny(address, SliceBytes, snapshot)); }
+    catch (const std::runtime_error& error) { refused = std::string_view(error.what()) == "zero read guard refusal"; }
+    Require(refused && guards == beforeGuard + 1 && flushes == beforeFlush && snapshot == unchanged, "zero reads: an unreadable span bypassed or repeated the read guard");
+    SetReadGuard([](std::uint64_t, std::size_t) { ++guards; });
+    SetFlushHook([](std::uint64_t at, std::size_t bytes) {
+        ++flushes;
+        Require(bytes == SliceBytes, "zero reads: wrong flush extent");
+        CommitZeroPage(reinterpret_cast<std::uint8_t*>(at), 0x12345678);
+    });
+    Require(ReadCommittedIfAny(address, SliceBytes, snapshot), "zero reads: the query preceded materialization by its flush");
+    Require(guards == 6 && flushes == 5, "zero reads: hooks ran more than once for one read");
+    for (std::size_t offset = 0; offset < snapshot.size(); offset += 4) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, snapshot.data() + offset, 4);
+        Require(word == 0x12345678, "zero reads: flush-produced bytes were lost");
+    }
+    const auto beforeThrow = snapshot;
+    const auto guardsBeforeThrow = guards, flushesBeforeThrow = flushes;
+    SetFlushHook([](std::uint64_t, std::size_t) { ++flushes; throw std::runtime_error("zero flush refusal"); });
+    refused = false;
+    try { static_cast<void>(ReadCommittedIfAny(address, SliceBytes, snapshot)); }
+    catch (const std::runtime_error& error) { refused = std::string_view(error.what()) == "zero flush refusal"; }
+    Require(refused && guards == guardsBeforeThrow + 1 && flushes == flushesBeforeThrow + 1 && snapshot == beforeThrow, "zero reads: a throwing flush changed scratch or ran hooks twice");
+    SetFlushHook(nullptr);
+    ProtectZeroPage(page, PAGE_NOACCESS);
+    Require(!ReadCommittedIfAny(address, SliceBytes, snapshot), "zero reads: NOACCESS bytes were read");
+    const auto serial = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto forget = ForgetSerial();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(page, SliceBytes, true, true, true, [&] {
+            DWORD old = 0;
+            Require(VirtualProtect(page, SliceBytes, PAGE_READWRITE, &old) != 0, "zero reads: mutation protection failed");
+        });
+        Require(GuestAllocations::GuestAllocationsGeneration_nid_postfix() == serial && ForgetSerial() == forget, "zero reads: the adversarial mutation already published its counters");
+        Require(ReadCommittedIfAny(address, SliceBytes, snapshot), "zero reads: stable counters hid a readable mutation");
+    }
+    ProtectZeroPage(page, PAGE_NOACCESS);
+    const auto mappingSerial = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto mappingForget = ForgetSerial();
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, SliceBytes, nullptr);
+    Require(section != nullptr, "zero reads: cannot create counterexample section");
+    try { GuestArena::GuestArenaMap_nid_postfix(page, SliceBytes, section, 0, PAGE_READWRITE); }
+    catch (...) { CloseHandle(section); throw; }
+    CloseHandle(section);
+    FillSlice(page, SliceBytes, 0xabcdef01, 4);
+    Require(GuestAllocations::GuestAllocationsGeneration_nid_postfix() == mappingSerial && ForgetSerial() == mappingForget, "zero reads: direct map changed registry counters");
+    Require(ReadCommittedIfAny(address, SliceBytes, snapshot) && snapshot.front() == std::byte{1}, "zero reads: direct map was hidden by old coverage");
+    MapZeroPage(page, 0x10203040);
+    Require(ReadCommittedIfAny(address, SliceBytes, snapshot) && snapshot.front() == std::byte{0x40}, "zero reads: shared remap kept old data");
+    GuestArena::GuestArenaReset_nid_postfix(block.At(SliceBytes), SliceBytes);
+    InvalidateZeroPage(block.At(SliceBytes));
+    Require(ReadCommittedIfAny(address, 2 * SliceBytes, snapshot), "zero reads: partially readable span was treated as empty");
+    Require(snapshot[0] == std::byte{0x40} && std::all_of(snapshot.begin() + SliceBytes, snapshot.end(), [](std::byte value) { return value == std::byte{0}; }), "zero reads: partial snapshot holes were not zeroed");
+    std::vector<std::byte> reference(2 * SliceBytes);
+    ReadCommitted(address, reference);
+    Require(snapshot == reference, "zero reads: nonempty snapshot differs from ReadCommitted semantics");
+    std::puts("zero-read API transitions and hook ordering passed");
+}
+
+int ZeroReadCases() {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    ZeroReadApiCases();
+    GuestBlock array(3 * SliceBytes, SliceBytes);
+    GuestBlock outputBlock(SliceBytes);
+    const auto device = OpenVulkanTestDevice();
+    if (!device) return VulkanTestSkipped;
+    auto* base = array.At(0);
+    auto* middle = array.At(SliceBytes);
+    auto* tail = array.At(2 * SliceBytes);
+    const auto output = [&](std::size_t offset = 0) { return std::span<std::uint32_t>(reinterpret_cast<std::uint32_t*>(outputBlock.At(offset)), Threads); };
+    const Shape shape{Format32Float, 128, 128, Type2DArray, 2, Swizzle64KbZX};
+    DrawDepth(*device, reinterpret_cast<std::uintptr_t>(base), {128, 128}, VK_FORMAT_D32_SFLOAT, DrawnDepth);
+    FillSlice(middle, SliceBytes, Bits(0.375f), 4);
+    ProtectZeroPage(middle, PAGE_NOACCESS);
+    GuestArena::GuestArenaReset_nid_postfix(tail, SliceBytes);
+    InvalidateZeroPage(tail);
+    const auto load = [&](std::uint32_t layer, std::uint32_t expected, const char* label) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Load(*device, base, shape, layer, output());
+        Expect(output(), expected, label);
+    };
+    // The first array use creates and detiles the zero upload in this open batch. Replacing it
+    // before submission must retain those immutable old bytes for the queued first read.
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Load(*device, base, shape, 2, output(256), false);
+    Require(device->OpenWriteOverlaps(reinterpret_cast<std::uintptr_t>(output(256).data()), output(256).size_bytes()), "zero reads: first output was not queued before replacement");
+    CommitZeroPage(tail, Bits(0.5f));
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Load(*device, base, shape, 2, output(512), false);
+    Require(device->OpenWriteOverlaps(reinterpret_cast<std::uintptr_t>(output(256).data()), output(256).size_bytes()), "zero reads: first queued output was submitted before replacement");
+    Require(device->OpenWriteOverlaps(reinterpret_cast<std::uintptr_t>(output(512).data()), output(512).size_bytes()), "zero reads: replacement output was not queued");
+    device->WaitIdle();
+    Expect(output(256), 0, "queued old zero upload lifetime");
+    Expect(output(512), Bits(0.5f), "reserve to commit depth slice");
+    for (unsigned i = 0; i < 3; ++i) load(1, 0, "unchanged unreadable depth upload");
+    ProtectZeroPage(middle, PAGE_READWRITE);
+    load(1, Bits(0.375f), "NOACCESS to readable depth slice");
+    ProtectZeroPage(middle, PAGE_NOACCESS);
+    load(1, 0, "nonzero depth upload becoming unreadable");
+    MapZeroPage(middle, Bits(0.625f));
+    load(1, Bits(0.625f), "shared mapped depth slice");
+    MapZeroPage(middle, Bits(0.875f));
+    load(1, Bits(0.875f), "remapped depth slice");
+    load(2, Bits(0.5f), "unchanged readable neighbor");
+    load(0, Bits(DrawnDepth), "unchanged live depth slice");
+    // A real deferred GPU writer must land before the new helper copies readable bytes. Using the
+    // helper directly prevents a surrounding shader-resource build from hiding a missing flush.
+    const auto tailAddress = reinterpret_cast<std::uintptr_t>(tail);
+    const std::array<std::uint32_t, 4> pattern{Bits(0.75f), Bits(0.75f), Bits(0.75f), Bits(0.75f)};
+    if (!device->FillBuffer(tailAddress, SliceBytes, pattern)) {
+        std::puts("skipped, zero-read GPU materialization requires writable host imports");
+        return VulkanTestSkipped;
+    }
+    Require(device->OpenWriteOverlaps(tailAddress, SliceBytes), "zero reads: GPU materialization was not deferred");
+    std::vector<std::byte> snapshot;
+    Require(AgcDriver::GuestMemory::ReadCommittedIfAny(tailAddress, SliceBytes, snapshot), "zero reads: GPU destination was unreadable");
+    for (std::size_t offset = 0; offset < snapshot.size(); offset += 4) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, snapshot.data() + offset, 4);
+        Require(word == Bits(0.75f), "zero reads: pending GPU result was not materialized before reading");
+    }
+    load(2, Bits(0.75f), "GPU-written depth slice");
+    std::puts("zero depth array transitions, retention and GPU materialization passed");
+    return 0;
+}
+#endif
+
+}
+
+int main(int argc, char** argv) {
+    try {
+        Require(argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--zero-only"), "usage: depth_plane_sampling [--zero-only]");
+        if (argc == 2) {
+#ifdef _WIN32
+            return ZeroReadCases();
+#else
+            std::puts("skipped, zero-read transition cases require Windows guest mappings");
+            return VulkanTestSkipped;
+#endif
+        }
         GuestBlock block;
         GuestBlock largeBlock(65536u + 80u * 1024u * 1024u * 4u);
         const auto device = OpenVulkanTestDevice();

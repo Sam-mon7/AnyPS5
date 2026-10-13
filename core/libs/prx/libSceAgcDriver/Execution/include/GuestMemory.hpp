@@ -30,6 +30,10 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 // Variants for resources in heaps the guest commits on demand (partially resident textures, GPU
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination);
+// The same synchronized read, without materializing an entirely unreadable range. Returns false
+// with destination untouched for that zero snapshot (or zero bytes); otherwise replaces destination,
+// zero-filling any holes. This queries current readability after the read guard and GPU flush.
+bool ReadCommittedIfAny(std::uint64_t address, std::size_t bytes, std::vector<std::byte>& destination);
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes);
 // EqualsCommitted without the flush hook: the caller has decided that the recorded GPU work
 // writing the range need not be waited for (the dispatch-cache validation in Driver.cpp).

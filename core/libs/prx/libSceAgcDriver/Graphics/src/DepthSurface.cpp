@@ -214,10 +214,11 @@ public:
         std::vector<std::shared_ptr<Buffer>> uploads(layers);
         std::vector<bool> changed(layers, layoutChanged);
         guestUploads.resize(layers);
+        guestUploadZero.resize(layers);
         uploadProofs.resize(layers);
         guestDirty.resize(layers);
         std::vector<std::byte> bytes;
-        std::size_t replaced = 0, reused = 0, proved = 0, detiled = 0;
+        std::size_t replaced = 0, reused = 0, proved = 0, detiled = 0, zeroReused = 0;
         static const bool memo = std::getenv("APS5_NO_DEPTH_UPLOAD_MEMO") == nullptr;
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         static const bool traceCoverage = std::getenv("APS5_TRACE_DEPTH_COVERAGE") != nullptr;
@@ -232,6 +233,7 @@ public:
             auto& proof = uploadProofs[layer];
             if (slices[layer] != VK_NULL_HANDLE) {
                 upload.reset();
+                guestUploadZero[layer] = false;
                 proof = {};
                 changed[layer] = true;
                 continue;
@@ -254,12 +256,19 @@ public:
             if (current) {
                 ++proved;
             } else {
-                bytes.resize(size);
-                GuestMemory::ReadCommitted(address, bytes);
-                if (upload == nullptr || upload->Bytes().size() != size || std::memcmp(upload->Bytes().data(), bytes.data(), size) != 0) {
+                bool read = true;
+                if (upload != nullptr && upload->Bytes().size() == size && guestUploadZero[layer]) {
+                    read = GuestMemory::ReadCommittedIfAny(address, size, bytes);
+                    if (!read) ++zeroReused;
+                } else {
+                    bytes.resize(size);
+                    GuestMemory::ReadCommitted(address, bytes);
+                }
+                if (read && (upload == nullptr || upload->Bytes().size() != size || std::memcmp(upload->Bytes().data(), bytes.data(), size) != 0)) {
                     auto replacement = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
                     std::memcpy(replacement->Bytes().data(), bytes.data(), size);
                     upload = std::move(replacement);
+                    guestUploadZero[layer] = std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; });
                     guestDirty[layer] = true;
                     ++replaced;
                 }
@@ -276,7 +285,7 @@ public:
             coverageSampled = true;
             TraceCoverage(slices, resource, geometry);
         }
-        if (profile && reused != 0) AgcDriver::ProfilePrint_nid_no_patch("[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu proved=%zu detiled=%zu bytes-per-layer=%llu reject-layout=%zu reject-missing=%zu reject-size=%zu reject-no-epoch=%zu reject-epoch=%zu reject-forget=%zu reject-journal=%zu reject-recorder=%zu reject-storage=%zu\n", static_cast<unsigned long long>(resource.baseAddress), layers, reused - replaced, replaced, proved, detiled, static_cast<unsigned long long>(geometry.layerBytes), rejected[Layout], rejected[Missing], rejected[Size], rejected[NoEpoch], rejected[Epoch], rejected[Forget], rejected[Journal], rejected[RecorderOverlap], rejected[StorageOverlap]);
+        if (profile && reused != 0) AgcDriver::ProfilePrint_nid_no_patch("[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu proved=%zu detiled=%zu bytes-per-layer=%llu reject-layout=%zu reject-missing=%zu reject-size=%zu reject-no-epoch=%zu reject-epoch=%zu reject-forget=%zu reject-journal=%zu reject-recorder=%zu reject-storage=%zu zero-reused=%zu\n", static_cast<unsigned long long>(resource.baseAddress), layers, reused - replaced, replaced, proved, detiled, static_cast<unsigned long long>(geometry.layerBytes), rejected[Layout], rejected[Missing], rejected[Size], rejected[NoEpoch], rejected[Epoch], rejected[Forget], rejected[Journal], rejected[RecorderOverlap], rejected[StorageOverlap], zeroReused);
         if (detiled != 0) {
             Require(context.detiler != nullptr, "depth plane copy requires a texture detiler");
             context.detiler->BeginBatch();
@@ -350,6 +359,7 @@ private:
     VkDeviceMemory memory = VK_NULL_HANDLE;
     std::unique_ptr<DeviceBuffer> staging;
     std::vector<std::shared_ptr<Buffer>> guestUploads;
+    std::vector<bool> guestUploadZero;
     struct UploadProof { std::uint64_t epoch = 0, serial = 0, forget = 0; };
     std::vector<UploadProof> uploadProofs;
     std::vector<bool> guestDirty;
