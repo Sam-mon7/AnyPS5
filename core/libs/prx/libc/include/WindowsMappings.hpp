@@ -310,6 +310,14 @@ public:
 private:
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         for (auto cursor = address; cursor < end;) {
+            const auto clean = cleanRanges.upper_bound(cursor);
+            if (clean != cleanRanges.begin()) {
+                const auto cleanEnd = std::prev(clean)->second;
+                if (cursor < cleanEnd) {
+                    cursor = std::min(end, cleanEnd);
+                    continue;
+                }
+            }
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = views.find(base); found != views.end()) {
                 if (found->second.protection == PAGE_NOACCESS) return false;
