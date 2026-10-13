@@ -32,6 +32,27 @@ alignas(256) constexpr std::array<std::uint32_t, 15> StoreCode{
     0x34060082u, 0xe0701000u, 0x80000a03u, 0xbf810000u, 0xbf810000u,
 };
 
+ShaderRecompiler::RecompileResult CachedWriter(AgcDriver::VulkanDevice& device) {
+    alignas(256) static constexpr std::array<std::uint32_t, 11> code{
+        0x7e3c0280u, 0x7e3e0280u, 0x7e140280u, 0xf0001108u, 0x00010a1eu,
+        0xbf8c3f70u, 0x7e1402ffu, 0x3f400000u, 0xf0201108u, 0x00010a1eu, 0xbf810000u,
+    };
+    const auto address = reinterpret_cast<std::uintptr_t>(Depth.data());
+    const std::array<std::uint32_t, 12> data{
+        0, 0, 0, 0,
+        static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>(address >> 40u) | (22u << 20u) | (((Width - 1u) & 3u) << 30u),
+        ((Width - 1u) >> 2u) | ((Height - 1u) << 14u), 0x90000facu, 0, 0, 0, 0,
+    };
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))}}};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {32, 0, data, ShaderRecompiler::ShaderComputeStageInfo{{32, 1, 1}, 0, {false, false, false}, false, 1}, {}, {}, memory},
+        device.Target(), {0, 0, 0, 128},
+    };
+    request.useCache = true;
+    return ShaderRecompiler::Recompile(request);
+}
+
 void Read(AgcDriver::VulkanDevice& device, std::uint32_t format, std::uint32_t width, bool sampled, float expected, bool store = false) {
     Output.fill(0xdeadbeefu);
     const auto output = reinterpret_cast<std::uintptr_t>(Output.data());
@@ -67,6 +88,17 @@ int main() {
         if (!device) return VulkanTestSkipped;
         const auto shaders = DepthFastClearHarness::Compile(*device);
         const auto address = reinterpret_cast<std::uintptr_t>(Depth.data());
+        Depth.fill(0.25f);
+        const auto writer = CachedWriter(*device);
+        device->Dispatch(writer, 1, 1, 1);
+        device->Dispatch(writer, 1, 1, 1);
+        device->WaitIdle();
+        const DepthFastClearHarness::Surface promoted{address, 0, 0, false, VK_FORMAT_D32_SFLOAT};
+        Require(DepthFastClearHarness::Draw(*device, shaders, promoted, {.depthWrite = true}) == DepthFastClearHarness::Covered, "promoted depth producer did not cover the surface");
+        Read(*device, 22u, Width, true, 0.5f);
+        device->Dispatch(writer, 1, 1, 1);
+        device->WaitIdle();
+        Read(*device, 22u, Width, true, 0.75f);
         for (const auto format : {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM}) {
             AgcDriver::Graphics::ClearCachedTextures(device->Device());
             AgcDriver::Graphics::ClearDepthSurfaces(device->Device());

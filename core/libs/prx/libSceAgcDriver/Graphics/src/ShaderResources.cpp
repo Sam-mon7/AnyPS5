@@ -2011,6 +2011,7 @@ bool LoopGuardEnabled() {
 void ShaderResources::noteReusable() {
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation();
+    depthSurfacesSeen = DepthSurfacesSerial();
     reusable = false;
     directRegions.clear();
     // A depth-backed storage image must copy the current depth plane at each use.
@@ -2614,6 +2615,8 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    // A new depth surface can change an existing image's backing without a guest-memory write.
+    if ((!textures.empty() || !storageTextures.empty()) && depthSurfacesSeen != DepthSurfacesSerial()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;

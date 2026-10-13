@@ -520,6 +520,7 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    std::uint64_t depthSurfacesSeen = 0;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
