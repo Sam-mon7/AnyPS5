@@ -6,6 +6,7 @@
 #endif
 #include <vulkan/vulkan.h>
 #include "GpuCheckpoints.hpp"
+#include "AftermathCapture.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +35,7 @@ inline void Require(bool condition, const std::string& reason) {
 }
 
 inline void Check(VkResult result, const char* operation) {
+    Aftermath::Notify(result);
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 

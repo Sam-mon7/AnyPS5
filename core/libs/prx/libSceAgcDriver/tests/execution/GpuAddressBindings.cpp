@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -43,8 +44,10 @@ bool HasObject(const GpuAddressBindings::Matches& matches, VkObjectType type, st
 }
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        const bool overlap = argc == 2 && std::strcmp(argv[1], "--overlap-compile-only") == 0;
+        Require(argc == 1 || overlap, "usage: agc_driver_gpu_address_bindings_tests [--overlap-compile-only]");
 #ifdef _WIN32
         Require(_putenv_s("APS5_GPU_ADDRESS_BINDINGS", "1") == 0 && _putenv_s("APS5_GPU_CHECKPOINTS", "") == 0, "cannot set binding-only diagnostic environment");
 #else
@@ -110,10 +113,23 @@ int main() {
             Require(HasObject(history->Find(0, UINT64_MAX, VK_OBJECT_TYPE_IMAGE, imageHandle), VK_OBJECT_TYPE_IMAGE, imageHandle, VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT, beforeRelease), "depth image unbind callback missing after destruction");
             beforeDestroy = history->Find(0, UINT64_MAX).newest;
         }
+        std::unique_ptr<AgcDriver::VulkanDevice> compileOnly;
+        if (overlap) {
+            compileOnly = std::make_unique<AgcDriver::VulkanDevice>(AgcDriver::VulkanDevice::CompileOnly{});
+            std::fprintf(stderr, "[binding-overlap] both devices alive\n");
+            std::fprintf(stderr, "[binding-overlap] ordinary destroy begin\n");
+        }
         device.reset();
+        if (overlap) std::fprintf(stderr, "[binding-overlap] ordinary destroyed; compile-only remains\n");
         const auto afterDestroy = history->Find(0, UINT64_MAX);
         Require(afterDestroy.newest > beforeDestroy && afterDestroy.droppedCallbacks == 0 && afterDestroy.omittedObjects == 0, "callback state must remain alive through device-owned resource destruction");
-        { AgcDriver::VulkanDevice compileOnly(AgcDriver::VulkanDevice::CompileOnly{}); }
+        if (overlap) {
+            std::fprintf(stderr, "[binding-overlap] compile-only destroy begin\n");
+            compileOnly.reset();
+            std::fprintf(stderr, "[binding-overlap] compile-only destroyed\n");
+        } else {
+            AgcDriver::VulkanDevice sequentialCompileOnly(AgcDriver::VulkanDevice::CompileOnly{});
+        }
         std::puts("address binding native buffer, depth image, unbind and device/compile-only teardown checks passed");
         return 0;
     } catch (const std::exception& error) {

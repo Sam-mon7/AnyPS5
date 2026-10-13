@@ -3660,6 +3660,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             context.CheckResult(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {
+            Aftermath::Notify(result); // Preserve the failed batch until crash capture finishes.
             release(*batch);
             context.CheckResult(result, "vkWaitForFences recorder");
         }

@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/AftermathCapture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
@@ -67,6 +68,7 @@ namespace AgcDriver {
 namespace {
 
 void check(VkResult result, const char* operation) {
+    Graphics::Aftermath::Notify(result);
     if (result != VK_SUCCESS) {
         throw std::runtime_error(std::string(operation) + ": Vulkan result " + std::to_string(result));
     }
@@ -228,6 +230,7 @@ struct WorkgroupMemory {
 };
 
 struct VulkanDevice::State {
+    Graphics::Aftermath::DeviceLease aftermath;
     bool compileOnly = false;
     std::shared_ptr<Graphics::GpuCheckpoints> gpuCheckpoints;
     std::shared_ptr<Graphics::GpuAddressBindings> addressBindings;
@@ -636,6 +639,7 @@ struct VulkanDevice::State {
     }
 
     ~State() {
+        Graphics::Aftermath::JoinPending();
         contextReady = false;
         if (compileOnly && device != VK_NULL_HANDLE) {
             reinterpret_cast<PFN_vkDestroyDevice>(deviceProc(device, "vkDestroyDevice"))(device, nullptr);
@@ -643,6 +647,7 @@ struct VulkanDevice::State {
         }
         if (device != VK_NULL_HANDLE) {
             const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            Graphics::Aftermath::Notify(idle);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
             {
@@ -1656,6 +1661,28 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
     deviceInfo.pNext = &bdaFeatures;
+#if defined(ANYPS5_AFTERMATH_ENABLED)
+    VkPhysicalDeviceDiagnosticsConfigFeaturesNV diagnosticsFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV};
+    VkDeviceDiagnosticsConfigCreateInfoNV diagnosticsConfig{VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV};
+    if (state->aftermath) {
+        if (hasExtension(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+            VkPhysicalDeviceFeatures2 queried{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &diagnosticsFeature};
+            state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &queried);
+        }
+        if (diagnosticsFeature.diagnosticsConfig == VK_TRUE) {
+            diagnosticsFeature.pNext = const_cast<void*>(deviceInfo.pNext);
+            diagnosticsConfig.pNext = &diagnosticsFeature;
+            diagnosticsConfig.flags = VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV;
+            deviceInfo.pNext = &diagnosticsConfig;
+            deviceExtensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+            deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+            deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+            std::fprintf(stderr, "[aftermath] instance=%llu resource tracking enabled; shader debug/automatic checkpoints disabled\n", static_cast<unsigned long long>(serial));
+        } else {
+            std::fprintf(stderr, "[aftermath] instance=%llu resource tracking unavailable; basic capture only\n", static_cast<unsigned long long>(serial));
+        }
+    }
+#endif
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->shaderProfile = std::move(shaderProfile);

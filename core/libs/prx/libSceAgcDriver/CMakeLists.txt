@@ -266,12 +266,78 @@ target_link_libraries(libSceAgcDriver PRIVATE
         jpeg_turbo
         ${CMAKE_DL_LIBS}
 )
+set(ANYPS5_AFTERMATH_SDK_ROOT "" CACHE PATH "Optional local Nsight Aftermath SDK root (contains include and lib)")
+if(ANYPS5_AFTERMATH_SDK_ROOT)
+    if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(FATAL_ERROR "Optional Aftermath capture currently supports Windows x64 only")
+    endif()
+    get_filename_component(agcAftermathRoot "${ANYPS5_AFTERMATH_SDK_ROOT}" ABSOLUTE)
+    foreach(header IN ITEMS GFSDK_Aftermath_GpuCrashDump.h GFSDK_Aftermath_Defines.h GFSDK_Aftermath.h)
+        if(NOT EXISTS "${agcAftermathRoot}/include/${header}")
+            message(FATAL_ERROR "Aftermath SDK header missing: ${agcAftermathRoot}/include/${header}")
+        endif()
+    endforeach()
+    set(agcAftermathDll "${agcAftermathRoot}/lib/x64/GFSDK_Aftermath_Lib.x64.dll")
+    if(NOT EXISTS "${agcAftermathDll}")
+        message(FATAL_ERROR "Aftermath SDK DLL missing: ${agcAftermathDll}")
+    endif()
+    file(TO_CMAKE_PATH "${agcAftermathDll}" agcAftermathDll)
+    set(agcAftermathGenerated "${CMAKE_CURRENT_BINARY_DIR}/aftermath_generated")
+    file(CONFIGURE OUTPUT "${agcAftermathGenerated}/AftermathSdkPath.hpp"
+        CONTENT "inline constexpr wchar_t AftermathSdkPath[] = LR\"aftermath(@agcAftermathDll@)aftermath\";\n" @ONLY)
+    target_sources(libSceAgcDriver PRIVATE Graphics/src/AftermathCapture.cpp)
+    target_include_directories(libSceAgcDriver PRIVATE "${agcAftermathRoot}/include" "${agcAftermathGenerated}")
+    target_compile_definitions(libSceAgcDriver PRIVATE ANYPS5_AFTERMATH_ENABLED=1)
+endif()
+
 if(APS5_ENABLE_TRACY)
     target_link_libraries(libSceAgcDriver PUBLIC TracyClient)
 endif()
 
 set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(libSceAgcDriver)
+
+add_test_executable(agc_aftermath_disabled_tests EXCLUDE_FROM_ALL tests/AftermathCapture.cpp)
+target_include_directories(agc_aftermath_disabled_tests PRIVATE
+        ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_aftermath_disabled_tests PRIVATE libc)
+set_target_properties(agc_aftermath_disabled_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_aftermath_disabled_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_aftermath_disabled_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_aftermath_disabled COMMAND agc_aftermath_disabled_tests disabled)
+    set_tests_properties(agc_aftermath_disabled PROPERTIES TIMEOUT 10)
+    if(WIN32)
+        set_tests_properties(agc_aftermath_disabled PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+if(WIN32 AND ANYPS5_AFTERMATH_SDK_ROOT)
+    set(agcAftermathTestInclude "${agcAftermathRoot}/include")
+    add_test_executable(agc_aftermath_capture_tests EXCLUDE_FROM_ALL
+            tests/AftermathCapture.cpp Graphics/src/AftermathCapture.cpp)
+    target_include_directories(agc_aftermath_capture_tests PRIVATE
+            ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${agcAftermathTestInclude})
+    target_compile_definitions(agc_aftermath_capture_tests PRIVATE
+            ANYPS5_AFTERMATH_ENABLED=1 ANYPS5_AFTERMATH_TESTING=1)
+    target_link_libraries(agc_aftermath_capture_tests PRIVATE libc)
+    set_target_properties(agc_aftermath_capture_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_aftermath_capture_tests)
+    if(BUILD_TESTING)
+        set_target_properties(agc_aftermath_capture_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+        foreach(scenario IN ITEMS
+                unset lifecycle original-error status-sequence collect-failed query-failed timeout
+                callback-bytes callback-throws callback-io-fails held-callback held-callback-finished
+                concurrent-deadline serialized-acquire abandon-locked disable-failed
+                load-failed pin-failed enable-failed relative-output missing-export)
+            add_test(NAME agc_aftermath_${scenario} COMMAND agc_aftermath_capture_tests ${scenario})
+            set_tests_properties(agc_aftermath_${scenario} PROPERTIES TIMEOUT 10)
+            set_tests_properties(agc_aftermath_${scenario} PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endforeach()
+    endif()
+endif()
 
 if(BUILD_TESTING)
     add_test_executable(agc_write_watch_coverage_tests tests/WriteWatchCoverage.cpp)
@@ -1059,6 +1125,23 @@ target_link_libraries(agc_driver_graphics_tests PRIVATE
 
 set_target_properties(agc_driver_graphics_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_graphics_tests)
+
+if(WIN32 AND ANYPS5_AFTERMATH_SDK_ROOT)
+    target_sources(agc_driver_graphics_tests PRIVATE Graphics/src/AftermathCapture.cpp)
+    target_include_directories(agc_driver_graphics_tests PRIVATE ${agcAftermathTestInclude})
+    target_compile_definitions(agc_driver_graphics_tests PRIVATE
+            ANYPS5_AFTERMATH_ENABLED=1 ANYPS5_AFTERMATH_TESTING=1)
+    if(BUILD_TESTING)
+        add_test(NAME agc_aftermath_recorder_release
+                COMMAND agc_driver_graphics_tests --aftermath-recorder-release)
+        set_tests_properties(agc_aftermath_recorder_release PROPERTIES TIMEOUT 10)
+        if(WIN32)
+            set_tests_properties(agc_aftermath_recorder_release PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        endif()
+    endif()
+endif()
+
 
 add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
         tests/BdaDevice.cpp
