@@ -2265,7 +2265,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !state.depth && resolved.moved.empty() && !multisampled) {
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty() && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -2284,6 +2284,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             recipe->masked = masked;
             recipe->fragmentOutputs = inputs.fragmentOutputs;
             recipe->shaderStages = inputs.shaderStages;
+            recipe->hasDepth = state.depth.has_value();
             *recipeOut = std::move(recipe);
         }
         timing.Mark("draw_and_resource_release");
@@ -2566,7 +2567,9 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     Require(!draw.indirect, "a draw recipe covers direct draws only");
     auto* recorder = Recorder::Active();
     if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
-    Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
+    if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
+    const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
+    Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
     if (inputs.nothing) {
         result.recorded = true;
@@ -2591,6 +2594,12 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
         targets.push_back(std::move(resident));
+    }
+    if (recipe.hasDepth) {
+        timer.phase(PhaseSetup);
+        const auto depthView = DepthSurfaceView(context, *state.depth);
+        timer.phase(PhaseReadTarget);
+        if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
     }
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
