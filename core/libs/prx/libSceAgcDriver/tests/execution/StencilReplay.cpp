@@ -345,6 +345,30 @@ int main() {
         const std::array<ShaderRecompiler::MemoryRegion, 2> guardedMemory{{{rootAddress, std::as_bytes(std::span(root))}, {payloadAddress, std::as_bytes(std::span(&payload, 1))}}};
         Draw(*device, guarded, exported, replace(), 6u, 2u, false, {}, {}, Vertices, VertexCode, rootData, guardedMemory);
         Check(all, "readonly guarded SRT survives repeated references, primitives and instances");
+        auto tablePixel = std::vector<std::uint32_t>{0xf4040280u, 0xfa000018u, 0xf4000305u, 0xfa000000u, 0xbf8cc07fu, 0x7e0e020cu, 0x8f058404u, 0xf4280308u, 0x0a000000u, 0x7e140280u, 0x7e160280u, 0xbf8cc07fu, 0xf0008f08u, 0x0003100au, 0xbf8c3f70u};
+        tablePixel.insert(tablePixel.end(), alternating.begin(), alternating.end());
+        tablePixel.erase(std::find(tablePixel.begin(), tablePixel.end(), 0x7e0e02f2u));
+        const auto tableColor = std::find(tablePixel.begin(), tablePixel.end(), 0xf800180fu);
+        *(tableColor + 1) = 0x07101010u;
+        const auto depthAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(DepthMemory.data()));
+        alignas(256) const std::array<std::uint32_t, 8> depthTable{
+            static_cast<std::uint32_t>(depthAddress >> 8u), static_cast<std::uint32_t>((depthAddress >> 40u) & 0xffu) | (22u << 20u) | (((Width - 1u) & 3u) << 30u),
+            ((Width - 1u) >> 2u) | ((Height - 1u) << 14u), 0xfacu | (9u << 20u) | (9u << 28u), 0u, 0u, 0u, 0u,
+        };
+        std::array<std::uint32_t, 20> tableData{};
+        std::copy(rootData.begin(), rootData.end(), tableData.begin());
+        const auto tableBuffer = BufferDescriptor(depthTable.data(), 0u, sizeof(depthTable));
+        std::copy(tableBuffer.begin(), tableBuffer.end(), tableData.begin() + 16);
+        const std::array<ShaderRecompiler::MemoryRegion, 4> tableMemory{{
+            guardedMemory[0], guardedMemory[1],
+            {reinterpret_cast<std::uintptr_t>(depthTable.data()), std::as_bytes(std::span(depthTable))},
+            {depthAddress, std::as_bytes(std::span(DepthMemory))},
+        }};
+        bool feedbackRefused = false;
+        try { Draw(*device, tablePixel, exported, replace(), 3u, 1u, false, {}, {}, Vertices, VertexCode, tableData, tableMemory); }
+        catch (const std::exception& error) { feedbackRefused = std::string(error.what()).find("sampled depth-surface feedback") != std::string::npos; if (!feedbackRefused) throw; }
+        Require(feedbackRefused, "stencil replay accepted depth feedback through an image table");
+        Require(std::ranges::all_of(Pixels, [](std::byte value) { return value == Kept; }), "table depth feedback published guest color results before refusal");
         root[6] = root[7] = 0u;
         bool faultThrown = false;
         try { Draw(*device, guarded, exported, replace(), 6u, 2u, false, {}, {}, Vertices, VertexCode, rootData, std::span(guardedMemory).first(1)); }

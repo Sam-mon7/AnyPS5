@@ -981,7 +981,7 @@ void verifyImageTableKeys() {
     large[1] = TableT(textures[2].bytes.data(), TableFormat11_11_10UInt, TableType2D);
     large[2] = TableT(textures[3].bytes.data(), TableFormat32UInt, TableType2D, 3u, 4u);
     large[3] = TableT(textures[3].bytes.data(), TableFormat8888UNorm, TableType3D);
-    large[4] = {0x1234u, 0x5678u, 0x9abcu, 0x0000ffacu, 0u, 0u, 0u, 0u};
+    large[4] = {0x1234u, 0x5678u, 0x9abcu, 0x1000ffacu, 0u, 0u, 0u, 0u};
     large[5] = TableT(textures[3].bytes.data(), 0u, TableType2D);
     for (std::uint32_t entry = 6; entry < Entries; entry++) large[entry] = TableT(textures[entry % 4u].bytes.data(), TableFormat8888UNorm, TableType2D, entry);
     const auto userData = TableUserData(guest);
@@ -1083,6 +1083,25 @@ void verifyImageTableBulkReads() {
     require(byWordReads.wordReads == Records * 8u && byWordReads.bulkCalls == 0u, "image table bulk reads: without a bulk reader the records were not read word by word once");
     require(byRunReads.wordReads == 0u && byRunReads.bulkCalls == 1u && byRunReads.bulkWords == Records * 8u, "image table bulk reads: the contiguous records across a page boundary were not read in one run");
     require(byRun->snapshot.tables == byWord->snapshot.tables && byRun->snapshot.tables.tables.at(0).keys == Records, "image table bulk reads: reading in runs changed the snapshot");
+    for (const bool bulk : {false, true}) {
+        SrtReadTrace trace;
+        auto tracedMemory = byWordReads;
+        SrtRuntime runtime;
+        runtime.userData = request.context.userData;
+        runtime.shaderBase = request.shader.codeAddress;
+        runtime.userContext = &tracedMemory;
+        runtime.readMemory = &CountingRead;
+        runtime.readSpecializationMemory = &CountingRead;
+        runtime.accessible = &CountingAccessible;
+        runtime.readTrace = &trace;
+        if (bulk) runtime.readWords = &CountingReadWords;
+        ResourceSnapshot snapshot;
+        ResourceMaterializer{}.Materialize(*GetResourcePlan(request), runtime, snapshot);
+        std::sort(trace.otherReads.begin(), trace.otherReads.end());
+        for (std::uint32_t word = 0; word < Records * 8u; ++word) {
+            require(std::binary_search(trace.otherReads.begin(), trace.otherReads.end(), byWordReads.begin + word * sizeof(std::uint32_t)), "image table reads were omitted from flat-data alias exclusions");
+        }
+    }
     AgcDriver::ShaderMemory memory({});
     const auto captured = memory.Capture(request);
     require(captured->snapshot.tables == byWord->snapshot.tables && TableCovered(memory.Regions(), words.data() + 512u, Records * 32u), "image table bulk reads: the shader memory's run reads changed the snapshot or its captured regions");
@@ -1202,7 +1221,7 @@ void verifyImageTables() {
     heap = saved;
 
 
-    heap[0][3] &= 0x0fffffffu;
+    heap[0][3] = (heap[0][3] & 0x0fffffffu) | 0x10000000u;
     const auto invalid = CompileTable(request);
     const auto& invalidMap = TableMap(*invalid.result);
     const auto invalidCodes = TableCodes(invalidMap, 0);
@@ -1220,7 +1239,7 @@ void verifyImageTables() {
     const auto& tail = partialTables.words.at(partialTables.tables[0].codes.at(3));
     require(tail.dwords[0] == heap[3][0] && std::all_of(tail.dwords.begin() + 1, tail.dwords.end(), [](std::uint32_t word) { return word == 0u; }), "image tables: the straddling record's tail is not zero");
     const auto& partialMap = TableMap(*partial.result);
-    require((partialMap.at(TableCodes(partialMap, 0).at(3) + Abi::ImageRecordFlags) & Abi::PoisonFlag) != 0u, "image tables: a straddling record was bound");
+    require(TableCodes(partialMap, 0).at(3) == Abi::NullCode, "image tables: a zero-filled type-zero tail was not a null descriptor");
     FillTableSrt(guest, heap.data(), 32u, 4u);
 
     void* reserved = nullptr;
@@ -1510,7 +1529,7 @@ void verifyPointerImageTable() {
     entry(0, TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D));
     entry(1, TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D));
     entry(2, TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D));
-    entry(4, {0x1234u, 0x5678u, 0x9abcu, 0x0000ffacu, 0u, 0u, 0u, 0u});
+    entry(4, {0x1234u, 0x5678u, 0x9abcu, 0x1000ffacu, 0u, 0u, 0u, 0u});
     entry(255, TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D));
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(root));
     const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};

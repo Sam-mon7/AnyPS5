@@ -457,6 +457,7 @@ private:
         if (!runtime.readMemory(runtime.userContext, address, &word)) {
             throw std::runtime_error("image table: failed to read guest memory at 0x" + hexText(address));
         }
+        if (runtime.readTrace != nullptr) runtime.readTrace->otherReads.push_back(address);
         return word;
     }
 
@@ -639,6 +640,9 @@ private:
         for (const auto& [address, count] : runs) {
             if (runtime.readWords != nullptr) {
                 if (!runtime.readWords(runtime.userContext, address, read.data() + at, count)) throw std::runtime_error("image table: failed to read guest memory at 0x" + hexText(address));
+                if (runtime.readTrace != nullptr) {
+                    for (std::uint32_t word = 0; word < count; ++word) runtime.readTrace->otherReads.push_back(address + word * sizeof(std::uint32_t));
+                }
             } else {
                 for (std::uint32_t word = 0; word < count; word++) read[at + word] = Read(address + word * 4u);
             }

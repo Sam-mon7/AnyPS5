@@ -1058,6 +1058,47 @@ int main() {
         return !StencilReplaySafe(b.program);
     });
 
+    passed &= run("stencil replay ignores only non-table image EXEC edges", [&] {
+        for (const auto opcode : {IrOpcode::ImageSampleRaw, IrOpcode::ImageGatherRaw, IrOpcode::ImageQueryLod}) {
+            Builder b;
+            b.program.Resources().stage = IrShaderStage::Pixel;
+            auto& active = b.ballotBit(b.truth());
+            auto& address = b.emit(IrOpcode::MakeImageAddress, IrType::ImageAddress, {&b.constant(0u)});
+            auto& image = b.emit(IrOpcode::GetImageResource, IrType::ImageResource, {});
+            auto& sampler = b.emit(IrOpcode::GetSamplerResource, IrType::SamplerResource, {});
+            b.program.Info().images.emplace_back();
+            b.program.Info().samplers.emplace_back();
+            auto& memories = b.program.Resources().memoryInfo;
+            memories.emplace_back();
+            memories.back().kind = ResourceKind::Image;
+            memories.back().resource = 0u;
+            memories.back().sampler = 0u;
+            auto& access = b.emit(opcode, IrType::U32x4, {&image, &sampler, &address, &active});
+            access.SetFlags(MemoryFlags{0u});
+            exportUnder(b, b.truth(), true, true);
+            if (!StencilReplaySafe(b.program)) return false;
+            b.program.Info().images[0].table = 0u;
+            if (StencilReplaySafe(b.program)) return false;
+            b.program.Info().images[0].table = NoTable;
+            b.program.Info().samplers[0].table = 0u;
+            if (StencilReplaySafe(b.program)) return false;
+            b.program.Info().samplers[0].table = NoTable;
+            memories[0].kind = ResourceKind::ScalarBuffer;
+            if (StencilReplaySafe(b.program)) return false;
+            memories[0].kind = ResourceKind::Image;
+            memories[0].sampler = 1u;
+            if (StencilReplaySafe(b.program)) return false;
+            memories[0].sampler = 0u;
+            access.SetFlags(MemoryFlags{1u});
+            if (StencilReplaySafe(b.program)) return false;
+            access.SetFlags(MemoryFlags{0u});
+            auto& coordinate = b.select(active, b.constant(1u), b.constant(0u));
+            address.ReplaceArgument(0u, &coordinate);
+            if (StencilReplaySafe(b.program)) return false;
+        }
+        return true;
+    });
+
     const auto optionalPixelBody = [&](bool derivativeConsumer, IrOpcode observer = IrOpcode::ImageSampleRaw) {
         Builder b;
         b.program.Resources().stage = IrShaderStage::Pixel;

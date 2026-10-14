@@ -293,14 +293,10 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
         const auto bytes = static_cast<std::uint64_t>(words) * sizeof(std::uint32_t);
         Page* page = nullptr;
         if (address % sizeof(std::uint32_t) == 0 && address <= std::numeric_limits<std::uint64_t>::max() - bytes && !self.overlapsInitial(address, address + bytes)) page = &self.page(base);
-        if (page != nullptr && page->valid.all()) {
+        if (page != nullptr && page->valid.All()) {
             std::memcpy(values, page->words.data() + index, bytes);
-            std::bitset<PageWords> mask;
-            mask.set();
-            mask >>= PageWords - words;
-            mask <<= index;
-            page->read |= mask;
-            page->recent |= mask;
+            page->read.SetRange(index, words);
+            page->recent.SetRange(index, words);
             CaptureTotals().reads += words;
         } else {
             for (std::size_t word = 0; word < words; ++word) {

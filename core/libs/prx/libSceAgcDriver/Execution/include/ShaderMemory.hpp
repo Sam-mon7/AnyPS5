@@ -86,6 +86,14 @@ private:
     public:
         [[nodiscard]] bool Test(std::size_t index) const { return (bits[index / 64u] >> (index % 64u) & 1u) != 0u; }
         void Set(std::size_t index) { bits[index / 64u] |= std::uint64_t{1} << (index % 64u); }
+        void SetRange(std::size_t index, std::size_t count) {
+            while (count != 0u) {
+                const auto words = std::min(count, 64u - index % 64u);
+                bits[index / 64u] |= (~std::uint64_t{0} >> (64u - words)) << (index % 64u);
+                index += words;
+                count -= words;
+            }
+        }
         void SetAll() { bits.fill(~std::uint64_t{0}); }
         void SetBlock(std::size_t index) { bits[index / 64u] |= ((std::uint64_t{1} << BlockWords) - 1u) << (index % 64u / BlockWords * BlockWords); }
         void Reset() { bits.fill(0u); }
