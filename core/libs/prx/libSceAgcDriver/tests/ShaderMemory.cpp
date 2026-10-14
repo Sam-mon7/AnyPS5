@@ -652,7 +652,7 @@ void verifyGuardedDescriptorSources() {
     static Texture texture;
     const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
     const std::array<std::uint32_t, 8> valid{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
-    const std::array<std::uint32_t, 8> invalid{0x12345678u, 0xffffffffu, 0xffffffffu, 0u, 0u, 0u, 0u, 0u};
+    const std::array<std::uint32_t, 8> invalid{0x12345678u, 0xffffffffu, 0xffffffffu, 0x10000000u, 0u, 0u, 0u, 0u};
     const std::array<std::uint32_t, 4> sampler{0u, 0u, 0u, 0u};
     std::array<std::uint32_t, 4> output{};
     const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
@@ -969,7 +969,7 @@ void verifyBindlessTable() {
     request.context.memory = emptyMemory.Regions();
     require(Recompile(request, *emptyCapture)->variantId == compiled->variantId, "bindless: an empty table changed the artifact");
     heap = savedHeap;
-    heap[0][3] &= 0x0fffffffu;
+    heap[0][3] = (heap[0][3] & 0x0fffffffu) | 0x10000000u;
     AgcDriver::ShaderMemory invalidMemory({});
     expectFailure([&] { static_cast<void>(invalidMemory.Capture(request)); }, "invalid descriptor", "bindless: an invalid T# was accepted");
     heap = savedHeap;
