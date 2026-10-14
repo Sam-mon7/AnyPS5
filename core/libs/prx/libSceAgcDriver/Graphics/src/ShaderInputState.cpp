@@ -103,7 +103,7 @@ ShaderRecompiler::ShaderPixelStageInfo DefaultUnexportedInputs(ShaderRecompiler:
     return pixel;
 }
 
-ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& context, const std::array<std::uint8_t, 8>& exportMappings, bool nullProgram) {
+ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& context, const std::array<std::uint8_t, 8>& exportMappings, bool nullProgram, const State* state) {
     const auto inControl = nullProgram ? 0u : read(context, spiPsInControl, RegisterBank::Context);
     const auto inputNum = inControl & 0x3Fu;
     if (inputNum > 32u) {
@@ -143,6 +143,12 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     const bool depthExportEnable = (shaderControl & 0x1u) != 0;
     const bool sampleMaskExportEnable = ((shaderControl >> 8u) & 0x1u) != 0;
     const bool stencilRefExportEnable = ((shaderControl >> 1u) & 0x1u) != 0;
+    const auto referenceUsed = [](const VkStencilOpState& face) {
+        const bool compared = face.compareMask != 0 && face.compareOp != VK_COMPARE_OP_ALWAYS && face.compareOp != VK_COMPARE_OP_NEVER;
+        const bool replaced = face.writeMask != 0 && (face.failOp == VK_STENCIL_OP_REPLACE || face.passOp == VK_STENCIL_OP_REPLACE || face.depthFailOp == VK_STENCIL_OP_REPLACE);
+        return compared || replaced;
+    };
+    const bool stencilReferenceUsed = state == nullptr || (state->stencilTest && (referenceUsed(state->stencilFront) || referenceUsed(state->stencilBack)));
     const bool depthBeforeShader = ((shaderControl >> 12u) & 0x1u) != 0;
     const auto zOrder = (shaderControl >> 4u) & 0x3u;
     const auto loaded = [&](PixelInput input) { return (activeInputs & PixelInputBit(input)) != 0; };
@@ -171,7 +177,7 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .orderedPixelShader = ((shaderControl >> 16u) & 0x1u) != 0,
         .targetOutputMode = targetOutputMode,
         .targetExportMapping = nullProgram ? std::array<std::uint8_t, 8>{} : exportMappings,
-        .stencilRefExportEnable = stencilRefExportEnable
+        .stencilRefExportEnable = stencilRefExportEnable && stencilReferenceUsed
     };
 }
 
