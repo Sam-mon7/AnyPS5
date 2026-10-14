@@ -199,6 +199,8 @@ private:
     DenseValues _dense;
 };
 
+bool MayEvaluate(const IrResourcePlan& program, IrValue* value);
+
 using Evaluator = BasicEvaluator<IrNode>;
 using CompactEvaluator = BasicEvaluator<CompactNode>;
 
