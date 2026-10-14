@@ -13,6 +13,7 @@ namespace ShaderRecompiler {
 
 using SrtMemoryReader = bool (*)(void* userData, std::uint64_t address, std::uint32_t* value);
 using SrtMemoryProbe = bool (*)(void* userData, std::uint64_t address, std::uint64_t bytes);
+using SrtMemoryBulkReader = bool (*)(void* userData, std::uint64_t address, std::uint32_t* values, std::uint64_t count);
 
 // The guest addresses a walk dereferenced (Detail::Evaluator::EvaluateRawRead): the leaf read of
 // each pure flat slot (IrResourcePlan::pureFlatSlots) as (flat offset, address), set by the
@@ -34,6 +35,8 @@ struct SrtRuntime {
     SrtReadTrace* readTrace = nullptr;
     SrtMemoryProbe accessible = nullptr;
     SrtUserDataUse* userDataUse = nullptr;
+    SrtMemoryProbe pendingWrite = nullptr;
+    SrtMemoryBulkReader readWords = nullptr;
 };
 
 enum class RuntimeValueType {

@@ -439,6 +439,18 @@ private:
         return false;
     }
 
+    bool unusedImageExec(const IrUse& use) const {
+        const auto& instruction = *use.user;
+        const auto opcode = instruction.Opcode();
+        if (use.operand != 3u || instruction.ArgumentCount() != 4u || instruction.Argument(3)->Type() != IrType::U1 || (opcode != IrOpcode::ImageSampleRaw && opcode != IrOpcode::ImageGatherRaw && opcode != IrOpcode::ImageQueryLod)) return false;
+        const auto index = instruction.Flags<MemoryFlags>().index;
+        const auto& memories = program.Resources().memoryInfo;
+        if (index >= memories.size()) return false;
+        const auto& memory = memories[index];
+        const auto& info = program.Info();
+        return memory.kind == ResourceKind::Image && memory.resource < info.images.size() && memory.sampler < info.samplers.size() && info.images[memory.resource].table == NoTable && info.samplers[memory.sampler].table == NoTable;
+    }
+
     bool quadObserved(const IrValue* value) const {
         std::set<const IrValue*> visited;
         std::vector<const IrValue*> pending{value};
@@ -449,6 +461,7 @@ private:
             for (const auto& info : program.Metadata().blockInfo) if (info.condition && info.condition->Resolve() == current) return true;
             for (const auto& use : current->OperandUses()) {
                 const auto opcode = use.user->Opcode();
+                if (unusedImageExec(use)) continue;
                 if (ImageOpcodeInfoOf(opcode).needsSampler || opcode == IrOpcode::Ballot || opcode == IrOpcode::WqmU64 || opcode == IrOpcode::ReadLane || opcode == IrOpcode::ReadFirstLane || opcode == IrOpcode::DppMoveU32 || opcode == IrOpcode::DppUpdateU32 || opcode == IrOpcode::SwizzleU32 || opcode == IrOpcode::PermuteU32 || opcode == IrOpcode::BpermuteU32 || opcode == IrOpcode::Permlane16U32 || opcode == IrOpcode::WriteLane || SharedAccessOf(opcode) != SharedAccess::None) return true;
                 if (opcode == IrOpcode::SetAttribute || opcode == IrOpcode::Reference || opcode == IrOpcode::ReferenceU32) continue;
                 pending.push_back(use.user);
@@ -471,6 +484,7 @@ private:
             }
             for (const auto& use : current->OperandUses()) {
                 const auto opcode = use.user->Opcode();
+                if (unusedImageExec(use)) continue;
                 if (ImageOpcodeInfoOf(opcode).needsSampler) return true;
                 if (restricted.contains(use.user) || opcode == IrOpcode::SetAttribute || opcode == IrOpcode::Reference || opcode == IrOpcode::ReferenceU32) continue;
                 pending.push_back(use.user);

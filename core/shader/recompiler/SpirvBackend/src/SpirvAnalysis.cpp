@@ -697,7 +697,7 @@ OneLaneRejection Wave64OneLaneRejection(const IrProgram& program, std::uint32_t 
     if (sharedWrites && workgroupThreads > program.WaveSize()) return OneLaneRejection::SharedMemory;
     const auto supported = [&](std::uint32_t capability) { return std::find(capabilities.begin(), capabilities.end(), capability) != capabilities.end(); };
     const auto& images = program.Info().images;
-    const bool bindless = std::any_of(images.begin(), images.end(), [](const auto& image) { return image.indirectRoot != ImageResource::NoIndirectImage; });
+    const bool bindless = std::any_of(images.begin(), images.end(), [](const auto& image) { return image.table != NoTable; });
     if (bindless && !(supported(spv::CapabilityShaderNonUniform) && supported(spv::CapabilitySampledImageArrayNonUniformIndexing) && supported(spv::CapabilityStorageImageArrayNonUniformIndexing))) {
         return OneLaneRejection::BindlessIndex;
     }
