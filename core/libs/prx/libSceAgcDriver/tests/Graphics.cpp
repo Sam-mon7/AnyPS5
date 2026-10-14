@@ -45,6 +45,10 @@
 #include <type_traits>
 #include <thread>
 #include <vector>
+#if defined(ANYPS5_AFTERMATH_TESTING)
+#include "prx/libSceAgcDriver/Graphics/include/AftermathCapture.hpp"
+#include <filesystem>
+#endif
 
 extern "C" std::terminate_handler APS5_VABI _ZSt13set_terminatePFvvE_nid_postfix(std::terminate_handler handler);
 
@@ -2590,6 +2594,30 @@ struct MockVulkan {
 
 MockVulkan mock;
 
+#if defined(ANYPS5_AFTERMATH_TESTING)
+bool aftermathFenceLoss = false;
+bool aftermathFinished = false;
+bool aftermathResetTooEarly = false;
+unsigned aftermathResets = 0, aftermathQueries = 0, aftermathDisables = 0;
+long long aftermathMilliseconds = 0;
+
+GFSDK_Aftermath_Result GFSDK_AFTERMATH_CALL mockAftermathEnable(GFSDK_Aftermath_Version, uint32_t, uint32_t,
+        PFN_GFSDK_Aftermath_GpuCrashDumpCb, PFN_GFSDK_Aftermath_ShaderDebugInfoCb,
+        PFN_GFSDK_Aftermath_GpuCrashDumpDescriptionCb, PFN_GFSDK_Aftermath_ResolveMarkerCb, void*) {
+    return GFSDK_Aftermath_Result_Success;
+}
+GFSDK_Aftermath_Result GFSDK_AFTERMATH_CALL mockAftermathDisable() { ++aftermathDisables; return GFSDK_Aftermath_Result_Success; }
+GFSDK_Aftermath_Result GFSDK_AFTERMATH_CALL mockAftermathStatus(GFSDK_Aftermath_CrashDump_Status* status) {
+    aftermathFinished = ++aftermathQueries == 2;
+    *status = aftermathFinished ? GFSDK_Aftermath_CrashDump_Status_Finished : GFSDK_Aftermath_CrashDump_Status_CollectingData;
+    return GFSDK_Aftermath_Result_Success;
+}
+bool mockAftermathReady() { return true; }
+void mockAftermathNoop() {}
+auto mockAftermathNow() -> std::chrono::steady_clock::time_point { return std::chrono::steady_clock::time_point{} + std::chrono::milliseconds(aftermathMilliseconds); }
+void mockAftermathSleep() { aftermathMilliseconds += 50; }
+#endif
+
 template<typename THandle>
 THandle makeHandle() {
     const auto value = mock.next++;
@@ -2856,8 +2884,21 @@ VKAPI_ATTR void VKAPI_CALL mockFreeCommandBuffers(VkDevice, VkCommandPool, std::
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateFence(VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence* fence) { *fence = makeHandle<VkFence>(); ++mock.live; return VK_SUCCESS; }
 VKAPI_ATTR void VKAPI_CALL mockDestroyFence(VkDevice, VkFence, const VkAllocationCallbacks*) { --mock.live; }
 VKAPI_ATTR VkResult VKAPI_CALL mockGetFenceStatus(VkDevice, VkFence) { return VK_SUCCESS; }
-VKAPI_ATTR VkResult VKAPI_CALL mockResetFences(VkDevice, std::uint32_t, const VkFence*) { return VK_SUCCESS; }
-VKAPI_ATTR VkResult VKAPI_CALL mockWaitForFences(VkDevice, std::uint32_t, const VkFence*, VkBool32, std::uint64_t) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL mockResetFences(VkDevice, std::uint32_t, const VkFence*) {
+#if defined(ANYPS5_AFTERMATH_TESTING)
+    if (aftermathFenceLoss) {
+        ++aftermathResets;
+        aftermathResetTooEarly |= !aftermathFinished;
+    }
+#endif
+    return VK_SUCCESS;
+}
+VKAPI_ATTR VkResult VKAPI_CALL mockWaitForFences(VkDevice, std::uint32_t, const VkFence*, VkBool32, std::uint64_t) {
+#if defined(ANYPS5_AFTERMATH_TESTING)
+    if (aftermathFenceLoss) return VK_ERROR_DEVICE_LOST;
+#endif
+    return VK_SUCCESS;
+}
 VKAPI_ATTR VkResult VKAPI_CALL mockBeginCommandBuffer(VkCommandBuffer, const VkCommandBufferBeginInfo*) { return VK_SUCCESS; }
 VKAPI_ATTR VkResult VKAPI_CALL mockEndCommandBuffer(VkCommandBuffer) { return VK_SUCCESS; }
 VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) { return VK_SUCCESS; }
@@ -2937,6 +2978,62 @@ AgcDriver::Graphics::Context mockContext() {
     context.limits.maxDescriptorSetStorageBuffers = 32;
     return context;
 }
+
+#if defined(ANYPS5_AFTERMATH_TESTING)
+void aftermathRecorderReleaseTest() {
+    namespace Capture = AgcDriver::Graphics::Aftermath;
+    const auto output = std::filesystem::absolute(std::filesystem::temp_directory_path()) /
+        ("anyps5-aftermath-recorder-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Require(!std::filesystem::exists(output), "Aftermath recorder test output already exists");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+    } cleanup{output};
+#ifdef _WIN32
+    _putenv_s("APS5_AFTERMATH", "1");
+    _putenv_s("APS5_AFTERMATH_DIR", output.string().c_str());
+    _putenv_s("APS5_PROFILE_DRAW", "");
+    _putenv_s("APS5_PROFILE_GPU", "");
+    _putenv_s("APS5_TRACE_DIR", "");
+#else
+    setenv("APS5_AFTERMATH", "1", 1);
+    setenv("APS5_AFTERMATH_DIR", output.string().c_str(), 1);
+    unsetenv("APS5_PROFILE_DRAW");
+    unsetenv("APS5_PROFILE_GPU");
+    unsetenv("APS5_TRACE_DIR");
+#endif
+    Capture::Testing::Hooks hooks;
+    hooks.enable = mockAftermathEnable;
+    hooks.disable = mockAftermathDisable;
+    hooks.status = mockAftermathStatus;
+    hooks.load = mockAftermathReady;
+    hooks.pin = mockAftermathReady;
+    hooks.unload = mockAftermathNoop;
+    hooks.now = mockAftermathNow;
+    hooks.sleep = mockAftermathSleep;
+    hooks.beforeWrite = mockAftermathNoop;
+    hooks.destroyed = mockAftermathNoop;
+    Capture::Testing::Install(hooks);
+    mock = MockVulkan{};
+    bool preservedError = false;
+    {
+        Capture::DeviceLease lease;
+        Require(static_cast<bool>(lease), "Aftermath recorder mock lease is disabled");
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::Graphics::Recorder recorder(mockContext(), false);
+        recorder.Commands();
+        recorder.Submit();
+        aftermathFenceLoss = true;
+        try { recorder.Sync(); }
+        catch (const std::runtime_error& error) { preservedError = std::string_view(error.what()).find("Vulkan result -4") != std::string_view::npos; }
+        aftermathFenceLoss = false;
+    }
+    Require(preservedError, "Aftermath changed the recorder's original device-loss exception");
+    Require(aftermathQueries == 2 && aftermathMilliseconds == 50, "Recorder did not finish capture before propagating loss");
+    Require(aftermathResets == 1 && !aftermathResetTooEarly, "Recorder released its failed batch before Aftermath capture finished");
+    Require(aftermathDisables == 1 && mock.live == 0, "Aftermath recorder fixture leaked session or Vulkan mock objects");
+}
+#endif
 
 using Role = ShaderRecompiler::DescriptorRole;
 using Kind = ShaderRecompiler::DescriptorKind;
@@ -6051,6 +6148,13 @@ int main(int argc, char** argv) {
             std::cout << "sparse buffer hole tests " << (passed ? "passed" : "failed") << '\n';
             return passed ? 0 : 1;
         }
+#if defined(ANYPS5_AFTERMATH_TESTING)
+        if (argc == 2 && std::string_view(argv[1]) == "--aftermath-recorder-release") {
+            aftermathRecorderReleaseTest();
+            std::cout << "Aftermath capture precedes failed recorder batch release\n";
+            return 0;
+        }
+#endif
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
             descriptorLayoutFlagTests();
             std::cout << "Descriptor layout native and captured binding flags passed\n";

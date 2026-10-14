@@ -3262,7 +3262,9 @@ void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
     auto& pool = chain[allocation.poolIndex];
     if (pool.handle != allocation.pool || pool.liveSets == 0) std::terminate();
     if (--pool.liveSets != 0) return;
-    if (resetPool(context.device, pool.handle, 0) != VK_SUCCESS) std::terminate();
+    const auto result = resetPool(context.device, pool.handle, 0);
+    Aftermath::Notify(result);
+    if (result != VK_SUCCESS) std::terminate();
     pool.exhausted = false;
 }
 

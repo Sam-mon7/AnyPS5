@@ -3753,6 +3753,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {
+            Aftermath::Notify(result);
             release(*batch);
             Check(result, "vkWaitForFences recorder");
         }

@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/AftermathCapture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <atomic>
 #include <cstdint>
@@ -71,6 +72,7 @@ Driver& Driver::Get() {
 }
 
 Driver::~Driver() {
+    Graphics::Aftermath::Abandon();
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
     stop();
 }

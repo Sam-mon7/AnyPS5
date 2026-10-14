@@ -5,6 +5,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include "AftermathCapture.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -44,6 +45,7 @@ inline void ReportDeviceLost() {
 }
 
 inline void Check(VkResult result, const char* operation) {
+    Aftermath::Notify(result);
     if (result == VK_ERROR_DEVICE_LOST) ReportDeviceLost();
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
