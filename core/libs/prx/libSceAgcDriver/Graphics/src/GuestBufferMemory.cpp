@@ -30,6 +30,7 @@
 #include <bit>
 #include <condition_variable>
 #include <iterator>
+#include <list>
 #include <map>
 #include <mutex>
 #include <set>
@@ -112,7 +113,7 @@ struct GuestBufferMemory::AddressSpace {
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     mutable std::mutex tableMutex;
-    mutable std::map<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>>> writeTables;
+    mutable std::map<std::vector<std::uint64_t>, std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>>> tables;
 };
 
 namespace {
@@ -1153,6 +1154,59 @@ ImageMirrors& Mirrors() {
     return mirrors;
 }
 
+struct SnapshotCopies {
+    using Key = std::tuple<std::uint64_t, std::size_t, VkBufferUsageFlags>;
+    static constexpr std::size_t Budget = std::size_t{16} << 20u;
+    static constexpr std::size_t MaxEntries = 1024;
+    std::mutex mutex;
+    VkDevice device = VK_NULL_HANDLE;
+    std::map<Key, std::pair<std::shared_ptr<Buffer>, std::list<Key>::iterator>> entries;
+    std::list<Key> recency;
+    std::size_t bytes = 0;
+    void clear() {
+        entries.clear();
+        recency.clear();
+        bytes = 0;
+    }
+};
+
+SnapshotCopies& SnapshotCopyCache() {
+    static SnapshotCopies copies;
+    return copies;
+}
+
+std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t address, std::span<const std::byte> bytes, VkBufferUsageFlags usage) {
+    auto& copies = SnapshotCopyCache();
+    std::lock_guard lock(copies.mutex);
+    if (copies.device != context.device) {
+        copies.clear();
+        copies.device = context.device;
+    }
+    const SnapshotCopies::Key key{address, bytes.size(), usage};
+    if (const auto found = copies.entries.find(key); found != copies.entries.end()) {
+        if (std::memcmp(found->second.first->Bytes().data(), bytes.data(), bytes.size()) == 0) {
+            copies.recency.splice(copies.recency.end(), copies.recency, found->second.second);
+            return found->second.first;
+        }
+        copies.recency.erase(found->second.second);
+        copies.bytes -= bytes.size();
+        copies.entries.erase(found);
+    }
+    auto buffer = std::make_shared<Buffer>(context, bytes.size(), usage);
+    std::memcpy(buffer->Bytes().data(), bytes.data(), bytes.size());
+    if (bytes.size() > SnapshotCopies::Budget) return buffer;
+    while (!copies.recency.empty() && (copies.bytes + bytes.size() > SnapshotCopies::Budget || copies.entries.size() >= SnapshotCopies::MaxEntries)) {
+        const auto oldest = copies.entries.find(copies.recency.front());
+        copies.bytes -= std::get<1>(oldest->first);
+        copies.entries.erase(oldest);
+        copies.recency.pop_front();
+    }
+    copies.recency.push_back(key);
+    copies.entries.emplace(key, std::pair{buffer, std::prev(copies.recency.end())});
+    copies.bytes += bytes.size();
+    return buffer;
+}
+
 bool mirrorsEnabled() {
     static const bool disabled = std::getenv("APS5_NO_LEASE_MIRROR") != nullptr;
     return !disabled;
@@ -1992,6 +2046,23 @@ MirrorStats MirrorCounters() {
     MirrorStats stats{0, state.heapBytes, state.rebuilds, state.blocksCopied, state.heapRefills, state.sweeps, state.heapChecks, state.sparseBinds};
     for (const auto& [base, mirror] : state.entries) stats.heapMirrors += mirror->heap ? 1 : 0;
     return stats;
+}
+
+std::vector<std::uint64_t> AddressTableKey(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const ShaderRecompiler::BdaAbi::Range> own) {
+    std::vector<std::uint64_t> key;
+    key.reserve(writes.size() * 2u + 1u + own.size() * 4u);
+    for (const auto& [begin, end] : writes) key.insert(key.end(), {begin, end});
+    key.push_back(std::numeric_limits<std::uint64_t>::max());
+    for (const auto& range : own) key.insert(key.end(), {range.begin, range.end, range.deviceAddress, (static_cast<std::uint64_t>(range.reserved) << 32u) | range.permissions});
+    return key;
+}
+
+void ClearSnapshotCopies(VkDevice device) {
+    auto& copies = SnapshotCopyCache();
+    std::lock_guard lock(copies.mutex);
+    if (copies.device != device) return;
+    copies.clear();
+    copies.device = VK_NULL_HANDLE;
 }
 
 void ClearImageMirrors(VkDevice device) {
@@ -3469,7 +3540,9 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     }
     const auto allocated = region.bufferEnd != 0 ? region.bufferEnd - region.begin : bytes;
     // A buffer made by UploadPrepare for a GPU copy that fell back here (its import went) is kept.
-    if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(allocated), usage);
+    const bool shared = region.buffer == nullptr && !region.hostBacked && !region.writable && !region.sparse && region.bufferEnd == 0 && region.snapshot.size() == bytes;
+    if (shared) region.buffer = snapshotCopy(context, region.begin, region.snapshot, usage);
+    else if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(allocated), usage);
     const auto readStart = std::chrono::steady_clock::now();
     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
     if (region.hostBacked || region.writable) {
@@ -3497,7 +3570,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         }
     }
     else {
-        std::memcpy(region.buffer->Bytes().data(), region.snapshot.data(), region.snapshot.size());
+        if (!shared) std::memcpy(region.buffer->Bytes().data(), region.snapshot.data(), region.snapshot.size());
         readBytes += region.snapshot.size();
     }
     region.snapshot.clear();
@@ -3802,31 +3875,42 @@ void GuestBufferMemory::AddressRanges(std::vector<ShaderRecompiler::BdaAbi::Rang
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
-    if (space == nullptr || !regions.empty()) return std::nullopt;
+    if (space == nullptr) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
-    if (writes.empty()) return CachedTable{space->serial, &space->ranges};
-    if (writeTableRanges != nullptr) return CachedTable{writeTableSerial, writeTableRanges.get()};
-    const auto& spaceRanges = space->ranges;
-    const bool inWritable = std::all_of(writes.begin(), writes.end(), [&](const auto& written) {
-        auto at = std::partition_point(spaceRanges.begin(), spaceRanges.end(), [&](const auto& range) { return range.end <= written.first; });
-        for (; at != spaceRanges.end() && at->begin < written.second; ++at) {
-            if ((at->permissions & ShaderRecompiler::BdaAbi::Write) == 0u) return false;
-        }
-        return true;
-    });
-    if (inWritable) return CachedTable{space->serial, &space->ranges};
-    std::lock_guard lock(space->tableMutex);
-    const auto found = space->writeTables.find(writes);
-    if (found != space->writeTables.end()) {
-        writeTableSerial = found->second.first;
-        writeTableRanges = found->second.second;
-    } else {
-        writeTableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
-        writeTableSerial = Spaces().serials.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (space->writeTables.size() >= 64u) space->writeTables.erase(space->writeTables.begin());
-        space->writeTables.emplace(writes, std::pair{writeTableSerial, writeTableRanges});
+    if (writes.empty() && regions.empty()) return CachedTable{space->serial, &space->ranges};
+    if (tableRanges != nullptr) return CachedTable{tableSerial, tableRanges.get()};
+    if (regions.empty()) {
+        const auto& spaceRanges = space->ranges;
+        const bool inWritable = std::all_of(writes.begin(), writes.end(), [&](const auto& written) {
+            auto at = std::partition_point(spaceRanges.begin(), spaceRanges.end(), [&](const auto& range) { return range.end <= written.first; });
+            for (; at != spaceRanges.end() && at->begin < written.second; ++at) {
+                if ((at->permissions & ShaderRecompiler::BdaAbi::Write) == 0u) return false;
+            }
+            return true;
+        });
+        if (inWritable) return CachedTable{space->serial, &space->ranges};
     }
-    return CachedTable{writeTableSerial, writeTableRanges.get()};
+    std::vector<ShaderRecompiler::BdaAbi::Range> own;
+    own.reserve(regions.size());
+    for (const auto& region : regions) own.push_back(addressRange(region));
+    auto key = AddressTableKey(writes, own);
+    static const bool verify = std::getenv("APS5_VERIFY_BDA_TABLES") != nullptr;
+    std::lock_guard lock(space->tableMutex);
+    const auto found = space->tables.find(key);
+    if (found != space->tables.end()) {
+        tableSerial = found->second.first;
+        tableRanges = found->second.second;
+        if (verify) {
+            const auto built = AddressRanges();
+            Require(built.size() == tableRanges->size() && (built.empty() || std::memcmp(built.data(), tableRanges->data(), built.size() * sizeof(built.front())) == 0), "a cached BDA table differs from the ranges of the build that found it");
+        }
+    } else {
+        tableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
+        tableSerial = Spaces().serials.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (space->tables.size() >= 64u) space->tables.erase(space->tables.begin());
+        space->tables.emplace(std::move(key), std::pair{tableSerial, tableRanges});
+    }
+    return CachedTable{tableSerial, tableRanges.get()};
 }
 
 bool GuestBufferMemory::HasCopiedWrites() const {
