@@ -4640,6 +4640,46 @@ void stencilRefExportTests() {
     expectFailure([&] { static_cast<void>(AgcDriver::Graphics::DecodeState(queue)); }, "stencil clear with a pixel shader that exports the stencil test value");
     queue.context[0x203] = 0x50u;
     static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
+    queue.context[0x000] = 0;
+    queue.context[0x200] = 0x007007e7;
+    queue.context[0x203] = 0x52;
+    queue.context[0x1c4] = 9;
+    queue.context[0x10b] = 0;
+    queue.context[0x10c] = 0x01ffffff;
+    queue.context[0x10d] = 0x01ffffff;
+    const auto unused = AgcDriver::Graphics::DecodeState(queue);
+    Require(unused.stencilTest && unused.depthTest && unused.depthWrite && unused.depthCompare == VK_COMPARE_OP_GREATER_OR_EQUAL, "the unused reference fixture lost its depth or stencil tests");
+    const auto checkReference = [&](const AgcDriver::Graphics::State& draw, bool expected) {
+        auto request = stencilRefExportRequest(0x52u, plain);
+        request.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports, false, &draw);
+        Require(request.context.pixel->stencilRefExportEnable == expected && !request.context.pixel->earlyZ, "stencil reference consumption or fragment-test ordering is wrong");
+        const auto compiled = ShaderRecompiler::Recompile(request);
+        Require(compiled.stencilReferences.empty() != expected && stencilRefShape(compiled.spirv.Words()).empty(), "stencil replay was lost for a consumed reference or retained for an unused reference");
+    };
+    checkReference(unused, false);
+    auto disabled = unused;
+    disabled.stencilTest = false;
+    checkReference(disabled, false);
+    auto never = unused;
+    never.stencilFront.compareOp = VK_COMPARE_OP_NEVER;
+    never.stencilBack.compareOp = VK_COMPARE_OP_NEVER;
+    checkReference(never, false);
+    for (const bool back : {false, true}) {
+        auto changed = unused;
+        auto& face = back ? changed.stencilBack : changed.stencilFront;
+        face.compareOp = VK_COMPARE_OP_EQUAL;
+        checkReference(changed, true);
+        face.compareMask = 0;
+        checkReference(changed, false);
+        for (auto* op : {&face.failOp, &face.passOp, &face.depthFailOp}) {
+            *op = VK_STENCIL_OP_REPLACE;
+            checkReference(changed, true);
+            face.writeMask = 0;
+            checkReference(changed, false);
+            face.writeMask = 0xff;
+            *op = VK_STENCIL_OP_KEEP;
+        }
+    }
 }
 
 std::set<std::string> bufferViews(std::span<const std::uint32_t> words) {
