@@ -387,6 +387,88 @@ void verifySignedMinimum() {
     }
 }
 
+void verifyMayEvaluate() {
+    using namespace ShaderRecompiler;
+    IrResourcePlan plan;
+    std::vector<std::unique_ptr<IrValue>> values;
+    const auto make = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments = {}) -> IrValue& {
+        values.push_back(std::make_unique<IrValue>(opcode, type, static_cast<std::uint32_t>(values.size())));
+        for (auto* argument : arguments) values.back()->AddArgument(argument);
+        return *values.back();
+    };
+    const auto constant = [&](std::uint32_t value) -> IrValue& {
+        auto& leaf = make(IrOpcode::Void, IrType::U32);
+        leaf.SetImmediateU32(value);
+        return leaf;
+    };
+    auto& scalar = make(IrOpcode::Void, IrType::ScalarReg);
+    scalar.SetRegister({RegisterBank::Scalar, 0});
+    auto& vector = make(IrOpcode::Void, IrType::VectorReg);
+    vector.SetRegister({RegisterBank::Vector, 0});
+    auto& input = make(IrOpcode::GetUserData, IrType::U32, {&scalar});
+    auto& lane = make(IrOpcode::GetRegister, IrType::U32, {&vector});
+    auto& uniform = make(IrOpcode::IEqual32, IrType::Bool, {&input, &constant(4)});
+    auto& varying = make(IrOpcode::IEqual32, IrType::Bool, {&input, &lane});
+    auto& select = make(IrOpcode::SelectU32, IrType::U32, {&uniform, &constant(1), &lane});
+    auto& unevaluated = make(IrOpcode::FPAdd32, IrType::F32, {&input, &input});
+    auto& invariant = make(IrOpcode::Phi, IrType::Bool);
+    invariant.AddArgument(&uniform);
+    invariant.AddArgument(&uniform);
+    auto& divergent = make(IrOpcode::Phi, IrType::Bool);
+    divergent.AddArgument(&uniform);
+    divergent.AddArgument(&varying);
+    auto& counter = make(IrOpcode::Phi, IrType::U32);
+    auto& next = make(IrOpcode::CompositeExtractU32x2, IrType::U32, {&make(IrOpcode::IAddCarry32, IrType::U32x2, {&counter, &constant(1)}), &constant(0)});
+    counter.AddArgument(&constant(0));
+    counter.AddArgument(&next);
+    auto& latch = make(IrOpcode::ULessThan32, IrType::Bool, {&next, &constant(4)});
+    auto& sum = make(IrOpcode::CompositeExtractU32x2, IrType::U32, {&make(IrOpcode::IAddCarry32, IrType::U32x2, {&input, &constant(1)}), &constant(0)});
+    std::array<std::uint32_t, 1> data{4};
+    SrtRuntime runtime{data};
+    for (const auto& [value, expected, name] : std::array<std::tuple<IrValue*, bool, const char*>, 11>{{
+             {&constant(3), true, "a constant"},
+             {&input, true, "user data"},
+             {&uniform, true, "a comparison of user data"},
+             {&lane, false, "a vector register read"},
+             {&varying, false, "a comparison with a vector register"},
+             {&select, false, "a select with a vector register arm"},
+             {&unevaluated, false, "an opcode the evaluator does not evaluate"},
+             {&invariant, true, "a phi whose operands agree"},
+             {&divergent, false, "a phi whose operands differ"},
+             {&latch, false, "a scalar loop counter's latch condition"},
+             {&sum, true, "the low word of a carry add of user data"},
+         }}) {
+        require(Detail::MayEvaluate(plan, value) == expected, (std::string("MayEvaluate misjudged ") + name).c_str());
+        Detail::Evaluator evaluator(plan, runtime);
+        std::uint32_t result = 0;
+        require(evaluator.Evaluate(Detail::IrNode(value), result) == expected, (std::string("MayEvaluate disagreed with the evaluator on ") + name).c_str());
+    }
+    const std::array<IrOpcode, 9> takenAsEvaluable{IrOpcode::Identity, IrOpcode::Phi, IrOpcode::Void, IrOpcode::GetUserData, IrOpcode::GetShaderBase, IrOpcode::ReadFirstLane, IrOpcode::ReadConst, IrOpcode::LoadAddressU32, IrOpcode::ReadConstBuffer};
+    for (std::uint16_t raw = 0; raw < static_cast<std::uint16_t>(IrOpcode::Count); ++raw) {
+        const auto opcode = static_cast<IrOpcode>(raw);
+        if (std::ranges::find(takenAsEvaluable, opcode) != takenAsEvaluable.end()) continue;
+        auto& value = make(opcode, IrType::U32, {&constant(0), &constant(0), &constant(0), &constant(0)});
+        Detail::Evaluator evaluator(plan, runtime);
+        std::uint32_t result = 0;
+        require(Detail::MayEvaluate(plan, &value) == evaluator.Evaluate(Detail::IrNode(&value), result), (std::string("MayEvaluate disagreed with the evaluator on ") + std::string(IrOpcodeName(opcode)) + " over constants").c_str());
+    }
+    IrProgram program;
+    auto& resources = program.Resources();
+    resources.resourceTrackingComplete = true;
+    resources.srtPlanComplete = true;
+    resources.controlFlow.resize(2);
+    resources.controlFlow[0].condition = &uniform;
+    resources.controlFlow[1].condition = &varying;
+    const auto extracted = ResourceMaterializer{}.ExtractPlan(program);
+    require(extracted.controlFlow[0].condition != nullptr, "plan extraction dropped a scalar condition");
+    require(extracted.controlFlow[1].condition == nullptr, "plan extraction retained a vector-dependent condition");
+    require(resources.controlFlow[1].condition == &varying, "plan extraction changed the source condition");
+    require(std::ranges::none_of(extracted.valueStorage, [](const auto& value) { return value->Opcode() == IrOpcode::GetRegister; }), "plan extraction copied an unevaluable condition's operands");
+    Detail::CompactEvaluator compact(extracted, runtime);
+    std::uint32_t result = 0;
+    require(compact.Evaluate(Detail::CompactNode::From(extracted, extracted.controlFlow[0].condition), result) && result == 1u, "filtered plan lost its compact scalar evaluation");
+}
+
 void verifyEvaluatedValues() {
     using namespace ShaderRecompiler;
     std::vector<std::unique_ptr<IrValue>> values;
@@ -3612,6 +3694,7 @@ int main(int argc, char** argv) {
         verifyTypeZeroImageMaterialization();
         verifyOutOfRangeConstantReads();
         verifySignedMinimum();
+        verifyMayEvaluate();
         verifyPureFlatSlots();
         verifyGuardedDescriptorSources();
         verifyBindlessTable();
