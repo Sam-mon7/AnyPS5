@@ -2388,6 +2388,28 @@ void Recorder::readGpuTiming(Batch& batch) {
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
     }
     std::sort(intervals.begin(), intervals.end());
+    static const bool traceGaps = std::getenv("APS5_TRACE_GPU_GAPS") != nullptr;
+    static std::size_t reportedGaps = 0;
+    if (traceGaps && batch.batchTiming < batch.timedKeys.size()) {
+        auto cursor = stamps[batch.batchTiming * 2];
+        const auto last = stamps[batch.batchTiming * 2 + 1];
+        const auto reportGap = [&](std::uint64_t begin, std::uint64_t end) {
+            if (end <= begin || static_cast<double>(end - begin) * period < 100'000'000.0 || reportedGaps >= 64) return;
+            auto before = BatchTimingKey, after = BatchTimingKey;
+            for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
+                if (i == batch.batchTiming) continue;
+                if (stamps[i * 2 + 1] == begin) before = batch.timedKeys[i];
+                if (stamps[i * 2] == end) after = batch.timedKeys[i];
+            }
+            ++reportedGaps;
+            AgcDriver::ProfilePrint_nid_no_patch("[gputime-gap] batch %llu queue 0x%llx: %.3f ms after key 0x%llx before key 0x%llx (batch %.3f ms, %zu ranges)\n", static_cast<unsigned long long>(batch.serial), static_cast<unsigned long long>(batch.queue), static_cast<double>(end - begin) * period / 1e6, static_cast<unsigned long long>(before), static_cast<unsigned long long>(after), batch.gpuEndNs / 1e6 - batch.gpuStartNs / 1e6, batch.timedKeys.size());
+        };
+        for (const auto& [begin, end] : intervals) {
+            reportGap(cursor, std::min(begin, last));
+            cursor = std::max(cursor, end);
+        }
+        reportGap(cursor, last);
+    }
     std::uint64_t coveredTicks = 0, unionEnd = 0;
     for (const auto& [begin, end] : intervals) {
         const auto from = std::max(begin, unionEnd);
