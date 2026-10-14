@@ -43,7 +43,7 @@ std::uint32_t* NewBlock() {
 #endif
     if (block == nullptr) throw std::runtime_error("pipelined dispatch: cannot allocate a guest block");
     std::memset(block, 0, BlockBytes);
-    GuestAllocations::Mutation().Add(block, BlockBytes, true, true);
+    GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
     return block;
 }
 
@@ -80,7 +80,7 @@ std::array<std::uint32_t, 7> FillPacket(std::uint32_t value, const void* destina
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x01016facu};
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
 std::vector<std::uint32_t> Round(const void* destination, std::uint32_t value, const void* code) {

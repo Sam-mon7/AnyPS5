@@ -437,7 +437,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             const auto commitQueue = submission.queue;
             const auto commitPacket = (packet[0] >> 8u) & 0xffu;
             const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-            auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), expanded = std::move(expanded), commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)] {
+            auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), expanded = std::move(expanded), commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)] {
                 DrawPipeline::FollowEpoch(epoch);
                 GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
                 for (const auto& item : expanded) commitDraw(localDevice, commitQueue, decode->state, item.direct, item.stages, item.snapshots, nullptr, {}, 0);
@@ -478,7 +478,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (programResults[programIndex] == nullptr) continue;
                 const auto pushBytes = programResults[programIndex]->pushConstants.size();
                 decodeVertexInfo(programIndex);
-                auto patchedResult = compileDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
+                auto patchedResult = std::make_shared<ShaderRecompiler::RecompileResult>(materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
                 if (!rejected.empty()) {
                     enqueueExpanded();
                     return DrawVerdict::Rejected;

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -103,6 +104,7 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
     if (!allQueues && submission.queue == 0) return;
     auto& resolved = resolvedAhead();
     if (resolved.contains(from) || device.Load() == nullptr) return;
+    if (DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (submission.commands[from] >> 8u) & 0xffu);
     auto& stats = groupCaptureStats();
     const auto begin = std::chrono::steady_clock::now();
     ++stats.runs;
