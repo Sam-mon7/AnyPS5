@@ -237,9 +237,9 @@ private:
         const auto sourceImage = toStorage ? image : plane.storage->Image();
         const auto destinationImage = toStorage ? plane.storage->Image() : image;
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, plane.staging->Handle(), 1, toStorage ? &planeRegion : &colorRegion);
+        CopyImageToBuffer(context, commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, plane.staging->Handle(), 1, toStorage ? &planeRegion : &colorRegion);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, plane.staging->Handle(), destinationImage, VK_IMAGE_LAYOUT_GENERAL, 1, toStorage ? &colorRegion : &planeRegion);
+        CopyBufferToImage(context, commands, plane.staging->Handle(), destinationImage, VK_IMAGE_LAYOUT_GENERAL, 1, toStorage ? &colorRegion : &planeRegion);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
         Recorder::CountBarriers(Recorder::CommandClass::Copy, 3);
         recorder->EndGpuTiming(timing, bytes);
@@ -390,7 +390,7 @@ private:
         };
         for (const auto layer : copiedLayers) {
             const auto copy = region(layer, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
-            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, slices[layer].image, VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &copy);
+            CopyImageToBuffer(context, commands, slices[layer].image, VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &copy);
             regions.push_back(region(layer, aspect(), layer));
         }
         if (!uploads.empty()) {
@@ -415,7 +415,7 @@ private:
         toTransfer.subresourceRange = {aspect(), 0, 1, 0, layers};
         const VkBufferMemoryBarrier staged{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, staging->Handle(), 0, VK_WHOLE_SIZE};
         barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &staged, 1, &toTransfer);
-        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        CopyBufferToImage(context, commands, staging->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
         VkImageMemoryBarrier toGeneral = toTransfer;
         toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;

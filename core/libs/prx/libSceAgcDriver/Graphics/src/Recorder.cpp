@@ -1090,7 +1090,6 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         cmdBeginQuery = context.Function<PFN_vkCmdBeginQuery>("vkCmdBeginQuery");
         cmdEndQuery = context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery");
         cmdResetQueryPool = context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool");
-        cmdCopyQueryPoolResults = context.Function<PFN_vkCmdCopyQueryPoolResults>("vkCmdCopyQueryPoolResults");
         cmdBindPipeline = context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
         cmdPushConstants = context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
         cmdDispatch = context.Function<PFN_vkCmdDispatch>("vkCmdDispatch");
@@ -1467,7 +1466,6 @@ void Recorder::recordKeyStores(bool forWriter) {
     // decompress kernel storing keys through a V#), and visible to the work after and to the host.
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
     const auto fill = context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer");
-    const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
     std::uint64_t bytes = 0;
     for (const auto& store : stores) {
         const VkDeviceSize fillBegin = std::min((store.first + 3) & ~VkDeviceSize{3}, store.last);
@@ -1478,7 +1476,7 @@ void Recorder::recordKeyStores(bool forWriter) {
             std::uint32_t copyCount = 0;
             if (fillBegin > store.first) copies[copyCount++] = {0, store.first, fillBegin - store.first};
             if (store.last > fillEnd) copies[copyCount++] = {0, fillEnd, store.last - fillEnd};
-            if (copyCount != 0) copy(commands, static_cast<Buffer*>(store.seed.get())->Handle(), store.buffer, copyCount, copies);
+            if (copyCount != 0) CopyBuffers(context, commands, static_cast<Buffer*>(store.seed.get())->Handle(), store.buffer, copyCount, copies);
         }
         bytes += store.last - store.first;
     }
@@ -2122,12 +2120,11 @@ void Recorder::endSegment(Batch& batch) {
 
 void Recorder::copySegments(VkCommandBuffer commands, std::uint32_t count) {
     Require(count <= pendingSamples.size() && count <= SegmentFoldCapacity, "occlusion segments exceed the fold capacity");
-    const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
     for (std::uint32_t i = 0; i < count;) {
         const auto& first = pendingSamples[i];
         std::uint32_t run = 1;
         while (i + run < count && pendingSamples[i + run].handle == first.handle && pendingSamples[i + run].slot == first.slot + run) ++run;
-        copy(commands, first.handle, first.slot, run, sampleCounter->Handle(), 16 + 8 * static_cast<VkDeviceSize>(i), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        CopyQueryResults(context, commands, first.handle, first.slot, run, sampleCounter->Handle(), 16 + 8 * static_cast<VkDeviceSize>(i), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
         i += run;
     }
 }
@@ -2202,7 +2199,6 @@ void Recorder::endSamples(Batch& batch) {
 
 void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
     const auto commands = batch.commands;
-    const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
     const auto bind = function(cmdBindPipeline, "vkCmdBindPipeline");
     const auto push = function(cmdPushConstants, "vkCmdPushConstants");
     const auto dispatch = function(cmdDispatch, "vkCmdDispatch");
@@ -2212,7 +2208,7 @@ void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
         if (done != 0) recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto& segment = pendingSamples[done + i];
-            copy(commands, segment.handle, segment.slot, 1, sampleCounter->Handle(), 16 + 8 * i, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            CopyQueryResults(context, commands, segment.handle, segment.slot, 1, sampleCounter->Handle(), 16 + 8 * i, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             if (segment.pool != nullptr) batch.kept.push_back(segment.pool);
         }
         done += count;

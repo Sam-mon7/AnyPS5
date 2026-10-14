@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuCopyCheckpoints.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuAddressBindings.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
@@ -9,6 +11,16 @@
 namespace AgcDriver::Graphics {
 
 namespace {
+
+template<typename TRegion, typename TSource, typename TDestination>
+std::uint64_t beginCopy(const Context& context, VkCommandBuffer commands, GpuCopyCheckpoints::Kind kind, TSource source, TDestination destination, std::uint32_t count, const TRegion* regions) {
+    if (context.copyCheckpoints == nullptr) return 0;
+    return context.copyCheckpoints->Before(commands, kind, source, destination, count, regions, context.addressBindings != nullptr ? context.addressBindings->LatestSerial() : 0);
+}
+
+void endCopy(const Context& context, VkCommandBuffer commands, std::uint64_t serial) {
+    if (serial != 0) context.copyCheckpoints->After(commands, serial);
+}
 
 VkDeviceSize ClassAllocationBytes(const VkMemoryRequirements& requirements, std::size_t capacity) {
     const auto alignment = std::max<VkDeviceSize>(requirements.alignment, 1);
@@ -213,7 +225,44 @@ std::size_t DeviceBuffer::Size() const {
 
 void CopyBuffer(const Context& context, VkCommandBuffer commands, VkBuffer source, VkDeviceSize sourceOffset, VkBuffer destination, VkDeviceSize destinationOffset, VkDeviceSize bytes) {
     const VkBufferCopy region{sourceOffset, destinationOffset, bytes};
-    context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, source, destination, 1, &region);
+    CopyBuffers(context, commands, source, destination, 1, &region);
+}
+
+void CopyBuffers(const Context& context, VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
+    const auto marker = beginCopy(context, commands, GpuCopyCheckpoints::Kind::Buffer, source, destination, count, regions);
+    context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, source, destination, count, regions);
+    endCopy(context, commands, marker);
+}
+
+void CopyBufferToImage(const Context& context, VkCommandBuffer commands, VkBuffer source, VkImage destination, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    const auto marker = beginCopy(context, commands, GpuCopyCheckpoints::Kind::BufferToImage, source, destination, count, regions);
+    context.Resolved(&DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage")(commands, source, destination, layout, count, regions);
+    endCopy(context, commands, marker);
+}
+
+void CopyImageToBuffer(const Context& context, VkCommandBuffer commands, VkImage source, VkImageLayout layout, VkBuffer destination, std::uint32_t count, const VkBufferImageCopy* regions) {
+    const auto marker = beginCopy(context, commands, GpuCopyCheckpoints::Kind::ImageToBuffer, source, destination, count, regions);
+    context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, source, layout, destination, count, regions);
+    endCopy(context, commands, marker);
+}
+
+void CopyImage(const Context& context, VkCommandBuffer commands, VkImage source, VkImageLayout sourceLayout, VkImage destination, VkImageLayout destinationLayout, std::uint32_t count, const VkImageCopy* regions) {
+    const auto marker = beginCopy(context, commands, GpuCopyCheckpoints::Kind::Image, source, destination, count, regions);
+    context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source, sourceLayout, destination, destinationLayout, count, regions);
+    endCopy(context, commands, marker);
+}
+
+void BlitImage(const Context& context, VkCommandBuffer commands, VkImage source, VkImageLayout sourceLayout, VkImage destination, VkImageLayout destinationLayout, std::uint32_t count, const VkImageBlit* regions, VkFilter filter) {
+    const auto marker = beginCopy(context, commands, GpuCopyCheckpoints::Kind::Blit, source, destination, count, regions);
+    context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, source, sourceLayout, destination, destinationLayout, count, regions, filter);
+    endCopy(context, commands, marker);
+}
+
+void CopyQueryResults(const Context& context, VkCommandBuffer commands, VkQueryPool pool, std::uint32_t first, std::uint32_t count, VkBuffer destination, VkDeviceSize offset, VkDeviceSize stride, VkQueryResultFlags flags) {
+    const std::array<std::uint64_t, 5> region{first, count, offset, stride, flags};
+    const auto marker = beginCopy(context, commands, GpuCopyCheckpoints::Kind::QueryResults, pool, destination, 1, &region);
+    context.Resolved(&DeviceFunctions::cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults")(commands, pool, first, count, destination, offset, stride, flags);
+    endCopy(context, commands, marker);
 }
 
 void RecordMemoryBarrier(const Context& context, VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) {
@@ -260,6 +309,7 @@ void FillDeviceFunctions(const Context& context, DeviceFunctions& functions) {
     functions.cmdDrawIndexedIndirect = context.Function<PFN_vkCmdDrawIndexedIndirect>("vkCmdDrawIndexedIndirect");
     functions.cmdCopyBufferToImage = context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
     functions.cmdCopyImageToBuffer = context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+    functions.cmdCopyQueryPoolResults = context.Function<PFN_vkCmdCopyQueryPoolResults>("vkCmdCopyQueryPoolResults");
     functions.cmdClearColorImage = context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
     functions.updateDescriptorSets = context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets");
     functions.allocateDescriptorSets = context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets");

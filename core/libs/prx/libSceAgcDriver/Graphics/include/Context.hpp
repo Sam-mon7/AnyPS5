@@ -30,6 +30,7 @@ class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
 class GpuAddressBindings;
+class GpuCopyCheckpoints;
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -99,6 +100,7 @@ struct DeviceFunctions {
     PFN_vkCmdDrawIndexedIndirect cmdDrawIndexedIndirect = nullptr;
     PFN_vkCmdCopyBufferToImage cmdCopyBufferToImage = nullptr;
     PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer = nullptr;
+    PFN_vkCmdCopyQueryPoolResults cmdCopyQueryPoolResults = nullptr;
     PFN_vkCmdClearColorImage cmdClearColorImage = nullptr;
     PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
     PFN_vkAllocateDescriptorSets allocateDescriptorSets = nullptr;
@@ -202,6 +204,7 @@ struct Context {
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
     std::shared_ptr<GpuAddressBindings> addressBindings;
+    std::shared_ptr<GpuCopyCheckpoints> copyCheckpoints;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

@@ -45,6 +45,7 @@ VKAPI_ATTR VkResult VKAPI_CALL MockFaultInfo(VkDevice, VkDeviceFaultCountsEXT* c
 }
 
 std::uint32_t checkpointCount = 0;
+bool copyCheckpointData = false;
 
 VKAPI_ATTR void VKAPI_CALL MockCheckpointData(VkQueue, std::uint32_t* count, VkCheckpointDataNV* data) {
     if (data == nullptr) {
@@ -55,7 +56,7 @@ VKAPI_ATTR void VKAPI_CALL MockCheckpointData(VkQueue, std::uint32_t* count, VkC
     for (std::uint32_t i = 0; i < *count; ++i) {
         Require(data[i].sType == VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV, "checkpoint entries were not initialised");
         data[i].stage = i == 0 ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
-        data[i].pCheckpointMarker = reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x10000ull + i * 0x100ull));
+        data[i].pCheckpointMarker = reinterpret_cast<void*>(copyCheckpointData ? AgcDriver::Graphics::GpuCopyCheckpoints::Marker(7, i != 0) : static_cast<std::uintptr_t>(0x10000ull + i * 0x100ull));
     }
 }
 
@@ -112,6 +113,60 @@ void Nothing() {
     faultCalls = 0;
     Require(AgcDriver::DeviceFaultReport(FakeDevice(), nullptr, FakeQueue(), nullptr).empty(), "a device without either extension reported something");
     Require(faultCalls == 0, "the fault info was queried without the extension");
+}
+
+std::vector<std::pair<VkCommandBuffer, std::uintptr_t>> emittedCopies;
+bool captureCopies = true;
+
+VKAPI_ATTR void VKAPI_CALL MockCopyCheckpoint(VkCommandBuffer commands, const void* marker) {
+    if (captureCopies) emittedCopies.emplace_back(commands, reinterpret_cast<std::uintptr_t>(marker));
+}
+
+void CopyCheckpoints() {
+    using History = AgcDriver::Graphics::GpuCopyCheckpoints;
+    static_assert(sizeof(History) < 1024 && sizeof(History::Entry) <= 144);
+    Require(!History::IsCopy(0x248881200), "shader checkpoints must retain their interpretation");
+    Require(History::Serial(History::Marker(History::MaxSerial, true)) == History::MaxSerial, "copy marker IDs must preserve every serial bit");
+    History history(FakeDevice(), MockCopyCheckpoint);
+    const auto commands = reinterpret_cast<VkCommandBuffer>(static_cast<std::uintptr_t>(0x3000));
+    VkBufferCopy regions[]{{0x100000001ull, 0x200000002ull, 65536}, {8, 16, 32}};
+    const auto original = regions[0];
+    const auto id = history.Before(commands, History::Kind::Buffer, std::uint64_t{0x1234}, std::uint64_t{0x5678}, 2, regions, 19);
+    history.After(commands, id);
+    Require(id == 1 && emittedCopies.size() == 2 && emittedCopies[0].first == commands && emittedCopies[1].first == commands, "copy command boundaries were not emitted on their command buffer");
+    Require(History::IsCopy(emittedCopies[0].second) && History::Serial(emittedCopies[0].second) == id && !History::IsAfter(emittedCopies[0].second) && History::IsAfter(emittedCopies[1].second), "copy markers lost their before/after identity");
+    regions[0] = {};
+    History::Entry entry;
+    Require(history.Find(id, entry) && entry.source == 0x1234 && entry.destination == 0x5678 && entry.commands == 0x3000 && entry.bindingSerial == 19 && entry.regionCount == 2 && entry.regionWords == 6, "copy history lost its command or resource identity");
+    Require(std::memcmp(entry.firstRegion.data(), &original, sizeof(original)) == 0, "copy history retained a caller region pointer instead of its bytes");
+    Require(!history.Find(0, entry) && !history.Find(2, entry), "copy history accepted an unknown marker");
+    const auto empty = history.Before(commands, History::Kind::Buffer, std::uint64_t{1}, std::uint64_t{2}, 0, static_cast<const VkBufferCopy*>(nullptr), 20);
+    Require(history.Find(empty, entry) && entry.regionWords == 0 && entry.regionCount == 0, "an empty copy diagnostic read a missing region");
+    const auto output = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
+    Require(output != nullptr, "copy history report file could not be created");
+    history.Report(output.get());
+    std::rewind(output.get());
+    std::array<char, 4096> bytes{};
+    const auto length = std::fread(bytes.data(), 1, bytes.size(), output.get());
+    const std::string report(bytes.data(), length);
+    Require(report.find("retained=2 newest=2 overwritten=0") != std::string::npos && report.find("omitted-regions=1") != std::string::npos && report.find("00000001,00000001,00000002,00000002,00010000,00000000") != std::string::npos, "copy report hid its bounds or changed the captured region");
+    checkpointCount = 2;
+    copyCheckpointData = true;
+    const auto lines = AgcDriver::DeviceFaultReport(VK_NULL_HANDLE, nullptr, FakeQueue(), MockCheckpointData);
+    copyCheckpointData = false;
+    Require(lines.size() == 2 && lines[0] == "[device-fault] checkpoint: copy 7 before at stage 0x1 (command boundary, not copy completion)" && lines[1] == "[device-fault] checkpoint: copy 7 after at stage 0x2000 (command boundary, not copy completion)", "fault report confused copy IDs with shader addresses");
+    captureCopies = false;
+    for (std::size_t index = 0; index < History::Capacity; ++index) history.Before(commands, History::Kind::Buffer, std::uint64_t{3}, std::uint64_t{4}, 1, &original, index);
+    Require(!history.Find(id, entry) && history.Find(History::Capacity + 2, entry) && entry.bindingSerial == History::Capacity - 1, "copy history did not bound or identify overwritten commands");
+    History concurrent(FakeDevice(), MockCopyCheckpoint);
+    const auto record = [&] {
+        for (int index = 0; index < 64; ++index) concurrent.Before(commands, History::Kind::Buffer, std::uint64_t{5}, std::uint64_t{6}, 1, &original, 21);
+    };
+    std::thread first(record), second(record);
+    first.join();
+    second.join();
+    Require(concurrent.Find(128, entry) && entry.serial == 128 && history.Find(History::Capacity + 2, entry), "copy history shared or lost IDs across instances or concurrent recordings");
+    captureCopies = true;
 }
 
 void AddressKinds() {
@@ -238,6 +293,7 @@ int main() {
         FaultInfo();
         FaultInfoFails();
         Checkpoints();
+        CopyCheckpoints();
         Nothing();
         AddressKinds();
         BindingHistory();

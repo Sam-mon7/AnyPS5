@@ -70,7 +70,7 @@ void PresentationScaler::RecordUpload(VkCommandBuffer commands, VkBuffer uploadB
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {sourceWidth, sourceHeight, 1u};
-    context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, uploadBuffer, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    Graphics::CopyBufferToImage(context, commands, uploadBuffer, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -120,7 +120,7 @@ void PresentationScaler::RecordBlitInto(VkCommandBuffer commands, VkImage image,
     blit.srcOffsets[1] = {static_cast<std::int32_t>(width), static_cast<std::int32_t>(height), 1};
     blit.dstSubresource = blit.srcSubresource;
     blit.dstOffsets[1] = {static_cast<std::int32_t>(sourceWidth), static_cast<std::int32_t>(sourceHeight), 1};
-    context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, image, layout, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
+    Graphics::BlitImage(context, commands, image, layout, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -133,7 +133,7 @@ void PresentationScaler::RecordReadback(VkCommandBuffer commands, VkBuffer desti
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {sourceWidth, sourceHeight, 1u};
-    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, 1, &copy);
+    Graphics::CopyImageToBuffer(context, commands, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, 1, &copy);
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
 }
 
@@ -152,7 +152,7 @@ void PresentationScaler::RecordBlitFrom(const Graphics::Context& context, VkComm
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.dstOffsets[0] = {rect.x, rect.y, 0};
     blit.dstOffsets[1] = {rect.x + static_cast<std::int32_t>(rect.width), rect.y + static_cast<std::int32_t>(rect.height), 1};
-    context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, image, layout, destinationImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
+    Graphics::BlitImage(context, commands, image, layout, destinationImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
 }
 
 }

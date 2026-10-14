@@ -5,6 +5,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include "prx/libSceAgcDriver/Graphics/include/GpuCopyCheckpoints.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -43,7 +44,9 @@ inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDevi
         points.resize(count);
         if (points.empty()) lines.emplace_back("[device-fault] no checkpoint reached");
         for (const auto& point : points) {
-            std::snprintf(line, sizeof(line), "[device-fault] checkpoint: program 0x%llx at stage 0x%x", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(point.pCheckpointMarker)), static_cast<unsigned>(point.stage));
+            const auto marker = reinterpret_cast<std::uintptr_t>(point.pCheckpointMarker);
+            if (Graphics::GpuCopyCheckpoints::IsCopy(marker)) std::snprintf(line, sizeof(line), "[device-fault] checkpoint: copy %llu %s at stage 0x%x (command boundary, not copy completion)", static_cast<unsigned long long>(Graphics::GpuCopyCheckpoints::Serial(marker)), Graphics::GpuCopyCheckpoints::IsAfter(marker) ? "after" : "before", static_cast<unsigned>(point.stage));
+            else std::snprintf(line, sizeof(line), "[device-fault] checkpoint: program 0x%llx at stage 0x%x", static_cast<unsigned long long>(marker), static_cast<unsigned>(point.stage));
             lines.emplace_back(line);
         }
     }

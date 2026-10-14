@@ -270,6 +270,7 @@ struct VulkanDevice::State {
     std::string driverInfo;
     PFN_vkGetCalibratedTimestampsKHR calibratedTimestamps = nullptr;
     PFN_vkCmdSetCheckpointNV checkpointMarker = nullptr;
+    std::shared_ptr<Graphics::GpuCopyCheckpoints> copyCheckpoints;
     bool deviceLostHook = false;
     VkTimeDomainKHR hostTimeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
@@ -1737,13 +1738,18 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
+    if (state->checkpointMarker != nullptr && std::getenv("APS5_GPU_COPY_CHECKPOINTS") != nullptr) {
+        state->copyCheckpoints = std::make_shared<Graphics::GpuCopyCheckpoints>(state->device, state->checkpointMarker);
+        std::fprintf(stderr, "[gpu-copy] enabled device=0x%llx capacity=%zu bytes=%zu; first region only, no resource retention\n", static_cast<unsigned long long>(Graphics::GpuCopyCheckpoints::Handle(state->device)), Graphics::GpuCopyCheckpoints::Capacity, Graphics::GpuCopyCheckpoints::Capacity * sizeof(Graphics::GpuCopyCheckpoints::Entry));
+    }
     if (deviceFault || checkpoints) {
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
         const auto checkpointData = checkpoints ? state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV") : nullptr;
-        Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, faultInfo, checkpointData, bindings = addressBindings ? state->addressBindings : nullptr] {
+        Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, faultInfo, checkpointData, bindings = addressBindings ? state->addressBindings : nullptr, copies = state->copyCheckpoints] {
             std::vector<VkDeviceFaultAddressInfoEXT> addresses;
             for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData, &addresses)) std::fprintf(stderr, "%s\n", line.c_str());
             if (bindings != nullptr) for (const auto& address : addresses) bindings->Report(address, stderr);
+            if (copies != nullptr) copies->Report(stderr);
         };
         state->deviceLostHook = true;
     }
@@ -2143,13 +2149,12 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
             std::memcpy(seed->Bytes().data(), pattern.data(), 16);
             recorder.Keep(seed);
             const auto chain = recorder.Commands();
-            const auto copyBuffer = context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
             const VkBufferCopy first{0, 0, 16};
-            copyBuffer(chain, seed->Handle(), patternBuffer->Handle(), 1, &first);
+            Graphics::CopyBuffers(context, chain, seed->Handle(), patternBuffer->Handle(), 1, &first);
             for (std::size_t done = 16; done < PatternBufferBytes; done *= 2) {
                 Graphics::RecordMemoryBarrier(context, chain, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
                 const VkBufferCopy copy{0, done, done};
-                copyBuffer(chain, patternBuffer->Handle(), patternBuffer->Handle(), 1, &copy);
+                Graphics::CopyBuffers(context, chain, patternBuffer->Handle(), patternBuffer->Handle(), 1, &copy);
             }
             Graphics::RecordMemoryBarrier(context, chain, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             if (buffers.size() >= PatternBuffersKept) buffers.erase(buffers.begin());
@@ -2185,7 +2190,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         ++patternFills;
         std::vector<VkBufferCopy> copies;
         for (std::size_t done = 0; done < bytes; done += PatternBufferBytes) copies.push_back({0, offset + done, std::min(PatternBufferBytes, bytes - done)});
-        context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, patternBuffer->Handle(), import->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
+        Graphics::CopyBuffers(context, commands, patternBuffer->Handle(), import->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
     } else {
         ++patternFills;
         // A 16-byte pattern is seeded once and doubled in place until the range is covered.
@@ -2193,14 +2198,13 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         std::memcpy(seed->Bytes().data(), pattern.data(), 16);
         recorder.Keep(seed);
         const VkBufferCopy first{0, offset, 16};
-        const auto copyBuffer = context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
-        copyBuffer(commands, seed->Handle(), import->buffer, 1, &first);
+        Graphics::CopyBuffers(context, commands, seed->Handle(), import->buffer, 1, &first);
         for (std::size_t done = 16; done < bytes;) {
             const auto chunk = std::min(done, bytes - done);
             Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             Graphics::Recorder::CountBarriers(CommandClass::Fill);
             const VkBufferCopy copy{offset, offset + done, chunk};
-            copyBuffer(commands, import->buffer, import->buffer, 1, &copy);
+            Graphics::CopyBuffers(context, commands, import->buffer, import->buffer, 1, &copy);
             done += chunk;
             ++doublingSteps;
         }
@@ -2436,7 +2440,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     }
     const auto gpuTiming = recorder.BeginGpuTiming(programAddress);
     const VkBufferCopy region{source - sourceImport->base, destination - destinationImport->base, bytes};
-    context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, sourceImport->buffer, destinationImport->buffer, 1, &region);
+    Graphics::CopyBuffers(context, commands, sourceImport->buffer, destinationImport->buffer, 1, &region);
     recorder.EndGpuTiming(gpuTiming, bytes);
     // The copied bytes are visible to everything recorded after and to the host, as after a fill.
     constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
@@ -3238,6 +3242,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     };
     context.dmaBufImport = state->dmaBufImport;
     context.addressBindings = state->addressBindingsEnabled ? state->addressBindings : nullptr;
+    context.copyCheckpoints = state->copyCheckpoints;
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
     context.samplerCache = state->samplerCache.get();

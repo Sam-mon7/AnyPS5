@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuCopyCheckpoints.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +24,106 @@ void Expect(bool condition, const std::string& what) {
     if (condition) return;
     std::fprintf(stderr, "FAIL: %s\n", what.c_str());
     ++failures;
+}
+
+std::vector<int> copyEvents;
+const void* expectedCopyRegions = nullptr;
+std::uint32_t expectedCopyCount = 0;
+
+template<typename TSource, typename TDestination, typename TRegion>
+void ExpectCopy(VkCommandBuffer commands, TSource source, TDestination destination, std::uint32_t count, const TRegion* regions) {
+    Expect(GpuCopyCheckpoints::Handle(commands) == 0x30 && GpuCopyCheckpoints::Handle(source) == 0x10 && GpuCopyCheckpoints::Handle(destination) == 0x20, "copy wrapper changed a command or resource handle");
+    Expect(count == expectedCopyCount && (expectedCopyRegions == nullptr || regions == expectedCopyRegions), "copy wrapper split or replaced its region array");
+    copyEvents.push_back(0);
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCopyMarker(VkCommandBuffer commands, const void* marker) {
+    const auto value = reinterpret_cast<std::uintptr_t>(marker);
+    Expect(GpuCopyCheckpoints::Handle(commands) == 0x30 && GpuCopyCheckpoints::IsCopy(value), "copy wrapper emitted an invalid marker");
+    copyEvents.push_back(GpuCopyCheckpoints::IsAfter(value) ? 1 : -1);
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCopyBuffers(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
+    ExpectCopy(commands, source, destination, count, regions);
+    if (expectedCopyRegions == nullptr) Expect(regions[0].srcOffset == 3 && regions[0].dstOffset == 7 && regions[0].size == 64, "single-range copy wrapper changed its offsets or length");
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCopyBufferToImage(VkCommandBuffer commands, VkBuffer source, VkImage destination, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    ExpectCopy(commands, source, destination, count, regions);
+    Expect(layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, "buffer-to-image wrapper changed its layout");
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCopyImageToBuffer(VkCommandBuffer commands, VkImage source, VkImageLayout layout, VkBuffer destination, std::uint32_t count, const VkBufferImageCopy* regions) {
+    ExpectCopy(commands, source, destination, count, regions);
+    Expect(layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, "image-to-buffer wrapper changed its layout");
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCopyImages(VkCommandBuffer commands, VkImage source, VkImageLayout sourceLayout, VkImage destination, VkImageLayout destinationLayout, std::uint32_t count, const VkImageCopy* regions) {
+    ExpectCopy(commands, source, destination, count, regions);
+    Expect(sourceLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && destinationLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, "image copy wrapper changed a layout");
+}
+
+VKAPI_ATTR void VKAPI_CALL mockBlitImages(VkCommandBuffer commands, VkImage source, VkImageLayout sourceLayout, VkImage destination, VkImageLayout destinationLayout, std::uint32_t count, const VkImageBlit* regions, VkFilter filter) {
+    ExpectCopy(commands, source, destination, count, regions);
+    Expect(sourceLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && destinationLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && filter == VK_FILTER_LINEAR, "blit wrapper changed a layout or filter");
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCopyQueries(VkCommandBuffer commands, VkQueryPool pool, std::uint32_t first, std::uint32_t count, VkBuffer destination, VkDeviceSize offset, VkDeviceSize stride, VkQueryResultFlags flags) {
+    ExpectCopy(commands, pool, destination, count, static_cast<const VkBufferCopy*>(nullptr));
+    Expect(first == 9 && offset == 0x100000008ull && stride == 8 && flags == (VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT), "query copy wrapper changed its range, offset or flags");
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL mockCopyProc(VkDevice, const char* name) {
+    if (std::strcmp(name, "vkCmdCopyBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(mockCopyBuffers);
+    if (std::strcmp(name, "vkCmdCopyBufferToImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(mockCopyBufferToImage);
+    if (std::strcmp(name, "vkCmdCopyImageToBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(mockCopyImageToBuffer);
+    if (std::strcmp(name, "vkCmdCopyImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(mockCopyImages);
+    if (std::strcmp(name, "vkCmdBlitImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(mockBlitImages);
+    if (std::strcmp(name, "vkCmdCopyQueryPoolResults") == 0) return reinterpret_cast<PFN_vkVoidFunction>(mockCopyQueries);
+    return nullptr;
+}
+
+void CopyDiagnostics() {
+    const auto commands = reinterpret_cast<VkCommandBuffer>(std::uintptr_t{0x30});
+    const auto sourceBuffer = reinterpret_cast<VkBuffer>(std::uintptr_t{0x10});
+    const auto destinationBuffer = reinterpret_cast<VkBuffer>(std::uintptr_t{0x20});
+    const auto sourceImage = reinterpret_cast<VkImage>(std::uintptr_t{0x10});
+    const auto destinationImage = reinterpret_cast<VkImage>(std::uintptr_t{0x20});
+    const auto pool = reinterpret_cast<VkQueryPool>(std::uintptr_t{0x10});
+    const VkBufferCopy buffers[]{{3, 7, 64}, {100, 200, 300}};
+    const VkBufferImageCopy bufferImages[2]{{.bufferOffset = 0x100000008ull, .imageExtent = {9, 7, 3}}, {.bufferOffset = 256}};
+    const VkImageCopy images[2]{{.extent = {9, 7, 3}}, {.extent = {4, 2, 1}}};
+    const VkImageBlit blits[2]{{.srcOffsets = {{1, 2, 3}, {9, 7, 4}}}, {}};
+    for (const bool enabled : {false, true}) for (const bool cached : {false, true}) {
+        Context context{};
+        context.deviceProc = mockCopyProc;
+        DeviceFunctions functions{};
+        functions.cmdCopyBuffer = mockCopyBuffers;
+        functions.cmdCopyBufferToImage = mockCopyBufferToImage;
+        functions.cmdCopyImageToBuffer = mockCopyImageToBuffer;
+        functions.cmdCopyQueryPoolResults = mockCopyQueries;
+        context.functions = cached ? &functions : nullptr;
+        if (enabled) context.copyCheckpoints = std::make_shared<GpuCopyCheckpoints>(VK_NULL_HANDLE, mockCopyMarker);
+        const auto check = [&](const void* regions, std::uint32_t count, auto invoke) {
+            copyEvents.clear();
+            expectedCopyRegions = regions;
+            expectedCopyCount = count;
+            invoke();
+            Expect(copyEvents == (enabled ? std::vector<int>{-1, 0, 1} : std::vector<int>{0}), "copy diagnostics changed call order, duplicated a copy or emitted disabled markers");
+        };
+        check(nullptr, 1, [&] { CopyBuffer(context, commands, sourceBuffer, 3, destinationBuffer, 7, 64); });
+        check(buffers, 2, [&] { CopyBuffers(context, commands, sourceBuffer, destinationBuffer, 2, buffers); });
+        check(bufferImages, 2, [&] { CopyBufferToImage(context, commands, sourceBuffer, destinationImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, bufferImages); });
+        check(bufferImages, 2, [&] { CopyImageToBuffer(context, commands, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destinationBuffer, 2, bufferImages); });
+        check(images, 2, [&] { CopyImage(context, commands, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destinationImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, images); });
+        check(blits, 2, [&] { BlitImage(context, commands, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destinationImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, blits, VK_FILTER_LINEAR); });
+        check(nullptr, 3, [&] { CopyQueryResults(context, commands, pool, 9, 3, destinationBuffer, 0x100000008ull, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT); });
+        if (enabled) {
+            GpuCopyCheckpoints::Entry entry;
+            Expect(context.copyCheckpoints->Find(4, entry) && entry.kind == GpuCopyCheckpoints::Kind::ImageToBuffer && std::memcmp(entry.firstRegion.data(), bufferImages, sizeof(bufferImages[0])) == 0, "image copy diagnostic did not retain its first region");
+            Expect(context.copyCheckpoints->Find(7, entry) && entry.kind == GpuCopyCheckpoints::Kind::QueryResults && entry.regionWords == 10, "query copy diagnostic did not retain its argument tuple");
+        }
+    }
 }
 
 constexpr std::size_t MiB = std::size_t{1} << 20u;
@@ -582,6 +683,7 @@ void PartialSlabDoesNotRetry() {
 
 int main() {
     try {
+        CopyDiagnostics();
         SizeClassesAndDirections();
         LargerClass();
         KeptUntilFence();

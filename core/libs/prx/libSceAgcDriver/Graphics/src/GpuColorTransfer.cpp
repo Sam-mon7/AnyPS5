@@ -154,7 +154,7 @@ void GpuColorTransfer::DetileImage(VkCommandBuffer commands, VkImage image, VkIm
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {width, height, 1};
-    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, layout, tiledDevice->Handle(), 1, &copy);
+    CopyImageToBuffer(context, commands, image, layout, tiledDevice->Handle(), 1, &copy);
     dispatch(commands, false, swapRedBlue, tenBit, false, halfFloat);
 }
 

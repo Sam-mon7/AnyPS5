@@ -413,7 +413,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                     regions.push_back(region);
                 }
             }
-            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+            CopyBufferToImage(context, commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
             std::unique_ptr<Buffer> dump;
             if (dumpWanted) {
                 dump = std::make_unique<Buffer>(context, static_cast<std::size_t>(mips[0].linearSize), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -609,7 +609,7 @@ bool Texture::RefreshDepthCopy() {
     toTransferDst.image = image;
     toTransferDst.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, copyLevels, 0, copyLayers};
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &produced, 0, nullptr, 1, &toTransferDst);
-    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, storageSource->Image(), VK_IMAGE_LAYOUT_GENERAL, linear->Handle(), static_cast<std::uint32_t>(fromSource.size()), fromSource.data());
+    CopyImageToBuffer(context, commands, storageSource->Image(), VK_IMAGE_LAYOUT_GENERAL, linear->Handle(), static_cast<std::uint32_t>(fromSource.size()), fromSource.data());
     VkBufferMemoryBarrier linearReady{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
     linearReady.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     linearReady.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -619,7 +619,7 @@ bool Texture::RefreshDepthCopy() {
     linearReady.offset = 0;
     linearReady.size = VK_WHOLE_SIZE;
     barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearReady, 0, nullptr);
-    context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(toDepth.size()), toDepth.data());
+    CopyBufferToImage(context, commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(toDepth.size()), toDepth.data());
     VkImageMemoryBarrier toShaderRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1298,7 +1298,7 @@ bool ClearKeepsDenormals(const Context& context, VkFormat format) {
         VkBufferImageCopy region{};
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.imageExtent = {1, 1, 1};
-        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.Handle(), 1, &region);
+        CopyImageToBuffer(context, commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.Handle(), 1, &region);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         batch.SubmitAndWait();
         keeps = std::memcmp(readback.Bytes().data(), pattern.data(), elementBytes) == 0;
@@ -1436,7 +1436,7 @@ void blitWhole(const Context& context, VkCommandBuffer commands, VkImage source,
     region.srcOffsets[1] = {static_cast<std::int32_t>(width), static_cast<std::int32_t>(height), 1};
     region.dstSubresource = region.srcSubresource;
     region.dstOffsets[1] = region.srcOffsets[1];
-    context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, source, VK_IMAGE_LAYOUT_GENERAL, destination, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
+    BlitImage(context, commands, source, VK_IMAGE_LAYOUT_GENERAL, destination, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
 }
 
 VkImageMemoryBarrier proxyBarrier(VkImage image, VkAccessFlags source, VkAccessFlags destination, VkImageLayout from, VkImageLayout to) {
@@ -2168,7 +2168,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
         const auto regions = CopyRegions(layers);
-        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        CopyBufferToImage(context, commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
         VkImageMemoryBarrier toGeneral = toTransfer;
         toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -2218,7 +2218,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
             const auto regions = CopyRegions();
-            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear.Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+            CopyBufferToImage(context, commands, linear.Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
             VkImageMemoryBarrier toGeneral = toTransfer;
             toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -2559,7 +2559,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     toTransfer.image = image;
     toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
-    context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    CopyBufferToImage(context, commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
     VkImageMemoryBarrier toGeneral = toTransfer;
     toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -2717,12 +2717,12 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         for (const auto& [begin, end, slab] : seeds) {
             // The piece's own slab (a seeded unit is one the piece covers partly).
             const VkBufferCopy seed{begin - import.base, SlabOffset(import, *slab, begin), end - begin};
-            context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, import.buffer, slab->buffer, 1, &seed);
+            CopyBuffers(context, commands, import.buffer, slab->buffer, 1, &seed);
             NoteShadowSeed(begin, end);
         }
         // The padding's current bytes, under the retile that follows (the import-ready barrier
         // orders the scratch writes).
-        for (const auto& [source, copies] : padding.copies) context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, source, tiledScratch->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+        for (const auto& [source, copies] : padding.copies) CopyBuffers(context, commands, source, tiledScratch->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
     }
     const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
     if (direct) {
@@ -2746,7 +2746,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
                 regions.push_back(region);
             }
         }
-        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        CopyImageToBuffer(context, commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
         for (std::size_t i = 0; i < windows.size(); ++i) {
@@ -2761,9 +2761,8 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         // part) precede the copies into the slabs and the import.
         const VkMemoryBarrier scratchDone{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &scratchDone, 0, nullptr, 0, nullptr);
-        const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
-        for (const auto& pieces : slabPieces) copyBuffer(commands, tiledScratch->Handle(), pieces.slab->buffer, static_cast<std::uint32_t>(pieces.copies.size()), pieces.copies.data());
-        if (!importCopies.empty()) copyBuffer(commands, tiledScratch->Handle(), import.buffer, static_cast<std::uint32_t>(importCopies.size()), importCopies.data());
+        for (const auto& pieces : slabPieces) CopyBuffers(context, commands, tiledScratch->Handle(), pieces.slab->buffer, static_cast<std::uint32_t>(pieces.copies.size()), pieces.copies.data());
+        if (!importCopies.empty()) CopyBuffers(context, commands, tiledScratch->Handle(), import.buffer, static_cast<std::uint32_t>(importCopies.size()), importCopies.data());
     }
     VkImageMemoryBarrier backToGeneral = toSource;
     backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -3813,7 +3812,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
             regions.push_back(region);
         }
     }
-    context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    CopyImage(context, commands, source.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
     VkImageMemoryBarrier copied = barriers[1];
     copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -3979,7 +3978,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barriers[1].image = image;
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
-    context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    CopyImage(context, commands, source.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
     VkImageMemoryBarrier copied = barriers[1];
     copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -4262,10 +4261,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             // earlier writer of the import, host stores included, first; the import-ready barrier
             // below orders the scratch writes).
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            for (const auto& [source, copies] : padding.copies) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, source, tiledScratch->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+            for (const auto& [source, copies] : padding.copies) CopyBuffers(context, commands, source, tiledScratch->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
         }
         const auto regions = CopyRegions(storedLayers);
-        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        CopyImageToBuffer(context, commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
@@ -4282,7 +4281,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &scratchDone, 0, nullptr);
             std::vector<VkBufferCopy> copies;
             for (const auto& [from, to] : keep) copies.push_back({from - descriptor.baseAddress, importOffset + (from - descriptor.baseAddress), to - from});
-            if (!copies.empty()) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tiledScratch->Handle(), import->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
+            if (!copies.empty()) CopyBuffers(context, commands, tiledScratch->Handle(), import->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
         }
         VkImageMemoryBarrier backToGeneral = toSource;
         backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -4363,7 +4362,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
     const auto regions = CopyRegions();
-    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear.Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+    CopyImageToBuffer(context, commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear.Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
     const VkBufferMemoryBarrier toShader[] = {WholeBufferBarrier(linear.Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT), WholeBufferBarrier(tiled.Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, toShader, 0, nullptr);
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
