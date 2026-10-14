@@ -144,6 +144,8 @@ The shader preparation threads are traced as well, `shader prepare`, with a buff
 
 The `gpu` track holds one `batch` slice per recorder batch, from the batch's timestamp pair. With `APS5_PROFILE_GPU=1` it also holds a slice per command class range, under the class names of the `[gputime]` line (`draw`, `copy`, `fill`, `present-blit`, ...); program ranges are left out. The track keeps up to 262,144 ranges; more set `trace_dropped`. The GPU clock is mapped onto the CPU clock with calibrated timestamps (`VK_KHR_calibrated_timestamps` or the EXT version, enabled only when a trace switch is set) taken when the window opens and when it closes, so the two clocks are matched at both ends of the window. A batch is added when the driver reads its timestamps, after its fence signals, so the batches of the last frames of the window, which complete after it closes, are missing. Without calibrated timestamps the trace has no `gpu` track, and the `[trace]` line says so.
 
+`APS5_GPU_TIMING_TOP=1` with `APS5_PROFILE_GPU=1` uses top-of-pipe start timestamps for program and class ranges. Batch starts and all ends remain bottom-of-pipe. This diagnostic mode includes outstanding earlier work in range durations, so per-key sums can overlap; the covered union is clipped to the batch span. Compare it with the default bottom-of-pipe starts before attributing gaps to work between ranges: timestamp writes do not order all following commands.
+
 With either switch set, the recorder writes a timestamp pair per batch for the whole run, as with `APS5_PROFILE_DRAW`. Without them, a `PerformanceTimer`, a GPU mutex acquisition and a read of batch timestamps each cost one more predictable branch.
 
 ## Driver thread priority

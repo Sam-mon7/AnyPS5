@@ -1930,9 +1930,9 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
-    // Both stamps wait for everything before them to complete, so the range is the timed work alone
-    // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
-    context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
+    static const bool top = std::getenv("APS5_GPU_TIMING_TOP") != nullptr;
+    const auto stage = top && key != BatchTimingKey ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, stage, open->queries, index * 2);
     return index;
 }
 
@@ -2387,7 +2387,12 @@ void Recorder::readGpuTiming(Batch& batch) {
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
-        intervals.push_back({stamps[i * 2], stamps[i * 2 + 1], key});
+        auto begin = stamps[i * 2], end = stamps[i * 2 + 1];
+        if (batch.batchTiming < batch.timedKeys.size()) {
+            begin = std::max(begin, stamps[batch.batchTiming * 2]);
+            end = std::min(end, stamps[batch.batchTiming * 2 + 1]);
+        }
+        if (end > begin) intervals.push_back({begin, end, key});
     }
     std::sort(intervals.begin(), intervals.end());
     static const bool traceGaps = std::getenv("APS5_TRACE_GPU_GAPS") != nullptr;
