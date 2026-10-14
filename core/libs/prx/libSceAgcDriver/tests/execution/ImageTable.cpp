@@ -717,6 +717,28 @@ void RunTests(AgcDriver::VulkanDevice& device) {
     Require(Faulted(selected) && selected.log.find("not an image") != std::string::npos && selected.log.find(address) != std::string::npos && selected.log.find("00001234") != std::string::npos, "image table: an invalid entry selected with EXEC set did not report its address, words and reason:\n" + selected.log);
     Require(Zeros(selected), "image table: a faulting access did not sample zeros");
 
+    auto excessiveMips = floatImage;
+    excessiveMips[1] |= 3u << 30u;
+    excessiveMips[2] = 6u;
+    excessiveMips[3] |= 9u << 16u;
+    SetWideRecord(0, floatImage);
+    SetWideRecord(1, uintImage);
+    Keys[0] = 1;
+    const auto mipsControl = Run(device, ReadTable256Code, 1, Lanes, 64);
+    SetWideRecord(0, excessiveMips);
+    Table[5] = 9u << 4u;
+    const auto mipsUnused = Run(device, ReadTable256Code, 1, Lanes, 64);
+    Require(!Faulted(mipsControl) && mipsUnused.imageTableCount == 2u && !Faulted(mipsUnused) && Group(mipsUnused, 0) == Group(mipsControl, 0), "image table: an unselected 28x1 entry with ten mips changed the result:\n" + mipsUnused.log);
+    auto fullTableCutCode = ReadTableCutCode;
+    fullTableCutCode[16] = 0xf0000f08u;
+    fullTableCutCode[17] = 0x00080401u;
+    Keys[0] = 0;
+    const auto mipsCut = Run(device, fullTableCutCode, 1, Lanes, 64);
+    Require(!Faulted(mipsCut), "image table: an excessive mip count faulted with EXEC clear:\n" + mipsCut.log);
+    const auto mipsSelected = Run(device, ReadTable256Code, 1, Lanes, 64);
+    Require(Faulted(mipsSelected) && mipsSelected.log.find("mip count exceeds the image extent") != std::string::npos && mipsSelected.log.find("28x1") != std::string::npos && Zeros(mipsSelected), "image table: an excessive mip count was not rejected when selected:\n" + mipsSelected.log);
+    SetClassRecords();
+
     void* reserved = nullptr;
 #ifdef _WIN32
     reserved = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_NOACCESS);

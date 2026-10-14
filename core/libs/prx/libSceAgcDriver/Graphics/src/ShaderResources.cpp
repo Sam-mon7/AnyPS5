@@ -3841,6 +3841,8 @@ std::uint32_t ShaderResources::rejectTableElement(TableStage& table, std::span<c
     poison.dwordCount = static_cast<std::uint32_t>(words.size());
     poison.resource = ShaderRecompiler::NoTable;
     poison.reason = static_cast<std::uint32_t>(ShaderRecompiler::ImageTableAbi::PoisonReason::DriverRejected);
+    static const bool trace = std::getenv("APS5_TRACE_IMAGE_TABLE") != nullptr;
+    if (trace) AgcDriver::ProfilePrint_nid_no_patch("[image-table] shader 0x%llx stage %u rejected descriptor %08x %08x %08x %08x %08x %08x %08x %08x: %s (faults only if selected)\n", static_cast<unsigned long long>(table.program->imageTableShader), static_cast<unsigned>(table.stage), poison.words[0], poison.words[1], poison.words[2], poison.words[3], poison.words[4], poison.words[5], poison.words[6], poison.words[7], message.c_str());
     table.poison.push_back(poison);
     table.messages.push_back(message);
     faultChecks = true;

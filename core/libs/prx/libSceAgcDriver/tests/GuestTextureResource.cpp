@@ -387,6 +387,50 @@ void RunGuestTextureResourceTests() {
     const auto partial = DecodeTextureResource(pack(partialMips));
     Require(partial.lastLevel == 1 && partial.mipCount == 3, "a view over part of the mip chain decoded wrongly");
 
+    Fields mipArray = base;
+    mipArray.width = 512;
+    mipArray.height = 512;
+    mipArray.format = 181;
+    mipArray.typeRaw = 13;
+    mipArray.tileModeRaw = 9;
+    mipArray.depth = 63;
+    mipArray.maxMip = 9;
+    mipArray.lastLevel = 9;
+    auto mipWords = pack(mipArray);
+    Require(DecodeTextureResource(mipWords).mipCount == 10, "a full 512x512 BC array mip chain was rejected");
+    mipWords[2] = 6;
+    reject([&] { DecodeTextureResource(mipWords); }, "mip count exceeds the image extent");
+
+    mipArray.width = 28;
+    mipArray.height = 1;
+    mipArray.maxMip = 4;
+    mipArray.lastLevel = 15;
+    const auto shortArray = DecodeTextureResource(pack(mipArray));
+    Require(shortArray.mipCount == 5 && shortArray.lastLevel == 4, "a view must end at the allocated mip chain");
+    mipArray.maxMip = 5;
+    rejectFields(mipArray, "mip count exceeds the image extent");
+    mipArray.maxMip = 4;
+    mipArray.baseLevel = 5;
+    mipArray.lastLevel = 5;
+    rejectFields(mipArray, "mip count exceeds the image extent");
+
+    Fields volumeMips = base;
+    volumeMips.width = 8;
+    volumeMips.height = 4;
+    volumeMips.depth = 31;
+    volumeMips.typeRaw = 10;
+    volumeMips.maxMip = 5;
+    volumeMips.lastLevel = 5;
+    Require(DecodeTextureResource(pack(volumeMips)).mipCount == 6, "volume depth must contribute to the mip limit");
+    volumeMips.maxMip = 6;
+    rejectFields(volumeMips, "mip count exceeds the image extent");
+
+    Fields oneTexel = base;
+    oneTexel.width = 1;
+    oneTexel.height = 1;
+    oneTexel.maxMip = 1;
+    rejectFields(oneTexel, "mip count exceeds the image extent");
+
     Fields pastLast = base;
     pastLast.base40 = 0x55ea000ull;
     pastLast.format = 71;

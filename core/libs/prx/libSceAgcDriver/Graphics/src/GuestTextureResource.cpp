@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include <algorithm>
+#include <bit>
 #include <stdexcept>
 #include <string>
 
@@ -190,6 +191,9 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
             }
             break;
     }
+
+    const auto extent = std::max({width, height, dimension == TextureDimension::k3D ? depth + 1u : 1u});
+    if (std::max(maxMip, lastLevel) >= std::bit_width(extent)) throw std::runtime_error("AGC graphics: guest texture mip count exceeds the image extent" + describe());
 
     GuestTextureResource result{};
     result.baseAddress = baseAddress;
