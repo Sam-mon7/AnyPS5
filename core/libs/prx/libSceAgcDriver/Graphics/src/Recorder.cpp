@@ -1748,8 +1748,10 @@ std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
+struct GapTotals { std::uint64_t count = 0; double ms = 0, maxMs = 0; };
 std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
+std::map<std::pair<std::uint64_t, std::uint64_t>, GapTotals> timingGaps;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
 
@@ -2365,7 +2367,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     static auto lastReport = std::chrono::steady_clock::now();
     // The union of the timed ranges (class ranges nest program ranges: a copy's transfer inside
     // its class range) against the batch span gives what no range covers.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
+    std::vector<std::array<std::uint64_t, 3>> intervals;
     intervals.reserve(batch.timedKeys.size());
     std::unique_lock lock(timingMutex);
     for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
@@ -2385,33 +2387,35 @@ void Recorder::readGpuTiming(Batch& batch) {
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
-        intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+        intervals.push_back({stamps[i * 2], stamps[i * 2 + 1], key});
     }
     std::sort(intervals.begin(), intervals.end());
     static const bool traceGaps = std::getenv("APS5_TRACE_GPU_GAPS") != nullptr;
     static std::size_t reportedGaps = 0;
     if (traceGaps && batch.batchTiming < batch.timedKeys.size()) {
         auto cursor = stamps[batch.batchTiming * 2];
+        auto previousKey = BatchTimingKey;
         const auto last = stamps[batch.batchTiming * 2 + 1];
-        const auto reportGap = [&](std::uint64_t begin, std::uint64_t end) {
-            if (end <= begin || static_cast<double>(end - begin) * period < 100'000'000.0 || reportedGaps >= 64) return;
-            auto before = BatchTimingKey, after = BatchTimingKey;
-            for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
-                if (i == batch.batchTiming) continue;
-                if (stamps[i * 2 + 1] == begin) before = batch.timedKeys[i];
-                if (stamps[i * 2] == end) after = batch.timedKeys[i];
-            }
+        const auto groupKey = [&](std::uint64_t key) { return key == BatchTimingKey || (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) ? key : std::uint64_t{0}; };
+        const auto reportGap = [&](std::uint64_t begin, std::uint64_t end, std::uint64_t before, std::uint64_t after) {
+            if (end <= begin) return;
+            const auto ms = static_cast<double>(end - begin) * period / 1e6;
+            auto& totals = timingGaps[{groupKey(before), groupKey(after)}];
+            ++totals.count;
+            totals.ms += ms;
+            totals.maxMs = std::max(totals.maxMs, ms);
+            if (ms < 100 || reportedGaps >= 64) return;
             ++reportedGaps;
-            AgcDriver::ProfilePrint_nid_no_patch("[gputime-gap] batch %llu queue 0x%llx: %.3f ms after key 0x%llx before key 0x%llx (batch %.3f ms, %zu ranges)\n", static_cast<unsigned long long>(batch.serial), static_cast<unsigned long long>(batch.queue), static_cast<double>(end - begin) * period / 1e6, static_cast<unsigned long long>(before), static_cast<unsigned long long>(after), batch.gpuEndNs / 1e6 - batch.gpuStartNs / 1e6, batch.timedKeys.size());
+            AgcDriver::ProfilePrint_nid_no_patch("[gputime-gap] batch %llu queue 0x%llx: %.3f ms after key 0x%llx before key 0x%llx (batch %.3f ms, %zu ranges)\n", static_cast<unsigned long long>(batch.serial), static_cast<unsigned long long>(batch.queue), ms, static_cast<unsigned long long>(before), static_cast<unsigned long long>(after), batch.gpuEndNs / 1e6 - batch.gpuStartNs / 1e6, batch.timedKeys.size());
         };
-        for (const auto& [begin, end] : intervals) {
-            reportGap(cursor, std::min(begin, last));
-            cursor = std::max(cursor, end);
+        for (const auto& [begin, end, key] : intervals) {
+            reportGap(cursor, std::min(begin, last), previousKey, begin <= last ? key : BatchTimingKey);
+            if (end > cursor) { cursor = end; previousKey = key; }
         }
-        reportGap(cursor, last);
+        reportGap(cursor, last, previousKey, BatchTimingKey);
     }
     std::uint64_t coveredTicks = 0, unionEnd = 0;
-    for (const auto& [begin, end] : intervals) {
+    for (const auto& [begin, end, key] : intervals) {
         const auto from = std::max(begin, unionEnd);
         if (end > from) coveredTicks += end - from;
         unionEnd = std::max(unionEnd, end);
@@ -2439,6 +2443,23 @@ void Recorder::readGpuTiming(Batch& batch) {
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    if (traceGaps) {
+        std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, GapTotals>> gaps(timingGaps.begin(), timingGaps.end());
+        std::sort(gaps.begin(), gaps.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        GapTotals total;
+        for (const auto& [keys, totals] : gaps) { total.count += totals.count; total.ms += totals.ms; total.maxMs = std::max(total.maxMs, totals.maxMs); }
+        const auto name = [&](std::uint64_t key) { return key == BatchTimingKey ? "batch" : key == 0 ? "program" : CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]; };
+        char text[256];
+        std::snprintf(text, sizeof(text), "[gputime-gaps] %llu gaps %.3fms total %.3fms max; top endpoint pairs:", static_cast<unsigned long long>(total.count), total.ms, total.maxMs);
+        std::string report(text);
+        for (std::size_t i = 0; i < gaps.size() && i < 12; ++i) {
+            const auto& [keys, totals] = gaps[i];
+            std::snprintf(text, sizeof(text), " %s->%s x%llu %.3fms max%.3fms", name(keys.first), name(keys.second), static_cast<unsigned long long>(totals.count), totals.ms, totals.maxMs);
+            report += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("%s\n", report.c_str());
+        timingGaps.clear();
+    }
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
