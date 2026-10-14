@@ -16,6 +16,8 @@ using namespace AgcDriver::DriverDetail;
 alignas(256) constexpr auto Code = PatternFillKernel;
 alignas(256) std::array<std::uint32_t, 4> Pattern{0, 0x12345678u, 0xdeadbeefu, 0x7fc12345u};
 alignas(256) std::array<std::uint32_t, 4> Control{};
+alignas(256) std::array<std::uint32_t, 3> Arguments{};
+alignas(256) volatile std::uint32_t Gate = 1;
 alignas(256) std::array<std::uint32_t, 260> Output{};
 
 std::array<std::uint32_t, 12> UserData(void* output, std::uint32_t records) {
@@ -99,9 +101,8 @@ std::vector<std::uint32_t> Commands(std::span<const std::uint32_t> data, std::ui
     registers(0x240, data);
     const auto initiator = 0x41u | (wave == 32 ? 0x8000u : 0u) | (partial ? 0x20u : 0u);
     if (indirect) {
-        static std::array<std::uint32_t, 3> arguments;
-        arguments = {threads / 64, 1, 1};
-        const auto pointer = reinterpret_cast<std::uintptr_t>(arguments.data());
+        Arguments = {threads / 64, 1, 1};
+        const auto pointer = reinterpret_cast<std::uintptr_t>(Arguments.data());
         words.insert(words.end(), {0xc0021600u, static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32u), initiator});
     } else {
         words.insert(words.end(), {0xc0031500u, partial ? threads : threads / 64, 1, 1, initiator});
@@ -185,6 +186,30 @@ void PartialGroupTests() {
     }
 }
 
+void IndirectWrittenAheadTests() {
+    for (const auto wave : {32u, 64u}) {
+        Output.fill(0xcafebabeu);
+        Pattern[0] = 0x5a5a5a5au;
+        Control = {256, 0, 0, 0};
+        const auto fill = Commands(UserData(Output.data(), 256), 128, wave, false, true);
+        Arguments = {1, 1, 1};
+        const auto gate = reinterpret_cast<std::uintptr_t>(&Gate);
+        const auto arguments = reinterpret_cast<std::uintptr_t>(Arguments.data());
+        std::vector<std::uint32_t> words{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(gate), static_cast<std::uint32_t>(gate >> 32u), 1u, 0xffffffffu, 0x19u};
+        words.insert(words.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(arguments), static_cast<std::uint32_t>(arguments >> 32u), 2u});
+        words.insert(words.end(), fill.begin(), fill.end());
+        Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+        AgcDriver::Submit(&packet, 0x20);
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output.data()), sizeof(Output));
+        Require(Arguments[0] == 2, "the preceding label did not write the indirect arguments");
+        for (std::size_t i = 0; i < Output.size(); ++i) {
+            const auto expected = i < 128 ? 0x5a5a5a5au : 0xcafebabeu;
+            Require(Output[i] == expected, "indirect fill captured arguments before their producer at " + std::to_string(i) + " wave " + std::to_string(wave));
+        }
+    }
+}
+
 void Benchmark() {
     constexpr std::size_t bytes = 64u << 20u;
     std::vector<std::uint32_t> storage(bytes / 4 + 4);
@@ -217,6 +242,7 @@ int main(int argc, char** argv) {
         else {
             ExecuteTests();
             PartialGroupTests();
+            IndirectWrittenAheadTests();
         }
         AgcDriverShutdown_nid_postfix();
         std::puts("pattern buffer fill tests passed");
