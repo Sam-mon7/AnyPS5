@@ -463,7 +463,8 @@ void verifyMayEvaluate() {
     require(extracted.controlFlow[0].condition != nullptr, "plan extraction dropped a scalar condition");
     require(extracted.controlFlow[1].condition == nullptr, "plan extraction retained a vector-dependent condition");
     require(resources.controlFlow[1].condition == &varying, "plan extraction changed the source condition");
-    require(std::ranges::none_of(extracted.valueStorage, [](const auto& value) { return value->Opcode() == IrOpcode::GetRegister; }), "plan extraction copied an unevaluable condition's operands");
+    require(std::ranges::none_of(extracted.valueStorage, [](const auto& value) { return value.Opcode() == IrOpcode::GetRegister; }), "plan extraction copied an unevaluable condition's operands");
+    require(std::ranges::all_of(extracted.valueStorage, [](const auto& value) { return value.Uses().empty(); }), "extracted plan retained compiler use lists");
     Detail::CompactEvaluator compact(extracted, runtime);
     std::uint32_t result = 0;
     require(compact.Evaluate(Detail::CompactNode::From(extracted, extracted.controlFlow[0].condition), result) && result == 1u, "filtered plan lost its compact scalar evaluation");
