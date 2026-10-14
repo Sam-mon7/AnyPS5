@@ -1261,13 +1261,20 @@ if(BUILD_TESTING)
 endif()
 
 if(WIN32 AND ANYPS5_AFTERMATH_SDK_ROOT)
-    target_sources(agc_driver_graphics_tests PRIVATE Graphics/src/AftermathCapture.cpp)
-    target_include_directories(agc_driver_graphics_tests PRIVATE ${agcAftermathTestInclude})
-    target_compile_definitions(agc_driver_graphics_tests PRIVATE
+    add_test_executable(agc_aftermath_recorder_release_tests EXCLUDE_FROM_ALL
+        tests/RecorderKeptBytes.cpp Graphics/src/Recorder.cpp Graphics/src/AftermathCapture.cpp)
+    target_include_directories(agc_aftermath_recorder_release_tests PRIVATE
+        ${LIBS_INCLUDE_DIR} ${agcTextureDetileGeneratedRoot} ${agcAftermathTestInclude}
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
+    target_compile_definitions(agc_aftermath_recorder_release_tests PRIVATE
             ANYPS5_AFTERMATH_ENABLED=1 ANYPS5_AFTERMATH_TESTING=1)
+    target_link_libraries(agc_aftermath_recorder_release_tests PRIVATE libSceAgcDriver shader_recompiler_agc_driver libc libkernel)
+    set_target_properties(agc_aftermath_recorder_release_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_aftermath_recorder_release_tests)
     if(BUILD_TESTING)
-        add_test(NAME agc_aftermath_recorder_release
-                COMMAND agc_driver_graphics_tests --aftermath-recorder-release)
+        set_target_properties(agc_aftermath_recorder_release_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+        add_test(NAME agc_aftermath_recorder_release COMMAND agc_aftermath_recorder_release_tests)
         set_tests_properties(agc_aftermath_recorder_release PROPERTIES TIMEOUT 10)
         if(WIN32)
             set_tests_properties(agc_aftermath_recorder_release PROPERTIES ENVIRONMENT_MODIFICATION
