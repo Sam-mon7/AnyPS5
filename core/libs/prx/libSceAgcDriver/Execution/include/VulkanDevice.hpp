@@ -21,7 +21,6 @@ namespace AgcDriver {
 
 namespace Graphics {
 class StorageTexture;
-class ShaderResources;
 }
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
@@ -323,7 +322,7 @@ private:
     IndirectOutcome dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe);
     // The stage-A pre-sync over `surfaces` (see PrepareDispatch): the serial waited for, 0 none.
     std::uint64_t presync(std::span<const std::pair<std::uint64_t, std::uint64_t>> surfaces);
-    std::shared_ptr<ComputePipelineObjects> computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, const Graphics::ShaderResources& resources, VkShaderStageFlags pushStages, std::uint64_t programAddress);
+    std::shared_ptr<ComputePipelineObjects> computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress);
     // A DISPATCH_INDIRECT's argument path (see DispatchIndirect): GPU-side from the host import, or
     // the counts read on the CPU (the record then continues as a direct dispatch).
     void decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText);
