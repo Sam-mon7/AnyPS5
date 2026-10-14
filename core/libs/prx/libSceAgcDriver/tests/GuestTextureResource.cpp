@@ -162,6 +162,23 @@ void RunGuestTextureResourceTests() {
     result = DecodeTextureResource(pack(wide));
     Require(result.width == 8192 && result.height == 4096, "wide texture dimensions were split across dwords incorrectly");
 
+    const std::array<std::uint32_t, 8> invalidExtent{
+        0xe34ab800u, 0xe22a4000u, 0xdb84b400u, 0xdb650facu,
+        0xe22a4400u, 0xe10a6800u, 0xdb650800u, 0xcce6c400u,
+    };
+    reject([&] { DecodeTextureResource(invalidExtent); }, "upper width or height bits");
+    for (const auto bit : {12u, 13u, 28u, 29u}) {
+        auto words = baseWords;
+        words[2] |= 1u << bit;
+        reject([&] { DecodeTextureResource(words); }, "upper width or height bits");
+    }
+    wide.width = 16384;
+    wide.height = 16384;
+    auto limitWords = pack(wide);
+    limitWords[2] |= 1u << 31u;
+    result = DecodeTextureResource(limitWords);
+    Require(result.width == 16384 && result.height == 16384, "maximum supported extents or resource level were rejected");
+
     Fields tileModes = base;
     tileModes.tileModeRaw = 0x01;
     Require(DecodeTextureResource(pack(tileModes)).tileMode == TextureTileMode::kStandard256B, "tile mode 0x01 must decode to standard 256B");

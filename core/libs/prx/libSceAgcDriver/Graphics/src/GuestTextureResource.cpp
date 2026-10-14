@@ -68,6 +68,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
 
     const auto minLod = (words[1] >> 8u) & 0xfffu;
     const auto format = (words[1] >> 20u) & 0x1ffu;
+    Require((words[2] & 0x30003000u) == 0, "guest texture descriptor uses upper width or height bits which are not implemented");
     const auto width = (((words[1] >> 30u) & 0x3u) | (((words[2] >> 0u) & 0xfffu) << 2u)) + 1u;
     const auto height = ((words[2] >> 14u) & 0x3fffu) + 1u;
 
