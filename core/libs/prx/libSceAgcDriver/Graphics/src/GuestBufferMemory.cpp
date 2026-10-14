@@ -843,15 +843,14 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         }
         failures.erase(failed);
     }
-    // The imports this one replaces overlap it; none may be held by a build, and the import must fit the budget (with
-    // what may be evicted) before any of them is retired.
     auto first = state.imports.lower_bound(base);
     if (first != state.imports.begin() && std::prev(first)->second.base + std::prev(first)->second.bytes > base) --first;
     std::uint64_t replaced = 0;
-    // A join may replace imports this build already looked up: it runs before any region confirms an import
-    // (UploadFinish's pre-pass re-resolves every pointer after it), and a retired import stays alive through the
-    // hold (KeepThroughHold). Refusing it there would keep the run copied for good.
-    const auto held = [&](const HostImport& entry) { return !joined && pointerHeld(state, entry); };
+    const auto held = [&](const HostImport& entry) {
+        if (joined || !pointerHeld(state, entry)) return false;
+        const bool expandedWindow = run.ranges.size() == 1 && entry.ranges.size() == 1 && entry.range == run.ranges.front() && base <= entry.base && base + bytes >= entry.base + entry.bytes && bytes > entry.bytes;
+        return !expandedWindow || Recorder::Active() == nullptr;
+    };
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
         if (held(it->second)) {
             if (traceRefusal) std::fprintf(stderr, "[import-refusal] 0x%llx+0x%llx overlaps held 0x%llx+0x%llx (use %llu floor %llu)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(it->second.base), static_cast<unsigned long long>(it->second.bytes), static_cast<unsigned long long>(it->second.lastUse), static_cast<unsigned long long>(state.buildFloor));
