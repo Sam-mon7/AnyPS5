@@ -2,6 +2,7 @@
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -3440,6 +3441,24 @@ void textureCacheBudgetTests() {
     Require(TextureCacheBudget(memory) == 6 * GiB, "a 24 GiB device-local heap does not give 6 GiB of cached textures");
 }
 
+void hostImportBudgetTests() {
+    using AgcDriver::Graphics::DefaultHostImportBudget;
+    constexpr std::uint64_t MiB = 1ull << 20u;
+    VkPhysicalDeviceMemoryProperties memory{};
+    Require(DefaultHostImportBudget(memory) == 6144 * MiB, "a device without a host heap does not get the 6 GiB floor");
+    memory.memoryHeapCount = 2;
+    memory.memoryHeaps[0] = {16384 * MiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryHeaps[1] = {8192 * MiB, 0};
+    Require(DefaultHostImportBudget(memory) == 6144 * MiB, "a small host heap does not get the floor");
+    memory.memoryHeaps[1] = {32768 * MiB, 0};
+    Require(DefaultHostImportBudget(memory) == 16384 * MiB, "a host heap does not get half its size");
+    memory.memoryHeaps[1] = {65536 * MiB, 0};
+    Require(DefaultHostImportBudget(memory) == 24576 * MiB, "a large host heap is not capped at 24 GiB");
+    memory.memoryHeaps[0] = {65536 * MiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryHeaps[1] = {4096 * MiB, 0};
+    Require(DefaultHostImportBudget(memory) == 6144 * MiB, "a device-local heap counts as host memory");
+}
+
 void sampledTextureBudgetTests() {
     using AgcDriver::Graphics::SampledTextureBudget;
     constexpr std::uint64_t GiB = 1ull << 30u;
@@ -5822,6 +5841,7 @@ int main(int argc, char** argv) {
         textureCacheBudgetTests();
         sampledTextureBudgetTests();
         storageTextureBudgetTests();
+        hostImportBudgetTests();
         sampledBudgetReportTests();
         meshArgumentTests();
         meshIndexBufferTests();

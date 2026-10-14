@@ -55,6 +55,7 @@ struct ImportProbe {
 };
 
 ImportProbe ProbeImportWriteProtection(const Context& context);
+std::uint64_t DefaultHostImportBudget(const VkPhysicalDeviceMemoryProperties& memory);
 ImportProbe ProbeDmaBufImportWriteProtection(const Context& context);
 ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);

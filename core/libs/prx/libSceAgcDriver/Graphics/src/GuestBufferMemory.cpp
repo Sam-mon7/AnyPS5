@@ -731,23 +731,8 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
     return freed;
 }
 
-std::uint64_t physicalMemoryBytes() {
-#ifdef _WIN32
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
-#else
-    const auto pages = sysconf(_SC_PHYS_PAGES);
-    const auto pageSize = sysconf(_SC_PAGESIZE);
-    return pages > 0 && pageSize > 0 ? static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(pageSize) : 0;
-#endif
-}
-
 std::atomic<std::uint64_t> budgetOverride{0};
 
-// Pinned imports count against the driver's system memory heap, which imports and type-3 mirrors share; past it
-// ordinary host allocations fail. The budget is APS5_HOST_IMPORT_MIB, else the larger of 6 GiB and half the physical
-// memory, at most the largest host heap less 2 GiB.
 std::uint64_t importBudget(const Context& context) {
     if (const auto set = budgetOverride.load(std::memory_order_relaxed); set != 0) return set;
     static const std::uint64_t configured = []() -> std::uint64_t {
@@ -755,13 +740,7 @@ std::uint64_t importBudget(const Context& context) {
         return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0u;
     }();
     if (configured != 0) return configured;
-    std::uint64_t hostHeap = 0;
-    for (std::uint32_t index = 0; index < context.memory.memoryHeapCount; ++index) {
-        if ((context.memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) hostHeap = std::max<std::uint64_t>(hostHeap, context.memory.memoryHeaps[index].size);
-    }
-    const auto fromMemory = std::max<std::uint64_t>(6144ull << 20u, physicalMemoryBytes() / 2);
-    constexpr std::uint64_t reserve = 2048ull << 20u;
-    return hostHeap > reserve ? std::min(fromMemory, hostHeap - reserve) : fromMemory;
+    return DefaultHostImportBudget(context.memory);
 }
 
 std::atomic<std::uint64_t> rangeImportWindow{64ull << 20u};
@@ -2277,6 +2256,16 @@ void SetImportWatch(const Context& context, ImportWatch watch) {
     state.watchDevice = context.device;
     state.unwatchImports = watch == ImportWatch::Unwatch;
     state.unwatchDmaBufImports = state.unwatchImports;
+}
+
+std::uint64_t DefaultHostImportBudget(const VkPhysicalDeviceMemoryProperties& memory) {
+    constexpr std::uint64_t floor = 6144ull << 20u;
+    constexpr std::uint64_t ceiling = 24576ull << 20u;
+    std::uint64_t host = 0;
+    for (std::uint32_t index = 0; index < memory.memoryHeapCount; ++index) {
+        if ((memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) host = std::max<std::uint64_t>(host, memory.memoryHeaps[index].size);
+    }
+    return std::clamp(host / 2, floor, ceiling);
 }
 
 void SetHostImportWindow(std::uint64_t bytes) {
