@@ -67,7 +67,6 @@ struct DrawEntry {
     std::vector<std::vector<std::shared_ptr<DispatchVariant>>> stages;
 
     std::atomic<std::shared_ptr<const std::vector<DrawRecipeRecord>>> recipes;
-    std::uint64_t touched = 0;
     std::list<std::uint64_t>::iterator order;
     std::uint64_t shape = 0;
 };

@@ -111,6 +111,27 @@ void ThirdDrawHitsTheCache(bool libraries) {
     Require(counters.hits == 1, mode + ": the repeated draw did not reuse the cached draw (" + std::to_string(counters.hits) + " hits)");
 }
 
+void RecentlyHitDrawSurvivesColdInsertions() {
+    const char* capacity = std::getenv("APS5_DRAW_CACHE_ENTRIES");
+    Require(capacity != nullptr && std::string(capacity) == "16", "draw-cache recency test requires APS5_DRAW_CACHE_ENTRIES=16");
+    std::vector<float> values;
+    for (unsigned key = 2; key <= 16; ++key) values.push_back(static_cast<float>(key));
+    values.insert(values.end(), {1.0f, 17.0f, 1.0f, 1.0f, 2.0f});
+    auto commands = DrawCommands();
+    for (const auto value : values) {
+        Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(value)});
+        Append(commands, 0x2d, {3, 2});
+    }
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw-cache recency submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(after.lookups - before.lookups == 20, "draw-cache recency workload did not execute all draws");
+    Require(after.hits - before.hits == 3 && after.absent - before.absent == 17, "a recently hit draw was evicted before a cold entry");
+    Require(after.touches - before.touches == 2, "draw-cache hits did not promote two non-front entries exactly once");
+}
+
 void SightingsKeepCollidingKeys() {
     DrawKeySightings sightings(DrawKeySightings::Ways);
     Require(!sightings.SeenBefore(0) && sightings.SeenBefore(0), "draw key 0 was not admitted at its second sight");
@@ -299,6 +320,7 @@ int main() {
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         ThirdDrawHitsTheCache(libraries);
+        RecentlyHitDrawSurvivesColdInsertions();
         EmptyCpuIndirectDrawsSkipFragmentCapture();
         QueuedFragmentWordInvalidatesFrontPage();
         AgcDriverShutdown_nid_postfix();

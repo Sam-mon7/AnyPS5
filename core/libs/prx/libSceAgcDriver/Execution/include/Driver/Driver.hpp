@@ -348,7 +348,7 @@ private:
     DrawRelocationPending drawRelocationPending;
     DrawRelocationCounters drawRelocationCounters;
     std::mutex drawCacheMutex;
-    std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
+    std::uint64_t drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;
 
     DrawEntryCounters drawEntryCounters;
