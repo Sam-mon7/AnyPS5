@@ -630,6 +630,50 @@ void importAtMapOverBudgetTests(const Context& context) {
     for (auto* block : {kept, used, mapped}) ::operator delete(block, std::align_val_t{bytes});
 }
 
+void importUnmirroredRangeAtBudgetTests(const Context& context) {
+    constexpr std::size_t bytes = 65536;
+    auto importing = context;
+    importing.hostImportAlignment = bytes;
+    auto* block = static_cast<std::byte*>(::operator new(5 * bytes, std::align_val_t{bytes}));
+    std::memset(block, 0x45, 5 * bytes);
+    const auto needed = reinterpret_cast<std::uintptr_t>(block);
+    const auto hot = needed + 2 * bytes;
+    const auto cold = needed + 4 * bytes;
+    const auto change = [&](bool add) {
+        GuestAllocations::Mutation mutation;
+        for (std::size_t offset : {std::size_t{0}, 2 * bytes, 4 * bytes}) {
+            if (add) mutation.Add(block + offset, bytes, true, false, true);
+            else mutation.Remove(block + offset);
+        }
+    };
+    change(true);
+    Require(HostImportFor(importing, needed, bytes) != nullptr, "the unmirrored range was not initially imported");
+    for (int use = 0; use < 300; ++use) Require(HostImportFor(importing, hot, bytes) != nullptr, "the hot range was not imported");
+    const auto budget = HostImportLiveBytes();
+    SetHostImportBudget(budget);
+    {
+        GuestBufferMemory traffic(importing);
+        traffic.AddReadable(hot, 16);
+        traffic.AddReadable(cold, 16);
+        traffic.Upload(false);
+        traffic.WriteBack();
+    }
+    Require(!HostImportCovers(importing, needed, bytes) && HostImportCovers(importing, cold, bytes), "descriptor traffic did not evict the unmirrored range");
+    for (int use = 0; use < 300; ++use) Require(HostImportFor(importing, hot, bytes) != nullptr, "the hot import was lost");
+    {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        Require(HostImportCovers(importing, needed, bytes), "an address-based build copied an unmirrored range instead of evicting a cold import");
+        Require(HostImportCovers(importing, hot, bytes) && !HostImportCovers(importing, cold, bytes), "reacquisition displaced a current build's import");
+        Require(HostImportLiveBytes() <= budget, "reacquisition exceeded the import budget");
+        leased.Upload(true);
+        leased.WriteBack();
+    }
+    SetHostImportBudget(0);
+    change(false);
+    ::operator delete(block, std::align_val_t{bytes});
+}
+
 ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
 }
@@ -1635,6 +1679,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importRefusedWholeRangeTests(context);
     importNeighbouringEdgesTests(context);
     importAtMapOverBudgetTests(context);
+    importUnmirroredRangeAtBudgetTests(context);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();

@@ -2508,10 +2508,6 @@ void GuestBufferMemory::AcquireRegistered() {
             if (importable) refreshImports(context, state, lease);
             if (importFloor == 0) importFloor = state.useCounter + 1;
             state.buildFloor = importFloor;
-            // Taken before the pass: the imports it takes are the registry's ones (just reconciled, so
-            // none is retired by a make below), and a mirror's preparation may sync the recorder, whose
-            // completions can retire an import already taken; that moves the epoch, and Upload then
-            // re-checks every pointer instead of trusting it.
             importsEpoch = state.epoch;
         }
         lap(timing.importsUs, at);
@@ -2532,15 +2528,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 entry = importAllocation(context, state, range->address, lease, 0, false);
             }
             lap(timing.importsUs, at);
-            if (entry != nullptr) {
-                region.hostBacked = true;
-                // Reused by Upload while no import was dropped since (see importsEpoch).
-                region.direct = entry;
-                regions.push_back(std::move(region));
-                imported.push_back(range->address);
-                continue;
-            }
-            if (mirrorsEnabled()) {
+            if (entry == nullptr && mirrorsEnabled()) {
                 region.mirror = acquireMirror(context, range, blocks, range->releasable);
                 lap(timing.mirrorsUs, at);
                 if (region.mirror != nullptr) {
@@ -2554,6 +2542,20 @@ void GuestBufferMemory::AcquireRegistered() {
                     regions.push_back(std::move(region));
                     continue;
                 }
+            }
+            if (entry == nullptr && importable) {
+                auto& state = Imports();
+                std::lock_guard lock(state.mutex);
+                entry = importAllocation(context, state, range->address, lease);
+                lap(timing.importsUs, at);
+            }
+            if (entry != nullptr) {
+                region.hostBacked = true;
+                // Reused by Upload while no import was dropped since (see importsEpoch).
+                region.direct = entry;
+                regions.push_back(std::move(region));
+                imported.push_back(range->address);
+                continue;
             }
             addCopiedRange({range->address, range->address + range->bytes, range->writable});
             const auto& copied = regions.back();
