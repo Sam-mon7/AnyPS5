@@ -2,7 +2,6 @@
 #include "../include/Mutex.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -88,18 +87,14 @@ int MutexOperations::Timedlock(PthreadMutex* mutex, const KernelTimespec* abstim
     if (std::chrono::duration<long double>(duration) >= std::chrono::duration<long double>(std::chrono::system_clock::duration::max()))
         throw std::overflow_error("Absolute mutex timeout exceeds the host clock range");
     const auto deadline = std::chrono::system_clock::time_point(std::chrono::duration_cast<std::chrono::system_clock::duration>(duration));
-    auto* current = resolveMutex(mutex, true);
-    return acquireMutex(current, [&](auto& native) {
+    return acquireMutex(resolveMutex(mutex, true), [&](auto& native) {
 #ifdef _WIN32
-        for (;;) {
-            const auto now = std::chrono::system_clock::now();
-            if (now >= deadline) return native.try_lock();
-            const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
-            const std::uint64_t slice = TimedWait::NowNanos() + static_cast<std::uint64_t>(std::min<std::int64_t>(remaining, 100000000));
-            if (TimedWait::ParkAcquire(current, [&] { return native.try_lock(); }, &slice)) return true;
+        while (!native.try_lock()) {
+            if (std::chrono::system_clock::now() >= deadline) return false;
+            TimedWait::SleepNanos(1000000);
         }
+        return true;
 #else
-        static_cast<void>(current);
         return native.try_lock_until(deadline);
 #endif
     }, sceTimedOut, false);
@@ -174,15 +169,13 @@ int APS5_VABI scePthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int APS5_VABI scePthreadMutexLock(PthreadMutex* mutex) {
-    auto* current = resolveMutex(mutex, true);
-    return acquireMutex(current, [current](auto& native) {
+    return acquireMutex(resolveMutex(mutex, true), [](auto& native) {
 #ifdef _WIN32
-        return TimedWait::ParkAcquire(current, [&] { return native.try_lock(); }, nullptr);
+        while (!native.try_lock()) TimedWait::SleepNanos(1000000);
 #else
-        static_cast<void>(current);
         native.lock();
-        return true;
 #endif
+        return true;
     }, 0, false);
 }
 
@@ -190,29 +183,21 @@ int APS5_VABI scePthreadMutexUnlock(PthreadMutex* mutex) {
     auto* current = resolveMutex(mutex, false);
     if (current->_owner.load(std::memory_order_acquire) != std::this_thread::get_id())
         return sceNotPermitted;
-    bool released = true;
     if (current->_type == MutexType::Recursive) {
-        released = --current->_count == 0;
-        if (released)
+        if (--current->_count == 0)
             current->_owner.store(std::thread::id{}, std::memory_order_release);
         current->_rmtx.unlock();
     } else {
         current->_owner.store(std::thread::id{}, std::memory_order_release);
         current->_mtx.unlock();
     }
-#ifdef _WIN32
-    if (released) TimedWait::Unpark(current);
-#else
-    static_cast<void>(released);
-#endif
     return 0;
 }
 
 int APS5_VABI scePthreadMutexTimedlock(PthreadMutex* mutex, KernelUseconds usec) {
     const auto deadline = TimedWait::DeadlineNanos(usec);
-    auto* current = resolveMutex(mutex, true);
-    return acquireMutex(current, [=](auto& native) {
-        return TimedWait::AcquireUntil(current, deadline, [&] { return native.try_lock(); }, [&](std::uint64_t micros) { return native.try_lock_for(std::chrono::microseconds(micros)); });
+    return acquireMutex(resolveMutex(mutex, true), [=](auto& native) {
+        return TimedWait::AcquireUntil(deadline, [&] { return native.try_lock(); }, [&](std::uint64_t micros) { return native.try_lock_for(std::chrono::microseconds(micros)); });
     }, sceTimedOut, false);
 }
 
