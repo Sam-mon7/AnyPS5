@@ -144,11 +144,14 @@ void CopyCheckpoints() {
     Require(history.Find(empty, entry) && entry.regionWords == 0 && entry.regionCount == 0, "an empty copy diagnostic read a missing region");
     const auto output = std::unique_ptr<FILE, decltype(&std::fclose)>(std::tmpfile(), std::fclose);
     Require(output != nullptr, "copy history report file could not be created");
+    Require(std::setvbuf(output.get(), nullptr, _IONBF, 0) == 0, "copy history report must exercise an unbuffered stream like stderr");
     history.Report(output.get());
     std::rewind(output.get());
     std::array<char, 4096> bytes{};
     const auto length = std::fread(bytes.data(), 1, bytes.size(), output.get());
     const std::string report(bytes.data(), length);
+    const auto latest = report.find(" id=2 "), older = report.find(" id=1 ");
+    Require(latest != std::string::npos && older != std::string::npos && latest < older, "copy history must report recent commands first so a truncated report retains the likely fault neighborhood");
     Require(report.find("retained=2 newest=2 overwritten=0") != std::string::npos && report.find("omitted-regions=1") != std::string::npos && report.find("00000001,00000001,00000002,00000002,00010000,00000000") != std::string::npos, "copy report hid its bounds or changed the captured region");
     checkpointCount = 2;
     copyCheckpointData = true;

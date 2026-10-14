@@ -79,12 +79,13 @@ public:
         std::lock_guard lock(mutex);
         const auto count = std::min<std::uint64_t>(newest, Capacity);
         std::fprintf(output, "[gpu-copy] device=0x%llx retained=%llu newest=%llu overwritten=%llu; CPU recording history, not GPU completion; before/after markers are command boundaries at the reported pipeline stage; only the first region is retained\n", static_cast<unsigned long long>(Handle(device)), static_cast<unsigned long long>(count), static_cast<unsigned long long>(newest), static_cast<unsigned long long>(newest - count));
-        for (auto serial = newest - count + 1; serial <= newest; ++serial) {
+        for (auto serial = newest; serial > newest - count; --serial) {
             const auto& entry = entries[(serial - 1) % Capacity];
             char line[1024];
             auto used = std::snprintf(line, sizeof(line), "[gpu-copy] device=0x%llx id=%llu kind=%s commands=0x%llx source=0x%llx destination=0x%llx bindingSerial=%llu regions=%u omitted-regions=%u first-region-u32=", static_cast<unsigned long long>(Handle(device)), static_cast<unsigned long long>(entry.serial), Name(entry.kind), static_cast<unsigned long long>(entry.commands), static_cast<unsigned long long>(entry.source), static_cast<unsigned long long>(entry.destination), static_cast<unsigned long long>(entry.bindingSerial), entry.regionCount, entry.regionCount == 0 ? 0 : entry.regionCount - 1);
             for (std::uint32_t word = 0; word < entry.regionWords; ++word) used += std::snprintf(line + used, sizeof(line) - used, "%s%08x", word != 0 ? "," : "", entry.firstRegion[word]);
-            std::fprintf(output, "%s\n", line);
+            line[used++] = '\n';
+            std::fwrite(line, 1, static_cast<std::size_t>(used), output);
         }
     }
 
