@@ -965,7 +965,9 @@ void ownPlanValues(IrResourcePlan& plan) {
     plan.denseValueIds = true;
 }
 
-void buildCompactPlan(IrResourcePlan& plan) {
+}
+
+void ResourceMaterializer::BuildCompactPlan(IrResourcePlan& plan) {
     if (!plan.denseValueIds || plan.valueStorage.size() >= CompactResourcePlan::NoValue) return;
     CompactResourcePlan compact;
     const auto idOf = [&](const IrValue* value, std::uint32_t& id) {
@@ -1016,8 +1018,6 @@ void buildCompactPlan(IrResourcePlan& plan) {
     plan.compact = std::move(compact);
 }
 
-}
-
 IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const {
     const IrResourcePlan& source = program.Resources();
     if (!source.resourceTrackingComplete || !source.srtPlanComplete) {
@@ -1061,7 +1061,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     for (const auto& sampler : plan.info.samplers) addSource(sampler.source);
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
-    buildCompactPlan(plan);
+    BuildCompactPlan(plan);
     return plan;
 }
 

@@ -99,6 +99,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
     require(left.pushConstants == right.pushConstants, prefix + "push constants differ");
     require(left.specialization == right.specialization, prefix + "specialization constants differ");
     require(left.workgroupMemoryDwords == right.workgroupMemoryDwords, prefix + "workgroup memory stride differs");
+    require(left.shaderDataUserWords == right.shaderDataUserWords, prefix + "forwarded shader user words differ");
     require(left.poisonedSrtReads == right.poisonedSrtReads, prefix + "poisoned SRT read counts differ");
     require(left.vertexAttributes.size() == right.vertexAttributes.size(), prefix + "vertex attribute count differs");
     for (std::size_t i = 0; i < left.vertexAttributes.size(); ++i) {
@@ -161,6 +162,7 @@ RecompileResult sampleResult() {
     result.memoryOffsetDword = 7;
     result.hostSubgroupSize = 32;
     result.workgroupMemoryDwords = 32769u;
+    result.shaderDataUserWords = {3u, 8u, 19u};
     result.vertexInputs = {{1, 4, 2}, {5, 2, 0}};
     result.vertexInputPatches = {{1, 20, {7, 8, 9}}, {5, 40, {10, 11, 12}}};
     result.registrationModule = true;
@@ -1423,7 +1425,8 @@ bool samePlan(const IrResourcePlan& left, const IrResourcePlan& right) {
     for (std::size_t index = 0; index < left.uniformFill.values.size(); ++index) {
         if (!sameValue(left.uniformFill.values[index], right.uniformFill.values[index])) return false;
     }
-    return left.materializationSources == right.materializationSources && left.guardedSrtSlots == right.guardedSrtSlots && left.srtGuardOffset == right.srtGuardOffset && left.cleanFlatSlots == right.cleanFlatSlots && left.pureFlatSlots == right.pureFlatSlots &&
+    return left.denseValueIds == right.denseValueIds && left.compact.values.empty() == right.compact.values.empty() &&
+           left.materializationSources == right.materializationSources && left.guardedSrtSlots == right.guardedSrtSlots && left.srtGuardOffset == right.srtGuardOffset && left.cleanFlatSlots == right.cleanFlatSlots && left.pureFlatSlots == right.pureFlatSlots &&
            left.requiresSpecializationMemory == right.requiresSpecializationMemory && left.srtPlanComplete == right.srtPlanComplete && left.resourceTrackingComplete == right.resourceTrackingComplete && left.info == right.info && left.uniformFill.fill == right.uniformFill.fill;
 }
 

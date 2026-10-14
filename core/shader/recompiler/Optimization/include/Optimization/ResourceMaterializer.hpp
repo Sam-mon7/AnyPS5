@@ -21,6 +21,7 @@ public:
     static void PrepareImageModes(ShaderInfo& info);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
+    static void BuildCompactPlan(IrResourcePlan& plan);
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const;
     static std::uint64_t SpecializationNanoseconds();
     static std::uint64_t EvaluateNanoseconds();
