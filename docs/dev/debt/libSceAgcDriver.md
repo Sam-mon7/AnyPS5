@@ -1,5 +1,7 @@
 # libSceAgcDriver technical debt
 
+- [Optional GPU address history](../../../core/libs/prx/libSceAgcDriver/Graphics/include/GpuAddressBindings.hpp) - `APS5_GPU_ADDRESS_BINDINGS` retains up to 1,048,576 binding records (56 MiB per instance) and reports the newest 32 overlaps with an EXT device fault. Callbacks record at most eight objects, contain exceptions, and perform no Vulkan calls or logging. The owner survives resource, device and messenger teardown. This bounded CPU callback history may lose older aliases or omit driver-private ranges; it is not GPU execution order, live ownership or fault causality. Fault-time lookup scans the retained ring; indexing is deferred until measured diagnostic cost warrants it.
+
 - [Optional Aftermath capture](../../../core/libs/prx/libSceAgcDriver/Graphics/src/AftermathCapture.cpp) - Windows x64 only, explicitly built with a local SDK path and enabled by APS5_AFTERMATH plus APS5_AFTERMATH_DIR. Records local basic/resource-tracking dumps without shader debug generation or cache changes. The callback module stays pinned in opted-in processes; failed/incomplete capture and static teardown deliberately retain the SDK/context until exit instead of draining under the loader lock. Three seconds bounds status polling, not undocumented SDK call latency. Precise shader-PC mapping still needs exact SPIR-V and matching nvdbg in a separate diagnostic phase.
 
 ### Unknown function info

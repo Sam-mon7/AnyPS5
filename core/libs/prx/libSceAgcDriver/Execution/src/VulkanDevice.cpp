@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/AftermathCapture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuAddressBindings.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
@@ -235,6 +236,10 @@ struct WorkgroupMemory {
 struct VulkanDevice::State {
     Graphics::Aftermath::DeviceLease aftermath;
     bool compileOnly = false;
+    std::shared_ptr<Graphics::GpuAddressBindings> addressBindings;
+    bool addressBindingsEnabled = false;
+    VkDebugUtilsMessengerEXT addressMessenger = VK_NULL_HANDLE;
+    PFN_vkDestroyDebugUtilsMessengerEXT destroyAddressMessenger = nullptr;
     void* library = nullptr;
     PFN_vkGetInstanceProcAddr instanceProc = nullptr;
     PFN_vkGetDeviceProcAddr deviceProc = nullptr;
@@ -736,6 +741,7 @@ struct VulkanDevice::State {
         }
         if (instance != VK_NULL_HANDLE) {
             if (surface) reinterpret_cast<PFN_vkDestroySurfaceKHR>(instanceProc(instance, "vkDestroySurfaceKHR"))(instance, surface, nullptr);
+            if (addressMessenger != VK_NULL_HANDLE) destroyAddressMessenger(instance, addressMessenger, nullptr);
             reinterpret_cast<PFN_vkDestroyInstance>(instanceProc(instance, "vkDestroyInstance"))(instance, nullptr);
         }
         if (library != nullptr) {
@@ -926,11 +932,15 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     application.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo create{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     create.pApplicationInfo = &application;
+    const bool addressBindingsRequested = std::getenv("APS5_GPU_ADDRESS_BINDINGS") != nullptr;
+    bool debugUtils = false;
     std::vector<const char*> instanceExtensions;
     if (window != nullptr) {
         APS5_LOG_OUT("Presentation window context=%p extent=%ux%u extensions=%zu", window->context, window->width, window->height, window->extensions.size());
         require(window->context && window->createSurface && window->getDrawableSize && window->width && window->height, "invalid window descriptor");
         instanceExtensions.assign(window->extensions.begin(), window->extensions.end());
+    }
+    if (window != nullptr || addressBindingsRequested) {
         std::uint32_t availableCount = 0;
         const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties");
         check(enumerateExtensions(nullptr, &availableCount, nullptr), "vkEnumerateInstanceExtensionProperties");
@@ -942,11 +952,30 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
                 throw std::runtime_error(std::string("Vulkan presentation: required instance extension missing: ") + name);
             }
         }
+        if (addressBindingsRequested) {
+            debugUtils = std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; });
+            if (debugUtils && std::none_of(instanceExtensions.begin(), instanceExtensions.end(), [](const char* name) { return std::strcmp(name, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; })) instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            if (!debugUtils) std::fputs("[gpu-binding] VK_EXT_debug_utils unavailable\n", stderr);
+        }
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
     }
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));
+    if (debugUtils) {
+        const auto createMessenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(state->instanceProc(state->instance, "vkCreateDebugUtilsMessengerEXT"));
+        state->destroyAddressMessenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(state->instanceProc(state->instance, "vkDestroyDebugUtilsMessengerEXT"));
+        require(createMessenger != nullptr && state->destroyAddressMessenger != nullptr, "address-binding debug-utils entry points unavailable");
+        state->addressBindings = std::make_shared<Graphics::GpuAddressBindings>(serial);
+        VkDebugUtilsMessengerCreateInfoEXT messenger{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+        messenger.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT;
+        messenger.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+        messenger.pfnUserCallback = Graphics::GpuAddressBindings::Callback;
+        messenger.pUserData = state->addressBindings.get();
+        VkDebugUtilsMessengerEXT handle = VK_NULL_HANDLE;
+        check(createMessenger(state->instance, &messenger, nullptr, &handle), "vkCreateDebugUtilsMessengerEXT address bindings");
+        state->addressMessenger = handle;
+    }
     if (window != nullptr) {
         state->surface = window->createSurface(window->context, state->instance);
         require(state->surface != VK_NULL_HANDLE, "window returned a null surface");
@@ -1626,6 +1655,24 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT bindingFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+    if (state->addressMessenger != VK_NULL_HANDLE && hasExtension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &bindingFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+    }
+    const bool addressBindings = bindingFeatures.reportAddressBinding == VK_TRUE;
+    state->addressBindingsEnabled = addressBindings;
+    if (addressBindings) {
+        bindingFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+        bindingFeatures.reportAddressBinding = VK_TRUE;
+        bindingFeatures.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &bindingFeatures;
+        deviceExtensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+    } else if (addressBindingsRequested) {
+        std::fprintf(stderr, "[gpu-binding] instance=%llu address-binding reporting unavailable\n", static_cast<unsigned long long>(serial));
+    }
     bdaFeatures.pNext = &byteFeatures;
     VkPhysicalDeviceRobustness2FeaturesEXT robustness2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
@@ -1667,6 +1714,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->shaderProfile = std::move(shaderProfile);
+    if (addressBindings) std::fprintf(stderr, "[gpu-binding] instance=%llu VK_EXT_device_address_binding_report enabled; %zu records, %zu objects/callback; CPU history only\n", static_cast<unsigned long long>(serial), Graphics::GpuAddressBindings::Capacity, Graphics::GpuAddressBindings::ObjectLimit);
     if (compileOnly) return;
     if (calibratedTimestamps != nullptr) {
         const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
@@ -1692,8 +1740,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (deviceFault || checkpoints) {
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
         const auto checkpointData = checkpoints ? state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV") : nullptr;
-        Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, faultInfo, checkpointData] {
-            for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData)) std::fprintf(stderr, "%s\n", line.c_str());
+        Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, faultInfo, checkpointData, bindings = addressBindings ? state->addressBindings : nullptr] {
+            std::vector<VkDeviceFaultAddressInfoEXT> addresses;
+            for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData, &addresses)) std::fprintf(stderr, "%s\n", line.c_str());
+            if (bindings != nullptr) for (const auto& address : addresses) bindings->Report(address, stderr);
         };
         state->deviceLostHook = true;
     }
@@ -3187,6 +3237,7 @@ Graphics::Context VulkanDevice::buildContext() const {
         state->hostImportAlignment
     };
     context.dmaBufImport = state->dmaBufImport;
+    context.addressBindings = state->addressBindingsEnabled ? state->addressBindings : nullptr;
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
     context.samplerCache = state->samplerCache.get();

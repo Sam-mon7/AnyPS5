@@ -29,6 +29,7 @@ class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
+class GpuAddressBindings;
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -200,6 +201,7 @@ struct Context {
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
+    std::shared_ptr<GpuAddressBindings> addressBindings;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

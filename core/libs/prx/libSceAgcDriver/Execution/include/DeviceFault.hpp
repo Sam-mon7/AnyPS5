@@ -31,7 +31,8 @@ inline std::string DeviceFaultText(const char (&text)[VK_MAX_DESCRIPTION_SIZE]) 
     return std::string(text, strnlen(text, VK_MAX_DESCRIPTION_SIZE));
 }
 
-inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDeviceFaultInfoEXT faultInfo, VkQueue queue, PFN_vkGetQueueCheckpointDataNV checkpointData) {
+inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDeviceFaultInfoEXT faultInfo, VkQueue queue, PFN_vkGetQueueCheckpointDataNV checkpointData, std::vector<VkDeviceFaultAddressInfoEXT>* reportedAddresses = nullptr) {
+    if (reportedAddresses != nullptr) reportedAddresses->clear();
     std::vector<std::string> lines;
     char line[VK_MAX_DESCRIPTION_SIZE + 128];
     if (checkpointData != nullptr && queue != VK_NULL_HANDLE) {
@@ -61,6 +62,7 @@ inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDevi
     const auto result = faultInfo(device, &counts, &info);
     addresses.resize(std::min<std::size_t>(addresses.size(), counts.addressInfoCount));
     vendors.resize(std::min<std::size_t>(vendors.size(), counts.vendorInfoCount));
+    if (reportedAddresses != nullptr && (result == VK_SUCCESS || result == VK_INCOMPLETE)) *reportedAddresses = addresses;
     std::snprintf(line, sizeof(line), "[device-fault] result %d: %s", static_cast<int>(result), DeviceFaultText(info.description).c_str());
     lines.emplace_back(line);
     for (const auto& address : addresses) {
