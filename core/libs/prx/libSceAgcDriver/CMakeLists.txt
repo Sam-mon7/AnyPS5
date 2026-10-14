@@ -1342,6 +1342,16 @@ endforeach()
 
 target_link_libraries(agc_driver_gpu_map_on_fiber_tests PRIVATE libSceFiber)
 if(BUILD_TESTING)
+    add_test(NAME agc_driver_depth_zero_reads COMMAND agc_driver_depth_plane_sampling_tests --zero-only)
+    add_test(NAME agc_driver_depth_large_array COMMAND agc_driver_depth_plane_sampling_tests --large-only)
+    add_test(NAME agc_driver_depth_large_array_no_memo COMMAND agc_driver_depth_plane_sampling_tests --large-only)
+    set_tests_properties(agc_driver_depth_zero_reads agc_driver_depth_large_array agc_driver_depth_large_array_no_memo PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_ASSERT_GPU_LOCK=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_property(TEST agc_driver_depth_large_array_no_memo APPEND PROPERTY ENVIRONMENT "APS5_NO_DEPTH_UPLOAD_MEMO=1")
+    if(WIN32)
+        set_tests_properties(agc_driver_depth_zero_reads agc_driver_depth_large_array agc_driver_depth_large_array_no_memo PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_gpu_address_bindings_overlap COMMAND agc_driver_gpu_address_bindings_tests --overlap-compile-only)
     set_tests_properties(agc_driver_gpu_address_bindings_overlap PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
