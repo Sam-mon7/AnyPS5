@@ -93,11 +93,11 @@ bool DrawKeySightings::SeenBefore(std::uint64_t key) {
     return false;
 }
 
-bool Driver::admitDrawKey(std::uint64_t key) {
+bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
     std::lock_guard cacheLock(drawCacheMutex);
     if (drawCache.contains(key)) return true;
     if (!drawKeySightings) drawKeySightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
-    return drawKeySightings->SeenBefore(key);
+    return drawKeySightings->SeenBefore(shape != 0 ? shape : key);
 }
 
 void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape) {

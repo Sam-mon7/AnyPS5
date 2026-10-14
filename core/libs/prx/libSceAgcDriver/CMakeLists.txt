@@ -1479,8 +1479,12 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_draw_cache_reuse_off COMMAND agc_driver_draw_cache_reuse_tests)
     set_tests_properties(agc_driver_draw_cache_reuse_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" SKIP_RETURN_CODE 77)
     set_tests_properties(agc_driver_draw_cache_reuse agc_driver_draw_cache_reuse_off PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
+    add_test(NAME agc_driver_draw_cache_relocation_off COMMAND agc_driver_draw_cache_relocation_tests)
+    set_tests_properties(agc_driver_draw_cache_relocation_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" SKIP_RETURN_CODE 77)
+    add_test(NAME agc_driver_draw_cache_relocation_verify COMMAND agc_driver_draw_cache_relocation_tests)
+    set_tests_properties(agc_driver_draw_cache_relocation_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_REGISTER_KEYS=1;APS5_VERIFY_DRAW_ENTRIES=1;APS5_VERIFY_DRAW_DATA_HITS=1;APS5_VERIFY_SRT_COMPACT=1" SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_driver_draw_cache_reuse_off PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_draw_cache_reuse_off agc_driver_draw_cache_relocation_off agc_driver_draw_cache_relocation_verify PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_driver agc_driver_pm4_failure PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=0")

@@ -25,6 +25,7 @@ alignas(16) std::array<float, 4> First{1.0f, 0.0f, 0.0f, 0.0f};
 alignas(16) std::array<float, 4> Moved{1.0f, 0.0f, 0.0f, 0.0f};
 alignas(16) std::array<float, 4> Other{0.5f, 0.0f, 0.0f, 0.0f};
 alignas(16) std::array<float, 4> Third{1.0f, 0.0f, 0.0f, 0.0f};
+alignas(16) std::array<float, 4> Fourth{1.0f, 0.0f, 0.0f, 0.0f};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
 
 struct Header {
@@ -107,13 +108,17 @@ void MovedDataHitsTheCache(bool libraries) {
     };
     const auto first = draw({First.data()});
     Require(first.lookups == 1 && first.hits == 0, mode + ": the first draw found a cached draw");
-    draw({Moved.data()});
+    const auto moved = draw({Moved.data()});
+    Require(moved.lookups == 2 && moved.hits == 0 && moved.inserts == 1, mode + ": a repeated draw shape with a new pointer was not admitted on its second sight");
     const auto third = draw({Third.data()});
-    Require(third.lookups == 3 && third.hits == 1, mode + ": a draw whose data moved a second time did not reuse the cached draw (" + std::to_string(third.hits) + " hits in " + std::to_string(third.lookups) + " lookups)");
+    Require(third.lookups == 3 && third.hits == 0 && third.inserts == 2, mode + ": the first relocated address did not establish a content alias");
+    const auto fourth = draw({Fourth.data()});
+    Require(fourth.lookups == 4 && fourth.hits == 1, mode + ": a draw whose data moved did not reuse the cached draw (" + std::to_string(fourth.hits) + " hits in " + std::to_string(fourth.lookups) + " lookups)");
     const auto other = draw({Other.data()});
-    Require(other.lookups == 4 && other.hits == third.hits, mode + ": a draw whose moved data holds another value reused the cached draw");
-    const auto again = draw({First.data(), Moved.data()});
-    Require(again.lookups == 6 && again.hits == other.hits + 2, mode + ": draws at addresses seen before did not reuse their cached draws (" + std::to_string(again.hits) + " hits)");
+    Require(other.lookups == 5 && other.hits == fourth.hits, mode + ": a draw whose moved data holds another value reused the cached draw");
+    const auto again = draw({Moved.data(), Third.data()});
+    Require(again.lookups == 7 && again.hits == other.hits + 2, mode + ": draws at addresses seen before did not reuse their cached draws (" + std::to_string(again.hits) + " hits)");
+    Require(again.verifyMismatches == 0 && again.verifyDecodeMismatches == 0, mode + ": a cached draw differed from a fresh capture");
 }
 
 }

@@ -276,15 +276,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::vector<ShaderRecompiler::MemoryRegion> regions(stageCaptures[i].regions.begin(), stageCaptures[i].regions.end());
         for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
         std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
-        std::vector<std::uint32_t> words;
-        for (const auto& region : regions) {
-            runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
-            const auto count = region.bytes.size() / sizeof(std::uint32_t);
-            const auto offset = words.size();
-            words.resize(offset + count);
-            std::memcpy(words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
-        }
+        DispatchVariant captured;
+        tagVariantRuns(captured, regions, stageCaptures[i].userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
+        const auto& runs = captured.runs;
+        const auto& words = captured.words;
         const auto& compiled = *stageCaptures[i].compiled;
         const char* what = runs != kept.runs ? "runs" : words != kept.words ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : compiled.pushConstants != kept.compiled->pushConstants ? "push constants" : nullptr;
         ++dataVerified;
