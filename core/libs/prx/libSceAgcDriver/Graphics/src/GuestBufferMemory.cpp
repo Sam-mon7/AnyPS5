@@ -819,6 +819,7 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
 }
 
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict) {
+    static const bool traceRefusal = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     const auto base = run.base;
     const auto bytes = run.bytes;
     auto& failures = joined ? state.failedJoins : state.failed;
@@ -831,9 +832,15 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         found->second.lastUse = ++state.useCounter;
         return &found->second;
     }
-    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return nullptr;
+    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) {
+        if (traceRefusal) std::fprintf(stderr, "[import-refusal] 0x%llx+0x%llx alignment 0x%llx\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(alignment));
+        return nullptr;
+    }
     if (const auto failed = failures.find(base); failed != failures.end()) {
-        if (sameRun(failed->second, run)) return nullptr;
+        if (sameRun(failed->second, run)) {
+            if (traceRefusal) std::fprintf(stderr, "[import-refusal] 0x%llx+0x%llx cached failure\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
+            return nullptr;
+        }
         failures.erase(failed);
     }
     // The imports this one replaces overlap it; none may be held by a build, and the import must fit the budget (with
@@ -846,7 +853,10 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     // hold (KeepThroughHold). Refusing it there would keep the run copied for good.
     const auto held = [&](const HostImport& entry) { return !joined && pointerHeld(state, entry); };
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
-        if (held(it->second)) return nullptr;
+        if (held(it->second)) {
+            if (traceRefusal) std::fprintf(stderr, "[import-refusal] 0x%llx+0x%llx overlaps held 0x%llx+0x%llx (use %llu floor %llu)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(it->second.base), static_cast<unsigned long long>(it->second.bytes), static_cast<unsigned long long>(it->second.lastUse), static_cast<unsigned long long>(state.buildFloor));
+            return nullptr;
+        }
         replaced += it->second.bytes;
     }
     const auto budget = importBudget(context);
@@ -880,6 +890,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+            if (traceRefusal) std::fprintf(stderr, "[import-refusal] 0x%llx+0x%llx inaccessible at 0x%llx state 0x%lx protect 0x%lx\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(cursor), info.State, info.Protect);
             failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
             return nullptr;
         }
@@ -892,6 +903,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
     if (!writable && readOnly) {
+        if (traceRefusal) std::fprintf(stderr, "[import-refusal] 0x%llx+0x%llx read-only\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
         failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
         return nullptr;
     }
