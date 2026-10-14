@@ -68,6 +68,12 @@ bool CaptureProfiled() {
     return profile;
 }
 
+template<typename TSnapshots>
+std::uint64_t InitialEnd(const TSnapshots& initial) {
+    const auto& last = *std::prev(initial.end());
+    return last.first + last.second.size();
+}
+
 std::uint64_t NanosecondsSince(std::chrono::steady_clock::time_point started) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
 }
@@ -169,7 +175,7 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
     pages.insert(position, {base, owned.release()});
     lastBase = base;
     lastPage = &page;
-    ++CaptureTotals().pages;
+    if (CaptureProfiled()) ++CaptureTotals().pages;
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
     if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
@@ -191,8 +197,8 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     if (address % sizeof(*value) != 0 || address > std::numeric_limits<std::uint64_t>::max() - sizeof(*value)) {
         throw std::runtime_error("AGC driver: invalid shader memory read address");
     }
-    ++CaptureTotals().reads;
-    if (!self.initial.empty()) {
+    if (CaptureProfiled()) ++CaptureTotals().reads;
+    if (!self.initial.empty() && address + sizeof(*value) > self.initial.begin()->first && address < InitialEnd(self.initial)) {
         const auto next = self.initial.upper_bound(address);
         if (next != self.initial.begin()) {
             const auto previous = std::prev(next);
@@ -315,18 +321,20 @@ bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_
     if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) return false;
     const auto end = address + bytes;
     while (address < end) {
-        const auto next = self.initial.upper_bound(address);
-        if (next != self.initial.begin()) {
-            const auto previous = std::prev(next);
-            if (address - previous->first < previous->second.size()) {
-                address = previous->first + previous->second.size();
-                continue;
+        if (!self.initial.empty() && address < InitialEnd(self.initial)) {
+            const auto next = self.initial.upper_bound(address);
+            if (next != self.initial.begin()) {
+                const auto previous = std::prev(next);
+                if (address - previous->first < previous->second.size()) {
+                    address = previous->first + previous->second.size();
+                    continue;
+                }
             }
         }
         const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
         const auto pageEnd = std::min<std::uint64_t>(base + PageBytes, end);
         const auto& page = self.page(base);
-        if (!page.wordwise && !page.valid.All() && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(pageEnd - address))) return false;
+        if (!page.wordwise && !page.lazy && !page.valid.All() && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(pageEnd - address))) return false;
         address = pageEnd;
     }
     return true;
