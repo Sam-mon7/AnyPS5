@@ -146,6 +146,8 @@ The `gpu` track holds one `batch` slice per recorder batch, from the batch's tim
 
 `APS5_GPU_TIMING_TOP=1` with `APS5_PROFILE_GPU=1` uses top-of-pipe start timestamps for program and class ranges. Batch starts and all ends remain bottom-of-pipe. This diagnostic mode includes outstanding earlier work in range durations, so per-key sums can overlap; the covered union is clipped to the batch span. Compare it with the default bottom-of-pipe starts before attributing gaps to work between ranges: timestamp writes do not order all following commands.
 
+`APS5_TRACE_GPU_GAPS=1` with GPU profiling reports uncovered intervals by endpoint class and gaps after a dispatch trailing range by the program range recorded immediately before it in the same batch. Program summaries retain at most 512 keys plus an unknown/overflow bucket and print the largest 12 every 10 seconds. These are associations in command recording order, not exclusive shader costs or proof of which command caused a gap. The summaries reuse existing timestamps and add no GPU commands.
+
 With either switch set, the recorder writes a timestamp pair per batch for the whole run, as with `APS5_PROFILE_DRAW`. Without them, a `PerformanceTimer`, a GPU mutex acquisition and a read of batch timestamps each cost one more predictable branch.
 
 ## Driver thread priority
