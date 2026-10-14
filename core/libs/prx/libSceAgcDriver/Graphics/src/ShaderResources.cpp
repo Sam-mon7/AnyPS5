@@ -487,7 +487,25 @@ std::uint64_t forcedCacheBudget() {
 
 std::uint64_t storageBudget(const Context& context) {
     const auto forced = forcedCacheBudget();
-    return forced != 0 ? forced : TextureCacheBudget(context.memory);
+    if (forced != 0) return forced;
+    if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudget(context.memory);
+    static struct {
+        std::mutex mutex;
+        VkPhysicalDevice device{VK_NULL_HANDLE};
+        std::chrono::steady_clock::time_point read{};
+        std::uint64_t budget{0};
+    } cached;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(cached.mutex);
+    if (cached.device == context.physical && now - cached.read < std::chrono::seconds(1)) return cached.budget;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    properties.pNext = &reported;
+    context.memoryProperties2(context.physical, &properties);
+    cached.device = context.physical;
+    cached.read = now;
+    cached.budget = StorageTextureBudget(context.memory, &reported);
+    return cached.budget;
 }
 
 std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
@@ -506,7 +524,7 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(cache.reportedBudget, budget, now - cache.reportedAt))) {
         char was[48] = "";
         if (!fresh) std::snprintf(was, sizeof(was), " (was %llu MiB)", static_cast<unsigned long long>(cache.reportedBudget >> 20u));
-        std::fprintf(stderr, "[gpu] sampled texture cache budget %llu MiB%s: device-local heap %u has a VK_EXT_memory_budget budget of %llu MiB and uses %llu MiB, %llu MiB of it sampled textures (%llu MiB in the cache) and %llu MiB cached storage images; storage image cache budget %llu MiB\n", static_cast<unsigned long long>(budget >> 20u), was, *heap, static_cast<unsigned long long>(reported.heapBudget[*heap] >> 20u), static_cast<unsigned long long>(reported.heapUsage[*heap] >> 20u), static_cast<unsigned long long>(sampled >> 20u), static_cast<unsigned long long>(cache.bytes >> 20u), static_cast<unsigned long long>(storage >> 20u), static_cast<unsigned long long>(TextureCacheBudget(context.memory) >> 20u));
+        std::fprintf(stderr, "[gpu] sampled texture cache budget %llu MiB%s: device-local heap %u has a VK_EXT_memory_budget budget of %llu MiB and uses %llu MiB, %llu MiB of it sampled textures (%llu MiB in the cache) and %llu MiB cached storage images; storage image cache budget %llu MiB\n", static_cast<unsigned long long>(budget >> 20u), was, *heap, static_cast<unsigned long long>(reported.heapBudget[*heap] >> 20u), static_cast<unsigned long long>(reported.heapUsage[*heap] >> 20u), static_cast<unsigned long long>(sampled >> 20u), static_cast<unsigned long long>(cache.bytes >> 20u), static_cast<unsigned long long>(storage >> 20u), static_cast<unsigned long long>(storageBudget(context) >> 20u));
         cache.reportedBudget = budget;
         cache.reportedAt = now;
     }
@@ -920,6 +938,12 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory) {
     const auto heap = largestDeviceLocalHeap(memory);
     return std::max<std::uint64_t>(2048ull << 20u, heap ? memory.memoryHeaps[*heap].size / 4u : 0u);
+}
+
+std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported) {
+    const auto heap = largestDeviceLocalHeap(memory);
+    if (reported == nullptr || !heap || reported->heapBudget[*heap] == 0) return TextureCacheBudget(memory);
+    return std::max<std::uint64_t>(2048ull << 20u, std::min<std::uint64_t>(TextureCacheBudget(memory), reported->heapBudget[*heap] / 4u));
 }
 
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes) {
