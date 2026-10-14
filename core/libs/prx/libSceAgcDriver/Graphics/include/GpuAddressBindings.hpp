@@ -76,6 +76,11 @@ public:
         return first <= last && entry.size != 0 && entry.base <= last && (entry.base >= first || entry.size > first - entry.base);
     }
 
+    std::uint64_t LatestSerial() const {
+        std::lock_guard lock(mutex);
+        return nextSerial;
+    }
+
     Matches Find(VkDeviceAddress first, VkDeviceAddress last, VkObjectType objectType = VK_OBJECT_TYPE_UNKNOWN, std::uint64_t object = 0) const {
         Matches result;
         std::lock_guard lock(mutex);

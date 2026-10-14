@@ -129,6 +129,7 @@ void BindingHistory() {
     static_assert(sizeof(History) < 1024, "binding history entries must not consume the caller's stack");
     static_assert(sizeof(History::Entry) <= 56, "the opt-in binding ring must stay within 56 MiB per instance");
     auto history = std::make_shared<History>(73);
+    Require(history->LatestSerial() == 0, "an empty binding history has no callback serial");
     std::array<VkDebugUtilsObjectNameInfoEXT, 10> objects{};
     for (std::size_t i = 0; i < objects.size(); ++i) {
         objects[i].sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
@@ -226,6 +227,7 @@ void BindingHistory() {
     second.join();
     const auto concurrentMatches = concurrent->Find(0, UINT64_MAX);
     Require(concurrentMatches.total == 512 && history->Find(0, UINT64_MAX).newest == matches.newest, "concurrent callbacks are serialized per instance without shared history");
+    Require(history->LatestSerial() == matches.newest, "the binding serial watermark survives ring rollover");
     for (std::size_t i = 1; i < concurrentMatches.count; ++i) Require(concurrentMatches.entries[i - 1].observedAt >= concurrentMatches.entries[i].observedAt, "concurrent binding timestamps follow the serialized record order");
 }
 

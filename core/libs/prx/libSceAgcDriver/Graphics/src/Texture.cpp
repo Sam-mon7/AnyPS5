@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuAddressBindings.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -32,10 +33,20 @@
 #include <optional>
 #include <unordered_map>
 #include <utility>
+#include <type_traits>
 
 namespace AgcDriver::Graphics {
 
 namespace {
+
+struct TextureUploadTrace {
+    std::shared_ptr<GpuAddressBindings> bindings;
+    std::uint64_t id = 0;
+
+    ~TextureUploadTrace() {
+        std::fprintf(stderr, "[texture-upload] id=%llu scope-or-kept-token-release bindingSerial=%llu (CPU lifetime; may include discard; not GPU completion or buffer destruction)\n", static_cast<unsigned long long>(id), static_cast<unsigned long long>(bindings->LatestSerial()));
+    }
+};
 
 // APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
 struct TextureProfile {
@@ -332,6 +343,23 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             } else {
                 batch = std::make_unique<CommandBatch>(context);
                 commands = batch->Handle();
+            }
+
+            std::shared_ptr<TextureUploadTrace> trace;
+            if (context.addressBindings != nullptr) {
+                static std::atomic<std::uint64_t> nextUpload{0};
+                trace = std::make_shared<TextureUploadTrace>();
+                trace->bindings = context.addressBindings;
+                trace->id = nextUpload.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (recorder != nullptr) recorder->Keep(trace);
+                const auto handleBits = [](auto handle) -> unsigned long long {
+                    if constexpr (std::is_pointer_v<decltype(handle)>) return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(handle));
+                    else return static_cast<unsigned long long>(handle);
+                };
+                std::fprintf(stderr, "[texture-upload] id=%llu device=0x%llx bindingSerial=%llu guest=0x%llx extent=%ux%ux%u layers=%u slices=%u mips=%u image=0x%llx recorder=0x%llx anticipatedBatch=%llu commands=0x%llx mode=%s staging=0x%llx stagingRequested=%llu tiled=0x%llx tiledRequested=%llu linear=0x%llx linearRequested=%llu (CPU recording: staging->tiled, detile tiled->linear, linear->image; pooled handles may have multiple uses)\n",
+                    static_cast<unsigned long long>(trace->id), handleBits(context.device), static_cast<unsigned long long>(trace->bindings->LatestSerial()), static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, geometry.imageDepth, geometry.imageLayers, arrayLayers, descriptor.mipCount,
+                    handleBits(image), handleBits(recorder), static_cast<unsigned long long>(recorder != nullptr ? recorder->Submissions() + 1u : 0u), handleBits(commands), recorder != nullptr ? "recorded" : "standalone",
+                    handleBits(staging->Handle()), static_cast<unsigned long long>(guestBytes), handleBits(tiled->Handle()), static_cast<unsigned long long>(guestBytes), handleBits(linear->Handle()), static_cast<unsigned long long>(linearBytes));
             }
 
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
