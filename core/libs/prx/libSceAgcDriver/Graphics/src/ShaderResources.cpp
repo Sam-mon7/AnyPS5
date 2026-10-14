@@ -1060,6 +1060,11 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             for (auto& resource : resources) recorder->Keep(std::move(resource));
         }
     }
+    if (!evicted.empty()) {
+        auto& sampled = Textures();
+        std::lock_guard lock(sampled.mutex);
+        dropUncachedViews(sampled);
+    }
     return texture;
 }
 
