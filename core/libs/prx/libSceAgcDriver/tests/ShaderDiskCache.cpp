@@ -24,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -358,6 +359,9 @@ void verifyEntryRoundTrip() {
     auto previousVersion = file;
     previousVersion[4] = static_cast<std::byte>(ShaderDiskCache::FormatVersion - 1u);
     require(ShaderDiskCache::DecodeEntry(previousVersion, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "an entry with the previous format version loads");
+    auto upstreamVersion = file;
+    upstreamVersion[4] = std::byte{30};
+    require(ShaderDiskCache::DecodeEntry(upstreamVersion, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "an entry with the upstream resource plan format loads");
     auto incompatible = variant;
     incompatible.artifact.runtimeAbiVersion = RuntimeAbi::Version + 1u;
     const auto incompatibleFile = ShaderDiskCache::EncodeEntry(key, incompatible);
@@ -1514,6 +1518,9 @@ void verifyPlanEntryDamage(const std::vector<std::byte>& key, const IrResourcePl
     auto previousFormat = file;
     previousFormat[4] = static_cast<std::byte>(ShaderDiskCache::FormatVersion - 1u);
     require(ShaderDiskCache::DecodePlanEntry(previousFormat, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, what + ": a plan entry of the previous format loads");
+    auto upstreamFormat = file;
+    upstreamFormat[4] = std::byte{30};
+    require(ShaderDiskCache::DecodePlanEntry(upstreamFormat, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, what + ": a plan entry with the upstream resource plan format loads");
     auto otherSource = file;
     otherSource[8] ^= std::byte{1};
     require(ShaderDiskCache::DecodePlanEntry(otherSource, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, what + ": a plan entry of another source version loads");
@@ -1581,7 +1588,23 @@ void verifyMalformedPlans() {
     require(!ShaderDiskCache::EncodePlan(emptied, bytes), "a plan with an empty value slot was encoded");
 }
 
+void verifyIndirectImagePlanModes() {
+    std::set<std::vector<std::byte>> tableEncodings;
+    for (std::uint32_t flags = 0u; flags < 8u; ++flags) {
+        auto plan = handBuiltPlan();
+        auto& table = *plan.descriptorSources[1].indirectImage;
+        table.laneKey = (flags & 1u) != 0u;
+        table.indexed = (flags & 2u) != 0u;
+        table.implicitDerivatives = (flags & 4u) != 0u;
+        const auto bytes = encodedPlan(plan);
+        require(tableEncodings.insert(bytes).second, "indirect image table modes share a disk plan encoding");
+        IrResourcePlan decoded;
+        require(ShaderDiskCache::DecodePlan(bytes, decoded) && samePlan(plan, decoded), "indirect image table modes changed in a disk plan round trip");
+    }
+}
+
 void verifyPlanRoundTrip() {
+    verifyIndirectImagePlanModes();
     const auto handBuilt = handBuiltPlan();
     const auto handBytes = encodedPlan(handBuilt);
     IrResourcePlan handDecoded;
@@ -1841,6 +1864,13 @@ void verifyDefaultDirectory(const char* self) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--resource-plan-codec") {
+            verifyResultRoundTrip();
+            verifyEntryRoundTrip();
+            verifyIndirectImagePlanModes();
+            std::cout << "resource plan codec tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);

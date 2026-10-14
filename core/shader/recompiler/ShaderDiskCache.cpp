@@ -141,7 +141,7 @@ static_assert(fieldCount<IrResourcePlan>() == 21, "IrResourcePlan changed: updat
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 30, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
-static_assert(fieldCount<DescriptorSource::IndirectImage>() == 7, "IndirectImage changed: update the plan encoder");
+static_assert(fieldCount<DescriptorSource::IndirectImage>() == 10, "IndirectImage changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 4, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
 static_assert(fieldCount<UniformFill>() == 5, "UniformFill changed: update the plan encoder");
@@ -893,6 +893,9 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Value(table.keyArg);
         out.Value(table.entryOffset);
         out.Value(table.hasMaterial);
+        out.Value(table.laneKey);
+        out.Value(table.indexed);
+        out.Value(table.implicitDerivatives);
     });
     writer.List(plan.controlFlow, [&](Writer& out, const ResourceBlock& block) {
         out.Value(valueIndex(block.condition));
@@ -1035,6 +1038,9 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         in.Value(table.keyArg);
         in.Value(table.entryOffset);
         in.Value(table.hasMaterial);
+        in.Value(table.laneKey);
+        in.Value(table.indexed);
+        in.Value(table.implicitDerivatives);
         source.indirectImage = indirect ? std::optional(table) : std::nullopt;
     });
     reader.List(plan.controlFlow, 28, [&](Reader& in, ResourceBlock& block) {
