@@ -375,6 +375,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_SYNC_SAMPLE_DUMPS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | takes the CPU path for occlusion-counter sample dumps, as `APS5_NO_GPU_SAMPLE_DUMPS` does |
 | `APS5_SYNC_SHADER_PREPARE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp` |  | prepares registered shaders on the registering thread instead of in the background |
 | `APS5_SYNC_TEXTURE_UPLOAD` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | restores the waiting batch for every texture upload |
+| `APS5_NO_DEPTH_UPLOAD_MEMO` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp` |  | disables unchanged-depth-upload proofs for comparison; immutable upload buffers are still compared and reused |
 | `APS5_TEXTURE_CACHE_MIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` | 0 | forced byte budget in MiB for the storage and sampled texture caches; `0` selects the budget automatically |
 | `APS5_THREAD_NICE` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/ThreadPriority.cpp` | -10 | nice value the raised queue workers and presenter ask rtkit for (clamped to -20..19) |
 | `APS5_THREAD_PRIORITY` | string | `core/libs/prx/libSceAgcDriver/Execution/src/ThreadPriority.cpp` | off | raises the queue workers and presenter above the title's threads: `off`, `high` or `rt` |
