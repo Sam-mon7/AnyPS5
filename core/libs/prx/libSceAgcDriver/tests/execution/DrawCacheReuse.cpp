@@ -1,6 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
+#include <atomic>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -10,6 +16,7 @@
 #include <exception>
 #include <initializer_list>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,7 +56,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-std::vector<std::uint32_t> DrawThrice() {
+std::vector<std::uint32_t> DrawCommands() {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
@@ -82,16 +89,16 @@ std::vector<std::uint32_t> DrawThrice() {
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
-    Append(commands, 0x2d, {3, 2});
-    Append(commands, 0x2d, {3, 2});
-    Append(commands, 0x2d, {3, 2});
     return commands;
 }
 
 void ThirdDrawHitsTheCache(bool libraries) {
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
-    auto commands = DrawThrice();
+    auto commands = DrawCommands();
+    Append(commands, 0x2d, {3, 2});
+    Append(commands, 0x2d, {3, 2});
+    Append(commands, 0x2d, {3, 2});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
@@ -114,10 +121,175 @@ void SightingsKeepCollidingKeys() {
     Require(sightings.SeenBefore(12) && sightings.SeenBefore(13) && sightings.SeenBefore(14), "a full bucket lost a key newer than the one it replaced");
 }
 
+alignas(256) constexpr std::array<std::uint32_t, 16> IndirectVertexCode{
+    0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
+    0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
+};
+alignas(256) constexpr std::array<std::uint32_t, 8> IndirectPixelCode{
+    0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0x7e000202u,
+    0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u,
+};
+alignas(8) Header IndirectVertexHeader{};
+alignas(8) Header IndirectPixelHeader{};
+alignas(4096) std::array<std::uint32_t, 1024> FragmentInput{};
+using IndirectRecord = std::array<std::uint32_t, 4>;
+alignas(16) std::array<IndirectRecord, 3> IndirectRecords{};
+alignas(16) std::uint32_t IndirectCount = 0;
+std::array<std::atomic<unsigned>, 3> IndirectRecordReads{};
+
+void ObserveIndirectCapture(std::uint64_t address, std::size_t bytes) {
+    using namespace AgcDriver::GuestMemory;
+    if (CurrentReadSite() == ReadSite::IndirectArguments && bytes == sizeof(IndirectRecord)) {
+        for (std::size_t index = 0; index < IndirectRecords.size(); ++index) {
+            if (address == reinterpret_cast<std::uintptr_t>(IndirectRecords[index].data())) ++IndirectRecordReads[index];
+        }
+    }
+}
+
+std::array<std::byte, 1024> SubmitIndirect(std::span<const IndirectRecord> records, bool cpuFallback, bool queuedArguments = false, bool inaccessibleInput = false, std::optional<std::uint32_t> drawCount = std::nullopt) {
+    Require(!records.empty() && records.size() <= IndirectRecords.size(), "invalid indirect regression record count");
+    const auto arguments = reinterpret_cast<std::uintptr_t>(IndirectRecords.data());
+    static std::size_t inputSlot = 0;
+    Require(inputSlot < FragmentInput.size(), "indirect regression exhausted fragment inputs");
+    const auto input = inaccessibleInput ? 0x10000u + inputSlot++ * 4u : reinterpret_cast<std::uintptr_t>(&FragmentInput[inputSlot++]);
+    std::array<std::byte, 1024> clear;
+    clear.fill(std::byte{0x40});
+    AgcDriver::GuestMemory::Write(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), clear);
+    const std::uint32_t red = std::bit_cast<std::uint32_t>(1.0f);
+    if (inaccessibleInput) Require(!AgcDriver::GuestMemory::Accessible(reinterpret_cast<const void*>(input), sizeof(red)), "empty indirect fixture input is unexpectedly mapped");
+    else AgcDriver::GuestMemory::Write(input, std::as_bytes(std::span(&red, 1)));
+    const std::array<IndirectRecord, 3> empty{};
+    AgcDriver::GuestMemory::Write(arguments, std::as_bytes(std::span(empty)));
+    if (!queuedArguments) AgcDriver::GuestMemory::Write(arguments, std::as_bytes(records));
+    const auto countAddress = reinterpret_cast<std::uintptr_t>(&IndirectCount);
+    const auto initialCount = queuedArguments ? 0u : drawCount.value_or(0);
+    AgcDriver::GuestMemory::Write(countAddress, std::as_bytes(std::span(&initialCount, 1)));
+
+    auto commands = DrawCommands();
+    const auto vertex = reinterpret_cast<std::uintptr_t>(IndirectVertexCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(IndirectPixelCode.data());
+    Append(commands, 0x79, {0x24a, 0});
+    Append(commands, 0x76, {0xc8, static_cast<std::uint32_t>(vertex >> 8u), static_cast<std::uint32_t>(vertex >> 40u)});
+    Append(commands, 0x76, {0x8b, 3u << 1u, 0, 0, 0});
+    Append(commands, 0x76, {0x008, static_cast<std::uint32_t>(pixel >> 8u), static_cast<std::uint32_t>(pixel >> 40u)});
+    Append(commands, 0x76, {0x00b, 2u << 1u, static_cast<std::uint32_t>(input), static_cast<std::uint32_t>(input >> 32u)});
+    Append(commands, 0x11, {1, static_cast<std::uint32_t>(arguments), static_cast<std::uint32_t>(arguments >> 32u)});
+    if (queuedArguments) {
+        Require(records.size() == 1, "queued-argument regression requires one record");
+        Append(commands, 0x37, {0x00100200u, static_cast<std::uint32_t>(arguments), static_cast<std::uint32_t>(arguments >> 32u), records[0][0], records[0][1], records[0][2], records[0][3]});
+        if (drawCount) Append(commands, 0x37, {0x00100200u, static_cast<std::uint32_t>(countAddress), static_cast<std::uint32_t>(countAddress >> 32u), *drawCount});
+    }
+    const auto instance = cpuFallback ? 0x8eu : 0x280u;
+    if (records.size() == 1 && !drawCount) Append(commands, 0x24, {0, 0x280, instance, 2});
+    else Append(commands, 0x2c, {0, 0x280, instance, 0x280u | (drawCount ? 1u << 30u : 0u), static_cast<std::uint32_t>(records.size()), drawCount ? static_cast<std::uint32_t>(countAddress) : 0u, drawCount ? static_cast<std::uint32_t>(countAddress >> 32u) : 0u, sizeof(IndirectRecord), 2});
+
+    for (auto& count : IndirectRecordReads) count = 0;
+    AgcDriver::GuestMemory::SetReadGuard(ObserveIndirectCapture);
+    struct ResetReadGuard {
+        ~ResetReadGuard() { AgcDriver::GuestMemory::SetReadGuard(nullptr); }
+    } resetReadGuard;
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "indirect capture regression submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    if (cpuFallback) {
+        const auto count = std::min(static_cast<std::uint32_t>(records.size()), drawCount.value_or(static_cast<std::uint32_t>(records.size())));
+        for (std::size_t index = 0; index < IndirectRecordReads.size(); ++index) {
+            Require(IndirectRecordReads[index] == (index < count ? 1u : 0u), "CPU indirect arguments were skipped or reread instead of reusing the ordered snapshot");
+        }
+    }
+    return ColorMemory;
+}
+
+void EmptyCpuIndirectDrawsSkipFragmentCapture() {
+    Registered(IndirectVertexHeader, IndirectVertexCode.data(), sizeof(IndirectVertexCode), 2);
+    Registered(IndirectPixelHeader, IndirectPixelCode.data(), sizeof(IndirectPixelCode), 1);
+    const std::array<IndirectRecord, 1> active{IndirectRecord{3, 1, 0, 0}};
+    const auto rendered = SubmitIndirect(active, true);
+    const auto kept = std::count(rendered.begin(), rendered.end(), std::byte{0x40});
+    Require(kept != 0 && kept != rendered.size(), "the active indirect triangle did not draw an edge through the target");
+    for (const auto record : {IndirectRecord{0, 1, 0, 0}, IndirectRecord{3, 0, 0, 0}}) {
+        const std::array<IndirectRecord, 1> records{record};
+        const auto empty = SubmitIndirect(records, true, false, true);
+        Require(std::all_of(empty.begin(), empty.end(), [](std::byte value) { return value == std::byte{0x40}; }), "an empty CPU indirect draw changed the render target");
+    }
+    const std::array mixed{IndirectRecord{3, 0, 0, 0}, IndirectRecord{3, 1, 0, 0}, IndirectRecord{0, 1, 0, 0}};
+    Require(SubmitIndirect(mixed, true) == rendered, "the active middle record in a mixed indirect packet rendered different pixels");
+    Require(SubmitIndirect(active, true, true) == rendered, "queued argument writes were not visible before the empty-draw decision");
+    const auto zeroCount = SubmitIndirect(active, true, false, true, 0);
+    Require(std::all_of(zeroCount.begin(), zeroCount.end(), [](std::byte value) { return value == std::byte{0x40}; }), "a zero indirect count changed the render target");
+    Require(SubmitIndirect(active, true, true, false, 1) == rendered, "queued indirect count and arguments were not visible before capture");
+    Require(SubmitIndirect(mixed, true, false, false, 99) == rendered, "an indirect count exceeding the packet maximum was not clamped");
+    Require(SubmitIndirect(active, false) == rendered, "the GPU-eligible indirect control rendered different pixels");
+    const std::array<IndirectRecord, 1> zeroInstances{IndirectRecord{3, 0, 0, 0}};
+    const auto emptyControl = SubmitIndirect(zeroInstances, false);
+    Require(std::all_of(emptyControl.begin(), emptyControl.end(), [](std::byte value) { return value == std::byte{0x40}; }), "the empty GPU-eligible indirect control changed the render target");
+}
+
+alignas(256) constexpr std::array<std::uint32_t, 19> SharedPageVertexCode{
+    0xf4000084u, 0xfa000000u, 0xbf8cc07fu,
+    0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
+    0x7e060280u, 0x7e080202u, 0xf80008cfu, 0x04030201u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
+};
+alignas(8) Header SharedPageVertexHeader{};
+alignas(4096) std::array<std::uint32_t, 1024> SharedCaptureInput{};
+std::array<std::byte, 1024> SubmitSharedPageIndirect(float color, bool queuedColor) {
+    static std::size_t slot = 0;
+    Require(slot + 1 < SharedCaptureInput.size(), "shared-page regression exhausted inputs");
+    const auto position = reinterpret_cast<std::uintptr_t>(&SharedCaptureInput[slot]);
+    const auto fragment = position + sizeof(std::uint32_t);
+    slot += 2;
+    const std::array input{std::bit_cast<std::uint32_t>(1.0f), std::bit_cast<std::uint32_t>(color)};
+    AgcDriver::GuestMemory::Write(position, std::as_bytes(std::span(input)));
+    std::array<std::byte, 1024> clear;
+    clear.fill(std::byte{0x40});
+    AgcDriver::GuestMemory::Write(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), clear);
+    const auto arguments = reinterpret_cast<std::uintptr_t>(IndirectRecords.data());
+    const IndirectRecord active{3, 1, 0, 0};
+    AgcDriver::GuestMemory::Write(arguments, std::as_bytes(std::span(active)));
+
+    auto commands = DrawCommands();
+    const auto vertex = reinterpret_cast<std::uintptr_t>(SharedPageVertexCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(IndirectPixelCode.data());
+    Append(commands, 0x79, {0x24a, 0});
+    Append(commands, 0x76, {0xc8, static_cast<std::uint32_t>(vertex >> 8u), static_cast<std::uint32_t>(vertex >> 40u)});
+    Append(commands, 0x76, {0x8b, 3u << 1u, static_cast<std::uint32_t>(position), static_cast<std::uint32_t>(position >> 32u), 0});
+    Append(commands, 0x76, {0x008, static_cast<std::uint32_t>(pixel >> 8u), static_cast<std::uint32_t>(pixel >> 40u)});
+    Append(commands, 0x76, {0x00b, 2u << 1u, static_cast<std::uint32_t>(fragment), static_cast<std::uint32_t>(fragment >> 32u)});
+    Append(commands, 0x11, {1, static_cast<std::uint32_t>(arguments), static_cast<std::uint32_t>(arguments >> 32u)});
+    if (queuedColor) Append(commands, 0x37, {0x00100200u, static_cast<std::uint32_t>(fragment), static_cast<std::uint32_t>(fragment >> 32u), std::bit_cast<std::uint32_t>(1.0f)});
+    Append(commands, 0x24, {0, 0x280, 0x8e, 2});
+
+    const auto retries = AgcDriver::DriverDetail::captureRetries.load();
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "shared-page indirect submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    if (queuedColor && AgcDriver::DriverDetail::DrawPipeline::Depth() == 0) {
+        Require(AgcDriver::DriverDetail::captureRetries.load() == retries + 1, "the shared-page indirect draw did not exercise exactly one queued-label capture retry");
+    }
+    return ColorMemory;
+}
+
+void QueuedFragmentWordInvalidatesFrontPage() {
+    using namespace AgcDriver::DriverDetail;
+    Require(DeferLabels() && !QueuedLabelTable(), "shared-page regression requires deferred labels with the queued-label table disabled");
+    Registered(SharedPageVertexHeader, SharedPageVertexCode.data(), sizeof(SharedPageVertexCode), 2);
+    const auto oldColor = SubmitSharedPageIndirect(0.0f, false);
+    const auto newColor = SubmitSharedPageIndirect(1.0f, false);
+    Require(oldColor != newColor, "the shared-page fragment input did not affect rendered pixels");
+    const auto kept = std::count(newColor.begin(), newColor.end(), std::byte{0x40});
+    Require(kept != 0 && kept != newColor.size(), "the shared-page vertex input did not produce the expected triangle edge");
+    Require(SubmitSharedPageIndirect(0.0f, true) == newColor, "fragment capture reused the stale front-stage page after publishing a queued color word");
+}
+
 }
 
 int main() {
     try {
+#ifdef _WIN32
+        Require(_putenv_s("APS5_NO_QUEUED_LABELS", "1") == 0 && _putenv_s("APS5_LABEL_FLUSH_US", "60000000") == 0, "cannot configure deferred-label regression");
+#else
+        Require(setenv("APS5_NO_QUEUED_LABELS", "1", 1) == 0 && setenv("APS5_LABEL_FLUSH_US", "60000000", 1) == 0, "cannot configure deferred-label regression");
+#endif
         SightingsKeepCollidingKeys();
         bool libraries = false;
         {
@@ -127,6 +299,8 @@ int main() {
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         ThirdDrawHitsTheCache(libraries);
+        EmptyCpuIndirectDrawsSkipFragmentCapture();
+        QueuedFragmentWordInvalidatesFrontPage();
         AgcDriverShutdown_nid_postfix();
         std::cout << "A repeated draw reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;
