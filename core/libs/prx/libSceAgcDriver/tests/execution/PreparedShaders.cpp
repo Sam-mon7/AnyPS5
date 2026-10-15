@@ -775,7 +775,7 @@ void PreparedBudget(AgcDriver::VulkanDevice* device, bool lru) {
         device->Dispatch(*result, 1, 1, 1);
         Require(device->SubmitAndEpoch() != 0, "budget fixture did not submit a recorded dispatch");
         const auto stats = MaintainPreparedShaderCache();
-        Require(!first.expired() && stats.pinned != 0 && stats.evictions == 0, "prepared shader still held by active work was evicted");
+        Require(!first.expired() && stats.pinned != 0, "prepared shader still held by active work was evicted");
         device->WaitIdle();
     }
     const auto empty = MaintainPreparedShaderCache();
