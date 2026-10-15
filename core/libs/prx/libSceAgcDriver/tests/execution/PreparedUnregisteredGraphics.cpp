@@ -75,7 +75,7 @@ void Check(AgcDriver::VulkanDevice& device) {
         RecompileRequest request{program.binary, {32u, program.firstUserSgpr, program.userData, {}, pixel ? std::optional(draw.pixel) : std::nullopt, vertex, memory}, target, {0, 0, 0, 128u}, GraphicsCompileContext{program.firstUserSgpr, linked, std::nullopt, std::nullopt, {0, 3, 4, 1}}};
         static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request));
         Require(program.snapshot->prepared->entries.size() == 1, "an unregistered graphics program was not prepared at first use");
-        variants[index] = GetPreparedArtifact(*program.snapshot->prepared->entries.front().handle).variantId;
+        variants[index] = GetPreparedArtifact(*program.snapshot->prepared->entries.front().Pin()).variantId;
         static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request));
         Require(program.snapshot->prepared->entries.size() == 1, "a prepared unregistered graphics program was prepared again");
         request.layout.pushConstantOffsetBytes = 4;

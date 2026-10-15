@@ -63,7 +63,7 @@ void Transactions() {
     {
         ShaderPreparationTransaction transaction;
         auto& prepared = transaction.Edit(front);
-        Require(prepared.rectangles.front().shaders == rectangle, "transaction copied an immutable rectangle artifact");
+        Require(prepared.rectangles.front().Pin() == rectangle, "transaction copied an immutable rectangle artifact");
         {
             ShaderPreparationTransaction nested;
             Require(&nested.Edit(front) == &prepared, "nested transaction did not reuse root changes");
@@ -73,7 +73,7 @@ void Transactions() {
         Require(!pixel->prepared->rectangleRequested, "nested commit published before root commit");
         transaction.Commit();
     }
-    Require(pixel->prepared->rectangleRequested && front.prepared->rectangles.front().shaders == rectangle, "root commit lost nested changes or shared artifacts");
+    Require(pixel->prepared->rectangleRequested && front.prepared->rectangles.front().Pin() == rectangle, "root commit lost nested changes or shared artifacts");
     std::weak_ptr<PreparedShaders> staged;
     {
         auto temporary = std::make_shared<ShaderSnapshot>();
