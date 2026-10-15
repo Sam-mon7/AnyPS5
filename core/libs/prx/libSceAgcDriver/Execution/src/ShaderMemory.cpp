@@ -104,6 +104,7 @@ struct TableCacheEntry {
     const ShaderRecompiler::IrResourcePlan* identity = nullptr;
     std::uint64_t shaderBase = 0, mappingGeneration = 0, forgetSerial = 0;
     std::vector<std::uint32_t> userData;
+    std::vector<std::pair<std::uint64_t, std::size_t>> initialRanges;
     ShaderRecompiler::ImageTableSnapshot tables;
     ShaderRecompiler::SrtReadTrace trace;
     ShaderRecompiler::SrtUserDataUse userUse;
@@ -385,6 +386,14 @@ bool ShaderMemory::reuseTables(void* context, const ShaderRecompiler::IrResource
         return false;
     }
     bool valid = found->mappingGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && found->forgetSerial == GuestMemory::ForgetSerial();
+    valid = valid && found->initialRanges.size() == self.initial.size();
+    if (valid) {
+        auto initial = self.initial.begin();
+        for (const auto& [address, bytes] : found->initialRanges) {
+            if (initial->first != address || initial->second.size() != bytes) { valid = false; break; }
+            ++initial;
+        }
+    }
     if (valid && !found->queries.empty()) valid = GuestMemory::UnchangedSinceAll(found->queries);
     std::vector<std::uint32_t> words;
     for (const auto& region : found->regions) {
@@ -421,7 +430,7 @@ void ShaderMemory::rememberTables(void* context, const ShaderRecompiler::IrResou
     auto& self = *static_cast<ShaderMemory*>(context);
     if (tables.tables.empty() || self.tableCacheUnsafe) return;
     for (const auto& table : tables.tables) {
-        if (table.fault != 0 || std::any_of(table.codes.begin(), table.codes.end(), [](auto code) { return (code & ShaderRecompiler::ImageTableAbi::PoisonFlag) != 0 && code != ShaderRecompiler::ImageTableAbi::PoisonCode(ShaderRecompiler::ImageTableAbi::PoisonReason::OutsideDomain); })) return;
+        if (table.fault != 0 || std::any_of(table.codes.begin(), table.codes.end(), [](auto code) { return (code & ShaderRecompiler::ImageTableAbi::PoisonFlag) != 0 && code != ShaderRecompiler::ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(ShaderRecompiler::ImageTableAbi::PoisonReason::OutsideDomain)); })) return;
     }
     TableCacheEntry entry;
     entry.identity = &plan;
@@ -429,6 +438,7 @@ void ShaderMemory::rememberTables(void* context, const ShaderRecompiler::IrResou
     entry.mappingGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     entry.forgetSerial = GuestMemory::ForgetSerial();
     entry.userData.assign(runtime.userData.begin(), runtime.userData.end());
+    for (const auto& [address, bytes] : self.initial) entry.initialRanges.emplace_back(address, bytes.size());
     entry.tables = tables;
     entry.bytes = tables.words.size() * sizeof(ShaderRecompiler::DescriptorValue);
     for (const auto& table : tables.tables) entry.bytes += table.codes.size() * sizeof(std::uint32_t) + table.readRanges.size() * sizeof(std::pair<std::uint64_t, std::uint64_t>);
