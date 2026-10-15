@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -227,6 +228,15 @@ struct Context {
             if ((mask & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & flags) == flags) return i;
         }
         throw std::runtime_error("AGC graphics: required Vulkan memory type is unavailable");
+    }
+
+    std::optional<std::uint32_t> RebarMemoryType(std::uint32_t mask) const {
+        constexpr auto flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            const auto& type = memory.memoryTypes[i];
+            if ((mask & (1u << i)) != 0 && (type.propertyFlags & flags) == flags && type.heapIndex < memory.memoryHeapCount && memory.memoryHeaps[type.heapIndex].size > (VkDeviceSize{256} << 20u)) return i;
+        }
+        return std::nullopt;
     }
 
     std::uint32_t DeviceMemoryType(std::uint32_t mask, VkDeviceSize bytes, const char* what) const {

@@ -1,11 +1,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuCopyCheckpoints.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuAddressBindings.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 
 namespace AgcDriver::Graphics {
@@ -49,12 +52,16 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
 
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, Access access) : Buffer(context, size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, access) {}
+
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, Access access) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties), uploadOnly(access == Access::UploadOnly && RebarUploads()), residentMirror(access == Access::ResidentMirror) {
     Require(size != 0, "zero-sized GPU buffer");
+    const bool rebarRequested = uploadOnly || access == Access::ResidentMirror;
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
-    if (const auto allocation = cache->Take(size, this->usage, properties)) {
+    const auto reuse = [&](const BufferAllocation& entry) {
+        const auto* allocation = &entry;
         buffer = allocation->buffer;
         memory = allocation->memory;
         mapping = allocation->mapping;
@@ -63,6 +70,8 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         capacity = allocation->bytes;
         offset = allocation->offset;
         slab = allocation->slab;
+        memoryType = allocation->memoryType;
+        rebarBytes = allocation->rebarBytes;
         if (allocation->bufferBytes != size) {
             context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
             buffer = VK_NULL_HANDLE;
@@ -72,10 +81,18 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 initializeAddress(usage);
             } catch (...) {
                 release();
+                buffer = VK_NULL_HANDLE;
+                memory = VK_NULL_HANDLE;
+                mapping = nullptr;
+                rebarBytes = 0;
+                slab = false;
                 throw;
             }
         }
         ready = true;
+    };
+    if (!rebarRequested) if (const auto allocation = cache->Take(size, this->usage, properties)) {
+        reuse(*allocation);
         return;
     }
     try {
@@ -103,7 +120,44 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         } else {
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, properties);
         }
-        if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && BufferPool::SlabEligible(capacity, requirements.alignment, requirements.size, context.limits.nonCoherentAtomSize)) {
+        if (rebarRequested) {
+            const auto hostType = allocation.memoryTypeIndex;
+            const auto type = context.RebarMemoryType(requirements.memoryTypeBits);
+            if (type) {
+                if (const auto pooled = cache->Take(size, this->usage, properties, *type)) {
+                    context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+                    buffer = VK_NULL_HANDLE;
+                    reuse(*pooled);
+                    return;
+                }
+                if (BufferPool::SlabEligible(capacity, requirements.alignment, requirements.size, context.limits.nonCoherentAtomSize)) {
+                    const auto slot = cache->TakeSlot(context, *type, capacity, addressable, true);
+                    if (slot.memory != VK_NULL_HANDLE) {
+                        memoryType = *type;
+                        memory = slot.memory;
+                        offset = slot.offset;
+                        slab = true;
+                        allocationBytes = capacity;
+                        Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, offset), "vkBindBufferMemory ReBAR slab");
+                        initializeAddress(usage);
+                        mapping = slot.mapping;
+                        ready = true;
+                        return;
+                    }
+                } else if (RebarMemory().Reserve(allocationBytes)) {
+                    allocation.memoryTypeIndex = *type;
+                    rebarBytes = allocationBytes;
+                }
+            } else RebarMemory().Ineligible();
+            memoryType = allocation.memoryTypeIndex;
+            if (rebarBytes == 0) if (const auto pooled = cache->Take(size, this->usage, properties, hostType)) {
+                context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+                buffer = VK_NULL_HANDLE;
+                reuse(*pooled);
+                return;
+            }
+        }
+        if (rebarBytes == 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && BufferPool::SlabEligible(capacity, requirements.alignment, requirements.size, context.limits.nonCoherentAtomSize)) {
             const auto slot = cache->TakeSlot(context, allocation.memoryTypeIndex, capacity, addressable);
             memory = slot.memory;
             offset = slot.offset;
@@ -132,7 +186,7 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size, memoryType, rebarBytes});
         return;
     }
     if (slab) {
@@ -143,6 +197,7 @@ void Buffer::release() noexcept {
     if (mapping) context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (rebarBytes != 0) RebarMemory().Release(rebarBytes);
 }
 
 VkBuffer Buffer::Handle() const {
@@ -150,6 +205,19 @@ VkBuffer Buffer::Handle() const {
 }
 
 std::span<std::byte> Buffer::Bytes() {
+    static const bool check = [] { const auto* value = std::getenv("APS5_REBAR_CHECK"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    Require(!check || !uploadOnly, "CPU read of an upload-only buffer");
+    Require(!check || !residentMirror, "CPU mirror read requires an explicit publication span");
+    return WriteBytes();
+}
+
+std::span<const std::byte> Buffer::ReadBytes(std::size_t offset, std::size_t bytes) {
+    Require(!uploadOnly, "CPU read of an upload-only buffer");
+    Require(offset <= size && bytes <= size - offset, "CPU mirror read exceeds its buffer");
+    return WriteBytes().subspan(offset, bytes);
+}
+
+std::span<std::byte> Buffer::WriteBytes() {
     Require(mapping != nullptr, "device-local buffer has no host mapping");
     return {static_cast<std::byte*>(mapping), size};
 }

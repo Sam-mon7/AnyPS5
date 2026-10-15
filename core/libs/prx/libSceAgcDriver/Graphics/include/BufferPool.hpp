@@ -25,6 +25,8 @@ struct BufferAllocation {
     VkDeviceSize offset = 0;
     bool slab = false;
     std::size_t bufferBytes = 0;
+    std::uint32_t memoryType = UINT32_MAX;
+    VkDeviceSize rebarBytes = 0;
 };
 
 struct SlabSlot {
@@ -63,11 +65,11 @@ public:
     static std::size_t Capacity(std::size_t bytes, VkMemoryPropertyFlags properties);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation);
-    std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, std::uint32_t memoryType = UINT32_MAX);
     void Put(const BufferAllocation& allocation) noexcept;
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
     static VkDeviceSize SlabBlockBytes(std::size_t capacity);
-    SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
+    SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, bool rebar = false);
     VkDeviceSize PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
     VramBudget& Vram() { return vram; }
@@ -80,6 +82,7 @@ private:
         std::vector<std::uint32_t> free;
         std::uint32_t used = 0;
         std::uint64_t slab = 0;
+        VkDeviceSize rebarBytes = 0;
     };
     struct Slab {
         std::vector<SlabBlock*> available;
@@ -95,11 +98,12 @@ private:
         std::size_t bytes;
         VkBufferUsageFlags usage;
         VkMemoryPropertyFlags properties;
+        std::uint32_t memoryType;
         bool operator==(const SlotKey&) const = default;
     };
     struct SlotKeyHash {
         std::size_t operator()(const SlotKey& key) const noexcept {
-            return std::hash<std::size_t>{}(key.bytes) ^ (static_cast<std::size_t>(key.usage) << 32u) ^ (static_cast<std::size_t>(key.properties) << 48u);
+            return std::hash<std::size_t>{}(key.bytes) ^ (static_cast<std::size_t>(key.usage) << 32u) ^ (static_cast<std::size_t>(key.properties) << 48u) ^ std::hash<std::uint32_t>{}(key.memoryType);
         }
     };
     // One retention tier: its slots by key (each list oldest first), their count and bytes, the
