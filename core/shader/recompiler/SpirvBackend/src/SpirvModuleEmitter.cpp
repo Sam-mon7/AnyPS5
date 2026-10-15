@@ -249,6 +249,11 @@ std::uint32_t MrtOutputMode(const SpirvEmitterState& state, const ExportInfo& ex
     return state.inputInfo.pixel->targetOutputMode[exp.index];
 }
 
+ColorOutputType MrtOutputType(const SpirvEmitterState& state, const ExportInfo& exp) {
+    if (state.program.Resources().stage != IrShaderStage::Pixel || exp.kind != ExportTargetKind::Mrt || state.inputInfo.pixel == nullptr || exp.index >= 8u) return ColorOutputType::Float;
+    return ResolveColorOutputType(state.inputInfo.pixel->targetOutputMode[exp.index], state.inputInfo.pixel->targetOutputType[exp.index]);
+}
+
 std::uint32_t PackUnorm10_11_11(SpirvEmitterState& state, std::uint32_t color) {
     const auto info = GetFormatInfo(IrBufferFormat::Format11_11_10UNorm);
     auto packed = ConstantU32(state, 0u);
@@ -304,9 +309,11 @@ std::uint32_t ExportRawComponent(SpirvValueEmitContext& ctx, std::uint32_t vecto
     return value;
 }
 
-std::uint32_t ExportVector(SpirvValueEmitContext& ctx, std::uint32_t data, const ExportInfo& exp, bool uintOutput) {
+std::uint32_t ExportVector(SpirvValueEmitContext& ctx, std::uint32_t data, const ExportInfo& exp, ColorOutputType outputType) {
     auto& state = ctx.state;
-    if (exp.compr && !uintOutput) {
+    const bool integerOutput = outputType == ColorOutputType::Uint || outputType == ColorOutputType::Sint;
+    if (integerOutput && exp.compr && MrtOutputMode(state, exp) != 7u) throw std::runtime_error("compressed raw32 integer fragment exports are unsupported");
+    if (exp.compr && !integerOutput) {
         const auto mode = MrtOutputMode(state, exp);
         const auto unpack = mode == 5u ? GLSLstd450UnpackUnorm2x16 : mode == 6u ? GLSLstd450UnpackSnorm2x16 : GLSLstd450UnpackHalf2x16;
         std::array<std::uint32_t, 4> f32 {ConstantF32(state, 0u), ConstantF32(state, 0u), ConstantF32(state, 0u), ConstantF32(state, 0x3f800000u)};
@@ -334,7 +341,7 @@ std::uint32_t ExportVector(SpirvValueEmitContext& ctx, std::uint32_t data, const
         ConstantU32(state, 0u),
         ConstantU32(state, 0u),
         ConstantU32(state, 0u),
-        ConstantU32(state, uintOutput ? 1u : 0x3f800000u),
+        ConstantU32(state, integerOutput ? 1u : 0x3f800000u),
     };
     const auto mode = MrtOutputMode(state, exp);
     const auto exported = exp.en & (mode == 1u ? 0x1u : mode == 2u ? 0x3u : mode == 3u ? 0x9u : 0xfu);
@@ -360,9 +367,10 @@ std::uint32_t ExportVector(SpirvValueEmitContext& ctx, std::uint32_t data, const
             }
         }
     }
-    if (uintOutput) {
+    if (integerOutput) {
         const auto vector = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), vector, raw[0], raw[1], raw[2], raw[3]);
+        if (outputType == ColorOutputType::Sint) return Unary(state, spv::OpBitcast, TypeI32Vector(state, 4u), vector);
         return vector;
     }
     std::array<std::uint32_t, 4> f32 {};
@@ -1357,23 +1365,25 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
         if (state.program.Resources().stage != IrShaderStage::Mesh && variable == 0u) {
             return;
         }
-        const bool uintOutput = MrtOutputMode(state, exp) == 7u;
-        const auto vectorType = uintOutput ? TypeU32Vector(state, 4u) : TypeF32Vector(state, 4u);
-        auto value = ExportVector(ctx, data, exp, uintOutput);
+        const auto outputType = MrtOutputType(state, exp);
+        const bool integerOutput = outputType == ColorOutputType::Uint || outputType == ColorOutputType::Sint;
+        const auto scalarType = outputType == ColorOutputType::Uint ? TypeU32(state) : outputType == ColorOutputType::Sint ? TypeI32(state) : TypeF32(state);
+        const auto vectorType = outputType == ColorOutputType::Uint ? TypeU32Vector(state, 4u) : outputType == ColorOutputType::Sint ? TypeI32Vector(state, 4u) : TypeF32Vector(state, 4u);
+        auto value = ExportVector(ctx, data, exp, outputType);
         if (state.program.Resources().stage == IrShaderStage::Pixel && exp.kind == ExportTargetKind::Mrt) {
             if (exp.index >= 8u) throw std::runtime_error("fragment export target exceeds the runtime mapping table");
             std::array<std::uint32_t, 4> components{};
             for (std::uint32_t component = 0; component < components.size(); ++component) {
                 const auto index = state.registrationModules ? EmitAndConstant(state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), EmitShaderDataDwordLoad(state, state.program.Metadata().bindings.RuntimeStateDword() + RuntimeAbi::StateExportMappings + exp.index / 4u), ConstantU32(state, exp.index % 4u * 8u + component * 2u)), 3u) : state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ExportBase + exp.index * 4u + component, component);
                 components[component] = state.module.AllocateId();
-                state.module.AddFunction(spv::OpVectorExtractDynamic, uintOutput ? TypeU32(state) : TypeF32(state), components[component], value, index);
+                state.module.AddFunction(spv::OpVectorExtractDynamic, scalarType, components[component], value, index);
             }
             const auto mapped = state.module.AllocateId();
             state.module.AddFunction(spv::OpCompositeConstruct, vectorType, mapped, components[0], components[1], components[2], components[3]);
             value = mapped;
-            if (exp.index == 0u && !uintOutput && AlphaToCoverage(state)) StoreAlphaCoverage(state, value);
+            if (exp.index == 0u && !integerOutput && AlphaToCoverage(state)) StoreAlphaCoverage(state, value);
             const auto mode = MrtOutputMode(state, exp);
-            if (!uintOutput && mode != 5u && mode != 6u) value = SelectExportPacking(state, exp.index, value);
+            if (!integerOutput && mode != 5u && mode != 6u) value = SelectExportPacking(state, exp.index, value);
         }
         if (exp.kind == ExportTargetKind::Position) {
             if (state.inputInfo.vertex == nullptr) {

@@ -808,7 +808,10 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         auto color = DecodeColorBuffer(cx, slot);
         if (slotExport == 7 && ((read(cx, 0x31c + slot * 0xfu) >> 8u) & 7u) != 4u) throw std::runtime_error("AGC graphics: color export format 7 (UINT16_ABGR) into a target that is not unsigned integer is unsupported");
         color.exportIndex = index;
-        color.uintExport = slotExport == 7;
+        const auto outputType = ColorOutputTypeOf(color);
+        const bool integerOutput = outputType == ShaderRecompiler::ColorOutputType::Uint || outputType == ShaderRecompiler::ColorOutputType::Sint;
+        Require(!integerOutput || slotExport == 1 || slotExport == 2 || slotExport == 3 || slotExport == 7 || slotExport == 9, "integer attachment needs a raw32 or UINT16 color export");
+        color.uintExport = outputType == ShaderRecompiler::ColorOutputType::Uint;
         if (color.samples > 1 && result.samples == 1 && result.colors.empty() && !result.depth && !result.alphaToCoverage && (read(cx, 0x292) & 1u) == 0) {
             result.samples = color.samples;
             result.customSampleLocations = true;
@@ -895,7 +898,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         }
         state.blendEnable = (blend >> 30u) & 1u;
         if (state.blendEnable && (mapping == 0x1bu || mapping == 0x93u)) throw std::runtime_error("AGC graphics: blending into a color target with a reversed component order is not implemented");
-        Require(!state.blendEnable || !color.uintExport, "blending into an unsigned integer target is unsupported");
+        Require(!state.blendEnable || ColorOutputTypeOf(color) == ShaderRecompiler::ColorOutputType::Float, "blending into an unsigned integer target or signed integer target is unsupported");
         if (state.blendEnable) {
             Require((read(cx, 0x31c + slot * 0xfu) & 0x10000u) == 0, "blend bypass conflicts with enabled blending");
             state.srcColorBlendFactor = blendFactor(blend & 0x1fu);
@@ -960,6 +963,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     if (result.alphaToCoverage) {
         const auto mrt0 = std::find_if(result.colors.begin(), result.colors.end(), [](const ColorTarget& color) { return color.exportIndex == 0; });
         Require(mrt0 != result.colors.end(), "alpha-to-coverage without a written MRT0 color target is unsupported");
+        Require(ColorOutputTypeOf(*mrt0) == ShaderRecompiler::ColorOutputType::Float, "alpha-to-coverage into an integer target is unsupported");
         const auto format = exportFormat & 0xfu;
         Require(format == 4u || format == 5u || format == 6u || format == 9u, "alpha-to-coverage needs an MRT0 export format with a floating-point alpha");
         Require(mrt0->componentMapping == 0xe4u && mrt0->packing == ShaderRecompiler::ColorExportPacking::None, "alpha-to-coverage into a component-swapped or packed MRT0 target is unsupported");
@@ -974,6 +978,27 @@ std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& 
         if (color.exportIndex < packings.size()) packings[color.exportIndex] = color.packing;
     }
     return packings;
+}
+
+ShaderRecompiler::ColorOutputType ColorOutputTypeOf(const ColorTarget& color) {
+    using Type = ShaderRecompiler::ColorOutputType;
+    if (color.packing != ShaderRecompiler::ColorExportPacking::None) return Type::Float;
+    switch (color.format) {
+        case VK_FORMAT_R8_UINT: case VK_FORMAT_R16_UINT: case VK_FORMAT_R32_UINT:
+        case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R8G8B8A8_UINT:
+        case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R16G16B16A16_UINT:
+        case VK_FORMAT_R32G32B32A32_UINT: return Type::Uint;
+        case VK_FORMAT_R32_SINT: return Type::Sint;
+        default: return Type::Float;
+    }
+}
+
+std::array<ShaderRecompiler::ColorOutputType, 8> ExportOutputTypes(const State& state) {
+    std::array<ShaderRecompiler::ColorOutputType, 8> types{};
+    for (const auto& color : state.colors) {
+        if (color.exportIndex < types.size()) types[color.exportIndex] = ColorOutputTypeOf(color);
+    }
+    return types;
 }
 
 ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state) {

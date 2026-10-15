@@ -122,6 +122,14 @@ void hdrComponentSwapTests() {
         queue.context[0x8e] = 0xf;
         queue.context[0x1e0] = (1u << 30u) | 13u;
         for (std::uint32_t i = 0; i < 4; ++i) queue.context[0x105 + i] = std::bit_cast<std::uint32_t>(float(i + 1) / 8.0f);
+        if (number == 4u) {
+            expectFailure([&] { DecodeState(queue); }, "blending into an unsigned integer target");
+            queue.context[0x1e0] = 0;
+            queue.context[0x31c] &= ~(1u << 11u);
+            state = DecodeState(queue);
+            Require(state.color.componentMapping == 0xe4u && ExportOutputTypes(state)[0] == ShaderRecompiler::ColorOutputType::Uint, "standard integer color mapping or numeric type changed");
+            continue;
+        }
         state = DecodeState(queue);
         Require(state.blendConstants == std::array<float, 4>{0.375f, 0.25f, 0.125f, 0.5f}, "alternate color blend constants were not swizzled with the export");
         queue.context[0x31c] &= ~(1u << 11u);
@@ -2034,6 +2042,26 @@ void uint16ExportTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(blended); }, "blending into an unsigned integer target");
     queue.context[0x1c5] = 8;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "color export format 8");
+}
+
+void raw32IntegerExportTests() {
+    using Type = ShaderRecompiler::ColorOutputType;
+    for (const auto number : {4u, 5u}) {
+        for (const auto mode : {1u, 2u, 3u, 9u}) {
+            auto queue = makeState();
+            queue.context[0x1c5] = mode;
+            queue.context[0x31c] = (queue.context[0x31c] & ~0x77cu) | (4u << 2u) | (number << 8u);
+            const auto state = AgcDriver::Graphics::DecodeState(queue);
+            const auto expected = number == 4u ? Type::Uint : Type::Sint;
+            Require(AgcDriver::Graphics::ExportOutputTypes(state)[0] == expected, "a raw32 export lost its attachment numeric type");
+            auto compacted = state;
+            compacted.colors[0].exportIndex = 3u;
+            const auto types = AgcDriver::Graphics::ExportOutputTypes(compacted);
+            Require(types[0] == Type::Auto && types[3] == expected, "attachment numeric type followed the physical target instead of the export location");
+            queue.context[0x1e0] = 1u << 30u;
+            expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "integer target");
+        }
+    }
 }
 
 VkSampleCountFlags depthSampleCounts = VK_SAMPLE_COUNT_4_BIT;
@@ -5402,10 +5430,12 @@ void unorm10_11_11TargetTests() {
         return AgcDriver::Graphics::ValidateShaders(shaders, target, subgroup, false);
     };
     Require(validate(packed, state) == std::set<std::uint32_t>{0u}, "the packed export did not reach attachment 0");
-    expectFailure([&] { validate(unpacked, state); }, "uint4 words to its packed 10_11_11 unorm attachments");
+    expectFailure([&] { validate(unpacked, state); }, "expected vertex:u32x4, got vertex:f32x4");
     auto plainState = state;
     plainState.colors[0].packing = ColorExportPacking::None;
-    expectFailure([&] { validate(packed, plainState); }, "float4 colors");
+    Require(validate(packed, plainState) == std::set<std::uint32_t>{0u}, "uint4 outputs did not validate against an ordinary R32_UINT attachment");
+    plainState.colors[0].format = VK_FORMAT_R32_SFLOAT;
+    expectFailure([&] { validate(packed, plainState); }, "expected vertex:f32x4, got vertex:u32x4");
     auto uintExport = request;
     uintExport.context.pixel->targetOutputMode[0] = 7;
     expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(uintExport)); }, "fragment output 0 has no 10_11_11 unorm packing path");
@@ -6082,6 +6112,12 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--raw32-integer-exports") {
+            uint16ExportTests();
+            raw32IntegerExportTests();
+            std::cout << "raw32 integer attachment state tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-lifetime") {
             pipelineLibraryLifetimeTests();
             return 0;
@@ -6194,6 +6230,7 @@ int main(int argc, char** argv) {
         metadataPassTests();
         cmaskTests();
         uint16ExportTests();
+        raw32IntegerExportTests();
         uint8x4TargetTests();
         multisampleTests();
         MsaaEnableSingleSampleTests();

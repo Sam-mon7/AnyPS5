@@ -114,6 +114,12 @@ enum class ColorExportPacking : std::uint8_t {
     Unorm10_11_11
 };
 
+enum class ColorOutputType : std::uint8_t { Auto, Float, Uint, Sint };
+
+constexpr ColorOutputType ResolveColorOutputType(std::uint8_t mode, ColorOutputType type) {
+    return type == ColorOutputType::Auto ? (mode == 7u ? ColorOutputType::Uint : ColorOutputType::Float) : type;
+}
+
 enum class RasterPrimitive : std::uint8_t {
     Point,
     Line,
@@ -152,6 +158,7 @@ struct ShaderPixelStageInfo {
     bool stencilRefExportEnable;
     RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
     bool layerExported = false;
+    std::array<ColorOutputType, 8> targetOutputType{};
 };
 
 struct ShaderVertexBufferResource {
