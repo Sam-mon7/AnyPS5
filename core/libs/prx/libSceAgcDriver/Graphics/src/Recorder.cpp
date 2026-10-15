@@ -3202,7 +3202,7 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 }
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
-    if (StorageTexture::ResidentResultsEnabled() && !InsideCompletionAction() && StorageTexture::FlushPending(address, bytes.size(), nullptr, "label", PublishScope::PartialUnits)) {
+    if (StorageTexture::ResidentResultsEnabled() && !InCompletion() && StorageTexture::FlushPending(address, bytes.size(), nullptr, "label", PublishScope::PartialUnits)) {
         if (Idle()) {
             GuestMemory::CheckRange(reinterpret_cast<const void*>(address), bytes.size(), 4, true);
             GuestMemory::StoreOwnBytes(address, bytes);
