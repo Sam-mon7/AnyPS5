@@ -6,6 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -53,6 +54,17 @@ bool DrawPipeline::DrainBeforeRead(std::uint64_t address, std::size_t bytes) {
     if (!pipeline.Busy() || !pipeline.Overlaps(address, bytes)) return false;
     pipeline.Drain(DrainReason::Capture);
     return true;
+}
+
+bool DrawPipeline::KeepsWait(std::span<const std::uint32_t> packet) {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_NARROW_PACKET_DRAINS"); return value != nullptr && std::strcmp(value, "1") == 0 && std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr; }();
+    if (!enabled || packet.empty()) return false;
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    if ((opcode != 0x3c && opcode != 0x93) || packet.size() != (opcode == 0x93 ? 9u : 7u) || (packet[1] & 0x10u) == 0) return false;
+    const auto address = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    const auto bytes = opcode == 0x93 ? 8u : 4u;
+    if (bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    return !Queue0().Overlaps(address, bytes);
 }
 
 bool& DrawPipeline::Active() {
@@ -120,6 +132,25 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         *top = 0;
     }
     drainOpcodes = {};
+    std::string requests;
+    for (std::size_t index = 0; index < reasonRequests.size(); ++index) {
+        const auto total = reasonRequests[index].load(std::memory_order_relaxed);
+        char item[72];
+        std::snprintf(item, sizeof(item), " %s %llu", DrainNames[index], static_cast<unsigned long long>(total - reportedReasons[index]));
+        requests += item;
+        reportedReasons[index] = total;
+    }
+    requests += "; by opcode:";
+    for (std::size_t opcode = 0; opcode < drainRequests.size(); ++opcode) {
+        const auto total = drainRequests[opcode].load(std::memory_order_relaxed);
+        const auto count = total - reportedRequests[opcode];
+        reportedRequests[opcode] = total;
+        if (count == 0) continue;
+        char item[40];
+        std::snprintf(item, sizeof(item), " 0x%02x %llu", static_cast<unsigned>(opcode), static_cast<unsigned long long>(count));
+        requests += item;
+    }
+    std::fprintf(stderr, "[draw-drain-requests] %.3f s:%s\n", windowNs / 1e9, requests.c_str());
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
@@ -172,6 +203,7 @@ void DrawPipeline::run() {
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+    reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
@@ -188,6 +220,10 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
 
 std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
     return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
+}
+
+std::uint64_t DrawPipeline::DrainRequestsByReason(DrainReason reason) {
+    return Queue0().reasonRequests[static_cast<std::size_t>(reason)].load(std::memory_order_relaxed);
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
