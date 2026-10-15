@@ -1217,6 +1217,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     source.program.reset();
     source.variants.push_back(variant);
+    if (PreparedShaderBudgetEnabled()) PreparedCacheStorage().dirty.store(true, std::memory_order_relaxed);
     return variant;
 }
 
@@ -1402,6 +1403,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         }
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
             source.memo.push_front({variant->artifact.variantId, hash, shared});
+            if (PreparedShaderBudgetEnabled()) PreparedCacheStorage().dirty.store(true, std::memory_order_relaxed);
             source.memoIndex.emplace(index, source.memo.begin());
             while (source.memo.size() > ResultMemoEntries) {
                 const auto& last = source.memo.back();
@@ -1527,6 +1529,7 @@ PreparedShaderCacheStats MaintainPreparedShaderCache() {
     const bool report = now - cache.reported >= std::chrono::seconds(10);
     if (!limit && !report) return cache.stats;
     if (!cache.dirty && !report && (!limit || cache.stats.memory.Bytes() <= *limit)) return cache.stats;
+    cache.dirty.store(false, std::memory_order_relaxed);
     if (limit) pruneSources();
     const auto measure = [&] {
         auto memory = sourceMemory();
@@ -1571,7 +1574,6 @@ PreparedShaderCacheStats MaintainPreparedShaderCache() {
     }
     cache.stats.pinned = std::ranges::count_if(cache.handles, [](const auto& object) { return object.owner.use_count() > 1; });
     cache.stats.overBudgetBytes = limit && cache.stats.memory.Bytes() > *limit ? cache.stats.memory.Bytes() - *limit : 0;
-    cache.dirty = false;
     if (profile && report) {
         const auto& memory = cache.stats.memory;
         constexpr double mib = 1024.0 * 1024.0;
