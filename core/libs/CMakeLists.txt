@@ -234,6 +234,8 @@ if(BUILD_TESTING)
         endif()
         add_test(NAME windows_write_watch COMMAND windows_write_watch_tests)
         set_tests_properties(windows_write_watch PROPERTIES TIMEOUT 20)
+        add_test(NAME windows_write_watch_query_cache COMMAND windows_write_watch_tests)
+        set_tests_properties(windows_write_watch_query_cache PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_GUEST_QUERY_CACHE=1")
     endif()
 
     add_test_executable(guest_offline_imports_tests tests/GuestOfflineImports.cpp)
