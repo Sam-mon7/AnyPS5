@@ -1,6 +1,8 @@
 #include "Translation/EmbeddedVertexFetch.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 
@@ -374,6 +376,19 @@ bool carryObserved(const RdnaProgram& program, std::size_t addIndex, std::uint32
 
 }
 
+std::uint64_t EmbeddedVertexFetchAnalyzer::UnusedUserSgprs(const RdnaProgram& program) {
+    if (program.instructions.empty()) return 0;
+    std::uint64_t unused = ~std::uint64_t{0};
+    for (const auto& inst : program.instructions) {
+        if (inst.op == RdnaOpcode::Unknown || inst.op == RdnaOpcode::SSetpcB64 || inst.op == RdnaOpcode::SSwappcB64 || inst.op == RdnaOpcode::SRfeB64 || inst.op == RdnaOpcode::SMovrelsB32 || inst.op == RdnaOpcode::SMovrelsB64 || inst.op == RdnaOpcode::SMovrelsd2B32 || inst.op == RdnaOpcode::SMovreldB32 || inst.op == RdnaOpcode::SMovreldB64) return 0;
+        for (std::uint32_t sgpr = 0; sgpr < 64; ++sgpr) {
+            const bool secondDestination = isScalarOperand(inst.destination2) && sgpr >= scalarSlot(inst.destination2) && sgpr - scalarSlot(inst.destination2) < 2;
+            if (touchesSgpr(inst, sgpr) || secondDestination) unused &= ~(std::uint64_t{1} << sgpr);
+        }
+    }
+    return unused;
+}
+
 EmbeddedFetchPlan EmbeddedVertexFetchAnalyzer::Analyze(const RdnaProgram& program, std::uint32_t attributeTableRegister, std::uint32_t bufferTableRegister, std::uint32_t userDataBaseRegister, std::uint32_t userDataCount, std::uint32_t waveSize) const {
     if (waveSize != 32u && waveSize != 64u) {
         throw std::runtime_error("unsupported wave size for embedded vertex fetch analysis");
@@ -403,13 +418,14 @@ EmbeddedFetchPlan EmbeddedVertexFetchAnalyzer::Analyze(const RdnaProgram& progra
     bool instanceOffsetConflict = false;
     std::vector<std::uint32_t> vertexAddPcs;
     std::vector<std::uint32_t> instanceAddPcs;
+    static const bool indirectFold = [] { const auto* value = std::getenv("APS5_INDIRECT_SGPR_FOLD"); return value != nullptr && std::strcmp(value, "1") == 0; }();
 
     for (const auto& inst : program.instructions) {
         const bool vertexIndexAccumulator = isVectorOperand(inst.destination) && (inst.destination.reg == 0u || (userDataBaseRegister == 8u && inst.destination.reg == kVertexIndexVgpr));
         const bool instanceIndexAccumulator = isVectorOperand(inst.destination) && (inst.destination.reg == (userDataBaseRegister == 8u ? kInstanceIndexVgpr : 3u));
         std::uint32_t sadZero = 0u;
         const bool indexOffsetAdd = (vertexIndexAccumulator || instanceIndexAccumulator) && isScalarOperand(inst.source0) &&
-            ((inst.op == RdnaOpcode::VAddI32 && isVectorOperand(inst.source1) && inst.source1.reg == inst.destination.reg) ||
+            (((inst.op == RdnaOpcode::VAddI32 || (indirectFold && (inst.op == RdnaOpcode::VAddNcU32 || inst.op == RdnaOpcode::VAddNcI32))) && isVectorOperand(inst.source1) && inst.source1.reg == inst.destination.reg) ||
              (userDataBaseRegister == 8u && (inst.destination.reg == kVertexIndexVgpr || inst.destination.reg == kInstanceIndexVgpr) &&
               inst.op == RdnaOpcode::VSadU32 && isVectorOperand(inst.source2) && inst.source2.reg == inst.destination.reg &&
               tryConstantOperand(sgprs, inst.source1, sadZero) && sadZero == 0u));

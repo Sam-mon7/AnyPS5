@@ -1,9 +1,30 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include "Translation/EmbeddedVertexFetch.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
+#include <cstring>
 
 namespace AgcDriver::DriverDetail {
+namespace {
+std::uint64_t UnusedSgprs(std::span<const std::uint32_t> code) {
+    if (code.empty() || code.size_bytes() > 1024u * 1024u) return 0;
+    struct Entry {
+        std::vector<std::uint32_t> code;
+        std::uint64_t unused;
+    };
+    struct CacheStorage {};
+    auto& cache = HostThreadLocal<std::vector<Entry>, CacheStorage>();
+    const auto found = std::find_if(cache.begin(), cache.end(), [&](const auto& entry) { return std::ranges::equal(entry.code, code); });
+    if (found != cache.end()) return found->unused;
+    const auto unused = ShaderRecompiler::EmbeddedVertexFetchAnalyzer::UnusedUserSgprs(ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code));
+    if (cache.size() == 4) cache.erase(cache.begin());
+    cache.push_back({std::vector<std::uint32_t>(code.begin(), code.end()), unused});
+    return unused;
+}
+}
 
 std::uint32_t Driver::drawUserWord(const DrawProgram& program, std::int32_t sgpr) {
     require(sgpr >= 0 && static_cast<std::uint32_t>(sgpr) >= program.firstUserSgpr, "invalid draw offset SGPR");
@@ -30,13 +51,15 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     const auto fail = [&](Path reason) { if (!indirectCpu) indirectCpu = reason; };
     constexpr std::uint32_t NoLocation = 0x280u;
     const bool meshPath = graphics.stages.mesh.has_value() && !graphics.stages.tessellation && !graphics.rectList;
+    static const bool indirectFold = [] { const auto* value = std::getenv("APS5_INDIRECT_SGPR_FOLD"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    const auto unused = indirectFold && graphics.stages.path == Graphics::ShaderPath::Vertex && !meshPath && !graphics.stages.tessellation ? UnusedSgprs(frontProgram.binary.code) : 0;
     const bool meshGpuSide = meshPath && drawParameters.indexed && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
     if ((graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList) && !meshGpuSide) fail(Path::NonVertexPath);
     if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) fail(Path::DrawIndex);
     if (indirect.countIndirect && !support.count) fail(Path::FeatureGap);
     if (indirect.countIndirect && indirect.count > 1 && !support.multi) fail(Path::FeatureGap);
     const auto dimension = [&](std::int32_t k, std::int32_t p, bool shared, bool conflict, std::uint32_t x, Rule& rule, std::uint32_t& constant) {
-        if (p < 0) {
+        if (p < 0 || (p < 64 && (unused & (std::uint64_t{1} << p)) != 0)) {
             rule = Rule::Constant;
             const auto offset = k >= 0 ? drawUserWord(frontProgram, k) : 0u;
             require(offset <= std::numeric_limits<std::uint32_t>::max() - x, "draw vertex offset overflow");

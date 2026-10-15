@@ -30,6 +30,7 @@ struct EmbeddedFetchPlan {
 
 class EmbeddedVertexFetchAnalyzer {
 public:
+    static std::uint64_t UnusedUserSgprs(const RdnaProgram& program);
     [[nodiscard]] EmbeddedFetchPlan Analyze(const RdnaProgram& program, std::uint32_t attributeTableRegister, std::uint32_t bufferTableRegister, std::uint32_t userDataBaseRegister, std::uint32_t userDataCount, std::uint32_t waveSize) const;
 };
 
