@@ -3,10 +3,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
+#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include "Translation/EmbeddedVertexFetch.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <iostream>
 #include <memory>
@@ -87,6 +91,16 @@ alignas(256) constexpr std::array<std::uint32_t, 30> CarryCode{
     0xf80008cf, 0x11101010,
     0xbf810000,
 };
+
+alignas(256) constexpr std::array<std::uint32_t, 28> NoCarryCode = [] {
+    std::array<std::uint32_t, 28> code{};
+    code[0] = PostAddCode[0];
+    code[1] = PostAddCode[1];
+    code[2] = 0x4a0a0a10;
+    code[3] = 0x4a101011;
+    std::copy(PostAddCode.begin() + 6, PostAddCode.end(), code.begin() + 4);
+    return code;
+}();
 
 alignas(256) constexpr std::array<std::uint32_t, 30> ClampCode{
     0x7e020280, 0x7e040280,
@@ -236,7 +250,7 @@ public:
         return userData;
     }
 
-    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData) const {
+    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, bool expectOffsets = true) const {
         ShaderRecompiler::ShaderVertexStageInfo info{};
         info.resourcesNum = 2;
         info.resources[0].fields = {BufferTable[0], BufferTable[1], BufferTable[2], BufferTable[3]};
@@ -258,7 +272,7 @@ public:
         };
         request.useCache = false;
         auto result = ShaderRecompiler::Recompile(request);
-        Require(result.vertexOffsetSgpr == static_cast<std::int32_t>(BaseVertexSgpr) && result.instanceOffsetSgpr == static_cast<std::int32_t>(StartInstanceSgpr), "the fetch adds of s16 and s17 were not folded into the draw (vertex " + std::to_string(result.vertexOffsetSgpr) + ", instance " + std::to_string(result.instanceOffsetSgpr) + ")");
+        Require(result.vertexOffsetSgpr == (expectOffsets ? static_cast<std::int32_t>(BaseVertexSgpr) : -1) && result.instanceOffsetSgpr == (expectOffsets ? static_cast<std::int32_t>(StartInstanceSgpr) : -1), "the fetch adds of s16 and s17 did not follow the fold switch (vertex " + std::to_string(result.vertexOffsetSgpr) + ", instance " + std::to_string(result.instanceOffsetSgpr) + ")");
         return result;
     }
 
@@ -330,10 +344,11 @@ private:
     std::uint32_t* records = nullptr;
 };
 
-AgcDriver::DriverDetail::DrawProgram Program(const std::vector<std::uint32_t>& userData) {
+AgcDriver::DriverDetail::DrawProgram Program(const std::vector<std::uint32_t>& userData, std::span<const std::uint32_t> code = {}) {
     AgcDriver::DriverDetail::DrawProgram program{};
     program.firstUserSgpr = 8;
     program.userData = userData;
+    program.binary.code = code;
     return program;
 }
 
@@ -346,8 +361,8 @@ std::string PathName(const std::optional<Path>& path) {
     return path ? "the CPU path (" + std::string(AgcDriver::Graphics::IndirectDrawPathName(*path)) + ")" : std::string("the GPU");
 }
 
-std::string Classified(Fixture& fixture, const std::string& what, const ShaderRecompiler::RecompileResult& vertex, const std::vector<std::uint32_t>& userData, AgcDriver::Pm4::DrawParameters& draw, std::optional<Path> expectedPath, Rule expectedRule) {
-    const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(), Program(userData), fixture.device, draw, false);
+std::string Classified(Fixture& fixture, const std::string& what, const ShaderRecompiler::RecompileResult& vertex, const std::vector<std::uint32_t>& userData, AgcDriver::Pm4::DrawParameters& draw, std::optional<Path> expectedPath, Rule expectedRule, std::span<const std::uint32_t> code = {}) {
+    const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(), Program(userData, code), fixture.device, draw, false);
     const auto& indirect = *draw.indirect;
     const bool rules = expectedPath || (indirect.vertexRule == expectedRule && indirect.instanceRule == expectedRule);
     std::cout << what << ": classified to " << PathName(path) << '\n';
@@ -479,6 +494,50 @@ std::string Run(Fixture& fixture) {
     return failures;
 }
 
+std::string ExtendedFold(Fixture& fixture) {
+    const auto* setting = std::getenv("APS5_INDIRECT_SGPR_FOLD");
+    const bool enabled = setting != nullptr && std::strcmp(setting, "1") == 0;
+    auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(PostAddCode);
+    const auto unused = ShaderRecompiler::EmbeddedVertexFetchAnalyzer::UnusedUserSgprs(decoded);
+    Require((unused & (std::uint64_t{1} << 18)) != 0 && (unused & (std::uint64_t{1} << 13)) == 0, "unused-SGPR proof missed a descriptor-base pair");
+    decoded.instructions.front().op = ShaderRecompiler::RdnaOpcode::SMovrelsB32;
+    Require(ShaderRecompiler::EmbeddedVertexFetchAnalyzer::UnusedUserSgprs(decoded) == 0, "unused-SGPR proof accepted relative scalar addressing");
+    const std::array<std::uint32_t, Vertices> indices{Indices[0], Indices[1], Indices[2]};
+    const std::array<std::uint32_t, 5> record{Vertices, Instances, 0, 700, 59455};
+    std::copy(record.begin(), record.end(), fixture.Records());
+    auto stale = fixture.UserData(0x51u, 0x62u);
+    stale.resize(12);
+    AgcDriver::Pm4::DrawParameters packet{reinterpret_cast<std::uintptr_t>(Indices.data()), static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+    packet.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(fixture.Records()), 0x25u, 20u, 20u, 1u, false, 0u, 0x10u, 0x11u, NoLocation, false, 0u};
+    packet.indirect->baseVertexSgpr = BaseVertexSgpr;
+    packet.indirect->startInstanceSgpr = StartInstanceSgpr;
+    const auto vertex = fixture.Vertex(NoCarryCode, stale, enabled);
+    std::string failures;
+    if (fixture.device->DrawIndirectSupport().firstInstance) {
+        failures += Classified(fixture, "no-carry integer fetch adds", vertex, stale, packet, enabled ? std::nullopt : std::optional(Path::NotFolded), Rule::InPlace, NoCarryCode);
+        if (enabled) {
+            fixture.Place(record[3], indices, record[4]);
+            fixture.Draw(vertex, packet);
+            failures += fixture.Check("no-carry adds on the GPU", indices, record[3], record[4], false);
+        }
+        const auto patched = fixture.UserData(record[3], record[4]);
+        const auto cpuVertex = fixture.Vertex(NoCarryCode, patched, enabled);
+        fixture.Place(record[3], indices, record[4]);
+        fixture.Draw(cpuVertex, FoldedDraw(cpuVertex, patched, {reinterpret_cast<std::uintptr_t>(Indices.data()), Vertices, 2, Instances, 0, true, 0, 0}));
+        failures += fixture.Check("no-carry adds on the CPU", indices, record[3], record[4], false);
+        const auto staticVertex = fixture.Vertex(PostAddCode, stale);
+        packet.indirect->baseVertexSgpr = 18;
+        packet.indirect->startInstanceSgpr = 19;
+        failures += Classified(fixture, "packet patches unused SGPRs", staticVertex, stale, packet, enabled ? std::nullopt : std::optional(Path::NotFolded), Rule::Constant, PostAddCode);
+        if (enabled) {
+            fixture.Place(0x51u, indices, 0x62u);
+            fixture.Draw(staticVertex, packet);
+            failures += fixture.Check("unused patched SGPRs on the GPU", indices, 0x51u, 0x62u, false);
+        }
+    }
+    return failures;
+}
+
 }
 
 int main() {
@@ -486,7 +545,7 @@ int main() {
         std::shared_ptr<AgcDriver::VulkanDevice> device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Fixture fixture(device);
-        const auto failures = Run(fixture);
+        const auto failures = Run(fixture) + ExtendedFold(fixture);
         if (!failures.empty()) {
             std::cerr << "vertex and instance indices differ from the guest's:\n" << failures;
             return 1;
