@@ -1253,9 +1253,19 @@ void deferMirrorWrite(ImageMirror& mirror, std::uint64_t begin, std::uint64_t en
     for (std::size_t at = 0; at < changed.size(); ++at) if (changed[at] == 0) mirror.generations[at] = generation;
 }
 
-void prepareMirrorImport(std::uint64_t address, std::size_t bytes) {
-    if (!ResidentHeapMirrors() || exportingHeapMirrors) return;
+void prepareMirrorImport(std::uint64_t address, std::size_t bytes, bool storage = false) {
+    static thread_local bool preparing = false;
+    if ((!ResidentHeapMirrors() && !storage) || exportingHeapMirrors || preparing) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    struct Restore {
+        bool& preparing;
+        ~Restore() { preparing = false; }
+    } restore{preparing};
+    preparing = true;
+    if (storage && StorageTexture::FlushLeased(address, bytes)) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Sync();
+    }
+    if (!ResidentHeapMirrors()) return;
     bool mirrored = false;
     {
         auto& state = Mirrors();
@@ -1929,6 +1939,15 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
     bool synced = false;
     bool drained = false;
     bool retiredImport = false;
+    bool storedImages = false;
+    const auto publishImages = [&] {
+        if (!StorageTexture::FlushLeased(address, bytes)) return;
+        storedImages = true;
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) {
+            recorder->Sync();
+            synced = true;
+        }
+    };
     // A range pinned only by the cached address space is released by dropping the cache's
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
@@ -1955,6 +1974,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
             }
             if (recorder != nullptr) recorder->FlushDeferredReleases();
             FlushHeapMirrorWrites(address, bytes, true);
+            publishImages();
             const auto end = static_cast<std::uint64_t>(address) + bytes;
             auto& imports = Imports();
             if (releaseParkedImports(imports, address, end)) retiredImport = true;
@@ -2008,6 +2028,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
             }
             if (recorder != nullptr) recorder->FlushDeferredReleases();
             FlushHeapMirrorWrites(address, bytes, true);
+            publishImages();
 
             const auto end = static_cast<std::uint64_t>(address) + bytes;
             auto& imports = Imports();
@@ -2061,7 +2082,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
     if (synced) ++state.stats.contentionSyncs;
     if (drained) ++state.stats.contentionDrains;
     state.stats.contentionMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    return synced || retiredImport;
+    return synced || retiredImport || storedImages;
 }
 
 void ensurePinWaiter() {
@@ -2082,6 +2103,14 @@ bool SyncLeaseWork() {
 bool ResidentHeapMirrors() {
     static const bool enabled = [] { const auto* value = std::getenv("APS5_RESIDENT_HEAP_MIRRORS"); return value != nullptr && std::strcmp(value, "1") == 0; }();
     return enabled;
+}
+
+std::shared_ptr<const GuestAllocations::Range> LeaseRegisteredRange(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return {};
+    const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, false);
+    if (range == nullptr || !range->readable || !range->writable || address < range->address || address - range->address > range->bytes || bytes > range->bytes - (address - range->address)) return {};
+    ensurePinWaiter();
+    return range;
 }
 
 bool HeapMirrorExportInProgress() { return exportingHeapMirrors; }
@@ -2470,9 +2499,10 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     auto& state = Imports();
     std::unique_lock lock(state.mutex);
     const auto ready = [&](const HostImport* entry) {
-        if (entry == nullptr || !ResidentHeapMirrors()) return entry;
+        const bool storage = entry != nullptr && entry->serial == 0 && StorageTexture::ResidentResultsEnabled();
+        if (entry == nullptr || (!ResidentHeapMirrors() && !storage)) return entry;
         lock.unlock();
-        prepareMirrorImport(address, bytes);
+        prepareMirrorImport(address, bytes, storage);
         lock.lock();
         return findImport(state, address, address + bytes);
     };

@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+namespace GuestAllocations { struct Range; }
+
 namespace AgcDriver::Graphics {
 
 class ResidentColor;
@@ -145,6 +147,9 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
 // or it leaves the cache. Dispatches reusing the image meanwhile skip the round trip entirely.
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
 public:
+    static bool ResidentResultsEnabled();
+    static bool AnyPendingAtIdle();
+    static bool FlushLeased(std::uint64_t address, std::size_t bytes);
     static std::shared_ptr<StorageTexture> Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
     ~StorageTexture();
     StorageTexture(const StorageTexture&) = delete;
@@ -511,6 +516,8 @@ private:
     std::vector<std::uint64_t> layerGeneration;
     std::vector<bool> layerPending;
     bool blockUnits = false;
+    std::shared_ptr<const GuestAllocations::Range> pendingLease;
+    bool canRetainUnits() const;
     // Write-back hysteresis (block units, see writeBack): partial stores in the current window of
     // presents, its first present, and the present until which every pending unit is stored.
     std::uint32_t partialStores = 0;
