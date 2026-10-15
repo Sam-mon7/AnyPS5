@@ -211,6 +211,10 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         embeddedFetch = EmbeddedVertexFetchAnalyzer{}.Analyze(decoded, inputInfo.vertex->fetchAttribReg, inputInfo.vertex->fetchBufferReg, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), request.context.waveSize);
         translateOptions.embeddedFetch = &embeddedFetch;
     }
+    if (stageKind == ShaderStageKind::Vertex) {
+        EmbeddedVertexFetchAnalyzer::ExtendInstanceOffset(embeddedFetch, decoded, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()));
+        if (embeddedFetch.instanceOffsetAddPc.has_value()) translateOptions.embeddedFetch = &embeddedFetch;
+    }
     auto program = translator.Translate(decoded, cfg, translateOptions);
     // Debug aid: APS5_DUMP_IR=<hex code address> (or "all") prints the program after each front-end pass.
     const auto dumpIr = [&](const char* pass) {

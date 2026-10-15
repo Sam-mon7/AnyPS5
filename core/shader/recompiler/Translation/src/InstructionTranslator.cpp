@@ -177,7 +177,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
     };
     const auto drawIndex = [&entryIr, &options, &builtin](StageInputKind kind) -> IrValue& {
         const auto* fetch = options.embeddedFetch;
-        const std::int32_t folded = fetch == nullptr ? -1 : kind == StageInputKind::VertexIndex ? fetch->vertexOffsetSgpr : fetch->instanceOffsetSgpr;
+        const std::int32_t folded = fetch == nullptr ? -1 : kind == StageInputKind::VertexIndex ? fetch->vertexOffsetSgpr : fetch->instanceOffsetAddPc.has_value() ? -1 : fetch->instanceOffsetSgpr;
         IrValue& index = builtin(kind);
         return folded < 0 ? index : entryIr.ISub(index, entryIr.GetUserData(static_cast<ScalarReg>(folded)));
     };
@@ -531,6 +531,10 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
                 continue;
             }
             if (options.embeddedFetch != nullptr) {
+                if (options.embeddedFetch->instanceOffsetAddPc == instruction.programCounter) {
+                    context.TranslateInstanceOffset(instruction);
+                    continue;
+                }
                 const auto load = std::ranges::find(options.embeddedFetch->loads, instruction.programCounter, &EmbeddedFetchLoad::programCounter);
                 if (load != options.embeddedFetch->loads.end()) {
                     if (options.inputInfo.vertex == nullptr || instruction.destination.kind != RdnaOperandKind::VectorRegister || instruction.dataDwordCount != load->componentCount) throw std::runtime_error("prepared vertex fetch does not match its instruction");

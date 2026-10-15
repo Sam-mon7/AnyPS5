@@ -374,6 +374,104 @@ bool carryObserved(const RdnaProgram& program, std::size_t addIndex, std::uint32
     return false;
 }
 
+bool plainOperand(const RdnaOperand& operand) {
+    return operand.sdwaSel == 6u && !operand.explicitSdwaDst && operand.omod == 0u && !operand.sdwaSext && !operand.opSel && !operand.opSelHi && !operand.negate && !operand.negateHi && !operand.absolute && !operand.clamp && !operand.dpp && !operand.dpp8;
+}
+
+bool fullVectorWrite(const RdnaInstruction& inst) {
+    return plainOperand(inst.destination) && (inst.op == RdnaOpcode::VMovB32 || isFormattedBufferLoad(inst.op) || inst.op == RdnaOpcode::BufferLoadDword || inst.op == RdnaOpcode::BufferLoadDwordx2 || inst.op == RdnaOpcode::BufferLoadDwordx4);
+}
+
+bool instanceProofInstruction(const RdnaInstruction& inst) {
+    if (inst.op == RdnaOpcode::SEndpgm || inst.op == RdnaOpcode::SVersion) return true;
+    if (leavesStraightLine(inst)) return false;
+    if (inst.family == RdnaInstructionFamily::SMEM && !isScalarLoad(inst.op)) return false;
+    switch (inst.op) {
+    case RdnaOpcode::SSwappcB64:
+    case RdnaOpcode::SCallB64:
+    case RdnaOpcode::SMovrelsB32:
+    case RdnaOpcode::SMovrelsB64:
+    case RdnaOpcode::SMovrelsd2B32:
+    case RdnaOpcode::SMovreldB32:
+    case RdnaOpcode::SMovreldB64:
+    case RdnaOpcode::VMovrelsB32:
+    case RdnaOpcode::VMovreldB32:
+    case RdnaOpcode::VMovrelsdB32:
+    case RdnaOpcode::VMovrelsd2B32:
+    case RdnaOpcode::VSwaprelB32:
+    case RdnaOpcode::VReadlaneB32:
+    case RdnaOpcode::VReadfirstlaneB32:
+    case RdnaOpcode::VWritelaneB32:
+    case RdnaOpcode::VPermlane16B32:
+    case RdnaOpcode::VPermlanex16B32:
+    case RdnaOpcode::SSetregB32:
+    case RdnaOpcode::SSetregImm32B32:
+        return false;
+    default:
+        break;
+    }
+    const std::array<const RdnaOperand*, 5> operands{&inst.destination, &inst.source0, &inst.source1, &inst.source2, &inst.source3};
+    if (std::any_of(operands.begin(), operands.end(), [](const RdnaOperand* operand) { return operand->dpp || operand->dpp8; })) return false;
+    switch (inst.family) {
+    case RdnaInstructionFamily::SOP1:
+    case RdnaInstructionFamily::SOP2:
+    case RdnaInstructionFamily::SOPK:
+    case RdnaInstructionFamily::SOPC:
+    case RdnaInstructionFamily::SOPP:
+    case RdnaInstructionFamily::SMEM:
+    case RdnaInstructionFamily::VOP1:
+    case RdnaInstructionFamily::VOP2:
+    case RdnaInstructionFamily::VOP3:
+    case RdnaInstructionFamily::VOP3P:
+    case RdnaInstructionFamily::VOPC:
+    case RdnaInstructionFamily::MUBUF:
+    case RdnaInstructionFamily::MTBUF:
+    case RdnaInstructionFamily::EXP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool operandCovers(const RdnaOperand& operand, RdnaOperandKind kind, std::uint32_t reg, std::uint32_t width) {
+    return operand.kind == kind && reg >= operand.reg && reg - operand.reg < width;
+}
+
+bool instanceInputRead(const RdnaInstruction& inst, std::uint32_t sgpr, bool scalarLive, bool vectorLive) {
+    const std::array<const RdnaOperand*, 4> sources{&inst.source0, &inst.source1, &inst.source2, &inst.source3};
+    for (std::uint32_t i = 0; i < sources.size(); ++i) {
+        const auto scalarWidth = isScalarLoad(inst.op) && i == 0u ? 2u : scalarOperandWidth(inst, i);
+        if (scalarLive && operandCovers(*sources[i], RdnaOperandKind::ScalarRegister, sgpr, scalarWidth)) return true;
+        std::uint32_t vectorWidth = inst.op == RdnaOpcode::VMovB32 || inst.family == RdnaInstructionFamily::VOP2 || inst.family == RdnaInstructionFamily::EXP ? (inst.is64Bit ? 2u : 1u) : 4u;
+        if (inst.family == RdnaInstructionFamily::MUBUF || inst.family == RdnaInstructionFamily::MTBUF) vectorWidth = inst.idxen && inst.offen ? 2u : 1u;
+        if (vectorLive && operandCovers(*sources[i], RdnaOperandKind::VectorRegister, kInstanceIndexVgpr, vectorWidth)) return true;
+    }
+    return vectorLive && !fullVectorWrite(inst) && operandCovers(inst.destination, RdnaOperandKind::VectorRegister, kInstanceIndexVgpr, std::max(embeddedFetchDstSize(inst), 4u));
+}
+
+bool scalarWriteCovers(const RdnaInstruction& inst, std::uint32_t sgpr) {
+    return operandCovers(inst.destination, RdnaOperandKind::ScalarRegister, sgpr, std::max(decodedDstSize(inst), inst.is64Bit ? 2u : 1u)) || operandCovers(inst.destination2, RdnaOperandKind::ScalarRegister, sgpr, 2u);
+}
+
+bool instanceInputsExclusive(const RdnaProgram& program, std::size_t addIndex, std::uint32_t sgpr) {
+    bool scalarLive = true;
+    bool vectorLive = true;
+    for (std::size_t i = 0; i < program.instructions.size(); ++i) {
+        const auto& inst = program.instructions[i];
+        if (!instanceProofInstruction(inst)) return false;
+        if (inst.op == RdnaOpcode::SEndpgm) return i > addIndex;
+        if (i == addIndex) continue;
+        if (i > addIndex && writesExec(inst)) return false;
+        if (instanceInputRead(inst, sgpr, scalarLive, vectorLive)) return false;
+        const bool scalarWrite = scalarWriteCovers(inst, sgpr);
+        const bool vectorWrite = operandCovers(inst.destination, RdnaOperandKind::VectorRegister, kInstanceIndexVgpr, std::max(embeddedFetchDstSize(inst), inst.is64Bit ? 2u : 1u));
+        if (i < addIndex && (scalarWrite || vectorWrite)) return false;
+        if (scalarWrite && (inst.op == RdnaOpcode::SMovB32 || inst.op == RdnaOpcode::SMovB64 || isScalarLoad(inst.op))) scalarLive = false;
+        if (vectorWrite && fullVectorWrite(inst)) vectorLive = false;
+    }
+    return false;
+}
+
 }
 
 std::uint64_t EmbeddedVertexFetchAnalyzer::UnusedUserSgprs(const RdnaProgram& program) {
@@ -387,6 +485,23 @@ std::uint64_t EmbeddedVertexFetchAnalyzer::UnusedUserSgprs(const RdnaProgram& pr
         }
     }
     return unused;
+}
+
+void EmbeddedVertexFetchAnalyzer::ExtendInstanceOffset(EmbeddedFetchPlan& plan, const RdnaProgram& program, std::uint32_t userDataBaseRegister, std::uint32_t userDataCount) {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_INDIRECT_SGPR_FOLD"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    if (!enabled || userDataBaseRegister != 8u || plan.instanceOffsetSgpr != -1 || plan.instanceOffsetConflict) return;
+    for (std::size_t i = 0; i < program.instructions.size(); ++i) {
+        const auto& inst = program.instructions[i];
+        if (inst.op != RdnaOpcode::VAddNcU32 || inst.is64Bit || inst.clampResult || !isVectorOperand(inst.destination) || inst.destination.reg == kInstanceIndexVgpr || !isVectorOperand(inst.source1) || inst.source1.reg != kInstanceIndexVgpr || inst.source0.kind != RdnaOperandKind::ScalarRegister) continue;
+        if (!plainOperand(inst.destination) || !plainOperand(inst.source0) || !plainOperand(inst.source1) || (inst.destination2.kind != RdnaOperandKind::Unknown && inst.destination2.kind != RdnaOperandKind::None && inst.destination2.kind != RdnaOperandKind::Null)) continue;
+        const auto sgpr = inst.source0.reg;
+        if (sgpr < userDataBaseRegister || sgpr - userDataBaseRegister >= userDataCount || !instanceInputsExclusive(program, i, sgpr)) continue;
+        plan.instanceOffsetSgpr = static_cast<std::int32_t>(sgpr);
+        plan.instanceOffsetShared = false;
+        plan.instanceIndexObserved = false;
+        plan.instanceOffsetAddPc = inst.programCounter;
+        return;
+    }
 }
 
 EmbeddedFetchPlan EmbeddedVertexFetchAnalyzer::Analyze(const RdnaProgram& program, std::uint32_t attributeTableRegister, std::uint32_t bufferTableRegister, std::uint32_t userDataBaseRegister, std::uint32_t userDataCount, std::uint32_t waveSize) const {
