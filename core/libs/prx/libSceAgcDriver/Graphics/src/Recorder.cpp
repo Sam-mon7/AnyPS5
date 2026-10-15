@@ -3202,6 +3202,14 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 }
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
+    if (StorageTexture::ResidentResultsEnabled() && !InsideCompletionAction() && StorageTexture::FlushPending(address, bytes.size(), nullptr, "label", PublishScope::PartialUnits)) {
+        if (Idle()) {
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(address), bytes.size(), 4, true);
+            GuestMemory::StoreOwnBytes(address, bytes);
+            return;
+        }
+        storedOnGpu = false;
+    }
     Require(open != nullptr || !inFlight.empty(), "no batch to append a completion label to");
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     std::vector<std::byte> copy(bytes.begin(), bytes.end());

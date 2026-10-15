@@ -537,7 +537,11 @@ bool WaitSatisfied(std::span<const std::uint32_t> packet) {
 }
 
 bool WaitSatisfiedUnchecked(std::span<const std::uint32_t> packet) {
-    static const bool resident = [] { const auto* value = std::getenv("APS5_RESIDENT_HEAP_MIRRORS"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    static const bool resident = [] {
+        const auto* heap = std::getenv("APS5_RESIDENT_HEAP_MIRRORS");
+        const auto* images = std::getenv("APS5_RESIDENT_STORAGE_IMAGES");
+        return (heap != nullptr && std::strcmp(heap, "1") == 0) || (images != nullptr && std::strcmp(images, "1") == 0);
+    }();
     if (resident) return WaitSatisfied(packet);
     const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
     const auto source = address(packet[2], packet[3]);

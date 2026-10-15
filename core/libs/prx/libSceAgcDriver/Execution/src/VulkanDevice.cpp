@@ -1894,7 +1894,7 @@ bool OpportunisticReap() {
 }
 
 void VulkanDevice::StoreIdleResults(bool reapFirst) {
-    if (!Graphics::StorageTexture::AnyPending()) return;
+    if (!Graphics::StorageTexture::AnyPendingAtIdle()) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     Graphics::StorageTexture::FlushAllPending("idle");
@@ -1962,6 +1962,7 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
+    if (Graphics::StorageTexture::ResidentResultsEnabled() && Graphics::PendingStorageOverlaps(address, bytes.size())) return 3;
     auto& recorder = *state->recorder;
     // Batches that already finished are retired before the checks: their completions ran, so they
     // neither keep the recorder busy nor force this label behind a completion. Only for the

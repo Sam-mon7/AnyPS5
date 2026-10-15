@@ -1557,6 +1557,20 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+bool StorageTexture::ResidentResultsEnabled() {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_RESIDENT_STORAGE_IMAGES"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    return enabled;
+}
+
+bool StorageTexture::canRetainUnits() const {
+    if (!ResidentResultsEnabled() || !blockUnits || !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return false;
+    if (pendingLease != nullptr) return true;
+    const auto lease = LeaseRegisteredRange(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (lease == nullptr) return false;
+    const auto committed = GuestMemory::CommittedRanges(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), true);
+    return committed.size() == 1 && committed.front().first == descriptor.baseAddress && committed.front().second == descriptor.baseAddress + guestBytes;
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1585,7 +1599,7 @@ bool StorageTexture::Refresh() {
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = pendingAlias();
-    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
+    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && (HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr || canRetainUnits()))) alias = nullptr;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
         if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
@@ -1693,7 +1707,7 @@ bool StorageTexture::Refresh() {
         }
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
-        direct = keys == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
+        direct = keys == DccKeys::Uncompressed && (HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr || canRetainUnits());
         if (alias != nullptr && direct) {
             // The alias's pending units that nothing stamped since its generation (a CPU store or a
             // driver store there wins over its results, as at its own write-back) are taken from
@@ -2181,6 +2195,25 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         ++Profile().storageDirectUploads;
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
+        return;
+    }
+    if (layers != nullptr && uploadedKeys == DccKeys::Uncompressed && canRetainUnits()) {
+        captureGuestBytes(layers);
+        stampLayers(true);
+        auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, Buffer::Access::UploadOnly);
+        const auto runs = unitRuns(*layers);
+        for (const auto& [begin, end] : runs) {
+            std::memcpy(staging->WriteBytes().data() + begin, original.data() + begin, static_cast<std::size_t>(end - begin));
+        }
+        const HostImport uploadSource{descriptor.baseAddress, guestBytes, staging->Handle(), VK_NULL_HANDLE, 0};
+        if (auto* recorder = Recorder::Active()) recorder->Keep(staging, staging->Size());
+        const auto bytes = uploadWindows(uploadSource, runs, false);
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) if ((*layers)[unit]) forgetBorrowed(unit, 1);
+        countStorageUpload(2, bytes);
+        partialUploads.fetch_add(1, std::memory_order_relaxed);
+        partialUploadBytes.fetch_add(bytes, std::memory_order_relaxed);
+        ++version;
+        if (profile) LookupOutcomes::Add(LookupOutcomes::UploadCpu, start);
         return;
     }
     layerOriginal.assign(trackedLayers, true);
@@ -2847,6 +2880,15 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (!eager && canRetainUnits() && pendingLease == nullptr) {
+        auto lease = LeaseRegisteredRange(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+        {
+            auto& pending = Pending();
+            std::lock_guard lock(pending.mutex);
+            pendingLease = std::move(lease);
+        }
+        static_cast<void>(HostImportSerial(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), false));
+    }
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
@@ -2893,6 +2935,7 @@ void StorageTexture::reconcilePending() {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     const bool any = anyLayerPending();
+    if (!any) pendingLease.reset();
     if (any == dirty) return;
     dirty = any;
     if (any) pending.textures.push_back(this);
@@ -2946,6 +2989,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         const auto* exempt = refreshing;
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
+            if (ResidentResultsEnabled() && std::strcmp(reason, "idle") == 0 && texture->pendingLease != nullptr) { ++it; continue; }
             if (texture != except && texture != exempt && texture->overlaps(address, bytes)) {
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
@@ -3063,7 +3107,36 @@ void StorageTexture::FlushDumpSelected(const char* reason) {
 }
 
 void StorageTexture::FlushAllPending(const char* reason) {
-    static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason));
+    const auto scope = ResidentResultsEnabled() && std::strcmp(reason, "idle") == 0 ? PublishScope::None : PublishScope::Whole;
+    static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason, scope));
+}
+
+bool StorageTexture::AnyPendingAtIdle() {
+    if (!ResidentResultsEnabled()) return AnyPending();
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    return std::any_of(pending.textures.begin(), pending.textures.end(), [](const auto* texture) { return texture->pendingLease == nullptr; });
+}
+
+bool StorageTexture::FlushLeased(std::uint64_t address, std::size_t bytes) {
+    if (!ResidentResultsEnabled()) return false;
+    const auto end = address + std::min<std::uint64_t>(bytes, std::numeric_limits<std::uint64_t>::max() - address);
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        for (const auto* texture : pending.textures) {
+            const auto& lease = texture->pendingLease;
+            if (lease != nullptr && lease->address < end && address < lease->address + lease->bytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
+        }
+    }
+    struct Restore {
+        const StorageTexture* previous;
+        ~Restore() { refreshing = previous; }
+    } restore{std::exchange(refreshing, nullptr)};
+    bool stored = false;
+    for (const auto& [begin, length] : ranges) stored |= FlushPending(begin, length, nullptr, "resident publication");
+    return stored;
 }
 
 bool StorageTexture::AnyPending() {
