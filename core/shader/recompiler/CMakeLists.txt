@@ -241,6 +241,14 @@ function(add_shader_recompiler target runtimeTarget)
             PrepareShader
             GetPreparedCode
             PreparedShaderInvocation::TryCreate
+            PreparedShaderBudgetEnabled
+            CachePreparedObject
+            MaintainPreparedShaderCache
+            TouchPreparedShader
+            NotePreparedShaderReprepare
+            AdjustPreparedObjectMemory
+            ClearPreparedObjects
+            EmbeddedVertexFetchAnalyzer::UnusedUserSgprs
             MatchesPreparedShader
             GetPreparedArtifact
             MaterializeShader
