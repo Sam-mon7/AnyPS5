@@ -1350,6 +1350,9 @@ endforeach()
 target_include_directories(agc_driver_draw_offset_indices_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler/RdnaDecoder/include
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler/Translation/include)
+target_include_directories(agc_driver_indirect_instance_offset_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/RdnaDecoder/include
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/Translation/include)
 foreach(agcExecutionTestName IN LISTS ANYPS5_AGC_EXECUTION_TESTS)
     if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/execution/${agcExecutionTestName}.cpp)
         message(FATAL_ERROR "ANYPS5_AGC_EXECUTION_TESTS names ${agcExecutionTestName}, which has no source in tests/execution")
@@ -2339,4 +2342,13 @@ if(BUILD_TESTING)
     endforeach()
     set_property(TEST agc_driver_indirect_sgpr_fold_off APPEND PROPERTY ENVIRONMENT "APS5_INDIRECT_SGPR_FOLD=0")
     set_property(TEST agc_driver_indirect_sgpr_fold_on APPEND PROPERTY ENVIRONMENT "APS5_INDIRECT_SGPR_FOLD=1")
+    foreach(instanceOffsetMode IN ITEMS off on)
+        add_test(NAME agc_driver_indirect_instance_offset_${instanceOffsetMode} COMMAND agc_driver_indirect_instance_offset_tests)
+        set_tests_properties(agc_driver_indirect_instance_offset_${instanceOffsetMode} PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_property(TEST agc_driver_indirect_instance_offset_${instanceOffsetMode} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_property(TEST agc_driver_indirect_instance_offset_off APPEND PROPERTY ENVIRONMENT "APS5_INDIRECT_SGPR_FOLD=0")
+    set_property(TEST agc_driver_indirect_instance_offset_on APPEND PROPERTY ENVIRONMENT "APS5_INDIRECT_SGPR_FOLD=1")
 endif()
