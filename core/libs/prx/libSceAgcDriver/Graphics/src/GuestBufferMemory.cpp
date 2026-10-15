@@ -1202,6 +1202,13 @@ std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t addre
     return buffer;
 }
 
+std::atomic<std::uint64_t> bufferWriteBackBytes{0};
+
+void countBufferWriteBack(std::size_t bytes) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) bufferWriteBackBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
 std::atomic<bool> pendingHeapMirrors{false};
 thread_local bool exportingHeapMirrors = false;
 
@@ -1214,6 +1221,7 @@ void storeMirrorWrite(ImageMirror& mirror, std::uint64_t begin, std::uint64_t en
     const std::vector<std::byte> published = RebarMirrors() ? std::vector<std::byte>(source.begin(), source.end()) : std::vector<std::byte>{};
     const auto current = RebarMirrors() ? std::span<const std::byte>(published) : std::span<const std::byte>(source);
     Recorder::NoteWrittenBack(begin, length);
+    countBufferWriteBack(length);
     storeChanged(begin, current, std::span<const std::byte>(mirror.shadow).subspan(offset, length));
     std::memcpy(mirror.shadow.data() + offset, current.data(), length);
     const auto generation = GuestMemory::TrackerGeneration();
@@ -1846,7 +1854,12 @@ void reportMirrors() {
     auto& state = Mirrors();
     const auto now = std::chrono::steady_clock::now();
     if (now - state.lastReport < std::chrono::seconds(10)) return;
+    const auto interval = std::chrono::duration<double>(now - state.lastReport).count();
     state.lastReport = now;
+    static std::uint64_t seenWriteBackBytes = 0;
+    const auto writtenBack = bufferWriteBackBytes.load(std::memory_order_relaxed);
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] CPU write-back spans %.1f MiB/10s (%.1f MiB in %.2f s)\n", (writtenBack - seenWriteBackBytes) / 1048576.0 * 10.0 / interval, (writtenBack - seenWriteBackBytes) / 1048576.0, interval);
+    seenWriteBackBytes = writtenBack;
     std::size_t count = 0;
     std::size_t writable = 0;
     std::size_t heaps = 0;
@@ -4227,6 +4240,7 @@ void GuestBufferMemory::WriteBack() {
                 continue;
             }
             const auto current = mirror.buffer->Bytes().subspan(offset, length);
+            countBufferWriteBack(length);
             if (mirror.heap) {
                 const auto reference = std::find_if(heapReferences.begin(), heapReferences.end(), [&](const auto& entry) { return entry.first == begin; });
                 Require(reference != heapReferences.end() && reference->second.size() == length, "heap mirror write-back has no reference");
@@ -4238,6 +4252,7 @@ void GuestBufferMemory::WriteBack() {
             std::memcpy(mirror.shadow.data() + offset, current.data(), length);
             continue;
         }
+        if (!(region.gpuCopy && (region.copiedBack || region.deviceLocal))) countBufferWriteBack(static_cast<std::size_t>(end - begin));
         if (region.gpuCopy) {
             Require(region.buffer != nullptr && end <= region.end, "write-back range exceeds its GPU owner");
             if (region.copiedBack) {
