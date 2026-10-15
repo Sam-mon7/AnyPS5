@@ -64,6 +64,8 @@
 #include <thread>
 #include <vector>
 
+void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, bool sparse);
+
 namespace {
 
 extern "C" {
@@ -7465,6 +7467,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-pending-write-snapshot") {
             pendingWriteSnapshotBenchmark(recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--resident-heap-only") {
+            RunResidentHeapMirrorTests(device.GetContext(), recorder, false);
+            RunResidentHeapMirrorTests(device.GetContext(), recorder, true);
             return 0;
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--storage-upload-lifetime-only" || std::string_view(argv[1]) == "--storage-upload-failure-only")) {
