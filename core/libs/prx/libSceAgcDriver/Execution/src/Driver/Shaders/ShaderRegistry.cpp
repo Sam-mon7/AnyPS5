@@ -32,6 +32,60 @@
 
 namespace AgcDriver::DriverDetail {
 
+std::shared_ptr<const ShaderRecompiler::SourceHandle> PreparedShaderState::Entry::Pin() const {
+    return handle != nullptr ? handle : cached.lock();
+}
+
+void PreparedShaderState::Entry::CacheOnly() {
+    if (ShaderRecompiler::PreparedShaderBudgetEnabled() && handle != nullptr) {
+        cached = handle;
+        handle.reset();
+    }
+}
+
+std::shared_ptr<const ShaderRecompiler::RectListShaders> PreparedShaderState::Rectangle::Pin() const {
+    return shaders != nullptr ? shaders : cached.lock();
+}
+
+void PreparedShaderState::Rectangle::CacheOnly() {
+    if (!ShaderRecompiler::PreparedShaderBudgetEnabled() || shaders == nullptr) return;
+    cached = shaders;
+    const auto weak = cached;
+    ShaderRecompiler::CachePreparedObject(shaders, ShaderRecompiler::PreparedObjectKind::Host, [weak] {
+        const auto shaders = weak.lock();
+        return shaders == nullptr ? 0 : sizeof(ShaderRecompiler::RectListShaders) + shaders->control.spirv.MemoryBytes() + shaders->evaluation.spirv.MemoryBytes();
+    });
+    shaders.reset();
+}
+
+namespace {
+
+void PinPreparedEntries(PreparedShaderState& prepared) {
+    if (!ShaderRecompiler::PreparedShaderBudgetEnabled()) return;
+    bool expired = false;
+    for (auto& entry : prepared.entries) {
+        entry.handle = entry.Pin();
+        expired |= entry.handle == nullptr;
+    }
+    if (expired) {
+        std::erase_if(prepared.entries, [](const auto& entry) { return entry.handle == nullptr; });
+        prepared.registeredAbis.clear();
+        prepared.graphicsAbis.clear();
+        prepared.deferred = true;
+        prepared.rectangleProgress.clear();
+    }
+    for (auto& rectangle : prepared.rectangles) rectangle.shaders = rectangle.Pin();
+    if (std::erase_if(prepared.rectangles, [](const auto& rectangle) { return rectangle.shaders == nullptr; }) != 0) prepared.rectangleProgress.clear();
+}
+
+void CachePreparedEntries(PreparedShaderState& prepared) {
+    if (!ShaderRecompiler::PreparedShaderBudgetEnabled()) return;
+    for (auto& entry : prepared.entries) entry.CacheOnly();
+    for (auto& rectangle : prepared.rectangles) rectangle.CacheOnly();
+}
+
+}
+
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
     std::exception_ptr failure;
     std::string dump;
@@ -150,6 +204,7 @@ void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std:
 bool CommittedAbi(const ShaderSnapshot& snapshot, std::span<const std::uint64_t> key) {
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
+    if (std::ranges::any_of(snapshot.prepared->entries, [](const auto& entry) { return entry.Pin() == nullptr; })) return false;
     return std::ranges::any_of(snapshot.prepared->registeredAbis, [&](const auto& abi) { return std::ranges::equal(abi, key); });
 }
 
@@ -235,7 +290,11 @@ ShaderPreparationTransaction::ShaderPreparationTransaction() {
 
 ShaderPreparationTransaction::~ShaderPreparationTransaction() {
     if (!committed) root->failed = true;
-    if (state != nullptr) State::active = nullptr;
+    if (state != nullptr) {
+        State::active = nullptr;
+        state.reset();
+        try { static_cast<void>(ShaderRecompiler::MaintainPreparedShaderCache()); } catch (...) {}
+    }
 }
 
 PreparedShaderState& ShaderPreparationTransaction::Edit(const ShaderSnapshot& snapshot) {
@@ -249,7 +308,9 @@ PreparedShaderState& ShaderPreparationTransaction::Edit(const ShaderSnapshot& sn
     }
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
-    return changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared, true, snapshot.prepared->entries.size(), snapshot.prepared->registeredAbis.size()}).first->second.prepared;
+    auto& prepared = changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared, true, snapshot.prepared->entries.size(), snapshot.prepared->registeredAbis.size()}).first->second.prepared;
+    PinPreparedEntries(prepared);
+    return prepared;
 }
 
 const PreparedShaderState& ShaderPreparationTransaction::Read(const ShaderSnapshot& snapshot) const {
@@ -260,7 +321,9 @@ const PreparedShaderState& ShaderPreparationTransaction::Read(const ShaderSnapsh
     if (found != changes.end()) return found->second.prepared;
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
-    return changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared, false, snapshot.prepared->entries.size(), snapshot.prepared->registeredAbis.size()}).first->second.prepared;
+    auto& prepared = changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared, false, snapshot.prepared->entries.size(), snapshot.prepared->registeredAbis.size()}).first->second.prepared;
+    PinPreparedEntries(prepared);
+    return prepared;
 }
 
 void ShaderPreparationTransaction::Hold() {
@@ -279,7 +342,7 @@ void ShaderPreparationTransaction::Commit() {
             auto& destination = *change.destination;
             for (auto index = std::min(change.baseEntries, destination.entries.size()); index < destination.entries.size(); ++index) {
                 const auto& entry = destination.entries[index];
-                if (std::ranges::none_of(change.prepared.entries, [&](const auto& existing) { return existing.codeOffset == entry.codeOffset && existing.handle == entry.handle; })) change.prepared.entries.push_back(entry);
+                if (std::ranges::none_of(change.prepared.entries, [&](const auto& existing) { return existing.codeOffset == entry.codeOffset && existing.Pin() == entry.Pin(); })) change.prepared.entries.push_back(entry);
             }
             for (auto index = std::min(change.baseAbis, destination.registeredAbis.size()); index < destination.registeredAbis.size(); ++index) {
                 const auto& abi = destination.registeredAbis[index];
@@ -292,6 +355,7 @@ void ShaderPreparationTransaction::Commit() {
             destination.rectangleProgress.swap(change.prepared.rectangleProgress);
             destination.fragments.swap(change.prepared.fragments);
             std::swap(destination.rectangleRequested, change.prepared.rectangleRequested);
+            CachePreparedEntries(destination);
         }
     }
     committed = true;
@@ -369,6 +433,10 @@ std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& re
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot) {
     ShaderPreparationTransaction transaction;
     transaction.Hold();
+    {
+        std::lock_guard lock(snapshot->prepared->mutex);
+        CachePreparedEntries(*snapshot->prepared);
+    }
     auto published = snapshot;
     if (registry != nullptr) {
         const auto found = registry->find(snapshot->codeAddress);
@@ -405,7 +473,7 @@ void ReportPreparedAtUse(const ShaderSnapshot& snapshot, const ShaderRecompiler:
         return;
     }
     if (!snapshot.header.empty()) {
-        if (!snapshot.prepared->deferred) APS5_LOG_ERR("Shader 0x%llx stage %u has no artifact prepared at registration for the state of this draw or dispatch; preparing it at use", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<std::uint32_t>(request.shader.stage));
+        if (!snapshot.prepared->deferred && !ShaderRecompiler::PreparedShaderBudgetEnabled()) APS5_LOG_ERR("Shader 0x%llx stage %u has no artifact prepared at registration for the state of this draw or dispatch; preparing it at use", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<std::uint32_t>(request.shader.stage));
         return;
     }
     if (request.shader.stage == ShaderRecompiler::ShaderStage::Compute) {
@@ -426,12 +494,25 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     ShaderRecompiler::BuildPreparedShaderKey(request, key);
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
+    bool expired = false;
     for (const auto& entry : snapshot.prepared->entries) {
-        if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
+        const auto handle = entry.Pin();
+        expired |= handle == nullptr && entry.codeOffset == codeOffset;
+        if (handle != nullptr && entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *handle, key)) {
+            ShaderRecompiler::TouchPreparedShader(handle);
+            lock.unlock();
+            static_cast<void>(ShaderRecompiler::MaintainPreparedShaderCache());
+            return handle;
+        }
     }
     ReportPreparedAtUse(snapshot, request);
     auto handle = PrepareShaderWithDiagnostics(request);
+    if (expired) ShaderRecompiler::NotePreparedShaderReprepare();
+    std::erase_if(snapshot.prepared->entries, [](const auto& entry) { return entry.Pin() == nullptr; });
     snapshot.prepared->entries.push_back({codeOffset, handle});
+    snapshot.prepared->entries.back().CacheOnly();
+    lock.unlock();
+    static_cast<void>(ShaderRecompiler::MaintainPreparedShaderCache());
     return handle;
 }
 
@@ -439,8 +520,7 @@ ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapsh
     std::lock_guard lock(snapshot.prepared->mutex);
     for (const auto& entry : snapshot.prepared->rectangles) {
         if (entry.vertexId == vertexId && entry.fragmentId == fragmentId) {
-            require(entry.shaders != nullptr, "prepared rectangle artifact is missing");
-            return *entry.shaders;
+            if (const auto shaders = entry.Pin()) return *shaders;
         }
     }
     throw std::runtime_error("AGC driver: prepared rectangle artifacts are missing");
@@ -449,12 +529,35 @@ ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapsh
 ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint64_t vertexId, std::uint64_t fragmentId, const ShaderRecompiler::SpirvTarget& target) {
     const auto prepared = [&] {
         std::lock_guard lock(front.prepared->mutex);
-        return std::ranges::any_of(front.prepared->rectangles, [&](const auto& entry) { return entry.vertexId == vertexId && entry.fragmentId == fragmentId; });
+        return std::ranges::any_of(front.prepared->rectangles, [&](const auto& entry) { return entry.vertexId == vertexId && entry.fragmentId == fragmentId && entry.Pin() != nullptr; });
     };
     if (prepared()) return PreparedRectangle(front, vertexId, fragmentId);
     APS5_LOG_ERR("Rect-list draw of shader 0x%llx has no rectangle for fragment shader 0x%llx; preparing it at draw", static_cast<unsigned long long>(front.codeAddress), static_cast<unsigned long long>(fragment->codeAddress));
     ResolvePreparedGraphics(front, fragment, 17, target);
     return PreparedRectangle(front, vertexId, fragmentId);
+}
+
+ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& pixel, const ShaderRecompiler::SpirvTarget& target) {
+    if (!ShaderRecompiler::PreparedShaderBudgetEnabled()) return DrawRectangle(front, fragment, vertex.variantId, pixel.variantId, target);
+    {
+        std::lock_guard lock(front.prepared->mutex);
+        for (const auto& rectangle : front.prepared->rectangles) {
+            if (rectangle.vertexId != vertex.variantId || rectangle.fragmentId != pixel.variantId) continue;
+            if (const auto shaders = rectangle.Pin()) {
+                ShaderRecompiler::CachePreparedObject(shaders, ShaderRecompiler::PreparedObjectKind::Host, [] { return 0; });
+                return *shaders;
+            }
+        }
+    }
+    auto shaders = std::make_shared<const ShaderRecompiler::RectListShaders>(ShaderRecompiler::BuildRectListShaders(vertex, pixel, target));
+    {
+        std::lock_guard lock(front.prepared->mutex);
+        std::erase_if(front.prepared->rectangles, [](const auto& rectangle) { return rectangle.Pin() == nullptr; });
+        front.prepared->rectangles.push_back({vertex.variantId, pixel.variantId, shaders});
+        front.prepared->rectangles.back().CacheOnly();
+    }
+    static_cast<void>(ShaderRecompiler::MaintainPreparedShaderCache());
+    return *shaders;
 }
 
 namespace {
@@ -522,19 +625,31 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     ShaderRecompiler::BuildPreparedShaderKey(source, key);
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
+    bool expired = false;
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
-        invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
+        const auto handle = entry.Pin();
+        if (handle == nullptr) { expired = true; continue; }
+        invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
         if (!linked.empty() && !std::ranges::equal(invocationRequest.shader.code, linked)) continue;
-        if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
+        if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key)) {
+            lock.unlock();
+            static_cast<void>(ShaderRecompiler::MaintainPreparedShaderCache());
+            return std::move(*invocation);
+        }
     }
     ReportPreparedAtUse(snapshot, source);
     auto handle = PrepareShaderWithDiagnostics(source);
+    if (expired) ShaderRecompiler::NotePreparedShaderReprepare();
     invocationRequest = source;
     invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
     auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
     if (!invocation.has_value()) throw std::runtime_error("AGC driver: an artifact prepared at use does not match its invocation");
+    std::erase_if(snapshot.prepared->entries, [](const auto& entry) { return entry.Pin() == nullptr; });
     snapshot.prepared->entries.push_back({codeOffset, std::move(handle)});
+    snapshot.prepared->entries.back().CacheOnly();
+    lock.unlock();
+    static_cast<void>(ShaderRecompiler::MaintainPreparedShaderCache());
     return std::move(*invocation);
 }
 std::optional<ShaderRecompiler::ShaderFloatMode> RegisteredFloatMode(const ShaderSnapshot& snapshot) {
@@ -910,6 +1025,7 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
         {
             std::lock_guard lock(prepared.mutex);
             prepared.entries.insert(prepared.entries.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
+            CachePreparedEntries(prepared);
             if (failure == nullptr && !plan->abiKey.empty()) prepared.registeredAbis.push_back(std::move(plan->abiKey));
             prepared.failure = failure;
             prepared.pending = false;
@@ -1050,6 +1166,10 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     const auto primitiveType = state.userConfig.find(0x242u);
     for (const auto& abi : transaction.Read(*owner).graphicsAbis) {
         if (abi.key != key || abi.registry.lock() != registry) continue;
+        if (ShaderRecompiler::PreparedShaderBudgetEnabled() && std::ranges::any_of(abi.stages, [&](const auto& stage) {
+            const auto snapshot = stage.lock();
+            return snapshot == nullptr || std::ranges::any_of(transaction.Read(*snapshot).entries, [](const auto& entry) { return entry.Pin() == nullptr; }) || transaction.Read(*snapshot).entries.empty();
+        })) continue;
         for (const auto& stage : abi.stages) {
             const auto snapshot = stage.lock();
             require(snapshot != nullptr, "prepared graphics ABI lost a registered stage");

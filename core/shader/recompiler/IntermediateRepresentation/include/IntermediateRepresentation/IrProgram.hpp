@@ -33,6 +33,12 @@ public:
     std::size_t ReclaimUnusedValues();
     [[nodiscard]] std::vector<IrBlock*>& BlockOrder();
     [[nodiscard]] const std::vector<IrBlock*>& BlockOrder() const;
+    [[nodiscard]] std::size_t MemoryBytes() const {
+        std::size_t bytes = sizeof(*this) + blocks.capacity() * sizeof(std::unique_ptr<IrBlock>) + blockOrder.capacity() * sizeof(IrBlock*) + values.capacity() * sizeof(std::unique_ptr<IrValue>);
+        for (const auto& block : blocks) bytes += block->MemoryBytes();
+        for (const auto& value : values) bytes += value->MemoryBytes();
+        return bytes;
+    }
 
 private:
     std::vector<std::unique_ptr<IrBlock>> blocks;

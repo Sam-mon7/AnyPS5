@@ -129,6 +129,11 @@ public:
         return value;
     }
     [[nodiscard]] std::size_t Size() const { return count; }
+    [[nodiscard]] std::size_t MemoryBytes() const {
+        std::size_t bytes = capacity * sizeof(IrValue);
+        for (const auto& value : *this) bytes += value.MemoryBytes() - sizeof(IrValue);
+        return bytes;
+    }
     [[nodiscard]] IrValue& operator[](std::size_t index) { return values[index]; }
     [[nodiscard]] const IrValue& operator[](std::size_t index) const { return values[index]; }
     [[nodiscard]] IrValue* begin() { return values; }

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ShaderObjectMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -113,7 +114,7 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     subgroup.requiredSubgroupSize = subgroupSize;
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
-    check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
+    check(create(device, cache, 1, &info, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline), pipeline), "vkCreateComputePipelines");
 }
 
 bool CaptureComputePipeline(std::size_t words) {
@@ -213,9 +214,9 @@ struct ComputePipelineObjects {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     ~ComputePipelineObjects() {
-        if (pipeline != VK_NULL_HANDLE) destroyPipeline(device, pipeline, nullptr);
-        if (layout != VK_NULL_HANDLE) destroyLayout(device, layout, nullptr);
-        if (module != VK_NULL_HANDLE) destroyModule(device, module, nullptr);
+        if (pipeline != VK_NULL_HANDLE) destroyPipeline(device, pipeline, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
+        if (layout != VK_NULL_HANDLE) destroyLayout(device, layout, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout));
+        if (module != VK_NULL_HANDLE) destroyModule(device, module, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module));
     }
 };
 
@@ -353,7 +354,7 @@ struct VulkanDevice::State {
     // dispatch's find-or-insert and the verify switch's lookups touch the map, recipes hold weak
     // references to its objects.
     std::mutex computePipelinesMutex;
-    std::map<std::uint64_t, std::shared_ptr<ComputePipelineObjects>> computePipelines;
+    std::map<std::uint64_t, Graphics::PreparedObjectReference<ComputePipelineObjects>> computePipelines;
     std::map<std::uint64_t, std::shared_future<std::shared_ptr<ComputePipelineObjects>>> computePipelinesBuilding;
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
@@ -447,7 +448,7 @@ struct VulkanDevice::State {
         VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         info.bindingCount = 1;
         info.pBindings = &binding;
-        check(DeviceFunction<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(device, &info, nullptr, &workgroupMemoryLayout), "vkCreateDescriptorSetLayout workgroup memory");
+        check(DeviceFunction<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(device, &info, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout), &workgroupMemoryLayout), "vkCreateDescriptorSetLayout workgroup memory");
     }
 
     std::shared_ptr<WorkgroupMemory> WorkgroupMemoryFor(const Graphics::Context& context, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint32_t dwords) {
@@ -705,7 +706,7 @@ struct VulkanDevice::State {
             Graphics::ClearHostImports(device);
             patternBuffers.clear();
             workgroupMemory.reset();
-            if (workgroupMemoryLayout != VK_NULL_HANDLE) reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(deviceProc(device, "vkDestroyDescriptorSetLayout"))(device, workgroupMemoryLayout, nullptr);
+            if (workgroupMemoryLayout != VK_NULL_HANDLE) reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(deviceProc(device, "vkDestroyDescriptorSetLayout"))(device, workgroupMemoryLayout, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout));
             descriptorCache.reset();
             emptyBuffer.reset();
             placeholderImages.reset();
@@ -802,8 +803,8 @@ ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePip
         std::vector<VkDescriptorSetLayout> sets;
         VkPipelineCache cache = VK_NULL_HANDLE;
         ~ReplayObjects() {
-            for (auto layout : sets) destroySetLayout(device, layout, nullptr);
-            if (cache != VK_NULL_HANDLE) destroyCache(device, cache, nullptr);
+            for (auto layout : sets) destroySetLayout(device, layout, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout));
+            if (cache != VK_NULL_HANDLE) destroyCache(device, cache, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Cache));
         }
     } replay{state->device, state->DeviceFunction<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout"), state->DeviceFunction<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache"), {}};
     ComputePipelineObjects objects;
@@ -823,13 +824,13 @@ ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePip
     VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     cacheInfo.initialDataSize = initialCache.size();
     cacheInfo.pInitialData = initialCache.data();
-    check(state->DeviceFunction<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(state->device, &cacheInfo, nullptr, &replay.cache), "vkCreatePipelineCache replay");
+    check(state->DeviceFunction<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(state->device, &cacheInfo, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Cache), &replay.cache), "vkCreatePipelineCache replay");
     result.cacheMilliseconds = elapsed(phase);
     phase = std::chrono::steady_clock::now();
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     moduleInfo.codeSize = capture.spirv.size() * sizeof(std::uint32_t);
     moduleInfo.pCode = capture.spirv.data();
-    check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects.module), "vkCreateShaderModule replay");
+    check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module), &objects.module), "vkCreateShaderModule replay");
     result.moduleMilliseconds = elapsed(phase);
     phase = std::chrono::steady_clock::now();
     std::array<std::array<std::uint64_t, 4>, 2> descriptorCounts{};
@@ -864,7 +865,7 @@ ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePip
         require(support.supported == VK_TRUE, "captured descriptor set layout is unsupported");
         require(variableCount <= variableSupport.maxVariableDescriptorCount, "captured variable descriptor count exceeds layout support");
         VkDescriptorSetLayout handle = VK_NULL_HANDLE;
-        check(state->DeviceFunction<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(state->device, &info, nullptr, &handle), "vkCreateDescriptorSetLayout replay");
+        check(state->DeviceFunction<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(state->device, &info, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout), &handle), "vkCreateDescriptorSetLayout replay");
         replay.sets.push_back(handle);
     }
     const std::array<std::uint32_t, 4> regularLimits{std::min(limits.maxDescriptorSetStorageBuffers, limits.maxPerStageDescriptorStorageBuffers), std::min(limits.maxDescriptorSetSampledImages, limits.maxPerStageDescriptorSampledImages), std::min(limits.maxDescriptorSetStorageImages, limits.maxPerStageDescriptorStorageImages), std::min(limits.maxDescriptorSetSamplers, limits.maxPerStageDescriptorSamplers)};
@@ -886,7 +887,7 @@ ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePip
     layoutInfo.pSetLayouts = replay.sets.data();
     layoutInfo.pushConstantRangeCount = static_cast<std::uint32_t>(capture.pushConstants.size());
     layoutInfo.pPushConstantRanges = capture.pushConstants.data();
-    check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout replay");
+    check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout), &objects.layout), "vkCreatePipelineLayout replay");
     result.layoutMilliseconds = elapsed(phase);
     phase = std::chrono::steady_clock::now();
     CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), replay.cache, objects.module, objects.layout, capture.flags, capture.stageFlags, specialization.Info(), capture.requiredSubgroupSize, &objects.pipeline);
@@ -4207,7 +4208,10 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         std::shared_future<std::shared_ptr<ComputePipelineObjects>> other;
         {
             std::lock_guard pipelines(state->computePipelinesMutex);
-            if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) return found->second;
+            if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) {
+                if (auto cached = found->second.Pin()) return cached;
+                state->computePipelines.erase(found);
+            }
             if (const auto pending = state->computePipelinesBuilding.find(pipelineKey); pending != state->computePipelinesBuilding.end()) other = pending->second;
             else state->computePipelinesBuilding.emplace(pipelineKey, building.get_future().share());
         }
@@ -4217,11 +4221,16 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         if (pipelineKey == 0) return built;
         {
             std::lock_guard pipelines(state->computePipelinesMutex);
-            if (built != nullptr) built = state->computePipelines.try_emplace(pipelineKey, built).first->second;
+            if (built != nullptr) {
+                auto& cached = state->computePipelines[pipelineKey];
+                if (auto existing = cached.Pin()) built = std::move(existing);
+                else cached = Graphics::PreparedObjectReference(built, state->device);
+            }
             state->computePipelinesBuilding.erase(pipelineKey);
         }
         if (error != nullptr) building.set_exception(error);
         else building.set_value(built);
+        static_cast<void>(ShaderRecompiler::MaintainPreparedShaderCache());
         return built;
     };
     std::shared_ptr<ComputePipelineObjects> objects;
@@ -4235,7 +4244,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
         moduleInfo.pCode = shader.spirv.data();
-        check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
+        check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module), &objects->module), "vkCreateShaderModule");
         const std::array<VkDescriptorSetLayout, 2> setLayouts{resources.Layout(), shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : VK_NULL_HANDLE};
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -4243,7 +4252,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
-        check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
+        check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout), &objects->layout), "vkCreatePipelineLayout");
         const VkPipelineCreateFlags pipelineFlags = (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
         const Graphics::PipelineSpecialization specialization(shader);
         const auto subgroupSize = state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize) ? std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize) : 0u;
@@ -4277,7 +4286,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         }
         if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
         CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline);
-        objects->destroyModule(objects->device, objects->module, nullptr);
+        objects->destroyModule(objects->device, objects->module, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module));
         objects->module = VK_NULL_HANDLE;
         Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
         if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] created a pipeline for %zu SPIR-V words in %.0f ms (program 0x%llx)\n", shader.spirv.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), static_cast<unsigned long long>(programAddress));
@@ -4314,7 +4323,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     std::shared_ptr<ComputePipelineObjects> objects = prepared != nullptr ? prepared->objects : nullptr;
     if (objects == nullptr && pipelineKey != 0) {
         std::lock_guard pipelines(state->computePipelinesMutex);
-        if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) objects = found->second;
+        if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) objects = found->second.Pin();
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& d = Dispatches();
@@ -4590,7 +4599,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         const auto pipelineKey = (shader.PipelineVariantId() << 1u) | (recipe.pushes ? 1u : 0u);
         {
             std::lock_guard pipelines(state->computePipelinesMutex);
-            if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) mapped = found->second;
+            if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) mapped = found->second.Pin();
         }
         // A data-only hit's words are the shader's, not the recipe's: its hash decision is
         // computed from the shader, as the record below decides by words.

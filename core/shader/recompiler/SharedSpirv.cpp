@@ -105,6 +105,12 @@ std::span<const std::uint32_t> SharedSpirv::Read() const {
     return words != nullptr ? words->Read() : std::span<const std::uint32_t>();
 }
 
+std::size_t SharedSpirv::MemoryBytes() const {
+    if (words == nullptr) return 0;
+    std::lock_guard lock(words->mutex);
+    return sizeof(Storage) + words->values.capacity() * sizeof(std::uint32_t) + words->count * sizeof(std::uint32_t);
+}
+
 const std::vector<std::uint32_t>& SharedSpirv::Words() const {
     if (words == nullptr) {
         static const std::vector<std::uint32_t> empty;

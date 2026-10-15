@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ShaderObjectMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
@@ -35,13 +36,34 @@ constexpr std::array<VkDynamicState, 15> dynamicStates{
 
 using Key = std::vector<std::byte>;
 
+struct LibraryLayout {
+    VkDevice device;
+    PFN_vkDestroyPipelineLayout destroy;
+    VkPipelineLayout handle = VK_NULL_HANDLE;
+    ~LibraryLayout() {
+        if (handle != VK_NULL_HANDLE) destroy(device, handle, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout));
+    }
+};
+
+struct LibraryPart {
+    VkDevice device;
+    PFN_vkDestroyPipeline destroy;
+    PFN_vkDestroyShaderModule destroyModule;
+    VkPipeline handle = VK_NULL_HANDLE;
+    std::shared_ptr<LibraryLayout> layout;
+    std::vector<VkShaderModule> modules;
+    ~LibraryPart() {
+        if (handle != VK_NULL_HANDLE) destroy(device, handle, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
+        for (const auto module : modules) destroyModule(device, module, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module));
+    }
+};
+
 struct DeviceLibraries {
     PFN_vkDestroyPipeline destroyPipeline = nullptr;
     PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
     PFN_vkDestroyShaderModule destroyModule = nullptr;
-    std::vector<VkShaderModule> modules;
-    std::map<Key, VkPipelineLayout> layouts;
-    std::array<std::map<Key, VkPipeline>, 4> parts;
+    std::map<Key, PreparedObjectReference<LibraryLayout>> layouts;
+    std::array<std::map<Key, PreparedObjectReference<LibraryPart>>, 4> parts;
     PipelineLibraryCounters counters;
 };
 
@@ -68,6 +90,7 @@ void runJobs(LibraryStore& store) {
         store.jobs.pop_front();
         lock.unlock();
         job();
+        job = {};
         lock.lock();
         if (--store.pending[device] == 0) store.idle.notify_all();
     }
@@ -109,6 +132,10 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     auto& store = Libraries();
     std::unique_lock lock(store.mutex);
     auto& device = store.devices[context.device];
+    if (ShaderRecompiler::PreparedShaderBudgetEnabled()) {
+        std::erase_if(device.layouts, [](const auto& entry) { return entry.second.Expired(); });
+        for (auto& part : device.parts) std::erase_if(part, [](const auto& entry) { return entry.second.Expired(); });
+    }
     if (device.destroyPipeline == nullptr) {
         device.destroyPipeline = context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline");
         device.destroyLayout = context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
@@ -116,7 +143,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     }
     const auto layoutFor = [&](const Key& key, std::optional<std::uint32_t> mask) {
         auto found = device.layouts.find(key);
-        if (found != device.layouts.end()) return found->second;
+        if (found != device.layouts.end()) if (auto cached = found->second.Pin()) return cached;
         auto info = layout;
         std::array<VkDescriptorSetLayout, 2> sets{VK_NULL_HANDLE, VK_NULL_HANDLE};
         if (mask.has_value()) {
@@ -125,12 +152,15 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             }
             info.pSetLayouts = sets.data();
         }
-        VkPipelineLayout handle = VK_NULL_HANDLE;
-        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &info, nullptr, &handle), "vkCreatePipelineLayout library");
-        return device.layouts.emplace(key, handle).first->second;
+        auto object = std::make_shared<LibraryLayout>();
+        object->device = context.device;
+        object->destroy = device.destroyLayout;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &info, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout), &object->handle), "vkCreatePipelineLayout library");
+        device.layouts.insert_or_assign(key, PreparedObjectReference(object, context.device));
+        return object;
     };
     const auto fullLayout = layoutFor(keys.layout, std::nullopt);
-    const std::array<VkPipelineLayout, 4> partLayouts{VK_NULL_HANDLE, split ? layoutFor(keys.preRasterizationLayout, keys.preRasterizationSets) : fullLayout, split ? layoutFor(keys.fragmentLayout, keys.fragmentSets) : fullLayout, VK_NULL_HANDLE};
+    const std::array<std::shared_ptr<LibraryLayout>, 4> partLayouts{nullptr, split ? layoutFor(keys.preRasterizationLayout, keys.preRasterizationSets) : fullLayout, split ? layoutFor(keys.fragmentLayout, keys.fragmentSets) : fullLayout, nullptr};
     std::vector<VkPipelineShaderStageCreateInfo> preRasterization;
     const VkPipelineShaderStageCreateInfo* fragment = nullptr;
     bool mesh = false;
@@ -163,13 +193,17 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     static const bool backgroundLinking = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
     const bool optimize = backgroundLinking && context.pipelineLinkTimeOptimization;
     std::vector<VkPipeline> libraries;
+    std::vector<std::shared_ptr<LibraryPart>> owners;
     for (std::size_t part = 0; part < flags.size(); ++part) {
         if (part == 0 && mesh) continue;
         const auto key = Combined(*partKeys[part], *contextKeys[part]);
         auto& cache = device.parts[part];
         if (const auto found = cache.find(key); found != cache.end()) {
-            libraries.push_back(found->second);
-            continue;
+            if (auto cached = found->second.Pin()) {
+                libraries.push_back(cached->handle);
+                owners.push_back(std::move(cached));
+                continue;
+            }
         }
         PerformanceTimer timing("Vulkan.GraphicsPipelineLibrary");
         VkGraphicsPipelineLibraryCreateInfoEXT library{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, flags[part] == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT ? &rendering : &shaderRendering};
@@ -177,7 +211,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &library};
         create.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
         create.pDynamicState = info.pDynamicState;
-        create.layout = partLayouts[part];
+        create.layout = partLayouts[part] != nullptr ? partLayouts[part]->handle : VK_NULL_HANDLE;
         switch (flags[part]) {
         case VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT:
             create.pVertexInputState = info.pVertexInputState;
@@ -203,28 +237,35 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.layout = VK_NULL_HANDLE;
             break;
         }
-        VkPipeline handle = VK_NULL_HANDLE;
+        auto object = std::make_shared<LibraryPart>();
+        object->device = context.device;
+        object->destroy = device.destroyPipeline;
+        object->destroyModule = device.destroyModule;
+        object->layout = partLayouts[part];
         if (partsOnly) lock.unlock();
-        const auto created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
+        const auto created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline), &object->handle);
         if (partsOnly) lock.lock();
         Check(created, "vkCreateGraphicsPipelines library");
         if (const auto raced = cache.find(key); raced != cache.end()) {
-            device.destroyPipeline(context.device, handle, nullptr);
-            libraries.push_back(raced->second);
-            continue;
+            if (auto cached = raced->second.Pin()) {
+                libraries.push_back(cached->handle);
+                owners.push_back(std::move(cached));
+                continue;
+            }
         }
-        cache.emplace(key, handle);
         if (optimize) {
             for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
                 for (auto& module : modules) {
                     if (module == VK_NULL_HANDLE || module != create.pStages[stage].module) continue;
-                    device.modules.push_back(module);
+                    object->modules.push_back(module);
                     module = VK_NULL_HANDLE;
                 }
             }
         }
         ++device.counters.built[part];
-        libraries.push_back(handle);
+        libraries.push_back(object->handle);
+        cache.insert_or_assign(key, PreparedObjectReference(object, context.device));
+        owners.push_back(std::move(object));
     }
     if (partsOnly) return VK_NULL_HANDLE;
     PerformanceTimer timing("Vulkan.GraphicsPipelineLink");
@@ -234,7 +275,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &linked};
     create.layout = info.layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline), "vkCreateGraphicsPipelines link");
+    Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline), &pipeline), "vkCreateGraphicsPipelines link");
     ++device.counters.linked;
     if (optimize && optimized != nullptr) {
         auto slot = std::make_shared<OptimizedPipeline>();
@@ -244,19 +285,19 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         const auto createPipelines = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines");
         const auto cache = context.pipelineCache;
         const auto libraryLayout = fullLayout;
-        enqueue(store, context.device, [slot, createPipelines, cache, libraryLayout, libraries, &store, devicePointer = &device] {
+        enqueue(store, context.device, [slot, createPipelines, cache, libraryLayout, libraries, owners, &store, devicePointer = &device] {
             if (slot->released.load()) return;
             VkPipelineLibraryCreateInfoKHR linked{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
             linked.libraryCount = static_cast<std::uint32_t>(libraries.size());
             linked.pLibraries = libraries.data();
             VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &linked};
             create.flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
-            create.layout = libraryLayout;
+            create.layout = libraryLayout->handle;
             VkPipeline result = VK_NULL_HANDLE;
-            if (createPipelines(slot->device, cache, 1, &create, nullptr, &result) != VK_SUCCESS) return;
+            if (createPipelines(slot->device, cache, 1, &create, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline), &result) != VK_SUCCESS) return;
             slot->handle.store(result);
             if (slot->released.load()) {
-                if (const auto handle = slot->handle.exchange(VK_NULL_HANDLE)) slot->destroy(slot->device, handle, nullptr);
+                if (const auto handle = slot->handle.exchange(VK_NULL_HANDLE)) slot->destroy(slot->device, handle, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
             }
             std::lock_guard lock(store.mutex);
             ++devicePointer->counters.optimized;
@@ -267,7 +308,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
 
 void OptimizedPipeline::Release() noexcept {
     released.store(true);
-    if (const auto pipeline = handle.exchange(VK_NULL_HANDLE)) destroy(device, pipeline, nullptr);
+    if (const auto pipeline = handle.exchange(VK_NULL_HANDLE)) destroy(device, pipeline, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
 }
 
 void WaitForOptimizedPipelines(VkDevice device) {
@@ -283,11 +324,6 @@ void ClearPipelineLibraries(VkDevice device) {
     const auto found = store.devices.find(device);
     if (found == store.devices.end()) return;
     auto& libraries = found->second;
-    for (auto& part : libraries.parts) {
-        for (const auto& [key, handle] : part) libraries.destroyPipeline(device, handle, nullptr);
-    }
-    for (const auto& [key, handle] : libraries.layouts) libraries.destroyLayout(device, handle, nullptr);
-    for (const auto module : libraries.modules) libraries.destroyModule(device, module, nullptr);
     store.devices.erase(found);
 }
 
