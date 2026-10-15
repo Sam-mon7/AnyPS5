@@ -21,6 +21,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -3550,6 +3551,132 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
         Require(watched ? memoryHolds({0, 0, 255, 255}, 65536, 0x33) : memoryHolds({255, 0, 0, 255}), "results dead under new clear keys were stored");
     }
     recorder.Sync();
+}
+
+bool residentStorageTests(const Device& device, Recorder& recorder) {
+    constexpr std::size_t unit = 65536;
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+    constexpr std::size_t bytes = surfaceBytes + unit;
+    auto* block = static_cast<std::uint8_t*>(AllocateWatched(bytes, unit));
+    if (block == nullptr) return false;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+    struct Release {
+        std::uint8_t* block;
+        ~Release() {
+            GuestAllocations::Mutation().Remove(block);
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } release{block};
+    if (!AgcDriver::GuestMemory::Watched(address, bytes)) return false;
+    std::memset(block, 0x55, bytes);
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    auto source = StorageTexture::Create(context, detiler, resource, 0);
+    auto alias = StorageTexture::Create(context, detiler, resource, 0);
+    source->SetCached(true);
+    alias->SetCached(true);
+    const bool resident = StorageTexture::ResidentResultsEnabled();
+    const auto clear = [&](const auto& image, VkClearColorValue value) {
+        image->Refresh();
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        image->MarkDirty();
+    };
+    const auto imageHolds = [&](const auto& image, std::array<std::uint8_t, 4> pixel, std::size_t cpuPixels = 0) {
+        Buffer readback(context, surfaceBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {side, side, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        const auto data = readback.Bytes();
+        std::size_t found = 0;
+        for (std::size_t offset = 0; offset < data.size(); offset += 4) {
+            bool cpu = true, gpu = true;
+            for (std::size_t channel = 0; channel < 4; ++channel) {
+                cpu &= data[offset + channel] == std::byte{0x33};
+                gpu &= data[offset + channel] == static_cast<std::byte>(pixel[channel]);
+            }
+            if (cpu) ++found;
+            else if (!gpu) return false;
+        }
+        return found == cpuPixels;
+    };
+    clear(source, {{1.0f, 0.0f, 0.0f, 1.0f}});
+    StorageTexture::FlushAllPending("idle");
+    recorder.Sync();
+    Require((StorageTexture::FindPending(address, surfaceBytes) == source) == resident, "idle publication did not respect resident storage mode");
+    Require(block[0] == (resident ? 0x55 : 255), "idle changed resident storage bytes or lost baseline results");
+    alias->Refresh();
+    Require(imageHolds(alias, {255, 0, 0, 255}), "a GPU alias consumer did not see the producer");
+    Require(block[0] == (resident ? 0x55 : 255), "a GPU alias consumer published resident results to the CPU");
+    std::vector<std::byte> read(surfaceBytes);
+    AgcDriver::GuestMemory::Read(address, read);
+    Require(block[0] == 255 && !StorageTexture::FindPending(address, surfaceBytes), "a CPU read did not publish resident storage results");
+    clear(alias, {{0.0f, 1.0f, 0.0f, 1.0f}});
+    std::memset(block, 0x33, unit);
+    alias->Refresh();
+    Require(imageHolds(alias, {0, 255, 0, 255}, unit / 4), "a partial CPU upload discarded untouched GPU units");
+    Require(block[unit] == (resident ? 255 : 0), "a partial CPU upload eagerly published untouched GPU units");
+    AgcDriver::GuestMemory::Read(address, read);
+    Require(block[0] == 0x33 && block[unit] == 0 && block[unit + 1] == 255, "publication lost CPU bytes or retained GPU results");
+    clear(source, {{0.0f, 0.0f, 1.0f, 1.0f}});
+    Require(StorageTexture::FlushPending(address, surfaceBytes, nullptr, "scanout"), "scan-out did not publish the pending surface");
+    recorder.Sync();
+    Require(block[0] == 0 && block[2] == 255, "scan-out did not expose the producer's pixels");
+    clear(source, {{1.0f, 0.0f, 0.0f, 1.0f}});
+    recorder.Sync();
+    const std::array<std::uint32_t, 7> wait{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0xff0000ffu, UINT32_MAX, 0};
+    Require(resident ? AgcDriver::Pm4::WaitSatisfiedUnchecked(wait) : AgcDriver::Pm4::WaitSatisfied(wait), "WAIT_REG_MEM did not publish resident image bytes");
+    clear(source, {{0.0f, 0.0f, 1.0f, 1.0f}});
+    const std::array<std::uint32_t, 1> label{0x12345678u};
+    recorder.AfterCompletions(address, std::as_bytes(std::span(label)), 1, 0, false);
+    recorder.Sync();
+    AgcDriver::GuestMemory::Read(address, read);
+    Require(std::memcmp(block, label.data(), sizeof(label)) == 0 && block[6] == 255, "an image publication overwrote a completion label");
+    clear(source, {{1.0f, 1.0f, 1.0f, 1.0f}});
+    if (resident) {
+        GuestAllocations::Mutation().Protect(block + surfaceBytes, unit, true, false, true, [] {});
+        Require(!StorageTexture::FindPending(address, surfaceBytes) && block[0] == 255 && block[1] == 255, "mutation of a leased registration did not publish its retained surface");
+    } else source->WriteBack();
+    clear(source, {{0.0f, 0.0f, 1.0f, 1.0f}});
+    if (HostImportFor(device.GetContext(), address, surfaceBytes) != nullptr && resident) {
+        recorder.Sync();
+        Require(!StorageTexture::FindPending(address, surfaceBytes) && block[0] == 0 && block[2] == 255, "an import transition did not publish resident image bytes");
+    }
+    source->Flush();
+    alias->Flush();
+    recorder.Sync();
+    return true;
 }
 
 bool writtenBufferOrderTests(const Device& device, Recorder& recorder) {
@@ -7473,6 +7600,12 @@ int main(int argc, char** argv) {
             RunResidentHeapMirrorTests(device.GetContext(), recorder, true);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--resident-storage-only") return residentStorageTests(device, recorder) ? 0 : 77;
+        if (argc == 2 && std::string_view(argv[1]) == "--storage-refresh-only") {
+            storageRefreshTests(device, recorder, false);
+            storageRefreshTests(device, recorder, true);
+            return 0;
+        }
         if (argc == 2 && (std::string_view(argv[1]) == "--storage-upload-lifetime-only" || std::string_view(argv[1]) == "--storage-upload-failure-only")) {
             storageUploadLifetimeTests(device, recorder, std::string_view(argv[1]) == "--storage-upload-failure-only");
             return 0;
@@ -7628,6 +7761,7 @@ int main(int argc, char** argv) {
         unitShadowTests(device, recorder);
         storageRefreshTests(device, recorder, false);
         storageRefreshTests(device, recorder, true);
+        static_cast<void>(residentStorageTests(device, recorder));
         static_cast<void>(writtenBufferOrderTests(device, recorder));
         writeBackPaddingTests(device, recorder, false);
         writeBackPaddingTests(device, recorder, true);
