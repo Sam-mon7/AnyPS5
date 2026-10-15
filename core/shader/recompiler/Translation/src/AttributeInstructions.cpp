@@ -175,6 +175,11 @@ bool TranslationContext::emitInterpolation(const RdnaInstruction& inst) {
     }
 }
 
+void TranslationContext::TranslateInstanceOffset(const RdnaInstruction& instruction) {
+    auto& index = ir.Emit(IrOpcode::GetBuiltin, IrOpcodeType(IrOpcode::GetBuiltin), {&ir.Constant(static_cast<std::uint32_t>(StageInputKind::InstanceIndex)), &ir.Constant(0u)});
+    writeOperand(instruction.destination, &index);
+}
+
 void TranslationContext::TranslateEmbeddedFetch(const RdnaInstruction& instruction, std::uint32_t attribute, std::uint32_t components) {
     if (!instruction.formatted || instruction.typed || components == 0u || components > 4u) throw std::runtime_error("invalid prepared vertex fetch");
     for (std::uint32_t component = 0; component < components; ++component) {

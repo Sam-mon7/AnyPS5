@@ -3,6 +3,7 @@
 
 #include "RdnaDecoder/RdnaProgram.hpp"
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -26,11 +27,13 @@ struct EmbeddedFetchPlan {
     bool instanceOffsetConflict = false;
     bool vertexIndexObserved = false;
     bool instanceIndexObserved = false;
+    std::optional<std::uint32_t> instanceOffsetAddPc;
 };
 
 class EmbeddedVertexFetchAnalyzer {
 public:
     static std::uint64_t UnusedUserSgprs(const RdnaProgram& program);
+    static void ExtendInstanceOffset(EmbeddedFetchPlan& plan, const RdnaProgram& program, std::uint32_t userDataBaseRegister, std::uint32_t userDataCount);
     [[nodiscard]] EmbeddedFetchPlan Analyze(const RdnaProgram& program, std::uint32_t attributeTableRegister, std::uint32_t bufferTableRegister, std::uint32_t userDataBaseRegister, std::uint32_t userDataCount, std::uint32_t waveSize) const;
 };
 
