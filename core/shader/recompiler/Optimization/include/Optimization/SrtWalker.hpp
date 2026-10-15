@@ -37,6 +37,8 @@ struct SrtRuntime {
     SrtUserDataUse* userDataUse = nullptr;
     SrtMemoryProbe pendingWrite = nullptr;
     SrtMemoryBulkReader readWords = nullptr;
+    bool (*reuseTables)(void*, const IrResourcePlan&, const SrtRuntime&, ImageTableSnapshot&) = nullptr;
+    void (*rememberTables)(void*, const IrResourcePlan&, const SrtRuntime&, const ImageTableSnapshot&) = nullptr;
 };
 
 enum class RuntimeValueType {

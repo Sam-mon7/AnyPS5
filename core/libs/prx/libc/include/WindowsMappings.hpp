@@ -5,9 +5,12 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <map>
 #include <memory>
@@ -34,6 +37,7 @@ public:
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
         std::lock_guard lock(mutex);
+        queryCache.clear();
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
         for (auto cursor = reinterpret_cast<std::uintptr_t>(address); cursor < end;) {
             const auto memory = query(cursor);
@@ -106,11 +110,42 @@ public:
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
+        queryCache.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
             it->second.armed = 0;
             invalidate(*it->second.page);
         }
+    }
+
+    void Protect(std::uintptr_t address, std::size_t bytes, DWORD protection) {
+        std::lock_guard lock(mutex);
+        queryCache.clear();
+        const auto end = address + bytes;
+        for (auto cursor = address; cursor < end;) {
+            const auto memory = query(cursor);
+            const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            if (memory.State == MEM_COMMIT) {
+                DWORD previous;
+                if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+            }
+            cursor = stop;
+        }
+        for (auto it = views.lower_bound(address); it != views.end() && it->first < end; ++it) {
+            it->second.protection = protection;
+            it->second.armed = 0;
+            invalidate(*it->second.page);
+        }
+    }
+
+    MEMORY_BASIC_INFORMATION Query(std::uintptr_t address) {
+        std::lock_guard lock(mutex);
+        return cachedQuery(address);
+    }
+
+    std::pair<std::uint64_t, std::uint64_t> QueryCounts() {
+        std::lock_guard lock(mutex);
+        return {queryHits, queryMisses};
     }
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
@@ -343,7 +378,7 @@ public:
                     cursor = next == views.end() ? end : std::min(end, next->first);
                     continue;
                 }
-                const auto memory = query(cursor);
+                const auto memory = cachedQuery(cursor);
                 if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
                 if (capacity == *count) return true;
@@ -376,7 +411,7 @@ private:
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
-            const auto memory = query(cursor);
+            const auto memory = cachedQuery(cursor);
             if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
             cursor = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
         }
@@ -464,7 +499,8 @@ private:
         return static_cast<std::uint8_t>(((1u << (last + 1)) - 1) & ~((1u << first) - 1));
     }
 
-    static void protectSubpages(std::uintptr_t base, std::uint8_t mask, DWORD protection, const char* operation) {
+    void protectSubpages(std::uintptr_t base, std::uint8_t mask, DWORD protection, const char* operation) {
+        if (mask != 0) queryCache.clear();
         for (std::size_t sub = 0; sub < subpages;) {
             if ((mask & (1u << sub)) == 0) {
                 ++sub;
@@ -510,6 +546,33 @@ private:
         return memory;
     }
 
+    MEMORY_BASIC_INFORMATION cachedQuery(std::uintptr_t address) {
+        static const bool enabled = [] { const auto* value = std::getenv("APS5_GUEST_QUERY_CACHE"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+        if (!enabled) return query(address);
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile && (queryHits + queryMisses) % 4096 == 0 && std::chrono::steady_clock::now() - queryReport >= std::chrono::seconds(10)) {
+            queryReport = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[guest-query-cache] %llu hits, %llu native queries, %zu committed regions held\n", static_cast<unsigned long long>(queryHits), static_cast<unsigned long long>(queryMisses), queryCache.size());
+        }
+        const auto found = std::find_if(queryCache.begin(), queryCache.end(), [&](const auto& memory) {
+            const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+            return address >= base && address - base < memory.RegionSize;
+        });
+        if (found != queryCache.end()) {
+            ++queryHits;
+            const auto memory = *found;
+            std::rotate(found, std::next(found), queryCache.end());
+            return memory;
+        }
+        ++queryMisses;
+        const auto memory = query(address);
+        if (memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0) {
+            if (queryCache.size() == 128) queryCache.erase(queryCache.begin());
+            queryCache.push_back(memory);
+        }
+        return memory;
+    }
+
     static void split(std::uintptr_t address, std::size_t bytes) {
         auto memory = query(address);
         memory = query(reinterpret_cast<std::uintptr_t>(memory.AllocationBase));
@@ -524,6 +587,7 @@ private:
     }
 
     void reset(std::uintptr_t address, std::size_t bytes) {
+        queryCache.clear();
         const auto end = address + bytes;
         forgetClean(address, end);
         for (auto cursor = address; cursor < end;) {
@@ -600,6 +664,9 @@ private:
     }
 
     Ranges cleanRanges;
+    std::vector<MEMORY_BASIC_INFORMATION> queryCache;
+    std::uint64_t queryHits = 0, queryMisses = 0;
+    std::chrono::steady_clock::time_point queryReport{};
     Ranges freshRanges;
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
