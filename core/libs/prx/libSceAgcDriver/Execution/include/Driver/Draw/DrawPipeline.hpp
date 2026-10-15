@@ -32,6 +32,7 @@ public:
     static std::size_t QueuedItems();
     static bool PipelineIndirect();
     static bool DrainBeforeRead(std::uint64_t address, std::size_t bytes);
+    static bool KeepsWait(std::span<const std::uint32_t> packet);
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
@@ -39,6 +40,7 @@ public:
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
+    static std::uint64_t DrainRequestsByReason(DrainReason reason);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     bool DrainIfOverlaps(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode = 0x100) {
@@ -107,6 +109,9 @@ private:
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
     std::array<std::uint64_t, 257> drainOpcodes{};
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainReason::Count)> reasonRequests{};
+    std::array<std::uint64_t, 257> reportedRequests{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> reportedReasons{};
     std::uint64_t depthSum = 0;
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Event::Count)> events{};
     std::array<std::uint64_t, static_cast<std::size_t>(Event::Count)> reportedEvents{};

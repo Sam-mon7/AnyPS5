@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -107,6 +108,32 @@ void hookReadOverPendingDispatch(DrawPipeline& pipeline, Log& log) {
     check(!DrawPipeline::DrainBeforeRead(0x900ff0, 32), "a read drained on a thread that is not the queue-0 worker");
 }
 
+void waitReadRanges(DrawPipeline& pipeline, Log& log) {
+    const auto* flag = std::getenv("APS5_NARROW_PACKET_DRAINS");
+    const bool enabled = flag != nullptr && std::strcmp(flag, "1") == 0 && std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
+    std::atomic<bool> release{false};
+    pipeline.Enqueue([&] { waitFor(release); log.Add("write"); }, {{0x100004, 0x100008}});
+    const std::array<std::uint32_t, 7> narrow{0xc0053c00u, 0x13u, 0x100000, 0, 1, UINT32_MAX, 0};
+    check(DrawPipeline::KeepsWait(narrow) == enabled, "a disjoint wait did not respect the narrow-drain switch");
+    const std::array<std::uint32_t, 9> wide{0xc0079300u, 0x13u, 0x100000, 0, 1, 0, UINT32_MAX, 0, 0};
+    check(!DrawPipeline::KeepsWait(wide), "a wide wait ignored a pending write to its upper dword");
+    auto overlapping = narrow;
+    overlapping[2] = 0x100004;
+    check(!DrawPipeline::KeepsWait(overlapping), "an overlapping wait bypassed its producer");
+    auto overflowing = wide;
+    overflowing[2] = UINT32_MAX - 3;
+    overflowing[3] = UINT32_MAX;
+    check(!DrawPipeline::KeepsWait(overflowing), "an overflowing wait range bypassed its drain");
+    check(!DrawPipeline::KeepsWait(std::span(narrow).first(3)), "a malformed wait bypassed its drain");
+    release.store(true, std::memory_order_release);
+    pipeline.Drain(DrawPipeline::DrainReason::Packet, 0x3c);
+    check(log.Take() == std::vector<std::string>{"write"}, "a wait drain did not complete its producer");
+    const auto requests = DrawPipeline::DrainRequestsByReason(DrawPipeline::DrainReason::Packet);
+    const auto opcodes = DrawPipeline::DrainRequestsByOpcode(0x3c);
+    pipeline.Drain(DrawPipeline::DrainReason::Packet, 0x3c);
+    check(DrawPipeline::DrainRequestsByReason(DrawPipeline::DrainReason::Packet) == requests + 1 && DrawPipeline::DrainRequestsByOpcode(0x3c) == opcodes + 1, "empty drain requests were absent from the diagnostics");
+}
+
 }
 
 int main() {
@@ -116,6 +143,7 @@ int main() {
         indirectArgumentsOverPendingDraw(pipeline, log);
         labelBetweenDispatchAndDraws(pipeline, log);
         hookReadOverPendingDispatch(pipeline, log);
+        waitReadRanges(pipeline, log);
         std::puts("draw pipeline commit tests passed");
         return 0;
     } catch (const std::exception& error) {
