@@ -733,7 +733,8 @@ void RebarUploadReuse() {
         std::memset(upload.WriteBytes().data(), 0x55, upload.Size());
         bool rejected = false;
         try { upload.Bytes(); } catch (const std::runtime_error&) { rejected = true; }
-        Expect(rejected, "upload-only CPU read was not rejected");
+        const auto* check = std::getenv("APS5_REBAR_CHECK");
+        Expect(rejected == (check != nullptr && std::strcmp(check, "1") == 0), "upload-only CPU read did not follow the debug check switch");
         const auto missingBefore = RebarMemory().ineligible.load();
         {
             auto host = mockContext();
