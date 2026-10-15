@@ -1347,6 +1347,9 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     configure_windows_unwind(${agcExecutionTest})
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
+target_include_directories(agc_driver_draw_offset_indices_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/RdnaDecoder/include
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/Translation/include)
 foreach(agcExecutionTestName IN LISTS ANYPS5_AGC_EXECUTION_TESTS)
     if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/execution/${agcExecutionTestName}.cpp)
         message(FATAL_ERROR "ANYPS5_AGC_EXECUTION_TESTS names ${agcExecutionTestName}, which has no source in tests/execution")
