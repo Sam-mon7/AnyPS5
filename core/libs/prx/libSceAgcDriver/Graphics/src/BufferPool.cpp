@@ -1,8 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include <limits>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <bit>
 #include <chrono>
 #include <cstdio>
@@ -10,6 +13,24 @@
 #include <limits>
 
 namespace AgcDriver::Graphics {
+
+bool RebarUploads() {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_REBAR_UPLOADS"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    return enabled;
+}
+
+RebarBudget& RebarMemory() {
+    static RebarBudget budget([] {
+        const auto* value = std::getenv("APS5_REBAR_MIB");
+        const auto mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 1024ull;
+        return std::min<std::uint64_t>(mib, UINT64_MAX >> 20u) << 20u;
+    }());
+    return budget;
+}
+
+void RebarBudget::Report() {
+    AgcDriver::ProfilePrint_nid_no_patch("[rebar] live %.1f MiB, peak %.1f MiB, allocations %llu, fallbacks ineligible %llu / over budget %llu\n", live.load() / 1048576.0, peak.load() / 1048576.0, static_cast<unsigned long long>(allocations.load()), static_cast<unsigned long long>(ineligible.load()), static_cast<unsigned long long>(overBudget.load()));
+}
 
 namespace {
 
@@ -82,7 +103,7 @@ std::uint64_t BufferPool::SlabKey(std::uint32_t memoryType, std::size_t capacity
     return (static_cast<std::uint64_t>(memoryType) << 40u) | (static_cast<std::uint64_t>(addressable ? 1u : 0u) << 39u) | static_cast<std::uint64_t>(capacity);
 }
 
-SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable) {
+SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, bool rebar) {
     const auto key = SlabKey(memoryType, capacity, addressable);
     const auto takeFrom = [&](SlabBlock& block, Slab& slab) {
         const auto index = block.free.back();
@@ -106,11 +127,21 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     if (addressable) allocation.pNext = &flags;
     allocation.allocationSize = blockBytes;
     allocation.memoryTypeIndex = memoryType;
-    block->memory = AllocateMemory(allocation, "vkAllocateMemory buffer slab");
+    if (rebar && !RebarMemory().Reserve(blockBytes)) return {};
+    block->rebarBytes = rebar ? blockBytes : 0;
+    try {
+        block->memory = AllocateMemory(allocation, "vkAllocateMemory buffer slab");
+    } catch (...) {
+        if (block->rebarBytes != 0) RebarMemory().Release(block->rebarBytes);
+        throw;
+    }
     if ((context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
         void* mapping = nullptr;
         const auto mapped = mapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapping);
-        if (mapped != VK_SUCCESS) freeMemory(device, block->memory, nullptr);
+        if (mapped != VK_SUCCESS) {
+            freeMemory(device, block->memory, nullptr);
+            if (block->rebarBytes != 0) RebarMemory().Release(block->rebarBytes);
+        }
         Check(mapped, "vkMapMemory buffer slab");
         block->mapping = static_cast<std::byte*>(mapping);
     }
@@ -129,6 +160,7 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
 void BufferPool::freeBlock(SlabBlock& block) noexcept {
     if (block.mapping != nullptr) unmap(device, block.memory);
     freeMemory(device, block.memory, nullptr);
+    if (block.rebarBytes != 0) RebarMemory().Release(block.rebarBytes);
 }
 
 VkDeviceSize BufferPool::PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept {
@@ -186,6 +218,7 @@ VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
     if (allocation.mapping != nullptr) unmap(device, allocation.memory);
     destroyBuffer(device, allocation.buffer, nullptr);
     freeMemory(device, allocation.memory, nullptr);
+    if (allocation.rebarBytes != 0) RebarMemory().Release(allocation.rebarBytes);
     return allocation.allocationBytes;
 }
 
@@ -215,7 +248,7 @@ BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlag
     return !sharedTiers() && capacity < classLimit ? smallTier : largeTier;
 }
 
-std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
+std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, std::uint32_t memoryType) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto capacity = Capacity(bytes, properties);
     std::lock_guard lock(mutex);
@@ -225,6 +258,7 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         const auto now = std::chrono::steady_clock::now();
         if (now - lastReport > std::chrono::seconds(10)) {
             lastReport = now;
+            if (RebarMemory().allocations.load() != 0 || RebarMemory().ineligible.load() != 0 || RebarMemory().overBudget.load() != 0) RebarMemory().Report();
             AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu)\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u));
             if (vram.Enabled()) {
                 const auto report = vram.Report();
@@ -235,7 +269,7 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
     auto& tier = tierFor(capacity, properties);
     const auto largest = &tier == &deviceTier && !exactSizes() && bytes <= std::numeric_limits<std::size_t>::max() / 2 ? std::max(capacity, bytes * 2) : capacity;
     auto found = tier.free.end();
-    for (auto size = capacity; size <= largest && found == tier.free.end(); size = NextCapacity(size)) found = tier.free.find({size, usage, properties});
+    for (auto size = capacity; size <= largest && found == tier.free.end(); size = NextCapacity(size)) found = tier.free.find({size, usage, properties, memoryType});
     if (found == tier.free.end() || found->second.empty()) {
         ++tier.misses;
         return std::nullopt;
@@ -329,7 +363,7 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
             evicted.push_back(allocation);
         } else {
             while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);
-            tier.free[{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, ++clock});
+            tier.free[{allocation.bytes, allocation.usage, allocation.properties, allocation.memoryType}].push_back({allocation, ++clock});
             ++tier.slots;
             tier.retainedBytes += allocation.allocationBytes;
         }

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -1150,7 +1151,8 @@ struct SnapshotCopies {
     static constexpr std::size_t MaxEntries = 1024;
     std::mutex mutex;
     VkDevice device = VK_NULL_HANDLE;
-    std::map<Key, std::pair<std::shared_ptr<Buffer>, std::list<Key>::iterator>> entries;
+    struct Entry { std::shared_ptr<Buffer> first; std::list<Key>::iterator second; std::vector<std::byte> shadow; };
+    std::map<Key, Entry> entries;
     std::list<Key> recency;
     std::size_t bytes = 0;
     void clear() {
@@ -1174,7 +1176,7 @@ std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t addre
     }
     const SnapshotCopies::Key key{address, bytes.size(), usage};
     if (const auto found = copies.entries.find(key); found != copies.entries.end()) {
-        if (std::memcmp(found->second.first->Bytes().data(), bytes.data(), bytes.size()) == 0) {
+        if (std::memcmp(RebarUploads() ? found->second.shadow.data() : found->second.first->Bytes().data(), bytes.data(), bytes.size()) == 0) {
             copies.recency.splice(copies.recency.end(), copies.recency, found->second.second);
             return found->second.first;
         }
@@ -1182,8 +1184,8 @@ std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t addre
         copies.bytes -= bytes.size();
         copies.entries.erase(found);
     }
-    auto buffer = std::make_shared<Buffer>(context, bytes.size(), usage);
-    std::memcpy(buffer->Bytes().data(), bytes.data(), bytes.size());
+    auto buffer = std::make_shared<Buffer>(context, bytes.size(), usage, Buffer::Access::UploadOnly);
+    std::memcpy(buffer->WriteBytes().data(), bytes.data(), bytes.size());
     if (bytes.size() > SnapshotCopies::Budget) return buffer;
     while (!copies.recency.empty() && (copies.bytes + bytes.size() > SnapshotCopies::Budget || copies.entries.size() >= SnapshotCopies::MaxEntries)) {
         const auto oldest = copies.entries.find(copies.recency.front());
@@ -1192,7 +1194,7 @@ std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t addre
         copies.recency.pop_front();
     }
     copies.recency.push_back(key);
-    copies.entries.emplace(key, std::pair{buffer, std::prev(copies.recency.end())});
+    copies.entries.emplace(key, SnapshotCopies::Entry{buffer, std::prev(copies.recency.end()), RebarUploads() ? std::vector<std::byte>(bytes.begin(), bytes.end()) : std::vector<std::byte>{}});
     copies.bytes += bytes.size();
     return buffer;
 }
@@ -3224,7 +3226,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 if (!staged) {
                     if (!gpuCopyEligible(region)) continue;
                     const auto allocateStart = std::chrono::steady_clock::now();
-                    region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable), copyBufferProperties(false));
+                    region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable), copyBufferProperties(false), !region.writable && !region.sparse ? Buffer::Access::UploadOnly : Buffer::Access::Default);
                     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 }
                 region.deviceLocal = staged;
@@ -3544,7 +3546,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     // A buffer made by UploadPrepare for a GPU copy that fell back here (its import went) is kept.
     const bool shared = region.buffer == nullptr && !region.hostBacked && !region.writable && !region.sparse && region.bufferEnd == 0 && region.snapshot.size() == bytes;
     if (shared) region.buffer = snapshotCopy(context, region.begin, region.snapshot, usage);
-    else if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(allocated), usage);
+    else if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(allocated), usage, !region.writable && !region.sparse ? Buffer::Access::UploadOnly : Buffer::Access::Default);
     const auto readStart = std::chrono::steady_clock::now();
     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
     if (region.hostBacked || region.writable) {
@@ -3552,8 +3554,8 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         // registered ranges of an address-based shader are read-only to it (AddressRanges).
         const bool written = region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(bytes));
         if (!region.sparse) {
-            GuestMemory::Read(region.begin, region.buffer->Bytes());
-            readBytes += region.buffer->Bytes().size();
+            GuestMemory::Read(region.begin, region.buffer->WriteBytes());
+            readBytes += region.buffer->Size();
             if (written) region.uploaded.assign(region.buffer->Bytes().begin(), region.buffer->Bytes().end());
         } else {
             // `uploaded` holds the backed pieces back to back.
@@ -3572,7 +3574,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         }
     }
     else {
-        if (!shared) std::memcpy(region.buffer->Bytes().data(), region.snapshot.data(), region.snapshot.size());
+        if (!shared) std::memcpy(region.buffer->WriteBytes().data(), region.snapshot.data(), region.snapshot.size());
         readBytes += region.snapshot.size();
     }
     region.snapshot.clear();
@@ -3584,7 +3586,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         static std::uint64_t logicalBytes = 0, readTotalBytes = 0;
         static std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> outside;
         std::lock_guard lock(reasonsMutex);
-        const auto bufferBytes = region.buffer->Bytes().size();
+        const auto bufferBytes = region.buffer->Size();
         logicalBytes += bytes;
         readTotalBytes += readBytes;
         if (!region.hostBacked && !region.writable) { ++snapshotOnly; snapshotBytes += bufferBytes; }
@@ -3637,7 +3639,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 // Or no shadow to be had: a host copy serves the region instead, aligned or not.
                 region->deviceLocal = false;
                 region->unstaged = true;
-                region->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable), copyBufferProperties(false));
+                region->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable), copyBufferProperties(false), !region->writable && !region->sparse ? Buffer::Access::UploadOnly : Buffer::Access::Default);
             }
             if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
         }

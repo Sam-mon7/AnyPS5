@@ -2593,6 +2593,7 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
 }
 
 bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {
+    if (entry.buffer->UploadOnly()) return false;
     const auto held = entry.buffer->Bytes();
     if (held.size() != bytes || bytes == 0) return false;
     constexpr std::uint64_t block = 65536;
