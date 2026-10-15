@@ -2148,6 +2148,41 @@ static void CheckAvailableDirectMemoryIsLargestFreeBlock() {
     Require(start == top && size == static_cast<std::size_t>(window));
 }
 
+static GuestAllocations::Lease pinHolder;
+
+static bool PinWaiterTakesANewLease(std::uintptr_t, std::size_t) {
+    pinHolder = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
+    return true;
+}
+
+static void CheckPinnedRangeIsLeftOutOfNewLeases() {
+    constexpr std::size_t page = 0x4000;
+    const auto failed = reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));
+    void* raw = mmap_nid_postfix(nullptr, page * 2, 3, 0x1002, -1, 0);
+    Require(raw != failed);
+    const auto holds = [&] {
+        return std::count_if(pinHolder.begin(), pinHolder.end(), [&](const auto& range) { return range->address == reinterpret_cast<std::uintptr_t>(raw); }) == 1;
+    };
+    pinHolder = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
+    Require(holds());
+    GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(PinWaiterTakesANewLease);
+    bool unmapped = false;
+    try {
+        unmapped = munmap_nid_postfix(raw, page * 2) == 0;
+    } catch (const std::exception&) {
+    }
+    GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(nullptr);
+    Require(unmapped);
+    Require(!holds());
+    pinHolder.clear();
+    void* again = mmap_nid_postfix(nullptr, page, 3, 0x1002, -1, 0);
+    Require(again != failed);
+    auto lease = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
+    Require(std::count_if(lease.begin(), lease.end(), [&](const auto& range) { return range->address == reinterpret_cast<std::uintptr_t>(again); }) == 1);
+    lease.clear();
+    Require(munmap_nid_postfix(again, page) == 0);
+}
+
 static void CheckMunmapOverUnmappedPages() {
     constexpr std::size_t page = 0x4000;
     const auto failed = reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));
@@ -2173,6 +2208,8 @@ static void CheckMunmapOverUnmappedPages() {
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "1000");
+#else
+    setenv("APS5_PIN_WAIT_MS", "1000", 1);
 #endif
     CheckAvailableDirectMemoryIsLargestFreeBlock();
     CheckVirtualQuerySplitFlexibleRanges();
@@ -2232,6 +2269,7 @@ int main() {
     CheckSharedWritesDuringHostWrite();
     CheckReadsIntoSharedWriteTracking();
     CheckPinnedSharedPages();
+    CheckPinnedRangeIsLeftOutOfNewLeases();
     CheckFailedCollectKeepsWrites();
 #if defined(__linux__)
     CheckWriteWatch();
