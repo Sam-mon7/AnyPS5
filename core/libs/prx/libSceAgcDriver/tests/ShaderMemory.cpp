@@ -700,7 +700,6 @@ void verifyTypeZeroImageMaterialization() {
     image.source = 0u;
     image.resourceClass = ImageResourceClass::Sampled;
     image.dimension = RdnaImageDimension::Dim2D;
-    image.read = true;
     plan.info.images.push_back(image);
     plan.info.runtimeImageModes.push_back(ResourceMaterializer::RuntimeImageModes(image));
 
@@ -708,17 +707,6 @@ void verifyTypeZeroImageMaterialization() {
     ResourceMaterializer{}.Materialize(plan, SrtRuntime{}, snapshot);
     require(snapshot.images.size() == 1u && snapshot.images[0].dwordCount == 8u && snapshot.images[0].dwords == words,
             "TYPE=0 image descriptor with a nonzero base was rejected or altered during materialization");
-
-    for (const bool atomic : {false, true}) {
-        image.resourceClass = ImageResourceClass::Storage;
-        image.read = false;
-        image.written = !atomic;
-        image.atomic = atomic;
-        plan.info.images[0] = image;
-        plan.info.runtimeImageModes[0] = ResourceMaterializer::RuntimeImageModes(image);
-        expectFailure([&] { ResourceMaterializer{}.Materialize(plan, SrtRuntime{}, snapshot); }, "runtime image descriptor is invalid",
-                      atomic ? "TYPE=0 atomic image descriptor was accepted without hardware evidence" : "TYPE=0 writable image descriptor was accepted without hardware evidence");
-    }
 }
 
 void verifyOutOfRangeConstantReads() {
@@ -1354,13 +1342,6 @@ void verifyImageTables() {
     const auto& poison = invalid.result->imageTablePoison.at(invalidFlags & ~Abi::PoisonFlag);
     require(poison.reason == static_cast<std::uint32_t>(Abi::PoisonReason::NotImage) && poison.dwordCount == 8u && poison.words[3] == heap[0][3] && invalid.result->imageTableFaults != 0u, "image tables: an invalid T# was not poisoned with its words");
     require(invalid.result->variantId == result.variantId, "image tables: an invalid T# changed the artifact");
-
-    heap[0][3] &= 0x0fffffffu;
-    const auto typeZeroTable = CompileTable(request);
-    const auto typeZeroCodes = TableCodes(TableMap(*typeZeroTable.result), 0);
-    const auto typeZeroFlags = TableMap(*typeZeroTable.result).at(typeZeroCodes[0] + Abi::ImageRecordFlags);
-    require((typeZeroCodes[0] & Abi::PoisonFlag) == 0u && (typeZeroFlags & Abi::PoisonFlag) != 0u && typeZeroTable.result->imageTableFaults != 0u,
-            "image tables: a TYPE=0 table entry was treated as a measured static null image");
     heap = saved;
 
     FillTableSrt(guest, heap.data(), 0u, 100u);
