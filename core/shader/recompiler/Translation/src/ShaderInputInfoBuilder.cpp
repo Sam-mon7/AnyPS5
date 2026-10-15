@@ -125,6 +125,14 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         place(PixelInput::PositionFixedPoint, (pixel.inputAddr & PixelInputBit(PixelInput::PositionFixedPoint)) != 0u);
         for (std::uint32_t i = 0; i < 8; ++i) {
             pixelStorage.targetOutputMode[i] = pixel.targetOutputMode[i];
+            pixelStorage.targetOutputType[i] = ResolveColorOutputType(pixel.targetOutputMode[i], pixel.targetOutputType[i]);
+            const auto type = pixelStorage.targetOutputType[i];
+            const auto mode = pixel.targetOutputMode[i];
+            if (type != ColorOutputType::Float && type != ColorOutputType::Uint && type != ColorOutputType::Sint) throw std::runtime_error("invalid color output type");
+            if (mode == 7u && type != ColorOutputType::Uint) throw std::runtime_error("UINT16 color export needs an unsigned integer attachment");
+            if ((type == ColorOutputType::Uint || type == ColorOutputType::Sint) && mode != 0u && mode != 1u && mode != 2u && mode != 3u && mode != 9u && !(mode == 7u && type == ColorOutputType::Uint)) {
+                throw std::runtime_error("integer attachment needs a raw32 or UINT16 color export");
+            }
         }
         pixelStorage.psPosX = pixel.posX;
         pixelStorage.psPosY = pixel.posY;

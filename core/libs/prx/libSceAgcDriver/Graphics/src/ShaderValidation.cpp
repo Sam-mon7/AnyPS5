@@ -645,9 +645,10 @@ std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders,
     for (const auto& [location, signature] : previous.outputs) {
         if (location >= attachments) continue;
         const auto color = std::find_if(state.colors.begin(), state.colors.end(), [&](const ColorTarget& target) { return target.exportIndex == location; });
-        const bool uintExport = color != state.colors.end() && color->uintExport;
+        const auto outputType = color != state.colors.end() ? ColorOutputTypeOf(*color) : ShaderRecompiler::ColorOutputType::Float;
         const bool packed = color != state.colors.end() && color->packing != ShaderRecompiler::ColorExportPacking::None;
-        Require(signature == (uintExport || packed ? "vertex:u32x4" : "vertex:f32x4"), packed ? "fragment shader must export uint4 words to its packed 10_11_11 unorm attachments" : uintExport ? "fragment shader must export uint4 colors to its unsigned integer attachments" : "fragment shader must export float4 colors to its attachments");
+        const auto expected = packed || outputType == ShaderRecompiler::ColorOutputType::Uint ? "vertex:u32x4" : outputType == ShaderRecompiler::ColorOutputType::Sint ? "vertex:i32x4" : "vertex:f32x4";
+        Require(signature == expected, "fragment output numeric type disagrees with its attachment (expected " + std::string(expected) + ", got " + signature + ")");
         locations.insert(location);
     }
     Require(!state.dualSourceBlend || previous.secondSource == "f32x4", "dual-source blending needs a float4 second color at location 0 index 1");

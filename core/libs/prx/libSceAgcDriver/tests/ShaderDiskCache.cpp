@@ -525,6 +525,14 @@ void verifyKeySensitivity() {
     require(fragment.Key() == fragmentKey && RecompileCacheKey::ContextHash(fragment.request) == fragmentContextKey, "runtime export mapping changed the fragment artifact key");
     fragment.request.context.pixel->targetOutputMode[0] = 7;
     require(fragment.Key() != fragmentKey, "integer fragment output reused a float interface");
+    fragment.request.context.pixel->targetOutputMode[0] = 9;
+    fragment.request.context.pixel->targetOutputType[0] = ColorOutputType::Uint;
+    const auto uintKey = fragment.Key();
+    require(uintKey != fragmentKey && RecompileCacheKey::ContextHash(fragment.request) != fragmentContextKey, "raw32 unsigned attachment reused a float interface");
+    fragment.request.context.pixel->targetOutputType[0] = ColorOutputType::Sint;
+    require(fragment.Key() != uintKey && fragment.Key() != fragmentKey, "raw32 signed attachment reused an unsigned or float interface");
+    fragment.request.context.pixel->targetOutputType[0] = ColorOutputType::Float;
+    require(fragment.Key() == fragmentKey, "explicit float attachment changed the legacy float interface");
 }
 
 void verifyFloatModeSerialization() {

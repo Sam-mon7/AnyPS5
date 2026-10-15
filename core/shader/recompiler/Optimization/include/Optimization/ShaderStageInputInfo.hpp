@@ -157,6 +157,7 @@ struct ShaderPixelInputInfo {
         return vgprs;
     }();
     std::uint8_t targetOutputMode[8] = {};
+    ColorOutputType targetOutputType[8] = {};
     std::uint32_t scratchSizeDwords = 0;
     bool psPosX = false;
     bool psPosY = false;

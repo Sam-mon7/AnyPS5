@@ -1,4 +1,5 @@
 #include "ControlFlow/RequestSerializer.hpp"
+#include <algorithm>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -752,7 +753,8 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(23u);
+    const bool numericOutputs = request.context.pixel && std::any_of(request.context.pixel->targetOutputType.begin(), request.context.pixel->targetOutputType.end(), [](auto type) { return type != ColorOutputType::Auto; });
+    writer.WriteU32(numericOutputs ? 0x80000017u : 23u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -776,6 +778,9 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteU32(request.target.registrationWordLimit);
     writer.WriteBool(request.target.vertexSubgroups);
     writer.WriteBool(request.target.float16DenormPreserve);
+    if (numericOutputs) {
+        for (const auto type : request.context.pixel->targetOutputType) writer.WriteU8(static_cast<std::uint8_t>(type));
+    }
     return base64Encode(buffer);
 }
 
@@ -783,7 +788,9 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     const std::string decoded = base64Decode(text);
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
-    const auto version = reader.ReadU32();
+    const auto encodedVersion = reader.ReadU32();
+    const bool numericOutputs = encodedVersion == 0x80000017u;
+    const auto version = numericOutputs ? 23u : encodedVersion;
     if (version < 1u || version > 23u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
@@ -809,6 +816,14 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     if (version >= 17u) result.request.target.registrationWordLimit = reader.ReadU32();
     if (version >= 18u) result.request.target.vertexSubgroups = reader.ReadBool();
     if (version >= 21u) result.request.target.float16DenormPreserve = reader.ReadBool();
+    if (numericOutputs) {
+        if (!result.request.context.pixel) throw std::runtime_error("RequestSerializer: numeric outputs require a pixel stage");
+        for (auto& type : result.request.context.pixel->targetOutputType) {
+            const auto value = reader.ReadU8();
+            if (value > static_cast<std::uint8_t>(ColorOutputType::Sint)) throw std::runtime_error("RequestSerializer: invalid color output type");
+            type = static_cast<ColorOutputType>(value);
+        }
+    }
     return result;
 }
 

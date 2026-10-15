@@ -181,6 +181,7 @@ private:
         append(key, value.alphaToCoverage);
         append(key, value.stencilRefExportEnable);
         append(key, value.targetOutputMode);
+        for (std::size_t i = 0; i < value.targetOutputType.size(); ++i) append(key, ResolveColorOutputType(value.targetOutputMode[i], value.targetOutputType[i]));
     }
 
     static void append(std::vector<std::uint64_t>& key, const ShaderVertexResourceDestination& value) {

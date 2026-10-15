@@ -2658,6 +2658,23 @@ void verifyVertexInfoVersion19() {
     pixel.context.pixel = ShaderPixelStageInfo{};
     pixel.context.pixel->rasterPrimitive = RasterPrimitive::Rectangle;
     const auto encodedPixel = serializer.Serialize(pixel);
+    auto typedPixel = pixel;
+    typedPixel.context.pixel->targetOutputType[0] = ColorOutputType::Uint;
+    typedPixel.context.pixel->targetOutputType[3] = ColorOutputType::Sint;
+    const auto typedEncoded = serializer.Serialize(typedPixel);
+    auto typedBytes = decodeBase64(typedEncoded);
+    require(typedBytes[4] == 23u && typedBytes[7] == 128u, "the local numeric-output capture reused an upstream format version");
+    const auto typedReplay = serializer.Deserialize(typedEncoded);
+    require(typedReplay.request.context.pixel->targetOutputType == typedPixel.context.pixel->targetOutputType && serializer.Serialize(typedReplay.request) == typedEncoded, "attachment numeric types did not round-trip");
+    for (std::size_t omitted = 1; omitted <= 8; ++omitted) {
+        auto truncated = typedBytes;
+        truncated.resize(truncated.size() - omitted);
+        expectFailure([&] { serializer.Deserialize(encodeBase64(truncated)); }, "truncated data", "a truncated numeric-output capture was accepted");
+    }
+    typedBytes.back() = 255u;
+    expectFailure([&] { serializer.Deserialize(encodeBase64(typedBytes)); }, "invalid color output type", "an invalid numeric output type was accepted");
+    require(serializer.Deserialize(encodedPixel).request.context.pixel->targetOutputType == pixel.context.pixel->targetOutputType, "a legacy capture acquired numeric output types");
+
     auto exportedPixel = pixel;
     exportedPixel.context.pixel->layerExported = true;
     const auto exportedBytes = decodeBase64(serializer.Serialize(exportedPixel));
