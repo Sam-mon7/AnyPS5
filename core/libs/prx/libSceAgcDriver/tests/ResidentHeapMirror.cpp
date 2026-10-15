@@ -1,6 +1,7 @@
 #include "BdaShader.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
@@ -122,6 +123,9 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         mutation.Add(raw, 2 * block, true, true, true);
     }
     const std::array<std::uint32_t, 2> values{0x12345678u, 0xabcdef09u};
+    const auto rebarBefore = RebarMemory().allocations.load();
+    const auto fallbackBefore = RebarMemory().overBudget.load();
+    const auto liveBefore = RebarMemory().live.load();
     VkDeviceAddress serving = 0;
     const auto dispatch = [&](bool written, const std::function<void()>& beforeWriteBack = {}) {
         Memory::BumpCollectEpoch();
@@ -159,6 +163,10 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         return output;
     };
     dispatch(true, [&] { static_cast<volatile std::uint8_t*>(raw)[8] = 0x55; });
+    if (resident && RebarMirrors()) {
+        if (context.RebarMemoryType(UINT32_MAX) && RebarMemory().limit >= liveBefore + 2 * block) Require(RebarMemory().live.load() >= liveBefore + 2 * block, "resident heap was not allocated in budgeted ReBAR memory");
+        if (RebarMemory().limit == 0) Require(RebarMemory().overBudget.load() > fallbackBefore, "resident heap did not fall back when the ReBAR budget was full");
+    } else Require(RebarMemory().allocations.load() == rebarBefore, "sparse or nonresident heap allocated ReBAR memory");
     const bool synchronousPublished = std::memcmp(raw, values.data(), sizeof(values)) == 0;
     const bool synchronousCpuPreserved = static_cast<std::uint8_t*>(raw)[8] == 0x55;
     auto synchronousRead = dispatch(false);
