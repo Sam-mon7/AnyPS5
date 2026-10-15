@@ -118,6 +118,12 @@ static int munmap_release(void* addr) {
 }
 
 static int mprotect(void* addr, size_t len, int prot) {
+    const auto* queryCache = std::getenv("APS5_GUEST_QUERY_CACHE");
+    if (queryCache != nullptr && std::strcmp(queryCache, "1") == 0 && KernelArena::Get().Contains(addr, len)) {
+        if (prot != PROT_NONE) CommitArenaRange(addr, len, WinProtFromPosix(prot));
+        else GuestArena::GuestArenaProtectMemory_nid_postfix(addr, len, WinProtFromPosix(prot));
+        return 0;
+    }
     GuestArena::GuestArenaSetProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(addr), len, WinProtFromPosix(prot));
     if (prot != PROT_NONE && KernelArena::Get().Contains(addr, len)) CommitArenaRange(addr, len, WinProtFromPosix(prot));
     auto cursor = reinterpret_cast<std::uintptr_t>(addr);

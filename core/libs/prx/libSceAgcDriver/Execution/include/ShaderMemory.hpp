@@ -16,6 +16,9 @@
 namespace ShaderRecompiler {
 struct SourceHandle;
 class PreparedShaderInvocation;
+struct IrResourcePlan;
+struct SrtRuntime;
+struct ImageTableSnapshot;
 }
 
 namespace AgcDriver {
@@ -76,6 +79,10 @@ public:
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
+    struct TableCacheCounts {
+        std::uint64_t hits, misses, invalidations;
+    };
+    static TableCacheCounts TableCacheStatistics();
 
 private:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
@@ -120,6 +127,8 @@ private:
     static bool readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
     static bool pending(void* context, std::uint64_t address, std::uint64_t bytes);
+    static bool reuseTables(void* context, const ShaderRecompiler::IrResourcePlan& plan, const ShaderRecompiler::SrtRuntime& runtime, ShaderRecompiler::ImageTableSnapshot& tables);
+    static void rememberTables(void* context, const ShaderRecompiler::IrResourcePlan& plan, const ShaderRecompiler::SrtRuntime& runtime, const ShaderRecompiler::ImageTableSnapshot& tables);
     Page& page(std::uint64_t base);
     [[nodiscard]] bool overlapsInitial(std::uint64_t begin, std::uint64_t end) const;
 
@@ -132,6 +141,9 @@ private:
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
+    std::uint64_t tableCaptureGeneration = 0;
+    std::size_t tableTraceLeaves = 0, tableTraceOther = 0, tableUserReads = 0;
+    bool tableCacheUnsafe = false;
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a

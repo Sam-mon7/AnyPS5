@@ -29,6 +29,8 @@ void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t byt
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule);
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes);
 #ifdef _WIN32
+std::size_t GuestArenaQueryMemory_nid_postfix(const void* address, void* information, std::size_t bytes);
+void GuestArenaProtectMemory_nid_postfix(void* address, std::size_t bytes, std::uint32_t protection);
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes);
