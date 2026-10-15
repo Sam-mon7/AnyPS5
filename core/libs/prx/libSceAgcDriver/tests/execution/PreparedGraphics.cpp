@@ -156,7 +156,7 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
         Require(repeated.first == 0u && repeated.second == 0u, "registration modules: another materialization of the same stages did not find the prebuilt libraries");
     }
     for (const auto& stage : stages) stage.snapshot->prepared->entries.push_back(stage.entry);
-    const auto& pixelArtifact = GetPreparedArtifact(*stages.back().entry.handle);
+    const auto& pixelArtifact = GetPreparedArtifact(*stages.back().entry.Pin());
     Require(!pixelArtifact.fragmentParameters.empty() && pixelArtifact.fragmentParameters.front().sourceLocation == 3u, "prepared fragment lost interpolant mapping");
     if (!mesh && !tessellation) {
         const auto frontCount = front.snapshot->prepared->entries.size();
@@ -179,7 +179,7 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
             if (primitiveFirst) ResolvePreparedGraphics(*front.snapshot, {}, 7, target);
             ResolvePreparedGraphics(*front.snapshot, fragment.snapshot, 0, target);
             if (!primitiveFirst) ResolvePreparedGraphics(*front.snapshot, {}, 17, target);
-            const auto vertexId = GetPreparedArtifact(*stages.front().entry.handle).variantId;
+            const auto vertexId = GetPreparedArtifact(*stages.front().entry.Pin()).variantId;
             const auto rectangle = PreparedRectangle(*front.snapshot, vertexId, pixelArtifact.variantId);
             Require(!rectangle.control.spirv.empty() && !rectangle.evaluation.spirv.empty(), "separate helpers did not prepare rectangle shaders");
             const auto count = front.snapshot->prepared->rectangles.size();
@@ -192,12 +192,12 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
         const auto newStages = PrepareGraphicsStages(changed, target);
         front.snapshot->prepared->entries.push_back(newStages.front().entry);
         ResolvePreparedGraphics(*front.snapshot, {}, 7, target);
-        const auto newVertexId = GetPreparedArtifact(*newStages.front().entry.handle).variantId;
-        Require(newVertexId != GetPreparedArtifact(*stages.front().entry.handle).variantId, "rectangle test did not change the vertex variant");
+        const auto newVertexId = GetPreparedArtifact(*newStages.front().entry.Pin()).variantId;
+        Require(newVertexId != GetPreparedArtifact(*stages.front().entry.Pin()).variantId, "rectangle test did not change the vertex variant");
         static_cast<void>(PreparedRectangle(*front.snapshot, newVertexId, pixelArtifact.variantId));
         fragment.snapshot->prepared->entries.push_back(newStages.back().entry);
         ResolvePreparedGraphics(*front.snapshot, fragment.snapshot, 0, target);
-        const auto newPixelId = GetPreparedArtifact(*newStages.back().entry.handle).variantId;
+        const auto newPixelId = GetPreparedArtifact(*newStages.back().entry.Pin()).variantId;
         Require(newPixelId != pixelArtifact.variantId, "rectangle test did not change the fragment variant");
         static_cast<void>(PreparedRectangle(*front.snapshot, newVertexId, newPixelId));
         auto temporary = std::make_shared<ShaderSnapshot>();
@@ -215,16 +215,16 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
         auto unlinked = std::make_shared<ShaderSnapshot>();
         unlinked->type = 1;
         unlinked->prepared->entries.push_back(drawStages.back().entry);
-        const auto drawPixelId = GetPreparedArtifact(*drawStages.back().entry.handle).variantId;
-        const auto drawVertexId = GetPreparedArtifact(*drawStages.front().entry.handle).variantId;
-        Require(drawVertexId == GetPreparedArtifact(*stages.front().entry.handle).variantId && drawPixelId != pixelArtifact.variantId && drawPixelId != newPixelId, "draw-only fragment test did not isolate a new fragment variant");
+        const auto drawPixelId = GetPreparedArtifact(*drawStages.back().entry.Pin()).variantId;
+        const auto drawVertexId = GetPreparedArtifact(*drawStages.front().entry.Pin()).variantId;
+        Require(drawVertexId == GetPreparedArtifact(*stages.front().entry.Pin()).variantId && drawPixelId != pixelArtifact.variantId && drawPixelId != newPixelId, "draw-only fragment test did not isolate a new fragment variant");
         const auto drawRectangle = DrawRectangle(*front.snapshot, unlinked, drawVertexId, drawPixelId, target);
         Require(!drawRectangle.control.spirv.empty() && !drawRectangle.evaluation.spirv.empty(), "a rect-list draw did not prepare the rectangle of a fragment variant prepared at draw");
         static_cast<void>(PreparedRectangle(*front.snapshot, drawVertexId, drawPixelId));
     }
     if (!dump.empty()) {
         for (std::size_t index = 0; index < stages.size(); ++index) {
-            const auto& words = GetPreparedArtifact(*stages[index].entry.handle).spirv;
+            const auto& words = GetPreparedArtifact(*stages[index].entry.Pin()).spirv;
             const auto name = dump / (std::to_string(static_cast<unsigned>(path)) + "-" + std::to_string(index) + ".spv");
             std::ofstream output(name, std::ios::binary);
             output.write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * sizeof(std::uint32_t)));
@@ -343,8 +343,8 @@ void NullPixelMatchesRegistration(AgcDriver::VulkanDevice& device) {
     const auto& fragment = draw.programs.back();
     Require(fragment.snapshot == null && fragment.userData.empty(), "a null pixel draw took the last pixel shader's user SGPRs");
     const auto stages = PrepareGraphicsStages(draw, device.Target());
-    const auto& handle = stages.back().entry.handle;
-    Require(std::ranges::any_of(registered, [&](const auto& entry) { return entry.handle == handle; }), "a null pixel draw did not match the variant prepared at registration");
+    const auto& handle = stages.back().entry.Pin();
+    Require(std::ranges::any_of(registered, [&](const auto& entry) { return entry.Pin() == handle; }), "a null pixel draw did not match the variant prepared at registration");
 }
 
 }

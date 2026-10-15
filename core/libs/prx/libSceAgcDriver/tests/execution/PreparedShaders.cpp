@@ -60,11 +60,11 @@ void RunUnregistered(AgcDriver::VulkanDevice& device, ShaderRecompiler::Recompil
         request.shader.code = snapshot.code;
         if (sourceFirst) {
             const auto handle = AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request);
-            Require(snapshot.prepared->entries.size() == 1 && snapshot.prepared->entries.front().handle == handle, "unregistered compute source was not cached");
+            Require(snapshot.prepared->entries.size() == 1 && snapshot.prepared->entries.front().Pin() == handle, "unregistered compute source was not cached");
         }
         static_cast<void>(AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request));
         Require(snapshot.prepared->entries.size() == 1, "unregistered compute invocation did not cache exactly one artifact");
-        const auto handle = snapshot.prepared->entries.front().handle;
+        const auto handle = snapshot.prepared->entries.front().Pin();
         const auto& artifact = ShaderRecompiler::GetPreparedArtifact(*handle);
         for (const bool useCache : {false, true}) {
             request.useCache = useCache;
@@ -94,7 +94,7 @@ void NullPixelAtDraw(AgcDriver::VulkanDevice& device) {
     static_cast<void>(AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request));
     Require(snapshot.prepared->entries.size() == 2, "the null pixel program was not prepared at draw");
     static_cast<void>(AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request));
-    Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == snapshot.prepared->entries.back().handle && snapshot.prepared->entries.size() == 2, "the null pixel program was prepared again for the same draw");
+    Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == snapshot.prepared->entries.back().Pin() && snapshot.prepared->entries.size() == 2, "the null pixel program was prepared again for the same draw");
 }
 
 void Run(AgcDriver::VulkanDevice& device) {
@@ -108,7 +108,7 @@ void Run(AgcDriver::VulkanDevice& device) {
         AgcDriver::DriverDetail::ShaderSnapshot unpredicted{request.shader.codeAddress, 0, 0, {code.begin(), code.end()}, {}};
         unpredicted.header.resize(sizeof(Shader));
         const auto prepared = AgcDriver::DriverDetail::SourceHandleFor(unpredicted, 0, request);
-        Require(unpredicted.prepared->entries.size() == 1 && unpredicted.prepared->entries.front().handle == prepared, "a registered shader with no matching artifact was not prepared");
+        Require(unpredicted.prepared->entries.size() == 1 && unpredicted.prepared->entries.front().Pin() == prepared, "a registered shader with no matching artifact was not prepared");
         Require(AgcDriver::DriverDetail::SourceHandleFor(unpredicted, 0, request) == prepared && unpredicted.prepared->entries.size() == 1, "an artifact prepared at a dispatch was not reused");
     }
     AgcDriver::DriverDetail::ShaderSnapshot snapshot{request.shader.codeAddress, 0, 0, {code.begin(), code.end()}, {}};
@@ -171,7 +171,7 @@ void Run(AgcDriver::VulkanDevice& device) {
     runtime.userData = users;
     const auto capture = ShaderRecompiler::CaptureResources(request, runtime, *handle);
     request.context.compute->numThreads[0] = 2;
-    Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == snapshot.prepared->entries[1].handle, "a dispatch did not find the artifact prepared for its state");
+    Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == snapshot.prepared->entries[1].Pin(), "a dispatch did not find the artifact prepared for its state");
     ExpectFailure([&] { static_cast<void>(ShaderRecompiler::CaptureResources(request, runtime, *handle)); }, "does not match the static ABI");
     ExpectFailure([&] { static_cast<void>(ShaderRecompiler::MaterializeShader(request, *capture, *handle)); }, "does not match the static ABI");
     const auto otherHandle = ShaderRecompiler::PrepareShader(request);
