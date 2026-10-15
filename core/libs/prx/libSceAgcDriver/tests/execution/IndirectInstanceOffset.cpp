@@ -258,7 +258,7 @@ void Run(const std::shared_ptr<AgcDriver::VulkanDevice>& device) {
 int main() {
     try {
         Analysis();
-        const auto device = OpenVulkanTestDevice();
+        std::shared_ptr<AgcDriver::VulkanDevice> device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Run(device);
         std::cout << "different-destination instance offset tests passed\n";
