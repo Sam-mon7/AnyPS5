@@ -8,7 +8,7 @@ namespace AgcDriver::Graphics {
 
 class Buffer {
 public:
-    enum class Access { Default, UploadOnly };
+    enum class Access { Default, UploadOnly, ResidentMirror };
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, Access access = Access::Default);
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, Access access);
     ~Buffer();
@@ -20,6 +20,7 @@ public:
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
     std::span<std::byte> Bytes();
     std::span<std::byte> WriteBytes();
+    std::span<const std::byte> ReadBytes(std::size_t offset, std::size_t bytes);
     std::size_t Size() const { return size; }
     bool UploadOnly() const { return uploadOnly; }
     bool Mapped() const { return mapping != nullptr; }
@@ -42,6 +43,7 @@ private:
     VkDeviceSize offset = 0;
     bool slab = false;
     bool uploadOnly = false;
+    bool residentMirror = false;
     std::uint32_t memoryType = UINT32_MAX;
     VkDeviceSize rebarBytes = 0;
     VkBufferUsageFlags usage;

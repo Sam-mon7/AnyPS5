@@ -28,6 +28,7 @@ public:
 
 RebarBudget& RebarMemory();
 bool RebarUploads();
+bool RebarMirrors();
 
 }
 

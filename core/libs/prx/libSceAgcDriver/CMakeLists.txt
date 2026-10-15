@@ -1010,6 +1010,8 @@ add_custom_command(
 
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
+        tests/ResidentHeapMirror.cpp
+        tests/BdaShader.cpp
         tests/ResidentPresent.cpp
         ${agcTriangleHeaders}
         ${agcSampleLodShaderHeader}
@@ -1026,6 +1028,7 @@ target_include_directories(agc_driver_recorder_tests PRIVATE
 )
 
 target_link_libraries(agc_driver_recorder_tests PRIVATE
+        shader_recompiler_agc_driver
         libkernel
         libSceAgcDriver
         SDL2-static
@@ -1036,6 +1039,16 @@ set_target_properties(agc_driver_recorder_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_recorder_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_driver_recorder_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    if(WIN32)
+        foreach(residentHeapMode IN ITEMS off on)
+            add_test(NAME agc_resident_heap_${residentHeapMode} COMMAND agc_driver_recorder_tests --resident-heap-only)
+            set_tests_properties(agc_resident_heap_${residentHeapMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_RESIDENT_HEAP_MIRRORS=unset:")
+            if(residentHeapMode STREQUAL "on")
+                set_property(TEST agc_resident_heap_${residentHeapMode} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RESIDENT_HEAP_MIRRORS=set:1")
+            endif()
+        endforeach()
+    endif()
     add_test(NAME agc_pipeline_cache COMMAND agc_driver_recorder_tests --pipeline-cache-only)
     add_test(NAME agc_pipeline_cache_file COMMAND agc_driver_recorder_tests --pipeline-cache-file-only)
     add_test(NAME agc_pipeline_library COMMAND agc_driver_recorder_tests --pipeline-library-only)
@@ -2291,4 +2304,24 @@ if(BUILD_TESTING)
         endforeach()
         set_property(TEST ${rebarTest}_rebar APPEND PROPERTY ENVIRONMENT "APS5_REBAR_UPLOADS=1;APS5_REBAR_CHECK=1")
     endforeach()
+endif()
+
+if(BUILD_TESTING)
+    add_test(NAME agc_recorder COMMAND agc_driver_recorder_tests)
+    set_tests_properties(agc_recorder PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1")
+    if(WIN32)
+        set_tests_properties(agc_recorder PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+if(BUILD_TESTING AND WIN32)
+    foreach(rebarMirrorMode IN ITEMS resident fallback requires_resident)
+        add_test(NAME agc_rebar_mirrors_${rebarMirrorMode} COMMAND agc_driver_recorder_tests --resident-heap-only)
+        set_tests_properties(agc_rebar_mirrors_${rebarMirrorMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "APS5_REBAR_MIRRORS=1;APS5_REBAR_CHECK=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_RESIDENT_HEAP_MIRRORS=unset:")
+        if(NOT rebarMirrorMode STREQUAL "requires_resident")
+            set_property(TEST agc_rebar_mirrors_${rebarMirrorMode} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RESIDENT_HEAP_MIRRORS=set:1")
+        endif()
+    endforeach()
+    set_property(TEST agc_rebar_mirrors_fallback APPEND PROPERTY ENVIRONMENT "APS5_REBAR_MIB=0")
 endif()

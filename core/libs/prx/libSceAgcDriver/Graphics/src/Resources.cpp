@@ -54,8 +54,9 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, Access access) : Buffer(context, size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, access) {}
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, Access access) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties), uploadOnly(access == Access::UploadOnly && RebarUploads()) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, Access access) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties), uploadOnly(access == Access::UploadOnly && RebarUploads()), residentMirror(access == Access::ResidentMirror) {
     Require(size != 0, "zero-sized GPU buffer");
+    const bool rebarRequested = uploadOnly || access == Access::ResidentMirror;
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
@@ -90,7 +91,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         }
         ready = true;
     };
-    if (!uploadOnly) if (const auto allocation = cache->Take(size, this->usage, properties)) {
+    if (!rebarRequested) if (const auto allocation = cache->Take(size, this->usage, properties)) {
         reuse(*allocation);
         return;
     }
@@ -119,7 +120,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         } else {
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, properties);
         }
-        if (uploadOnly) {
+        if (rebarRequested) {
             const auto hostType = allocation.memoryTypeIndex;
             const auto type = context.RebarMemoryType(requirements.memoryTypeBits);
             if (type) {
@@ -206,7 +207,14 @@ VkBuffer Buffer::Handle() const {
 std::span<std::byte> Buffer::Bytes() {
     static const bool check = [] { const auto* value = std::getenv("APS5_REBAR_CHECK"); return value != nullptr && std::strcmp(value, "1") == 0; }();
     Require(!check || !uploadOnly, "CPU read of an upload-only buffer");
+    Require(!check || !residentMirror, "CPU mirror read requires an explicit publication span");
     return WriteBytes();
+}
+
+std::span<const std::byte> Buffer::ReadBytes(std::size_t offset, std::size_t bytes) {
+    Require(!uploadOnly, "CPU read of an upload-only buffer");
+    Require(offset <= size && bytes <= size - offset, "CPU mirror read exceeds its buffer");
+    return WriteBytes().subspan(offset, bytes);
 }
 
 std::span<std::byte> Buffer::WriteBytes() {

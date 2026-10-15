@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -536,6 +537,8 @@ bool WaitSatisfied(std::span<const std::uint32_t> packet) {
 }
 
 bool WaitSatisfiedUnchecked(std::span<const std::uint32_t> packet) {
+    static const bool resident = [] { const auto* value = std::getenv("APS5_RESIDENT_HEAP_MIRRORS"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    if (resident) return WaitSatisfied(packet);
     const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
     const auto source = address(packet[2], packet[3]);
     const std::uint64_t value = wide ? *reinterpret_cast<const volatile std::uint64_t*>(source) : *reinterpret_cast<const volatile std::uint32_t*>(source);

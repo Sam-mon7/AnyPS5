@@ -19,6 +19,11 @@ bool RebarUploads() {
     return enabled;
 }
 
+bool RebarMirrors() {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_REBAR_MIRRORS"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    return enabled;
+}
+
 RebarBudget& RebarMemory() {
     static RebarBudget budget([] {
         const auto* value = std::getenv("APS5_REBAR_MIB");
