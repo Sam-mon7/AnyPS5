@@ -1348,6 +1348,11 @@ ShaderSnapshot PrepareNullPixelProgram(const VulkanDevice& device) {
     return null;
 }
 
+std::shared_ptr<const ShaderRegistry> Driver::RegisteredShaders() {
+    std::lock_guard lock(mutex);
+    return shaders;
+}
+
 void Driver::RegisterShader(const Shader* shader) {
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.Register");

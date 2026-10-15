@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "../NarrowConstantStoreFixture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -624,6 +625,19 @@ void LazyRegistration() {
     header.shader.num_sh_registers = 255;
     ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "truncated shader metadata");
     header.shader.num_sh_registers = header.registers.size();
+    const auto registered = [&] {
+        const auto registry = AgcDriver::DriverDetail::Driver::Get().RegisteredShaders();
+        Require(registry != nullptr, "lazy registration published no shader registry");
+        auto snapshot = AgcDriver::DriverDetail::RegisteredHeader(*registry, &header.shader);
+        Require(snapshot != nullptr, "lazy registration published no snapshot");
+        return snapshot;
+    };
+    const auto lazySnapshot = registered();
+    {
+        AgcDriver::DriverDetail::ShaderPreparationTransaction transaction;
+        const auto& state = transaction.Read(*lazySnapshot);
+        Require(state.deferred && state.entries.empty(), "lazy registration prepared the shader before its first dispatch");
+    }
     constexpr std::size_t outputBytes = 65536;
 #ifdef _WIN32
     auto* allocation = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, outputBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -657,6 +671,10 @@ void LazyRegistration() {
             const auto expected = offset < Threads * LaneBytes ? ExpectedLane[offset % LaneBytes] : Fill;
             if (output[offset] != expected) throw std::runtime_error("lazy dispatch " + std::to_string(iteration) + " byte " + std::to_string(offset) + " is " + std::to_string(output[offset]) + ", expected " + std::to_string(expected));
         }
+    }
+    {
+        AgcDriver::DriverDetail::ShaderPreparationTransaction transaction;
+        Require(!transaction.Read(*lazySnapshot).entries.empty(), "the first dispatch did not prepare the lazily registered shader");
     }
     AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, {});
     alignas(256) static const std::array<std::uint32_t, 1> invalid{0xbf9f0000u};
