@@ -2,7 +2,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuCopyCheckpoints.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -139,6 +143,7 @@ struct MockDevice {
     std::uint64_t destroyedBuffers = 0;
     VkDeviceSize liveBytes = 0;
     std::map<VkDeviceMemory, VkDeviceSize> memoryBytes;
+    std::map<VkDeviceMemory, std::uint32_t> memoryTypes;
     std::map<VkBuffer, std::pair<VkDeviceMemory, VkDeviceSize>> bound;
     std::set<VkBuffer> liveBuffers;
     std::deque<VkResult> results;
@@ -161,7 +166,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateBuffer(VkDevice, const VkBufferCreateIn
 }
 
 VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer buffer, VkMemoryRequirements* requirements) {
-    *requirements = {mock.sizes.at(buffer), 256, 3};
+    *requirements = {mock.sizes.at(buffer), 256, 7};
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
@@ -177,7 +182,8 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAlloca
         return result;
     }
     *memory = reinterpret_cast<VkDeviceMemory>(static_cast<std::uintptr_t>(mock.next++));
-    if (info->memoryTypeIndex == 1) mock.hostMemory[*memory].resize(info->allocationSize);
+    if (info->memoryTypeIndex != 0) mock.hostMemory[*memory].resize(info->allocationSize);
+    mock.memoryTypes[*memory] = info->memoryTypeIndex;
     mock.memoryBytes[*memory] = info->allocationSize;
     mock.liveBytes += info->allocationSize;
     ++mock.allocations;
@@ -681,8 +687,84 @@ void PartialSlabDoesNotRetry() {
 
 }
 
+void RebarEligibilityAndBudget() {
+    auto context = mockContext();
+    context.memory.memoryHeapCount = 1;
+    context.memory.memoryHeaps[0].size = 256 * MiB;
+    context.memory.memoryTypes[1].propertyFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    Expect(!context.RebarMemoryType(3), "a 256 MiB BAR was eligible");
+    context.memory.memoryHeaps[0].size += 1;
+    Expect(context.RebarMemoryType(3) == 1, "large coherent visible device heap was rejected");
+    Expect(!context.RebarMemoryType(1), "memory type mask was ignored");
+    context.memory.memoryTypes[1].propertyFlags &= ~VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    Expect(!context.RebarMemoryType(3), "noncoherent device heap was eligible");
+    RebarBudget budget(1024);
+    Expect(budget.Reserve(768) && !budget.Reserve(257) && budget.Reserve(256), "ReBAR budget did not enforce the allocation boundary");
+    Expect(!budget.Reserve(1) && budget.live == 1024 && budget.peak == 1024 && budget.allocations == 2 && budget.overBudget == 2, "ReBAR counters differ from allocations");
+    budget.Release(768);
+    Expect(budget.Reserve(768) && budget.live == 1024, "freed ReBAR budget was not reusable");
+}
+
+void RebarUploadReuse() {
+    if (!RebarUploads()) return;
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        context.limits.minStorageBufferOffsetAlignment = 256;
+        context.limits.maxStorageBufferRange = 1u << 27;
+        struct Cleanup { VkDevice device; ~Cleanup() { ClearSnapshotCopies(device); } } cleanup{context.device};
+        context.memory.memoryHeapCount = 2;
+        context.memory.memoryHeaps[0].size = 512 * MiB;
+        context.memory.memoryHeaps[1].size = 512 * MiB;
+        context.memory.memoryTypeCount = 3;
+        context.memory.memoryTypes[1] = {HostVisible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0};
+        context.memory.memoryTypes[2] = {HostVisible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1};
+        Buffer ordinary(context, 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        Buffer upload(context, 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, Buffer::Access::UploadOnly);
+        const auto rebar = mock.memoryTypes.at(MemoryOf(upload.Handle()));
+        Expect(rebar == (RebarMemory().limit == 0 ? 2u : 1u), "upload did not resolve to ReBAR or budget fallback");
+        Expect(rebar != 1 || MemoryOf(ordinary.Handle()) != MemoryOf(upload.Handle()), "host and ReBAR allocations mixed");
+        if (rebar == 1) {
+            const auto allocations = RebarMemory().allocations.load();
+            { Buffer another(context, 4000, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, Buffer::Access::UploadOnly);
+              Expect(MemoryOf(another.Handle()) == MemoryOf(upload.Handle()), "ReBAR slots did not share their resolved slab"); }
+            Expect(RebarMemory().allocations.load() == allocations && RebarMemory().live.load() == 2 * MiB, "ReBAR slab was charged per slot or released while pooled");
+        }
+        std::memset(upload.WriteBytes().data(), 0x55, upload.Size());
+        bool rejected = false;
+        try { upload.Bytes(); } catch (const std::runtime_error&) { rejected = true; }
+        Expect(rejected, "upload-only CPU read was not rejected");
+        const auto missingBefore = RebarMemory().ineligible.load();
+        {
+            auto host = mockContext();
+            Buffer fallback(host, 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, Buffer::Access::UploadOnly);
+            Expect(mock.memoryTypes.at(MemoryOf(fallback.Handle())) == 1 && RebarMemory().ineligible.load() == missingBefore + 1, "missing ReBAR type did not select host fallback");
+        }
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto snapshot = [&](std::byte value) {
+            auto memory = std::make_shared<GuestBufferMemory>(context);
+            const std::array<std::byte, 16> data{value};
+            memory->AddSnapshot({0x100000, data});
+            memory->Upload(false);
+            return memory;
+        };
+        const auto descriptor = [](const auto& memory) {
+            std::uint32_t adjustment = 0;
+            return memory->Descriptor(0x100000, 16, adjustment).buffer;
+        };
+        const auto first = snapshot(std::byte{0x11});
+        Expect(descriptor(first) == descriptor(snapshot(std::byte{0x11})), "same snapshot bytes were not reused");
+        const auto changed = snapshot(std::byte{0x22});
+        Expect(descriptor(first) != descriptor(changed), "changed snapshot bytes reused the old upload");
+        ClearSnapshotCopies(context.device);
+    }
+    Expect(RebarMemory().live == 0 && mock.liveBytes == 0, "ReBAR allocations stayed charged after the pool was freed");
+}
+
 int main() {
     try {
+        RebarEligibilityAndBudget();
+        RebarUploadReuse();
         CopyDiagnostics();
         SizeClassesAndDirections();
         LargerClass();

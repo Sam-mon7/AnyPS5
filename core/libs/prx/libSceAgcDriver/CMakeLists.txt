@@ -2236,3 +2236,59 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
+
+if(BUILD_TESTING)
+    add_test(NAME agc_rebar_uploads COMMAND agc_buffer_pool_tests)
+    add_test(NAME agc_rebar_uploads_budget_full COMMAND agc_buffer_pool_tests)
+    set_tests_properties(agc_rebar_uploads agc_rebar_uploads_budget_full PROPERTIES ENVIRONMENT "APS5_REBAR_UPLOADS=1;APS5_REBAR_CHECK=1")
+    set_property(TEST agc_rebar_uploads_budget_full APPEND PROPERTY ENVIRONMENT "APS5_REBAR_MIB=0")
+    if(WIN32)
+        set_tests_properties(agc_rebar_uploads agc_rebar_uploads_budget_full PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_storage_upload_lifetime_rebar COMMAND agc_driver_recorder_tests --storage-upload-lifetime-only)
+    add_test(NAME agc_storage_upload_failure_rebar COMMAND agc_driver_recorder_tests --storage-upload-failure-only)
+    add_test(NAME agc_readonly_fallback_reuse_rebar COMMAND agc_driver_recorder_tests --readonly-fallback-only)
+    add_test(NAME agc_driver_depth_zero_reads_rebar COMMAND agc_driver_depth_plane_sampling_tests --zero-only)
+    add_test(NAME agc_driver_depth_large_array_rebar COMMAND agc_driver_depth_plane_sampling_tests --large-only)
+    add_test(NAME agc_driver_depth_large_array_no_memo_rebar COMMAND agc_driver_depth_plane_sampling_tests --large-only)
+    add_test(NAME agc_driver_graphics_rebar COMMAND agc_driver_graphics_tests)
+    add_test(NAME agc_driver_depth_bias_per_face_rebar COMMAND agc_driver_depth_bias_per_face_tests)
+    add_test(NAME agc_driver_depth_compare_copy_rebar COMMAND agc_driver_depth_compare_copy_tests)
+    add_test(NAME agc_driver_depth_fast_clear_rebar COMMAND agc_driver_depth_fast_clear_tests)
+    add_test(NAME agc_driver_depth_fast_clear_submit_rebar COMMAND agc_driver_depth_fast_clear_submit_tests)
+    add_test(NAME agc_driver_depth_plane_guest_layers_rebar COMMAND agc_driver_depth_plane_guest_layers_tests)
+    add_test(NAME agc_driver_depth_plane_sampling_rebar COMMAND agc_driver_depth_plane_sampling_tests)
+    add_test(NAME agc_driver_depth_storage_rebar COMMAND agc_driver_depth_storage_tests)
+    add_test(NAME agc_driver_depth_storage_dispatch_rebar COMMAND agc_driver_depth_storage_dispatch_tests)
+    add_test(NAME agc_driver_depth_storage_reuse_rebar COMMAND agc_driver_depth_storage_reuse_tests)
+    add_test(NAME agc_driver_prepared_graphics_rebar COMMAND agc_driver_prepared_graphics_tests)
+    add_test(NAME agc_driver_prepared_unregistered_graphics_rebar COMMAND agc_driver_prepared_unregistered_graphics_tests)
+    foreach(rebarTest IN ITEMS
+        agc_driver_depth_bias_per_face
+        agc_driver_depth_compare_copy
+        agc_driver_depth_fast_clear
+        agc_driver_depth_fast_clear_submit
+        agc_driver_depth_plane_guest_layers
+        agc_driver_depth_plane_sampling
+        agc_driver_depth_storage
+        agc_driver_depth_storage_dispatch
+        agc_driver_depth_storage_reuse
+        agc_driver_prepared_graphics
+        agc_driver_prepared_unregistered_graphics
+        agc_storage_upload_lifetime
+        agc_storage_upload_failure
+        agc_readonly_fallback_reuse
+        agc_driver_depth_zero_reads
+        agc_driver_depth_large_array
+        agc_driver_depth_large_array_no_memo
+        agc_driver_graphics
+)
+        foreach(rebarProperty IN ITEMS ENVIRONMENT ENVIRONMENT_MODIFICATION SKIP_RETURN_CODE TIMEOUT FAIL_REGULAR_EXPRESSION PASS_REGULAR_EXPRESSION WILL_FAIL WORKING_DIRECTORY)
+            get_test_property(${rebarTest} ${rebarProperty} rebarValue)
+            if(NOT rebarValue STREQUAL "NOTFOUND")
+                set_property(TEST ${rebarTest}_rebar PROPERTY ${rebarProperty} "${rebarValue}")
+            endif()
+        endforeach()
+        set_property(TEST ${rebarTest}_rebar APPEND PROPERTY ENVIRONMENT "APS5_REBAR_UPLOADS=1;APS5_REBAR_CHECK=1")
+    endforeach()
+endif()
