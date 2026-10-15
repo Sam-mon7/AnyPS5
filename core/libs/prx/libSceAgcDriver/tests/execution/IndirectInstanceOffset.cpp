@@ -120,6 +120,20 @@ void Analysis() {
     pairRead.op = RdnaOpcode::VCvtF32F64;
     tuple.instructions.insert(tuple.instructions.begin() + 3, pairRead);
     CheckPlan(tuple, false, "a 64-bit source pair reading v8 must block the fold");
+    auto scalarTuple = program;
+    auto scalarPairRead = read(RdnaOperandKind::ScalarRegister, 9);
+    scalarPairRead.op = RdnaOpcode::SMovB64;
+    scalarPairRead.family = RdnaInstructionFamily::SOP1;
+    scalarPairRead.destination.kind = RdnaOperandKind::ScalarRegister;
+    scalarPairRead.destination.reg = 40;
+    scalarPairRead.dataDwordCount = 2;
+    scalarTuple.instructions.insert(scalarTuple.instructions.begin() + 3, scalarPairRead);
+    CheckPlan(scalarTuple, false, "a scalar pair reading s10 must block the fold");
+    Require((ShaderRecompiler::EmbeddedVertexFetchAnalyzer::UnusedUserSgprs(scalarTuple) & (std::uint64_t{1} << 10)) == 0, "a scalar pair was incorrectly considered unused");
+    auto readModifyWrite = program;
+    readModifyWrite.instructions[6].op = RdnaOpcode::SBitset0B64;
+    readModifyWrite.instructions[6].dataDwordCount = 2;
+    CheckPlan(readModifyWrite, false, "a scalar read-modify-write must block the fold");
 }
 
 std::array<std::uint32_t, 4> Descriptor(const void* data, std::uint32_t count) {

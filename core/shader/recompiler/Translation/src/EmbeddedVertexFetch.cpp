@@ -437,10 +437,17 @@ bool operandCovers(const RdnaOperand& operand, RdnaOperandKind kind, std::uint32
     return operand.kind == kind && reg >= operand.reg && reg - operand.reg < width;
 }
 
+std::uint32_t proofScalarOperandWidth(const RdnaInstruction& inst, std::uint32_t index) {
+    if (isScalarLoad(inst.op) && index == 0u) return 2u;
+    if (inst.op == RdnaOpcode::VMovB32 || inst.op == RdnaOpcode::VAddI32 || inst.op == RdnaOpcode::VAddNcU32 || inst.op == RdnaOpcode::VAddNcI32 || inst.op == RdnaOpcode::VSadU32) return 1u;
+    if (isVectorAlu(inst)) return 4u;
+    return std::max(scalarOperandWidth(inst, index), 2u);
+}
+
 bool instanceInputRead(const RdnaInstruction& inst, std::uint32_t sgpr, bool scalarLive, bool vectorLive) {
     const std::array<const RdnaOperand*, 4> sources{&inst.source0, &inst.source1, &inst.source2, &inst.source3};
     for (std::uint32_t i = 0; i < sources.size(); ++i) {
-        const auto scalarWidth = isScalarLoad(inst.op) && i == 0u ? 2u : scalarOperandWidth(inst, i);
+        const auto scalarWidth = proofScalarOperandWidth(inst, i);
         if (scalarLive && operandCovers(*sources[i], RdnaOperandKind::ScalarRegister, sgpr, scalarWidth)) return true;
         std::uint32_t vectorWidth = inst.op == RdnaOpcode::VMovB32 || inst.family == RdnaInstructionFamily::VOP2 || inst.family == RdnaInstructionFamily::EXP ? (inst.is64Bit ? 2u : 1u) : 4u;
         if (inst.family == RdnaInstructionFamily::MUBUF || inst.family == RdnaInstructionFamily::MTBUF) vectorWidth = inst.idxen && inst.offen ? 2u : 1u;
@@ -450,7 +457,7 @@ bool instanceInputRead(const RdnaInstruction& inst, std::uint32_t sgpr, bool sca
 }
 
 bool scalarWriteCovers(const RdnaInstruction& inst, std::uint32_t sgpr) {
-    return operandCovers(inst.destination, RdnaOperandKind::ScalarRegister, sgpr, std::max(decodedDstSize(inst), inst.is64Bit ? 2u : 1u)) || operandCovers(inst.destination2, RdnaOperandKind::ScalarRegister, sgpr, 2u);
+    return operandCovers(inst.destination, RdnaOperandKind::ScalarRegister, sgpr, std::max(decodedDstSize(inst), inst.is64Bit || isVectorAlu(inst) ? 2u : 1u)) || operandCovers(inst.destination2, RdnaOperandKind::ScalarRegister, sgpr, 2u);
 }
 
 bool instanceInputsExclusive(const RdnaProgram& program, std::size_t addIndex, std::uint32_t sgpr) {
@@ -464,9 +471,11 @@ bool instanceInputsExclusive(const RdnaProgram& program, std::size_t addIndex, s
         if (i > addIndex && writesExec(inst)) return false;
         if (instanceInputRead(inst, sgpr, scalarLive, vectorLive)) return false;
         const bool scalarWrite = scalarWriteCovers(inst, sgpr);
+        const bool fullScalarWrite = inst.op == RdnaOpcode::SMovB32 || inst.op == RdnaOpcode::SMovB64 || isScalarLoad(inst.op);
         const bool vectorWrite = operandCovers(inst.destination, RdnaOperandKind::VectorRegister, kInstanceIndexVgpr, std::max(embeddedFetchDstSize(inst), inst.is64Bit ? 2u : 1u));
         if (i < addIndex && (scalarWrite || vectorWrite)) return false;
-        if (scalarWrite && (inst.op == RdnaOpcode::SMovB32 || inst.op == RdnaOpcode::SMovB64 || isScalarLoad(inst.op))) scalarLive = false;
+        if (scalarLive && scalarWrite && !fullScalarWrite) return false;
+        if (scalarWrite && fullScalarWrite) scalarLive = false;
         if (vectorWrite && fullVectorWrite(inst)) vectorLive = false;
     }
     return false;
@@ -480,8 +489,11 @@ std::uint64_t EmbeddedVertexFetchAnalyzer::UnusedUserSgprs(const RdnaProgram& pr
     for (const auto& inst : program.instructions) {
         if (inst.op == RdnaOpcode::Unknown || inst.op == RdnaOpcode::SSetpcB64 || inst.op == RdnaOpcode::SSwappcB64 || inst.op == RdnaOpcode::SRfeB64 || inst.op == RdnaOpcode::SMovrelsB32 || inst.op == RdnaOpcode::SMovrelsB64 || inst.op == RdnaOpcode::SMovrelsd2B32 || inst.op == RdnaOpcode::SMovreldB32 || inst.op == RdnaOpcode::SMovreldB64) return 0;
         for (std::uint32_t sgpr = 0; sgpr < 64; ++sgpr) {
+            const std::array<const RdnaOperand*, 4> sources{&inst.source0, &inst.source1, &inst.source2, &inst.source3};
+            bool sourceTuple = false;
+            for (std::uint32_t i = 0; i < sources.size(); ++i) sourceTuple |= operandCovers(*sources[i], RdnaOperandKind::ScalarRegister, sgpr, proofScalarOperandWidth(inst, i));
             const bool secondDestination = isScalarOperand(inst.destination2) && sgpr >= scalarSlot(inst.destination2) && sgpr - scalarSlot(inst.destination2) < 2;
-            if (touchesSgpr(inst, sgpr) || secondDestination) unused &= ~(std::uint64_t{1} << sgpr);
+            if (touchesSgpr(inst, sgpr) || sourceTuple || secondDestination) unused &= ~(std::uint64_t{1} << sgpr);
         }
     }
     return unused;
