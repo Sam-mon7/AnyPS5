@@ -30,6 +30,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 // Variants for resources in heaps the guest commits on demand (partially resident textures, GPU
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination);
+bool ReadCommittedIfAny(std::uint64_t address, std::size_t bytes, std::vector<std::byte>& destination);
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination);
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes);
 // EqualsCommitted without the flush hook: the caller has decided that the recorded GPU work

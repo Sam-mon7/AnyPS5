@@ -2125,6 +2125,20 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     copyCommitted(address, destination);
 }
 
+bool ReadCommittedIfAny(std::uint64_t address, std::size_t bytes, std::vector<std::byte>& destination) {
+    if (bytes == 0) return false;
+    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
+    FlushGpuWrites(address, bytes);
+    const TimedAccess timed(CounterRead, bytes);
+    CountReadCaller(__builtin_return_address(0));
+    const auto committed = DescribeCommitted(address, bytes);
+    if (committed.ranges.empty()) return false;
+    destination.resize(bytes);
+    if (!committed.whole) std::memset(destination.data(), 0, bytes);
+    for (const auto& [begin, end] : committed.ranges) std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+    return true;
+}
+
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
