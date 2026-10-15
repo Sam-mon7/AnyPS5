@@ -376,15 +376,27 @@ struct SourceKeyHash {
     }
 };
 
-struct SourceReference {
-    std::shared_ptr<SourceEntry> strong;
-    std::weak_ptr<SourceEntry> weak;
-    explicit SourceReference(const std::shared_ptr<SourceEntry>& source) {
+template<class T> struct CacheReference {
+    std::shared_ptr<T> strong;
+    std::weak_ptr<T> weak;
+    explicit CacheReference(const std::shared_ptr<T>& source) {
         if (PreparedShaderBudgetEnabled()) weak = source;
         else strong = source;
     }
-    std::shared_ptr<SourceEntry> Lock() const { return strong != nullptr ? strong : weak.lock(); }
+    std::shared_ptr<T> Lock() const { return strong != nullptr ? strong : weak.lock(); }
 };
+using SourceReference = CacheReference<SourceEntry>;
+
+template<class TKey, class T> std::shared_ptr<T> cachedEntry(std::map<TKey, CacheReference<T>>& entries, const TKey& key) {
+    if (PreparedShaderBudgetEnabled()) std::erase_if(entries, [](const auto& entry) { return entry.second.weak.expired(); });
+    const auto found = entries.find(key);
+    if (found != entries.end()) {
+        if (auto entry = found->second.Lock()) return entry;
+    }
+    auto entry = std::make_shared<T>();
+    entries.insert_or_assign(key, CacheReference<T>(entry));
+    return entry;
+}
 
 struct SourceCache {
     PrimedSharedMutex mutex;
@@ -859,7 +871,7 @@ struct PreparedBindingPlan {
     std::exception_ptr failure;
     DescriptorBindingPlan bindings;
     PrimedSharedMutex mutex;
-    std::map<std::vector<std::uint32_t>, std::shared_ptr<PreparedModuleEntry>> modules;
+    std::map<std::vector<std::uint32_t>, CacheReference<PreparedModuleEntry>> modules;
 };
 
 struct RegistrationModuleEntry {
@@ -868,20 +880,37 @@ struct RegistrationModuleEntry {
     std::shared_ptr<const SpecializedModule> module;
 };
 
+std::size_t bindingPlanBytes(const DescriptorBindingPlan& plan) {
+    std::size_t bytes = vectorBytes(plan.bindings) + vectorBytes(plan.imageMetadata) + vectorBytes(plan.specialization) + vectorBytes(plan.runtimeState);
+    for (const auto& binding : plan.bindings) {
+        bytes += vectorBytes(binding.resources) + vectorBytes(binding.identityImageSwizzle) + vectorBytes(binding.samplerFilterElements) + vectorBytes(binding.inactive) + vectorBytes(binding.tableSamplerMasks);
+        const auto& descriptor = binding.descriptor;
+        bytes += vectorBytes(descriptor.guestDescriptor) + vectorBytes(descriptor.samplerDepthCompare) + vectorBytes(descriptor.imageWritten) + vectorBytes(descriptor.imageDepthCompare) + vectorBytes(descriptor.imageAtomic) + vectorBytes(descriptor.imageAtomic64) + vectorBytes(descriptor.imageShapes) + vectorBytes(descriptor.bufferAtomic) + vectorBytes(descriptor.bufferWritten) + vectorBytes(descriptor.samplerUnnormalized) + vectorBytes(descriptor.imageUnnormalized) + vectorBytes(descriptor.imageUnnormalizedBaseLevel) + vectorBytes(descriptor.samplerIntegerBorder) + vectorBytes(descriptor.imageSamplers) + vectorBytes(descriptor.bufferRead);
+    }
+    return bytes;
+}
+
+std::size_t specializedBytes(const std::shared_ptr<const SpecializedModule>& module) {
+    return module == nullptr ? 0 : sizeof(SpecializedModule) + module->spirv.MemoryBytes() + vectorBytes(module->bindings);
+}
+
+void trackSpecialized(const std::shared_ptr<const SpecializedModule>& module) {
+    CachePreparedObject(module, PreparedObjectKind::Host, [weak = std::weak_ptr(module)] { return specializedBytes(weak.lock()); });
+}
+
 std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<std::shared_ptr<const SpecializedModule>()>& specialize) {
     std::vector<std::uint64_t> key{variantId};
     key.insert(key.end(), moduleKey.begin(), moduleKey.end());
     static PrimedSharedMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<RegistrationModuleEntry>> modules;
+    static std::map<std::vector<std::uint64_t>, CacheReference<RegistrationModuleEntry>> modules;
     std::shared_ptr<RegistrationModuleEntry> entry;
     {
         std::shared_lock lock(mutex);
-        if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
+        if (const auto found = modules.find(key); found != modules.end()) entry = found->second.Lock();
     }
     if (entry == nullptr) {
         std::unique_lock lock(mutex);
-        const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<RegistrationModuleEntry>()).first->second;
+        entry = cachedEntry(modules, key);
     }
     std::call_once(entry->ready, [&] {
         try {
@@ -891,6 +920,11 @@ std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t varian
         }
     });
     if (entry->failure) std::rethrow_exception(entry->failure);
+    CachePreparedObject(entry, PreparedObjectKind::Host, [weak = std::weak_ptr(entry)] {
+        const auto entry = weak.lock();
+        return entry == nullptr ? 0 : sizeof(RegistrationModuleEntry);
+    });
+    trackSpecialized(entry->module);
     return entry->module;
 }
 
@@ -922,16 +956,15 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
     static PrimedSharedMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
+    static std::map<std::vector<std::uint64_t>, CacheReference<PreparedBindingPlan>> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
     {
         std::shared_lock lock(mutex);
-        if (const auto found = plans.find(key); found != plans.end()) plan = found->second;
+        if (const auto found = plans.find(key); found != plans.end()) plan = found->second.Lock();
     }
     if (plan == nullptr) {
         std::unique_lock lock(mutex);
-        const auto found = plans.find(key);
-        plan = found != plans.end() ? found->second : plans.emplace(key, std::make_shared<PreparedBindingPlan>()).first->second;
+        plan = cachedEntry(plans, key);
     }
     std::call_once(plan->ready, [&] {
         try {
@@ -941,6 +974,10 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
         }
     });
     if (plan->failure) std::rethrow_exception(plan->failure);
+    CachePreparedObject(plan, PreparedObjectKind::Host, [weak = std::weak_ptr(plan)] {
+        const auto plan = weak.lock();
+        return plan == nullptr ? 0 : sizeof(PreparedBindingPlan) + bindingPlanBytes(plan->bindings);
+    });
     return plan;
 }
 
@@ -951,16 +988,15 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     key.push_back(artifact.variantId);
     for (const auto& constant : constants) key.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
     static PrimedSharedMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<SpecializedModuleEntry>> modules;
+    static std::map<std::vector<std::uint64_t>, CacheReference<SpecializedModuleEntry>> modules;
     std::shared_ptr<SpecializedModuleEntry> entry;
     {
         std::shared_lock lock(mutex);
-        if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
+        if (const auto found = modules.find(key); found != modules.end()) entry = found->second.Lock();
     }
     if (entry == nullptr) {
         std::unique_lock lock(mutex);
-        const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
+        entry = cachedEntry(modules, key);
     }
     std::call_once(entry->ready, [&] {
         try {
@@ -970,6 +1006,11 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
         }
     });
     if (entry->failure) std::rethrow_exception(entry->failure);
+    CachePreparedObject(entry, PreparedObjectKind::Host, [weak = std::weak_ptr(entry)] {
+        const auto entry = weak.lock();
+        return entry == nullptr ? 0 : sizeof(SpecializedModuleEntry);
+    });
+    trackSpecialized(entry->module);
     return entry->module;
 }
 
@@ -1046,12 +1087,11 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel) {
         {
             std::shared_lock lock(plan->mutex);
-            if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second;
+            if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second.Lock();
         }
         if (entry == nullptr) {
             std::unique_lock lock(plan->mutex);
-            const auto found = plan->modules.find(moduleKey);
-            entry = found != plan->modules.end() ? found->second : plan->modules.emplace(moduleKey, std::make_shared<PreparedModuleEntry>()).first->second;
+            entry = cachedEntry(plan->modules, moduleKey);
         }
         const auto prepare = [&] {
             auto constants = plan->bindings.specialization;
@@ -1088,6 +1128,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             }
         });
         if (entry->failure) std::rethrow_exception(entry->failure);
+        CachePreparedObject(entry, PreparedObjectKind::Host, [weak = std::weak_ptr(entry)] {
+            const auto entry = weak.lock();
+            return entry == nullptr ? 0 : sizeof(PreparedModuleEntry) + bindingPlanBytes(entry->bindings);
+        });
         const auto& module = entry->module;
         result.specializationId = module->specializationId;
         result.spirv = module->spirv;
