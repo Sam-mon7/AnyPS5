@@ -67,6 +67,11 @@ public:
     [[nodiscard]] bool IsSsaSealed() const;
     void AddBranch(IrBlock* block);
     [[nodiscard]] bool Empty() const;
+    [[nodiscard]] std::size_t MemoryBytes() const {
+        return sizeof(*this) + instructions.size() * (sizeof(IrValue*) + 2 * sizeof(void*)) + (predecessors.capacity() + successors.capacity()) * sizeof(IrBlock*)
+            + (ssaScalarValues.HasStorage() + ssaThreadBitScalarValues.HasStorage() + ssaScalarMaskTags.HasStorage()) * NumScalarRegs * sizeof(IrValue*)
+            + ssaVectorValues.HasStorage() * NumVectorRegs * sizeof(IrValue*);
+    }
 
 private:
     bool ssaSealed = false;

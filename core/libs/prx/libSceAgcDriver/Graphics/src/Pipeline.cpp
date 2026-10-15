@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ShaderObjectMemory.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -309,7 +310,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
             module.pCode = shader.spirv.data();
-            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &module, nullptr, &_modules[i]), "vkCreateShaderModule graphics");
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &module, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module), &_modules[i]), "vkCreateShaderModule graphics");
             const auto stage = VulkanStage(shaders[i].stage);
             stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
             stages[i].stage = stage;
@@ -330,7 +331,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
-        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout), &layout), "vkCreatePipelineLayout graphics");
         std::vector<VkAttachmentDescription> colors;
         std::vector<VkAttachmentReference> references(state.blends.size(), VkAttachmentReference{VK_ATTACHMENT_UNUSED, attachmentLayout});
         for (std::uint32_t index = 0; index < state.colors.size(); ++index) {
@@ -490,28 +491,28 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         if (dynamicRendering) pipelineInfo.pNext = &rendering;
         timing.Mark("modules_and_state");
         if (prebuilding && !libraries) {
-            for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module));
             _modules.clear();
             return;
         }
         if (prebuilding) {
             static_cast<void>(LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, true, _modules));
-            for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module));
             _modules.clear();
             prebuilt = true;
             return;
         }
         if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
-        else Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+        else Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline), &pipeline), "vkCreateGraphicsPipelines");
         if (alternateAlpha) {
             blend.pAttachments = secondChannels.data();
-            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &secondChannel), "vkCreateGraphicsPipelines");
+            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline), &secondChannel), "vkCreateGraphicsPipelines");
         }
         if (state.depthBiasPerFace) {
             raster.cullMode = VK_CULL_MODE_FRONT_BIT;
-            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &backFaces), "vkCreateGraphicsPipelines");
+            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline), &backFaces), "vkCreateGraphicsPipelines");
         }
-        for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module));
         _modules.clear();
         timing.Mark("create");
         LogPipelineStatistics_nid_no_patch(context, pipeline);
@@ -539,13 +540,13 @@ void Pipeline::release() noexcept {
     framebuffers.clear();
     if (optimized != nullptr) optimized->Release();
     optimized.reset();
-    if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
-    if (backFaces) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, backFaces, nullptr);
-    if (secondChannel) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, secondChannel, nullptr);
+    if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
+    if (backFaces) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, backFaces, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
+    if (secondChannel) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, secondChannel, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
     if (renderPass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, renderPass, nullptr);
-    if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+    if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout));
     for (auto module : _modules) {
-        if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module));
     }
     pipeline = VK_NULL_HANDLE;
     backFaces = VK_NULL_HANDLE;
@@ -852,7 +853,7 @@ struct PipelineStore {
         std::weak_ptr<BufferPool> pool;
         std::uint64_t hash;
         std::vector<std::byte> key;
-        std::shared_ptr<Pipeline> pipeline;
+        PreparedObjectReference<Pipeline> pipeline;
     };
     std::mutex mutex;
     std::vector<std::byte> scratchKey;
@@ -902,7 +903,7 @@ bool alive(const PipelineStore::Entry& entry, const Context& context) {
 // Drops an entry of a device that is gone: its objects went with the device, so they are forgotten,
 // not destroyed.
 std::list<PipelineStore::Entry>::iterator abandon(PipelineStore& store, std::list<PipelineStore::Entry>::iterator it) {
-    it->pipeline->Abandon();
+    if (const auto pipeline = it->pipeline.Pin()) pipeline->Abandon();
     ++store.generation;
     store.index.erase(it->hash);
     return store.entries.erase(it);
@@ -930,6 +931,12 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
+    for (auto entry = store.entries.begin(); entry != store.entries.end();) {
+        if (!entry->pipeline.Expired()) { ++entry; continue; }
+        store.index.erase(entry->hash);
+        entry = store.entries.erase(entry);
+        ++store.generation;
+    }
     reportPipelines(store);
     const bool identity = pipelineIdentity();
     auto* last = identity ? &ThreadLastPipeline() : nullptr;
@@ -939,7 +946,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             ++store.hits;
             ++store.identityHits;
             store.entries.splice(store.entries.end(), store.entries, last->entry);
-            return last->entry->pipeline;
+            if (auto pipeline = last->entry->pipeline.Pin()) return pipeline;
         }
         last->generation = 0;
     } else {
@@ -966,7 +973,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
                 ++store.hits;
                 store.entries.splice(store.entries.end(), store.entries, it);
                 remember(it);
-                return it->pipeline;
+                if (auto pipeline = it->pipeline.Pin()) return pipeline;
             }
             abandon(store, it);
         } else {
@@ -982,19 +989,20 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
     auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
-    store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
+    store.entries.push_back({context.device, context.bufferPool, hash, key, PreparedObjectReference(pipeline, context.device)});
     store.index[hash] = std::prev(store.entries.end());
     constexpr std::size_t bound = 1024;
     while (store.entries.size() > bound) {
         // Only an entry no recorded draw still holds may go (Kept keeps its shared_ptr until the fence).
-        const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
+        const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.UseCount() <= 1; });
         if (victim == store.entries.end()) break;
         store.index.erase(victim->hash);
         store.entries.erase(victim);
         ++store.generation;
         ++store.evicted;
     }
-    if (const auto found = store.index.find(hash); found != store.index.end() && found->second->pipeline == pipeline) remember(found->second);
+    if (const auto found = store.index.find(hash); found != store.index.end() && found->second->pipeline.Pin() == pipeline) remember(found->second);
+    static_cast<void>(ShaderRecompiler::MaintainPreparedShaderCache());
     return pipeline;
 }
 
@@ -1011,6 +1019,7 @@ void ClearCachedPipelines(VkDevice device) {
         ++store.generation;
     }
     ClearPipelineLibraries(device);
+    ShaderRecompiler::ClearPreparedObjects(reinterpret_cast<std::uintptr_t>(device));
 }
 
 }

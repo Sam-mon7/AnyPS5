@@ -38,11 +38,17 @@ struct PreparedShaderState {
     struct Entry {
         std::size_t codeOffset;
         std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+        std::weak_ptr<const ShaderRecompiler::SourceHandle> cached{};
+        std::shared_ptr<const ShaderRecompiler::SourceHandle> Pin() const;
+        void CacheOnly();
     };
     struct Rectangle {
         std::uint64_t vertexId;
         std::uint64_t fragmentId;
         std::shared_ptr<const ShaderRecompiler::RectListShaders> shaders;
+        std::weak_ptr<const ShaderRecompiler::RectListShaders> cached{};
+        std::shared_ptr<const ShaderRecompiler::RectListShaders> Pin() const;
+        void CacheOnly();
     };
     struct RectangleProgress {
         std::weak_ptr<const ShaderSnapshot> fragment;
@@ -128,6 +134,7 @@ void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<
 
 ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, std::uint64_t vertexId, std::uint64_t fragmentId);
 ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint64_t vertexId, std::uint64_t fragmentId, const ShaderRecompiler::SpirvTarget& target);
+ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& pixel, const ShaderRecompiler::SpirvTarget& target);
 
 std::uint64_t SnapshotCodeHash(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 

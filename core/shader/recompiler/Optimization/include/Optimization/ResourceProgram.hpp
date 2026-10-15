@@ -6,6 +6,7 @@
 #include "Optimization/SrtWalker.hpp"
 #include <cstdint>
 #include <memory>
+#include <functional>
 
 namespace ShaderRecompiler {
 
@@ -52,6 +53,37 @@ struct SourceHandle {
     std::shared_ptr<const CompiledVariant> artifact;
     std::vector<std::uint64_t> staticKey;
 };
+struct PreparedShaderMemory {
+    std::uint64_t code = 0;
+    std::uint64_t ir = 0;
+    std::uint64_t spirv = 0;
+    std::uint64_t reflection = 0;
+    std::uint64_t layouts = 0;
+    std::uint64_t results = 0;
+    std::uint64_t cache = 0;
+    std::uint64_t pipelines = 0;
+    std::uint64_t modules = 0;
+    std::uint64_t driverLayouts = 0;
+    std::uint64_t pipelineCaches = 0;
+    std::size_t sources = 0;
+    [[nodiscard]] std::uint64_t Bytes() const { return code + ir + spirv + reflection + layouts + results + cache + pipelines + modules + driverLayouts + pipelineCaches; }
+};
+struct PreparedShaderCacheStats {
+    PreparedShaderMemory memory;
+    std::uint64_t peakBytes = 0;
+    std::uint64_t evictions = 0;
+    std::uint64_t rePrepares = 0;
+    std::size_t pinned = 0;
+    std::uint64_t overBudgetBytes = 0;
+};
+[[nodiscard]] bool PreparedShaderBudgetEnabled();
+[[nodiscard]] PreparedShaderCacheStats MaintainPreparedShaderCache();
+void TouchPreparedShader(const std::shared_ptr<const SourceHandle>& handle);
+void NotePreparedShaderReprepare();
+enum class PreparedObjectKind { Host, Pipeline, Module, Layout, Cache };
+void CachePreparedObject(const std::shared_ptr<const void>& object, PreparedObjectKind kind, std::function<std::uint64_t()> bytes, std::uintptr_t owner = 0);
+void AdjustPreparedObjectMemory(PreparedObjectKind kind, std::uint64_t allocated, std::uint64_t freed);
+void ClearPreparedObjects(std::uintptr_t owner);
 class PreparedShaderInvocation {
 public:
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);

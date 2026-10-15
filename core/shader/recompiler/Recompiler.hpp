@@ -453,6 +453,7 @@ public:
     operator const std::vector<std::uint32_t>&() const { return Words(); }
     [[nodiscard]] std::size_t size() const { return Read().size(); }
     [[nodiscard]] bool empty() const { return Read().empty(); }
+    [[nodiscard]] std::size_t MemoryBytes() const;
     [[nodiscard]] const std::uint32_t* data() const { return Read().data(); }
     [[nodiscard]] std::uint32_t* data() { return Mutable().data(); }
     [[nodiscard]] const std::uint32_t& operator[](std::size_t index) const { return Read()[index]; }

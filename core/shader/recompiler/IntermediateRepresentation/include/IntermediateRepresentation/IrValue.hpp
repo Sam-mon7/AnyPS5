@@ -71,6 +71,9 @@ public:
     [[nodiscard]] IrValue* Argument(std::size_t index) const;
     [[nodiscard]] IrBlock* PhiBlock(std::size_t index) const;
     [[nodiscard]] const std::vector<IrUse>& OperandUses() const;
+    [[nodiscard]] std::size_t MemoryBytes() const {
+        return sizeof(*this) + phiBlocks.capacity() * sizeof(IrBlock*) + operandUses.capacity() * sizeof(IrUse) + (arguments.capacity() + uses.capacity()) * sizeof(IrValue*);
+    }
     [[nodiscard]] std::uint64_t ImmediateU64() const;
     [[nodiscard]] std::uint16_t ImmediateF16Bits() const;
     [[nodiscard]] float ImmediateF32() const;

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ShaderObjectMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include <algorithm>
@@ -58,7 +59,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
     info.initialDataSize = initialData.size();
     info.pInitialData = initialData.empty() ? nullptr : initialData.data();
     const auto create = context.Function<PFN_vkCreatePipelineCache>("vkCreatePipelineCache");
-    VkResult result = create(context.device, &info, nullptr, &cache);
+    VkResult result = create(context.device, &info, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Cache), &cache);
     if (result != VK_SUCCESS && !initialData.empty()) {
         std::fprintf(stderr, "[pipeline-cache] the driver refused %s (Vulkan result %d); starting empty\n", path.string().c_str(), static_cast<int>(result));
         info.initialDataSize = 0;
@@ -66,7 +67,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         loadedBytes = 0;
         settledBytes = 0;
         settledFile.reset();
-        result = create(context.device, &info, nullptr, &cache);
+        result = create(context.device, &info, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Cache), &cache);
     }
     Check(result, "vkCreatePipelineCache");
     if (!path.empty()) saver = std::thread([this] { run(); });
@@ -82,7 +83,7 @@ PipelineCache::~PipelineCache() {
         saver.join();
         save(true);
     }
-    context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, nullptr);
+    context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Cache));
 }
 
 std::span<const std::byte> PipelineCache::File::Payload() const {
@@ -187,7 +188,7 @@ void PipelineCache::save(bool final) {
         const Context& context;
         const VkPipelineCache& cache;
         ~DestroyMerged() {
-            if (cache != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, nullptr);
+            if (cache != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Cache));
         }
     } destroyMerged{context, merged};
     if (disk.state == FileState::Valid) {
@@ -195,7 +196,7 @@ void PipelineCache::save(bool final) {
         VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         info.initialDataSize = data.size();
         info.pInitialData = data.data();
-        const auto result = context.Function<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(context.device, &info, nullptr, &merged);
+        const auto result = context.Function<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(context.device, &info, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Cache), &merged);
         if (result == VK_SUCCESS) {
             floor = std::max(loadedBytes, data.size());
         } else {
