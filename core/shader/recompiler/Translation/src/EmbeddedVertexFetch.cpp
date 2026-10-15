@@ -359,6 +359,7 @@ bool writesSgprMask(const RdnaInstruction& inst, std::uint32_t sgpr, std::uint32
 
 bool carryObserved(const RdnaProgram& program, std::size_t addIndex, std::uint32_t waveSize) {
     const auto& add = program.instructions[addIndex];
+    if (add.op == RdnaOpcode::VAddNcU32 || add.op == RdnaOpcode::VAddNcI32) return false;
     if (add.destination2.kind == RdnaOperandKind::None || add.destination2.kind == RdnaOperandKind::Null) return false;
     if (!isScalarOperand(add.destination2)) return true;
     const auto first = scalarSlot(add.destination2);

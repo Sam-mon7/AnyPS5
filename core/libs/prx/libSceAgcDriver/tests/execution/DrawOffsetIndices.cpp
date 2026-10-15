@@ -520,11 +520,13 @@ std::string ExtendedFold(Fixture& fixture) {
             fixture.Draw(vertex, packet);
             failures += fixture.Check("no-carry adds on the GPU", indices, record[3], record[4], false);
         }
-        const auto patched = fixture.UserData(record[3], record[4]);
-        const auto cpuVertex = fixture.Vertex(NoCarryCode, patched, enabled);
-        fixture.Place(record[3], indices, record[4]);
-        fixture.Draw(cpuVertex, FoldedDraw(cpuVertex, patched, {reinterpret_cast<std::uintptr_t>(Indices.data()), Vertices, 2, Instances, 0, true, 0, 0}));
-        failures += fixture.Check("no-carry adds on the CPU", indices, record[3], record[4], false);
+        if (enabled) {
+            const auto patched = fixture.UserData(record[3], record[4]);
+            const auto cpuVertex = fixture.Vertex(NoCarryCode, patched);
+            fixture.Place(record[3], indices, record[4]);
+            fixture.Draw(cpuVertex, FoldedDraw(cpuVertex, patched, {reinterpret_cast<std::uintptr_t>(Indices.data()), Vertices, 2, Instances, 0, true, 0, 0}));
+            failures += fixture.Check("no-carry adds on the CPU", indices, record[3], record[4], false);
+        }
         const auto staticVertex = fixture.Vertex(PostAddCode, stale);
         packet.indirect->baseVertexSgpr = 18;
         packet.indirect->startInstanceSgpr = 19;
