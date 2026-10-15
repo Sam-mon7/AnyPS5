@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -16,6 +17,8 @@
 #include <limits>
 #include <shared_mutex>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -604,29 +607,77 @@ public:
         std::vector<std::shared_ptr<Buffer>> uploads;
         std::vector<std::uint32_t> uploadLayers;
         std::vector<std::uint32_t> copiedLayers;
+        const std::array layout{static_cast<std::uint32_t>(resource.tileMode), static_cast<std::uint32_t>(resource.dimension), resource.mipCount, resource.allocatedMipCount, resource.pipeBankXor};
+        const bool layoutChanged = !filled || guestLayout != layout;
+        guestUploads.resize(layers);
+        guestUploadZero.resize(layers);
+        uploadProofs.resize(layers);
+        std::vector<std::byte> bytes;
+        std::size_t reused = 0, replaced = 0, proved = 0, zeroReused = 0, watchedProofs = 0, missingGenerations = 0;
+        static const bool memo = std::getenv("APS5_NO_DEPTH_UPLOAD_MEMO") == nullptr;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             auto& held = guestLayers[layer];
             auto& surface = surfaceLayers[layer];
+            auto& upload = guestUploads[layer];
+            auto& proof = uploadProofs[layer];
             if (slices[layer].image != VK_NULL_HANDLE) {
                 held = {};
-                if (slices[layer].written != 0 && surface.image == slices[layer].image && surface.written == slices[layer].written) continue;
+                upload.reset();
+                guestUploadZero[layer] = false;
+                proof = {};
+                if (!layoutChanged && slices[layer].written != 0 && surface.image == slices[layer].image && surface.written == slices[layer].written) continue;
                 surface = slices[layer];
                 copiedLayers.push_back(layer);
                 continue;
             }
             surface = {};
             const GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes))};
-            if (held.generation != 0 && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation)) {
-                held.generation = current.generation;
-                continue;
+            const auto size = static_cast<std::size_t>(current.bytes);
+            const auto epoch = memo && GuestMemory::GpuMutex().HeldByThisThread() ? GuestMemory::CollectEpoch() : 0;
+            const auto serial = GuestMemory::TrackerGeneration();
+            const auto forget = GuestMemory::ForgetSerial();
+            const std::array range{std::pair{current.address, current.address + size}};
+            const bool same = !layoutChanged && upload != nullptr && upload->Bytes().size() == size && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick;
+            const bool eligible = memo && same && proof.forget == forget && (forget & 1u) == 0 &&
+                !Recorder::SnapshotWriteOverlaps(current.address, size) && !StorageTexture::AnyPendingOverlaps(range);
+            const bool watched = eligible && GuestMemory::UnchangedSince(current.address, size, held.generation);
+            const bool unchanged = eligible && (watched ||
+                 (epoch != 0 && proof.epoch == epoch && GuestMemory::NewestStamp(current.address, size) <= proof.serial));
+            missingGenerations += held.generation == 0;
+            watchedProofs += watched;
+            bool changed = !same;
+            if (unchanged) {
+                ++proved;
+            } else {
+                bool read = true;
+                if (upload != nullptr && upload->Bytes().size() == size && guestUploadZero[layer]) {
+                    read = GuestMemory::ReadCommittedIfAny(current.address, size, bytes);
+                    if (!read) ++zeroReused;
+                } else {
+                    bytes.resize(size);
+                    GuestMemory::ReadCommitted(current.address, bytes);
+                }
+                if (read && (upload == nullptr || upload->Bytes().size() != size || std::memcmp(upload->Bytes().data(), bytes.data(), size) != 0)) {
+                    auto replacement = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                    std::memcpy(replacement->Bytes().data(), bytes.data(), size);
+                    upload = std::move(replacement);
+                    guestUploadZero[layer] = std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; });
+                    changed = true;
+                    ++replaced;
+                }
             }
-            auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
-            uploads.push_back(std::move(upload));
-            uploadLayers.push_back(layer);
+            ++reused;
+            proof = {epoch, serial, forget};
+            if (changed) {
+                uploads.push_back(upload);
+                uploadLayers.push_back(layer);
+            }
             held = current;
         }
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile && reused != 0) AgcDriver::ProfilePrint_nid_no_patch("[depth-upload] base=0x%llx layers=%u reused=%zu replaced=%zu proved=%zu detiled=%zu bytes-per-layer=%llu zero-reused=%zu proved-watch=%zu proved-epoch=%zu no-generation=%zu\n", static_cast<unsigned long long>(resource.baseAddress), layers, reused - replaced, replaced, proved, uploads.size(), static_cast<unsigned long long>(geometry.layerBytes), zeroReused, watchedProofs, proved - watchedProofs, missingGenerations);
         if (!copiedLayers.empty() || !uploads.empty()) record(slices, resource, geometry, copiedLayers, uploads, uploadLayers);
+        guestLayout = layout;
         const std::array<std::uint32_t, 6> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType), baseLayer};
         auto& texture = textures[key];
         if (texture == nullptr) {
@@ -657,6 +708,11 @@ private:
     std::vector<std::unique_ptr<DeviceBuffer>> retiredStaging;
     std::map<std::array<std::uint32_t, 6>, std::shared_ptr<Texture>> textures;
     std::vector<GuestLayer> guestLayers;
+    std::vector<std::shared_ptr<Buffer>> guestUploads;
+    std::vector<bool> guestUploadZero;
+    struct UploadProof { std::uint64_t epoch = 0, serial = 0, forget = 0; };
+    std::vector<UploadProof> uploadProofs;
+    std::array<std::uint32_t, 5> guestLayout{};
     std::vector<DepthPlaneSlice> surfaceLayers;
     bool filled = false;
 
@@ -730,6 +786,7 @@ private:
 
     void release() noexcept {
         textures.clear();
+        guestUploads.clear();
         staging.reset();
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
