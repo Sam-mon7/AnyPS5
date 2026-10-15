@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ShaderObjectMemory.hpp"
 #include "VulkanTestDevice.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
@@ -724,11 +725,86 @@ void DeferredUndecodableRegistration() {
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "unsupported MIMG opcode");
 }
 
+void PreparedBudget(AgcDriver::VulkanDevice* device, bool lru) {
+    using namespace ShaderRecompiler;
+    using namespace AgcDriver::DriverDetail;
+    Require(PreparedShaderBudgetEnabled(), "prepared shader budget is disabled");
+    const ShaderComputeStageInfo compute{{1, 1, 1}, 0, {}, false, 1, {}};
+    const auto requestFor = [&](const ShaderSnapshot& snapshot) {
+        return RecompileRequest{{ShaderStage::Compute, snapshot.codeAddress, snapshot.code, 0, {}}, {32, 0, {}, compute, {}, {}, {}}, device->ComputeTarget(32), {0, 0, 0, 128}};
+    };
+    if (lru) {
+        struct Object {
+            void* allocation = nullptr;
+            ~Object() {
+                const auto* callbacks = AgcDriver::Graphics::ShaderObjectAllocator(PreparedObjectKind::Pipeline);
+                callbacks->pfnFree(callbacks->pUserData, allocation);
+            }
+        };
+        std::array<AgcDriver::Graphics::PreparedObjectReference<Object>, 3> objects;
+        std::array<std::weak_ptr<Object>, 3> handles;
+        const auto create = [&](std::size_t index) {
+            auto object = std::make_shared<Object>();
+            const auto* callbacks = AgcDriver::Graphics::ShaderObjectAllocator(PreparedObjectKind::Pipeline);
+            object->allocation = callbacks->pfnAllocation(callbacks->pUserData, 400 * 1024, 64, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+            Require(object->allocation != nullptr, "cannot allocate budget fixture");
+            handles[index] = object;
+            objects[index] = AgcDriver::Graphics::PreparedObjectReference(object);
+        };
+        create(0);
+        create(1);
+        static_cast<void>(objects[0].Pin());
+        create(2);
+        const auto stats = MaintainPreparedShaderCache();
+        Require(!handles[0].expired() && handles[1].expired() && !handles[2].expired(), "prepared cache did not evict the least recently used object");
+        Require(stats.memory.Bytes() <= 1024 * 1024 && stats.evictions != 0, "prepared cache exceeded its unpinned budget");
+        return;
+    }
+    ShaderSnapshot snapshot{0x100000, 0, 0, {0xbf810000u}, {}};
+    const auto request = requestFor(snapshot);
+    std::weak_ptr<const SourceHandle> first;
+    std::vector<std::uint32_t> expected;
+    {
+        const auto handle = SourceHandleFor(snapshot, 0, request);
+        first = handle;
+        const auto words = GetPreparedArtifact(*handle).spirv.Read();
+        expected.assign(words.begin(), words.end());
+        const auto invocation = InvocationFor(snapshot, 0, request);
+        const auto capture = invocation.Capture({});
+        const auto result = invocation.Materialize(*capture);
+        device->Dispatch(*result, 1, 1, 1);
+        Require(device->SubmitAndEpoch() != 0, "budget fixture did not submit a recorded dispatch");
+        const auto stats = MaintainPreparedShaderCache();
+        Require(!first.expired() && stats.pinned != 0 && stats.evictions == 0, "prepared shader still held by active work was evicted");
+        device->WaitIdle();
+    }
+    const auto empty = MaintainPreparedShaderCache();
+    Require(first.expired() && empty.memory.sources == 0 && empty.evictions != 0, "zero prepared cache budget retained an unused shader");
+    {
+        const auto handle = SourceHandleFor(snapshot, 0, request);
+        Require(std::ranges::equal(GetPreparedArtifact(*handle).spirv.Read(), expected), "an evicted shader re-prepared differently");
+        Require(MaintainPreparedShaderCache().rePrepares == 1, "prepared cache did not count re-preparation");
+    }
+    static_cast<void>(MaintainPreparedShaderCache());
+    LazyRegistration();
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy")), "invalid test arguments");
+        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy" || std::string_view(argv[1]) == "--budget-zero" || std::string_view(argv[1]) == "--budget-lru")), "invalid test arguments");
+        if (argc == 2 && (std::string_view(argv[1]) == "--budget-zero" || std::string_view(argv[1]) == "--budget-lru")) {
+            if (std::string_view(argv[1]) == "--budget-lru") {
+                PreparedBudget(nullptr, true);
+                return 0;
+            }
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            PreparedBudget(device.get(), false);
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--lazy") {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
             LazyRegistration();
