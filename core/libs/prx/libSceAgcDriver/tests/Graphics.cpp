@@ -4184,6 +4184,33 @@ void pipelineLibrarySetTests() {
 
 void pipelineLibraryLifetimeTests() {
     using namespace AgcDriver::Graphics;
+    {
+        mock = MockVulkan{};
+        auto context = mockContext();
+        context.device = makeHandle<VkDevice>();
+        context.graphicsPipelineLibrary = true;
+        context.pipelineLinkTimeOptimization = false;
+        context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.spirv = makeModule({});
+        fragment.spirv = makeModule({.fragment = true});
+        vertex.variantId = 1;
+        fragment.variantId = 2;
+        const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+        const std::array<std::uint32_t, 1> mainKey{11}, fragmentKey{22};
+        const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), makeHandle<VkDescriptorSetLayout>(), true, mainKey, fragmentKey};
+        Require(context.bufferPool == nullptr, "the lazy-pool fixture already owns a buffer pool");
+        auto first = CachedPipeline(context, State{}, VertexInputLayout{}, resources, shaders);
+        const auto live = mock.liveGraphicsPipelines;
+        static_cast<void>(GetBufferPool(context));
+        auto again = CachedPipeline(context, State{}, VertexInputLayout{}, resources, shaders);
+        Require(again == first && mock.liveGraphicsPipelines == live, "creating a buffer pool abandoned pipelines on a live device");
+        ClearCachedPipelines(context.device);
+        again.reset();
+        first.reset();
+        context.bufferPool.reset();
+        Require(mock.live == 0, "lazy-pool pipeline tests leaked Vulkan objects");
+    }
     for (const bool abandon : {false, true}) {
         mock = MockVulkan{};
         auto context = mockContext();
