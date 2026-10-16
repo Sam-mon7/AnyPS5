@@ -2539,6 +2539,7 @@ struct MockDescriptorWrite {
 struct MockVulkan {
     std::uint64_t next = 1;
     std::int64_t live = 0;
+    std::set<VkPipeline> liveGraphicsPipelines;
     std::map<VkBuffer, VkDeviceSize> bufferSizes;
     std::map<VkBuffer, VkBufferUsageFlags> bufferUsage;
     std::map<VkDeviceMemory, VkMemoryAllocateFlags> allocationFlags;
@@ -2780,6 +2781,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineC
     }
     *pipelines = makeHandle<VkPipeline>();
     ++mock.graphicsPipelineCreateCount;
+    mock.liveGraphicsPipelines.insert(*pipelines);
     ++mock.live;
     return VK_SUCCESS;
 }
@@ -2823,7 +2825,8 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateComputePipelines(VkDevice, VkPipelineCa
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockDestroyPipeline(VkDevice, VkPipeline, const VkAllocationCallbacks*) {
+VKAPI_ATTR void VKAPI_CALL mockDestroyPipeline(VkDevice, VkPipeline pipeline, const VkAllocationCallbacks*) {
+    mock.liveGraphicsPipelines.erase(pipeline);
     --mock.live;
 }
 
@@ -4148,6 +4151,47 @@ void pipelineLibrarySetTests() {
         expectFailure(prebuild, "descriptor set exceeds two slots");
         ClearPipelineLibraries(context.device);
         Require(mock.live == 0, "shader library tests leaked Vulkan objects");
+    }
+}
+
+void pipelineLibraryLifetimeTests() {
+    using namespace AgcDriver::Graphics;
+    for (const bool abandon : {false, true}) {
+        mock = MockVulkan{};
+        auto context = mockContext();
+        context.device = makeHandle<VkDevice>();
+        context.graphicsPipelineLibrary = true;
+        context.pipelineLinkTimeOptimization = false;
+        context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.spirv = makeModule({});
+        fragment.spirv = makeModule({.fragment = true});
+        vertex.variantId = 1;
+        fragment.variantId = 2;
+        const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+        const std::array<std::uint32_t, 1> mainKey{11}, fragmentKey{22};
+        const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), makeHandle<VkDescriptorSetLayout>(), true, mainKey, fragmentKey};
+        auto first = std::make_unique<Pipeline>(context, State{}, VertexInputLayout{}, resources, shaders);
+        auto second = std::make_unique<Pipeline>(context, State{}, VertexInputLayout{}, resources, shaders);
+        const auto live = mock.liveGraphicsPipelines;
+        Require(live.size() == 6, "two linked pipelines did not share four libraries");
+        ClearPipelineLibraries(context.device);
+        ShaderRecompiler::ClearPreparedObjects(reinterpret_cast<std::uintptr_t>(context.device));
+        Require(mock.liveGraphicsPipelines == live, "cache clearing destroyed libraries of live linked pipelines");
+        if (abandon) {
+            const auto objects = mock.live;
+            first->Abandon();
+            second->Abandon();
+            first.reset();
+            second.reset();
+            Require(mock.live == objects, "abandoning linked pipelines destroyed objects on a dead device");
+            mock = MockVulkan{};
+        } else {
+            first.reset();
+            Require(mock.liveGraphicsPipelines.size() == live.size() - 1, "destroying one linked pipeline destroyed shared libraries");
+            second.reset();
+            Require(mock.live == 0 && mock.liveGraphicsPipelines.empty(), "linked pipeline lifetime tests leaked Vulkan objects");
+        }
     }
 }
 
@@ -6038,6 +6082,10 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-lifetime") {
+            pipelineLibraryLifetimeTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--sparse-buffer-holes") {
             bool passed = false;
             {
@@ -6114,6 +6162,7 @@ int main(int argc, char** argv) {
         RunGuestLeaseWaitTests();
         stateTests();
         pipelineLibrarySetTests();
+        pipelineLibraryLifetimeTests();
         hdrComponentSwapTests();
         depthMaintenanceTests();
         hardwareScreenOffsetTests();

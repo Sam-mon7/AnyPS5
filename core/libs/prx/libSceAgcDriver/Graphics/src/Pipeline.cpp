@@ -496,13 +496,13 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             return;
         }
         if (prebuilding) {
-            static_cast<void>(LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, true, _modules));
+            static_cast<void>(LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, libraryParts, &optimized, true, _modules));
             for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module));
             _modules.clear();
             prebuilt = true;
             return;
         }
-        if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+        if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, libraryParts, &optimized, false, _modules);
         else Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline), &pipeline), "vkCreateGraphicsPipelines");
         if (alternateAlpha) {
             blend.pAttachments = secondChannels.data();
@@ -543,6 +543,7 @@ void Pipeline::release() noexcept {
     if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
     if (backFaces) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, backFaces, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
     if (secondChannel) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, secondChannel, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
+    libraryParts.clear();
     if (renderPass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, renderPass, nullptr);
     if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Layout));
     for (auto module : _modules) {
@@ -559,6 +560,8 @@ void Pipeline::release() noexcept {
 void Pipeline::Abandon() noexcept {
     if (optimized != nullptr) optimized->released.store(true);
     optimized.reset();
+    AbandonPipelineLibraryParts(libraryParts);
+    libraryParts.clear();
     for (auto& entry : framebuffers) entry.framebuffer->Abandon();
     framebuffers.clear();
     pipeline = VK_NULL_HANDLE;

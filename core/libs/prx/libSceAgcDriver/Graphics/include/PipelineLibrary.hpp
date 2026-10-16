@@ -12,6 +12,9 @@
 
 namespace AgcDriver::Graphics {
 
+struct PipelineLibraryPart;
+void AbandonPipelineLibraryParts(std::span<const std::shared_ptr<PipelineLibraryPart>> parts) noexcept;
+
 struct PipelineLibraryKeys {
     std::vector<std::byte> vertexInput;
     std::vector<std::byte> preRasterization;
@@ -35,7 +38,7 @@ struct OptimizedPipeline {
     void Release() noexcept;
 };
 
-VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::shared_ptr<OptimizedPipeline>* optimized = nullptr, bool partsOnly = false, std::span<VkShaderModule> modules = {});
+VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::vector<std::shared_ptr<PipelineLibraryPart>>& retained, std::shared_ptr<OptimizedPipeline>* optimized = nullptr, bool partsOnly = false, std::span<VkShaderModule> modules = {});
 
 void WaitForOptimizedPipelines(VkDevice device);
 

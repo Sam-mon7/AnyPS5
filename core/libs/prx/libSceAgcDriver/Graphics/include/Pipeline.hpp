@@ -86,6 +86,7 @@ private:
     bool depthBias = false;
     bool libraries = false;
     std::shared_ptr<OptimizedPipeline> optimized;
+    std::vector<std::shared_ptr<PipelineLibraryPart>> libraryParts;
     bool dynamicRendering = false;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;

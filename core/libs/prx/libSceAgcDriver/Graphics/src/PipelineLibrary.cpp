@@ -37,6 +37,8 @@ constexpr std::array<VkDynamicState, 15> dynamicStates{
 
 using Key = std::vector<std::byte>;
 
+}
+
 struct LibraryLayout {
     VkDevice device;
     PFN_vkDestroyPipelineLayout destroy;
@@ -46,25 +48,35 @@ struct LibraryLayout {
     }
 };
 
-struct LibraryPart {
+struct PipelineLibraryPart {
     VkDevice device;
     PFN_vkDestroyPipeline destroy;
     PFN_vkDestroyShaderModule destroyModule;
     VkPipeline handle = VK_NULL_HANDLE;
     std::shared_ptr<LibraryLayout> layout;
     std::vector<VkShaderModule> modules;
-    ~LibraryPart() {
+    ~PipelineLibraryPart() {
         if (handle != VK_NULL_HANDLE) destroy(device, handle, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Pipeline));
         for (const auto module : modules) destroyModule(device, module, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module));
     }
 };
+
+void AbandonPipelineLibraryParts(std::span<const std::shared_ptr<PipelineLibraryPart>> parts) noexcept {
+    for (const auto& part : parts) {
+        part->handle = VK_NULL_HANDLE;
+        part->modules.clear();
+        if (part->layout != nullptr) part->layout->handle = VK_NULL_HANDLE;
+    }
+}
+
+namespace {
 
 struct DeviceLibraries {
     PFN_vkDestroyPipeline destroyPipeline = nullptr;
     PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
     PFN_vkDestroyShaderModule destroyModule = nullptr;
     std::map<Key, PreparedObjectReference<LibraryLayout>> layouts;
-    std::array<std::map<Key, PreparedObjectReference<LibraryPart>>, 4> parts;
+    std::array<std::map<Key, PreparedObjectReference<PipelineLibraryPart>>, 4> parts;
     PipelineLibraryCounters counters;
 };
 
@@ -129,7 +141,7 @@ std::span<const VkDynamicState> PipelineLibraryDynamicStates() {
     return dynamicStates;
 }
 
-VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::shared_ptr<OptimizedPipeline>* optimized, bool partsOnly, std::span<VkShaderModule> modules) {
+VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::vector<std::shared_ptr<PipelineLibraryPart>>& retained, std::shared_ptr<OptimizedPipeline>* optimized, bool partsOnly, std::span<VkShaderModule> modules) {
     Require(info.renderPass == VK_NULL_HANDLE && info.pDynamicState != nullptr, "pipeline library parts need dynamic rendering and the library dynamic states");
     const bool split = (layout.flags & VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT) != 0;
     Require(!split || (layout.setLayoutCount == 2u && layout.pSetLayouts != nullptr && ((keys.preRasterizationSets | keys.fragmentSets) & ~3u) == 0u), "split pipeline library layout requires two descriptor set slots and a valid mask");
@@ -197,7 +209,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     static const bool backgroundLinking = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
     const bool optimize = backgroundLinking && context.pipelineLinkTimeOptimization;
     std::vector<VkPipeline> libraries;
-    std::vector<std::shared_ptr<LibraryPart>> owners;
+    std::vector<std::shared_ptr<PipelineLibraryPart>> owners;
     for (std::size_t part = 0; part < flags.size(); ++part) {
         if (part == 0 && mesh) continue;
         const auto key = Combined(*partKeys[part], *contextKeys[part]);
@@ -241,7 +253,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.layout = VK_NULL_HANDLE;
             break;
         }
-        auto object = std::make_shared<LibraryPart>();
+        auto object = std::make_shared<PipelineLibraryPart>();
         object->device = context.device;
         object->destroy = device.destroyPipeline;
         object->destroyModule = device.destroyModule;
@@ -272,6 +284,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         owners.push_back(std::move(object));
     }
     if (partsOnly) return VK_NULL_HANDLE;
+    retained = owners;
     PerformanceTimer timing("Vulkan.GraphicsPipelineLink");
     VkPipelineLibraryCreateInfoKHR linked{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
     linked.libraryCount = static_cast<std::uint32_t>(libraries.size());
