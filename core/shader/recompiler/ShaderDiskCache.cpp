@@ -1549,6 +1549,8 @@ void BuildSpecializedKey(const SharedSpirv& source, std::span<const PipelineSpec
         writer.Value(constant.id);
         writer.Value(constant.value);
     }
+    const auto* mode = std::getenv("APS5_SPIRV_OPT");
+    if (mode != nullptr && (std::strcmp(mode, "none") == 0 || std::strcmp(mode, "full") == 0)) writer.Text(mode);
 }
 
 std::string EntryName(std::span<const std::byte> key) {
