@@ -34,9 +34,15 @@ struct Counters {
     std::uint64_t planMisses = 0;
     std::uint64_t planWrites = 0;
     std::uint64_t planLoadFailures = 0;
+    std::uint64_t verifiedHits = 0;
+    std::uint64_t verifyMismatches = 0;
 };
 
 [[nodiscard]] std::uint64_t SourceVersion();
+[[nodiscard]] bool OutputKeyed();
+[[nodiscard]] bool VerifyHits();
+[[nodiscard]] bool SameOutput(const CompiledVariant& left, const CompiledVariant& right);
+void NoteVerifiedHit(const char* what, bool matched, std::uint64_t codeAddress, std::size_t cachedBytes, std::size_t freshBytes);
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key);
 

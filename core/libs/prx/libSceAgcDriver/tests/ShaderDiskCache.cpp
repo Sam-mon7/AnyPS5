@@ -55,6 +55,14 @@ void setEnvironment(const char* name, const std::string& value) {
 #endif
 }
 
+void unsetEnvironment(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
     return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
 }
@@ -1857,6 +1865,151 @@ void verifyPlanAcrossProcesses(const char* self) {
     run("--load-plan-switch");
 }
 
+std::string hexVersion(std::uint64_t value) {
+    char text[17];
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+void runChild(const char* self, const std::string& arguments) {
+    const std::string command = "\"" + std::string(self) + "\" " + arguments;
+    require(std::system(command.c_str()) == 0, "the process " + arguments + " failed");
+}
+
+void appendKey(std::vector<std::byte>& out, const std::vector<std::byte>& key) {
+    const std::uint64_t size = key.size();
+    const auto* bytes = reinterpret_cast<const std::byte*>(&size);
+    out.insert(out.end(), bytes, bytes + sizeof(size));
+    out.insert(out.end(), key.begin(), key.end());
+}
+
+std::pair<std::vector<std::byte>, std::vector<std::byte>> stageKeys() {
+    SampleRequest compute;
+    SampleRequest vertex;
+    vertex.request.shader.stage = ShaderStage::Vertex;
+    vertex.request.context.compute.reset();
+    return {compute.Key(), vertex.Key()};
+}
+
+int runSwitchKeyProcess(const std::string& path) {
+    const auto [compute, vertex] = stageKeys();
+    std::vector<std::byte> out;
+    appendKey(out, compute);
+    appendKey(out, vertex);
+    require(WriteFileAtomically(path, out), "cannot write the switch keys");
+    return 0;
+}
+
+std::pair<std::vector<std::byte>, std::vector<std::byte>> childStageKeys(const char* self, const std::filesystem::path& path, const char* budget, const char* fold) {
+    if (budget != nullptr) setEnvironment("APS5_PREPARED_SHADER_MIB", budget);
+    if (fold != nullptr) setEnvironment("APS5_INDIRECT_SGPR_FOLD", fold);
+    runChild(self, "--switch-keys \"" + path.string() + "\"");
+    unsetEnvironment("APS5_PREPARED_SHADER_MIB");
+    unsetEnvironment("APS5_INDIRECT_SGPR_FOLD");
+    std::vector<std::byte> file;
+    require(ReadWholeFile(path, file), "cannot read the child's switch keys");
+    std::size_t offset = 0;
+    const auto take = [&] {
+        std::uint64_t size = 0;
+        require(offset + sizeof(size) <= file.size(), "truncated switch keys");
+        std::memcpy(&size, file.data() + offset, sizeof(size));
+        offset += sizeof(size);
+        require(offset + size <= file.size(), "truncated switch key");
+        std::vector<std::byte> key(file.begin() + static_cast<std::ptrdiff_t>(offset), file.begin() + static_cast<std::ptrdiff_t>(offset + size));
+        offset += size;
+        return key;
+    };
+    auto compute = take();
+    auto vertex = take();
+    return {std::move(compute), std::move(vertex)};
+}
+
+void verifySwitchScoping(const char* self, const std::filesystem::path& directory) {
+    if (std::getenv("APS5_PREPARED_SHADER_MIB") != nullptr || std::getenv("APS5_INDIRECT_SGPR_FOLD") != nullptr) {
+        std::cout << "switch scoping not tested: APS5_PREPARED_SHADER_MIB or APS5_INDIRECT_SGPR_FOLD is set\n";
+        return;
+    }
+    const auto [compute, vertex] = stageKeys();
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "switch-keys.bin";
+    const auto budget = childStageKeys(self, path, "64", nullptr);
+    require(budget.first == compute && budget.second == vertex, "APS5_PREPARED_SHADER_MIB changed a cache key, though the budget never changes compiled output");
+    const auto fold = childStageKeys(self, path, nullptr, "1");
+    require(fold.first == compute, "APS5_INDIRECT_SGPR_FOLD changed a compute shader's cache key, though the fold only rewrites vertex shaders");
+    require(fold.second != vertex, "APS5_INDIRECT_SGPR_FOLD did not change a vertex shader's cache key");
+    std::cout << "APS5_PREPARED_SHADER_MIB is key-neutral and APS5_INDIRECT_SGPR_FOLD keys only vertex shaders\n";
+}
+
+int runOutputKeyProcess(const std::string& sourceVersion) {
+    require(ShaderDiskCache::OutputKeyed(), "ANYPS5_SHADER_CACHE_KEY=output did not select the output key");
+    const auto version = hexVersion(ShaderDiskCache::SourceVersion());
+    require(version != sourceVersion, "the output key reused the source version " + sourceVersion);
+    require(ShaderDiskCache::EntryDirectory().filename().string() == version, "output-keyed entries are not stored under the output version");
+    std::cout << "ANYPS5_SHADER_CACHE_KEY=output keys entries by output version " << version << " instead of source version " << sourceVersion << '\n';
+    return 0;
+}
+
+int runSourceKeyProcess() {
+    require(!ShaderDiskCache::OutputKeyed(), "an invalid ANYPS5_SHADER_CACHE_KEY selected the output key");
+    return 0;
+}
+
+void verifyOutputKey(const char* self) {
+    require(!ShaderDiskCache::OutputKeyed(), "the source key is not the default");
+    setEnvironment("ANYPS5_SHADER_CACHE_KEY", "output");
+    runChild(self, "--output-key " + hexVersion(ShaderDiskCache::SourceVersion()));
+    setEnvironment("ANYPS5_SHADER_CACHE_KEY", "outptu");
+    runChild(self, "--source-key");
+    unsetEnvironment("ANYPS5_SHADER_CACHE_KEY");
+}
+
+int runVerifyProcess(bool expectMismatch) {
+    ComputeRequest cached(true);
+    const auto loaded = Recompile(cached.request);
+    ShaderDiskCache::Flush();
+    const auto totals = ShaderDiskCache::Totals();
+    const auto counts = " (hits " + std::to_string(totals.hits) + ", verified " + std::to_string(totals.verifiedHits) + ", mismatches " + std::to_string(totals.verifyMismatches) + ", writes " + std::to_string(totals.writes) + ")";
+    require(ShaderDiskCache::VerifyHits(), "ANYPS5_SHADER_CACHE_VERIFY=1 did not enable verification");
+    require(totals.hits == 1u && totals.verifiedHits >= 1u, "the stored variant was not loaded and verified" + counts);
+    require(totals.verifyMismatches == (expectMismatch ? 1u : 0u), std::string(expectMismatch ? "a damaged entry passed verification" : "an intact entry failed verification") + counts);
+    require(totals.writes == (expectMismatch ? 1u : 0u), std::string(expectMismatch ? "the fresh variant did not replace the damaged entry" : "a verified entry was written again") + counts);
+    ComputeRequest fresh(false);
+    requireSameResult(Recompile(fresh.request), loaded, "verified against compiled");
+    std::cout << (expectMismatch ? "verification replaced a damaged entry with a fresh compile\n" : "verification recompiled an intact entry and kept it\n");
+    return 0;
+}
+
+void verifyHitVerification(const char* self) {
+    ComputeRequest request(true);
+    std::vector<std::byte> key;
+    std::filesystem::path path;
+    for (const std::uint32_t subgroup : {32u, 64u, 1u}) {
+        ShaderDiskCache::BuildKey(request.request, subgroup, key);
+        path = ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key);
+        if (std::filesystem::exists(path)) break;
+    }
+    require(std::filesystem::exists(path), "the compute request's entry was not stored");
+    setEnvironment("ANYPS5_SHADER_CACHE_VERIFY", "1");
+    runChild(self, "--verify");
+    std::vector<std::byte> file;
+    require(ReadWholeFile(path, file), "cannot read the stored entry");
+    CompiledVariant variant;
+    require(ShaderDiskCache::DecodeEntry(file, key, variant) == ShaderDiskCache::LoadStatus::Loaded, "the stored entry does not decode");
+    const auto original = variant.artifact.spirv.Read();
+    std::vector<std::uint32_t> damaged(original.begin(), original.end());
+    require(damaged.size() > 5u, "the stored SPIR-V is too short to damage");
+    damaged.back() ^= 0x1u;
+    variant.artifact.spirv = std::vector<std::uint32_t>(damaged);
+    require(WriteFileAtomically(path, ShaderDiskCache::EncodeEntry(key, variant)), "cannot write the damaged entry");
+    runChild(self, "--verify-mismatch");
+    unsetEnvironment("ANYPS5_SHADER_CACHE_VERIFY");
+    require(ReadWholeFile(path, file), "cannot read the replaced entry");
+    CompiledVariant replaced;
+    require(ShaderDiskCache::DecodeEntry(file, key, replaced) == ShaderDiskCache::LoadStatus::Loaded, "the replaced entry does not decode");
+    const auto words = replaced.artifact.spirv.Read();
+    require(std::vector<std::uint32_t>(words.begin(), words.end()) != damaged, "the damaged entry is still stored");
+}
+
 void verifyDefaultDirectory(const char* self) {
     setEnvironment("ANYPS5_SHADER_CACHE_DIR", "");
     setEnvironment("ANYPS5_NO_SHADER_CACHE", "1");
@@ -1875,6 +2028,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);
+        if (argc == 3 && std::string_view(argv[1]) == "--switch-keys") return runSwitchKeyProcess(argv[2]);
+        if (argc == 3 && std::string_view(argv[1]) == "--output-key") return runOutputKeyProcess(argv[2]);
+        if (argc == 2 && std::string_view(argv[1]) == "--source-key") return runSourceKeyProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--verify") return runVerifyProcess(false);
+        if (argc == 2 && std::string_view(argv[1]) == "--verify-mismatch") return runVerifyProcess(true);
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
         verifyDefaultDirectory(argv[0]);
@@ -1893,6 +2051,10 @@ int main(int argc, char** argv) {
         verifyPlanAcrossProcesses(argv[0]);
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);
+        unsetEnvironment("APS5_NO_FAILURE_MEMO");
+        verifySwitchScoping(argv[0], directory);
+        verifyOutputKey(argv[0]);
+        verifyHitVerification(argv[0]);
         verifyInvocationIsolation();
         verifyBufferAlignmentSpecialization();
         verifyBindingPlanSelection();

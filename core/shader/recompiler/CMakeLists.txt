@@ -301,7 +301,7 @@ function(add_shader_recompiler target runtimeTarget)
             "-DEXTRA=${shaderCacheExtra}"
             "-DOUTPUT=${shaderCacheVersionHeader}"
             -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderCacheVersion.cmake"
-            DEPENDS ${shaderCacheRecompilerSources} ${shaderCacheGuardSources} ${shaderCacheSubmoduleStamps} "${shaderCacheListFile}" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderCacheVersion.cmake"
+            DEPENDS ${shaderCacheRecompilerSources} ${shaderCacheGuardSources} ${shaderCacheSubmoduleStamps} "${shaderCacheListFile}" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderCacheVersion.cmake" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderOutputEpoch.txt"
             COMMENT "Hashing the shader recompiler sources for the shader disk cache"
             VERBATIM
     )
