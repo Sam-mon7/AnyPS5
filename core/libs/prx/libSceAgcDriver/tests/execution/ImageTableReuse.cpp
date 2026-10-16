@@ -20,6 +20,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -319,6 +320,105 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
     RunImageStore(device, stores);
 }
 
+bool AcrossEpochs() {
+    const auto* value = std::getenv("APS5_TABLE_REUSE_ACROSS_EPOCHS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+void SampleInNewEpoch(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& result, std::uint32_t record, const std::vector<std::uint32_t>& expected, const std::string& what) {
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Require(Dispatch(device, result, record) == expected, "image table reuse across epochs: " + what);
+}
+
+void SettleAcrossEpochs(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& result, std::uint32_t record, const std::vector<std::uint32_t>& expected, const std::string& what) {
+    for (std::uint32_t attempt = 0; attempt < 4; ++attempt) {
+        const auto before = AgcDriver::Graphics::ImageTableReuses();
+        SampleInNewEpoch(device, result, record, expected, what);
+        if (Since(before).reused == 1) return;
+    }
+    Require(false, "image table reuse across epochs: " + what + ": the table was never kept");
+}
+
+void RunAcrossEpochs(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
+    for (std::uint32_t texture = 0; texture < Records; ++texture) {
+        Fill(block, texture, 0.375f);
+        SetRecord(block, texture, texture);
+    }
+    for (std::uint32_t key = 0; key < Records; ++key) Keys[key] = key;
+    const auto srt = Buffer(block.Table(), Records * Stride);
+    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+    std::copy(srt.begin(), srt.end(), Srt.begin());
+    std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+    SetOutput(Output.data());
+    const auto result = Compile(device, block);
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::puts("guest memory has no write watch: image table reuse across epochs is not tested");
+        return;
+    }
+    SettleAcrossEpochs(device, result, 1, Row(block.Texels(1)), "a warm-up dispatch sampled the wrong entry");
+
+    auto before = AgcDriver::Graphics::ImageTableReuses();
+    for (const std::uint32_t record : {5u, 9u, 5u}) SampleInNewEpoch(device, result, record, Row(block.Texels(record)), "a dispatch of a kept table in a new epoch sampled the wrong entry");
+    Expect(before, 3, 0, "three dispatches of one kept table in three new epochs");
+
+    before = AgcDriver::Graphics::ImageTableReuses();
+    Fill(block, 17, 0.875f);
+    SampleInNewEpoch(device, result, 17, Row(block.Texels(17)), "an entry the CPU wrote before the epoch kept its old texels");
+    Require(Since(before).resolved >= 1, "image table reuse across epochs: a CPU write over an entry did not resolve the table again");
+    SettleAcrossEpochs(device, result, 17, Row(block.Texels(17)), "the table resolved after a CPU write sampled the wrong entry");
+
+    std::vector<float> stored(Width * Height);
+    for (std::uint32_t texel = 0; texel < Width * Height; ++texel) stored[texel] = -2.0f - static_cast<float>(texel);
+    before = AgcDriver::Graphics::ImageTableReuses();
+    AgcDriver::GuestMemory::Write(AddressOf(block.Texels(11)), std::as_bytes(std::span(stored)));
+    Require(Dispatch(device, result, 11) == Row(stored.data()), "image table reuse across epochs: an entry the driver stored over in the epoch kept its old texels");
+    Require(Since(before).resolved >= 1, "image table reuse across epochs: a driver store over an entry did not resolve the table again");
+    SettleAcrossEpochs(device, result, 11, Row(stored.data()), "the table resolved after a driver store sampled the wrong entry");
+
+    for (std::uint32_t texel = 0; texel < Width * Height; ++texel) stored[texel] = -3.0f - static_cast<float>(texel);
+    before = AgcDriver::Graphics::ImageTableReuses();
+    AgcDriver::GuestMemory::Write(AddressOf(block.Texels(19)), std::as_bytes(std::span(stored)));
+    SampleInNewEpoch(device, result, 19, Row(stored.data()), "an entry the driver stored over before the epoch kept its old texels");
+    Require(Since(before).resolved >= 1, "image table reuse across epochs: a driver store before the epoch did not resolve the table again");
+
+    SetOutput(block.Texels(13));
+    const auto writer = Compile(device, block);
+    SetOutput(Output.data());
+    SettleAcrossEpochs(device, result, 15, Row(block.Texels(15)), "the table before a dispatch wrote an entry sampled the wrong entry");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    static_cast<void>(Dispatch(device, writer, 7));
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto sampled = Dispatch(device, result, 13);
+    const std::vector<float> written(block.Texels(13), block.Texels(13) + Width * Height);
+    Require(std::bit_cast<std::uint32_t>(written[0]) == Row(block.Texels(7))[0], "image table reuse across epochs: the dispatch writing into an entry's texels stored the wrong values");
+    Require(sampled == Row(written.data()), "image table reuse across epochs: an entry a dispatch wrote in an earlier epoch kept its old texels");
+
+    SettleAcrossEpochs(device, result, 21, Row(block.Texels(21)), "the table before the texture cache was cleared sampled the wrong entry");
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    SampleInNewEpoch(device, result, 21, Row(block.Texels(21)), "the table after the texture cache and its held textures were cleared sampled the wrong entry");
+    SettleAcrossEpochs(device, result, 23, Row(block.Texels(23)), "the table resolved after the texture cache was cleared sampled the wrong entry");
+}
+
+void RunImageStoreAcrossEpochs(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
+    for (std::uint32_t texture = 0; texture < Records; ++texture) {
+        Fill(block, texture, 0.625f);
+        SetRecord(block, texture, texture);
+    }
+    const auto srt = Buffer(block.Table(), Records * Stride);
+    std::copy(srt.begin(), srt.end(), Srt.begin());
+    const auto result = Compile(device, block);
+    SettleAcrossEpochs(device, result, 25, Row(block.Texels(25)), "the table before an image store sampled the wrong entry");
+    SampleInNewEpoch(device, result, 23, Row(block.Texels(23)), "the kept table before an image store sampled the wrong entry");
+    Store(device, block, 23);
+    std::vector<float> stored(Width);
+    for (std::uint32_t x = 0; x < Width; ++x) stored[x] = -4.0f - static_cast<float>(x);
+    SampleInNewEpoch(device, result, 23, Row(stored.data()), "an entry an image store left results pending over kept its old texels");
+    AgcDriver::Graphics::StorageTexture::FlushPending(AddressOf(block.Texels(23)), TextureBytes, nullptr, "test");
+    device.WaitIdle();
+    Require(Row(block.Texels(23)) == Row(stored.data()), "image table reuse across epochs: the image store wrote the wrong values");
+    SampleInNewEpoch(device, result, 23, Row(stored.data()), "an entry whose image store results were flushed sampled the wrong texels");
+}
+
 }
 
 int main() {
@@ -327,6 +427,12 @@ int main() {
         GuestBlock stores(UnimportableBytes);
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (AcrossEpochs()) {
+            RunAcrossEpochs(*device, block);
+            RunImageStoreAcrossEpochs(*device, stores);
+            std::puts("image table reuse across epochs tests passed");
+            return 0;
+        }
         RunTests(*device, block, stores);
         std::puts("image table reuse tests passed");
         return 0;
