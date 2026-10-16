@@ -3086,6 +3086,23 @@ void descriptorLayoutFlagTests() {
         }
         Require(mock.live == 0, "exported binding flag fixture leaked Vulkan objects");
     }
+    mock = MockVulkan{};
+    {
+        auto context = mockContext();
+        AgcDriver::Graphics::DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        context.imageTableCapacity = 2;
+        context.samplerTableCapacity = 2;
+        ShaderRecompiler::RecompileResult program;
+        program.bindings.push_back(makeBinding(Role::SamplerTable, 1, 2, {}));
+        program.bindings.push_back(makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, 2, {}));
+        const AgcDriver::Graphics::CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        const auto described = AgcDriver::Graphics::DescribeSetLayouts(context, std::span(&compute, 1));
+        const std::vector<VkDescriptorBindingFlags> expected{VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, indexed};
+        Require(described.mainBindingFlags == expected, "described table layout lost capture binding flags");
+        Require(mock.layoutBindingFlags == expected, "described capture flags differ from the native table layout");
+    }
+    Require(mock.live == 0, "described table layout leaked Vulkan objects");
 }
 
 void descriptorPoolTests() {

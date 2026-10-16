@@ -107,6 +107,7 @@ struct DescribedSetLayouts {
     PipelineSetLayouts layouts;
     std::vector<std::uint32_t> mainKey;
     std::vector<std::uint32_t> fragmentKey;
+    std::vector<VkDescriptorBindingFlags> mainBindingFlags;
     PipelineSetLayouts View() const { return {layouts.main, layouts.fragment, layouts.split, mainKey, fragmentKey}; }
 };
 DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const CompiledShader> shaders);
