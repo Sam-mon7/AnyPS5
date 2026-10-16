@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -106,7 +107,10 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     ++enqueued;
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes)});
     outstanding.fetch_add(1, std::memory_order_release);
-    if (!thread.joinable()) thread = std::thread([this] { run(); });
+    if (!thread.joinable()) thread = std::thread([this] {
+        RaiseServiceThreadPriority("draw pipeline");
+        run();
+    });
     if (committerWaiting) wake.notify_one();
     if (!profile) return;
     const auto now = std::chrono::steady_clock::now();

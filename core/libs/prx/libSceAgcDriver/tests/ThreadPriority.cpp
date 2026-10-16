@@ -6,6 +6,11 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -67,12 +72,37 @@ void RefusalTest() {
     Require(threw, "a refused priority request must throw");
 }
 
+void ServiceTest(bool expectRaised) {
+    bool threw = false;
+    int observed = 0;
+    std::thread([&] {
+        try {
+            RaiseServiceThreadPriority("test service");
+        } catch (...) {
+            threw = true;
+        }
+#ifdef _WIN32
+        observed = GetThreadPriority(GetCurrentThread());
+#endif
+    }).join();
+    Require(!threw, "raising a service thread's priority must never throw");
+    Require(ServiceThreadPriorityRequested() == expectRaised, std::string("APS5_SERVICE_THREAD_PRIORITY must be ") + (expectRaised ? "on" : "off") + " in this test");
+#ifdef _WIN32
+    const int expected = expectRaised ? THREAD_PRIORITY_ABOVE_NORMAL : THREAD_PRIORITY_NORMAL;
+    Require(observed == expected, "service thread priority is " + std::to_string(observed) + ", expected " + std::to_string(expected));
+#endif
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         if (argc > 1 && std::string(argv[1]) == "refused") {
             RefusalTest();
+            return 0;
+        }
+        if (argc > 1 && (std::string(argv[1]) == "service-on" || std::string(argv[1]) == "service-off")) {
+            ServiceTest(std::string(argv[1]) == "service-on");
             return 0;
         }
         ParseTests();
