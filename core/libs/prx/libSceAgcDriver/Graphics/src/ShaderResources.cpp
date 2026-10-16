@@ -161,11 +161,35 @@ struct TablePinRegistry {
     std::mutex mutex;
     std::vector<std::shared_ptr<PinnedTableTextures>> sets;
     std::uint64_t bytes = 0;
+    std::uint64_t budgetEvictions = 0;
 };
 
 TablePinRegistry& TablePins() {
     static TablePinRegistry registry;
     return registry;
+}
+
+bool TableReuseAcrossEpochs();
+std::uint64_t TablePinBudget();
+
+void evictTableTexture(const std::shared_ptr<Texture>& texture) {
+    std::vector<std::shared_ptr<PinnedTableTextures>> released;
+    auto& registry = TablePins();
+    std::lock_guard lock(registry.mutex);
+    for (auto& set : registry.sets) {
+        const auto count = std::count(set->textures.begin(), set->textures.end(), texture);
+        if (count == 0) continue;
+        const auto bytes = static_cast<std::uint64_t>(count) * texture->AllocationBytes();
+        if (bytes > TablePinBudget() - registry.bytes) {
+            registry.bytes -= set->bytes;
+            released.push_back(std::move(set));
+            ++registry.budgetEvictions;
+        } else {
+            set->bytes += bytes;
+            registry.bytes += bytes;
+        }
+    }
+    std::erase(registry.sets, nullptr);
 }
 
 void releaseTablePins(VkDevice device) {
@@ -258,6 +282,7 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 }
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
+    if (TableReuseAcrossEpochs()) evictTableTexture(it->texture);
     cache.bytes -= it->accounted;
     if (it->source != nullptr) {
         for (auto [view, last] = cache.views.equal_range(it->source.get()); view != last; ++view) {
@@ -1458,12 +1483,14 @@ void reportTableReuse() {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     std::uint64_t held = 0;
+    std::uint64_t unpinned = 0;
     {
         auto& registry = TablePins();
         std::lock_guard lock(registry.mutex);
         held = registry.bytes;
+        unpinned = registry.budgetEvictions;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[image-tables] lookups %llu: reused %llu in the epoch, %llu across epochs (%llu with pinned textures); missed %llu with no kept table, %llu not current, %llu with a texture gone; kept tables dropped by epoch %llu, unwatch %llu, allocations %llu, depth surfaces %llu; resolved tables kept %llu, not kept: capacity %llu, no epoch %llu, storage view %llu, dcc %llu, no generation %llu, other %llu, state moved %llu, pending storage %llu; pinned %llu, over pin budget %llu; %llu elements resolved, %llu MiB pinned in total, %llu MiB held now\n",count(counters.lookups), count(counters.sameEpoch), count(counters.acrossEpochs), count(counters.pinnedHits), count(counters.noTable), count(counters.notCurrent), count(counters.evicted), count(counters.droppedEpoch), count(counters.droppedUnwatch), count(counters.droppedAllocations), count(counters.droppedDepth), count(counters.remembered), count(counters.ineligibleCapacity), count(counters.ineligibleEpochZero), count(counters.ineligibleStorage), count(counters.ineligibleDcc), count(counters.ineligibleGeneration), count(counters.ineligibleOther), count(counters.stateMoved), count(counters.pendingOverlap), count(counters.pinned), count(counters.overPinBudget), count(counters.elements), count(counters.pinnedBytes) >> 20u, static_cast<unsigned long long>(held >> 20u));
+    AgcDriver::ProfilePrint_nid_no_patch("[image-tables] lookups %llu: reused %llu in the epoch, %llu across epochs (%llu with pinned textures); missed %llu with no kept table, %llu not current, %llu with a texture gone; kept tables dropped by epoch %llu, unwatch %llu, allocations %llu, depth surfaces %llu; resolved tables kept %llu, not kept: capacity %llu, no epoch %llu, storage view %llu, dcc %llu, no generation %llu, other %llu, state moved %llu, pending storage %llu; pinned %llu, over pin budget %llu; %llu elements resolved, %llu MiB pinned at admission in total, %llu MiB held now, %llu tables unpinned on eviction\n",count(counters.lookups), count(counters.sameEpoch), count(counters.acrossEpochs), count(counters.pinnedHits), count(counters.noTable), count(counters.notCurrent), count(counters.evicted), count(counters.droppedEpoch), count(counters.droppedUnwatch), count(counters.droppedAllocations), count(counters.droppedDepth), count(counters.remembered), count(counters.ineligibleCapacity), count(counters.ineligibleEpochZero), count(counters.ineligibleStorage), count(counters.ineligibleDcc), count(counters.ineligibleGeneration), count(counters.ineligibleOther), count(counters.stateMoved), count(counters.pendingOverlap), count(counters.pinned), count(counters.overPinBudget), count(counters.elements), count(counters.pinnedBytes) >> 20u, static_cast<unsigned long long>(held >> 20u), static_cast<unsigned long long>(unpinned));
 }
 
 struct TableState {
@@ -1585,6 +1612,10 @@ bool CachedTableTextures(const ReusedTable& table, std::vector<std::shared_ptr<T
 
 void PinTableTextures(ReusedTable& table) {
     auto& counters = TableReuses();
+    if (TablePinBudget() == 0) {
+        counters.overPinBudget.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     auto pinned = std::make_shared<PinnedTableTextures>();
     pinned->device = table.device;
     pinned->textures.reserve(table.elements.size());
@@ -1600,11 +1631,9 @@ void PinTableTextures(ReusedTable& table) {
             }
             pinned->textures.push_back(std::move(texture));
         }
-    }
-    {
         auto& registry = TablePins();
-        std::lock_guard lock(registry.mutex);
-        if (registry.bytes + pinned->bytes > TablePinBudget()) {
+        std::lock_guard registryLock(registry.mutex);
+        if (pinned->bytes > TablePinBudget() - registry.bytes) {
             counters.overPinBudget.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -4260,7 +4289,9 @@ void ShaderResources::resolveImageTables() {
 
 ImageTableReuseCounts ImageTableReuses() {
     const auto& counters = TextureCounts();
-    return {counters.tablesReused.load(std::memory_order_relaxed), counters.tablesResolved.load(std::memory_order_relaxed)};
+    auto& registry = TablePins();
+    std::lock_guard lock(registry.mutex);
+    return {counters.tablesReused.load(std::memory_order_relaxed), counters.tablesResolved.load(std::memory_order_relaxed), registry.bytes, registry.sets.size()};
 }
 
 void ShaderResources::finishImageTables() {

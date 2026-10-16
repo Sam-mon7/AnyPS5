@@ -72,9 +72,9 @@ std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
 }
 
-std::array<std::uint32_t, 4> Image(const void* texels) {
+std::array<std::uint32_t, 4> Image(const void* texels, std::uint32_t width = Width, std::uint32_t height = Height) {
     const auto address = AddressOf(texels);
-    return {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32Float << 20u) | (((Width - 1u) & 3u) << 30u), ((Width - 1u) >> 2u) | ((Height - 1u) << 14u) | (1u << 31u), 0xfacu | (Type2D << 28u)};
+    return {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32Float << 20u) | (((width - 1u) & 3u) << 30u), ((width - 1u) >> 2u) | ((height - 1u) << 14u) | (1u << 31u), 0xfacu | (Type2D << 28u)};
 }
 
 std::array<std::uint32_t, 4> Buffer(const void* base, std::uint32_t bytes) {
@@ -84,20 +84,20 @@ std::array<std::uint32_t, 4> Buffer(const void* base, std::uint32_t bytes) {
 
 class GuestBlock {
 public:
-    explicit GuestBlock(std::size_t registered = BlockBytes) {
+    explicit GuestBlock(std::size_t registered = BlockBytes, std::size_t allocationBytes = BlockBytes) : bytes(allocationBytes) {
 #ifdef _WIN32
-        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
 #else
         constexpr std::uintptr_t alignment = 65536;
-        void* mapped = mmap(nullptr, BlockBytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
             const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
             const auto aligned = (begin + alignment - 1) & ~(alignment - 1);
             if (aligned != begin) munmap(mapped, aligned - begin);
-            if (aligned + BlockBytes != begin + BlockBytes + alignment) munmap(reinterpret_cast<void*>(aligned + BlockBytes), begin + alignment - aligned);
+            if (aligned + bytes != begin + bytes + alignment) munmap(reinterpret_cast<void*>(aligned + bytes), begin + alignment - aligned);
             block = reinterpret_cast<std::uint8_t*>(aligned);
-            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
         }
 #endif
         Require(block != nullptr, "image table reuse: cannot allocate the guest block");
@@ -107,19 +107,20 @@ public:
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
 #ifdef _WIN32
-        GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
-        GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
+        GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 #else
-        munmap(block, BlockBytes);
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes);
+        munmap(block, bytes);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
 #endif
     }
 
     std::uint32_t* Table() const { return reinterpret_cast<std::uint32_t*>(block); }
-    float* Texels(std::uint32_t texture) const { return reinterpret_cast<float*>(block + TexturesOffset + static_cast<std::size_t>(texture) * TextureBytes); }
+    float* Texels(std::uint32_t texture, std::size_t textureBytes = TextureBytes) const { return reinterpret_cast<float*>(block + TexturesOffset + static_cast<std::size_t>(texture) * textureBytes); }
 
 private:
     std::uint8_t* block = nullptr;
+    std::size_t bytes;
 };
 
 void SetRecord(const GuestBlock& block, std::uint32_t record, std::uint32_t texture) {
@@ -381,6 +382,11 @@ void RunAcrossEpochs(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
     SampleInNewEpoch(device, result, 19, Row(stored.data()), "an entry the driver stored over before the epoch kept its old texels");
     Require(Since(before).resolved >= 1, "image table reuse across epochs: a driver store before the epoch did not resolve the table again");
 
+    SettleAcrossEpochs(device, result, 21, Row(block.Texels(21)), "the table before the texture cache was cleared sampled the wrong entry");
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    SampleInNewEpoch(device, result, 21, Row(block.Texels(21)), "the table after the texture cache and its held textures were cleared sampled the wrong entry");
+    SettleAcrossEpochs(device, result, 23, Row(block.Texels(23)), "the table resolved after the texture cache was cleared sampled the wrong entry");
+
     SetOutput(block.Texels(13));
     const auto writer = Compile(device, block);
     SetOutput(Output.data());
@@ -392,11 +398,57 @@ void RunAcrossEpochs(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
     const std::vector<float> written(block.Texels(13), block.Texels(13) + Width * Height);
     Require(std::bit_cast<std::uint32_t>(written[0]) == Row(block.Texels(7))[0], "image table reuse across epochs: the dispatch writing into an entry's texels stored the wrong values");
     Require(sampled == Row(written.data()), "image table reuse across epochs: an entry a dispatch wrote in an earlier epoch kept its old texels");
+}
 
-    SettleAcrossEpochs(device, result, 21, Row(block.Texels(21)), "the table before the texture cache was cleared sampled the wrong entry");
+void RunPinBudget(AgcDriver::VulkanDevice& device, bool overflow) {
+    const std::uint32_t side = overflow ? 128 : 16;
+    const std::uint32_t pressureSide = overflow ? 256 : 128;
+    const std::size_t bytes = 2 * TexturesOffset + Records * side * side * 4u;
+    const std::size_t pressureBytes = 2 * TexturesOffset + Records * pressureSide * pressureSide * 4u;
+    GuestBlock block(bytes - 256, bytes);
+    GuestBlock pressure(pressureBytes - 256, pressureBytes);
+    const auto prepare = [&](const GuestBlock& guest, std::uint32_t extent) {
+        for (std::uint32_t record = 0; record < Records; ++record) {
+            auto* texels = guest.Texels(record, extent * extent * 4u);
+            std::fill_n(texels, extent * extent, 0.25f + static_cast<float>(record));
+            auto* words = guest.Table() + record * (Stride / 4u);
+            std::fill_n(words, Stride / 4u, 0u);
+            std::copy(PointClamp.begin(), PointClamp.end(), words);
+            const auto image = Image(texels, extent, extent);
+            std::copy(image.begin(), image.end(), words + 4);
+            Keys[record] = record;
+        }
+        const auto srt = Buffer(guest.Table(), Records * Stride);
+        const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+        std::copy(srt.begin(), srt.end(), Srt.begin());
+        std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+        SetOutput(Output.data());
+        return Compile(device, guest);
+    };
+    const auto result = prepare(block, side);
+    const auto flood = prepare(pressure, pressureSide);
+    const std::vector<std::uint32_t> expected(Lanes, std::bit_cast<std::uint32_t>(0.25f));
+    SettleAcrossEpochs(device, result, 0, expected, "the table before eviction sampled the wrong entry");
+    const auto budget = std::strtoull(std::getenv("APS5_TABLE_PIN_MIB"), nullptr, 10) << 20u;
+    auto held = AgcDriver::Graphics::ImageTableReuses();
+    Require(held.pinnedBytes == 0, "image table pins: cached textures were charged before eviction");
+    Require(held.pinnedTables == (budget == 0 ? 0u : 1u), "image table pins: a zero budget retained a table or a nonzero budget did not pin it");
+    SampleInNewEpoch(device, flood, 0, expected, "the eviction pressure table sampled the wrong entry");
+    held = AgcDriver::Graphics::ImageTableReuses();
+    Require(held.pinnedBytes <= budget, "image table pins: later cache eviction exceeded the pin budget");
+    if (budget != 0 && !overflow) Require(held.pinnedBytes != 0, "image table pins: later cache eviction was not charged");
+    const auto before = held;
+    SampleInNewEpoch(device, result, 0, expected, "the table after eviction sampled the wrong entry");
+    if (budget != 0 && !overflow) Expect(before, 1, 0, "a table pinned across cache eviction");
+    else Require(Since(before).resolved == 1, "image table pins: a table still held textures past its budget");
+    const auto beforeWrite = AgcDriver::Graphics::ImageTableReuses();
+    std::fill_n(block.Texels(0), side * side, 0.75f);
+    const std::vector<std::uint32_t> changed(Lanes, std::bit_cast<std::uint32_t>(0.75f));
+    SampleInNewEpoch(device, result, 0, changed, "a CPU write after cache eviction kept old pinned texels");
+    Require(Since(beforeWrite).resolved == 1, "image table pins: a CPU write after eviction did not invalidate the table");
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
-    SampleInNewEpoch(device, result, 21, Row(block.Texels(21)), "the table after the texture cache and its held textures were cleared sampled the wrong entry");
-    SettleAcrossEpochs(device, result, 23, Row(block.Texels(23)), "the table resolved after the texture cache was cleared sampled the wrong entry");
+    held = AgcDriver::Graphics::ImageTableReuses();
+    Require(held.pinnedBytes == 0 && held.pinnedTables == 0, "image table pins: device cache clear retained pins or their charge");
 }
 
 void RunImageStoreAcrossEpochs(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
@@ -421,12 +473,17 @@ void RunImageStoreAcrossEpochs(AgcDriver::VulkanDevice& device, const GuestBlock
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         GuestBlock block;
         GuestBlock stores(UnimportableBytes);
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && (std::strcmp(argv[1], "--pin-budget") == 0 || std::strcmp(argv[1], "--pin-overflow") == 0)) {
+            RunPinBudget(*device, std::strcmp(argv[1], "--pin-overflow") == 0);
+            std::puts("image table pin budget tests passed");
+            return 0;
+        }
         if (AcrossEpochs()) {
             RunAcrossEpochs(*device, block);
             RunImageStoreAcrossEpochs(*device, stores);

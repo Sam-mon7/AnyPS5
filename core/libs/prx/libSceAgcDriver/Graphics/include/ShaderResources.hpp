@@ -114,6 +114,8 @@ private:
 struct ImageTableReuseCounts {
     std::uint64_t reused = 0;
     std::uint64_t resolved = 0;
+    std::uint64_t pinnedBytes = 0;
+    std::size_t pinnedTables = 0;
 };
 ImageTableReuseCounts ImageTableReuses();
 
