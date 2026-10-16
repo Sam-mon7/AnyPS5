@@ -761,6 +761,23 @@ void SourceMemoMemory(AgcDriver::VulkanDevice& device) {
     Require(after.sources == before.sources && after.results == before.results && after.spirv == before.spirv, "released source retained memo memory accounting");
 }
 
+void PreparedMaintenance() {
+    using namespace ShaderRecompiler;
+    Require(PreparedShaderBudgetEnabled(), "prepared maintenance fixture requires a budget");
+    auto object = std::make_shared<int>(0);
+    CachePreparedObject(object, PreparedObjectKind::Host, [] { return sizeof(int); }, 1);
+    std::this_thread::sleep_for(std::chrono::seconds(11));
+    const auto stats = MaintainPreparedShaderCache();
+    Require(stats.pinned == 1 && stats.evictions == 0, "prepared maintenance did not collect the pinned object");
+    object.reset();
+    for (unsigned iteration = 0; iteration < 100; ++iteration) {
+        const auto current = MaintainPreparedShaderCache();
+        Require(current.pinned == stats.pinned, "prepared maintenance repeated its periodic scan before the next interval");
+        Require(current.evictions == 0 && current.memory.Bytes() == stats.memory.Bytes(), "under-budget maintenance changed retained memory");
+    }
+    ClearPreparedObjects(1);
+}
+
 void PreparedBudget(AgcDriver::VulkanDevice* device, bool lru) {
     using namespace ShaderRecompiler;
     using namespace AgcDriver::DriverDetail;
@@ -840,6 +857,10 @@ void PreparedBudget(AgcDriver::VulkanDevice* device, bool lru) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--budget-maintenance") {
+            PreparedMaintenance();
+            return 0;
+        }
         Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy" || std::string_view(argv[1]) == "--budget-zero" || std::string_view(argv[1]) == "--budget-lru" || std::string_view(argv[1]) == "--memo-memory")), "invalid test arguments");
         if (argc == 2 && std::string_view(argv[1]) == "--memo-memory") {
             const auto device = OpenVulkanTestDevice();
