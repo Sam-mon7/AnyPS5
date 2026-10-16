@@ -1904,6 +1904,16 @@ void verifySpecializedEncoding() {
     target.nonConstantImageOffsets = !target.nonConstantImageOffsets;
     ShaderDiskCache::BuildSpecializedKey(source, constants, target, changed);
     require(changed != key, "specialization target is absent from key");
+    target.nonConstantImageOffsets = !target.nonConstantImageOffsets;
+    std::vector<std::byte> noOptimization, fullOptimization, restored;
+    setEnvironment("APS5_SPIRV_OPT", "none");
+    ShaderDiskCache::BuildSpecializedKey(source, constants, target, noOptimization);
+    setEnvironment("APS5_SPIRV_OPT", "full");
+    ShaderDiskCache::BuildSpecializedKey(source, constants, target, fullOptimization);
+    unsetEnvironment("APS5_SPIRV_OPT");
+    ShaderDiskCache::BuildSpecializedKey(source, constants, target, restored);
+    require(noOptimization != key && fullOptimization != key && noOptimization != fullOptimization, "optimizer modes share a specialized cache key");
+    require(restored == key, "default specialized cache key changed after selecting another mode");
     const auto file = ShaderDiskCache::EncodeSpecializedEntry(key, source);
     SharedSpirv decoded;
     require(ShaderDiskCache::DecodeSpecializedEntry(file, key, decoded) == ShaderDiskCache::LoadStatus::Loaded && decoded == source, "specialized module did not round trip");
@@ -1960,6 +1970,7 @@ int verifySpecializedAcrossProcesses(const char* self) {
     setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
     setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
     unsetEnvironment("ANYPS5_SHADER_CACHE_VERIFY");
+    unsetEnvironment("APS5_SPIRV_OPT");
     verifySpecializedEncoding();
     runChild(self, "--specialized-store");
     runChild(self, "--specialized-load");
