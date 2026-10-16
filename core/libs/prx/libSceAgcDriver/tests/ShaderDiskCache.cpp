@@ -1872,7 +1872,11 @@ std::string hexVersion(std::uint64_t value) {
 }
 
 void runChild(const char* self, const std::string& arguments) {
+#ifdef _WIN32
+    const std::string command = "\"\"" + std::string(self) + "\" " + arguments + "\"";
+#else
     const std::string command = "\"" + std::string(self) + "\" " + arguments;
+#endif
     require(std::system(command.c_str()) == 0, "the process " + arguments + " failed");
 }
 
