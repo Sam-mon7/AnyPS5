@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <set>
 
 namespace AgcDriver::DriverDetail {
 
@@ -78,6 +80,25 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     stageCapture.compiled = invocation.Materialize(*capture);
     timing.Mark("materialize");
     ShaderRecompiler::RecompileResult result = *stageCapture.compiled;
+    static const bool dumpIndirect = std::getenv("APS5_DUMP_INDIRECT_FALLBACKS") != nullptr;
+    if (dumpIndirect && i == 0 && drawParameters.indirect && program.binary.stage == Stage::Vertex) {
+        static std::mutex dumpMutex;
+        static std::set<std::uint64_t> dumped;
+        std::lock_guard lock(dumpMutex);
+        if (dumped.size() < 8 && !dumped.contains(program.binary.codeAddress)) {
+            auto probe = drawParameters;
+            if (ClassifyIndirectDraw(result, graphics, program, localDevice, probe, false) == Graphics::IndirectDrawPath::NotFolded) {
+                dumped.insert(program.binary.codeAddress);
+                const auto file = dumpRequest(program.binary.codeAddress, request);
+                const auto& indirect = *drawParameters.indirect;
+                std::fprintf(stderr, "[indirect-capture] shader=0x%llx request=%s user-base=%u patched-base=s%d patched-instance=s%d analyzer-base=s%d analyzer-instance=s%d shared=%d/%d conflict=%d/%d\n",
+                    static_cast<unsigned long long>(program.binary.codeAddress), file.c_str(), program.firstUserSgpr,
+                    indirect.baseVertexSgpr, indirect.startInstanceSgpr, result.vertexOffsetSgpr, result.instanceOffsetSgpr,
+                    result.vertexOffsetShared ? 1 : 0, result.instanceOffsetShared ? 1 : 0,
+                    result.vertexOffsetConflict ? 1 : 0, result.instanceOffsetConflict ? 1 : 0);
+            }
+        }
+    }
     phaseTiming.Phase(DrawRowRecompile);
     return result;
 }
