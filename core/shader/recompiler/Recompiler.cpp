@@ -314,7 +314,41 @@ struct EmissionFailure {
     std::exception_ptr failure;
 };
 
+namespace {
+
+struct SourceMemoryTotals {
+    std::mutex mutex;
+    PreparedShaderMemory memory;
+};
+
+SourceMemoryTotals& sourceMemoryTotals() {
+    static auto* totals = new SourceMemoryTotals();
+    return *totals;
+}
+
+struct SourceMemoryAccount {
+    PreparedShaderMemory memory;
+
+    void Set(const PreparedShaderMemory& next) {
+        static const bool enabled = PreparedShaderBudgetEnabled() || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (!enabled) return;
+        auto& totals = sourceMemoryTotals();
+        std::lock_guard lock(totals.mutex);
+        for (const auto field : {&PreparedShaderMemory::code, &PreparedShaderMemory::ir, &PreparedShaderMemory::spirv,
+                 &PreparedShaderMemory::reflection, &PreparedShaderMemory::layouts, &PreparedShaderMemory::results, &PreparedShaderMemory::cache}) {
+            totals.memory.*field += next.*field - memory.*field;
+        }
+        totals.memory.sources += next.sources - memory.sources;
+        memory = next;
+    }
+
+    ~SourceMemoryAccount() { Set({}); }
+};
+
+}
+
 struct SourceEntry {
+    SourceMemoryAccount accounting;
     std::mutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
@@ -405,6 +439,8 @@ template<class TKey, class T> std::shared_ptr<T> cachedEntry(std::map<TKey, Cach
 struct SourceCache {
     PrimedSharedMutex mutex;
     std::unordered_map<std::vector<std::uint64_t>, std::vector<SourceReference>, SourceKeyHash> sources;
+    std::size_t entryBytes = 0;
+    SourceMemoryAccount accounting;
 };
 
 SourceCache& Sources() {
@@ -442,46 +478,36 @@ std::size_t artifactBytes(const CompiledShaderArtifact& artifact) {
         + vectorBytes(artifact.parameterExports) + vectorBytes(artifact.fragmentParameters) + vectorBytes(artifact.stencilReferences);
 }
 
-PreparedShaderMemory sourceMemory() {
-    auto& cache = Sources();
-    std::shared_lock cacheLock(cache.mutex);
+void updateSourceMemory(SourceEntry& source) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!PreparedShaderBudgetEnabled() && !profile) return;
     PreparedShaderMemory memory;
     std::set<const void*> spirv;
-    std::set<const void*> plans;
     const auto countSpirv = [&](const SharedSpirv& words) {
         if (!words.empty() && spirv.insert(words.data()).second) memory.spirv += words.MemoryBytes();
     };
-    memory.cache = cache.sources.empty() ? 0 : cache.sources.bucket_count() * sizeof(void*);
-    for (const auto& [key, bucket] : cache.sources) {
-        memory.cache += vectorBytes(key) + vectorBytes(bucket) + sizeof(key) + sizeof(bucket) + sizeof(void*);
-        for (const auto& reference : bucket) {
-            const auto source = reference.Lock();
-            if (source == nullptr) continue;
-            std::lock_guard sourceLock(source->mutex);
-            ++memory.sources;
-            memory.code += vectorBytes(source->code);
-            memory.cache += sizeof(SourceEntry) + vectorBytes(source->variants) + vectorBytes(source->emissionFailures)
-                + source->memoIndex.bucket_count() * sizeof(void*) + source->memoIndex.size() * (sizeof(std::uint64_t) + sizeof(void*) * 2);
-            if (source->plan != nullptr && plans.insert(source->plan.get()).second) memory.ir += source->planMemory;
-            if (source->program != nullptr) memory.ir += source->programMemory;
-            for (const auto& variant : source->variants) {
-                memory.reflection += sizeof(CompiledVariant) + infoBytes(variant->info.info) + artifactBytes(variant->artifact);
-                memory.layouts += layoutBytes(variant->info.bindings) + layoutBytes(variant->bindings.layout);
-                countSpirv(variant->artifact.spirv);
-            }
-            for (const auto& memo : source->memo) {
-                const auto& result = *memo.result;
-                memory.results += sizeof(ResultMemoEntry) + sizeof(RecompileResult) + 2 * sizeof(void*) + artifactBytes(result)
-                    + vectorBytes(result.specialization) + vectorBytes(result.bindings) + vectorBytes(result.pushConstants)
-                    + vectorBytes(result.vertexAttributes) + vectorBytes(result.imageTablePoison) + vectorBytes(result.imageTableRanges)
-                    + vectorBytes(result.imageTableReadRanges) + vectorBytes(result.shaderDataUserWords);
-                for (const auto& binding : result.bindings) memory.results += vectorBytes(binding.guestDescriptor);
-                for (const auto& ranges : result.imageTableReadRanges) memory.results += vectorBytes(ranges);
-                countSpirv(result.spirv);
-            }
-        }
+    memory.sources = 1;
+    memory.code = vectorBytes(source.code);
+    memory.cache = sizeof(SourceEntry) + vectorBytes(source.variants) + vectorBytes(source.emissionFailures)
+        + source.memoIndex.bucket_count() * sizeof(void*) + source.memoIndex.size() * (sizeof(std::uint64_t) + sizeof(void*) * 2);
+    if (source.plan != nullptr) memory.ir += source.planMemory;
+    if (source.program != nullptr) memory.ir += source.programMemory;
+    for (const auto& variant : source.variants) {
+        memory.reflection += sizeof(CompiledVariant) + infoBytes(variant->info.info) + artifactBytes(variant->artifact);
+        memory.layouts += layoutBytes(variant->info.bindings) + layoutBytes(variant->bindings.layout);
+        countSpirv(variant->artifact.spirv);
     }
-    return memory;
+    for (const auto& memo : source.memo) {
+        const auto& result = *memo.result;
+        memory.results += sizeof(ResultMemoEntry) + sizeof(RecompileResult) + 2 * sizeof(void*) + artifactBytes(result)
+            + vectorBytes(result.specialization) + vectorBytes(result.bindings) + vectorBytes(result.pushConstants)
+            + vectorBytes(result.vertexAttributes) + vectorBytes(result.imageTablePoison) + vectorBytes(result.imageTableRanges)
+            + vectorBytes(result.imageTableReadRanges) + vectorBytes(result.shaderDataUserWords);
+        for (const auto& binding : result.bindings) memory.results += vectorBytes(binding.guestDescriptor);
+        for (const auto& ranges : result.imageTableReadRanges) memory.results += vectorBytes(ranges);
+        countSpirv(result.spirv);
+    }
+    source.accounting.Set(memory);
 }
 
 struct PreparedCache {
@@ -491,14 +517,20 @@ struct PreparedCache {
         const void* identity;
         PreparedObjectKind kind;
         std::uintptr_t device;
-        std::function<std::uint64_t()> bytes;
+        std::uint64_t bytes;
     };
     std::mutex mutex;
     std::list<Object> handles;
     std::unordered_map<const void*, decltype(handles)::iterator> index;
     PreparedShaderCacheStats stats;
-    std::atomic<bool> dirty{true};
+    std::array<std::uint64_t, 5> bytes{};
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+
+    auto Erase(std::list<Object>::iterator entry) {
+        bytes[static_cast<std::size_t>(entry->kind)] -= entry->bytes;
+        index.erase(entry->identity);
+        return handles.erase(entry);
+    }
 };
 
 PreparedCache& PreparedCacheStorage() {
@@ -528,9 +560,13 @@ void pruneSources() {
     std::unique_lock lock(cache.mutex);
     for (auto entry = cache.sources.begin(); entry != cache.sources.end();) {
         std::erase_if(entry->second, [](const auto& reference) { return reference.strong == nullptr && reference.weak.expired(); });
-        if (entry->second.empty()) entry = cache.sources.erase(entry);
+        if (entry->second.empty()) {
+            cache.entryBytes -= vectorBytes(entry->first) + vectorBytes(entry->second) + sizeof(*entry) + sizeof(void*);
+            entry = cache.sources.erase(entry);
+        }
         else ++entry;
     }
+    cache.accounting.Set({.cache = cache.entryBytes + (cache.sources.empty() ? 0 : cache.sources.bucket_count() * sizeof(void*))});
 }
 
 bool FailureMemo() {
@@ -575,7 +611,10 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         if (source == nullptr) {
             source = std::make_shared<SourceEntry>();
             source->code.assign(request.shader.code.begin(), request.shader.code.end());
-            auto& bucket = sources[key];
+            const auto [position, inserted] = sources.try_emplace(key);
+            auto& bucket = position->second;
+            if (inserted) cache.entryBytes += vectorBytes(position->first) + sizeof(*position) + sizeof(void*);
+            cache.entryBytes -= vectorBytes(bucket);
             if (!bucket.empty()) {
                 // A second entry under one key is a code hash collision (or the unhashed key with
                 // identical code, which cannot happen); each is reported under the profile switch.
@@ -585,6 +624,8 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 if (profile) std::fprintf(stderr, "[recompile] source key collision %llu: %zu entries share a key (%zu code words)\n", static_cast<unsigned long long>(collisions), bucket.size() + 1, request.shader.code.size());
             }
             bucket.emplace_back(source);
+            cache.entryBytes += vectorBytes(bucket);
+            cache.accounting.Set({.cache = cache.entryBytes + sources.bucket_count() * sizeof(void*)});
         }
     }
     {
@@ -627,8 +668,11 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
     }
     if (PreparedShaderBudgetEnabled() || std::getenv("APS5_PROFILE_DRAW") != nullptr) {
         std::lock_guard lock(source->mutex);
-        if (source->planMemory == 0 && source->plan != nullptr) source->planMemory = planBytes(*source->plan);
-        if (source->programMemory == 0 && source->program != nullptr) source->programMemory = source->program->MemoryBytes() + planBytes(source->program->Resources()) - sizeof(IrResourcePlan);
+        if (source->accounting.memory.sources == 0) {
+            if (source->plan != nullptr) source->planMemory = planBytes(*source->plan);
+            if (source->program != nullptr) source->programMemory = source->program->MemoryBytes() + planBytes(source->program->Resources()) - sizeof(IrResourcePlan);
+            updateSourceMemory(*source);
+        }
     }
     return source;
 }
@@ -1228,6 +1272,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), &emissionFailure));
         } catch (...) {
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
+            updateSourceMemory(source);
             throw;
         }
         if (cached != nullptr) {
@@ -1241,7 +1286,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     source.program.reset();
     source.variants.push_back(variant);
-    if (PreparedShaderBudgetEnabled()) PreparedCacheStorage().dirty.store(true, std::memory_order_relaxed);
+    updateSourceMemory(source);
     return variant;
 }
 
@@ -1427,7 +1472,6 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         }
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
             source.memo.push_front({variant->artifact.variantId, hash, shared});
-            if (PreparedShaderBudgetEnabled()) PreparedCacheStorage().dirty.store(true, std::memory_order_relaxed);
             source.memoIndex.emplace(index, source.memo.begin());
             while (source.memo.size() > ResultMemoEntries) {
                 const auto& last = source.memo.back();
@@ -1435,6 +1479,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
                 source.memo.pop_back();
                 counters.evictions.fetch_add(1, std::memory_order_relaxed);
             }
+            updateSourceMemory(source);
         }
     }
     reportResultMemo();
@@ -1507,15 +1552,15 @@ void CachePreparedObject(const std::shared_ptr<const void>& object, PreparedObje
     std::lock_guard lock(cache.mutex);
     auto found = cache.index.find(object.get());
     if (found != cache.index.end() && found->second->weak.expired()) {
-        cache.handles.erase(found->second);
-        cache.index.erase(found);
+        cache.Erase(found->second);
         found = cache.index.end();
     }
     if (found != cache.index.end()) cache.handles.splice(cache.handles.begin(), cache.handles, found->second);
     else {
-        cache.handles.push_front({PreparedShaderBudgetEnabled() ? object : nullptr, object, object.get(), kind, owner, std::move(bytes)});
+        const auto measured = bytes();
+        cache.handles.push_front({PreparedShaderBudgetEnabled() ? object : nullptr, object, object.get(), kind, owner, measured});
         cache.index.emplace(object.get(), cache.handles.begin());
-        cache.dirty = true;
+        cache.bytes[static_cast<std::size_t>(kind)] += measured;
     }
 }
 
@@ -1524,10 +1569,8 @@ void ClearPreparedObjects(std::uintptr_t owner) {
     std::lock_guard lock(cache.mutex);
     for (auto entry = cache.handles.begin(); entry != cache.handles.end();) {
         if (entry->device != owner || owner == 0) { ++entry; continue; }
-        cache.index.erase(entry->identity);
-        entry = cache.handles.erase(entry);
+        entry = cache.Erase(entry);
     }
-    cache.dirty.store(true, std::memory_order_relaxed);
 }
 
 void AdjustPreparedObjectMemory(PreparedObjectKind kind, std::uint64_t allocated, std::uint64_t freed) {
@@ -1552,51 +1595,48 @@ PreparedShaderCacheStats MaintainPreparedShaderCache() {
     const auto now = std::chrono::steady_clock::now();
     const bool report = now - cache.reported >= std::chrono::seconds(10);
     if (!limit && !report) return cache.stats;
-    if (!cache.dirty && !report && (!limit || cache.stats.memory.Bytes() <= *limit)) return cache.stats;
-    cache.dirty.store(false, std::memory_order_relaxed);
-    if (limit) pruneSources();
     const auto measure = [&] {
-        auto memory = sourceMemory();
-        memory.pipelines = DriverMemory()[0].load(std::memory_order_relaxed);
-        memory.modules = DriverMemory()[1].load(std::memory_order_relaxed);
-        memory.driverLayouts = DriverMemory()[2].load(std::memory_order_relaxed);
-        memory.pipelineCaches = DriverMemory()[3].load(std::memory_order_relaxed);
-        for (const auto& object : cache.handles) {
-            const auto bytes = object.bytes();
-            switch (object.kind) {
-            case PreparedObjectKind::Host: memory.cache += bytes; break;
-            case PreparedObjectKind::Pipeline: memory.pipelines += bytes; break;
-            case PreparedObjectKind::Module: memory.modules += bytes; break;
-            case PreparedObjectKind::Layout: memory.driverLayouts += bytes; break;
-            case PreparedObjectKind::Cache: memory.pipelineCaches += bytes; break;
-            }
+        PreparedShaderMemory memory;
+        {
+            auto& totals = sourceMemoryTotals();
+            std::lock_guard sourceLock(totals.mutex);
+            memory = totals.memory;
         }
+        memory.cache += cache.bytes[0];
+        memory.pipelines = DriverMemory()[0].load(std::memory_order_relaxed) + cache.bytes[1];
+        memory.modules = DriverMemory()[1].load(std::memory_order_relaxed) + cache.bytes[2];
+        memory.driverLayouts = DriverMemory()[2].load(std::memory_order_relaxed) + cache.bytes[3];
+        memory.pipelineCaches = DriverMemory()[3].load(std::memory_order_relaxed) + cache.bytes[4];
         return memory;
     };
-    for (auto entry = cache.handles.begin(); entry != cache.handles.end();) {
-        if (!entry->weak.expired()) { ++entry; continue; }
-        cache.index.erase(entry->identity);
-        entry = cache.handles.erase(entry);
+    if (report) {
+        for (auto entry = cache.handles.begin(); entry != cache.handles.end();) {
+            if (!entry->weak.expired()) { ++entry; continue; }
+            entry = cache.Erase(entry);
+        }
+        pruneSources();
     }
     cache.stats.memory = measure();
     cache.stats.peakBytes = std::max(cache.stats.peakBytes, cache.stats.memory.Bytes());
-    if (limit) {
+    if (limit && cache.stats.memory.Bytes() > *limit) {
         bool progress = true;
         while (progress && cache.stats.memory.Bytes() > *limit) {
             progress = false;
             for (auto entry = cache.handles.end(); entry != cache.handles.begin() && cache.stats.memory.Bytes() > *limit;) {
                 --entry;
                 if (entry->owner.use_count() != 1) continue;
-                cache.index.erase(entry->identity);
-                entry = cache.handles.erase(entry);
+                entry = cache.Erase(entry);
                 ++cache.stats.evictions;
                 progress = true;
-                pruneSources();
                 cache.stats.memory = measure();
             }
         }
+        pruneSources();
+        cache.stats.memory = measure();
+        cache.stats.pinned = std::ranges::count_if(cache.handles, [](const auto& object) { return object.owner.use_count() > 1; });
+    } else if (report) {
+        cache.stats.pinned = std::ranges::count_if(cache.handles, [](const auto& object) { return object.owner.use_count() > 1; });
     }
-    cache.stats.pinned = std::ranges::count_if(cache.handles, [](const auto& object) { return object.owner.use_count() > 1; });
     cache.stats.overBudgetBytes = limit && cache.stats.memory.Bytes() > *limit ? cache.stats.memory.Bytes() - *limit : 0;
     if (profile && report) {
         const auto& memory = cache.stats.memory;

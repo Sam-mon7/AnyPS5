@@ -758,6 +758,17 @@ void PreparedBudget(AgcDriver::VulkanDevice* device, bool lru) {
         const auto stats = MaintainPreparedShaderCache();
         Require(!handles[0].expired() && handles[1].expired() && !handles[2].expired(), "prepared cache did not evict the least recently used object");
         Require(stats.memory.Bytes() <= 1024 * 1024 && stats.evictions != 0, "prepared cache exceeded its unpinned budget");
+        const auto tracked = std::make_shared<int>(0);
+        unsigned measurements = 0;
+        for (unsigned iteration = 0; iteration < 100; ++iteration) {
+            CachePreparedObject(tracked, PreparedObjectKind::Host, [&] { ++measurements; return 4096; }, 1);
+            CachePreparedObject(std::make_shared<int>(0), PreparedObjectKind::Host, [] { return 0; }, 2);
+            Require(MaintainPreparedShaderCache().memory.Bytes() == stats.memory.Bytes() + 4096, "prepared cache running total drifted on a cache hit");
+        }
+        Require(measurements == 1, "prepared cache remeasured an unchanged object");
+        ClearPreparedObjects(1);
+        ClearPreparedObjects(2);
+        Require(MaintainPreparedShaderCache().memory.Bytes() == stats.memory.Bytes(), "prepared cache retained cleared object accounting");
         return;
     }
     ShaderSnapshot snapshot{0x100000, 0, 0, {0xbf810000u}, {}};
