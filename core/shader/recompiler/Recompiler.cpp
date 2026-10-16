@@ -593,12 +593,15 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
             if (FailureMemo() && source->planFailure) std::rethrow_exception(source->planFailure);
             const bool disk = diskPlans();
             std::vector<std::byte> planKey;
+            std::shared_ptr<const IrResourcePlan> cachedPlan;
             if (disk) {
                 ShaderDiskCache::BuildPlanKey(request, HostSubgroupSize(request), planKey);
                 IrResourcePlan loaded;
                 if (ShaderDiskCache::LoadPlan(planKey, loaded)) {
                     loaded.shaderHash = request.shader.codeAddress;
-                    source->plan = std::make_shared<const IrResourcePlan>(std::move(loaded));
+                    auto plan = std::make_shared<const IrResourcePlan>(std::move(loaded));
+                    if (ShaderDiskCache::VerifyHits()) cachedPlan = std::move(plan);
+                    else source->plan = std::move(plan);
                 }
             }
             if (source->plan == nullptr) {
@@ -610,7 +613,15 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                     if (FailureMemo()) source->planFailure = std::current_exception();
                     throw;
                 }
-                if (disk) ShaderDiskCache::StorePlan(std::move(planKey), source->plan);
+                if (cachedPlan != nullptr) {
+                    std::vector<std::byte> cachedBytes;
+                    std::vector<std::byte> freshBytes;
+                    const bool matched = ShaderDiskCache::EncodePlan(*cachedPlan, cachedBytes) && ShaderDiskCache::EncodePlan(*source->plan, freshBytes) && cachedBytes == freshBytes;
+                    ShaderDiskCache::NoteVerifiedHit("resource plan", matched, request.shader.codeAddress, cachedBytes.size(), freshBytes.size());
+                    if (!matched) ShaderDiskCache::StorePlan(std::move(planKey), source->plan);
+                } else if (disk) {
+                    ShaderDiskCache::StorePlan(std::move(planKey), source->plan);
+                }
             }
         }
     }
@@ -1198,6 +1209,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive();
     std::vector<std::byte> diskKey;
     std::shared_ptr<const CompiledVariant> variant;
+    std::shared_ptr<const CompiledVariant> cached;
     if (disk) {
         ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), diskKey);
         CompiledVariant loaded;
@@ -1205,6 +1217,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             loaded.layout = request.layout;
             loaded.artifact.variantId = nextVariantId();
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
+            if (ShaderDiskCache::VerifyHits()) cached = std::exchange(variant, nullptr);
         }
     }
     if (variant == nullptr) {
@@ -1217,7 +1230,14 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
             throw;
         }
-        if (disk) ShaderDiskCache::Store(std::move(diskKey), variant);
+        if (cached != nullptr) {
+            const bool matched = ShaderDiskCache::SameOutput(*cached, *variant);
+            ShaderDiskCache::NoteVerifiedHit("compiled variant", matched, request.shader.codeAddress, cached->artifact.spirv.Read().size() * sizeof(std::uint32_t), variant->artifact.spirv.Read().size() * sizeof(std::uint32_t));
+            if (matched) variant = std::move(cached);
+            else ShaderDiskCache::Store(std::move(diskKey), variant);
+        } else if (disk) {
+            ShaderDiskCache::Store(std::move(diskKey), variant);
+        }
     }
     source.program.reset();
     source.variants.push_back(variant);

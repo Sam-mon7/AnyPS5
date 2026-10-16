@@ -1160,22 +1160,35 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_DOM_INTERSECTION",
     "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_RESULT_MEMO",
+    "APS5_PREPARED_SHADER_MIB",
 };
 
-const std::vector<std::byte>& switchKey() {
-    static const std::vector<std::byte> key = [] {
-        std::vector<std::byte> bytes;
-        Writer writer(bytes);
-        for (const auto name : Generated::RecompilerSwitches) {
-            if (std::find(std::begin(NeutralSwitches), std::end(NeutralSwitches), name) != std::end(NeutralSwitches)) continue;
-            const char* value = std::getenv(std::string(name).c_str());
-            if (value == nullptr) continue;
-            writer.Text(std::string(name));
-            writer.Text(value);
-        }
-        return bytes;
-    }();
-    return key;
+constexpr std::string_view VertexStageSwitches[] = {
+    "APS5_INDIRECT_SGPR_FOLD",
+};
+
+bool vertexStage(const RecompileRequest& request) {
+    return request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Local;
+}
+
+std::vector<std::byte> buildSwitchKey(bool vertex) {
+    std::vector<std::byte> bytes;
+    Writer writer(bytes);
+    for (const auto name : Generated::RecompilerSwitches) {
+        if (std::find(std::begin(NeutralSwitches), std::end(NeutralSwitches), name) != std::end(NeutralSwitches)) continue;
+        if (!vertex && std::find(std::begin(VertexStageSwitches), std::end(VertexStageSwitches), name) != std::end(VertexStageSwitches)) continue;
+        const char* value = std::getenv(std::string(name).c_str());
+        if (value == nullptr) continue;
+        writer.Text(std::string(name));
+        writer.Text(value);
+    }
+    return bytes;
+}
+
+const std::vector<std::byte>& switchKey(bool vertex) {
+    static const std::vector<std::byte> vertexKey = buildSwitchKey(true);
+    static const std::vector<std::byte> otherKey = buildSwitchKey(false);
+    return vertex ? vertexKey : otherKey;
 }
 
 std::string hex(std::uint64_t value) {
@@ -1255,7 +1268,16 @@ public:
         counters.planMisses = planMisses.load(std::memory_order_relaxed);
         counters.planWrites = planWrites.load(std::memory_order_relaxed);
         counters.planLoadFailures = planLoadFailures.load(std::memory_order_relaxed);
+        counters.verifiedHits = verifiedHits.load(std::memory_order_relaxed);
+        counters.verifyMismatches = verifyMismatches.load(std::memory_order_relaxed);
         return counters;
+    }
+
+    void NoteVerifiedHit(const char* what, bool matched, std::uint64_t codeAddress, std::size_t cachedBytes, std::size_t freshBytes) {
+        verifiedHits.fetch_add(1, std::memory_order_relaxed);
+        if (matched) return;
+        const auto mismatches = verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+        if (mismatches < 16) std::fprintf(stderr, "[shader-disk-cache] verify mismatch for the %s of shader 0x%llx: the cached entry (%zu bytes) differs from a fresh build (%zu bytes); using and storing the fresh one\n", what, static_cast<unsigned long long>(codeAddress), cachedBytes, freshBytes);
     }
 
 private:
@@ -1307,7 +1329,7 @@ private:
     }
 
     void run() {
-        std::fprintf(stderr, "[shader-disk-cache] %s (source version %s, format %u)\n", directory.string().c_str(), hex(SourceVersion()).c_str(), FormatVersion);
+        std::fprintf(stderr, "[shader-disk-cache] %s (%s version %s, format %u%s)\n", directory.string().c_str(), OutputKeyed() ? "output" : "source", hex(SourceVersion()).c_str(), FormatVersion, VerifyHits() ? ", verifying hits" : "");
         housekeeping();
         std::unique_lock lock(mutex);
         while (true) {
@@ -1382,13 +1404,14 @@ private:
         const auto totals = Totals();
         const auto loadNs = loadNanoseconds.load(std::memory_order_relaxed);
         const auto delta = [](std::uint64_t after, std::uint64_t before) { return static_cast<unsigned long long>(after - before); };
-        if (totals.hits == reported.hits && totals.misses == reported.misses && totals.writes == reported.writes && totals.loadFailures == reported.loadFailures && totals.writeFailures == reported.writeFailures && totals.planHits == reported.planHits && totals.planMisses == reported.planMisses && totals.planWrites == reported.planWrites && totals.planLoadFailures == reported.planLoadFailures) return;
+        if (totals.hits == reported.hits && totals.misses == reported.misses && totals.writes == reported.writes && totals.loadFailures == reported.loadFailures && totals.writeFailures == reported.writeFailures && totals.planHits == reported.planHits && totals.planMisses == reported.planMisses && totals.planWrites == reported.planWrites && totals.planLoadFailures == reported.planLoadFailures && totals.verifiedHits == reported.verifiedHits) return;
         std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
                      delta(totals.hits, reported.hits), delta(totals.misses, reported.misses), delta(totals.writes, reported.writes), static_cast<double>(totals.bytesWritten - reported.bytesWritten) / (1024.0 * 1024.0),
                      delta(totals.loadFailures, reported.loadFailures), delta(totals.writeFailures, reported.writeFailures),
                      delta(totals.planHits, reported.planHits), delta(totals.planMisses, reported.planMisses), delta(totals.planWrites, reported.planWrites), delta(totals.planLoadFailures, reported.planLoadFailures),
                      static_cast<double>(totals.bytesRead - reported.bytesRead) / (1024.0 * 1024.0), static_cast<double>(loadNs - reportedLoadNs) / 1e6,
                      static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes), static_cast<unsigned long long>(totals.planHits), static_cast<unsigned long long>(totals.planMisses));
+        if (VerifyHits()) std::fprintf(stderr, "[shader-disk-cache] verify (10 s): %llu hits recompiled, %llu mismatches (totals: %llu verified, %llu mismatches)\n", delta(totals.verifiedHits, reported.verifiedHits), delta(totals.verifyMismatches, reported.verifyMismatches), static_cast<unsigned long long>(totals.verifiedHits), static_cast<unsigned long long>(totals.verifyMismatches));
         reported = totals;
         reportedLoadNs = loadNs;
     }
@@ -1402,6 +1425,7 @@ private:
     bool writing = false;
     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
     std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0};
+    std::atomic<std::uint64_t> verifiedHits{0}, verifyMismatches{0};
     std::atomic<std::int64_t> lastReport{0};
     std::mutex reportMutex;
     Counters reported;
@@ -1415,8 +1439,39 @@ DiskStore& store() {
 
 }
 
+bool OutputKeyed() {
+    static const bool keyed = [] {
+        const char* text = std::getenv("ANYPS5_SHADER_CACHE_KEY");
+        if (text == nullptr || *text == '\0' || std::strcmp(text, "source") == 0) return false;
+        if (std::strcmp(text, "output") == 0) return true;
+        std::fprintf(stderr, "[shader-disk-cache] ANYPS5_SHADER_CACHE_KEY must be source or output, not %s; keying by source\n", text);
+        return false;
+    }();
+    return keyed;
+}
+
 std::uint64_t SourceVersion() {
-    return Generated::SourceVersion;
+    return OutputKeyed() ? Generated::OutputVersion : Generated::SourceVersion;
+}
+
+bool VerifyHits() {
+    static const bool verify = [] {
+        const char* text = std::getenv("ANYPS5_SHADER_CACHE_VERIFY");
+        return text != nullptr && std::strcmp(text, "1") == 0;
+    }();
+    return verify;
+}
+
+bool SameOutput(const CompiledVariant& left, const CompiledVariant& right) {
+    auto first = left;
+    auto second = right;
+    first.info.shaderHash = 0;
+    second.info.shaderHash = 0;
+    return EncodeEntry({}, first) == EncodeEntry({}, second);
+}
+
+void NoteVerifiedHit(const char* what, bool matched, std::uint64_t codeAddress, std::size_t cachedBytes, std::size_t freshBytes) {
+    store().NoteVerifiedHit(what, matched, codeAddress, cachedBytes, freshBytes);
 }
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {
@@ -1435,7 +1490,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, s
     writer.Value(request.layout.firstBinding);
     writer.Value(request.layout.pushConstantOffsetBytes);
     writer.Value(request.layout.pushConstantSizeBytes);
-    const auto& switches = switchKey();
+    const auto& switches = switchKey(vertexStage(request));
     key.insert(key.end(), switches.begin(), switches.end());
 }
 
@@ -1452,7 +1507,7 @@ void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSiz
     writer.Values(std::span<const std::uint64_t>(memoryKey));
     writer.Values(request.shader.code);
     writer.Value(hostSubgroupSize);
-    const auto& switches = switchKey();
+    const auto& switches = switchKey(vertexStage(request));
     key.insert(key.end(), switches.begin(), switches.end());
 }
 

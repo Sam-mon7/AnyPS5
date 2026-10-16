@@ -35,6 +35,7 @@ endforeach()
 
 set(failures)
 set(manifest "${EXTRA}\n")
+set(outputManifest "${EXTRA}\n")
 set(switches)
 foreach(source IN LISTS sources)
     if(NOT EXISTS "${source}")
@@ -102,6 +103,7 @@ foreach(submodule IN LISTS submodules)
         set(commit "unversioned ${digest}")
     endif()
     string(APPEND manifest "submodule ${relative} ${commit}\n")
+    string(APPEND outputManifest "submodule ${relative} ${commit}\n")
 endforeach()
 
 foreach(source IN LISTS guard)
@@ -136,6 +138,14 @@ endif()
 
 string(SHA256 version "${manifest}")
 string(SUBSTRING "${version}" 0 16 version)
+file(READ "${RECOMPILER_DIR}/ShaderOutputEpoch.txt" outputEpoch)
+string(STRIP "${outputEpoch}" outputEpoch)
+if(NOT outputEpoch MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "core/shader/recompiler/ShaderOutputEpoch.txt must hold one decimal number, not '${outputEpoch}'")
+endif()
+string(APPEND outputManifest "epoch ${outputEpoch}\n")
+string(SHA256 outputVersion "${outputManifest}")
+string(SUBSTRING "${outputVersion}" 0 16 outputVersion)
 list(REMOVE_DUPLICATES switches)
 list(SORT switches)
 list(JOIN switches ",\n    " switchList)
@@ -149,6 +159,7 @@ set(content "#ifndef CORE_SHADER_RECOMPILER_SHADERCACHEVERSION_HPP
 namespace ShaderRecompiler::ShaderDiskCache::Generated {
 
 inline constexpr std::uint64_t SourceVersion = 0x${version}ull;
+inline constexpr std::uint64_t OutputVersion = 0x${outputVersion}ull;
 
 inline constexpr std::string_view RecompilerSwitches[] = {
     ${switchList}
