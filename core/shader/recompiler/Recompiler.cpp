@@ -306,6 +306,7 @@ struct ResultMemoEntry {
     std::uint64_t variantId;
     std::uint64_t hash;
     std::shared_ptr<const RecompileResult> result;
+    std::size_t memory = 0;
 };
 
 struct EmissionFailure {
@@ -349,6 +350,8 @@ struct SourceMemoryAccount {
 
 struct SourceEntry {
     SourceMemoryAccount accounting;
+    PreparedShaderMemory retainedMemory;
+    std::map<const void*, std::pair<std::size_t, std::size_t>> spirvReferences;
     std::mutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
@@ -478,35 +481,57 @@ std::size_t artifactBytes(const CompiledShaderArtifact& artifact) {
         + vectorBytes(artifact.parameterExports) + vectorBytes(artifact.fragmentParameters) + vectorBytes(artifact.stencilReferences);
 }
 
-void updateSourceMemory(SourceEntry& source) {
+bool trackSourceMemory() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!PreparedShaderBudgetEnabled() && !profile) return;
-    PreparedShaderMemory memory;
-    std::set<const void*> spirv;
-    const auto countSpirv = [&](const SharedSpirv& words) {
-        if (!words.empty() && spirv.insert(words.data()).second) memory.spirv += words.MemoryBytes();
-    };
+    return PreparedShaderBudgetEnabled() || profile;
+}
+
+void addSourceSpirv(SourceEntry& source, const SharedSpirv& words) {
+    if (words.empty()) return;
+    auto& [references, bytes] = source.spirvReferences[words.data()];
+    const auto current = words.MemoryBytes();
+    source.retainedMemory.spirv -= bytes;
+    source.retainedMemory.spirv += current;
+    bytes = current;
+    ++references;
+}
+
+void removeSourceSpirv(SourceEntry& source, const SharedSpirv& words) {
+    if (words.empty()) return;
+    const auto found = source.spirvReferences.find(words.data());
+    if (found == source.spirvReferences.end()) throw std::logic_error("source memory accounting lost a SPIR-V reference");
+    if (--found->second.first == 0) {
+        source.retainedMemory.spirv -= found->second.second;
+        source.spirvReferences.erase(found);
+    }
+}
+
+std::size_t resultMemory(const RecompileResult& result) {
+    auto bytes = sizeof(ResultMemoEntry) + sizeof(RecompileResult) + 2 * sizeof(void*) + artifactBytes(result)
+        + vectorBytes(result.specialization) + vectorBytes(result.bindings) + vectorBytes(result.pushConstants)
+        + vectorBytes(result.vertexAttributes) + vectorBytes(result.imageTablePoison) + vectorBytes(result.imageTableRanges)
+        + vectorBytes(result.imageTableReadRanges) + vectorBytes(result.shaderDataUserWords);
+    for (const auto& binding : result.bindings) bytes += vectorBytes(binding.guestDescriptor);
+    for (const auto& ranges : result.imageTableReadRanges) bytes += vectorBytes(ranges);
+    return bytes;
+}
+
+void removeMemoMemory(SourceEntry& source, const ResultMemoEntry& memo) {
+    if (!trackSourceMemory()) return;
+    source.retainedMemory.results -= memo.memory;
+    removeSourceSpirv(source, memo.result->spirv);
+}
+
+void updateSourceMemory(SourceEntry& source) {
+    if (!trackSourceMemory()) return;
+    auto memory = source.retainedMemory;
     memory.sources = 1;
     memory.code = vectorBytes(source.code);
     memory.cache = sizeof(SourceEntry) + vectorBytes(source.variants) + vectorBytes(source.emissionFailures)
-        + source.memoIndex.bucket_count() * sizeof(void*) + source.memoIndex.size() * (sizeof(std::uint64_t) + sizeof(void*) * 2);
+        + source.memoIndex.bucket_count() * sizeof(void*) + source.memoIndex.size() * (sizeof(std::uint64_t) + sizeof(void*) * 2)
+        + source.spirvReferences.size() * (sizeof(decltype(source.spirvReferences)::value_type) + 3 * sizeof(void*));
     if (source.plan != nullptr) memory.ir += source.planMemory;
     if (source.program != nullptr) memory.ir += source.programMemory;
-    for (const auto& variant : source.variants) {
-        memory.reflection += sizeof(CompiledVariant) + infoBytes(variant->info.info) + artifactBytes(variant->artifact);
-        memory.layouts += layoutBytes(variant->info.bindings) + layoutBytes(variant->bindings.layout);
-        countSpirv(variant->artifact.spirv);
-    }
-    for (const auto& memo : source.memo) {
-        const auto& result = *memo.result;
-        memory.results += sizeof(ResultMemoEntry) + sizeof(RecompileResult) + 2 * sizeof(void*) + artifactBytes(result)
-            + vectorBytes(result.specialization) + vectorBytes(result.bindings) + vectorBytes(result.pushConstants)
-            + vectorBytes(result.vertexAttributes) + vectorBytes(result.imageTablePoison) + vectorBytes(result.imageTableRanges)
-            + vectorBytes(result.imageTableReadRanges) + vectorBytes(result.shaderDataUserWords);
-        for (const auto& binding : result.bindings) memory.results += vectorBytes(binding.guestDescriptor);
-        for (const auto& ranges : result.imageTableReadRanges) memory.results += vectorBytes(ranges);
-        countSpirv(result.spirv);
-    }
     source.accounting.Set(memory);
 }
 
@@ -1312,6 +1337,11 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     source.program.reset();
     source.variants.push_back(variant);
+    if (trackSourceMemory()) {
+        source.retainedMemory.reflection += sizeof(CompiledVariant) + infoBytes(variant->info.info) + artifactBytes(variant->artifact);
+        source.retainedMemory.layouts += layoutBytes(variant->info.bindings) + layoutBytes(variant->bindings.layout);
+        addSourceSpirv(source, variant->artifact.spirv);
+    }
     updateSourceMemory(source);
     return variant;
 }
@@ -1492,16 +1522,23 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
                 source.memo.splice(source.memo.begin(), source.memo, found->second);
                 shared = found->second->result;
             } else {
+                removeMemoMemory(source, *found->second);
                 source.memo.erase(found->second);
                 source.memoIndex.erase(found);
             }
         }
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
             source.memo.push_front({variant->artifact.variantId, hash, shared});
+            if (trackSourceMemory()) {
+                source.memo.front().memory = resultMemory(*shared);
+                source.retainedMemory.results += source.memo.front().memory;
+                addSourceSpirv(source, shared->spirv);
+            }
             source.memoIndex.emplace(index, source.memo.begin());
             while (source.memo.size() > ResultMemoEntries) {
                 const auto& last = source.memo.back();
                 source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
+                removeMemoMemory(source, last);
                 source.memo.pop_back();
                 counters.evictions.fetch_add(1, std::memory_order_relaxed);
             }

@@ -725,6 +725,42 @@ void DeferredUndecodableRegistration() {
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "unsupported MIMG opcode");
 }
 
+void SourceMemoMemory(AgcDriver::VulkanDevice& device) {
+    using namespace ShaderRecompiler;
+    Require(PreparedShaderBudgetEnabled(), "source memo memory fixture requires a budget");
+    const auto before = MaintainPreparedShaderCache().memory;
+    {
+        const std::array<std::uint32_t, 1> code{0xbf810000u};
+        const ShaderComputeStageInfo compute{{1, 1, 1}, 0, {}, false, 1, {}};
+        const RecompileRequest request{{ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}}, {32, 0, {}, compute, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+        const auto prepared = PrepareShader(request);
+        ResourceCapture capture = *CaptureResources(request, {});
+        capture.snapshot.userData.resize(1);
+        const auto baseline = MaintainPreparedShaderCache().memory;
+        std::shared_ptr<const RecompileResult> last;
+        PreparedShaderMemory saturated;
+        for (std::uint32_t i = 0; i < 1024; ++i) {
+            capture.snapshot.userData.front() = i;
+            bool hit = true;
+            last = Recompile(request, capture, &hit);
+            Require(!hit, "distinct source memo snapshots unexpectedly hit");
+            Require(last->spirv.data() == GetPreparedArtifact(*prepared).spirv.data(), "source memo fixture does not share its immutable SPIR-V");
+            if (i == 511) saturated = MaintainPreparedShaderCache().memory;
+        }
+        const auto current = MaintainPreparedShaderCache().memory;
+        Require(current.results > baseline.results, "source memo entries were not counted");
+        Require(current.results == saturated.results && current.cache == saturated.cache, "source memo accounting grew after eviction reached steady size");
+        Require(current.spirv == baseline.spirv, "shared source memo SPIR-V was counted more than once");
+        for (unsigned i = 0; i < 100; ++i) {
+            bool hit = false;
+            Require(Recompile(request, capture, &hit) == last && hit, "source memo hit did not reuse its result");
+        }
+        Require(MaintainPreparedShaderCache().memory.Bytes() == current.Bytes(), "source memo hits changed memory accounting");
+    }
+    const auto after = MaintainPreparedShaderCache().memory;
+    Require(after.sources == before.sources && after.results == before.results && after.spirv == before.spirv, "released source retained memo memory accounting");
+}
+
 void PreparedBudget(AgcDriver::VulkanDevice* device, bool lru) {
     using namespace ShaderRecompiler;
     using namespace AgcDriver::DriverDetail;
@@ -804,7 +840,13 @@ void PreparedBudget(AgcDriver::VulkanDevice* device, bool lru) {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy" || std::string_view(argv[1]) == "--budget-zero" || std::string_view(argv[1]) == "--budget-lru")), "invalid test arguments");
+        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy" || std::string_view(argv[1]) == "--budget-zero" || std::string_view(argv[1]) == "--budget-lru" || std::string_view(argv[1]) == "--memo-memory")), "invalid test arguments");
+        if (argc == 2 && std::string_view(argv[1]) == "--memo-memory") {
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            SourceMemoMemory(*device);
+            return 0;
+        }
         if (argc == 2 && (std::string_view(argv[1]) == "--budget-zero" || std::string_view(argv[1]) == "--budget-lru")) {
             if (std::string_view(argv[1]) == "--budget-lru") {
                 PreparedBudget(nullptr, true);
