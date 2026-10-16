@@ -12,8 +12,8 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
-#ifdef _WIN32
 #include "prx/libc/include/HostThreadLocal.hpp"
+#ifdef _WIN32
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -4030,8 +4030,10 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
 
 void GuestBufferMemory::AddressRanges(std::vector<ShaderRecompiler::BdaAbi::Range>& result) const {
     Require(uploaded && !committed, "guest GPU address ranges are not available");
-    thread_local std::vector<ShaderRecompiler::BdaAbi::Range> own;
-    thread_local std::vector<ShaderRecompiler::BdaAbi::Range> merged;
+    struct OwnRangesStorage {};
+    struct MergedRangesStorage {};
+    auto& own = HostThreadLocal<std::vector<ShaderRecompiler::BdaAbi::Range>, OwnRangesStorage>();
+    auto& merged = HostThreadLocal<std::vector<ShaderRecompiler::BdaAbi::Range>, MergedRangesStorage>();
     own.clear();
     for (const auto& region : regions) own.push_back(addressRange(region));
     result.clear();

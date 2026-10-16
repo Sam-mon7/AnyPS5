@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -140,7 +141,8 @@ BdaResources::BdaResources(const Context& context) {
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
     const auto cached = memory.CachedAddressTable();
-    thread_local std::vector<ShaderRecompiler::BdaAbi::Range> built;
+    struct AddressRangesStorage {};
+    auto& built = HostThreadLocal<std::vector<ShaderRecompiler::BdaAbi::Range>, AddressRangesStorage>();
     if (!cached.has_value()) memory.AddressRanges(built);
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
