@@ -1436,6 +1436,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->depthBiasClamp = enabled.depthBiasClamp == VK_TRUE;
     enabled.dualSrcBlend = available.dualSrcBlend;
     state->dualSrcBlend = enabled.dualSrcBlend == VK_TRUE;
+    enabled.independentBlend = available.independentBlend;
     enabled.occlusionQueryPrecise = available.occlusionQueryPrecise;
     state->occlusionQueryPrecise = enabled.occlusionQueryPrecise == VK_TRUE;
     // Recompiled storage-image access declares no format (the guest descriptor decides it).
