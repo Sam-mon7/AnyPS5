@@ -584,6 +584,29 @@ static void ApplyJobAffinity(PthreadPrivate& thread, void* handle) {
     });
     CpuTopology::PinTraced(thread.name.c_str(), handle, mask);
 }
+
+static void ApplyJobPriority(PthreadPrivate& thread, void* nativeHandle) {
+    static const int requested = [] {
+        const char* value = std::getenv("APS5_JOB_PRIORITY");
+        if (value != nullptr && std::strcmp(value, "below") == 0) return THREAD_PRIORITY_BELOW_NORMAL;
+        if (value != nullptr && std::strcmp(value, "lowest") == 0) return THREAD_PRIORITY_LOWEST;
+        return THREAD_PRIORITY_NORMAL;
+    }();
+    if (requested == THREAD_PRIORITY_NORMAL) return;
+    const bool job = thread.name.compare(0, std::strlen(JOB_WORKER_PREFIX), JOB_WORKER_PREFIX) == 0;
+    if (!job && !thread.jobPriorityApplied) return;
+    const HANDLE handle = nativeHandle != nullptr ? static_cast<HANDLE>(nativeHandle) : GetCurrentThread();
+    if (job && !thread.jobPriorityApplied) {
+        thread.originalJobPriority = GetThreadPriority(handle);
+        if (thread.originalJobPriority == THREAD_PRIORITY_ERROR_RETURN)
+            throw std::system_error(GetLastError(), std::system_category(), "Reading job worker host priority");
+    }
+    const int priority = job ? requested : thread.originalJobPriority;
+    if (!SetThreadPriority(handle, priority))
+        throw std::system_error(GetLastError(), std::system_category(), "Setting job worker host priority");
+    thread.jobPriorityApplied = job;
+    std::fprintf(stderr, "[job-priority] %s tid=%lu host=%d%s\n", thread.name.c_str(), static_cast<unsigned long>(GetThreadId(handle)), priority, job ? "" : " (restored)");
+}
 #endif
 
 struct NativeThreadArgs {
@@ -615,6 +638,7 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
             const std::wstring description(self->name.begin(), self->name.end());
             SetThreadDescription(GetCurrentThread(), description.c_str());
             ApplyJobAffinity(*self, nullptr);
+            ApplyJobPriority(*self, nullptr);
         }
         args->initialized.set_value();
     } catch (...) {
@@ -942,6 +966,7 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
     const std::wstring description(thread->name.begin(), thread->name.end());
     SetThreadDescription(static_cast<HANDLE>(thread->nativeHandle), description.c_str());
     ApplyJobAffinity(*thread, thread->nativeHandle);
+    ApplyJobPriority(*thread, thread->nativeHandle);
 #endif
     return SCE_OK;
 }

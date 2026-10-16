@@ -1274,6 +1274,17 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(guest_pthread_rename PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        add_test_executable(guest_job_priority_tests ${LIBS_INCLUDE_DIR}/tests/GuestJobPriority.cpp)
+        target_include_directories(guest_job_priority_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_job_priority_tests PRIVATE libkernel libc)
+        configure_windows_unwind(guest_job_priority_tests)
+        foreach(jobPriority IN ITEMS default below lowest invalid)
+            add_test(NAME guest_job_priority_${jobPriority} COMMAND guest_job_priority_tests ${jobPriority})
+            set_tests_properties(guest_job_priority_${jobPriority} PROPERTIES TIMEOUT 20
+                ENVIRONMENT "APS5_JOB_PRIORITY=${jobPriority};APS5_NO_JOB_AFFINITY=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        endforeach()
+        set_property(TEST guest_job_priority_default APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_JOB_PRIORITY=unset:")
     endif()
     add_test_executable(guest_coredump_attach_tests ${LIBS_INCLUDE_DIR}/tests/GuestCoredumpAttach.cpp)
     target_include_directories(guest_coredump_attach_tests PRIVATE ${LIBS_INCLUDE_DIR})
