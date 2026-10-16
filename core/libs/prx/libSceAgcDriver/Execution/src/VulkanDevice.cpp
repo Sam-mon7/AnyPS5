@@ -3936,11 +3936,11 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     if (pushStages != 0 && state->properties.limits.maxPushConstantsSize < Graphics::ComputePushConstantBytes) return prepared;
     if (built.Layout() != VK_NULL_HANDLE) {
         const auto layouts = built.SetLayouts();
-        prepared->objects = computePipeline(context, shader, layouts.main, layouts.mainKey, pushStages, programAddress);
+        prepared->objects = computePipeline(context, shader, layouts.main, layouts.mainKey, built.LayoutBindingFlags(), pushStages, programAddress);
     } else if (context.descriptorCache != nullptr) {
         const auto described = Graphics::DescribeSetLayouts(context, shaders);
         prepared->describedLayoutKey = described.mainKey;
-        prepared->objects = computePipeline(context, shader, described.layouts.main, described.mainKey, pushStages, programAddress);
+        prepared->objects = computePipeline(context, shader, described.layouts.main, described.mainKey, described.mainBindingFlags, pushStages, programAddress);
     }
     return prepared;
 }
@@ -4219,7 +4219,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recordStep(PhaseRecordCompletion);
 }
 
-std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
+std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, std::span<const VkDescriptorBindingFlags> bindingFlags, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const std::uint64_t pipelineKey = shader.PipelineVariantId() != 0 ? (shader.PipelineVariantId() << 1u) | (pushStages != 0 ? 1u : 0u) : 0u;
     std::promise<std::shared_ptr<ComputePipelineObjects>> building;
@@ -4281,9 +4281,10 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
             ComputeDescriptorSetLayout resourcesLayout;
             const bool updateAfterBind = layoutKey.size() % 4u == 1u;
             resourcesLayout.flags = updateAfterBind ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
+            require(layoutKey.size() / 4u == bindingFlags.size(), "compute capture binding flag count differs from layout");
             for (std::size_t index = 0; index + 4u <= layoutKey.size(); index += 4u) {
                 const auto type = static_cast<VkDescriptorType>(layoutKey[index + 1u]);
-                resourcesLayout.bindings.push_back({layoutKey[index], type, layoutKey[index + 2u], layoutKey[index + 3u], updateAfterBind && type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0u});
+                resourcesLayout.bindings.push_back({layoutKey[index], type, layoutKey[index + 2u], layoutKey[index + 3u], bindingFlags[index / 4u]});
             }
             capture.sets.push_back(std::move(resourcesLayout));
             if (shader.workgroupMemoryDwords != 0) capture.sets.push_back({0, {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0}}});
@@ -4484,7 +4485,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     timer.phase(PhaseResources);
     if (objects == nullptr) {
         const auto layouts = resources->SetLayouts();
-        objects = computePipeline(context, shader, layouts.main, layouts.mainKey, pushStages, programAddress);
+        objects = computePipeline(context, shader, layouts.main, layouts.mainKey, resources->LayoutBindingFlags(), pushStages, programAddress);
         timing.Mark("pipeline_create");
         timer.phase(PhasePipeline);
     }

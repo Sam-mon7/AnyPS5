@@ -1827,6 +1827,7 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
     result.layouts.split = split;
     result.layouts.main = context.descriptorCache->Layout(result.mainKey, descriptions[0], updateAfterBind, bindingFlags[0]);
     if (split) result.layouts.fragment = context.descriptorCache->Layout(result.fragmentKey, descriptions[1], updateAfterBind, bindingFlags[1]);
+    result.mainBindingFlags = std::move(bindingFlags[0]);
     return result;
 }
 
