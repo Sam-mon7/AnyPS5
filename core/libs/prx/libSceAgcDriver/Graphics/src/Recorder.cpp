@@ -1816,7 +1816,8 @@ bool Recorder::GpuTimingEnabled() {
 }
 
 bool Recorder::BatchStampsEnabled() {
-    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured();
+    static const bool present = std::getenv("APS5_PROFILE_PRESENT") != nullptr;
+    return present || GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured();
 }
 
 void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
