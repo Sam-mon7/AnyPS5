@@ -364,7 +364,7 @@ void reportedBudgetTests(const Context& context) {
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     properties.pNext = &reported;
     context.memoryProperties2(context.physical, &properties);
-    const auto budget = SampledTextureBudget(context.memory, &reported, 0);
+    const auto budget = SampledTextureBudget(context.memory, &reported, 0, 0);
     Require(budget >= (2048ull << 20u), "the sampled texture cache budget is below the 2 GiB floor");
     for (std::uint32_t heap = 0; heap < context.memory.memoryHeapCount; ++heap) {
         if ((context.memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
@@ -616,7 +616,7 @@ std::uint64_t ExpectedBudget(const Context& context) {
     ReportBudget(context.physical, &properties);
     const auto sampled = SampledTextureMemory();
     const auto cached = TextureCacheUsage().sampledBytes;
-    return SampledTextureBudget(context.memory, &reported, sampled + TextureCacheUsage().storageBytes, sampled > cached ? sampled - cached : 0u);
+    return SampledTextureBudget(context.memory, &reported, sampled, TextureCacheUsage().storageBytes, sampled > cached ? sampled - cached : 0u);
 }
 
 std::uint64_t ReadBudget(const Context& context) {
