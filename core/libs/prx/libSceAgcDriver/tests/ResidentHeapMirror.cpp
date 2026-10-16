@@ -186,6 +186,14 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
     std::array<std::byte, sizeof(values)> cpu{};
     Memory::Read(address, cpu);
     Require(std::memcmp(cpu.data(), values.data(), sizeof(values)) == 0, "a CPU read missed resident GPU writes");
+    Memory::Write(address, std::as_bytes(std::span(initial)));
+    dispatch(true);
+    alignas(8) std::array<std::uint32_t, 2> completion{};
+    const std::array<std::uint32_t, 2> completed{0x11223344u, 0x55667788u};
+    recorder.AfterCompletions(reinterpret_cast<std::uint64_t>(completion.data()), std::as_bytes(std::span(completed)), 1, 0, false);
+    recorder.Sync();
+    Require(completion == completed, "native CPU fixture completion label was not published");
+    Require(static_cast<volatile std::uint32_t*>(raw)[0] == values[0] && static_cast<volatile std::uint32_t*>(raw)[1] == values[1], "native CPU read after a disjoint completion label missed resident GPU writes");
     if (resident) {
         const Memory::ReadSiteScope site(Memory::ReadSite::MirrorRefresh);
         Require(!StoreHeapMirrorResults(address + 3 * block, std::as_bytes(std::span(values)), std::as_bytes(std::span(initial))), "a range beyond the heap was accepted for resident storage");
