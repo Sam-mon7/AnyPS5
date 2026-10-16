@@ -812,6 +812,25 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
+std::shared_ptr<const SpecializedModule> specializedModule(SharedSpirv spirv, bool hasConstants) {
+    auto module = std::make_shared<SpecializedModule>();
+    const auto words = spirv.Read();
+    std::map<std::uint32_t, std::uint32_t> bindingNumbers;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(words[cursor + 1u], words[cursor + 3u]);
+        if (op == spv::OpVariable && count >= 4u) {
+            if (const auto found = bindingNumbers.find(words[cursor + 2u]); found != bindingNumbers.end()) module->bindings.push_back(found->second);
+            module->pushData |= words[cursor + 3u] == spv::StorageClassPushConstant;
+        }
+        cursor += count;
+    }
+    module->spirv = std::move(spirv);
+    module->specializationId = hasConstants ? nextVariantId() : 0u;
+    return module;
+}
+
 std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
@@ -895,21 +914,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
 #endif
-    auto module = std::make_shared<SpecializedModule>();
-    std::map<std::uint32_t, std::uint32_t> bindingNumbers;
-    for (std::size_t cursor = 5; cursor < materialized.size();) {
-        const auto count = materialized[cursor] >> 16u;
-        const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
-        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
-        if (op == spv::OpVariable && count >= 4u) {
-            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end()) module->bindings.push_back(found->second);
-            module->pushData |= materialized[cursor + 3u] == spv::StorageClassPushConstant;
-        }
-        cursor += count;
-    }
-    module->spirv = std::move(materialized);
-    module->specializationId = constants.empty() ? 0u : nextVariantId();
-    return module;
+    return specializedModule(SharedSpirv(std::move(materialized)), !constants.empty());
 }
 
 struct SpecializedModuleEntry {
@@ -1040,7 +1045,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     return plan;
 }
 
-std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const RecompileRequest& request) {
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
     key.clear();
@@ -1059,7 +1064,28 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     }
     std::call_once(entry->ready, [&] {
         try {
-            entry->module = buildSpecializedModule(artifact, classes, constants, target);
+            static const bool diskCache = [] {
+                const auto* enabled = std::getenv("APS5_CACHE_SPECIALIZED_COMPUTE");
+                return enabled != nullptr && std::strcmp(enabled, "1") == 0;
+            }();
+            std::vector<std::byte> diskKey;
+            if (diskCache && request.useCache && request.shader.stage == ShaderStage::Compute && artifact.vertexInputPatches.empty() && artifact.stencilReferences.empty() && ShaderDiskCache::Enabled()) {
+                ShaderDiskCache::BuildSpecializedKey(artifact.spirv, constants, request.target, diskKey);
+                SharedSpirv cached;
+                if (ShaderDiskCache::LoadSpecialized(diskKey, cached)) {
+                    if (!ShaderDiskCache::VerifyHits()) {
+                        entry->module = specializedModule(std::move(cached), !constants.empty());
+                        return;
+                    }
+                    entry->module = buildSpecializedModule(artifact, classes, constants, request.target);
+                    const bool matched = cached == entry->module->spirv;
+                    ShaderDiskCache::NoteVerifiedHit("specialized compute module", matched, request.shader.codeAddress, cached.size() * sizeof(std::uint32_t), entry->module->spirv.size() * sizeof(std::uint32_t));
+                    if (!matched) ShaderDiskCache::StoreSpecialized(std::move(diskKey), entry->module->spirv);
+                    return;
+                }
+            }
+            entry->module = buildSpecializedModule(artifact, classes, constants, request.target);
+            if (!diskKey.empty()) ShaderDiskCache::StoreSpecialized(std::move(diskKey), entry->module->spirv);
         } catch (...) {
             entry->failure = std::current_exception();
         }
@@ -1173,7 +1199,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request); }) : specializeModule(variant.artifact, vertexClasses, constants, request);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);

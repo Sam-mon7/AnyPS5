@@ -34,6 +34,10 @@ struct Counters {
     std::uint64_t planMisses = 0;
     std::uint64_t planWrites = 0;
     std::uint64_t planLoadFailures = 0;
+    std::uint64_t specializedHits = 0;
+    std::uint64_t specializedMisses = 0;
+    std::uint64_t specializedWrites = 0;
+    std::uint64_t specializedLoadFailures = 0;
     std::uint64_t verifiedHits = 0;
     std::uint64_t verifyMismatches = 0;
 };
@@ -60,6 +64,10 @@ void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSiz
 [[nodiscard]] std::vector<std::byte> EncodePlanEntry(std::span<const std::byte> key, const IrResourcePlan& plan);
 [[nodiscard]] LoadStatus DecodePlanEntry(std::span<const std::byte> file, std::span<const std::byte> key, IrResourcePlan& plan);
 
+void BuildSpecializedKey(const SharedSpirv& source, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, std::vector<std::byte>& key);
+[[nodiscard]] std::vector<std::byte> EncodeSpecializedEntry(std::span<const std::byte> key, const SharedSpirv& spirv);
+[[nodiscard]] LoadStatus DecodeSpecializedEntry(std::span<const std::byte> file, std::span<const std::byte> key, SharedSpirv& spirv);
+
 [[nodiscard]] bool Enabled();
 [[nodiscard]] std::filesystem::path EntryDirectory();
 
@@ -67,6 +75,8 @@ void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSiz
 void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant);
 [[nodiscard]] bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan);
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan);
+[[nodiscard]] bool LoadSpecialized(std::span<const std::byte> key, SharedSpirv& spirv);
+void StoreSpecialized(std::vector<std::byte> key, SharedSpirv spirv);
 void Flush();
 [[nodiscard]] Counters Totals();
 

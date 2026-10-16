@@ -866,6 +866,13 @@ target_include_directories(agc_shader_disk_cache_tests PRIVATE ${LIBS_INCLUDE_DI
 target_link_libraries(agc_shader_disk_cache_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_disk_cache_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_disk_cache_tests)
+if(BUILD_TESTING)
+    add_test(NAME agc_shader_specialized_disk_cache COMMAND agc_shader_disk_cache_tests --specialized-suite)
+    set_tests_properties(agc_shader_specialized_disk_cache PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1")
+    if(WIN32)
+        set_tests_properties(agc_shader_specialized_disk_cache PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 
 add_test_executable(agc_shared_spirv_tests EXCLUDE_FROM_ALL tests/SharedSpirv.cpp ${PROJECT_SOURCE_DIR}/core/shader/recompiler/SharedSpirv.cpp)
 target_include_directories(agc_shared_spirv_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/shader/recompiler)

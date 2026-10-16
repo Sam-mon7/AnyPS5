@@ -1880,6 +1880,97 @@ void runChild(const char* self, const std::string& arguments) {
     require(std::system(command.c_str()) == 0, "the process " + arguments + " failed");
 }
 
+void verifySpecializedEncoding() {
+    const SharedSpirv source(std::vector<std::uint32_t>{spv::MagicNumber, 0x00010300u, 0u, 1u, 0u, (1u << 16u) | spv::OpNop});
+    std::array<PipelineSpecializationConstant, 1> constants{{{7u, 11u}}};
+    SpirvTarget target{};
+    target.vulkanVersion = 0x00401000u;
+    target.spirvVersion = 0x00010300u;
+    std::vector<std::byte> key, changed;
+    ShaderDiskCache::BuildSpecializedKey(source, constants, target, key);
+    require(key.size() < 256u, "specialization key retains the source module");
+    constants[0].value++;
+    ShaderDiskCache::BuildSpecializedKey(source, constants, target, changed);
+    require(changed != key, "specialization value is absent from key");
+    constants[0].value--;
+    constants[0].id++;
+    ShaderDiskCache::BuildSpecializedKey(source, constants, target, changed);
+    require(changed != key, "specialization ID is absent from key");
+    constants[0].id--;
+    auto otherSource = source;
+    otherSource[2] = 1u;
+    ShaderDiskCache::BuildSpecializedKey(otherSource, constants, target, changed);
+    require(changed != key, "source SPIR-V is absent from key");
+    target.nonConstantImageOffsets = !target.nonConstantImageOffsets;
+    ShaderDiskCache::BuildSpecializedKey(source, constants, target, changed);
+    require(changed != key, "specialization target is absent from key");
+    const auto file = ShaderDiskCache::EncodeSpecializedEntry(key, source);
+    SharedSpirv decoded;
+    require(ShaderDiskCache::DecodeSpecializedEntry(file, key, decoded) == ShaderDiskCache::LoadStatus::Loaded && decoded == source, "specialized module did not round trip");
+    require(ShaderDiskCache::DecodeSpecializedEntry(file, changed, decoded) == ShaderDiskCache::LoadStatus::KeyMismatch, "specialized module accepted another key");
+    for (std::size_t size = 0; size < file.size(); ++size) require(ShaderDiskCache::DecodeSpecializedEntry(std::span(file).first(size), key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "truncated specialized module was accepted");
+    auto damaged = file;
+    damaged.back() ^= std::byte{1};
+    require(ShaderDiskCache::DecodeSpecializedEntry(damaged, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "corrupt specialized module was accepted");
+    auto invalid = source;
+    invalid[5] = 0u;
+    require(ShaderDiskCache::DecodeSpecializedEntry(ShaderDiskCache::EncodeSpecializedEntry(key, invalid), key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "zero-length specialized instruction was accepted");
+    ShaderDiskCache::StoreSpecialized(key, source);
+    ShaderDiskCache::Flush();
+    require(ShaderDiskCache::LoadSpecialized(key, decoded) && decoded == source, "stored specialized module did not load");
+    require(WriteFileAtomically(ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key), damaged), "cannot damage stored specialized module");
+    require(!ShaderDiskCache::LoadSpecialized(key, decoded), "damaged specialized disk entry did not fall back");
+}
+
+int runSpecializedProcess(std::string_view mode) {
+    setEnvironment("APS5_CACHE_SPECIALIZED_COMPUTE", mode == "--specialized-off" ? "0" : "1");
+    if (mode == "--specialized-verify") setEnvironment("ANYPS5_SHADER_CACHE_VERIFY", "1");
+    ComputeRequest request(true);
+    request.request.context.waveSize = 32u;
+    request.request.context.compute->numThreads = {32u, 1u, 1u};
+    request.userData[3] = 0x31027facu;
+    static_cast<void>(PrepareShader(request.request));
+    std::array<RecompileResult, 2> results;
+    for (std::uint32_t offset = 0; offset < results.size(); ++offset) {
+        request.userData[0] = 0x10000000u + offset;
+        results[offset] = Recompile(request.request);
+        require(!results[offset].spirv.empty() && results[offset].specializationId != 0u, "fixture did not specialize a compute module");
+        std::vector<std::byte> output;
+        ShaderDiskCache::EncodeResult(results[offset], output);
+        const auto path = ShaderDiskCache::EntryDirectory() / ("specialized-output-" + std::to_string(offset));
+        if (mode == "--specialized-store") require(WriteFileAtomically(path, output), "cannot store specialized output");
+        else {
+            std::vector<std::byte> expected;
+            require(ReadWholeFile(path, expected) && expected == output, "specialized SPIR-V, bindings or push constants differ across processes");
+        }
+    }
+    require(results[0].spirv != results[1].spirv && results[0].specializationId != results[1].specializationId, "different alignments shared a specialized module");
+    ShaderDiskCache::Flush();
+    const auto totals = ShaderDiskCache::Totals();
+    const bool cold = mode == "--specialized-store";
+    const bool disabled = mode == "--specialized-off";
+    require(totals.specializedHits == (cold || disabled ? 0u : 2u) && totals.specializedMisses == (cold ? 2u : 0u) && totals.specializedWrites == (cold ? 2u : 0u) && totals.specializedLoadFailures == 0u, "unexpected specialized disk hit/miss/write counts: " + std::to_string(totals.specializedHits) + "/" + std::to_string(totals.specializedMisses) + "/" + std::to_string(totals.specializedWrites));
+    if (mode == "--specialized-verify") require(totals.verifiedHits >= 2u && totals.verifyMismatches == 0u, "specialized verification did not reproduce cached output");
+    return 0;
+}
+
+int verifySpecializedAcrossProcesses(const char* self) {
+    const auto directory = std::filesystem::temp_directory_path() / ("aps5-specialized-cache-test-" + std::to_string(std::random_device{}()));
+    require(!std::filesystem::exists(directory), "specialized test directory already exists");
+    setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
+    setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
+    unsetEnvironment("ANYPS5_SHADER_CACHE_VERIFY");
+    verifySpecializedEncoding();
+    runChild(self, "--specialized-store");
+    runChild(self, "--specialized-load");
+    runChild(self, "--specialized-off");
+    runChild(self, "--specialized-verify");
+    ShaderDiskCache::Flush();
+    std::filesystem::remove_all(directory);
+    std::cout << "specialized compute disk cache: cold, warm, opt-out, verification and corrupt entries passed\n";
+    return 0;
+}
+
 void appendKey(std::vector<std::byte>& out, const std::vector<std::byte>& key) {
     const std::uint64_t size = key.size();
     const auto* bytes = reinterpret_cast<const std::byte*>(&size);
@@ -1938,6 +2029,10 @@ void verifySwitchScoping(const char* self, const std::filesystem::path& director
     const auto path = directory / "switch-keys.bin";
     const auto budget = childStageKeys(self, path, "64", nullptr);
     require(budget.first == compute && budget.second == vertex, "APS5_PREPARED_SHADER_MIB changed a cache key, though the budget never changes compiled output");
+    setEnvironment("APS5_CACHE_SPECIALIZED_COMPUTE", "1");
+    const auto specialized = childStageKeys(self, path, nullptr, nullptr);
+    unsetEnvironment("APS5_CACHE_SPECIALIZED_COMPUTE");
+    require(specialized.first == compute && specialized.second == vertex, "specialization disk cache changed a primary cache key");
     const auto fold = childStageKeys(self, path, nullptr, "1");
     require(fold.first == compute, "APS5_INDIRECT_SGPR_FOLD changed a compute shader's cache key, though the fold only rewrites vertex shaders");
     require(fold.second != vertex, "APS5_INDIRECT_SGPR_FOLD did not change a vertex shader's cache key");
@@ -2029,6 +2124,8 @@ void verifyDefaultDirectory(const char* self) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--specialized-suite") return verifySpecializedAcrossProcesses(argv[0]);
+        if (argc == 2 && std::string_view(argv[1]).starts_with("--specialized-")) return runSpecializedProcess(argv[1]);
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);
