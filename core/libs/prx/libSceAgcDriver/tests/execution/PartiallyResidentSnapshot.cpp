@@ -213,6 +213,8 @@ std::array<std::uint32_t, 8> Descriptor(std::uint64_t address) {
 }
 
 void Run(const Context& context, ReservedSurface& surface) {
+    const auto* value = std::getenv("APS5_RELEASE_TEXTURE_SNAPSHOTS");
+    const bool released = value != nullptr && std::strcmp(value, "1") == 0;
     const auto address = surface.Address();
     const auto words = Descriptor(address);
     Require(DescribeSurface(DecodeTextureResource(words)).guestBytes == SurfaceBytes, "the test descriptor does not describe the reserved surface");
@@ -235,15 +237,17 @@ void Run(const Context& context, ReservedSurface& surface) {
     AgcDriver::GuestMemory::SetFlushHook(&CountReads);
     try {
         sample("at its first use", true, false);
+        Require(TextureCacheUsage().snapshotBytes == (released ? 0u : SurfaceBytes), "partially resident snapshot retained the wrong CPU byte count");
+        Require(TextureCacheUsage().omittedSnapshotBytes == (released ? SurfaceBytes : 0u), "partially resident snapshot omitted-byte accounting is wrong");
         sample("again", false, true);
         surface.Data()[0x100] = 0x11;
         sample("after a CPU write to its committed part", true, false);
         sample("after the re-read of the written part", false, true);
         AgcDriver::GuestMemory::MarkWritten(address + 0x200, 4);
-        sample("after a driver store into its committed part", true, true);
+        sample("after a driver store into its committed part", true, !released);
         sample("after the compare that followed the driver store", false, true);
         surface.Commit(2 * BlockBytes, BlockBytes);
-        sample("after a page inside it was committed", true, true);
+        sample("after a page inside it was committed", true, !released);
         sample("after the compare that followed the commit", false, true);
         std::memset(surface.Data() + 2 * BlockBytes, 0x33, BlockBytes);
         sample("after a CPU write to the newly committed page", true, false);
@@ -253,7 +257,7 @@ void Run(const Context& context, ReservedSurface& surface) {
         sample("after a page inside it was decommitted and committed again", true, false);
         sample("after the re-read of the recommitted page", false, true);
         surface.Decommit(2 * BlockBytes, BlockBytes);
-        sample("after a page inside it was decommitted", true, true);
+        sample("after a page inside it was decommitted", true, !released);
         sample("after the compare that followed the decommit", false, true);
     } catch (...) {
         AgcDriver::GuestMemory::SetFlushHook(nullptr);

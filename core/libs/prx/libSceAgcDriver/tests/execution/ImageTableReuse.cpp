@@ -526,6 +526,51 @@ void RunImageStoreAcrossEpochs(AgcDriver::VulkanDevice& device, const GuestBlock
     SampleInNewEpoch(device, result, 23, Row(stored.data()), "an entry whose image store results were flushed sampled the wrong texels");
 }
 
+void RunSnapshotRetention(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
+    using namespace AgcDriver::Graphics;
+    const auto* value = std::getenv("APS5_RELEASE_TEXTURE_SNAPSHOTS");
+    const bool released = value != nullptr && std::strcmp(value, "1") == 0;
+    for (std::uint32_t texture = 0; texture < Records; ++texture) {
+        Fill(block, texture, 0.375f);
+        SetRecord(block, texture, texture);
+        Keys[texture] = texture;
+    }
+    const auto srt = Buffer(block.Table(), Records * Stride);
+    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+    std::copy(srt.begin(), srt.end(), Srt.begin());
+    std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+    SetOutput(Output.data());
+    const auto result = Compile(device, block);
+    SampleInNewEpoch(device, result, 5, Row(block.Texels(5)), "snapshot retention sampled the wrong entry");
+    auto use = TextureCacheUsage();
+    Require(use.sampledEntries == Records, "snapshot retention did not cache every test texture");
+    Require(use.snapshotBytes == (released ? 0u : Records * TextureBytes), "snapshot retention kept the wrong CPU byte count");
+    Require(use.omittedSnapshotBytes == (released ? Records * TextureBytes : 0u), "snapshot retention omitted-byte accounting is wrong");
+    Fill(block, 5, 0.875f);
+    SampleInNewEpoch(device, result, 5, Row(block.Texels(5)), "a released snapshot hid a CPU write");
+
+    ClearCachedTextures(device.Device());
+    Require(TextureCacheUsage().snapshotBytes == 0 && TextureCacheUsage().omittedSnapshotBytes == 0, "cache clear kept snapshot byte charges");
+    SetDccRecord(block, Records - 1, Records - 1);
+    auto mixed = Compile(device, block);
+    const auto binding = std::find_if(mixed.bindings.begin(), mixed.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& candidate) { return candidate.role == ShaderRecompiler::DescriptorRole::ImageTable; });
+    const auto* dccWords = block.Table() + (Records - 1u) * (Stride / 4u) + 4u;
+    std::copy_n(dccWords, 8, binding->guestDescriptor.end() - 8);
+    Require(DecodeTextureResource(std::span(binding->guestDescriptor).last(8)).dccAddress != 0, "snapshot retention fixture did not supply DCC metadata to the driver");
+    SampleInNewEpoch(device, mixed, Records - 1, Row(block.Texels(Records - 1)), "snapshot retention changed DCC texels");
+    use = TextureCacheUsage();
+    Require(use.snapshotBytes == (released ? TextureBytes : Records * TextureBytes), "snapshot retention DCC CPU bytes: " + std::to_string(use.snapshotBytes) + " retained, " + std::to_string(use.omittedSnapshotBytes) + " omitted");
+
+    AgcDriver::GuestMemory::Unwatch(AddressOf(block.Texels(0)), Records * TextureBytes);
+    Require(AgcDriver::GuestMemory::CollectWrites(AddressOf(block.Texels(0)), TextureBytes) == 0, "snapshot retention fixture is still watched");
+    Fill(block, 5, 0.625f);
+    SampleInNewEpoch(device, mixed, 5, Row(block.Texels(5)), "a released snapshot hid a write after unwatching");
+    use = TextureCacheUsage();
+    Require(use.snapshotBytes == Records * TextureBytes && use.omittedSnapshotBytes == 0, "unprovable snapshots did not retain comparison bytes");
+    ClearCachedTextures(device.Device());
+    Require(TextureCacheUsage().snapshotBytes == 0 && TextureCacheUsage().omittedSnapshotBytes == 0, "final cache clear kept snapshot byte charges");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -536,6 +581,12 @@ int main(int argc, char** argv) {
         GuestBlock selective(UnimportableBytes);
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::strcmp(argv[1], "--snapshot-retention") == 0) {
+            if (!AgcDriver::GuestMemory::WriteWatched()) return VulkanTestSkipped;
+            RunSnapshotRetention(*device, selective);
+            std::puts("snapshot retention tests passed");
+            return 0;
+        }
         if (argc == 2 && (std::strcmp(argv[1], "--pin-budget") == 0 || std::strcmp(argv[1], "--pin-overflow") == 0)) {
             RunPinBudget(*device, std::strcmp(argv[1], "--pin-overflow") == 0);
             std::puts("image table pin budget tests passed");

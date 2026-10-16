@@ -35,6 +35,8 @@ struct TextureCacheUse {
     std::size_t sampledEntries = 0;
     std::uint64_t sampledBytes = 0;
     std::uint64_t storageBytes = 0;
+    std::uint64_t snapshotBytes = 0;
+    std::uint64_t omittedSnapshotBytes = 0;
 };
 TextureCacheUse TextureCacheUsage();
 std::uint64_t SampledTextureCacheBudget(const Context& context);

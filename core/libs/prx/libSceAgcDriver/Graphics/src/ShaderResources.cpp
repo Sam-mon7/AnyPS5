@@ -102,6 +102,7 @@ TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words,
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
+    std::size_t surfaceBytes;
     std::vector<std::byte> bytes;
     std::shared_ptr<Texture> texture;
     // A fast-cleared surface is cached as its clear texels; it stays valid while the keys are unchanged.
@@ -126,6 +127,8 @@ struct TextureCache {
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
     std::uint64_t bytes = 0;
+    std::uint64_t snapshotBytes = 0;
+    std::uint64_t omittedSnapshotBytes = 0;
     std::size_t passed = 0;
     std::chrono::steady_clock::time_point passedSince{};
     std::uint64_t firstUsesPresent = 0;
@@ -136,6 +139,7 @@ struct TextureCache {
         std::uint64_t evicted = 0;
         std::uint64_t passed = 0;
         std::uint64_t stale = 0;
+        std::uint64_t resnapshots = 0;
     } counts;
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
     VkPhysicalDevice budgetDevice = VK_NULL_HANDLE;
@@ -284,6 +288,8 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     if (TableReuseAcrossEpochs()) evictTableTexture(it->texture);
     cache.bytes -= it->accounted;
+    cache.snapshotBytes -= it->bytes.capacity();
+    if (it->source == nullptr && it->bytes.empty()) cache.omittedSnapshotBytes -= it->surfaceBytes;
     if (it->source != nullptr) {
         for (auto [view, last] = cache.views.equal_range(it->source.get()); view != last; ++view) {
             if (view->second == it) {
@@ -363,6 +369,7 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-snapshots] cache CPU bytes: %llu retained, %llu omitted; %llu resnapshots after failed proof (10 s)\n", static_cast<unsigned long long>(cache.snapshotBytes), static_cast<unsigned long long>(cache.omittedSnapshotBytes), static_cast<unsigned long long>(counts.resnapshots));
 }
 
 struct ImageMemoEntry {
@@ -653,6 +660,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return cachedTexture(context, words, normalized, components, guestBytes, depthCompare);
     }
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    static const bool releaseSnapshots = [] {
+        const auto* value = std::getenv("APS5_RELEASE_TEXTURE_SNAPSHOTS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto scanKeys = [&] {
@@ -721,6 +732,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // UnchangedSince (here and on a cache hit) looks at them: the checks only compare stamped blocks,
     // so a write the game made since the last walk is invisible until a collect stamps its page. The
     // walk is memoized per packet, so a texture viewed from a storage image repeats it for free.
+    if (releaseSnapshots && source == nullptr && resource.dccAddress == 0 && Recorder::SnapshotWriteOverlaps(address, bytes)) {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
+        GuestMemory::FlushGpuWrites(address, bytes);
+    }
     auto generation = GuestMemory::CollectWrites(address, bytes);
     if (source != nullptr && !GuestMemory::UnchangedSince(address, bytes, source->Generation())) {
         // The CPU wrote the memory while results were pending: Refresh merges them the usual way.
@@ -775,18 +790,20 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
-        } else if (source == nullptr && it->bytes.size() == guestBytes && it->keys == *keys) {
+        } else if (source == nullptr && it->surfaceBytes == guestBytes && it->keys == *keys) {
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
             const auto equalsCommitted = [&] {
+                if (it->bytes.empty()) return false;
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
             const auto unchanged = [&] {
                 if (it->committed != committed) return false;
-                return committed.has_value() ? !Recorder::SnapshotWriteOverlaps(address, it->bytes.size()) && GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation);
+                if (it->bytes.empty() && snapshotGeneration == 0) return false;
+                return committed.has_value() ? !Recorder::SnapshotWriteOverlaps(address, it->surfaceBytes) && GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->surfaceBytes, it->generation);
             };
             if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || equalsCommitted()) {
                 it->generation = snapshotGeneration;
@@ -797,11 +814,12 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
             }
+            if (it->bytes.empty()) ++cache.counts.resnapshots;
         }
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, snapshotGeneration};
+    CachedTexture entry{key, address, bytes, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
     if (source != nullptr) {
         entry.source = source;
@@ -825,6 +843,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        if (releaseSnapshots && snapshotGeneration != 0 && resource.dccAddress == 0 && *keys == DccKeys::Uncompressed) std::vector<std::byte>().swap(entry.bytes);
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
@@ -838,6 +857,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return texture;
     }
     cache.bytes += entry.accounted;
+    cache.snapshotBytes += entry.bytes.capacity();
+    if (entry.source == nullptr && entry.bytes.empty()) cache.omittedSnapshotBytes += entry.surfaceBytes;
     entry.present = Recorder::Presents();
     ++cache.counts.inserted;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
@@ -1065,6 +1086,8 @@ TextureCacheUse TextureCacheUsage() {
         dropUncachedViews(sampled);
         use.sampledEntries = sampled.entries.size();
         use.sampledBytes = sampled.bytes;
+        use.snapshotBytes = sampled.snapshotBytes;
+        use.omittedSnapshotBytes = sampled.omittedSnapshotBytes;
     }
     use.storageBytes = storageCacheBytes();
     return use;
