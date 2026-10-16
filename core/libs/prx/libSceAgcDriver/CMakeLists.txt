@@ -1456,7 +1456,7 @@ if(BUILD_TESTING)
             set_property(TEST agc_driver_prepared_shader_budget_${preparedBudget} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-    set_property(TEST agc_driver_prepared_shader_budget_zero APPEND PROPERTY ENVIRONMENT "APS5_PREPARED_SHADER_MIB=0")
+    set_property(TEST agc_driver_prepared_shader_budget_zero APPEND PROPERTY ENVIRONMENT "APS5_PREPARED_SHADER_MIB=0" "APS5_SUSPEND_DRAIN=1")
     set_property(TEST agc_driver_prepared_shader_budget_lru APPEND PROPERTY ENVIRONMENT "APS5_PREPARED_SHADER_MIB=1")
 endif()
 

@@ -802,7 +802,6 @@ int main(int argc, char** argv) {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
             PreparedBudget(device.get(), false);
-            AgcDriverShutdown_nid_postfix();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--lazy") {
