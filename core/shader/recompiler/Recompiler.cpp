@@ -1678,6 +1678,7 @@ PreparedShaderCacheStats MaintainPreparedShaderCache() {
             entry = cache.Erase(entry);
         }
         pruneSources();
+        cache.reported = now;
     }
     cache.stats.memory = measure();
     cache.stats.peakBytes = std::max(cache.stats.peakBytes, cache.stats.memory.Bytes());
@@ -1707,7 +1708,6 @@ PreparedShaderCacheStats MaintainPreparedShaderCache() {
         std::fprintf(stderr, "[shader-memory] sources %zu, live %.2f MiB, peak %.2f MiB: code %.2f, IR/plans %.2f, SPIR-V %.2f, reflection %.2f, descriptor layouts %.2f, results %.2f, cache %.2f MiB; evictions %llu, re-prepares %llu, pinned %zu\n",
             memory.sources, memory.Bytes() / mib, cache.stats.peakBytes / mib, memory.code / mib, memory.ir / mib, memory.spirv / mib, memory.reflection / mib,
             memory.layouts / mib, memory.results / mib, memory.cache / mib, static_cast<unsigned long long>(cache.stats.evictions), static_cast<unsigned long long>(cache.stats.rePrepares), cache.stats.pinned);
-        cache.reported = now;
         std::fprintf(stderr, "[shader-vulkan-memory] pipelines %.2f MiB, modules %.2f MiB, layouts %.2f MiB, pipeline caches %.2f MiB; pinned/unmanaged over budget %.2f MiB\n", memory.pipelines / mib, memory.modules / mib, memory.driverLayouts / mib, memory.pipelineCaches / mib, cache.stats.overBudgetBytes / mib);
     }
     return cache.stats;
