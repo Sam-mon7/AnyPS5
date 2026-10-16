@@ -312,18 +312,6 @@ std::invalid_argument OutsideArena(const char* operation, const void* pointer, s
 }
 
 #ifdef _WIN32
-std::size_t GuestArenaQueryMemory_nid_postfix(const void* address, void* information, std::size_t bytes) {
-    if (bytes < sizeof(MEMORY_BASIC_INFORMATION)) return 0;
-    if (!Arena::Get().Contains(address, 1)) return VirtualQuery(address, static_cast<MEMORY_BASIC_INFORMATION*>(information), bytes);
-    *static_cast<MEMORY_BASIC_INFORMATION*>(information) = WindowsMappings::Get().Query(reinterpret_cast<std::uintptr_t>(address));
-    return sizeof(MEMORY_BASIC_INFORMATION);
-}
-
-void GuestArenaProtectMemory_nid_postfix(void* address, std::size_t bytes, std::uint32_t protection) {
-    if (!Arena::Get().Contains(address, bytes)) throw OutsideArena("protect", address, bytes);
-    WindowsMappings::Get().Protect(reinterpret_cast<std::uintptr_t>(address), bytes, protection);
-}
-
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
     WindowsMappings::Get().SetProtection(address, bytes, protection);
 }

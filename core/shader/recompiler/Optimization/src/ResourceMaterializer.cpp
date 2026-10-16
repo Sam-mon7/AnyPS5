@@ -1603,10 +1603,7 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     std::vector<std::uint8_t> activeSources;
     try {
         materializeSnapshot(plan, runtime, walker, nextSnapshot, activeSources);
-        if (runtime.reuseTables == nullptr || !runtime.reuseTables(runtime.userContext, plan, runtime, nextSnapshot.tables)) {
-            TableSnapshotter(plan, runtime, walker, activeSources, nextSnapshot.tables).Run();
-            if (runtime.rememberTables != nullptr) runtime.rememberTables(runtime.userContext, plan, runtime, nextSnapshot.tables);
-        }
+        TableSnapshotter(plan, runtime, walker, activeSources, nextSnapshot.tables).Run();
     } catch (...) {
         reportTables();
         throw;

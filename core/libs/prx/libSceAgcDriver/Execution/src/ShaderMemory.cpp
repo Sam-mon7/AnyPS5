@@ -2,8 +2,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
-#include "prx/libc/include/GuestAllocations.hpp"
-#include "prx/libc/include/GuestArena.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -93,36 +91,6 @@ std::vector<std::unique_ptr<TPage>>& pagePool() {
 }
 
 constexpr std::size_t PagePoolLimit = 64;
-
-bool TableSnapshotCacheEnabled() {
-    static const bool enabled = [] { const auto* value = std::getenv("APS5_TABLE_SNAPSHOT_CACHE"); return value != nullptr && std::strcmp(value, "1") == 0; }();
-    return enabled;
-}
-
-struct TableCacheEntry {
-    std::weak_ptr<const ShaderRecompiler::IrResourcePlan> plan;
-    const ShaderRecompiler::IrResourcePlan* identity = nullptr;
-    std::uint64_t shaderBase = 0, mappingGeneration = 0, forgetSerial = 0;
-    std::vector<std::uint32_t> userData;
-    std::vector<std::pair<std::uint64_t, std::size_t>> initialRanges;
-    ShaderRecompiler::ImageTableSnapshot tables;
-    ShaderRecompiler::SrtReadTrace trace;
-    ShaderRecompiler::SrtUserDataUse userUse;
-    struct Region {
-        std::uint64_t address;
-        std::vector<std::uint32_t> words;
-    };
-    std::vector<Region> regions;
-    std::vector<GuestMemory::UnchangedQuery> queries;
-    std::size_t bytes = 0;
-};
-
-auto& TableSnapshots() {
-    return HostThreadLocal<std::vector<TableCacheEntry>, TableCacheEntry>();
-}
-
-std::atomic<std::uint64_t> tableHits{0}, tableMisses{0}, tableInvalidations{0};
-constexpr std::size_t TableCacheBytes = 16u * 1024u * 1024u;
 
 }
 
@@ -358,116 +326,10 @@ bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_
         const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
         const auto pageEnd = std::min<std::uint64_t>(base + PageBytes, end);
         const auto& page = self.page(base);
-        if (!page.wordwise && !page.valid.All() && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(pageEnd - address))) {
-            self.tableCacheUnsafe = true;
-            return false;
-        }
+        if (!page.wordwise && !page.valid.All() && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(pageEnd - address))) return false;
         address = pageEnd;
     }
     return true;
-}
-
-ShaderMemory::TableCacheCounts ShaderMemory::TableCacheStatistics() {
-    return {tableHits.load(), tableMisses.load(), tableInvalidations.load()};
-}
-
-bool ShaderMemory::reuseTables(void* context, const ShaderRecompiler::IrResourcePlan& plan, const ShaderRecompiler::SrtRuntime& runtime, ShaderRecompiler::ImageTableSnapshot& tables) {
-    auto& self = *static_cast<ShaderMemory*>(context);
-    self.tableTraceLeaves = runtime.readTrace != nullptr ? runtime.readTrace->leaves.size() : 0;
-    self.tableTraceOther = runtime.readTrace != nullptr ? runtime.readTrace->otherReads.size() : 0;
-    self.tableUserReads = runtime.userDataUse != nullptr ? runtime.userDataUse->reads.size() : 0;
-    auto& cache = TableSnapshots();
-    std::erase_if(cache, [](const auto& entry) { return entry.plan.expired(); });
-    const auto found = std::find_if(cache.begin(), cache.end(), [&](const auto& entry) {
-        return entry.plan.lock().get() == &plan && entry.shaderBase == runtime.shaderBase && std::ranges::equal(entry.userData, runtime.userData);
-    });
-    if (found == cache.end()) {
-        ++tableMisses;
-        return false;
-    }
-    bool valid = found->mappingGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && found->forgetSerial == GuestMemory::ForgetSerial();
-    valid = valid && found->initialRanges.size() == self.initial.size();
-    if (valid) {
-        auto initial = self.initial.begin();
-        for (const auto& [address, bytes] : found->initialRanges) {
-            if (initial->first != address || initial->second.size() != bytes) { valid = false; break; }
-            ++initial;
-        }
-    }
-    if (valid && !found->queries.empty()) valid = GuestMemory::UnchangedSinceAll(found->queries);
-    std::vector<std::uint32_t> words;
-    for (const auto& region : found->regions) {
-        if (!valid) break;
-        const auto bytes = region.words.size() * sizeof(std::uint32_t);
-        if (self.pendingWrite != nullptr && self.pendingWrite(region.address, bytes, {}) != PendingWrite::None) { valid = false; break; }
-        if (!accessible(context, region.address, bytes)) { valid = false; break; }
-        words.resize(region.words.size());
-        valid = readWords(context, region.address, words.data(), words.size()) && words == region.words;
-    }
-    valid = valid && found->mappingGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && found->forgetSerial == GuestMemory::ForgetSerial();
-    if (!valid) {
-        cache.erase(found);
-        ++tableMisses;
-        ++tableInvalidations;
-        return false;
-    }
-    tables = found->tables;
-    if (runtime.readTrace != nullptr) {
-        runtime.readTrace->leaves.insert(runtime.readTrace->leaves.end(), found->trace.leaves.begin(), found->trace.leaves.end());
-        runtime.readTrace->otherReads.insert(runtime.readTrace->otherReads.end(), found->trace.otherReads.begin(), found->trace.otherReads.end());
-    }
-    if (runtime.userDataUse != nullptr) {
-        runtime.userDataUse->asBase |= found->userUse.asBase;
-        runtime.userDataUse->asValue |= found->userUse.asValue;
-        runtime.userDataUse->reads.insert(runtime.userDataUse->reads.end(), found->userUse.reads.begin(), found->userUse.reads.end());
-    }
-    std::rotate(found, std::next(found), cache.end());
-    ++tableHits;
-    return true;
-}
-
-void ShaderMemory::rememberTables(void* context, const ShaderRecompiler::IrResourcePlan& plan, const ShaderRecompiler::SrtRuntime& runtime, const ShaderRecompiler::ImageTableSnapshot& tables) {
-    auto& self = *static_cast<ShaderMemory*>(context);
-    if (tables.tables.empty() || self.tableCacheUnsafe) return;
-    for (const auto& table : tables.tables) {
-        if (table.fault != 0 || std::any_of(table.codes.begin(), table.codes.end(), [](auto code) { return (code & ShaderRecompiler::ImageTableAbi::PoisonFlag) != 0 && code != ShaderRecompiler::ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(ShaderRecompiler::ImageTableAbi::PoisonReason::OutsideDomain)); })) return;
-    }
-    TableCacheEntry entry;
-    entry.identity = &plan;
-    entry.shaderBase = runtime.shaderBase;
-    entry.mappingGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    entry.forgetSerial = GuestMemory::ForgetSerial();
-    entry.userData.assign(runtime.userData.begin(), runtime.userData.end());
-    for (const auto& [address, bytes] : self.initial) entry.initialRanges.emplace_back(address, bytes.size());
-    entry.tables = tables;
-    entry.bytes = tables.words.size() * sizeof(ShaderRecompiler::DescriptorValue);
-    for (const auto& table : tables.tables) entry.bytes += table.codes.size() * sizeof(std::uint32_t) + table.readRanges.size() * sizeof(std::pair<std::uint64_t, std::uint64_t>);
-    for (const auto& region : self.Regions()) {
-        if (region.guestAddress % 4 != 0 || region.bytes.size() % 4 != 0 || region.bytes.size() > TableCacheBytes - std::min(TableCacheBytes, entry.bytes)) return;
-        if (self.pendingWrite != nullptr && self.pendingWrite(region.guestAddress, region.bytes.size(), {}) != PendingWrite::None) return;
-        auto& copy = entry.regions.emplace_back(region.guestAddress, std::vector<std::uint32_t>(region.bytes.size() / 4));
-        std::memcpy(copy.words.data(), region.bytes.data(), region.bytes.size());
-        entry.bytes += region.bytes.size();
-        if (self.tableCaptureGeneration != 0 && GuestMemory::UnchangedSince(region.guestAddress, region.bytes.size(), self.tableCaptureGeneration)) entry.queries.push_back({region.guestAddress, region.bytes.size(), self.tableCaptureGeneration});
-    }
-    if (runtime.readTrace != nullptr) {
-        entry.trace.leaves.assign(runtime.readTrace->leaves.begin() + self.tableTraceLeaves, runtime.readTrace->leaves.end());
-        entry.trace.otherReads.assign(runtime.readTrace->otherReads.begin() + self.tableTraceOther, runtime.readTrace->otherReads.end());
-    }
-    if (runtime.userDataUse != nullptr) {
-        entry.userUse = *runtime.userDataUse;
-        entry.userUse.reads.erase(entry.userUse.reads.begin(), entry.userUse.reads.begin() + self.tableUserReads);
-    }
-    entry.bytes += entry.trace.leaves.size() * sizeof(std::pair<std::uint32_t, std::uint64_t>) + entry.trace.otherReads.size() * sizeof(std::uint64_t) + entry.userUse.reads.size() * sizeof(std::pair<std::uint64_t, std::int32_t>);
-    if (entry.bytes > TableCacheBytes) return;
-    auto& cache = TableSnapshots();
-    std::size_t bytes = entry.bytes;
-    for (const auto& cached : cache) bytes += cached.bytes;
-    while (!cache.empty() && (cache.size() >= 8 || bytes > TableCacheBytes)) {
-        bytes -= cache.front().bytes;
-        cache.erase(cache.begin());
-    }
-    cache.push_back(std::move(entry));
 }
 
 bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t bytes) {
@@ -512,18 +374,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.accessible = &accessible;
     runtime.pendingWrite = &pending;
     runtime.readWords = &readWords;
-    if (TableSnapshotCacheEnabled()) {
-        tableCaptureGeneration = GuestMemory::TrackerGeneration();
-        tableCacheUnsafe = false;
-        runtime.reuseTables = &reuseTables;
-        runtime.rememberTables = &rememberTables;
-    }
     auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
-    if (TableSnapshotCacheEnabled()) {
-        for (auto& entry : TableSnapshots()) {
-            if (entry.identity == capture->plan.get() && entry.plan.expired()) entry.plan = capture->plan;
-        }
-    }
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;
@@ -535,10 +386,6 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
         const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         auto due = nextReport.load(std::memory_order_relaxed);
         if (now >= due && nextReport.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count(), std::memory_order_relaxed)) {
-            if (TableSnapshotCacheEnabled()) {
-                const auto counts = TableCacheStatistics();
-                AgcDriver::ProfilePrint_nid_no_patch("[table-snapshot-cache] %llu hits, %llu misses, %llu invalidations\n", static_cast<unsigned long long>(counts.hits), static_cast<unsigned long long>(counts.misses), static_cast<unsigned long long>(counts.invalidations));
-            }
             const auto captures = static_cast<double>(totals.captures.load());
             const auto captureNs = totals.captureNanoseconds.load();
             const auto resolveNs = totals.resolveNanoseconds.load();

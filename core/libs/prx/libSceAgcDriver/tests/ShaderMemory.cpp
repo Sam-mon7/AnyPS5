@@ -1,7 +1,4 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
-#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include "prx/libc/include/GuestAllocations.hpp"
-#include "prx/libc/include/GuestHeap.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/RequestMemoryView.hpp"
@@ -1118,55 +1115,6 @@ void verifyImageTableBulkReads() {
     const auto& cut = cutByRun->snapshot.tables.tables.at(0);
     require(cut.keys == 4u && (cut.codes[0] & Abi::PoisonFlag) == 0u && cut.codes[1] == unmapped && cut.codes[2] == unmapped && cut.codes[3] == unmapped, "image table bulk reads: a record crossing into an unmapped page was not Unmapped poison");
     require(cutByRun->snapshot.tables == cutByWord->snapshot.tables && cutWordReads.wordReads == 12u && cutRunReads.wordReads == 0u && cutRunReads.bulkWords == 12u, "image table bulk reads: a record cut by an unmapped page read other words in runs than word by word");
-}
-
-void verifyTableSnapshotCache() {
-    using AgcDriver::ShaderMemory;
-    const auto* setting = std::getenv("APS5_TABLE_SNAPSHOT_CACHE");
-    const bool enabled = setting != nullptr && std::strcmp(setting, "1") == 0;
-    static TableTexture textures[2];
-    const auto exercise = [&](TableGuest& guest) {
-        guest = {};
-        guest.heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
-        guest.heap[1] = TableT(textures[1].bytes.data(), TableFormat8888UNorm, TableType2D);
-        guest.materials = {{{0u, 0u, 0u, 0u}, {0u, 1u, 0u, 0u}, {0u, 0u, 0u, 0u}}};
-        FillTableSrt(guest, guest.heap.data(), 32u, 4u);
-        const auto userData = TableUserData(guest);
-        const auto request = TableRequest(TableMaterialCode, userData);
-        const auto capture = [&] {
-            AgcDriver::GuestMemory::BumpCollectEpoch();
-            ShaderMemory memory({});
-            return memory.Capture(request);
-        };
-        const auto first = capture();
-        const auto before = ShaderMemory::TableCacheStatistics();
-        const auto second = capture();
-        const auto after = ShaderMemory::TableCacheStatistics();
-        require(second->snapshot.tables == first->snapshot.tables && second->readTrace.otherReads == first->readTrace.otherReads && second->readTrace.leaves == first->readTrace.leaves, "table snapshot cache changed the table or its read dependencies");
-        require(after.hits == before.hits + (enabled ? 1u : 0u), "unchanged table snapshot did not follow its opt-in switch");
-        guest.heap[0][3] ^= 1u;
-        const auto written = capture();
-        require(written->snapshot.tables != second->snapshot.tables, "table snapshot cache hid a CPU table write");
-        guest.materials[1][1] = 2u;
-        const auto key = capture();
-        require(key->snapshot.tables != written->snapshot.tables, "table snapshot cache hid a material-key write");
-        FillTableSrt(guest, guest.heap.data() + 1, 32u, 3u);
-        const auto descriptor = capture();
-        require(descriptor->snapshot.tables.tables[0].base == reinterpret_cast<std::uintptr_t>(guest.heap.data() + 1) && descriptor->snapshot.tables != key->snapshot.tables, "table snapshot cache hid a descriptor change");
-        capture();
-        const auto mappingBefore = ShaderMemory::TableCacheStatistics();
-        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(&guest), sizeof(guest));
-        const auto remapped = capture();
-        const auto mappingAfter = ShaderMemory::TableCacheStatistics();
-        require(remapped->snapshot.tables == descriptor->snapshot.tables && mappingAfter.hits == mappingBefore.hits, "mapping invalidation reused an old table snapshot");
-        if (enabled) require(mappingAfter.invalidations > mappingBefore.invalidations, "table mapping invalidation was not counted");
-    };
-    alignas(4096) static TableGuest ordinary;
-    exercise(ordinary);
-    std::unique_ptr<TableGuest, decltype(&GuestHeap::GuestHeapFree_nid_postfix)> watched(static_cast<TableGuest*>(GuestHeap::GuestHeapAlign_nid_postfix(4096, sizeof(TableGuest))), &GuestHeap::GuestHeapFree_nid_postfix);
-    require(watched != nullptr, "cannot allocate a guest table snapshot fixture");
-    new (watched.get()) TableGuest{};
-    exercise(*watched);
 }
 
 void verifyImageTables() {
@@ -4302,11 +4250,6 @@ void verifySrgbDepthCompareModes() {
 int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
-        if (argc == 2 && std::string_view(argv[1]) == "--table-snapshot-cache") {
-            verifyTableSnapshotCache();
-            std::cout << "Table snapshot content, descriptor and mapping invalidation passed\n";
-            return 0;
-        }
         if (argc == 2 && std::string_view(argv[1]) == "--frontend-pair") {
             verifyFrontendPair();
             std::cout << "Prepared frontend reuse preserves full and partial-thread programs\n";

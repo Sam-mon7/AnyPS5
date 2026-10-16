@@ -186,44 +186,6 @@ void CheckConcurrentWrites() {
     region.Collect(Collection::Armed);
     Require(region.Collect(Collection::Armed).empty(), "concurrent writes did not settle");
 }
-
-void CheckQueryCache() {
-    auto& mappings = Mappings::Get();
-    auto* memory = static_cast<unsigned char*>(mappings.Reserve(nullptr, Bytes));
-    Require(memory != nullptr, "query cache reservation failed");
-    const auto address = reinterpret_cast<std::uintptr_t>(memory);
-    Require(mappings.Query(address).State == MEM_RESERVE, "query cache changed a reserved range");
-    mappings.Commit(memory, Bytes, PAGE_READWRITE, Bytes, true);
-    Require(mappings.Query(address).State == MEM_COMMIT && mappings.Query(address).Protect == PAGE_READWRITE, "query cache hid a new commit");
-    const auto before = mappings.QueryCounts();
-    mappings.Query(address);
-    const auto after = mappings.QueryCounts();
-    const auto* setting = std::getenv("APS5_GUEST_QUERY_CACHE");
-    const bool enabled = setting != nullptr && std::strcmp(setting, "1") == 0;
-    Require(after.first == before.first + (enabled ? 1u : 0u), "committed query reuse did not follow its opt-in switch");
-    mappings.Protect(address, Small, PAGE_READONLY);
-    Require(mappings.Query(address).Protect == PAGE_READONLY && mappings.Query(address + Small).Protect == PAGE_READWRITE, "query cache hid a partial protection change");
-    mappings.Protect(address, Small, PAGE_NOACCESS);
-    Require(mappings.Query(address).Protect == PAGE_NOACCESS, "query cache hid no-access protection");
-    mappings.Commit(memory, Bytes, PAGE_READWRITE, Bytes, true);
-    Require(mappings.Query(address).Protect == PAGE_READWRITE, "query cache hid a protection restoration");
-    mappings.Reset(memory, Bytes);
-    Require(mappings.Query(address).State == MEM_RESERVE, "query cache hid an unmap");
-    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Bytes, nullptr);
-    Require(section != nullptr, "query cache section failed");
-    mappings.Map(memory, Bytes, section, 0, PAGE_READWRITE);
-    Require(mappings.Query(address).Type == MEM_MAPPED, "query cache reused a previous private mapping");
-    std::array<void*, 32> pages{};
-    auto count = pages.size();
-    mappings.Collect(address, Bytes, pages.data(), &count, true);
-    MEMORY_BASIC_INFORMATION actual{};
-    Require(VirtualQuery(memory, &actual, sizeof(actual)) == sizeof(actual) && mappings.Query(address).Protect == actual.Protect, "query cache hid write-watch arming");
-    static_cast<volatile unsigned char*>(memory)[0] = 9;
-    Require(mappings.Query(address).Protect == PAGE_READWRITE, "query cache hid a write-watch fault");
-    mappings.Reset(memory, Bytes);
-    VirtualFree(memory, 0, MEM_RELEASE);
-    CloseHandle(section);
-}
 }
 
 int main() {
@@ -237,7 +199,6 @@ int main() {
         CheckFailureAndHoles();
         CheckPrivate();
         CheckConcurrentWrites();
-        CheckQueryCache();
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
