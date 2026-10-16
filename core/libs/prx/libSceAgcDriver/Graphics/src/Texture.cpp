@@ -51,6 +51,8 @@ struct TextureUploadTrace {
 // APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
 struct TextureProfile {
     double allocate = 0, read = 0, gpu = 0, view = 0;
+    std::array<double, 8> setup{};
+    std::uint64_t setupCount = 0;
     std::uint64_t count = 0;
     std::uint64_t fromStorage = 0;
     double storageCreate = 0, storageWriteBack = 0, storageAlloc = 0, storageHostCopy = 0, storageGpu = 0, storageStore = 0;
@@ -253,6 +255,14 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
+    auto setupStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::array<double, 8> setup{};
+    const auto setupPhase = [&](std::size_t index) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        setup[index] = std::chrono::duration<double, std::milli>(now - setupStart).count();
+        setupStart = now;
+    };
     try {
         const auto colorFormat = SampledTextureFormat(context, descriptor.format);
         Require(!depthCompare || colorFormat == VK_FORMAT_R32_SFLOAT || colorFormat == VK_FORMAT_R16_UNORM, "comparison sampling requires an R32 float or R16 unorm depth texture");
@@ -290,8 +300,10 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        setupPhase(0);
         Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage");
         owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
+        setupPhase(1);
 
         VkMemoryRequirements requirements{};
         context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
@@ -299,8 +311,10 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "texture");
+        setupPhase(2);
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+        setupPhase(3);
 
         {
             // Debug aid: APS5_DUMP_TEXTURE=<hex addresses, comma separated> saves the detiled first mip
@@ -317,11 +331,35 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 dumpWanted = dumpList.find(address) != std::string::npos || dumpList.find(extent) != std::string::npos;
             }
             auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, Buffer::Access::UploadOnly);
+            setupPhase(4);
             std::memcpy(staging->WriteBytes().data(), snapshot.data(), snapshot.size());
+            setupPhase(5);
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            setupPhase(6);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            setupPhase(7);
             if (profile) Profile().allocate += timer.lap();
             if (profile) Profile().read += timer.lap();
+            if (profile) {
+                auto& totals = Profile();
+                double elapsed = 0;
+                for (std::size_t i = 0; i < setup.size(); ++i) {
+                    totals.setup[i] += setup[i];
+                    elapsed += setup[i];
+                }
+                ++totals.setupCount;
+                constexpr std::array<const char*, 8> names{"geometry", "image", "placement", "memory+bind", "staging", "memcpy", "tiled-buffer", "linear-buffer"};
+                if (totals.setupCount % 200 == 0) {
+                    std::string line;
+                    for (std::size_t i = 0; i < setup.size(); ++i) line += " " + std::string(names[i]) + "=" + std::to_string(totals.setup[i]);
+                    AgcDriver::ProfilePrint_nid_no_patch("[texture-setup] %llu allocations, cumulative CPU ms:%s\n", static_cast<unsigned long long>(totals.setupCount), line.c_str());
+                }
+                if (elapsed > 50.0) {
+                    std::string line;
+                    for (std::size_t i = 0; i < setup.size(); ++i) line += " " + std::string(names[i]) + "=" + std::to_string(setup[i]);
+                    AgcDriver::ProfilePrint_nid_no_patch("[texture-setup] slow %.3f ms guest=0x%llx bytes=%llu linear=%llu image=%llu type=%u extent=%ux%u layers=%u CPU ms:%s\n", elapsed, static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(linearBytes), static_cast<unsigned long long>(allocationBytes), allocation.memoryTypeIndex, descriptor.width, descriptor.height, arrayLayers, line.c_str());
+                }
+            }
 
             detiler.BeginBatch();
             // The upload is recorded into the open batch, like a storage image's: the work that samples

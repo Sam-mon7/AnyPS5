@@ -4157,11 +4157,19 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin);
         if (found == nullptr) continue;
         const auto& region = *found;
-        if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+        if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) {
+            const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+            if (profile) {
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+                if (ms > 50.0) AgcDriver::ProfilePrint_nid_no_patch("[write-marks] MarkWritten %.3f ms address=0x%llx bytes=%llu blocks64K=%llu direct=%d copied=%d\n", ms, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(end > begin ? ((end - 1u) >> 16u) - (begin >> 16u) + 1u : 0u), region.direct != nullptr ? 1 : 0, region.gpuCopy && region.copiedBack ? 1 : 0);
+            }
+        }
     }
 }
 

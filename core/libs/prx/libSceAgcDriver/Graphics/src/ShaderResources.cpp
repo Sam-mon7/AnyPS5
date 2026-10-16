@@ -1423,6 +1423,8 @@ struct BufferWriteCounters {
     std::atomic<std::uint64_t> elements{0};
     std::atomic<std::uint64_t> readOnly{0};
     std::atomic<std::uint64_t> notesSkipped{0};
+    std::array<std::atomic<std::uint64_t>, 5> markNs{};
+    std::atomic<std::uint64_t> markCalls{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -4742,32 +4744,61 @@ void ShaderResources::WriteBack() {
 }
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+    const bool profile = BuildProfiled();
+    auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::array<std::uint64_t, 5> elapsed{};
+    const auto markPhase = [&](std::size_t index) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        elapsed[index] = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - started).count());
+        started = now;
+    };
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    markPhase(0);
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (!storageWritten[index]) continue;
         storageTextures[index]->MarkDirty();
         static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
     }
+    markPhase(1);
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
     guestMemory.RecordCopyBacks(recorder);
+    markPhase(2);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
+    markPhase(3);
     guestMemory.MarkDirectWrites();
-    if (!BuildProfiled()) return;
+    markPhase(4);
+    if (!profile) return;
     auto& counters = BufferWrites();
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < elapsed.size(); ++i) {
+        counters.markNs[i].fetch_add(elapsed[i], std::memory_order_relaxed);
+        total += elapsed[i];
+    }
+    counters.markCalls.fetch_add(1, std::memory_order_relaxed);
+    if (total > 50000000u) {
+        std::uint64_t bytes = 0, largest = 0;
+        for (const auto& [begin, end] : guestMemory.Writes()) {
+            bytes += end - begin;
+            largest = std::max(largest, end - begin);
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[write-marks] slow %.3f ms bda=%d storage=%zu ranges=%zu bytes=%llu largest=%llu CPU ms: reads=%.3f storage=%.3f copies=%.3f publish=%.3f stamp=%.3f\n", total / 1e6, usesBda ? 1 : 0, storageTextures.size(), guestMemory.Writes().size(), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(largest), elapsed[0] / 1e6, elapsed[1] / 1e6, elapsed[2] / 1e6, elapsed[3] / 1e6, elapsed[4] / 1e6);
+    }
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in
     // WriteBack() and publishes no pending writes, so it has no notes to skip.
     counters.notesSkipped.fetch_add(readOnlyBuffers, std::memory_order_relaxed);
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[write-marks] %llu calls, cumulative CPU ms: reads=%.3f storage=%.3f copies=%.3f publish=%.3f stamp=%.3f\n", static_cast<unsigned long long>(counters.markCalls.load()), counters.markNs[0].load() / 1e6, counters.markNs[1].load() / 1e6, counters.markNs[2].load() / 1e6, counters.markNs[3].load() / 1e6, counters.markNs[4].load() / 1e6);
     const auto elements = counters.elements.load();
     const auto readOnly = counters.readOnly.load();
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] descriptor elements bound: %llu total, %llu written, %llu read-only; %llu pending-write notes skipped\n", static_cast<unsigned long long>(elements), static_cast<unsigned long long>(elements - readOnly), static_cast<unsigned long long>(readOnly), static_cast<unsigned long long>(counters.notesSkipped.load()));
