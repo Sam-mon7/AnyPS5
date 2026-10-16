@@ -3089,6 +3089,10 @@ void descriptorLayoutFlagTests() {
     mock = MockVulkan{};
     {
         auto context = mockContext();
+        context.limits.maxPerStageDescriptorSamplers = 2;
+        context.limits.maxDescriptorSetSamplers = 2;
+        context.limits.maxPerStageDescriptorSampledImages = 2;
+        context.limits.maxDescriptorSetSampledImages = 2;
         AgcDriver::Graphics::DescriptorCache cache(context);
         context.descriptorCache = &cache;
         context.imageTableCapacity = 2;
