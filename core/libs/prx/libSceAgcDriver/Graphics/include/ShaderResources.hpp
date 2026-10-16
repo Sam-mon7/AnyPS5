@@ -24,6 +24,12 @@ namespace AgcDriver { class VulkanDevice; }
 namespace AgcDriver::Graphics {
 
 class Recorder;
+struct PreparedSampledSnapshot;
+
+struct SampledPreparationCounts {
+    std::uint64_t prepared, used, rejected, budgetSkipped, bytes, liveBytes;
+};
+SampledPreparationCounts SampledPreparations();
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
@@ -369,6 +375,8 @@ private:
     void build(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes);
     void buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes);
     void buildComplete();
+    void prepareSampledSnapshots(const ShaderRecompiler::RecompileResult& program);
+    PreparedSampledSnapshot* preparedSnapshot(std::span<const std::uint32_t> words);
     // APS5_PROFILE_DRAW: closes the current sub-phase of the build into the [resources] totals.
     double phase(BuildPhase which);
     // `written` is the element's DescriptorBinding::bufferWritten: a read-only element binds the
@@ -407,6 +415,7 @@ private:
         std::uint64_t entryGeneration = 0;
     };
     std::vector<ImageRecord> imageRecords;
+    std::map<std::array<std::uint32_t, 8>, std::unique_ptr<PreparedSampledSnapshot>> preparedSnapshots;
     struct PreviousSampled {
         std::array<std::uint32_t, 8> words{};
         bool depthCompare = false;

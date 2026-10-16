@@ -526,6 +526,108 @@ void RunImageStoreAcrossEpochs(AgcDriver::VulkanDevice& device, const GuestBlock
     SampleInNewEpoch(device, result, 23, Row(stored.data()), "an entry whose image store results were flushed sampled the wrong texels");
 }
 
+void RunPreparedSnapshots(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
+    using namespace AgcDriver::Graphics;
+    const auto* flag = std::getenv("APS5_PREPARE_TEXTURE_SNAPSHOTS");
+    const bool enabled = flag != nullptr && std::strcmp(flag, "1") == 0;
+    for (std::uint32_t texture = 0; texture < Records; ++texture) {
+        Fill(block, texture, 0.375f);
+        SetRecord(block, texture, texture);
+        Keys[texture] = texture;
+    }
+    const auto srt = Buffer(block.Table(), Records * Stride);
+    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+    std::copy(srt.begin(), srt.end(), Srt.begin());
+    std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+    SetOutput(Output.data());
+    const auto result = Compile(device, block);
+    Require(Dispatch(device, result, 5) == Row(block.Texels(5)), "prepared snapshot warmup sampled wrong texels");
+    const auto prepare = [&] {
+        ClearCachedTextures(device.Device());
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto before = SampledPreparations();
+        auto prepared = device.PrepareDispatch(result, {}, Lanes, AddressOf(TableCode.data()));
+        const auto after = SampledPreparations();
+        Require(enabled ? after.prepared > before.prepared && after.liveBytes > 0 : after.prepared == before.prepared && after.liveBytes == 0, "prepared snapshot admission did not match the switch");
+        Require(after.liveBytes <= (256ull << 20u), "prepared snapshots exceeded their logical staging cap");
+        return prepared;
+    };
+    const auto finish = [&](std::shared_ptr<AgcDriver::PreparedDispatch> prepared, const std::vector<std::uint32_t>& expected, const char* what) {
+        std::fill(Output.begin(), Output.end(), 0xdeadbeefu);
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            device.Dispatch(result, 1, 1, 1, {}, AddressOf(TableCode.data()), std::move(prepared));
+            device.WaitIdle();
+        }
+        std::vector<std::uint32_t> actual(Lanes);
+        for (std::uint32_t lane = 0; lane < Lanes; ++lane) actual[lane] = Output[lane * 4u];
+        Require(actual == expected, std::string("prepared snapshots: ") + what);
+        Require(SampledPreparations().liveBytes == 0, "completed preparation kept staging charges or mapping pins");
+    };
+    auto prepared = prepare();
+    auto before = SampledPreparations();
+    finish(std::move(prepared), Row(block.Texels(5)), "unchanged snapshot sampled wrong texels");
+    Require(!enabled || SampledPreparations().used > before.used, "unchanged prepared staging was never used");
+
+    prepared = prepare();
+    before = SampledPreparations();
+    Fill(block, 5, 0.875f);
+    finish(std::move(prepared), Row(block.Texels(5)), "a CPU write without an epoch bump sampled old texels");
+    Require(!enabled || SampledPreparations().rejected > before.rejected, "fresh CPU writes did not reject prepared staging");
+
+    prepared = prepare();
+    before = SampledPreparations();
+    std::vector<float> stored(Width, 0.625f);
+    AgcDriver::GuestMemory::Write(AddressOf(block.Texels(5)), std::as_bytes(std::span(stored)));
+    finish(std::move(prepared), Row(stored.data()), "a driver store sampled old texels");
+    Require(!enabled || SampledPreparations().rejected > before.rejected, "a driver store did not reject prepared staging");
+
+    prepared = prepare();
+    before = SampledPreparations();
+    {
+        GuestBlock changedMapping(UnimportableBytes);
+        finish(std::move(prepared), Row(block.Texels(5)), "a mapping-generation change sampled wrong texels");
+    }
+    Require(!enabled || SampledPreparations().rejected > before.rejected, "a mapping-generation change did not reject prepared staging");
+
+    prepared = prepare();
+    Require(Dispatch(device, result, 5) == Row(block.Texels(5)), "concurrent cache fill sampled wrong texels");
+    before = SampledPreparations();
+    finish(std::move(prepared), Row(block.Texels(5)), "a duplicate cache fill sampled wrong texels");
+    Require(SampledPreparations().used == before.used, "prepared staging replaced a current cache entry");
+
+    prepared = prepare();
+    prepared.reset();
+    Require(SampledPreparations().liveBytes == 0, "abandoned preparation kept staging charges");
+    prepared = prepare();
+    ClearCachedTextures(device.Device());
+    finish(std::move(prepared), Row(block.Texels(5)), "cache clear invalidated a private snapshot");
+
+    SetOutput(block.Texels(5));
+    const auto writer = Compile(device, block);
+    SetOutput(Output.data());
+    prepared = prepare();
+    before = SampledPreparations();
+    static_cast<void>(Dispatch(device, writer, 7));
+    Require(Row(block.Texels(5)).front() == Row(block.Texels(7)).front(), "prepared snapshot GPU writer did not write the target");
+    Keys[0] = 5;
+    finish(std::move(prepared), Row(block.Texels(5)), "a GPU buffer write sampled old prepared texels");
+    Require(!enabled || SampledPreparations().rejected > before.rejected, "a GPU buffer write did not reject prepared staging");
+
+    prepared = prepare();
+    Store(device, block, 5);
+    for (std::uint32_t x = 0; x < Width; ++x) stored[x] = -4.0f - static_cast<float>(x);
+    finish(std::move(prepared), Row(stored.data()), "a GPU image store sampled old prepared texels");
+
+    prepared = prepare();
+    before = SampledPreparations();
+    AgcDriver::GuestMemory::Unwatch(AddressOf(block.Texels(0)), Records * TextureBytes);
+    Fill(block, 5, 0.125f);
+    finish(std::move(prepared), Row(block.Texels(5)), "unwatching preserved stale prepared texels");
+    Require(!enabled || SampledPreparations().rejected > before.rejected, "unwatching did not reject prepared staging");
+    ClearCachedTextures(device.Device());
+}
+
 void RunSnapshotRetention(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
     using namespace AgcDriver::Graphics;
     const auto* value = std::getenv("APS5_RELEASE_TEXTURE_SNAPSHOTS");
@@ -581,6 +683,12 @@ int main(int argc, char** argv) {
         GuestBlock selective(UnimportableBytes);
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::strcmp(argv[1], "--prepared-snapshots") == 0) {
+            if (!AgcDriver::GuestMemory::WriteWatched()) return VulkanTestSkipped;
+            RunPreparedSnapshots(*device, selective);
+            std::puts("prepared snapshot tests passed");
+            return 0;
+        }
         if (argc == 2 && std::strcmp(argv[1], "--snapshot-retention") == 0) {
             if (!AgcDriver::GuestMemory::WriteWatched()) return VulkanTestSkipped;
             RunSnapshotRetention(*device, selective);
