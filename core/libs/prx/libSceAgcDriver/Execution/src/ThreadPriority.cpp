@@ -306,4 +306,35 @@ void RaiseWorkerThreadPriority(const char* role) {
     Raise(role);
 }
 
+bool ServiceThreadPriorityRequested() {
+    static const bool requested = [] {
+        const char* text = std::getenv("APS5_SERVICE_THREAD_PRIORITY");
+        if (text == nullptr || *text == '\0' || std::strcmp(text, "0") == 0) return false;
+        if (std::strcmp(text, "1") == 0) return true;
+        LogOnce("service threads", std::string("APS5_SERVICE_THREAD_PRIORITY must be 0 or 1, not ") + text + "; left at normal priority");
+        return false;
+    }();
+    return requested;
+}
+
+void RaiseServiceThreadPriority(const char* role) {
+    if (!ServiceThreadPriorityRequested()) return;
+#ifdef _WIN32
+    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
+        LogOnce(role, "above normal refused (error " + std::to_string(GetLastError()) + ")");
+        return;
+    }
+    LogOnce(role, "above normal");
+#else
+    const auto tid = static_cast<std::uint64_t>(syscall(SYS_gettid));
+    const std::int32_t nice = static_cast<std::int32_t>(std::max(-20, std::min(19, EnvInt("APS5_SERVICE_THREAD_NICE", -5))));
+    std::string failure;
+    if (!RtkitCall("MakeThreadHighPriorityWithPID", tid, DbusTypeInt32, &nice, failure)) {
+        LogOnce(role, "nice " + std::to_string(nice) + " refused: " + failure);
+        return;
+    }
+    LogOnce(role, "nice " + std::to_string(nice) + " via rtkit");
+#endif
+}
+
 }

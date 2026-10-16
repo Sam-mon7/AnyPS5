@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderObjectMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include <array>
 #include <condition_variable>
 #include <cstdlib>
@@ -98,7 +99,10 @@ void runJobs(LibraryStore& store) {
 
 void enqueue(LibraryStore& store, VkDevice device, std::function<void()> job) {
     if (!store.started) {
-        std::thread(runJobs, std::ref(store)).detach();
+        std::thread([&store] {
+            RaiseServiceThreadPriority("pipeline library");
+            runJobs(store);
+        }).detach();
         store.started = true;
     }
     ++store.pending[device];
