@@ -193,7 +193,7 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
     recorder.AfterCompletions(reinterpret_cast<std::uint64_t>(completion.data()), std::as_bytes(std::span(completed)), 1, 0, false);
     recorder.Sync();
     Require(completion == completed, "native CPU fixture completion label was not published");
-    Require(static_cast<volatile std::uint32_t*>(raw)[0] == values[0] && static_cast<volatile std::uint32_t*>(raw)[1] == values[1], "native CPU read after a disjoint completion label missed resident GPU writes");
+    const bool nativePublished = static_cast<volatile std::uint32_t*>(raw)[0] == values[0] && static_cast<volatile std::uint32_t*>(raw)[1] == values[1];
     if (resident) {
         const Memory::ReadSiteScope site(Memory::ReadSite::MirrorRefresh);
         Require(!StoreHeapMirrorResults(address + 3 * block, std::as_bytes(std::span(values)), std::as_bytes(std::span(initial))), "a range beyond the heap was accepted for resident storage");
@@ -274,6 +274,7 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
     GuestArena::GuestArenaRelease_nid_postfix(raw, 2 * block);
     Require(synchronousPublished, "explicit heap write-back did not publish the GPU stores");
     Require(synchronousCpuPreserved, "explicit heap write-back rolled back a CPU store after the GPU baseline");
+    Require(nativePublished, "native CPU read after a disjoint completion label missed resident GPU writes");
     std::cout << (sparse ? "Sparse heap fallback tests passed\n" : "Resident heap recorder tests passed\n");
 #endif
 }
