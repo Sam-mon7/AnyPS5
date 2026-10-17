@@ -19,6 +19,7 @@ void APS5_VABI scePthreadExit(void* retval);
 int APS5_VABI scePthreadJoin(Pthread thread, void** retval);
 int APS5_VABI scePthreadRename(Pthread thread, const char* name);
 int APS5_VABI scePthreadGetname(Pthread thread, char* name);
+void APS5_VABI scePthreadYield();
 Pthread APS5_VABI scePthreadSelf();
 int APS5_VABI scePthreadCancel(Pthread thread);
 int APS5_VABI scePthreadSetcancelstate(int state, int* old_state);
@@ -220,7 +221,7 @@ int APS5_VABI pthread_getcpuclockid_nid_postfix(Pthread thread, int* clockId) {
 }
 
 int APS5_VABI sched_yield_nid_postfix(void) {
-    std::this_thread::yield();
+    scePthreadYield();
     return 0;
 }
 
@@ -250,7 +251,7 @@ void APS5_VABI pthread_testcancel_nid_postfix(void) {
 }
 
 void APS5_VABI pthread_yield_nid_postfix(void) {
-    std::this_thread::yield();
+    scePthreadYield();
 }
 
 unsigned int APS5_VABI sleep_nid_postfix(unsigned int seconds) {
