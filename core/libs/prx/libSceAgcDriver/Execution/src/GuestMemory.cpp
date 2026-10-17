@@ -537,18 +537,41 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 std::fprintf(stderr, "[query] 0x%llx range 0x%zx: base 0x%llx size 0x%llx state 0x%lx protect 0x%lx type 0x%lx %.0f us gen %llu from +0x%llx\n", static_cast<unsigned long long>(cursor), bytes, reinterpret_cast<unsigned long long>(memory.BaseAddress), static_cast<unsigned long long>(memory.RegionSize), memory.State, memory.Protect, memory.Type, us, static_cast<unsigned long long>(GuestAllocations::GuestAllocationsGeneration_nid_postfix()), ModuleOffset(__builtin_return_address(0)));
             }
         }
-        auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+        const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
         if (memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - base || base + memory.RegionSize <= cursor) return false;
-        auto regionEnd = base + memory.RegionSize;
+        const auto regionEnd = base + memory.RegionSize;
         std::uint32_t logicalProtection = memory.Protect;
+        const bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
         if (GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection)) {
             constexpr std::uintptr_t sharedPage = 0x4000;
-            const auto page = cursor & ~(sharedPage - 1);
-            base = std::max(base, page);
-            regionEnd = std::min(regionEnd, page + sharedPage);
+            const auto stop = std::min(end, regionEnd);
+            const auto access = [&](std::uint32_t value) {
+                const bool readable = committed && readableProtection(value & 0xffu);
+                return std::pair{readable, readable && writableProtection(value & 0xffu)};
+            };
+            auto state = access(logicalProtection);
+            auto from = cursor;
+            auto page = cursor & ~(sharedPage - 1);
+            while (true) {
+                page += sharedPage;
+                std::pair<bool, bool> next{};
+                if (page < stop) {
+                    std::uint32_t pageProtection = memory.Protect;
+                    GuestArena::GuestArenaProtection_nid_postfix(page, &pageProtection);
+                    next = access(pageProtection);
+                    if (next == state) continue;
+                }
+                const auto to = std::min(stop, page);
+                pages.record(std::max(base, from & ~(sharedPage - 1)), std::min(regionEnd, page), state.first, state.second, generation);
+                if (!emit(PageRun{from, to, state.first, state.second})) return true;
+                if (page >= stop) break;
+                from = page;
+                state = next;
+            }
+            cursor = stop;
+            continue;
         }
         const auto protection = logicalProtection & 0xffu;
-        const bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
         const bool readable = committed && readableProtection(protection);
         const bool writable = readable && writableProtection(protection);
         pages.record(base, regionEnd, readable, writable, generation);
