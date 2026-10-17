@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #ifdef _WIN32
@@ -1666,9 +1667,42 @@ const void* ThreadToken() {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
 }
 
+bool CompletionProbeEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_COMPLETION_PROBE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+GpuLockHolder GpuMutexType::Holder() const {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto generation = probeGeneration.load();
+        if ((generation & 1u) != 0) continue;
+        GpuLockHolder result{true, probeThread.load(), probeQueue.load(), probePresenter.load(), probeSinceNs.load()};
+        if (generation == probeGeneration.load()) return result;
+    }
+    return {false};
+}
+
 void GpuMutexType::acquired() {
     owner.store(ThreadToken(), std::memory_order_relaxed);
-    if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+    if (++depth == 1) {
+        gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+        if (CompletionProbeEnabled()) {
+#ifdef _WIN32
+            thread_local const auto thread = static_cast<std::uint64_t>(GetCurrentThreadId());
+#else
+            thread_local const auto thread = static_cast<std::uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+            probeGeneration.fetch_add(1);
+            probeThread.store(thread);
+            probeQueue.store(LockStats().tag);
+            probePresenter.store(LockStats().holderColumn == PresenterColumn);
+            probeSinceNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            probeGeneration.fetch_add(1);
+        }
+    }
 }
 
 bool GpuMutexType::try_lock() {
@@ -1709,6 +1743,11 @@ void GpuMutexType::unlock() {
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
+        if (CompletionProbeEnabled()) {
+            probeGeneration.fetch_add(1);
+            probeThread.store(0);
+            probeGeneration.fetch_add(1);
+        }
     }
     mutex.unlock();
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part

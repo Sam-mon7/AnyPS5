@@ -1100,6 +1100,105 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 
 }
 
+struct Recorder::CompletionProbe {
+    struct Entry {
+        std::uint64_t serial = 0;
+        std::size_t actions = 0;
+        bool submitted = false;
+        bool delivering = false;
+        std::chrono::steady_clock::time_point readySince{};
+        std::chrono::steady_clock::time_point deliverySince{};
+    };
+    std::mutex mutex;
+    std::condition_variable_any wake;
+    std::map<const Batch*, Entry> batches;
+    std::jthread thread;
+
+    CompletionProbe(const Context& context, VkSemaphore timeline, std::uint64_t id) {
+        const auto getValue = timeline == VK_NULL_HANDLE ? nullptr : context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR");
+        thread = std::jthread([this, device = context.device, timeline, getValue, id](std::stop_token stop) {
+            std::unique_lock lock(mutex);
+            while (!stop.stop_requested()) {
+                wake.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; });
+                if (stop.stop_requested()) break;
+                lock.unlock();
+                std::uint64_t value = 0;
+                const auto queryStart = std::chrono::steady_clock::now();
+                const auto query = getValue == nullptr ? VK_ERROR_FEATURE_NOT_PRESENT : getValue(device, timeline, &value);
+                const auto now = std::chrono::steady_clock::now();
+                const auto holder = GuestMemory::GpuMutex().Holder();
+                std::size_t pending = 0, unsubmitted = 0, unresolved = 0, ready = 0, readyBatches = 0, delivering = 0;
+                double oldestReadyMs = 0, oldestDeliveryMs = 0;
+                lock.lock();
+                for (auto& [batch, entry] : batches) {
+                    if (entry.actions == 0) continue;
+                    pending += entry.actions;
+                    if (!entry.submitted) {
+                        unsubmitted += entry.actions;
+                    } else if (entry.delivering) {
+                        delivering += entry.actions;
+                        oldestDeliveryMs = std::max(oldestDeliveryMs, std::chrono::duration<double, std::milli>(now - entry.deliverySince).count());
+                    } else {
+                        if (query == VK_SUCCESS && entry.serial <= value && entry.readySince == std::chrono::steady_clock::time_point{}) entry.readySince = now;
+                        if (entry.readySince == std::chrono::steady_clock::time_point{}) {
+                            unresolved += entry.actions;
+                        } else {
+                            ready += entry.actions;
+                            ++readyBatches;
+                            oldestReadyMs = std::max(oldestReadyMs, std::chrono::duration<double, std::milli>(now - entry.readySince).count());
+                        }
+                    }
+                }
+                lock.unlock();
+                const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+                const auto heldMs = holder.stable && holder.thread != 0 && nanos > static_cast<std::int64_t>(holder.sinceNs) ? (nanos - holder.sinceNs) / 1e6 : 0;
+                const auto* role = !holder.stable ? "changing" : holder.thread == 0 ? "none" : holder.presenter ? "presenter" : holder.queue == 0xffffffffu ? "thread" : "queue";
+                std::fprintf(stderr, "[completion-probe] ns=%llu recorder=%llu gpu_serial=%llu query=%d query_ms=%.3f pending_actions=%zu unsubmitted_actions=%zu unresolved_actions=%zu ready_batches=%zu ready_actions=%zu oldest_ready_observed_ms=%.3f delivering_actions=%zu oldest_delivery_ms=%.3f mutex_stable=%d mutex_tid=%llu mutex_queue=0x%x mutex_role=%s mutex_held_ms=%.3f\n",
+                    static_cast<unsigned long long>(nanos), static_cast<unsigned long long>(id), static_cast<unsigned long long>(value), static_cast<int>(query), std::chrono::duration<double, std::milli>(now - queryStart).count(),
+                    pending, unsubmitted, unresolved, readyBatches, ready, oldestReadyMs, delivering, oldestDeliveryMs, holder.stable,
+                    static_cast<unsigned long long>(holder.thread), holder.queue, role, heldMs);
+                lock.lock();
+            }
+        });
+    }
+
+    ~CompletionProbe() {
+        thread.request_stop();
+        wake.notify_all();
+    }
+
+    void Note(const Batch& batch, std::uint64_t serial) {
+        std::lock_guard lock(mutex);
+        auto& entry = batches[&batch];
+        if (entry.actions == 0) entry.readySince = {};
+        entry.serial = serial;
+        entry.actions = batch.completions.size();
+        entry.submitted = batch.submitted;
+    }
+
+    void Begin(const Batch& batch) {
+        std::lock_guard lock(mutex);
+        if (auto found = batches.find(&batch); found != batches.end()) {
+            found->second.delivering = true;
+            found->second.deliverySince = std::chrono::steady_clock::now();
+        }
+    }
+
+    void Delivered(const Batch& batch) {
+        std::lock_guard lock(mutex);
+        if (auto found = batches.find(&batch); found != batches.end() && found->second.actions != 0) --found->second.actions;
+    }
+
+    void Forget(const Batch& batch) {
+        std::lock_guard lock(mutex);
+        batches.erase(&batch);
+    }
+};
+
+void Recorder::noteProbeCompletion(const Batch& batch) {
+    if (completionProbe != nullptr && !batch.completions.empty()) completionProbe->Note(batch, batch.submitted ? batch.serial : submissions + 1);
+}
+
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
     {
         std::lock_guard lock(liveRecordersMutex);
@@ -1123,7 +1222,10 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         cmdPushConstants = context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
         cmdDispatch = context.Function<PFN_vkCmdDispatch>("vkCmdDispatch");
     }
-    if (!timelineSemaphores) return;
+    if (!timelineSemaphores) {
+        if (GuestMemory::CompletionProbeEnabled()) completionProbe = std::make_unique<CompletionProbe>(context, timeline, id);
+        return;
+    }
     // The timeline starts at 0 and every Submit signals its serial (1, 2, ...): a value that only
     // grows, so a thread waiting for it outside the mutex can never observe a reset or a reused
     // handle (the batch fences are pooled and reset in release()). A failure here only disables the
@@ -1137,9 +1239,11 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         std::fprintf(stderr, "[gpu] timeline semaphore creation failed (Vulkan result %d); drains wait under the GPU mutex\n", static_cast<int>(result));
         timeline = VK_NULL_HANDLE;
     }
+    if (GuestMemory::CompletionProbeEnabled()) completionProbe = std::make_unique<CompletionProbe>(context, timeline, id);
 }
 
 Recorder::~Recorder() {
+    completionProbe.reset();
     try {
         Sync();
     } catch (const std::exception& error) {
@@ -2804,6 +2908,7 @@ Recorder::SnapshotSlice Recorder::AllocateDrawSnapshot(std::size_t bytes) {
 void Recorder::OnComplete(std::function<void()> action) {
     ensureOpen();
     open->completions.push_back(std::move(action));
+    noteProbeCompletion(*open);
     ++open->writeBackCompletionCount;
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -3285,6 +3390,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         GuestMemory::CheckRange(reinterpret_cast<const void*>(address), copy.size(), 4, true);
         GuestMemory::StoreOwnBytes(address, copy);
     });
+    noteProbeCompletion(batch);
     // Counted per batch and counted down when the batch finishes, on every exit path of finish()
     // (a label whose range became unmapped is reported there, and a lost device throws before the
     // completions run): a label that will never land must not leave the workers reaping forever.
@@ -3310,6 +3416,7 @@ bool Recorder::AfterRecordedWork(std::function<void()> action) {
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     batch.completions.push_back(std::move(action));
+    noteProbeCompletion(batch);
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
     if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
@@ -3411,6 +3518,7 @@ void Recorder::Submit() {
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
+    noteProbeCompletion(*batch);
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
         ++submitCount;
@@ -3806,6 +3914,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         Recorder& recorder;
         const Batch* batch;
         ~Finishing() {
+            if (recorder.completionProbe != nullptr) recorder.completionProbe->Forget(*batch);
             auto& list = recorder.finishing;
             list.erase(std::remove(list.begin(), list.end(), batch), list.end());
             // The batch's completion labels have landed, or never will (fence failure below).
@@ -3896,6 +4005,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // reaped or synced the batch. Inside them the flush hook makes no pending-write wait (SyncThrough).
     const bool profile = DrawProfiled();
     const auto completionStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (completionProbe != nullptr) completionProbe->Begin(*batch);
     {
         struct InCompletion {
             InCompletion() { ++completionDepth; }
@@ -3907,6 +4017,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             } catch (const std::exception& error) {
                 std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
             }
+            if (completionProbe != nullptr) completionProbe->Delivered(*batch);
         }
     }
     if (profile) holdCounters.completions += batch->completions.size();

@@ -112,7 +112,7 @@ void ReleaseWatched(void* block, std::size_t bytes) {
 // them, as the driver creates its own; the recorder's batches need a real queue and real fences.
 class Device {
 public:
-    Device() {
+    Device(bool timelineRequested = false) {
 #ifdef _WIN32
         library = SDL_LoadObject("vulkan-1.dll");
 #else
@@ -256,6 +256,16 @@ public:
                 extensionsEnabled.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
                 robustness.pNext = address.pNext;
                 address.pNext = &robustness;
+            }
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (timelineRequested) {
+                Require(hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME), "timeline semaphore extension unavailable");
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timeline};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                Require(timeline.timelineSemaphore == VK_TRUE, "timeline semaphore feature unavailable");
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timeline.pNext = address.pNext;
+                address.pNext = &timeline;
             }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             device.queueCreateInfoCount = 1;
@@ -7611,17 +7621,66 @@ void Run(Context context) {
 }
 #endif
 
+void completionProbeTests(Device& device) {
+    const bool enabled = AgcDriver::GuestMemory::CompletionProbeEnabled();
+    Require(GpuMutex().Holder().thread == 0, "completion probe reports an owner before locking");
+    AgcDriver::GuestMemory::TagGpuLockThread(0x40);
+    std::unique_lock gpu(GpuMutex());
+    const auto outer = GpuMutex().Holder();
+    if (enabled) {
+        Require(outer.stable && outer.thread != 0 && outer.queue == 0x40 && outer.sinceNs != 0, "completion probe missed the GPU mutex owner");
+#ifdef _WIN32
+        Require(outer.thread == GetCurrentThreadId(), "completion probe owner is not the Windows thread id");
+#endif
+    }
+    {
+        std::lock_guard nested(GpuMutex());
+        const auto inner = GpuMutex().Holder();
+        Require(inner.thread == outer.thread && inner.sinceNs == outer.sinceNs, "recursive lock reset the completion probe hold");
+    }
+    Require(GpuMutex().Holder().thread == outer.thread, "recursive unlock cleared the completion probe owner");
+    std::atomic<unsigned> delivered{0};
+    {
+        Recorder recorder(device.GetContext(), true);
+        recorder.OnComplete([&] {
+            ++delivered;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        });
+        recorder.WaitSerial(recorder.SubmitAndEpoch());
+        std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+        Require(delivered.load() == 0, "completion probe delivered a callback");
+        recorder.OnComplete([&] { ++delivered; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        Require(delivered.load() == 0, "completion probe delivered an unsubmitted callback");
+        recorder.Reap();
+        Require(delivered.load() == 1, "reap did not deliver only the submitted callback");
+        recorder.Sync();
+        Require(delivered.load() == 2, "sync did not deliver the remaining callback");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    }
+    std::fprintf(stderr, "[completion-probe-test] recorder destroyed\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    gpu.unlock();
+    Require(GpuMutex().Holder().thread == 0, "completion probe kept a released mutex owner");
+    std::cout << "Completion probe tests passed\n";
+}
+
 int main(int argc, char** argv) {
     try {
+        const bool completionProbe = argc == 2 && std::string_view(argv[1]) == "--completion-probe-only";
         std::unique_ptr<Device> created;
         try {
-            created = std::make_unique<Device>();
+            created = std::make_unique<Device>(completionProbe);
         } catch (const std::exception& error) {
             if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
             std::cout << "skipped, no usable Vulkan device: " << error.what() << '\n';
             return 77;
         }
         Device& device = *created;
+        if (completionProbe) {
+            completionProbeTests(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-retirement-only") {
             const auto alignment = device.GetContext().hostImportAlignment;
             if (alignment == 0 || alignment > 65536) {

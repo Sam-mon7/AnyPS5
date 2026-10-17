@@ -129,6 +129,14 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
 // compute workers, and that wait has to stay visible. Under APS5_PROFILE_DRAW each thread reports its
 // waits in a [lock] line every 10 s (APS5_NO_LOCK_PROFILE=1 turns the timing off); a queue worker tags
 // its thread with TagGpuLockThread so the line names the queue.
+bool CompletionProbeEnabled();
+struct GpuLockHolder {
+    bool stable = true;
+    std::uint64_t thread = 0;
+    std::uint32_t queue = 0xffffffffu;
+    bool presenter = false;
+    std::uint64_t sinceNs = 0;
+};
 class GpuMutexType {
 public:
     void lock();
@@ -141,6 +149,7 @@ public:
     // current acquisition is the outermost, so code that releases the mutex around a wait
     // (Recorder::SyncThrough for the flush hook) gives up no caller's hold.
     std::uint32_t DepthOnThisThread() const;
+    GpuLockHolder Holder() const;
 
 private:
     void acquired();
@@ -149,6 +158,11 @@ private:
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};
     std::uint32_t depth = 0;
+    std::atomic<std::uint64_t> probeGeneration{0};
+    std::atomic<std::uint64_t> probeThread{0};
+    std::atomic<std::uint32_t> probeQueue{0xffffffffu};
+    std::atomic<bool> probePresenter{false};
+    std::atomic<std::uint64_t> probeSinceNs{0};
 };
 GpuMutexType& GpuMutex();
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:

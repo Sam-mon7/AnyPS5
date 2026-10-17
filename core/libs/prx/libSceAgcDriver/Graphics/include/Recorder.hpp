@@ -772,6 +772,9 @@ private:
     bool unsignaled(std::uint64_t serial) const;
 
     Context context;
+    struct CompletionProbe;
+    std::unique_ptr<CompletionProbe> completionProbe;
+    void noteProbeCompletion(const Batch& batch);
     VkSemaphore timeline = VK_NULL_HANDLE;
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
