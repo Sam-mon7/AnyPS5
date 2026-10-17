@@ -1155,12 +1155,29 @@ std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memor
     return std::max<std::uint64_t>(2048ull << 20u, std::min<std::uint64_t>(TextureCacheBudget(memory), reported->heapBudget[*heap] / 4u));
 }
 
+namespace {
+
+// APS5_SAMPLED_BUDGET_STORAGE_IN_USE=1 keeps the storage images in use out of the sampled budget, not
+// the storage cache's whole budget. The sampled budget is read again every second, so storage images
+// that grow take their room back by shrinking it. Reserving the unused rest of the storage budget left
+// run 207's sampled cache, which held only the newest frame's textures, 1.6 GiB short of that frame.
+bool sampledBudgetStorageInUse() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_SAMPLED_BUDGET_STORAGE_IN_USE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+}
+
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t sampledBytes, std::uint64_t storageBytes, std::uint64_t heldOutsideCache) {
     const auto heap = largestDeviceLocalHeap(memory);
     if (reported == nullptr || !heap || reported->heapBudget[*heap] == 0) return TextureCacheBudget(memory);
     const auto budget = reported->heapBudget[*heap];
     const auto usage = reported->heapUsage[*heap];
-    const auto reserved = usage - std::min<std::uint64_t>(usage, sampledBytes + storageBytes) + std::max(StorageTextureBudget(memory, reported), storageBytes) + heldOutsideCache + budget / 32u;
+    const auto storageReserve = sampledBudgetStorageInUse() ? storageBytes : std::max(StorageTextureBudget(memory, reported), storageBytes);
+    const auto reserved = usage - std::min<std::uint64_t>(usage, sampledBytes + storageBytes) + storageReserve + heldOutsideCache + budget / 32u;
     return std::max<std::uint64_t>(2048ull << 20u, budget > reserved ? budget - reserved : 0u);
 }
 

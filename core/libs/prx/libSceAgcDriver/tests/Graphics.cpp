@@ -3804,16 +3804,22 @@ void sampledTextureBudgetTests() {
     Require(SampledTextureBudget(memory, &reported, 0, 0) == 4 * GiB, "a zero budget for the largest device-local heap did not fall back to a quarter of the heap");
     reported.heapBudget[2] = 15 * GiB;
     reported.heapUsage[2] = 9 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB, 0) == 6 * GiB + 800 * MiB, "a 15 GiB budget with 4 GiB used outside the texture caches does not leave 6 GiB 800 MiB after the 3 GiB 768 MiB storage cache budget and 480 MiB of headroom");
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB, 0, 2 * GiB) == 4 * GiB + 800 * MiB, "2 GiB of sampled textures held outside the cache were not kept out of its budget");
-    Require(SampledTextureBudget(memory, &reported, 2 * GiB, 3 * GiB) == 6 * GiB + 800 * MiB, "a storage cache holding less than its 3 GiB 768 MiB budget did not keep that budget out of the sampled budget");
+    // APS5_SAMPLED_BUDGET_STORAGE_IN_USE=1 (agc_driver_graphics_storage_in_use) keeps only the storage
+    // images in use out of the sampled budget, not the 3 GiB 768 MiB storage cache budget.
+    const auto* inUseValue = std::getenv("APS5_SAMPLED_BUDGET_STORAGE_IN_USE");
+    const bool inUse = inUseValue != nullptr && std::string_view(inUseValue) == "1";
+    Require(SampledTextureBudget(memory, &reported, 5 * GiB, 0) == (inUse ? 10 * GiB + 544 * MiB : 6 * GiB + 800 * MiB), "a 15 GiB budget with 4 GiB used outside the texture caches does not leave 6 GiB 800 MiB after the 3 GiB 768 MiB storage cache budget and 480 MiB of headroom (10 GiB 544 MiB with no storage images in use)");
+    Require(SampledTextureBudget(memory, &reported, 5 * GiB, 0, 2 * GiB) == (inUse ? 8 * GiB + 544 * MiB : 4 * GiB + 800 * MiB), "2 GiB of sampled textures held outside the cache were not kept out of its budget");
+    Require(SampledTextureBudget(memory, &reported, 2 * GiB, 3 * GiB) == (inUse ? 7 * GiB + 544 * MiB : 6 * GiB + 800 * MiB), inUse ? "a storage cache holding 3 GiB of its budget did not leave the unused rest to the sampled budget" : "a storage cache holding less than its 3 GiB 768 MiB budget did not keep that budget out of the sampled budget");
     const auto grown = SampledTextureBudget(memory, &reported, 1 * GiB, 6 * GiB);
     Require(grown == 6 * GiB + 544 * MiB, "a storage cache grown to 6 GiB, past its 3 GiB 768 MiB budget, was not kept out of the sampled budget");
     Require(grown + 6 * GiB + 2 * GiB + 480 * MiB <= 15 * GiB, "the sampled budget, a 6 GiB storage cache, 2 GiB used outside the texture caches and 480 MiB of headroom exceed the 15 GiB heap budget");
     reported.heapUsage[2] = 3 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB, 0) == 10 * GiB + 800 * MiB, "usage below the cached bytes is not read as no other device memory in use");
+    Require(SampledTextureBudget(memory, &reported, 5 * GiB, 0) == (inUse ? 14 * GiB + 544 * MiB : 10 * GiB + 800 * MiB), "usage below the cached bytes is not read as no other device memory in use");
     reported.heapUsage[2] = 12 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 1 * GiB, 0) == 2 * GiB, "a heap whose other users leave no room does not keep the 2 GiB floor");
+    Require(SampledTextureBudget(memory, &reported, 1 * GiB, 0) == (inUse ? 3 * GiB + 544 * MiB : 2 * GiB), "a heap whose other users leave no room does not keep the 2 GiB floor (3 GiB 544 MiB left with no storage images in use)");
+    reported.heapUsage[2] = 15 * GiB;
+    Require(SampledTextureBudget(memory, &reported, 1 * GiB, 0) == 2 * GiB, "a heap whose other users fill it does not keep the 2 GiB floor");
     memory.memoryHeaps[0].flags = 0;
     memory.memoryHeaps[2].flags = 0;
     Require(SampledTextureBudget(memory, &reported, 0, 0) == 2 * GiB, "a device without a device-local heap does not keep 2 GiB of sampled textures");
