@@ -1202,8 +1202,12 @@ configure_windows_unwind(agc_recorder_kept_bytes_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_recorder_kept_bytes_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_recorder_kept_bytes COMMAND agc_recorder_kept_bytes_tests)
+    add_test(NAME agc_recorder_kept_bytes_background_off COMMAND agc_recorder_kept_bytes_tests)
+    set_tests_properties(agc_recorder_kept_bytes_background_off PROPERTIES ENVIRONMENT "APS5_BACKGROUND_RELEASE=0")
+    add_test(NAME agc_recorder_kept_bytes_background COMMAND agc_recorder_kept_bytes_tests background)
+    set_tests_properties(agc_recorder_kept_bytes_background PROPERTIES ENVIRONMENT "APS5_BACKGROUND_RELEASE=1" TIMEOUT 15)
     if(WIN32)
-        set_tests_properties(agc_recorder_kept_bytes PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_kept_bytes agc_recorder_kept_bytes_background_off agc_recorder_kept_bytes_background PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

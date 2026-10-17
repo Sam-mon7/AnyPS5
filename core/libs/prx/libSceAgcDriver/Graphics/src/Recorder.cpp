@@ -335,6 +335,7 @@ HoldCounters holdCounters;
 struct DeferredBatch {
     std::vector<std::shared_ptr<void>> kept;
     std::vector<std::function<void()>> completions;
+    std::size_t bytes = 0;
 };
 struct DeferredBatchesTag {};
 auto& DeferredBatches() { return HostThreadLocal<std::vector<DeferredBatch>, DeferredBatchesTag>(); }
@@ -347,6 +348,8 @@ std::vector<DeferredBatch> TakeDeferred() {
     return taken;
 }
 std::atomic<std::uint64_t> deferredPending{0};
+std::atomic<std::size_t> deferredKeptBytes{0};
+std::atomic<std::uint64_t> releaseBudgetWaits{0}, releaseBudgetWaitUs{0}, forcedBackgroundReleases{0};
 std::atomic<std::uint64_t> threadReleases{0}, threadObjects{0}, threadReleaseUs{0};
 std::atomic<std::uint64_t> inlineReleases{0}, inlineObjects{0}, inlineReleaseUs{0}, inlineOverBound{0};
 std::atomic<std::uint64_t> releaseQueueMax{0};
@@ -359,6 +362,24 @@ bool ReleaseUnderLock() {
 bool ReleaseOnUnlock() {
     static const bool onUnlock = std::getenv("APS5_RELEASE_ON_UNLOCK") != nullptr;
     return onUnlock;
+}
+
+bool BackgroundRelease() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_BACKGROUND_RELEASE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0' && !ReleaseUnderLock() && !ReleaseOnUnlock();
+    }();
+    return enabled;
+}
+
+void ReportBackgroundRelease() {
+    if (!DrawProfiled()) return;
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    AgcDriver::ProfilePrint_nid_no_patch("[background-release] cumulative: %llu forced batches; %llu byte-budget waits %.3f ms; %zu bytes pending destruction\n",
+        static_cast<unsigned long long>(forcedBackgroundReleases.load()), static_cast<unsigned long long>(releaseBudgetWaits.load()), releaseBudgetWaitUs.load() / 1000.0, deferredKeptBytes.load());
 }
 
 std::size_t ReleaseQueueBound() {
@@ -384,6 +405,10 @@ void DestroyDeferred(std::vector<DeferredBatch> releasing, bool onThread) {
         // The completions first (their captures hold some of the objects), then the objects.
         batch.completions.clear();
         batch.kept.clear();
+        if (batch.bytes != 0) {
+            deferredKeptBytes.fetch_sub(batch.bytes, std::memory_order_acq_rel);
+            deferredKeptBytes.notify_all();
+        }
         deferredPending.fetch_sub(1, std::memory_order_acq_rel);
     }
     releasing.clear();
@@ -2566,6 +2591,25 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
 void Recorder::BoundKeptBytes() {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
+    if (BackgroundRelease()) {
+        ReleaseDeferredKeeps();
+        for (;;) {
+            const auto pending = deferredKeptBytes.load(std::memory_order_acquire);
+            if (inFlightKeptBytes <= 2 * KeptBytesBudget && pending <= 2 * KeptBytesBudget - inFlightKeptBytes) break;
+            if (pending != 0) {
+                const auto start = std::chrono::steady_clock::now();
+                deferredKeptBytes.wait(pending, std::memory_order_acquire);
+                releaseBudgetWaits.fetch_add(1, std::memory_order_relaxed);
+                releaseBudgetWaitUs.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
+            } else {
+                auto batch = std::move(inFlight.front());
+                inFlight.pop_front();
+                finish(std::move(batch), true, 4, true);
+            }
+        }
+        ReportBackgroundRelease();
+        return;
+    }
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
         auto batch = std::move(inFlight.front());
@@ -3867,9 +3911,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     }
     if (profile) holdCounters.completions += batch->completions.size();
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    // Deferred only from inside a hold: the unlock that releases the list is this thread's own, and
-    // a caller finishing batches without the mutex (a test) might never make one.
-    if (releaseNow || ReleaseUnderLock() || !GuestMemory::GpuMutex().HeldByThisThread()) {
+    const bool background = BackgroundRelease();
+    if ((releaseNow && !background) || ReleaseUnderLock() || !GuestMemory::GpuMutex().HeldByThisThread()) {
         batch->completions.clear();
         batch->kept.clear();
     } else {
@@ -3878,13 +3921,18 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         // destroys the batch's objects here, under the mutex, counts nothing the destructor would
         // wait for and must not escape (the rest of finish() releases the fence and command buffer).
         try {
-            DeferredBatches().push_back({std::move(batch->kept), std::move(batch->completions)});
+            DeferredBatches().push_back({std::move(batch->kept), std::move(batch->completions), background ? batch->keptBytes : 0});
             deferredPending.fetch_add(1, std::memory_order_acq_rel);
             DeferredBytes() += batch->keptBytes;
+            if (background) deferredKeptBytes.fetch_add(batch->keptBytes, std::memory_order_acq_rel);
         } catch (...) {
         }
         batch->completions.clear();
         batch->kept.clear();
+        if (background) {
+            if (releaseNow) forcedBackgroundReleases.fetch_add(1, std::memory_order_relaxed);
+            ReleaseDeferredKeeps();
+        }
     }
     if (profile) {
         const auto now = std::chrono::steady_clock::now();

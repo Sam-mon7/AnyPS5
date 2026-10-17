@@ -1,14 +1,17 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 #if defined(ANYPS5_AFTERMATH_TESTING)
 #include <filesystem>
@@ -308,20 +311,100 @@ void SharedOwnerCountsOncePerBatch() {
     recorder.Sync();
 }
 
+void BackgroundRelease(bool teardown) {
+    mock = MockDevice{};
+    std::promise<void> entered, allow, completed;
+    auto enteredFuture = entered.get_future();
+    auto allowFuture = allow.get_future().share();
+    auto completedFuture = completed.get_future();
+    std::thread::id caller, destroyer;
+    std::atomic<bool> writeBack{false}, destroyed{false};
+    bool ordered = false;
+    std::exception_ptr failure;
+    auto object = std::shared_ptr<int>(new int(0), [&](int* value) {
+        destroyer = std::this_thread::get_id();
+        ordered = writeBack.load(std::memory_order_acquire);
+        entered.set_value();
+        allowFuture.wait();
+        delete value;
+        destroyed.store(true, std::memory_order_release);
+    });
+    std::thread worker([&, object = std::move(object)]() mutable {
+        try {
+            caller = std::this_thread::get_id();
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            auto recorder = std::make_unique<Recorder>(mockContext());
+            recorder->Keep(object, Budget);
+            recorder->OnComplete([&, capture = std::move(object)] {
+                *capture = 42;
+                writeBack.store(true, std::memory_order_release);
+            });
+            recorder->Sync();
+            if (teardown) {
+                recorder.reset();
+            } else {
+                recorder->Keep(std::make_shared<int>(1), Budget);
+                recorder->BoundKeptBytes();
+                recorder->Keep(std::make_shared<int>(2), Budget);
+                recorder->BoundKeptBytes();
+            }
+            completed.set_value();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    const bool started = enteredFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    Expect(started, "completed kept objects never reached a destructor");
+    if (started) {
+        Expect(destroyer != caller, "kept object destruction ran on the recorder caller");
+        Expect(ordered, "kept object destruction preceded its guest write-back");
+    }
+    Expect(completedFuture.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout,
+        teardown ? "recorder teardown returned before destruction finished" : "the byte bound ignored objects being destroyed on the release thread");
+    allow.set_value();
+    worker.join();
+    if (failure) std::rethrow_exception(failure);
+    Expect(destroyed.load(std::memory_order_acquire), "kept object outlived the recorder");
+    Expect(mock.signaled.empty(), "recorder leaked mock Vulkan fences");
 }
 
-int main() {
+void BackgroundForcedRelease() {
+    mock = MockDevice{};
+    const auto caller = std::this_thread::get_id();
+    std::thread::id destroyer;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(mockContext());
+        recorder.Keep(std::shared_ptr<int>(new int(0), [&](int* value) {
+            destroyer = std::this_thread::get_id();
+            delete value;
+        }), 3 * Budget);
+        recorder.BoundKeptBytes();
+        Expect(recorder.InFlightKeptBytes() == 0, "oversized completed batch remains in flight");
+    }
+    Expect(destroyer != std::thread::id{} && destroyer != caller, "forced budget retirement destroyed objects on the recorder caller");
+}
+
+}
+
+int main(int argc, char** argv) {
     try {
 #if defined(ANYPS5_AFTERMATH_TESTING)
         aftermathRecorderReleaseTest();
         std::puts("Aftermath capture precedes failed recorder batch release");
         return 0;
 #endif
-        OpenBatchUnderBudget();
-        InFlightWithinTwiceTheBudget();
-        SyncedWithinTwiceTheBudget();
-        CountFollowsEveryPath();
-        SharedOwnerCountsOncePerBatch();
+        if (argc == 2 && std::string_view(argv[1]) == "background") {
+            BackgroundRelease(false);
+            BackgroundRelease(true);
+            BackgroundForcedRelease();
+        } else {
+            OpenBatchUnderBudget();
+            InFlightWithinTwiceTheBudget();
+            SyncedWithinTwiceTheBudget();
+            CountFollowsEveryPath();
+            SharedOwnerCountsOncePerBatch();
+        }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
