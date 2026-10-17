@@ -95,6 +95,7 @@ public:
         const auto owned = std::make_shared<Section>(duplicate);
         if (RunViews()) {
             const auto end = cursor + bytes;
+            timer.Step(MemoryLockProbe::MapStep::Split);
             timer.Step(MemoryLockProbe::MapStep::MapView);
             if (!map(section, GetCurrentProcess(), address, offset, bytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map a run of shared guest pages");
             timer.Step(MemoryLockProbe::MapStep::QueryCommit);
