@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -64,8 +65,7 @@ public:
                 cursor += size;
             } else {
                 if (memory.State != MEM_COMMIT) throw std::runtime_error("guest memory is not committed");
-                const auto mapped = views.find(cursor & ~(pageBytes - 1));
-                if (mapped != views.end()) {
+                for (auto mapped = views.lower_bound(cursor & ~(pageBytes - 1)); mapped != views.end() && mapped->first < stop; ++mapped) {
                     mapped->second.protection = protection;
                     mapped->second.armed = 0;
                     invalidate(*mapped->second.page);
@@ -93,6 +93,38 @@ public:
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) fail("keep shared guest section");
         const auto owned = std::make_shared<Section>(duplicate);
+        if (RunViews()) {
+            const auto end = cursor + bytes;
+            timer.Step(MemoryLockProbe::MapStep::MapView);
+            if (!map(section, GetCurrentProcess(), address, offset, bytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map a run of shared guest pages");
+            timer.Step(MemoryLockProbe::MapStep::QueryCommit);
+            for (auto at = cursor; at < end;) {
+                const auto memory = query(at);
+                const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                if (memory.State == MEM_RESERVE && !VirtualAlloc(reinterpret_cast<void*>(at), stop - at, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit a run of shared guest pages");
+                at = stop;
+            }
+            timer.Step(MemoryLockProbe::MapStep::Protect);
+            DWORD previous;
+            if (!VirtualProtect(address, bytes, protection, &previous)) fail("protect a run of shared guest pages");
+            timer.Step(MemoryLockProbe::MapStep::Bookkeeping);
+            for (std::size_t done = 0; done < bytes; done += pageBytes) {
+                const auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done);
+                auto shared = physical[key].lock();
+                if (!shared) {
+                    shared = std::make_shared<SharedPage>();
+                    physical[key] = shared;
+                }
+                const auto base = cursor + done;
+                shared->aliases.push_back(base);
+                views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0});
+                remember(freshRanges, base, base + pageBytes);
+                invalidate(*shared);
+                timer.PageDone();
+            }
+            runs.emplace(cursor, Run{bytes, owned, offset});
+            return;
+        }
         const bool lean = LeanMap();
         for (std::size_t done = 0; done < bytes; done += pageBytes) {
             timer.Step(MemoryLockProbe::MapStep::Split);
@@ -171,6 +203,25 @@ public:
         invalidate(*view.page, written);
         protectSubpages(base, written, view.protection, "resume shared memory write");
         view.armed &= static_cast<std::uint8_t>(~written);
+        return true;
+    }
+
+    bool HandleTransition(std::uintptr_t address) {
+        if (transitionOwner.load() == GetCurrentThreadId()) return false;
+        bool recent = false;
+        for (std::size_t slot = 0; slot < transitionSlots && !recent; ++slot) recent = transitionFrom[slot].load() <= address && address < transitionTo[slot].load();
+        if (!recent) return false;
+        thread_local std::uintptr_t lastAddress = 0;
+        thread_local int repeats = 0;
+        if (address != lastAddress) {
+            lastAddress = address;
+            repeats = 0;
+        }
+        if (++repeats > 8) {
+            repeats = 0;
+            return false;
+        }
+        MemoryLockProbe::Lock lock(mutex, "transition-fault", 1);
         return true;
     }
 
@@ -557,6 +608,7 @@ private:
 
     void reset(std::uintptr_t address, std::size_t bytes) {
         const auto end = address + bytes;
+        if (!runs.empty()) splitRuns(address, end);
         forgetClean(address, end);
         for (auto cursor = address; cursor < end;) {
             const auto memory = query(cursor);
@@ -574,12 +626,8 @@ private:
             if (allocationEnd > end || query(allocationEnd).AllocationBase == memory.AllocationBase) throw std::runtime_error("guest release truncates a host allocation");
             if (memory.Type == MEM_MAPPED) {
                 if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(cursor), MEM_PRESERVE_PLACEHOLDER)) fail("unmap shared guest page");
-                const auto found = views.find(cursor);
-                if (found != views.end()) {
-                    std::erase(found->second.page->aliases, cursor);
-                    views.erase(found);
-                    forget(freshRanges, cursor, cursor + pageBytes);
-                }
+                for (auto page = cursor; page < allocationEnd; page += pageBytes) forgetView(page);
+                runs.erase(cursor);
             } else if (memory.Type == MEM_PRIVATE) {
                 if (!VirtualFree(reinterpret_cast<void*>(cursor), allocationEnd - cursor, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release private guest memory");
             } else {
@@ -593,6 +641,85 @@ private:
         const auto first = query(address);
         split(address, std::min(bytes, reinterpret_cast<std::uintptr_t>(first.BaseAddress) + first.RegionSize - address));
         if (query(address).RegionSize != bytes && !VirtualFree(reinterpret_cast<void*>(address), bytes, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) fail("coalesce guest placeholders");
+    }
+
+    static bool RunViews() {
+        static const bool enabled = [] {
+            const char* text = std::getenv("APS5_RUN_GUEST_VIEWS");
+            return text != nullptr && std::string_view(text) == "1";
+        }();
+        return enabled;
+    }
+
+    struct Run {
+        std::size_t bytes;
+        std::shared_ptr<Section> section;
+        std::uint64_t offset;
+    };
+
+    struct Transition {
+        WindowsMappings& owner;
+        Transition(WindowsMappings& owner, std::uintptr_t from, std::uintptr_t to) : owner(owner) {
+            const auto slot = owner.transitionNext.fetch_add(1) % transitionSlots;
+            owner.transitionTo[slot].store(0);
+            owner.transitionFrom[slot].store(from);
+            owner.transitionTo[slot].store(to);
+            owner.transitionOwner.store(GetCurrentThreadId());
+        }
+        ~Transition() { owner.transitionOwner.store(0); }
+        Transition(const Transition&) = delete;
+        Transition& operator=(const Transition&) = delete;
+    };
+
+    void forgetView(std::uintptr_t page) {
+        const auto found = views.find(page);
+        if (found == views.end()) return;
+        std::erase(found->second.page->aliases, page);
+        views.erase(found);
+        forget(freshRanges, page, page + pageBytes);
+    }
+
+    void splitRuns(std::uintptr_t address, std::uintptr_t end) {
+        std::vector<std::pair<std::uintptr_t, Run>> partial;
+        auto it = runs.upper_bound(address);
+        if (it != runs.begin()) --it;
+        for (; it != runs.end() && it->first < end; ++it) {
+            const auto runEnd = it->first + it->second.bytes;
+            if (runEnd <= address || (it->first >= address && runEnd <= end)) continue;
+            partial.emplace_back(*it);
+        }
+        for (const auto& [base, run] : partial) splitRun(base, run, address, end);
+    }
+
+    void splitRun(std::uintptr_t base, const Run& run, std::uintptr_t address, std::uintptr_t end) {
+        const auto runEnd = base + run.bytes;
+        const auto cutFrom = std::max(base, address);
+        const auto cutTo = std::min(runEnd, end);
+        const Transition transition(*this, base, runEnd);
+        if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER)) fail("unmap a shared guest run to split it");
+        runs.erase(base);
+        remapPiece(base, cutFrom, run.section, run.offset);
+        remapPiece(cutTo, runEnd, run.section, run.offset + (cutTo - base));
+        for (auto page = cutFrom; page < cutTo; page += pageBytes) forgetView(page);
+    }
+
+    void remapPiece(std::uintptr_t from, std::uintptr_t to, const std::shared_ptr<Section>& section, std::uint64_t offset) {
+        if (from >= to) return;
+        split(from, to - from);
+        if (!map(section->handle, GetCurrentProcess(), reinterpret_cast<void*>(from), offset, to - from, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("remap a kept part of a shared guest run");
+        for (auto page = from; page < to;) {
+            const auto protection = views.at(page).protection;
+            auto stop = page + pageBytes;
+            while (stop < to && views.at(stop).protection == protection) stop += pageBytes;
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(page), stop - page, protection, &previous)) fail("restore kept shared guest pages");
+            for (auto armed = page; armed < stop; armed += pageBytes) {
+                const auto& view = views.at(armed);
+                if (view.armed != 0) protectSubpages(armed, view.armed, protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY, "re-arm a kept shared guest page");
+            }
+            page = stop;
+        }
+        runs.emplace(from, Run{to - from, section, offset});
     }
 
     void* mapAliasRuns(std::uintptr_t address, std::size_t bytes) {
@@ -636,6 +763,12 @@ private:
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::map<std::uintptr_t, std::size_t> splitAliases;
+    std::map<std::uintptr_t, Run> runs;
+    static constexpr std::size_t transitionSlots = 16;
+    std::array<std::atomic<std::uintptr_t>, transitionSlots> transitionFrom{};
+    std::array<std::atomic<std::uintptr_t>, transitionSlots> transitionTo{};
+    std::atomic<std::size_t> transitionNext{0};
+    std::atomic<DWORD> transitionOwner{0};
     MemoryLockProbe::Mutex mutex;
     MemoryLockProbe::MapProbe mapProbe;
     AllocateFunction allocate = nullptr;

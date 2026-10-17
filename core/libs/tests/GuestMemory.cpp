@@ -1150,6 +1150,63 @@ static void CheckAliasAcrossDirectAllocations() {
     Require(sceKernelReleaseDirectMemory(first, page * 3) == 0);
 }
 
+static void CheckSharedRunSplitKeepsNeighbours() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t pages = 8;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * pages, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, page * pages, 3, 0, phys, 0) == 0);
+    auto* bytes = static_cast<volatile unsigned char*>(mapped);
+    for (std::size_t index = 0; index < pages; ++index) bytes[page * index + 7] = static_cast<unsigned char>(0x21 + index);
+    Require(sceKernelMunmap(const_cast<unsigned char*>(bytes) + page * 3, page * 2) == 0);
+    for (const std::size_t index : {0u, 1u, 2u, 5u, 6u, 7u}) Require(bytes[page * index + 7] == 0x21 + index);
+    bytes[page * 6 + 9] = 0x66;
+    void* again = const_cast<unsigned char*>(bytes) + page * 3;
+    Require(sceKernelMapDirectMemory(&again, page * 2, 3, 0x10, phys + static_cast<std::int64_t>(page * 3), 0) == 0 && again == const_cast<unsigned char*>(bytes) + page * 3);
+    for (std::size_t index = 0; index < pages; ++index) Require(bytes[page * index + 7] == 0x21 + index);
+    Require(bytes[page * 6 + 9] == 0x66);
+    Require(sceKernelMunmap(mapped, page * pages) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page * pages) == 0);
+}
+
+static void CheckReadsDuringSharedRunSplits() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t runs = 64;
+    for (int round = 0; round < 4; ++round) {
+        std::int64_t phys = 0;
+        Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2 * runs, 0, 0, &phys) == 0);
+        std::array<volatile unsigned char*, runs> first{};
+        for (std::size_t index = 0; index < runs; ++index) {
+            void* mapped = nullptr;
+            Require(sceKernelMapDirectMemory(&mapped, page * 2, 3, 0, phys + static_cast<std::int64_t>(page * 2 * index), 0) == 0);
+            first[index] = static_cast<volatile unsigned char*>(mapped);
+            first[index][0] = static_cast<unsigned char>(index + 1);
+            first[index][page] = 0x5a;
+        }
+        std::atomic<bool> stop{false};
+        std::atomic<bool> wrong{false};
+        std::atomic<std::uint64_t> reads{0};
+        std::vector<std::thread> readers;
+        for (int thread = 0; thread < 4; ++thread) readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                for (std::size_t index = 0; index < runs; ++index) {
+                    if (first[index][0] != static_cast<unsigned char>(index + 1)) wrong = true;
+                }
+                reads.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        for (std::size_t index = 0; index < runs; ++index) Require(sceKernelMunmap(const_cast<unsigned char*>(first[index]) + page, page) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        stop = true;
+        for (auto& reader : readers) reader.join();
+        Require(!wrong && reads.load() != 0);
+        for (std::size_t index = 0; index < runs; ++index) Require(sceKernelMunmap(const_cast<unsigned char*>(first[index]), page) == 0);
+        Require(sceKernelReleaseDirectMemory(phys, page * 2 * runs) == 0);
+    }
+}
+
 static void CheckAliasRefusesPagesThatAreNotSharedViews() {
     constexpr std::size_t page = 0x4000;
     std::int64_t phys = 0;
@@ -2339,6 +2396,8 @@ int main() {
     CheckAliasAcrossDirectAllocations();
     CheckAliasOfReorderedSharedPages();
     CheckAliasRefusesPagesThatAreNotSharedViews();
+    CheckSharedRunSplitKeepsNeighbours();
+    CheckReadsDuringSharedRunSplits();
 #endif
     CheckUnhintedKernelMappingsLandInTheWindow();
 #if defined(__linux__)
