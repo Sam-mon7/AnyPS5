@@ -45,6 +45,7 @@ struct HostImport {
     bool joined = false;
     std::shared_ptr<void> chunk;
     mutable std::uint64_t lastUse = 0;
+    std::shared_ptr<void> backingLifetime;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -188,6 +189,17 @@ struct MirrorStats {
     std::uint64_t sparseBinds = 0;
 };
 MirrorStats MirrorCounters();
+struct VramDescriptorStats {
+    std::uint64_t mirrorRegions = 0;
+    std::uint64_t gpuCopies = 0;
+    std::uint64_t importedRegions = 0;
+    std::uint64_t cpuCopies = 0;
+    std::uint64_t referenceBytes = 0;
+    std::uint64_t resultBytes = 0;
+    std::uint64_t writeBackBytes = 0;
+    std::uint64_t writeBackUs = 0;
+};
+VramDescriptorStats VramDescriptorCounters();
 void ClearSnapshotCopies(VkDevice device);
 std::vector<std::uint64_t> AddressTableKey(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const ShaderRecompiler::BdaAbi::Range> own);
 void ClearImageMirrors(VkDevice device);
@@ -279,7 +291,7 @@ public:
     void RecordCopyBacks(Recorder& recorder);
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
-    bool HoldsLease() const { return !lease.empty() || space != nullptr; }
+    bool HoldsLease() const { return !lease.empty() || space != nullptr || std::any_of(regions.begin(), regions.end(), [](const auto& region) { return region.mirrorLease != nullptr || !region.mirrorPieces.empty(); }); }
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
         for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
@@ -303,6 +315,12 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
 
 private:
+    struct MirrorPiece {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::shared_ptr<ImageMirror> mirror;
+        std::shared_ptr<const GuestAllocations::Range> lease;
+    };
     struct Region {
         std::uint64_t begin;
         std::uint64_t end;
@@ -329,6 +347,8 @@ private:
         // Set when the region is served by an image mirror: nothing is copied; writable mirrors are
         // written back by comparing with the mirror's shadow. Kept alive here for recorded work.
         std::shared_ptr<ImageMirror> mirror {};
+        std::shared_ptr<const GuestAllocations::Range> mirrorLease;
+        std::vector<MirrorPiece> mirrorPieces;
         // The mirror is a descriptor sub-range one found by UploadPrepare (not a lease mirror), which
         // UploadFinish confirms still has its Range before the region binds it.
         bool subrangeMirror = false;
@@ -405,6 +425,9 @@ private:
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
     void takeHeapReferences();
+    void recordMirrorResults(Recorder* recorder);
+    void holdMirror(const std::shared_ptr<ImageMirror>& mirror);
+    void releaseMirrorUses();
     Context context;
     bool stagingAllowed = false;
     bool adjustedRegions = false;
@@ -424,6 +447,16 @@ private:
     bool regionsSorted = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
+    struct MirrorReadback {
+        std::uint64_t begin;
+        std::size_t bytes;
+        std::shared_ptr<ImageMirror> mirror;
+        std::shared_ptr<Buffer> reference;
+        std::shared_ptr<Buffer> result;
+        bool recorded = false;
+    };
+    std::vector<MirrorReadback> mirrorReadbacks;
+    std::vector<std::shared_ptr<ImageMirror>> mirrorUses;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;
