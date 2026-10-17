@@ -133,6 +133,9 @@ struct TextureCache {
     std::chrono::steady_clock::time_point passedSince{};
     std::uint64_t firstUsesPresent = 0;
     std::unordered_set<TextureKey, TextureKeyHash> firstUses;
+    // Snapshot buffers kept for reuse by size (APS5_TEXTURE_SNAPSHOT_POOL_MIB), and their capacity.
+    std::multimap<std::size_t, std::vector<std::byte>> spareSnapshots;
+    std::uint64_t spareBytes = 0;
     struct Counts {
         std::uint64_t inserted = 0;
         std::uint64_t uncached = 0;
@@ -140,6 +143,9 @@ struct TextureCache {
         std::uint64_t passed = 0;
         std::uint64_t stale = 0;
         std::uint64_t resnapshots = 0;
+        std::uint64_t snapshotsMade = 0;
+        std::uint64_t snapshotBytesMade = 0;
+        std::uint64_t snapshotsReused = 0;
     } counts;
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
     VkPhysicalDevice budgetDevice = VK_NULL_HANDLE;
@@ -295,6 +301,53 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
     return cache.entries.end();
 }
 
+// APS5_TEXTURE_SNAPSHOT_POOL_MIB=<n> keeps up to n MiB of the snapshot buffers of erased, released or
+// uncached textures and gives them to the next snapshots they can hold. A new snapshot is otherwise a
+// fresh allocation that is zero-filled and then overwritten: every page is a demand-zero fault, taken
+// under the GPU lock, and with little free RAM each fault trims the whole process first.
+std::uint64_t snapshotPoolBudget() {
+    static const std::uint64_t budget = [] {
+        const char* text = std::getenv("APS5_TEXTURE_SNAPSHOT_POOL_MIB");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) << 20u : 0u;
+    }();
+    return budget;
+}
+
+// A buffer of `bytes` for a snapshot: a spare one that holds them in at most twice the space, else a
+// new one. A spare buffer keeps an older texture's bytes; the snapshot reads overwrite all of them but
+// a fill's tail shorter than one texel, which a new buffer has zeroed.
+std::vector<std::byte> takeSnapshot(TextureCache& cache, std::size_t bytes) {
+    ++cache.counts.snapshotsMade;
+    cache.counts.snapshotBytesMade += bytes;
+    if (snapshotPoolBudget() != 0 && bytes != 0) {
+        if (const auto it = cache.spareSnapshots.lower_bound(bytes); it != cache.spareSnapshots.end() && it->first / 2u <= bytes) {
+            auto snapshot = std::move(it->second);
+            cache.spareBytes -= snapshot.capacity();
+            cache.spareSnapshots.erase(it);
+            snapshot.resize(bytes);
+            const auto tail = std::min<std::size_t>(bytes, 16u);
+            std::memset(snapshot.data() + bytes - tail, 0, tail);
+            ++cache.counts.snapshotsReused;
+            return snapshot;
+        }
+    }
+    return std::vector<std::byte>(bytes);
+}
+
+// Keeps a snapshot buffer for reuse while the pool has room, dropping the largest spares to make it.
+void spareSnapshot(TextureCache& cache, std::vector<std::byte>&& snapshot) {
+    const auto budget = snapshotPoolBudget();
+    if (budget == 0 || snapshot.capacity() < (64u << 10u) || snapshot.capacity() > budget) return;
+    while (cache.spareBytes + snapshot.capacity() > budget && !cache.spareSnapshots.empty()) {
+        const auto largest = std::prev(cache.spareSnapshots.end());
+        cache.spareBytes -= largest->second.capacity();
+        cache.spareSnapshots.erase(largest);
+    }
+    cache.spareBytes += snapshot.capacity();
+    const auto size = snapshot.size();
+    cache.spareSnapshots.emplace(size, std::move(snapshot));
+}
+
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     if (TableReuseAcrossEpochs()) evictTableTexture(it->texture);
     cache.bytes -= it->accounted;
@@ -309,6 +362,7 @@ void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
         }
     }
     if (it->texture.use_count() > 1) noteReleased(it->texture);
+    spareSnapshot(cache, std::move(it->bytes));
     cache.index.erase(it->key);
     cache.entries.erase(it);
     ++cache.erasures;
@@ -372,15 +426,25 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
     return true;
 }
 
+// APS5_TEXTURE_CACHE_REPORT=1 prints the [texture-cache], [texture-snapshots] and [textures] lines
+// every 10 s without the rest of APS5_PROFILE_DRAW's profiling.
+bool textureCacheReport() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_TEXTURE_CACHE_REPORT");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || textureCacheReport();
     if (!profile) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - cache.countsReported < std::chrono::seconds(10)) return;
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
-    AgcDriver::ProfilePrint_nid_no_patch("[texture-snapshots] cache CPU bytes: %llu retained, %llu omitted; %llu resnapshots after failed proof (10 s)\n", static_cast<unsigned long long>(cache.snapshotBytes), static_cast<unsigned long long>(cache.omittedSnapshotBytes), static_cast<unsigned long long>(counts.resnapshots));
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-snapshots] cache CPU bytes: %llu retained, %llu omitted; %llu resnapshots after failed proof; %llu snapshots made (%llu MiB), %llu of them in reused buffers, %llu MiB spare (10 s)\n", static_cast<unsigned long long>(cache.snapshotBytes), static_cast<unsigned long long>(cache.omittedSnapshotBytes), static_cast<unsigned long long>(counts.resnapshots), static_cast<unsigned long long>(counts.snapshotsMade), static_cast<unsigned long long>(counts.snapshotBytesMade >> 20u), static_cast<unsigned long long>(counts.snapshotsReused), static_cast<unsigned long long>(cache.spareBytes >> 20u));
 }
 
 struct ImageMemoEntry {
@@ -459,7 +523,7 @@ TextureCounters& TextureCounts() {
 }
 
 void reportTextureCounters() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || textureCacheReport();
     if (!profile) return;
     auto& counters = TextureCounts();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -830,7 +894,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, bytes, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, snapshotGeneration};
+    CachedTexture entry{key, address, bytes, source != nullptr ? std::vector<std::byte>() : takeSnapshot(cache, bytes), nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
     if (source != nullptr) {
         entry.source = source;
@@ -854,7 +918,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
-        if (releaseSnapshots && snapshotGeneration != 0 && resource.dccAddress == 0 && *keys == DccKeys::Uncompressed) std::vector<std::byte>().swap(entry.bytes);
+        if (releaseSnapshots && snapshotGeneration != 0 && resource.dccAddress == 0 && *keys == DccKeys::Uncompressed) spareSnapshot(cache, std::exchange(entry.bytes, {}));
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
@@ -862,6 +926,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto texture = entry.texture;
     if (!admitTexture(cache, key, entry.accounted, budget)) {
         noteReleased(texture);
+        spareSnapshot(cache, std::move(entry.bytes));
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budget);
         reportTextureCounters();
