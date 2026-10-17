@@ -10,6 +10,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -163,9 +164,14 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         return output;
     };
     dispatch(true, [&] { static_cast<volatile std::uint8_t*>(raw)[8] = 0x55; });
+    const auto* vramValue = std::getenv("APS5_VRAM_MIRRORS");
+    const bool vramMirrors = vramValue != nullptr && std::strcmp(vramValue, "1") == 0;
     if (resident && RebarMirrors()) {
         if (context.RebarMemoryType(UINT32_MAX) && RebarMemory().limit >= liveBefore + 2 * block) Require(RebarMemory().live.load() >= liveBefore + 2 * block, "resident heap was not allocated in budgeted ReBAR memory");
         if (RebarMemory().limit == 0) Require(RebarMemory().overBudget.load() > fallbackBefore, "resident heap did not fall back when the ReBAR budget was full");
+    } else if (vramMirrors && !sparse) {
+        if (context.RebarMemoryType(UINT32_MAX) && RebarMemory().limit >= liveBefore + 2 * block) Require(RebarMemory().allocations.load() > rebarBefore, "a heap mirror was not placed in ReBAR memory with APS5_VRAM_MIRRORS");
+        if (RebarMemory().limit == 0) Require(RebarMemory().overBudget.load() > fallbackBefore, "a heap mirror did not fall back to host memory when the ReBAR budget was full");
     } else Require(RebarMemory().allocations.load() == rebarBefore, "sparse or nonresident heap allocated ReBAR memory");
     const bool synchronousPublished = std::memcmp(raw, values.data(), sizeof(values)) == 0;
     const bool synchronousCpuPreserved = static_cast<std::uint8_t*>(raw)[8] == 0x55;
