@@ -1846,7 +1846,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                         const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
                         const bool read = element < binding.bufferRead.size() && binding.bufferRead[element];
-                        const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic, read);
+                        const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic, read, shader.stage, binding.binding, element);
                         const auto& push = shader.program->pushConstants;
                         if (!push.empty()) {
                             const auto position = shader.program->memoryOffsetDword * 4u + element;
@@ -3567,11 +3567,16 @@ DescriptorCache::Stats DescriptorCache::Counters() const {
     return stats;
 }
 
-std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read) {
+std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read, ShaderRecompiler::ShaderStage stage, std::uint32_t binding, std::uint32_t element) {
     Require(words.size() == 4, "buffer descriptor must contain four DWORDs");
     Require((words[1] & 0x40000000u) == 0, "buffer descriptor has reserved bits set");
     const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
-    Require(descriptor.Type() == 0u, "buffer descriptor uses an unsupported type");
+    if (descriptor.Type() != 0u) {
+        if (std::getenv("APS5_TRACE_BAD_DESCRIPTORS") != nullptr) {
+            std::fprintf(stderr, "[bad-buffer-descriptor] site=resources stage=%u binding=%u element=%u type=%u words=%08x %08x %08x %08x\n", static_cast<unsigned>(stage), binding, element, static_cast<unsigned>(descriptor.Type()), words[0], words[1], words[2], words[3]);
+        }
+        Require(false, "buffer descriptor uses an unsupported type");
+    }
     const auto address = descriptor.Base48();
     const auto byteSize = descriptor.GetSize();
     if (byteSize == 0 || address == 0) {

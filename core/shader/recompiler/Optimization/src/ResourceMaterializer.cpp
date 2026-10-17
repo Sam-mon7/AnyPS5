@@ -891,7 +891,12 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
 void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot) {
     for (std::uint32_t i = 0u; i < plan.info.buffers.size(); ++i) {
         const auto decoded = decodeBufferDescriptor(snapshot.buffers.at(i));
-        if (decoded.Type() != 0u) throw std::runtime_error("buffer descriptor uses an unsupported type");
+        if (decoded.Type() != 0u) {
+            if (std::getenv("APS5_TRACE_BAD_DESCRIPTORS") != nullptr) {
+                std::fprintf(stderr, "[bad-buffer-descriptor] site=materialize ir-stage=%u buffer=%u type=%u words=%08x %08x %08x %08x\n", static_cast<unsigned>(plan.stage), i, static_cast<unsigned>(decoded.Type()), decoded.fields[0], decoded.fields[1], decoded.fields[2], decoded.fields[3]);
+            }
+            throw std::runtime_error("buffer descriptor uses an unsupported type");
+        }
         if (plan.stage != IrShaderStage::Compute && decoded.AddTid()) throw std::runtime_error("buffer ADD_TID is only valid for compute shaders");
     }
     if (snapshot.flattenedSrt.size() != plan.srtReads.size()) throw std::runtime_error("runtime SRT size differs from the static interface");
