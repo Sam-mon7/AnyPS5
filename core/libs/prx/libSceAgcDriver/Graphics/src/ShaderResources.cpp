@@ -436,6 +436,15 @@ bool textureCacheReport() {
     return enabled;
 }
 
+// The report alone prints straight to stderr: the profile writer starts a thread that APS5_PROFILE_DRAW
+// runs keep, and that the process then waits on at exit.
+template<typename... TArgs>
+void reportPrint(const char* format, TArgs... args) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) AgcDriver::ProfilePrint_nid_no_patch(format, args...);
+    else std::fprintf(stderr, format, args...);
+}
+
 void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || textureCacheReport();
     if (!profile) return;
@@ -443,8 +452,8 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     if (now - cache.countsReported < std::chrono::seconds(10)) return;
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
-    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
-    AgcDriver::ProfilePrint_nid_no_patch("[texture-snapshots] cache CPU bytes: %llu retained, %llu omitted; %llu resnapshots after failed proof; %llu snapshots made (%llu MiB), %llu of them in reused buffers, %llu MiB spare (10 s)\n", static_cast<unsigned long long>(cache.snapshotBytes), static_cast<unsigned long long>(cache.omittedSnapshotBytes), static_cast<unsigned long long>(counts.resnapshots), static_cast<unsigned long long>(counts.snapshotsMade), static_cast<unsigned long long>(counts.snapshotBytesMade >> 20u), static_cast<unsigned long long>(counts.snapshotsReused), static_cast<unsigned long long>(cache.spareBytes >> 20u));
+    reportPrint("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
+    reportPrint("[texture-snapshots] cache CPU bytes: %llu retained, %llu omitted; %llu resnapshots after failed proof; %llu snapshots made (%llu MiB), %llu of them in reused buffers, %llu MiB spare (10 s)\n", static_cast<unsigned long long>(cache.snapshotBytes), static_cast<unsigned long long>(cache.omittedSnapshotBytes), static_cast<unsigned long long>(counts.resnapshots), static_cast<unsigned long long>(counts.snapshotsMade), static_cast<unsigned long long>(counts.snapshotBytesMade >> 20u), static_cast<unsigned long long>(counts.snapshotsReused), static_cast<unsigned long long>(cache.spareBytes >> 20u));
 }
 
 struct ImageMemoEntry {
@@ -530,7 +539,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved));
+    reportPrint("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
