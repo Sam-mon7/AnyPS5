@@ -1324,3 +1324,59 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
 endif()
+
+if(BUILD_TESTING AND WIN32)
+    add_test_executable(guest_short_sleeps_tests ${LIBS_INCLUDE_DIR}/tests/GuestShortSleeps.cpp)
+    target_include_directories(guest_short_sleeps_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_short_sleeps_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_short_sleeps_tests)
+    foreach(shortSleeps IN ITEMS off on)
+        foreach(coarseWaits IN ITEMS off on)
+            set(shortSleepTest guest_short_sleeps_${shortSleeps}_coarse_${coarseWaits})
+            add_test(NAME ${shortSleepTest} COMMAND guest_short_sleeps_tests ${shortSleeps})
+            set_tests_properties(${shortSleepTest} PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+            if(shortSleeps STREQUAL "on")
+                set_property(TEST ${shortSleepTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_REAL_SHORT_SLEEPS=set:1")
+            else()
+                set_property(TEST ${shortSleepTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_REAL_SHORT_SLEEPS=unset:")
+            endif()
+            if(coarseWaits STREQUAL "on")
+                set_property(TEST ${shortSleepTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_COARSE_TIMED_WAITS=set:1")
+            else()
+                set_property(TEST ${shortSleepTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_COARSE_TIMED_WAITS=unset:")
+            endif()
+        endforeach()
+    endforeach()
+    foreach(shortSleepRegression IN ITEMS
+            guest_nanosleep guest_cond_timedwait guest_cond_recursive_mutex guest_cond_unowned_mutex
+            guest_getitimer guest_itimer guest_sigtimedwait guest_semaphore guest_event_flag guest_kqueue
+            guest_raise_nested_sleep guest_mutex_raise_exception
+            guest_pthread_barrier guest_pthread_spin guest_pthread_getname guest_pthread_attr
+            guest_pthread_schedparam guest_pthread_mutexattr guest_pthread_mutex_errors guest_pthread_start
+            guest_pthread_attr_errors guest_pthread_stack guest_pthread_sem guest_pthread_cancel
+            guest_pthread_cancel_recovery guest_pthread_rwlock guest_pthread_join_self guest_pthread_key
+            guest_pthread_destructor_lifetime guest_pthread_atfork guest_pthread_rename)
+        set(shortSleepTest guest_real_short_sleeps_${shortSleepRegression})
+        add_test(NAME ${shortSleepTest} COMMAND ${shortSleepRegression}_tests)
+        get_test_property(${shortSleepRegression} TIMEOUT shortSleepTimeout)
+        if(NOT shortSleepTimeout)
+            set(shortSleepTimeout 30)
+        endif()
+        set_tests_properties(${shortSleepTest} PROPERTIES TIMEOUT ${shortSleepTimeout} ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>;APS5_REAL_SHORT_SLEEPS=set:1;APS5_COARSE_TIMED_WAITS=unset:")
+        get_test_property(${shortSleepRegression} RUN_SERIAL shortSleepSerial)
+        if(shortSleepSerial)
+            set_property(TEST ${shortSleepTest} PROPERTY RUN_SERIAL TRUE)
+        endif()
+    endforeach()
+    add_test(NAME guest_real_short_sleeps_guest_equeue_events COMMAND guest_equeue_event_tests)
+    set_tests_properties(guest_real_short_sleeps_guest_equeue_events PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
+        "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>;APS5_REAL_SHORT_SLEEPS=set:1;APS5_COARSE_TIMED_WAITS=unset:")
+    foreach(shortSleepRegression IN ITEMS guest_nanosleep guest_raise_nested_sleep guest_pthread_cancel guest_pthread_cancel_recovery)
+        set(shortSleepTest guest_real_short_sleeps_coarse_${shortSleepRegression})
+        add_test(NAME ${shortSleepTest} COMMAND ${shortSleepRegression}_tests)
+        set_tests_properties(${shortSleepTest} PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>;APS5_REAL_SHORT_SLEEPS=set:1;APS5_COARSE_TIMED_WAITS=set:1")
+    endforeach()
+endif()
