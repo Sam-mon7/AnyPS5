@@ -9,12 +9,14 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <map>
 #include <memory>
 #include <vector>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 namespace GuestArena {
@@ -91,22 +93,28 @@ public:
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) fail("keep shared guest section");
         const auto owned = std::make_shared<Section>(duplicate);
+        const bool lean = LeanMap();
         for (std::size_t done = 0; done < bytes; done += pageBytes) {
             timer.Step(MemoryLockProbe::MapStep::Split);
-            split(cursor + done, pageBytes);
             void* page = reinterpret_cast<void*>(cursor + done);
+            if (!lean) split(cursor + done, pageBytes);
+            else if (done + pageBytes < bytes && !VirtualFree(page, pageBytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("split guest placeholder suffix");
             timer.Step(MemoryLockProbe::MapStep::MapView);
             if (!map(section, GetCurrentProcess(), page, offset + done, pageBytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map shared guest page");
             timer.Step(MemoryLockProbe::MapStep::QueryCommit);
-            MEMORY_BASIC_INFORMATION memory{};
-            if (VirtualQuery(page, &memory, sizeof(memory)) != sizeof(memory)) fail("query shared guest page");
-            if (memory.State == MEM_RESERVE && !VirtualAlloc(page, pageBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
+            const auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done);
+            std::shared_ptr<SharedPage> shared;
+            if (lean) shared = physical[key].lock();
+            if (!shared) {
+                MEMORY_BASIC_INFORMATION memory{};
+                if (VirtualQuery(page, &memory, sizeof(memory)) != sizeof(memory)) fail("query shared guest page");
+                if (memory.State == MEM_RESERVE && !VirtualAlloc(page, pageBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
+            }
             DWORD previous;
             timer.Step(MemoryLockProbe::MapStep::Protect);
             if (!VirtualProtect(page, pageBytes, protection, &previous)) fail("protect shared guest page");
             timer.Step(MemoryLockProbe::MapStep::Bookkeeping);
-            const auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done);
-            auto shared = physical[key].lock();
+            if (!lean) shared = physical[key].lock();
             if (!shared) {
                 shared = std::make_shared<SharedPage>();
                 physical[key] = shared;
@@ -514,6 +522,14 @@ private:
         unmap = reinterpret_cast<UnmapFunction>(GetProcAddress(module, "UnmapViewOfFile2"));
         if (!allocate || !map || !unmap) throw std::runtime_error("Windows placeholder memory APIs are required");
         compare = reinterpret_cast<CompareFunction>(GetProcAddress(module, "CompareObjectHandles"));
+    }
+
+    static bool LeanMap() {
+        static const bool enabled = [] {
+            const char* text = std::getenv("APS5_LEAN_GUEST_MAP");
+            return text != nullptr && std::string_view(text) == "1";
+        }();
+        return enabled;
     }
 
     [[noreturn]] static void fail(const char* operation) {
