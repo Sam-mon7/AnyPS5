@@ -1162,6 +1162,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_RESULT_MEMO",
     "APS5_PREPARED_SHADER_MIB",
+    "APS5_SPIRV_IN_MEMORY",
 };
 
 constexpr std::string_view VertexStageSwitches[] = {

@@ -91,7 +91,11 @@ struct SharedSpirv::Storage {
 SharedSpirv::SharedSpirv(std::vector<std::uint32_t> source) {
     auto storage = std::make_shared<Storage>();
     const auto* enabled = std::getenv("APS5_FILE_BACKED_SPIRV");
-    if (enabled != nullptr && std::string_view(enabled) == "1" && source.size() >= 16384u) storage->Back(source);
+    static const bool inMemory = [] {
+        const auto* value = std::getenv("APS5_SPIRV_IN_MEMORY");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    if (!inMemory && enabled != nullptr && std::string_view(enabled) == "1" && source.size() >= 16384u) storage->Back(source);
     else storage->values = std::move(source);
     words = std::move(storage);
 }
