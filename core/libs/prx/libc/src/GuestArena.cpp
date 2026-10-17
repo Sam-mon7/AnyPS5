@@ -338,6 +338,46 @@ bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* pro
     return WindowsMappings::Get().Protection(address, protection);
 }
 
+void GuestArenaSetGpuPageFault_nid_no_patch(bool (*callback)(std::uintptr_t, bool)) {
+    WindowsMappings::Get().SetGpuPageFault(callback);
+}
+
+bool GuestArenaCanProtectGpuAccess_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().CanProtectGpuAccess(address, bytes);
+}
+
+bool GuestArenaProtectGpuAccess_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().ProtectGpuAccess(address, bytes);
+}
+
+bool GuestArenaHasGpuOverlay_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().HasGpuOverlay(address, bytes);
+}
+
+bool GuestArenaArmGpuWriteWatch_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().ArmGpuWriteWatch(address, bytes);
+}
+
+void GuestArenaDisarmGpuWriteWatch_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().DisarmGpuWriteWatch(address, bytes);
+}
+
+bool GuestArenaPublishGpuPage_nid_no_patch(std::uintptr_t address, const void* gpu, const void* firstCpuBase) {
+    return WindowsMappings::Get().PublishGpuPage(address, gpu, firstCpuBase);
+}
+
+bool GuestArenaGpuOverlayProtection_nid_no_patch(std::uintptr_t address, std::uint32_t* protection, bool* pending) {
+    return WindowsMappings::Get().GpuOverlayProtection(address, protection, pending);
+}
+
+bool GuestArenaApplyGpuProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
+    return WindowsMappings::Get().ApplyGpuProtection(address, bytes, protection);
+}
+
+bool GuestArenaVisitGpuAliases_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool (*visitor)(std::uintptr_t, std::size_t, void*), void* context) {
+    return WindowsMappings::Get().VisitGpuAliases(address, bytes, visitor, context);
+}
+
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear);
 }
@@ -378,7 +418,11 @@ void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
 
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("shared mapping", pointer, bytes);
+    const auto generation = WindowsMappings::Get().TracksGpuAccess() ? commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1 : 0;
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection);
+    if (generation != 0) {
+        if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes, generation);
+    }
 }
 
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) {

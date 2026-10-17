@@ -120,6 +120,7 @@ static int munmap_release(void* addr) {
 static int mprotect(void* addr, size_t len, int prot) {
     GuestArena::GuestArenaSetProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(addr), len, WinProtFromPosix(prot));
     if (prot != PROT_NONE && KernelArena::Get().Contains(addr, len)) CommitArenaRange(addr, len, WinProtFromPosix(prot));
+    if (KernelArena::Get().Contains(addr, len) && GuestArena::GuestArenaApplyGpuProtection_nid_no_patch(reinterpret_cast<std::uintptr_t>(addr), len, WinProtFromPosix(prot))) return 0;
     auto cursor = reinterpret_cast<std::uintptr_t>(addr);
     const auto end = cursor + len;
     while (cursor < end) {

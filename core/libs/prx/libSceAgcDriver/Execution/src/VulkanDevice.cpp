@@ -1969,6 +1969,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
     if (Graphics::PendingStorageOverlaps(address, bytes.size(), nullptr)) return 3;
     auto& recorder = *state->recorder;
+    if (Graphics::VramWritable() && Graphics::HasVramMirrorWriters()) return 2;
     // Batches that already finished are retired before the checks: their completions ran, so they
     // neither keep the recorder busy nor force this label behind a completion. Only for the
     // graphics worker: a reap runs completions (copied write-backs, whose guest stores can re-enter
@@ -2036,6 +2037,7 @@ bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirs
 
 bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     if (!state->recorder) return false;
+    if (Graphics::VramWritable() && Graphics::HasVramMirrorWriters()) return false;
     auto& recorder = *state->recorder;
     constexpr std::size_t bytes = 15 * 16 + 8;
     if (OpportunisticReap()) recorder.Reap();
@@ -4098,6 +4100,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
+    resources.BeginGpuWrites(recorder);
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
@@ -4219,6 +4222,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
         if (resources.HasCopiedWrites()) writers->push_back(kept);
     }
+    resources.ReadyForSubmit(recorder);
     recordStep(PhaseRecordCompletion);
 }
 

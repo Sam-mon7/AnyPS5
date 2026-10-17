@@ -1516,6 +1516,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
         else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
     }
+    resources->ReadyForSubmit(recorder);
     for (const auto& resident : residents) {
         if (resident != nullptr) resident->MarkDirty();
     }
@@ -1732,6 +1733,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory, inputs.inPlaceReads};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    resources.BeginGpuWrites(*recorder);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
@@ -2313,6 +2315,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
+    if (recorded) resources->BeginGpuWrites(*recorder);
     if (recorded) recorder->PrepareSampleSlot();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
@@ -2474,6 +2477,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     {
         // The recorder sync SubmitAndWait makes is the draw's own wait, not a nested hook wait.
         const auto ownBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
+        resources->SealForSubmit(&*batch);
         batch->SubmitAndWait();
         if (!stencilReferences.empty()) resources->CheckFaults();
         if (profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;

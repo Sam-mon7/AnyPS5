@@ -448,7 +448,7 @@ VkImageView RenderTarget::View() const {
     return view;
 }
 
-CommandBatch::CommandBatch(const Context& context) : context(context) {
+CommandBatch::CommandBatch(const Context& context, Mode mode) : context(context), mode(mode) {
     // Records into the device's one command pool and submits to its queue: device-lock work only.
     GuestMemory::AssertGpuLockHeld("CommandBatch");
     try {
@@ -463,7 +463,7 @@ CommandBatch::CommandBatch(const Context& context) : context(context) {
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer");
         // Work recorded so far goes first in queue order, so this batch sees its results.
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Submit();
+        if (auto* recorder = Recorder::Active(); mode == Mode::Default && recorder != nullptr && recorder->Recording()) recorder->Submit();
     } catch (...) {
         release();
         throw;
@@ -494,6 +494,11 @@ void CommandBatch::SubmitAndWait() {
     Wait();
 }
 
+std::shared_ptr<const bool> CommandBatch::TrackSubmission() {
+    if (submissionState == nullptr) submissionState = std::make_shared<bool>(submitted);
+    return submissionState;
+}
+
 void CommandBatch::Submit() {
     PerformanceTimer timing("Graphics.Submit");
     Require(!submitted, "command batch has already been submitted");
@@ -506,6 +511,7 @@ void CommandBatch::Submit() {
     timing.Mark("queue_submit");
     pending = true;
     submitted = true;
+    if (submissionState != nullptr) *submissionState = true;
 }
 
 void CommandBatch::Wait() {
@@ -517,7 +523,7 @@ void CommandBatch::Wait() {
     if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST) pending = false;
     Check(result, "vkWaitForFences graphics");
     // Recorded batches preceded this one, so their completions (write-backs) can run now.
-    if (auto* recorder = Recorder::Active()) recorder->Reap();
+    if (auto* recorder = Recorder::Active(); mode == Mode::Default && recorder != nullptr) recorder->Reap();
 }
 
 }

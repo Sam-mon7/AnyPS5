@@ -111,6 +111,7 @@ public:
     static bool SnapshotRingEnabled();
     SnapshotSlice AllocateDrawSnapshot(std::size_t bytes);
     void OnComplete(std::function<void()> action);
+    std::size_t CompletionCount() const { return open != nullptr ? open->completions.size() : 0; }
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).

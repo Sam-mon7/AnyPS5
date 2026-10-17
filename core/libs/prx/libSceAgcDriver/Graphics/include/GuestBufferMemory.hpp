@@ -89,7 +89,10 @@ std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
+struct MirrorWriteInterval;
 class Recorder;
+void SealVramMirrorSubmission(Recorder& recorder);
+void RetireVramMirrorRecorder(Recorder& recorder) noexcept;
 
 template<typename TRange>
 void OverlappedRanges(std::span<const TRange> sorted, std::size_t first, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::vector<std::size_t>& indices) {
@@ -200,6 +203,18 @@ struct VramDescriptorStats {
     std::uint64_t writeBackUs = 0;
 };
 VramDescriptorStats VramDescriptorCounters();
+struct VramWritableStats {
+    std::uint64_t pagesWritten = 0;
+    std::uint64_t pagesMerged = 0;
+    std::uint64_t overflowFallbacks = 0;
+    std::uint64_t readbackBytes = 0;
+    std::uint64_t writeBackUs = 0;
+    std::uint64_t basePages = 0;
+    std::uint64_t pendingPages = 0;
+    std::uint64_t faults = 0;
+};
+VramWritableStats VramWritableCounters();
+bool HasVramMirrorWriters();
 void ClearSnapshotCopies(VkDevice device);
 std::vector<std::uint64_t> AddressTableKey(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const ShaderRecompiler::BdaAbi::Range> own);
 void ClearImageMirrors(VkDevice device);
@@ -218,6 +233,9 @@ public:
     explicit GuestBufferMemory(const Context& context);
     ~GuestBufferMemory();
     void AcquireRegistered();
+    void SetAddressWrites(bool value) { addressWrites = value; }
+    void QueueBdaWrites(std::uint64_t address, std::size_t bytes) const;
+    void QueueBdaOverflow() const;
     // APS5_PROFILE_DRAW: the parts of one address-based build ([address] line every 10 s): the
     // registry lease, the imports pass, the mirror preparation and the mirror compare (blocks and
     // copied blocks) are timed by AcquireRegistered on the calling thread; the caller adds the
@@ -289,6 +307,9 @@ public:
     // regions was recorded (ShaderResources::MarkGpuWrites), under GuestMemory::GpuMutex. A use that
     // never calls it (a synchronous draw) stores the staging bytes from the CPU in WriteBack.
     void RecordCopyBacks(Recorder& recorder);
+    void BeginGpuWrites(Recorder& recorder);
+    void ReadyForSubmit(Recorder& recorder);
+    void SealForSubmit(CommandBatch* batch = nullptr);
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr || std::any_of(regions.begin(), regions.end(), [](const auto& region) { return region.mirrorLease != nullptr || !region.mirrorPieces.empty(); }); }
@@ -428,9 +449,15 @@ private:
     void recordMirrorResults(Recorder* recorder);
     void holdMirror(const std::shared_ptr<ImageMirror>& mirror);
     void releaseMirrorUses();
+    void prepareMirrorWrites(bool addressable);
+    void recordMirrorWrites(Recorder* recorder);
+    void completeMirrorWrites();
     Context context;
     bool stagingAllowed = false;
     bool adjustedRegions = false;
+    bool addressWrites = true;
+    bool synchronousWrites = false;
+    std::shared_ptr<const bool> synchronousSubmission;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).
@@ -457,6 +484,7 @@ private:
     };
     std::vector<MirrorReadback> mirrorReadbacks;
     std::vector<std::shared_ptr<ImageMirror>> mirrorUses;
+    std::vector<std::pair<std::shared_ptr<ImageMirror>, std::shared_ptr<MirrorWriteInterval>>> mirrorWrites;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;

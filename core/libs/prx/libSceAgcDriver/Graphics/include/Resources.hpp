@@ -110,7 +110,8 @@ private:
 
 class CommandBatch {
 public:
-    explicit CommandBatch(const Context& context);
+    enum class Mode { Default, Independent };
+    explicit CommandBatch(const Context& context, Mode mode = Mode::Default);
     ~CommandBatch();
     CommandBatch(const CommandBatch&) = delete;
     CommandBatch& operator=(const CommandBatch&) = delete;
@@ -118,14 +119,17 @@ public:
     void SubmitAndWait();
     void Submit();
     void Wait();
+    std::shared_ptr<const bool> TrackSubmission();
 
 private:
     void release() noexcept;
     Context context;
+    Mode mode;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool pending = false;
     bool submitted = false;
+    std::shared_ptr<bool> submissionState;
 };
 
 }
