@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DispatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FragmentBarycentric.hpp"
@@ -4564,6 +4565,19 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         recipe->needsCompletion = resources->NeedsCompletion();
         recipe->holdsLease = resources->HoldsLease();
         *recipeOut = std::move(recipe);
+        DispatchCoverage::Note(DispatchCoverage::Built);
+    } else if (DispatchCoverage::Enabled()) {
+        using namespace DispatchCoverage;
+        if (recipeOut == nullptr) Note(BuildNoDestination);
+        else if (!DispatchRecipes()) Note(BuildDisabled);
+        else if (!cacheable) Note(BuildUncacheable);
+        else if (resources->UsesAddressTable()) Note(BuildBda);
+        else if (resources->HoldsLease()) Note(BuildLease);
+        else if (resources->HasCopiedWrites()) Note(BuildCopiedWrites);
+        else if (!resources->Reusable()) Note(BuildNotReusable);
+        else if (resources->NeedsCompletion()) Note(BuildCompletion);
+        else if (objects == nullptr) Note(BuildNoObjects);
+        else Note(BuildEmptyKey);
     }
     timer.finish(lookupsBefore, groupsText, indirect);
     return outcome;

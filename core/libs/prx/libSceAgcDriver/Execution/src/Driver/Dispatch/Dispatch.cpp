@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DispatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -265,6 +266,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     timing.Mark("decode_key_device_setup");
     bool readsClear = false;
     if (pipelineCandidate) {
+        DispatchCoverage::Note(DispatchCoverage::Candidate);
         std::vector<ShaderRecompiler::MemoryRegion> reads;
         bool entryFound = false;
         {
@@ -276,11 +278,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         if (!entryFound || noDispatchCache || stampValidate()) {
             NoteItemFallback(ItemFallback::Miss);
+            DispatchCoverage::Note(DispatchCoverage::InitialMiss);
         } else if (verifyDataHits()) {
             NoteItemFallback(ItemFallback::Verify);
+            DispatchCoverage::Note(DispatchCoverage::InitialVerify);
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
-            if (!readsClear) NoteItemFallback(ItemFallback::Reads);
+            if (!readsClear) {
+                NoteItemFallback(ItemFallback::Reads);
+                DispatchCoverage::Note(DispatchCoverage::InitialReads);
+            }
         }
         if (!readsClear) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     }
@@ -311,9 +318,27 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
             pipelined = bounded;
-            if (!bounded) NoteItemFallback(ItemFallback::Writes);
+            if (!bounded) {
+                NoteItemFallback(ItemFallback::Writes);
+                DispatchCoverage::Note(DispatchCoverage::RecipeUnbounded);
+            }
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
+            if (DispatchCoverage::Enabled()) {
+                using namespace DispatchCoverage;
+                if (!cached) Note(LookupNotCached);
+                else if (keepVariant == nullptr) Note(LookupNoVariant);
+                else {
+                    Note(HitNoRecipe);
+                    const auto hasRole = [&](ShaderRecompiler::DescriptorRole role) {
+                        return std::any_of(compiledResult->bindings.begin(), compiledResult->bindings.end(), [&](const auto& binding) { return binding.role == role; });
+                    };
+                    if (compiledResult->bdaAbiVersion != 0 || hasRole(ShaderRecompiler::DescriptorRole::BdaPagetable)) Note(HitNoRecipeBda);
+                    else if (hasRole(ShaderRecompiler::DescriptorRole::FaultBuffer)) Note(HitNoRecipeFault);
+                    else if (hasRole(ShaderRecompiler::DescriptorRole::Gds)) Note(HitNoRecipeGds);
+                    else Note(HitNoRecipeOther);
+                }
+            }
         }
         if (!pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     }
@@ -438,6 +463,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto filledKeys = keysFill ? FilledKeys(keysFill->pattern) : Graphics::DccKeys::Mixed;
 
     if (pipelined) {
+        DispatchCoverage::Note(DispatchCoverage::Pipelined);
         const auto recipe = keepVariant->recipe.load(std::memory_order_acquire);
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
@@ -498,6 +524,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }
         }, std::move(itemWrites));
         ReportDispatchItems(profile);
+        DispatchCoverage::Report();
         return;
     }
 
@@ -509,6 +536,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     std::shared_ptr<const Recipe> builtRecipe;
     auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+    if (DispatchCoverage::Enabled()) {
+        using namespace DispatchCoverage;
+        Note(attachTo != nullptr ? AttachVariant : stampValidate() ? AttachStamp : !CacheableResult(compiled) ? AttachPoison : AttachMissing);
+    }
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
@@ -601,6 +632,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         pending.tailAt = phaseLap;
     }
     if (profile && ++dispatches % 100 == 0) AgcDriver::ProfilePrint_nid_no_patch( "[gpu] %llu dispatches (%llu dispatch cache hits, %llu evictions, %llu recompile cache hits): capture %.1f s, cache key %.1f s, recompile %.1f s, device %.1f s\n", static_cast<unsigned long long>(dispatches), static_cast<unsigned long long>(dispatchCacheHits), static_cast<unsigned long long>(dispatchCacheEvictions), static_cast<unsigned long long>(cacheHits), captureMs / 1000, keyMs / 1000, recompileMs / 1000, deviceMs / 1000);
+    DispatchCoverage::Report();
 }
 
 }
