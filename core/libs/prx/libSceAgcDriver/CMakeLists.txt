@@ -2498,6 +2498,25 @@ if(BUILD_TESTING AND WIN32)
         ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_WRITABLE=1;APS5_RESIDENT_HEAP_MIRRORS=0"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
     set_property(TEST agc_vram_writable_heap_fallback APPEND PROPERTY ENVIRONMENT "APS5_REBAR_MIB=0")
+    foreach(vramDeferredMode IN ITEMS off on)
+        add_test(NAME agc_vram_deferred_${vramDeferredMode} COMMAND agc_driver_recorder_tests --vram-deferred-only)
+        set_tests_properties(agc_vram_deferred_${vramDeferredMode} PROPERTIES TIMEOUT 60
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_WRITABLE=1;APS5_VRAM_DEFERRED=0;APS5_RESIDENT_HEAP_MIRRORS=0"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
+    endforeach()
+    set_property(TEST agc_vram_deferred_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DEFERRED=set:1")
+    add_test(NAME agc_vram_deferred_recorder COMMAND agc_driver_recorder_tests --vram-writable-recorder-only)
+    add_test(NAME agc_vram_deferred_graphics COMMAND agc_driver_graphics_tests --vram-writable-bda)
+    add_test(NAME agc_vram_deferred_bda_device COMMAND agc_driver_bda_device_tests)
+    add_test(NAME agc_vram_deferred_storage_refresh COMMAND agc_driver_recorder_tests --storage-refresh-only)
+    add_test(NAME agc_vram_deferred_write_tracking COMMAND agc_write_tracking_tests)
+    add_test(NAME agc_vram_deferred_label COMMAND agc_driver_vram_writable_label_tests)
+    add_test(NAME agc_vram_deferred_draw COMMAND agc_driver_draw_offset_indices_tests --vram-writable-sync)
+    set_tests_properties(agc_vram_deferred_recorder agc_vram_deferred_graphics agc_vram_deferred_bda_device agc_vram_deferred_storage_refresh agc_vram_deferred_write_tracking agc_vram_deferred_label agc_vram_deferred_draw
+        PROPERTIES TIMEOUT 180 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_WRITABLE=1;APS5_VRAM_DEFERRED=1;APS5_RESIDENT_HEAP_MIRRORS=0"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
+    set_property(TEST agc_vram_deferred_draw APPEND PROPERTY ENVIRONMENT "APS5_SYNC_DRAWS=1")
 endif()
 
 add_test_executable(agc_vram_options_tests EXCLUDE_FROM_ALL tests/VramOptions.cpp)
@@ -2517,6 +2536,9 @@ if(BUILD_TESTING)
     set_property(TEST agc_vram_options_descriptors_requires_mirrors APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DESCRIPTORS=set:1")
     set_property(TEST agc_vram_options_descriptors_resident_conflict APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_RESIDENT_HEAP_MIRRORS=set:1")
     add_test(NAME agc_vram_options_writable_requires_descriptors COMMAND agc_vram_options_tests "APS5_VRAM_WRITABLE requires APS5_VRAM_DESCRIPTORS=1")
+    add_test(NAME agc_vram_options_deferred_requires_writable COMMAND agc_vram_options_tests "APS5_VRAM_DEFERRED requires APS5_VRAM_WRITABLE=1")
+    set_tests_properties(agc_vram_options_deferred_requires_writable PROPERTIES ENVIRONMENT_MODIFICATION
+        "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_DEFERRED=set:1;APS5_RESIDENT_HEAP_MIRRORS=unset:")
     set_tests_properties(agc_vram_options_writable_requires_descriptors PROPERTIES ENVIRONMENT_MODIFICATION
         "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=unset:;APS5_VRAM_WRITABLE=set:1;APS5_VRAM_DEFERRED=unset:;APS5_RESIDENT_HEAP_MIRRORS=unset:")
     if(WIN32)

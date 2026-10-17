@@ -576,6 +576,11 @@ void RunVramWritableTests(const AgcDriver::Graphics::Context& device, AgcDriver:
             }
             Require(recorder.Submissions() == unsubmitted, "pre-submit CPU writes unexpectedly submitted the GPU work");
             recorder.Sync();
+            if (VramDeferred()) {
+                const auto pending = VramWritableCounters();
+                Require(pending.pendingPages == armed.pendingPages + 1 && pending.readbackBytes == armed.readbackBytes, "deferred completion eagerly published a BDA page");
+                Require(*static_cast<volatile std::uint32_t*>(raw) == values[0], "deferred BDA page missed its native read fault");
+            }
             const auto merged = VramWritableCounters();
             Require(merged.pagesWritten == armed.pagesWritten + 1 && merged.pagesMerged == armed.pagesMerged + 1 && merged.readbackBytes >= armed.readbackBytes + page, "written-page decoding did not publish and merge the one GPU-written page");
             Require(std::memcmp(raw, values.data(), sizeof(values)) == 0 && guest[8] == 0x61 && guest[9] == 0x62, "first-fault merge lost GPU stores or either CPU store");
@@ -638,9 +643,14 @@ void RunVramWritableTests(const AgcDriver::Graphics::Context& device, AgcDriver:
             Require(reader.address == writer.address && completions == completed && MirrorCounters().blocksCopied == copied, "GPU reader replaced or synchronized a clean writable mirror");
             recorder.Sync();
             Require(std::memcmp(reader.output->Bytes().data(), values.data(), sizeof(values)) == 0, "GPU reader lost the preceding mirror writer");
+            if (VramDeferred()) FlushHeapMirrorWrites(base, 2 * block, true);
             const auto overflowBefore = VramWritableCounters();
             const auto overflow = dispatch(base, true, false, true);
             recorder.Sync();
+            if (VramDeferred()) {
+                Require(VramWritableCounters().pendingPages == overflowBefore.pendingPages + 2 * block / page, "overflow did not retain every writable page");
+                FlushHeapMirrorWrites(base, 2 * block, true);
+            }
             const auto overflowAfter = VramWritableCounters();
             Require(overflowAfter.overflowFallbacks == overflowBefore.overflowFallbacks + 1 && overflowAfter.pagesWritten == overflowBefore.pagesWritten + 2 * block / page, "written-page overflow did not publish exactly the writable mirror set");
             Require(*reinterpret_cast<volatile std::uint32_t*>(base + block) == 0x76543210u && guest[2 * block] == 0x11, "overflow publication lost a writable mirror or changed a read-only mirror");
@@ -692,6 +702,96 @@ void RunVramWritableTests(const AgcDriver::Graphics::Context& device, AgcDriver:
         GuestArena::GuestArenaRelease_nid_postfix(raw, bytes);
         if (section != nullptr) CloseHandle(section);
     }
-    std::cout << "VRAM writable eager coherence tests passed\n";
+    std::cout << "VRAM writable coherence tests passed\n";
+#endif
+}
+
+void RunVramDeferredTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder) {
+#ifdef _WIN32
+    using namespace AgcDriver::Graphics;
+    namespace Memory = AgcDriver::GuestMemory;
+    Require(VramWritable(), "deferred publication tests require writable mirrors");
+    constexpr std::size_t bytes = 65536;
+    constexpr std::size_t page = 4096;
+    void* raw = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
+    void* alias = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot create deferred publication memory");
+    GuestArena::GuestArenaMap_nid_postfix(raw, bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(alias, bytes, section, 0, PAGE_READWRITE);
+    const auto base = reinterpret_cast<std::uint64_t>(raw);
+    auto* native = static_cast<volatile std::uint8_t*>(alias);
+    GuestAllocations::Mutation().Add(raw, bytes, true, true, true);
+    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+        std::memset(raw, 0x11, bytes);
+        Memory::BumpCollectEpoch();
+        const auto before = VramWritableCounters();
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AcquireRegistered();
+        memory->AddWritable(base, sizeof(std::uint32_t));
+        memory->AddWritable(base + 2 * page, sizeof(std::uint32_t));
+        memory->Upload(true);
+        memory->BeginGpuWrites(recorder);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        for (const auto offset : {0u, 2u * static_cast<unsigned>(page)}) {
+            std::uint32_t adjustment = 0;
+            const auto view = memory->Descriptor(base + offset, sizeof(std::uint32_t), adjustment);
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + adjustment, sizeof(std::uint32_t), 0x76543210u + offset);
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT);
+        memory->RecordCopyBacks(recorder);
+        recorder.Keep(memory);
+        recorder.OnComplete([memory] { memory->WriteBack(); });
+        memory->ReadyForSubmit(recorder);
+        if (scenario == 1) native[2 * page + 8] = 0x69;
+        recorder.Sync();
+        memory.reset();
+        recorder.FlushDeferredReleases();
+        const auto completed = VramWritableCounters();
+        Require(!HasVramMirrorWriters(), "completed deferred pages retained an in-flight writer");
+        if (VramDeferred()) Require(completed.pendingPages == before.pendingPages + 2 && completed.readbackBytes == before.readbackBytes, "deferred completion did not retain exactly the two written pages");
+        else Require(completed.pendingPages == before.pendingPages && completed.readbackBytes == before.readbackBytes + 2 * page, "disabled deferred mode did not publish eagerly");
+        MEMORY_BASIC_INFORMATION protection{};
+        Require(VirtualQuery(static_cast<std::uint8_t*>(alias) + page, &protection, sizeof(protection)) == sizeof(protection) && protection.Protect != PAGE_NOACCESS && native[page] == 0x11, "an unwritten candidate page stayed inaccessible");
+        if (scenario == 0) {
+            const auto submissions = recorder.Submissions();
+            GuestBufferMemory reader(context);
+            reader.SetAddressWrites(false);
+            reader.AcquireRegistered();
+            reader.Upload(true);
+            reader.WriteBack();
+            Require(recorder.Submissions() == submissions && VramWritableCounters().pendingPages == completed.pendingPages && VramWritableCounters().readbackBytes == completed.readbackBytes, "a clean GPU consumer published deferred CPU pages");
+        }
+        if (scenario < 2) {
+            {
+                std::lock_guard recursive(Memory::GpuMutex());
+                Require(*static_cast<volatile std::uint32_t*>(alias) == 0x76543210u, "native read did not publish the first deferred page");
+            }
+            const auto first = VramWritableCounters();
+            if (VramDeferred()) Require(first.pendingPages == before.pendingPages + 1 && first.readbackBytes == before.readbackBytes + page, "one native read published another dirty page");
+            std::array<std::byte, sizeof(std::uint32_t)> readback{};
+            Memory::Read(base + 2 * page, readback);
+            std::uint32_t result = 0;
+            std::memcpy(&result, readback.data(), sizeof(result));
+            Require(result == 0x76545210u && native[2 * page + 8] == (scenario == 1 ? 0x69 : 0x11), "deferred merge lost GPU or disjoint CPU bytes");
+        } else if (scenario == 2) {
+            FlushHeapMirrorWrites(base, sizeof(std::uint32_t), true);
+        } else {
+            GuestAllocations::Mutation().Remove(raw);
+            GuestAllocations::Mutation().Add(raw, bytes, true, true, true);
+        }
+        Require(VramWritableCounters().pendingPages == before.pendingPages && !GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(base, bytes), "publication or retirement retained protected pages");
+        Require(*static_cast<volatile std::uint32_t*>(alias) == 0x76543210u && *reinterpret_cast<volatile std::uint32_t*>(static_cast<std::uint8_t*>(alias) + 2 * page) == 0x76545210u, "retirement lost a deferred GPU result");
+    }
+    GuestAllocations::Mutation().Remove(raw);
+    ClearImageMirrors(context.device);
+    ClearHostImports(context.device);
+    for (auto* mapping : {raw, alias}) {
+        GuestArena::GuestArenaReset_nid_postfix(mapping, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(mapping, bytes);
+    }
+    CloseHandle(section);
+    std::cout << "VRAM deferred publication tests passed\n";
 #endif
 }
