@@ -204,6 +204,10 @@ VkBuffer Buffer::Handle() const {
     return buffer;
 }
 
+bool Buffer::DeviceLocal() const {
+    return memoryType < context.memory.memoryTypeCount && (context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+}
+
 std::span<std::byte> Buffer::Bytes() {
     static const bool check = [] { const auto* value = std::getenv("APS5_REBAR_CHECK"); return value != nullptr && std::strcmp(value, "1") == 0; }();
     Require(!check || !uploadOnly, "CPU read of an upload-only buffer");

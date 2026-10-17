@@ -2447,6 +2447,13 @@ if(BUILD_TESTING AND WIN32)
         endif()
     endforeach()
     set_property(TEST agc_rebar_mirrors_fallback APPEND PROPERTY ENVIRONMENT "APS5_REBAR_MIB=0")
+    add_test(NAME agc_vram_mirrors_recorder COMMAND agc_driver_recorder_tests)
+    add_test(NAME agc_vram_mirrors_heap COMMAND agc_driver_recorder_tests --resident-heap-only)
+    add_test(NAME agc_vram_mirrors_heap_fallback COMMAND agc_driver_recorder_tests --resident-heap-only)
+    add_test(NAME agc_vram_mirrors_bda_device COMMAND agc_driver_bda_device_tests)
+    set_tests_properties(agc_vram_mirrors_recorder agc_vram_mirrors_heap agc_vram_mirrors_heap_fallback agc_vram_mirrors_bda_device PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_RESIDENT_HEAP_MIRRORS=unset:")
+    set_property(TEST agc_vram_mirrors_heap_fallback APPEND PROPERTY ENVIRONMENT "APS5_REBAR_MIB=0")
 endif()
 
 if(BUILD_TESTING)

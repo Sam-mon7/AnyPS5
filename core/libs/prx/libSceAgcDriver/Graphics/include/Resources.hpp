@@ -24,6 +24,7 @@ public:
     std::size_t Size() const { return size; }
     bool UploadOnly() const { return uploadOnly; }
     bool Mapped() const { return mapping != nullptr; }
+    bool DeviceLocal() const;
     void Invalidate();
 
 private:
