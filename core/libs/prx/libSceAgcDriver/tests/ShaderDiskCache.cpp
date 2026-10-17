@@ -103,6 +103,7 @@ void requireSameArtifact(const CompiledShaderArtifact& left, const CompiledShade
 void requireSameResult(const RecompileResult& left, const RecompileResult& right, const char* what) {
     requireSameArtifact(left, right, what);
     const std::string prefix = std::string(what) + ": ";
+    require(left.bdaWrites == right.bdaWrites, prefix + "BDA write metadata differs");
     require(sameBindings(left.bindings, right.bindings), prefix + "bindings differ");
     require(left.pushConstants == right.pushConstants, prefix + "push constants differ");
     require(left.specialization == right.specialization, prefix + "specialization constants differ");
@@ -280,6 +281,7 @@ CompiledVariant sampleVariant() {
     info.info.vertexOffsetSgpr = 6;
     info.info.hasBitwiseXor = true;
     info.info.usesDma = true;
+    info.info.bdaWrites = true;
     info.info.usesFaultBuffer = true;
     info.info.rasterPrimitive = true;
     info.info.layerExported = true;
@@ -340,6 +342,11 @@ void verifyResultRoundTrip() {
     require(ShaderDiskCache::DecodeResult(bytes, decoded), "an encoded result does not decode");
     requireSameResult(result, decoded, "result round trip");
     require(decoded.variantId == 0 && !decoded.cacheHit, "the per-process fields were stored");
+    auto runtimeOnly = result;
+    runtimeOnly.bdaWrites = true;
+    std::vector<std::byte> runtimeBytes;
+    ShaderDiskCache::EncodeResult(runtimeOnly, runtimeBytes);
+    require(runtimeBytes == bytes, "runtime BDA write metadata changed the serialized result");
     for (std::size_t size = 0; size < bytes.size(); size += size < 256 ? 1 : 97) {
         RecompileResult partial;
         require(!ShaderDiskCache::DecodeResult(std::span(bytes).first(size), partial), "a result truncated to " + std::to_string(size) + " bytes decodes");

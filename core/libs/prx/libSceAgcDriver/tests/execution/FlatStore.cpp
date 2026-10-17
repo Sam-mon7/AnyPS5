@@ -135,6 +135,7 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const std
     };
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
+    Require(result.bdaWrites, "flat store lost its runtime BDA write metadata");
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
 }

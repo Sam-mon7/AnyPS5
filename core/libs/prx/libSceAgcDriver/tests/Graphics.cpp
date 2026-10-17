@@ -6212,6 +6212,26 @@ int main(int argc, char** argv) {
             std::cout << "sparse buffer hole tests " << (passed ? "passed" : "failed") << '\n';
             return passed ? 0 : 1;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--vram-writable-bda") {
+            auto context = mockContext();
+            context.bufferDeviceAddress = true;
+            context.limits.maxStorageBufferRange = 1u << 27;
+            RunVramWritableBdaResourceTests(context, {
+                [](VkBuffer buffer) -> std::span<std::byte> { return mockBufferMemory(buffer); }, {},
+                [](VkDeviceAddress address) {
+                    const auto offset = address - 0x100000000000ULL;
+                    const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
+                    return mockBufferMemory(buffer).subspan(offset % 0x10000);
+                },
+                [](std::optional<VkDeviceSize> headroom) {
+                    mock.memoryLimit = headroom.has_value() ? std::optional<VkDeviceSize>(mock.allocatedBytes + *headroom) : std::nullopt;
+                },
+                [] { return mock.allocationAttempts; }
+            });
+            Require(mock.live == 0, "writable VRAM graphics tests leaked Vulkan objects");
+            std::cout << "writable VRAM graphics tests passed\n";
+            return 0;
+        }
         {
             AgcDriver::Graphics::PipelineCacheSynchronization synchronization;
             auto pipelineUse = synchronization.LockForPipelineUse();

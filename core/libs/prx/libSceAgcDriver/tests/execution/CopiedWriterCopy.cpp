@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
@@ -22,6 +24,12 @@
 #include <span>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+struct VulkanDeviceTestAccess {
+    static Graphics::Context Context(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+}
 
 namespace {
 
@@ -99,16 +107,48 @@ void RecordDispatch(AgcDriver::VulkanDevice& device, const GuestBlock& input, co
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
 }
 
+void CheckCopiedWriteRefusal(AgcDriver::Graphics::Context context) {
+    using namespace AgcDriver::Graphics;
+    context.hostImportAlignment = 0;
+    std::array<std::byte, 64> memory;
+    memory.fill(std::byte{Fill});
+    bool refused = false;
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    try {
+        GuestBufferMemory buffers(context);
+        buffers.AddWritable(reinterpret_cast<std::uintptr_t>(memory.data()), memory.size());
+        buffers.Upload(false);
+    } catch (const std::runtime_error& error) {
+        const std::string text(error.what());
+        if (text.find("requires shared protection or a coherent host import") == std::string::npos) throw;
+        refused = true;
+    }
+    Require(refused == VramWritable(), "copied writer: unsafe copied descriptor did not follow the writable switch");
+    Require(std::all_of(memory.begin(), memory.end(), [](std::byte value) { return value == std::byte{Fill}; }), "copied writer: refused preparation changed guest bytes");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        const bool writableCopy = argc == 2 && std::strcmp(argv[1], "--vram-writable-copy") == 0;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        const auto context = AgcDriver::VulkanDeviceTestAccess::Context(*device);
+        if (writableCopy) CheckCopiedWriteRefusal(context);
         const GuestBlock input;
         std::memset(input.Data(), 0, BlockBytes);
         const GuestBlock output;
         const GuestBlock destination;
+        if (writableCopy) {
+            for (const auto* block : {&input, &output, &destination}) {
+                const auto* imported = AgcDriver::Graphics::HostImportFor(context, block->Address(), BlockBytes);
+                if (imported == nullptr) {
+                    Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "copied writer: the focused coherent-import case requires host imports");
+                    return VulkanTestSkipped;
+                }
+            }
+        }
         RecordDispatch(*device, input, output);
         auto* recorder = AgcDriver::Graphics::Recorder::Active();
         Require(recorder != nullptr, "copied writer: no active recorder");
