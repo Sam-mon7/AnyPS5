@@ -105,6 +105,14 @@ public:
             publish();
         }
     }
+    Lock(Mutex& probe, std::try_to_lock_t, const char* operation)
+        : probe(probe), held(probe.mutex, std::try_to_lock), operation(operation), bytes(0) {
+        if (held.owns_lock() && Enabled()) {
+            started = Now();
+            exceptions = std::uncaught_exceptions();
+            publish();
+        }
+    }
     ~Lock() {
         if (!held.owns_lock() || !Enabled()) return;
         probe.version.fetch_add(1);
