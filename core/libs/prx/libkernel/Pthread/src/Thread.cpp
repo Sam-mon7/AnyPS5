@@ -4,6 +4,7 @@
 #include "../include/Cancel.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/Time/include/TimedWait.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include <algorithm>
@@ -893,6 +894,12 @@ Pthread APS5_VABI scePthreadSelf() {
 }
 
 void APS5_VABI scePthreadYield() {
+#ifdef _WIN32
+    if (TimedWait::RealShortSleeps()) {
+        if (SwitchToThread() == 0) Sleep(0);
+        return;
+    }
+#endif
     std::this_thread::yield();
 }
 

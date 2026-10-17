@@ -2,6 +2,7 @@
 #include "prx/libkernel/Pthread/include/WindowsThreadLocal.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 
 #ifdef _WIN32
@@ -265,6 +266,14 @@ bool Coarse() {
 #endif
 }
 
+bool RealShortSleeps() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_REAL_SHORT_SLEEPS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 std::uint64_t NowNanos() {
 #ifdef _WIN32
     static const std::uint64_t frequency = [] {
@@ -297,6 +306,13 @@ std::uint64_t RemainingMicros(std::uint64_t deadlineNanos) {
 void SleepUntil(std::uint64_t deadlineNanos) {
 #ifdef _WIN32
     std::uint64_t now = NowNanos();
+    if (RealShortSleeps()) {
+        while (now < deadlineNanos) {
+            if (!TimerWait(ThreadTimer(1), deadlineNanos - now)) AlertableSleep(WholeMilliseconds(deadlineNanos - now));
+            now = NowNanos();
+        }
+        return;
+    }
     if (deadlineNanos > now + LEAD_NANOS) {
         const HANDLE timer = ThreadTimer(1);
         if (!TimerWait(timer, deadlineNanos - now - LEAD_NANOS)) AlertableSleep(WholeMilliseconds(deadlineNanos - now - LEAD_NANOS));
@@ -326,6 +342,13 @@ void PollSleepUntil(std::uint64_t deadlineNanos) {
 void SleepNanos(std::uint64_t nanos) {
     if (nanos == 0) return;
 #ifdef _WIN32
+    if (RealShortSleeps()) {
+        const auto now = NowNanos();
+        const auto deadline = nanos > std::numeric_limits<std::uint64_t>::max() - now ? std::numeric_limits<std::uint64_t>::max() : now + nanos;
+        if (!TimerWait(ThreadTimer(0), nanos)) AlertableSleep(WholeMilliseconds(nanos));
+        SleepUntil(deadline);
+        return;
+    }
     if (Coarse()) {
         SleepNanosCoarse(nanos);
         return;
