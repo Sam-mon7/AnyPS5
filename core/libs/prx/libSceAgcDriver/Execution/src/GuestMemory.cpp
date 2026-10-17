@@ -1707,13 +1707,13 @@ GpuLockHolder GpuMutexType::Holder() const {
     for (int attempt = 0; attempt < 3; ++attempt) {
         const auto generation = probeGeneration.load();
         if ((generation & 1u) != 0) continue;
-        GpuLockHolder result{true, probeThread.load(), probeQueue.load(), probePresenter.load(), probeSinceNs.load()};
+        GpuLockHolder result{true, probeThread.load(), probeQueue.load(), probePresenter.load(), probeSinceNs.load(), probeSite.load()};
         if (generation == probeGeneration.load()) return result;
     }
     return {false};
 }
 
-void GpuMutexType::acquired() {
+void GpuMutexType::acquired(GpuLockSite site) {
     owner.store(ThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
@@ -1727,6 +1727,7 @@ void GpuMutexType::acquired() {
             probeThread.store(thread);
             probeQueue.store(LockStats().tag);
             probePresenter.store(LockStats().holderColumn == PresenterColumn);
+            probeSite.store(GpuLockSiteNames[static_cast<std::size_t>(site)]);
             probeSinceNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
             probeGeneration.fetch_add(1);
         }
@@ -1735,8 +1736,9 @@ void GpuMutexType::acquired() {
 
 bool GpuMutexType::try_lock() {
     if (!GpuLockProfiled()) {
+        const auto site = CompletionProbeEnabled() ? std::exchange(LockStats().nextSite, GpuLockSite::Other) : GpuLockSite::Other;
         if (!mutex.try_lock()) return false;
-        acquired();
+        acquired(site == GpuLockSite::Other ? GpuLockSite::Try : site);
         return true;
     }
     // The tag is consumed whether or not the try succeeds (a failed try must not name the next
@@ -1748,7 +1750,7 @@ bool GpuMutexType::try_lock() {
         ++stats.triesFailed;
         return false;
     }
-    acquired();
+    acquired(tagged == GpuLockSite::Other ? GpuLockSite::Try : tagged);
     if (depth == 1 && GpuHoldProfiled()) BeginHold(static_cast<std::size_t>(tagged == GpuLockSite::Other ? GpuLockSite::Try : tagged));
     return true;
 }
@@ -1774,6 +1776,7 @@ void GpuMutexType::unlock() {
         if (CompletionProbeEnabled()) {
             probeGeneration.fetch_add(1);
             probeThread.store(0);
+            probeSite.store("none");
             probeGeneration.fetch_add(1);
         }
     }
@@ -1804,17 +1807,17 @@ void AssertGpuLockHeld(const char* where) {
 void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
+        const auto site = CompletionProbeEnabled() || trace != nullptr ? std::exchange(LockStats().nextSite, GpuLockSite::Other) : GpuLockSite::Other;
         if (trace == nullptr) {
             mutex.lock();
         } else {
-            const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!mutex.try_lock()) {
                 const auto start = std::chrono::steady_clock::now();
                 mutex.lock();
-                trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
+                trace->Add("GpuMutex.wait", GpuLockSiteNames[static_cast<std::size_t>(site)], start, std::chrono::steady_clock::now());
             }
         }
-        acquired();
+        acquired(site);
         return;
     }
     auto& stats = LockStats();
@@ -1829,7 +1832,7 @@ void GpuMutexType::lock() {
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
         mutex.lock();
-        acquired();
+        acquired(static_cast<GpuLockSite>(site));
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
         if (holders) {
@@ -1899,13 +1902,12 @@ void GpuMutexType::lock() {
         stats.lockedGpuWaitMs = 0;
         return;
     }
-    acquired();
+    acquired(static_cast<GpuLockSite>(site));
     if (depth == 1 && GpuHoldProfiled()) BeginHold(site);
 }
 
 void TagGpuLockSite(GpuLockSite site) {
-    // Off the profiled path the tag is never read, so the thread-local is not touched either.
-    if (!GpuLockProfiled() && !PerformanceTrace::Recording()) return;
+    if (!GpuLockProfiled() && !PerformanceTrace::Recording() && !CompletionProbeEnabled()) return;
     LockStats().nextSite = site;
 }
 

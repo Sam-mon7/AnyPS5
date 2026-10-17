@@ -130,12 +130,14 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
 // waits in a [lock] line every 10 s (APS5_NO_LOCK_PROFILE=1 turns the timing off); a queue worker tags
 // its thread with TagGpuLockThread so the line names the queue.
 bool CompletionProbeEnabled();
+enum class GpuLockSite : std::uint8_t;
 struct GpuLockHolder {
     bool stable = true;
     std::uint64_t thread = 0;
     std::uint32_t queue = 0xffffffffu;
     bool presenter = false;
     std::uint64_t sinceNs = 0;
+    const char* site = "none";
 };
 class GpuMutexType {
 public:
@@ -152,7 +154,7 @@ public:
     GpuLockHolder Holder() const;
 
 private:
-    void acquired();
+    void acquired(GpuLockSite site);
     std::recursive_mutex mutex;
     // The holder's thread token and recursion depth, written by the holder only; another thread
     // reads the owner just to see that it is not itself.
@@ -163,6 +165,7 @@ private:
     std::atomic<std::uint32_t> probeQueue{0xffffffffu};
     std::atomic<bool> probePresenter{false};
     std::atomic<std::uint64_t> probeSinceNs{0};
+    std::atomic<const char*> probeSite{"none"};
 };
 GpuMutexType& GpuMutex();
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:

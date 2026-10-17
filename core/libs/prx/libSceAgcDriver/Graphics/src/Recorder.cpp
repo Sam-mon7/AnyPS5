@@ -1191,10 +1191,10 @@ struct Recorder::CompletionProbe {
                 MapTimesFields(mapLast, sizeof(mapLast), "map_last", detail.last);
                 MapTimesFields(mapSlowest, sizeof(mapSlowest), "map_slowest", detail.slowest);
                 const auto stepAge = detail.stepSinceNs != 0 && nanos > static_cast<std::int64_t>(detail.stepSinceNs) ? (nanos - detail.stepSinceNs) / 1e6 : 0;
-                std::fprintf(stderr, "[completion-probe] ns=%llu recorder=%llu gpu_serial=%llu query=%d query_ms=%.3f pending_actions=%zu unsubmitted_actions=%zu unresolved_actions=%zu ready_batches=%zu ready_actions=%zu oldest_ready_observed_ms=%.3f delivering_actions=%zu oldest_delivery_ms=%.3f mutex_stable=%d mutex_tid=%llu mutex_queue=0x%x mutex_role=%s mutex_held_ms=%.3f %s %s map_steps_stable=%d map_steps_calls=%llu map_steps_cpu_failures=%llu map_step=%s map_step_since_ns=%llu map_step_ms=%.3f map_done_pages=%llu %s %s %s\n",
+                std::fprintf(stderr, "[completion-probe] ns=%llu recorder=%llu gpu_serial=%llu query=%d query_ms=%.3f pending_actions=%zu unsubmitted_actions=%zu unresolved_actions=%zu ready_batches=%zu ready_actions=%zu oldest_ready_observed_ms=%.3f delivering_actions=%zu oldest_delivery_ms=%.3f mutex_stable=%d mutex_tid=%llu mutex_queue=0x%x mutex_role=%s mutex_site=%s mutex_held_ms=%.3f %s %s map_steps_stable=%d map_steps_calls=%llu map_steps_cpu_failures=%llu map_step=%s map_step_since_ns=%llu map_step_ms=%.3f map_done_pages=%llu %s %s %s\n",
                     static_cast<unsigned long long>(nanos), static_cast<unsigned long long>(id), static_cast<unsigned long long>(value), static_cast<int>(query), std::chrono::duration<double, std::milli>(now - queryStart).count(),
                     pending, unsubmitted, unresolved, readyBatches, ready, oldestReadyMs, delivering, oldestDeliveryMs, holder.stable,
-                    static_cast<unsigned long long>(holder.thread), holder.queue, role, heldMs, registryFields, mappingFields,
+                    static_cast<unsigned long long>(holder.thread), holder.queue, role, holder.site, heldMs, registryFields, mappingFields,
                     detail.stable, static_cast<unsigned long long>(detail.calls), static_cast<unsigned long long>(detail.cpuFailures), MemoryLockProbe::MapStepNames[static_cast<std::size_t>(detail.step)],
                     static_cast<unsigned long long>(detail.stepSinceNs), stepAge, static_cast<unsigned long long>(detail.completedPages), mapTotal, mapLast, mapSlowest);
                 lock.lock();

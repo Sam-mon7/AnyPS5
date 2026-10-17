@@ -7719,19 +7719,24 @@ void completionProbeTests(Device& device) {
     memoryLockProbeTests();
     const bool enabled = AgcDriver::GuestMemory::CompletionProbeEnabled();
     Require(GpuMutex().Holder().thread == 0, "completion probe reports an owner before locking");
+    Require(std::string_view(GpuMutex().Holder().site) == "none", "completion probe reports a site before locking");
     AgcDriver::GuestMemory::TagGpuLockThread(0x40);
+    AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Draw);
     std::unique_lock gpu(GpuMutex());
     const auto outer = GpuMutex().Holder();
     if (enabled) {
         Require(outer.stable && outer.thread != 0 && outer.queue == 0x40 && outer.sinceNs != 0, "completion probe missed the GPU mutex owner");
+        Require(std::string_view(outer.site) == "draw", "completion probe missed the GPU mutex site");
 #ifdef _WIN32
         Require(outer.thread == GetCurrentThreadId(), "completion probe owner is not the Windows thread id");
 #endif
     }
     {
+        AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Hook);
         std::lock_guard nested(GpuMutex());
         const auto inner = GpuMutex().Holder();
         Require(inner.thread == outer.thread && inner.sinceNs == outer.sinceNs, "recursive lock reset the completion probe hold");
+        Require(std::string_view(inner.site) == outer.site, "recursive lock replaced the outer completion probe site");
     }
     Require(GpuMutex().Holder().thread == outer.thread, "recursive unlock cleared the completion probe owner");
     std::atomic<unsigned> delivered{0};
@@ -7762,6 +7767,19 @@ void completionProbeTests(Device& device) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
     gpu.unlock();
     Require(GpuMutex().Holder().thread == 0, "completion probe kept a released mutex owner");
+    Require(std::string_view(GpuMutex().Holder().site) == "none", "completion probe kept a released mutex site");
+    {
+        std::lock_guard untagged(GpuMutex());
+        Require(std::string_view(GpuMutex().Holder().site) == (enabled ? "other" : "none"), "completion probe retained a consumed lock tag");
+    }
+    AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Copy);
+    Require(GpuMutex().try_lock(), "completion probe test could not acquire an idle mutex");
+    Require(std::string_view(GpuMutex().Holder().site) == (enabled ? "copy" : "none"), "completion probe missed tagged try-lock site");
+    GpuMutex().unlock();
+    Require(GpuMutex().try_lock(), "completion probe test could not reacquire an idle mutex");
+    Require(std::string_view(GpuMutex().Holder().site) == (enabled ? "try" : "none"), "completion probe missed untagged try-lock site");
+    GpuMutex().unlock();
+    Require(std::string_view(GpuMutex().Holder().site) == "none", "completion probe kept a released try-lock site");
     std::cout << "Completion probe tests passed\n";
 }
 
