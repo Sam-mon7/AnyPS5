@@ -1,6 +1,7 @@
 #include "BdaTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -711,18 +712,29 @@ void importedHeapMirrorTests(const Context& context, const BdaTestAccess& access
     };
     const auto before = MirrorCounters();
     registry(true);
-    Require(build(context) != 0, "the heap range is missing from the BDA table of a build without host imports");
+    const auto first = build(context);
+    Require(first != 0, "the heap range is missing from the BDA table of a build without host imports");
     const auto mirrored = MirrorCounters();
     Require(mirrored.heapMirrors == before.heapMirrors + 1 && mirrored.heapBytes == before.heapBytes + bytes, "a range built without host imports was not heap mirrored");
-    Require(build(importing) != 0 && HostImportCovers(importing, address, bytes), "the heap mirrored range was not imported once imports were available");
-    const auto imported = MirrorCounters();
-    Require(imported.heapMirrors == before.heapMirrors && imported.heapBytes == before.heapBytes, "a heap mirror outlived the host import that serves its range");
-    Require(build(importing) != 0 && MirrorCounters().heapMirrors == before.heapMirrors && MirrorCounters().rebuilds == imported.rebuilds, "an imported range was heap mirrored again");
-    static_cast<std::uint8_t*>(block)[bytes / 2] = 0x22;
-    const auto device = build(context);
-    const auto again = MirrorCounters();
-    Require(device != 0 && again.heapMirrors == before.heapMirrors + 1 && again.heapBytes == before.heapBytes + bytes && again.rebuilds == imported.rebuilds + 1, "a range no import serves was not heap mirrored again");
-    Require(access.addressBytes(device)[bytes / 2] == std::byte{0x22} && access.addressBytes(device)[bytes / 2 + 1] == std::byte{0x11}, "a heap mirror made after its import missed the guest bytes");
+    if (VramDescriptors()) {
+        Require(build(importing) == first && HostImportFor(importing, address, bytes) == nullptr && !HostImportCovers(importing, address, bytes), "a mirrored heap acquired a second imported backing");
+        const auto retained = MirrorCounters();
+        Require(retained.heapMirrors == mirrored.heapMirrors && retained.heapBytes == mirrored.heapBytes && retained.rebuilds == mirrored.rebuilds, "import availability replaced the heap mirror");
+        Require(build(importing) == first && MirrorCounters().rebuilds == retained.rebuilds && MirrorCounters().blocksCopied == retained.blocksCopied, "an unchanged heap mirror was rebuilt or refreshed");
+        static_cast<std::uint8_t*>(block)[bytes / 2] = 0x22;
+        Require(build(context) == first && MirrorCounters().rebuilds == retained.rebuilds && MirrorCounters().blocksCopied == retained.blocksCopied + 1, "the stable heap mirror did not refresh only the CPU-written block");
+        Require(access.addressBytes(first)[bytes / 2] == std::byte{0x22} && access.addressBytes(first)[bytes / 2 + 1] == std::byte{0x11}, "the retained heap mirror missed the guest bytes");
+    } else {
+        Require(build(importing) != 0 && HostImportCovers(importing, address, bytes), "the heap mirrored range was not imported once imports were available");
+        const auto imported = MirrorCounters();
+        Require(imported.heapMirrors == before.heapMirrors && imported.heapBytes == before.heapBytes, "a heap mirror outlived the host import that serves its range");
+        Require(build(importing) != 0 && MirrorCounters().heapMirrors == before.heapMirrors && MirrorCounters().rebuilds == imported.rebuilds, "an imported range was heap mirrored again");
+        static_cast<std::uint8_t*>(block)[bytes / 2] = 0x22;
+        const auto device = build(context);
+        const auto again = MirrorCounters();
+        Require(device != 0 && again.heapMirrors == before.heapMirrors + 1 && again.heapBytes == before.heapBytes + bytes && again.rebuilds == imported.rebuilds + 1, "a range no import serves was not heap mirrored again");
+        Require(access.addressBytes(device)[bytes / 2] == std::byte{0x22} && access.addressBytes(device)[bytes / 2 + 1] == std::byte{0x11}, "a heap mirror made after its import missed the guest bytes");
+    }
     registry(false);
     Require(HostImportFor(importing, address, bytes) == nullptr && !HostImportCovers(importing, address, bytes), "the import outlived its range");
     Require(build(context) == 0, "the unregistered heap range is still in the BDA table");

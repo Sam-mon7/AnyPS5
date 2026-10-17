@@ -2454,6 +2454,41 @@ if(BUILD_TESTING AND WIN32)
     set_tests_properties(agc_vram_mirrors_recorder agc_vram_mirrors_heap agc_vram_mirrors_heap_fallback agc_vram_mirrors_bda_device PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_RESIDENT_HEAP_MIRRORS=unset:")
     set_property(TEST agc_vram_mirrors_heap_fallback APPEND PROPERTY ENVIRONMENT "APS5_REBAR_MIB=0")
+    foreach(vramDescriptorMode IN ITEMS off on)
+        add_test(NAME agc_vram_descriptors_${vramDescriptorMode} COMMAND agc_driver_recorder_tests --vram-descriptors-only)
+        set_tests_properties(agc_vram_descriptors_${vramDescriptorMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=0;APS5_RESIDENT_HEAP_MIRRORS=0"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
+    endforeach()
+    set_property(TEST agc_vram_descriptors_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DESCRIPTORS=set:1")
+    add_test(NAME agc_vram_descriptors_recorder COMMAND agc_driver_recorder_tests)
+    add_test(NAME agc_vram_descriptors_heap COMMAND agc_driver_recorder_tests --resident-heap-only)
+    add_test(NAME agc_vram_descriptors_heap_fallback COMMAND agc_driver_recorder_tests --resident-heap-only)
+    add_test(NAME agc_vram_descriptors_bda_device COMMAND agc_driver_bda_device_tests)
+    add_test(NAME agc_vram_descriptors_graphics COMMAND agc_driver_graphics_tests)
+    set_tests_properties(agc_vram_descriptors_recorder agc_vram_descriptors_heap agc_vram_descriptors_heap_fallback agc_vram_descriptors_bda_device agc_vram_descriptors_graphics
+        PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_RESIDENT_HEAP_MIRRORS=0"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
+    set_property(TEST agc_vram_descriptors_heap_fallback APPEND PROPERTY ENVIRONMENT "APS5_REBAR_MIB=0")
+endif()
+
+add_test_executable(agc_vram_options_tests EXCLUDE_FROM_ALL tests/VramOptions.cpp)
+target_link_libraries(agc_vram_options_tests PRIVATE libc)
+target_include_directories(agc_vram_options_tests PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(agc_vram_options_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_vram_options_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_vram_options_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_vram_options_off COMMAND agc_vram_options_tests)
+    add_test(NAME agc_vram_options_descriptors COMMAND agc_vram_options_tests)
+    add_test(NAME agc_vram_options_descriptors_requires_mirrors COMMAND agc_vram_options_tests "APS5_VRAM_DESCRIPTORS requires APS5_VRAM_MIRRORS=1")
+    add_test(NAME agc_vram_options_descriptors_resident_conflict COMMAND agc_vram_options_tests "APS5_RESIDENT_HEAP_MIRRORS to be off")
+    set_tests_properties(agc_vram_options_off agc_vram_options_descriptors agc_vram_options_descriptors_requires_mirrors agc_vram_options_descriptors_resident_conflict
+        PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_MIRRORS=unset:;APS5_VRAM_DESCRIPTORS=unset:;APS5_RESIDENT_HEAP_MIRRORS=unset:;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
+    set_property(TEST agc_vram_options_descriptors APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1")
+    set_property(TEST agc_vram_options_descriptors_requires_mirrors APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DESCRIPTORS=set:1")
+    set_property(TEST agc_vram_options_descriptors_resident_conflict APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_RESIDENT_HEAP_MIRRORS=set:1")
 endif()
 
 if(BUILD_TESTING)

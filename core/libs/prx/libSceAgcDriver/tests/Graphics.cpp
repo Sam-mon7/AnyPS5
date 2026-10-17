@@ -2877,6 +2877,17 @@ VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer buffer,
     std::memcpy(memory.data() + offset, data, static_cast<std::size_t>(size));
 }
 
+VKAPI_ATTR void VKAPI_CALL mockCmdCopyBuffer(VkCommandBuffer, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
+    const auto input = mockBufferMemory(source);
+    const auto output = mockBufferMemory(destination);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const auto& region = regions[index];
+        Require(region.srcOffset <= input.size() && region.size <= input.size() - region.srcOffset, "a buffer copy exceeds its source");
+        Require(region.dstOffset <= output.size() && region.size <= output.size() - region.dstOffset, "a buffer copy exceeds its destination");
+        std::memcpy(output.data() + region.dstOffset, input.data() + region.srcOffset, static_cast<std::size_t>(region.size));
+    }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo* info, VkCommandBuffer* commands) {
     for (std::uint32_t index = 0; index < info->commandBufferCount; ++index) commands[index] = makeHandle<VkCommandBuffer>();
     mock.live += info->commandBufferCount;
@@ -2948,7 +2959,8 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
-        {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)}
+        {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)},
+        {"vkCmdCopyBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdCopyBuffer)}
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -2959,6 +2971,12 @@ AgcDriver::Graphics::Context mockContext() {
     context.deviceProc = mockProc;
     context.memory.memoryTypeCount = 1;
     context.memory.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const auto* vramMirrors = std::getenv("APS5_VRAM_MIRRORS");
+    if (vramMirrors != nullptr && std::strcmp(vramMirrors, "1") == 0) {
+        context.memory.memoryTypes[0].propertyFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        context.memory.memoryHeapCount = 1;
+        context.memory.memoryHeaps[0] = {VkDeviceSize{1} << 30u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    }
     context.limits.minStorageBufferOffsetAlignment = 1;
     context.limits.maxBoundDescriptorSets = 1;
     context.limits.maxStorageBufferRange = 16384;

@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -334,6 +335,421 @@ private:
 };
 
 using Kind = Recorder::ReadKind;
+
+void vramDescriptorTests(const Device& device, Recorder& recorder) {
+    namespace Memory = AgcDriver::GuestMemory;
+    auto context = device.GetContext();
+    context.nullDescriptors = device.NullDescriptors();
+    Require(context.hostImportAlignment != 0 && context.hostImportAlignment <= 65536, "VRAM descriptor fixture requires host imports aligned within 64 KiB");
+    Require(context.limits.minStorageBufferOffsetAlignment > 4, "VRAM descriptor fixture requires a misaligned DWORD offset");
+    constexpr std::size_t blockBytes = 65536;
+    constexpr std::size_t bytes = 2 * blockBytes;
+    constexpr std::size_t viewBytes = 64;
+    for (const bool imported : {false, true}) {
+        auto* block = static_cast<std::uint8_t*>(AllocateWatched(bytes, blockBytes));
+        Require(block != nullptr, "VRAM descriptor fixture requires watched memory");
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        const auto element = address + blockBytes;
+        struct Release {
+            const Context& context;
+            Recorder& recorder;
+            void* block;
+            ~Release() {
+                recorder.Sync();
+                recorder.FlushDeferredReleases();
+                GuestAllocations::Mutation().Remove(block);
+                ClearImageMirrors(context.device);
+                ClearHostImports(context.device);
+                ReleaseWatched(block, bytes);
+            }
+        } release{context, recorder, block};
+        std::memset(block, 0x11, bytes);
+        GuestAllocations::Mutation().Add(block, bytes, true, !imported, true);
+        VkBuffer importBuffer = VK_NULL_HANDLE;
+        if (imported) {
+            const auto* backing = HostImportFor(context, address, bytes);
+            Require(backing != nullptr, "VRAM descriptor fixture could not establish its import");
+            importBuffer = backing->buffer;
+        }
+        auto seedContext = context;
+        if (!imported) {
+            seedContext.hostImportAlignment = 0;
+            seedContext.dmaBufImport = false;
+        }
+        GuestBufferMemory seed(seedContext);
+        seed.AcquireRegistered();
+        seed.Upload(true);
+        std::uint32_t adjustment = 0;
+        const auto backing = seed.Descriptor(element, viewBytes, adjustment);
+        Require(adjustment == 0, "VRAM descriptor fixture has an unaligned backing");
+        seed.WriteBack();
+        recorder.Sync();
+        if (VramDescriptors()) {
+            if (imported) Require(backing.buffer == importBuffer, "an address build mirrored an import-backed range");
+            else Require(HostImportFor(context, address, bytes) == nullptr, "a mirror-backed range acquired a host import");
+        }
+        const auto read = [&](std::uint64_t begin) {
+            Memory::BumpCollectEpoch();
+            auto memory = std::make_shared<GuestBufferMemory>(context);
+            memory->AddReadable(begin, viewBytes);
+            memory->Upload(false);
+            std::uint32_t offset = 0;
+            const auto view = memory->Descriptor(begin, viewBytes, offset);
+            Require(offset == 0, "a non-adjusted descriptor retained a misaligned offset");
+            auto output = std::make_shared<Buffer>(context, viewBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            CopyBuffer(context, commands, view.buffer, view.offset, output->Handle(), 0, viewBytes);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            recorder.Keep(memory);
+            recorder.Keep(output);
+            recorder.OnComplete([memory] { memory->WriteBack(); });
+            recorder.Sync();
+            Require(std::memcmp(output->Bytes().data(), reinterpret_cast<const void*>(begin), viewBytes) == 0,
+                    "descriptor read missed a CPU write after backing creation");
+            return view;
+        };
+        block[blockBytes] = 0x45;
+        block[blockBytes + 4] = 0x76;
+        const auto aligned = read(element);
+        if (VramDescriptors()) Require(aligned.buffer == backing.buffer, "descriptor read replaced its registered range backing");
+        const auto copiesBefore = VramDescriptorCounters();
+        const auto misaligned = read(element + 4);
+        Require(misaligned.buffer != backing.buffer, "misaligned descriptor was bound without a GPU copy");
+        if (VramDescriptors() && !imported) {
+            const auto copiesAfter = VramDescriptorCounters();
+            Require(copiesAfter.gpuCopies > copiesBefore.gpuCopies && copiesAfter.cpuCopies == copiesBefore.cpuCopies,
+                    "misaligned mirror descriptor used a CPU copy");
+        }
+        if (imported) {
+            if (VramDescriptors()) Require(HostImportFor(context, address, bytes)->buffer == importBuffer, "descriptor read retired its range's import");
+            continue;
+        }
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, viewBytes, 0x31000000u};
+        binding.bufferWritten = {true};
+        program.bindings.push_back(binding);
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        const auto writeBackBefore = VramDescriptorCounters();
+        auto resources = std::make_shared<ShaderResources>(context, compute);
+        struct PipelineRelease {
+            const Context& context;
+            Recorder& recorder;
+            VkPipeline pipeline = VK_NULL_HANDLE;
+            VkPipelineLayout layout = VK_NULL_HANDLE;
+            VkShaderModule module = VK_NULL_HANDLE;
+            ~PipelineRelease() {
+                recorder.Sync();
+                if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+                if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+                if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            }
+        } pipeline{context, recorder};
+        const auto setLayout = resources->Layout();
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t)};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &setLayout;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &pipeline.layout), "VRAM descriptor pipeline layout");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = sizeof(BUFFER_UPDATE_SPV);
+        moduleInfo.pCode = BUFFER_UPDATE_SPV;
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &pipeline.module), "VRAM descriptor shader module");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, pipeline.module, "main", nullptr};
+        pipelineInfo.layout = pipeline.layout;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline.pipeline), "VRAM descriptor pipeline");
+        const auto commands = recorder.Commands();
+        recorder.Keep(resources);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+        resources->Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout);
+        const std::uint32_t delta = 1;
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(delta), &delta);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+        resources->MarkGpuWrites(recorder);
+        recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
+        block[blockBytes + 8] = 0x5a;
+        recorder.Sync();
+        Require(block[blockBytes] == 0x46 && block[blockBytes + 8] == 0x5a,
+                "descriptor write-back lost the GPU store or a disjoint CPU store in the same block");
+        if (VramDescriptors()) {
+            Require(HostImportFor(context, address, bytes) == nullptr, "a descriptor writer imported its mirror-backed range");
+            const auto writeBackAfter = VramDescriptorCounters();
+            Require(writeBackAfter.referenceBytes > writeBackBefore.referenceBytes && writeBackAfter.resultBytes > writeBackBefore.resultBytes,
+                    "mirror descriptor write-back did not copy its reference and result through the GPU");
+            Require(writeBackAfter.writeBackBytes > writeBackBefore.writeBackBytes, "mirror descriptor write-back was not counted");
+        }
+        auto written = std::make_shared<GuestBufferMemory>(context);
+        written->AddWritable(element + 4, 4);
+        written->AddReadable(element + 4, viewBytes);
+        written->Upload(false);
+        std::uint32_t writtenAdjustment = 0;
+        const auto writtenView = written->Descriptor(element + 4, viewBytes, writtenAdjustment);
+        Require(writtenAdjustment == 0 && writtenView.buffer != backing.buffer, "misaligned descriptor writer was not staged");
+        const auto writeCommands = recorder.Commands();
+        RecordMemoryBarrier(context, writeCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(writeCommands, writtenView.buffer, writtenView.offset, 4, 0x99887766u);
+        RecordMemoryBarrier(context, writeCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        written->RecordCopyBacks(recorder);
+        recorder.Keep(written);
+        recorder.NotePendingWrites(written->Writes());
+        recorder.OnComplete([written] { written->WriteBack(); });
+        block[blockBytes + 12] = 0x6b;
+        recorder.Sync();
+        std::uint32_t writtenValue = 0;
+        std::memcpy(&writtenValue, block + blockBytes + 4, sizeof(writtenValue));
+        Require(writtenValue == 0x99887766u && block[blockBytes + 12] == 0x6b,
+                "misaligned descriptor copy-back lost GPU or disjoint CPU bytes");
+    }
+    std::cout << "VRAM descriptor coherence tests passed\n";
+}
+
+void vramDescriptorBoundaryTests(const Device& device, Recorder& recorder) {
+    namespace Memory = AgcDriver::GuestMemory;
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    constexpr std::size_t blockBytes = 65536;
+    auto* block = static_cast<std::uint8_t*>(AllocateWatched(2 * blockBytes, blockBytes));
+    Require(block != nullptr, "boundary descriptor fixture requires watched memory");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto begin = address + blockBytes - 32;
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        std::uint8_t* block;
+        ~Release() {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            GuestAllocations::Mutation().Remove(block);
+            GuestAllocations::Mutation().Remove(block + blockBytes);
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            ReleaseWatched(block, 2 * blockBytes);
+        }
+    } release{context, recorder, block};
+    std::memset(block, 0x11, 2 * blockBytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, blockBytes, true, true, true);
+        mutation.Add(block + blockBytes, blockBytes, true, true, true);
+    }
+    GuestBufferMemory seed(context);
+    seed.AcquireRegistered();
+    seed.Upload(true);
+    std::uint32_t adjustment = 0;
+    const auto left = seed.Descriptor(address, 32, adjustment);
+    const auto right = seed.Descriptor(address + blockBytes, 32, adjustment);
+    Require(left.buffer != right.buffer, "boundary fixture did not create separate mirror backings");
+    seed.WriteBack();
+    recorder.Sync();
+    const auto write = [&](std::uint64_t at, std::size_t size, std::uint32_t first, std::uint32_t second) {
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddWritable(at, size);
+        memory->Upload(false);
+        std::uint32_t offset = 0;
+        const auto view = memory->Descriptor(at, size, offset);
+        Require(offset == 0, "boundary writer retained an adjusted descriptor");
+        const auto commands = recorder.Commands();
+        std::shared_ptr<Buffer> uploaded;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (size == 64) {
+            uploaded = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            CopyBuffer(context, commands, view.buffer, view.offset, uploaded->Handle(), 0, size);
+            recorder.Keep(uploaded);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset, second == 0 ? size : 4, first);
+        if (second != 0) context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + 32, 4, second);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        memory->RecordCopyBacks(recorder);
+        recorder.Keep(memory);
+        recorder.NotePendingWrites(memory->Writes());
+        recorder.OnComplete([memory] { memory->WriteBack(); });
+        return uploaded;
+    };
+    write(begin, 32, 0x22222222u, 0);
+    write(begin + 32, 32, 0x33333333u, 0);
+    auto read = std::make_shared<GuestBufferMemory>(context);
+    const auto copiedBefore = VramDescriptorCounters();
+    read->AddReadable(begin, 64);
+    read->Upload(false);
+    const auto view = read->Descriptor(begin, 64, adjustment);
+    Require(adjustment == 0, "boundary reader retained an adjusted descriptor");
+    if (VramDescriptors()) {
+        const auto copiedAfter = VramDescriptorCounters();
+        Require(copiedAfter.gpuCopies > copiedBefore.gpuCopies && copiedAfter.cpuCopies == copiedBefore.cpuCopies,
+                "boundary mirror descriptor took a CPU snapshot");
+    }
+    auto output = std::make_shared<Buffer>(context, 64, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, view.buffer, view.offset, output->Handle(), 0, 64);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(read);
+    recorder.Keep(output);
+    recorder.OnComplete([read] { read->WriteBack(); });
+    recorder.Sync();
+    for (std::size_t i = 0; i < 64; ++i) Require(output->Bytes()[i] == (i < 32 ? std::byte{0x22} : std::byte{0x33}),
+                                              "boundary descriptor missed GPU writes from one of its mirrors");
+    block[blockBytes - 16] = 0x7c;
+    block[blockBytes + 16] = 0x8d;
+    Memory::BumpCollectEpoch();
+    const auto refreshed = write(begin, 64, 0x44444444u, 0x55555555u);
+    block[blockBytes - 20] = 0x5a;
+    block[blockBytes + 12] = 0x6b;
+    recorder.Sync();
+    Require(refreshed->Bytes()[16] == std::byte{0x7c} && refreshed->Bytes()[48] == std::byte{0x8d},
+            "boundary descriptor did not refresh CPU writes from both mirrors");
+    Require(block[blockBytes - 32] == 0x44 && block[blockBytes] == 0x55,
+            "boundary descriptor write-back lost GPU stores in one of its mirrors");
+    Require(block[blockBytes - 20] == 0x5a && block[blockBytes + 12] == 0x6b &&
+            block[blockBytes - 16] == 0x7c && block[blockBytes + 16] == 0x8d,
+            "boundary descriptor write-back lost CPU bytes in one of its mirrors");
+    std::cout << "VRAM descriptor boundary tests passed\n";
+}
+
+void vramDescriptorSparseGrowthTests(const Device& device, Recorder& recorder) {
+#ifdef _WIN32
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    constexpr std::size_t blockBytes = 65536;
+    constexpr std::size_t extent = 1u << 20u;
+    constexpr std::size_t reserved = 8 * extent;
+    constexpr std::size_t grownAt = 2 * extent;
+    constexpr std::size_t tailAt = 7 * extent / 2;
+    constexpr std::size_t heldTailAt = 6 * extent;
+    auto* block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(reserved, blockBytes));
+    Require(block != nullptr, "sparse growth fixture could not reserve its heap");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        std::uint8_t* block;
+        ~Release() {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            GuestAllocations::Mutation().Remove(block);
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            GuestArena::GuestArenaReset_nid_postfix(block, reserved);
+            GuestArena::GuestArenaRelease_nid_postfix(block, reserved);
+        }
+    } release{context, recorder, block};
+    GuestArena::GuestArenaCommit_nid_postfix(block, blockBytes, PAGE_READWRITE, blockBytes);
+    std::memset(block, 0x11, blockBytes);
+    GuestAllocations::Mutation().Add(block, reserved, true, true, true);
+    const auto read = [&](const std::shared_ptr<GuestBufferMemory>& memory, std::uint64_t at) {
+        std::uint32_t adjustment = 0;
+        const auto view = memory->Descriptor(at, 16, adjustment);
+        auto output = std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, view.buffer, view.offset + adjustment, output->Handle(), 0, 16);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(memory);
+        recorder.Keep(output);
+        recorder.Sync();
+        std::array<std::byte, 16> bytes{};
+        std::memcpy(bytes.data(), output->Bytes().data(), bytes.size());
+        return bytes;
+    };
+    auto writer = std::make_shared<GuestBufferMemory>(context);
+    writer->AddWritable(address, reserved);
+    writer->Upload(false);
+    std::uint32_t adjustment = 0;
+    const auto initial = writer->Descriptor(address, reserved, adjustment);
+    Require(adjustment == 0 && initial.range == extent, "sparse growth fixture has an unexpected initial mirror extent");
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, initial.buffer, initial.offset, 4, 0x77777777u);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+    writer->RecordCopyBacks(recorder);
+    recorder.Keep(writer);
+    recorder.NotePendingWrites(writer->Writes());
+    const auto completed = std::make_shared<bool>(false);
+    recorder.OnComplete([writer, completed] { writer->WriteBack(); *completed = true; });
+    block[8] = 0x55;
+    GuestArena::GuestArenaCommit_nid_postfix(block + grownAt, blockBytes, PAGE_READWRITE, blockBytes);
+    block[grownAt] = 0x66;
+    auto grown = std::make_shared<GuestBufferMemory>(context);
+    grown->AcquireRegistered();
+    grown->Upload(true);
+    const auto grownView = grown->Descriptor(address, reserved, adjustment);
+    Require(*completed && block[0] == 0x77 && block[8] == 0x55,
+            "sparse mirror growth did not complete and publish its recorded writer");
+    Require(grownView.buffer != initial.buffer && grownView.range == 3 * extent,
+            "sparse mirror did not grow to include newly committed memory");
+    Require(read(grown, address)[0] == std::byte{0x77} && read(grown, address + grownAt)[0] == std::byte{0x66},
+            "sparse mirror growth lost old GPU results or newly committed CPU bytes");
+    grown->WriteBack();
+    const auto tail = [&](std::size_t at) {
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddReadable(address, reserved);
+        memory->AddReadable(address + at, 16);
+        memory->Upload(false);
+        return memory;
+    };
+    const auto copiesBefore = VramDescriptorCounters();
+    auto extended = tail(tailAt);
+    const auto whole = extended->Descriptor(address, reserved, adjustment);
+    const auto hole = extended->Descriptor(address + tailAt, 16, adjustment);
+    Require(whole.buffer == hole.buffer && hole.range >= 16, "unmapped sparse tail was not served by the heap's descriptor backing");
+    const auto holeBytes = read(extended, address + tailAt);
+    Require(std::all_of(holeBytes.begin(), holeBytes.end(), [](std::byte value) { return value == std::byte{}; }),
+            "unmapped sparse tail did not read as zero on the GPU");
+    if (VramDescriptors()) Require(extended->CopiedBytes() == 0 && VramDescriptorCounters().cpuCopies == copiesBefore.cpuCopies,
+                                   "sparse mirror tail growth fell back to a CPU copy");
+    extended->WriteBack();
+    if (VramDescriptors()) {
+        auto prepared = std::make_shared<GuestBufferMemory>(context);
+        prepared->AddReadable(address, 16);
+        prepared->UploadPrepare(false);
+        const auto beforeRefusal = VramDescriptorCounters();
+        bool refused = false;
+        try { static_cast<void>(tail(heldTailAt)); }
+        catch (const std::runtime_error& error) { refused = std::string_view(error.what()).find("prepared or uploaded build") != std::string_view::npos; }
+        Require(refused && VramDescriptorCounters().cpuCopies == beforeRefusal.cpuCopies,
+                "sparse mirror growth under a prepared owner silently used a CPU fallback");
+        prepared->UploadFinish(false);
+        Require(read(prepared, address)[0] == std::byte{0x77}, "refused sparse growth invalidated its prepared owner");
+        prepared->WriteBack();
+        auto after = tail(heldTailAt);
+        const auto afterBytes = read(after, address + heldTailAt);
+        Require(after->CopiedBytes() == 0 && std::all_of(afterBytes.begin(), afterBytes.end(), [](std::byte value) { return value == std::byte{}; }),
+                "sparse mirror could not grow after its prepared owner completed");
+        after->WriteBack();
+    }
+    std::cout << "VRAM descriptor sparse growth tests passed\n";
+#else
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+#endif
+}
 
 void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
@@ -7848,6 +8264,12 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--vram-descriptors-only") {
+            vramDescriptorTests(device, recorder);
+            vramDescriptorBoundaryTests(device, recorder);
+            vramDescriptorSparseGrowthTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--readonly-fallback-only") {
             if (device.GetContext().hostImportAlignment == 0 || !AgcDriver::GuestMemory::WriteWatched()) return 77;
             readonlyFallbackReuseTests(device, recorder, gpu);
