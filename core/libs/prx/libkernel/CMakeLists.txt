@@ -1162,8 +1162,10 @@ if(BUILD_TESTING)
     add_dependencies(guest_memory_tests guest_memory_module)
     target_compile_definitions(guest_memory_tests PRIVATE GUEST_MEMORY_MODULE="$<TARGET_FILE:guest_memory_module>")
     add_test(NAME guest_memory COMMAND guest_memory_tests)
+    add_test(NAME guest_memory_published_lease COMMAND guest_memory_tests)
+    set_tests_properties(guest_memory_published_lease PROPERTIES ENVIRONMENT "APS5_REGISTRY_PUBLISHED_LEASE=1")
     if(WIN32)
-        set_tests_properties(guest_memory PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(guest_memory guest_memory_published_lease PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_mlock_tests ${LIBS_INCLUDE_DIR}/tests/GuestMlock.cpp)
