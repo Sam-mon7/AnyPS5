@@ -67,6 +67,7 @@ struct MirrorWriteInterval {
     bool active = false;
     bool recorded = false;
     bool complete = false;
+    bool pending = false;
 };
 
 // Image mirrors. The main guest image (the PE at 0x7ff6b...) is MEM_IMAGE memory, which
@@ -1346,9 +1347,15 @@ bool intervalCovers(const MirrorWriteInterval& interval, std::uint64_t page) {
 }
 
 void validateMirrorAliases(ImageMirror& mirror);
-void finishMirrorWriter(ImageMirror& mirror);
+void finishMirrorWriter(ImageMirror& mirror, std::uint64_t begin = 0, std::uint64_t end = std::numeric_limits<std::uint64_t>::max());
 
 void disarmInterval(MirrorWriteInterval& interval) {
+    if (interval.pending) {
+        auto& state = WritableState();
+        std::lock_guard lock(state.mutex);
+        state.total.pendingPages -= interval.written.size();
+        interval.pending = false;
+    }
 #ifdef _WIN32
     for (const auto& [begin, end] : interval.watched) GuestArena::GuestArenaDisarmGpuWriteWatch_nid_no_patch(begin, static_cast<std::size_t>(end - begin));
 #endif
@@ -1372,10 +1379,11 @@ bool writablePageFault(std::uintptr_t page, bool write) {
         if (page < mirror->base || page + 4096 > mirror->base + mirror->bytes) return false;
         interval = mirror->writer;
     }
-    if (interval == nullptr || !interval->active || interval->complete || !intervalCovers(*interval, page)) return false;
+    if (interval == nullptr || !interval->active || !intervalCovers(*interval, page)) return false;
     if (interval->sealed) {
         countWritable({.faults = 1});
-        finishMirrorWriter(*mirror);
+        if (VramDeferred()) finishMirrorWriter(*mirror, page, page + 4096);
+        else finishMirrorWriter(*mirror);
         return true;
     }
     if (!write) return false;
@@ -1385,8 +1393,10 @@ bool writablePageFault(std::uintptr_t page, bool write) {
     return true;
 }
 
-void publishMirrorPages(ImageMirror& mirror, const std::shared_ptr<MirrorWriteInterval>& interval) {
+void publishMirrorPages(ImageMirror& mirror, const std::shared_ptr<MirrorWriteInterval>& interval, std::uint64_t begin = 0, std::uint64_t end = std::numeric_limits<std::uint64_t>::max()) {
     if (interval->written.empty()) return;
+    auto next = interval->written.lower_bound(begin & ~std::uint64_t{4095});
+    if (next == interval->written.end() || *next >= end) return;
     const auto started = std::chrono::steady_clock::now();
     constexpr std::size_t capacity = 256;
     auto& state = WritableState();
@@ -1396,11 +1406,10 @@ void publishMirrorPages(ImageMirror& mirror, const std::shared_ptr<MirrorWriteIn
     }
     if (state.readback == nullptr) state.readback = std::make_shared<Buffer>(interval->context, capacity * 4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     std::array<std::uint64_t, capacity> pages{};
-    auto next = interval->written.begin();
     VramWritableStats added;
-    while (next != interval->written.end()) {
+    while (next != interval->written.end() && *next < end) {
         std::size_t count = 0;
-        while (next != interval->written.end() && count < pages.size()) pages[count++] = *next++;
+        while (next != interval->written.end() && *next < end && count < pages.size()) pages[count++] = *next++;
         CommandBatch batch(interval->context, CommandBatch::Mode::Independent);
         RecordMemoryBarrier(interval->context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         for (std::size_t index = 0; index < count; ++index) CopyBuffer(interval->context, batch.Handle(), mirror.buffer->Handle(), pages[index] - mirror.base, state.readback->Handle(), index * 4096, 4096);
@@ -1420,15 +1429,20 @@ void publishMirrorPages(ImageMirror& mirror, const std::shared_ptr<MirrorWriteIn
             Recorder::NoteWrittenBack(page, 4096);
             ++added.pagesWritten;
             added.pagesMerged += base != nullptr;
+            interval->bases.erase(page);
+            interval->written.erase(page);
+            if (interval->pending) {
+                std::lock_guard lock(state.mutex);
+                --state.total.pendingPages;
+            }
         }
         added.readbackBytes += count * 4096;
     }
-    interval->written.clear();
     added.writeBackUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
     countWritable(added);
 }
 
-void finishMirrorWriter(ImageMirror& mirror) {
+void finishMirrorWriter(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end) {
     const auto interval = mirror.writer;
     if (interval == nullptr) return;
     if (!interval->complete) {
@@ -1440,9 +1454,11 @@ void finishMirrorWriter(ImageMirror& mirror) {
         recorder->FinishUpTo(interval->serial);
         Require(interval->complete, "a writable mirror writer has no completion action");
     }
-    publishMirrorPages(mirror, interval);
-    disarmInterval(*interval);
-    if (mirror.writer == interval) mirror.writer.reset();
+    publishMirrorPages(mirror, interval, begin, end);
+    if (interval->written.empty()) {
+        disarmInterval(*interval);
+        if (mirror.writer == interval) mirror.writer.reset();
+    }
 }
 
 void sealMirrorWriter(MirrorWriteInterval& interval) {
@@ -2662,7 +2678,10 @@ void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force)
             std::lock_guard lock(state.mutex);
             for (const auto& [base, mirror] : state.entries) if (mirror->writer != nullptr && mirror->writer->recorded && address < base + mirror->bytes && base - std::min(base, address) < bytes) mirrors.push_back(mirror);
         }
-        for (const auto& mirror : mirrors) finishMirrorWriter(*mirror);
+        for (const auto& mirror : mirrors) {
+            if (VramDeferred() && !force) finishMirrorWriter(*mirror, address, address + std::min<std::uint64_t>(bytes, std::numeric_limits<std::uint64_t>::max() - address));
+            else finishMirrorWriter(*mirror);
+        }
     }
     if (!ResidentHeapMirrors() || exportingHeapMirrors || !pendingHeapMirrors.load(std::memory_order_acquire) || bytes == 0) return;
     if (!force && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::MirrorRefresh) return;
@@ -5211,6 +5230,32 @@ void GuestBufferMemory::completeMirrorWrites() {
     for (const auto& [mirror, interval] : mirrorWrites) {
         Require(interval->sealed, "a VRAM mirror writer executed without protecting guest aliases");
         interval->complete = true;
+        if (VramDeferred() && !interval->written.empty()) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> pending;
+            for (const auto page : interval->written) {
+                if (!pending.empty() && pending.back().second == page) pending.back().second += 4096;
+                else pending.emplace_back(page, page + 4096);
+            }
+#ifdef _WIN32
+            for (const auto& [begin, end] : interval->watched) {
+                auto cursor = begin;
+                for (const auto& [first, last] : pending) {
+                    if (last <= cursor || first >= end) continue;
+                    if (cursor < first) GuestArena::GuestArenaDisarmGpuWriteWatch_nid_no_patch(cursor, static_cast<std::size_t>(first - cursor));
+                    cursor = std::min(end, last);
+                }
+                if (cursor < end) GuestArena::GuestArenaDisarmGpuWriteWatch_nid_no_patch(cursor, static_cast<std::size_t>(end - cursor));
+            }
+#endif
+            interval->watched = std::move(pending);
+            std::erase_if(interval->bases, [&](const auto& entry) { return !interval->written.contains(entry.first); });
+            interval->recorder = nullptr;
+            interval->pending = true;
+            auto& state = WritableState();
+            std::lock_guard lock(state.mutex);
+            state.total.pendingPages += interval->written.size();
+            continue;
+        }
         publishMirrorPages(*mirror, interval);
         disarmInterval(*interval);
         if (mirror->writer == interval) mirror->writer.reset();
