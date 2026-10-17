@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/MemoryLockProbe.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1101,6 +1102,21 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 }
 
 struct Recorder::CompletionProbe {
+    static void MemoryFields(char* output, std::size_t capacity, const char* prefix, const MemoryLockProbe::Snapshot& state, std::uint64_t now) {
+        const auto age = [&](std::uint64_t since) { return since != 0 && since < now ? (now - since) / 1e6 : 0; };
+        const auto pages = [](std::uint64_t bytes) { return bytes / 16384 + (bytes % 16384 != 0); };
+        std::snprintf(output, capacity,
+            "%s_stable=%d %s_tid=%llu %s_since_ns=%llu %s_held_ms=%.3f %s_op=%s %s_op_since_ns=%llu %s_op_ms=%.3f %s_bytes=%llu %s_pages=%llu "
+            "%s_map_ops=%llu %s_map_exception_ops=%llu %s_map_bytes=%llu %s_map_ms=%.3f %s_map_max_ms=%.3f "
+            "%s_last_map_tid=%llu %s_last_map_op=%s %s_last_map_bytes=%llu %s_last_map_pages=%llu %s_last_map_start_ns=%llu %s_last_map_end_ns=%llu %s_last_map_ms=%.3f",
+            prefix, state.stable, prefix, static_cast<unsigned long long>(state.thread), prefix, static_cast<unsigned long long>(state.thread ? state.sinceNs : 0),
+            prefix, state.thread ? age(state.sinceNs) : 0, prefix, state.thread ? state.operation : "none", prefix, static_cast<unsigned long long>(state.thread ? state.operationSinceNs : 0),
+            prefix, state.thread ? age(state.operationSinceNs) : 0, prefix, static_cast<unsigned long long>(state.thread ? state.bytes : 0), prefix, static_cast<unsigned long long>(state.thread ? pages(state.bytes) : 0),
+            prefix, static_cast<unsigned long long>(state.maps), prefix, static_cast<unsigned long long>(state.failedMaps), prefix, static_cast<unsigned long long>(state.mapBytes), prefix, state.mapNs / 1e6, prefix, state.maxMapNs / 1e6,
+            prefix, static_cast<unsigned long long>(state.lastMapThread), prefix, state.lastMapOperation, prefix, static_cast<unsigned long long>(state.lastMapBytes), prefix, static_cast<unsigned long long>(pages(state.lastMapBytes)),
+            prefix, static_cast<unsigned long long>(state.lastMapSinceNs), prefix, static_cast<unsigned long long>(state.lastMapEndNs), prefix, (state.lastMapEndNs - state.lastMapSinceNs) / 1e6);
+    }
+
     struct Entry {
         std::uint64_t serial = 0;
         std::size_t actions = 0;
@@ -1127,6 +1143,8 @@ struct Recorder::CompletionProbe {
                 const auto query = getValue == nullptr ? VK_ERROR_FEATURE_NOT_PRESENT : getValue(device, timeline, &value);
                 const auto now = std::chrono::steady_clock::now();
                 const auto holder = GuestMemory::GpuMutex().Holder();
+                const auto registry = MemoryLockProbe::GuestAllocationLockSnapshot_nid_no_patch();
+                const auto mappings = MemoryLockProbe::WindowsMappingsLockSnapshot_nid_no_patch();
                 std::size_t pending = 0, unsubmitted = 0, unresolved = 0, ready = 0, readyBatches = 0, delivering = 0;
                 double oldestReadyMs = 0, oldestDeliveryMs = 0;
                 lock.lock();
@@ -1153,10 +1171,13 @@ struct Recorder::CompletionProbe {
                 const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
                 const auto heldMs = holder.stable && holder.thread != 0 && nanos > static_cast<std::int64_t>(holder.sinceNs) ? (nanos - holder.sinceNs) / 1e6 : 0;
                 const auto* role = !holder.stable ? "changing" : holder.thread == 0 ? "none" : holder.presenter ? "presenter" : holder.queue == 0xffffffffu ? "thread" : "queue";
-                std::fprintf(stderr, "[completion-probe] ns=%llu recorder=%llu gpu_serial=%llu query=%d query_ms=%.3f pending_actions=%zu unsubmitted_actions=%zu unresolved_actions=%zu ready_batches=%zu ready_actions=%zu oldest_ready_observed_ms=%.3f delivering_actions=%zu oldest_delivery_ms=%.3f mutex_stable=%d mutex_tid=%llu mutex_queue=0x%x mutex_role=%s mutex_held_ms=%.3f\n",
+                char registryFields[2048], mappingFields[2048];
+                MemoryFields(registryFields, sizeof(registryFields), "registry", registry, nanos);
+                MemoryFields(mappingFields, sizeof(mappingFields), "mapping", mappings, nanos);
+                std::fprintf(stderr, "[completion-probe] ns=%llu recorder=%llu gpu_serial=%llu query=%d query_ms=%.3f pending_actions=%zu unsubmitted_actions=%zu unresolved_actions=%zu ready_batches=%zu ready_actions=%zu oldest_ready_observed_ms=%.3f delivering_actions=%zu oldest_delivery_ms=%.3f mutex_stable=%d mutex_tid=%llu mutex_queue=0x%x mutex_role=%s mutex_held_ms=%.3f %s %s\n",
                     static_cast<unsigned long long>(nanos), static_cast<unsigned long long>(id), static_cast<unsigned long long>(value), static_cast<int>(query), std::chrono::duration<double, std::milli>(now - queryStart).count(),
                     pending, unsubmitted, unresolved, readyBatches, ready, oldestReadyMs, delivering, oldestDeliveryMs, holder.stable,
-                    static_cast<unsigned long long>(holder.thread), holder.queue, role, heldMs);
+                    static_cast<unsigned long long>(holder.thread), holder.queue, role, heldMs, registryFields, mappingFields);
                 lock.lock();
             }
         });

@@ -24,6 +24,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/MemoryLockProbe.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
@@ -7621,7 +7622,51 @@ void Run(Context context) {
 }
 #endif
 
+void memoryLockProbeTests() {
+    const bool enabled = MemoryLockProbe::Enabled();
+    MemoryLockProbe::Mutex mutex;
+    const auto tid = MemoryLockProbe::Thread();
+    {
+        MemoryLockProbe::Lock lock(mutex, "map-test", 32768);
+        MemoryLockProbe::Snapshot sampled;
+        std::jthread reader([&] { sampled = mutex.Read(); });
+        reader.join();
+        Require(sampled.stable && sampled.thread == (enabled ? tid : 0), "memory probe cannot sample a held lock from another thread");
+        if (enabled) Require(sampled.bytes == 32768 && std::string_view(sampled.operation) == "map-test", "memory probe lost operation metadata");
+        lock.unlock();
+        Require(mutex.Read().thread == 0, "memory probe reports an unlocked owner");
+        lock.lock();
+        if (enabled) Require(mutex.Read().operationSinceNs == sampled.operationSinceNs && mutex.Read().sinceNs >= sampled.sinceNs, "memory probe lost mutation span on relock");
+    }
+    auto sampled = mutex.Read();
+    Require(sampled.thread == 0 && sampled.maps == (enabled ? 1 : 0), "memory probe lost completed map");
+    if (enabled) Require(sampled.lastMapThread == tid && sampled.lastMapBytes == 32768 && sampled.lastMapEndNs >= sampled.lastMapSinceNs, "memory probe lost completed map dimensions");
+    try {
+        MemoryLockProbe::Lock lock(mutex, "map-failed", 16384);
+        throw std::runtime_error("probe unwind");
+    } catch (const std::runtime_error&) {}
+    sampled = mutex.Read();
+    Require(sampled.thread == 0 && sampled.failedMaps == (enabled ? 1 : 0), "memory probe failed to clear owner on exception");
+#ifdef _WIN32
+    constexpr std::size_t bytes = 32768;
+    auto* memory = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 16384);
+    Require(memory != nullptr, "memory probe test cannot reserve guest memory");
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    Require(section != nullptr, "memory probe test cannot create backing");
+    const auto before = MemoryLockProbe::WindowsMappingsLockSnapshot_nid_no_patch();
+    GuestArena::GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+    const auto after = MemoryLockProbe::WindowsMappingsLockSnapshot_nid_no_patch();
+    Require(after.stable && after.thread == 0, "Windows mapping probe retains released owner");
+    if (enabled) Require(after.maps == before.maps + 1 && after.lastMapThread == tid && after.lastMapBytes == bytes && std::string_view(after.lastMapOperation) == "map", "Windows mapping probe missed actual map in libc");
+    std::memset(memory, 0x5a, bytes);
+    Require(static_cast<const unsigned char*>(memory)[bytes - 1] == 0x5a, "Windows mapping changed content");
+    GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+    CloseHandle(section);
+#endif
+}
+
 void completionProbeTests(Device& device) {
+    memoryLockProbeTests();
     const bool enabled = AgcDriver::GuestMemory::CompletionProbeEnabled();
     Require(GpuMutex().Holder().thread == 0, "completion probe reports an owner before locking");
     AgcDriver::GuestMemory::TagGpuLockThread(0x40);
@@ -7647,11 +7692,16 @@ void completionProbeTests(Device& device) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1200));
         });
         recorder.WaitSerial(recorder.SubmitAndEpoch());
+        auto mutation = std::make_unique<GuestAllocations::Mutation>("map-probe-test", 32768);
         std::this_thread::sleep_for(std::chrono::milliseconds(2200));
         Require(delivered.load() == 0, "completion probe delivered a callback");
         recorder.OnComplete([&] { ++delivered; });
         std::this_thread::sleep_for(std::chrono::milliseconds(1200));
         Require(delivered.load() == 0, "completion probe delivered an unsubmitted callback");
+        const auto registry = MemoryLockProbe::GuestAllocationLockSnapshot_nid_no_patch();
+        if (enabled) Require(registry.stable && registry.thread == MemoryLockProbe::Thread() && registry.bytes == 32768 && std::string_view(registry.operation) == "map-probe-test", "registry probe missed complete mutation span");
+        mutation.reset();
+        Require(MemoryLockProbe::GuestAllocationLockSnapshot_nid_no_patch().thread == 0, "registry probe retained released mutation");
         recorder.Reap();
         Require(delivered.load() == 1, "reap did not deliver only the submitted callback");
         recorder.Sync();

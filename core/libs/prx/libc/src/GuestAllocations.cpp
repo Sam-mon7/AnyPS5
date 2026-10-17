@@ -1,4 +1,6 @@
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/MemoryLockProbe.hpp"
+#include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -32,7 +34,7 @@ namespace GuestAllocations {
 namespace {
 
 struct Registry {
-    std::mutex mutex;
+    MemoryLockProbe::Mutex mutex;
     std::map<std::uint64_t, std::shared_ptr<const Range>> ranges;
     bool mainImageRegistered = false;
     std::map<std::uintptr_t, std::uintptr_t> registeredImages;
@@ -78,7 +80,7 @@ void require(bool condition, const char* reason) {
 // invalidator once the generation has moved on, so a cache that observed the old state meanwhile
 // notices either way.
 struct MutationState {
-    std::unique_lock<std::mutex> lock;
+    MemoryLockProbe::Lock lock;
     std::vector<std::pair<std::uintptr_t, std::size_t>> changed;
     std::vector<std::pair<std::uintptr_t, std::size_t>> gpuMapped;
 };
@@ -122,10 +124,14 @@ bool backWritableImageAnonymously() {
 }
 
 void* GuestAllocationsBegin_nid_postfix() {
-    auto* state = new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
+    auto* state = new MutationState{MemoryLockProbe::Lock(registry().mutex), {}};
     registry().readableLease.reset();
     registry().allLease.reset();
     return state;
+}
+
+void GuestAllocationsDescribe_nid_no_patch(void* mutation, const char* operation, std::size_t bytes) {
+    static_cast<MutationState*>(mutation)->lock.Describe(operation, bytes);
 }
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
@@ -563,7 +569,7 @@ void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_
 }
 
 Lease GuestAllocationsAcquire_nid_postfix() {
-    std::lock_guard lock(registry().mutex);
+    MemoryLockProbe::Lock lock(registry().mutex, "acquire");
     if (auto shared = registry().readableLease.lock()) return Lease(std::move(shared));
     auto ranges = std::make_shared<Lease::Ranges>();
     for (const auto& [address, range] : registry().ranges) {
@@ -574,7 +580,7 @@ Lease GuestAllocationsAcquire_nid_postfix() {
 }
 
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next) {
-    std::lock_guard lock(registry().mutex);
+    MemoryLockProbe::Lock lock(registry().mutex, "lookup");
     const auto& ranges = registry().ranges;
     auto it = ranges.upper_bound(address);
     if (it != ranges.begin()) {
@@ -590,7 +596,7 @@ std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t a
 }
 
 Lease GuestAllocationsAcquireAll_nid_postfix() {
-    std::lock_guard lock(registry().mutex);
+    MemoryLockProbe::Lock lock(registry().mutex, "acquire-all");
     if (auto shared = registry().allLease.lock()) return Lease(std::move(shared));
     auto ranges = std::make_shared<Lease::Ranges>();
     ranges->reserve(registry().ranges.size());
@@ -601,4 +607,16 @@ Lease GuestAllocationsAcquireAll_nid_postfix() {
     return Lease(std::move(ranges));
 }
 
+}
+
+MemoryLockProbe::Snapshot MemoryLockProbe::GuestAllocationLockSnapshot_nid_no_patch() {
+    return GuestAllocations::registry().mutex.Read();
+}
+
+MemoryLockProbe::Snapshot MemoryLockProbe::WindowsMappingsLockSnapshot_nid_no_patch() {
+#ifdef _WIN32
+    return GuestArena::WindowsMappings::Get().Probe();
+#else
+    return Snapshot{.stable = true};
+#endif
 }

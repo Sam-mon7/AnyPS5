@@ -838,7 +838,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     if (physStart < 0 || (static_cast<std::uint64_t>(physStart) & (PS5_PAGE_SIZE - 1)) != 0 || static_cast<std::uint64_t>(physStart) >= DIRECT_MEMORY_SIZE || len > DIRECT_MEMORY_SIZE - static_cast<std::uint64_t>(physStart)) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
-    GuestAllocations::Mutation mutation;
+    GuestAllocations::Mutation mutation("map-direct", len);
     flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
@@ -869,7 +869,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
 int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
-    GuestAllocations::Mutation mutation;
+    GuestAllocations::Mutation mutation("map-anon", len);
     flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) {
@@ -898,7 +898,7 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || (offset & (PS5_PAGE_SIZE - 1)) != 0 || len > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) || offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - len) return SCE_KERNEL_ERROR_EINVAL;
 #if defined(__linux__)
     const bool shared = (flags & 3) == 1;
-    GuestAllocations::Mutation mutation;
+    GuestAllocations::Mutation mutation("map-file", len);
     const int placementFlags = flags & (GuestMapFixedFlag | 0x80 | 0x400000);
     flags = PlaceHintInReservation(*addr, len, placementFlags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
@@ -936,7 +936,7 @@ int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     const auto nativeProtection = LinuxProtFromSce(prot);
-    GuestAllocations::Mutation mutation;
+    GuestAllocations::Mutation mutation("map-shared", len);
     void* mapped = MapPlaced(*addr, len, PROT_NONE, 0, PS5_PAGE_SIZE);
     try {
 #ifdef _WIN32
@@ -1000,7 +1000,7 @@ int DoMprotect(const void* addr, size_t len, int prot) {
         RecordProtection(insidePointer, insideBytes, prot);
         return 0;
     }
-    GuestAllocations::Mutation mutation;
+    GuestAllocations::Mutation mutation("protect", bytes);
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION memory{};
     if (VirtualQuery(pointer, &memory, sizeof(memory)) != sizeof(memory)) throw std::runtime_error("Cannot query guest memory protection range");
@@ -1049,7 +1049,7 @@ int DoMtypeprotect(const void* addr, size_t len, int type, int prot) {
 int DoMunmap(void* addr, size_t len) {
     Trace("unmap %p+0x%zx", addr, len);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || !addr) return SCE_KERNEL_ERROR_EINVAL;
-    GuestAllocations::Mutation mutation;
+    GuestAllocations::Mutation mutation("unmap", len);
     if (!mutation.Overlaps(addr, len)) return 0;
     UnmapRegistered(mutation, addr, len);
     return 0;
@@ -1058,7 +1058,7 @@ int DoMunmap(void* addr, size_t len) {
 int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
-    GuestAllocations::Mutation mutation;
+    GuestAllocations::Mutation mutation("reserve", len);
     const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
     if (fixed && mutation.Covers(*addr, len)) {
         constexpr int GuestMapNoOverwrite = 0x80;
@@ -1166,7 +1166,9 @@ std::vector<DirectMemoryView> DirectMemoryViews(int64_t start, size_t len) {
 
 void UnmapDirectMemoryViews(const std::vector<DirectMemoryView>& views) {
     if (views.empty()) return;
-    GuestAllocations::Mutation mutation;
+    std::size_t totalBytes = 0;
+    for (const auto& view : views) totalBytes += view.bytes;
+    GuestAllocations::Mutation mutation("unmap-direct-views", totalBytes);
     for (const auto& view : views) {
         Trace("unmap released view %p+0x%zx", reinterpret_cast<void*>(view.address), view.bytes);
         UnmapRegistered(mutation, reinterpret_cast<void*>(view.address), view.bytes);

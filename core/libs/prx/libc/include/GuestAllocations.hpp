@@ -52,6 +52,7 @@ using Mapped = std::vector<std::weak_ptr<const Range>>;
 
 extern "C" {
 void* GuestAllocationsBegin_nid_postfix();
+void GuestAllocationsDescribe_nid_no_patch(void* mutation, const char* operation, std::size_t bytes);
 void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation);
 #ifdef _WIN32
 void GuestAllocationsRegisterImage_nid_postfix(void* mutation, const void* image);
@@ -90,6 +91,7 @@ void GuestAllocationsNoteGpuMapping_nid_postfix(void* mutation, const void* poin
 class Mutation {
 public:
     Mutation() : handle(GuestAllocationsBegin_nid_postfix()) {}
+    Mutation(const char* operation, std::size_t bytes) : Mutation() { GuestAllocationsDescribe_nid_no_patch(handle, operation, bytes); }
     ~Mutation() { GuestAllocationsEnd_nid_postfix(handle); }
     Mutation(const Mutation&) = delete;
     Mutation& operator=(const Mutation&) = delete;

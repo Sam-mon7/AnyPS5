@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBC_INCLUDE_WINDOWSMAPPINGS_HPP
 
 #ifdef _WIN32
+#include "MemoryLockProbe.hpp"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -22,6 +23,8 @@ class WindowsMappings {
 public:
     enum class Collection { All, Armed, Fresh };
 
+    MemoryLockProbe::Snapshot Probe() const { return mutex.Read(); }
+
     static WindowsMappings& Get() {
         static WindowsMappings mappings;
         return mappings;
@@ -33,7 +36,7 @@ public:
 
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "commit", bytes);
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
         for (auto cursor = reinterpret_cast<std::uintptr_t>(address); cursor < end;) {
             const auto memory = query(cursor);
@@ -70,12 +73,12 @@ public:
     }
 
     void Reset(void* address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "reset", bytes);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "map", bytes);
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
         HANDLE duplicate = nullptr;
@@ -105,7 +108,7 @@ public:
     }
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "protect", bytes);
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
             it->second.armed = 0;
@@ -114,7 +117,7 @@ public:
     }
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "pin", bytes);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
             ++page.pins;
@@ -129,7 +132,7 @@ public:
     }
 
     void Unpin(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "unpin", bytes);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
             if (page.pins != 0) --page.pins;
@@ -138,7 +141,7 @@ public:
     }
 
     bool HandleWrite(std::uintptr_t address) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "write-fault", 1);
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
         if (found == views.end() || !writable(found->second.protection)) return false;
@@ -151,7 +154,7 @@ public:
     }
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "host-write-begin", bytes);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
         for (auto it = first; it != views.end() && it->first < end; ++it) {
@@ -171,7 +174,7 @@ public:
     }
 
     void EndHostWrite(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "host-write-end", bytes);
         const auto end = address + bytes;
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             --it->second.hostWrites;
@@ -180,7 +183,7 @@ public:
     }
 
     void* MapAlias(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "map-alias", bytes);
         const auto refuse = [&](const char* reason) {
             char text[192];
             std::snprintf(text, sizeof(text), "read-write alias of shared guest memory 0x%llx+0x%llx: %s", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), reason);
@@ -213,7 +216,7 @@ public:
     void UnmapAlias(void* alias) {
         if (alias == nullptr) return;
         {
-            std::lock_guard lock(mutex);
+            MemoryLockProbe::Lock lock(mutex, "unmap-alias", 0);
             if (const auto found = splitAliases.find(reinterpret_cast<std::uintptr_t>(alias)); found != splitAliases.end()) {
                 const auto error = releaseAlias(found->first, found->second);
                 splitAliases.erase(found);
@@ -228,7 +231,7 @@ public:
     }
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "protection", 1);
         const auto found = views.find(address & ~(pageBytes - 1));
         if (found == views.end()) return false;
         *protection = found->second.protection;
@@ -236,7 +239,7 @@ public:
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
-        std::lock_guard lock(mutex);
+        MemoryLockProbe::Lock lock(mutex, "collect", bytes);
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -604,7 +607,7 @@ private:
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::map<std::uintptr_t, std::size_t> splitAliases;
-    std::mutex mutex;
+    MemoryLockProbe::Mutex mutex;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;
