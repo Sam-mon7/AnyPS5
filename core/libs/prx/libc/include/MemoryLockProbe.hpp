@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBC_INCLUDE_MEMORYLOCKPROBE_HPP
 #define CORE_LIBS_PRX_LIBC_INCLUDE_MEMORYLOCKPROBE_HPP
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -49,6 +50,151 @@ inline std::uint64_t Thread() {
 #endif
 }
 
+enum class MapStep { None, Lock, Reset, Setup, Split, MapView, QueryCommit, Protect, Bookkeeping };
+inline constexpr std::array<const char*, 9> MapStepNames{"none", "lock", "reset", "setup", "split", "mapview", "query_commit", "protect", "bookkeeping"};
+
+struct MapTimes {
+    std::uint64_t thread = 0, bytes = 0, pages = 0, sinceNs = 0, endNs = 0, cpuNs = 0;
+    bool cpuValid = false, failed = false;
+    std::array<std::uint64_t, 8> steps{};
+};
+
+struct MapDetails {
+    bool stable = false;
+    std::uint64_t calls = 0, cpuFailures = 0, stepSinceNs = 0, completedPages = 0;
+    MapStep step = MapStep::None;
+    MapTimes total, last, slowest;
+};
+
+class MapProbe {
+    struct AtomicTimes {
+        std::atomic<std::uint64_t> thread{0}, bytes{0}, pages{0}, sinceNs{0}, endNs{0}, cpuNs{0};
+        std::atomic<bool> cpuValid{false}, failed{false};
+        std::array<std::atomic<std::uint64_t>, 8> steps{};
+
+        MapTimes Read() const {
+            MapTimes result{thread.load(), bytes.load(), pages.load(), sinceNs.load(), endNs.load(), cpuNs.load(), cpuValid.load(), failed.load()};
+            for (std::size_t i = 0; i < steps.size(); ++i) result.steps[i] = steps[i].load();
+            return result;
+        }
+        void Store(const MapTimes& value) {
+            thread.store(value.thread); bytes.store(value.bytes); pages.store(value.pages);
+            sinceNs.store(value.sinceNs); endNs.store(value.endNs); cpuNs.store(value.cpuNs);
+            cpuValid.store(value.cpuValid); failed.store(value.failed);
+            for (std::size_t i = 0; i < steps.size(); ++i) steps[i].store(value.steps[i]);
+        }
+    };
+
+    static bool cpuTime(std::uint64_t& result) {
+#ifdef _WIN32
+        FILETIME created{}, exited{}, kernel{}, user{};
+        if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return false;
+        const auto ticks = [](FILETIME time) { return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime; };
+        result = (ticks(kernel) + ticks(user)) * 100;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+public:
+    struct Start {
+        bool enabled = Enabled(), cpuValid = false;
+        std::uint64_t wallNs = 0, cpuNs = 0;
+        Start() {
+            if (!enabled) return;
+            wallNs = Now();
+            cpuValid = cpuTime(cpuNs);
+        }
+    };
+
+    class Timer {
+    public:
+        Timer(MapProbe& probe, const Start& start, std::uint64_t bytes) : probe(probe), start(start) {
+            if (!start.enabled) return;
+            times.thread = Thread();
+            times.bytes = bytes;
+            times.sinceNs = start.wallNs;
+            currentSince = Now();
+            times.steps[0] = currentSince - start.wallNs;
+            current = MapStep::Reset;
+            exceptions = std::uncaught_exceptions();
+            publish();
+        }
+        ~Timer() {
+            if (!start.enabled) return;
+            times.endNs = Now();
+            times.steps[static_cast<std::size_t>(current) - 1] += times.endNs - currentSince;
+            std::uint64_t cpu = 0;
+            times.cpuValid = start.cpuValid && cpuTime(cpu) && cpu >= start.cpuNs;
+            if (times.cpuValid) times.cpuNs = cpu - start.cpuNs;
+            times.failed = std::uncaught_exceptions() > exceptions;
+            probe.version.fetch_add(1);
+            probe.calls.fetch_add(1);
+            if (!times.cpuValid) probe.cpuFailures.fetch_add(1);
+            auto total = probe.total.Read();
+            total.bytes += times.bytes;
+            total.pages += times.pages;
+            total.endNs += times.endNs - times.sinceNs;
+            total.cpuNs += times.cpuNs;
+            total.cpuValid = probe.cpuFailures.load() == 0;
+            total.failed = total.failed || times.failed;
+            for (std::size_t i = 0; i < times.steps.size(); ++i) total.steps[i] += times.steps[i];
+            probe.total.Store(total);
+            probe.last.Store(times);
+            const auto slowest = probe.slowest.Read();
+            if (times.endNs - times.sinceNs >= slowest.endNs - slowest.sinceNs) probe.slowest.Store(times);
+            probe.step.store(MapStep::None);
+            probe.stepSinceNs.store(0);
+            probe.completedPages.store(0);
+            probe.version.fetch_add(1);
+        }
+        Timer(const Timer&) = delete;
+        Timer& operator=(const Timer&) = delete;
+
+        void Step(MapStep next) {
+            if (!start.enabled) return;
+            const auto now = Now();
+            times.steps[static_cast<std::size_t>(current) - 1] += now - currentSince;
+            current = next;
+            currentSince = now;
+            publish();
+        }
+        void PageDone() { if (start.enabled) ++times.pages; }
+
+    private:
+        void publish() {
+            probe.version.fetch_add(1);
+            probe.step.store(current);
+            probe.stepSinceNs.store(currentSince);
+            probe.completedPages.store(times.pages);
+            probe.version.fetch_add(1);
+        }
+        MapProbe& probe;
+        const Start& start;
+        MapTimes times;
+        MapStep current = MapStep::None;
+        std::uint64_t currentSince = 0;
+        int exceptions = 0;
+    };
+
+    MapDetails Read() const {
+        if (!Enabled()) return MapDetails{.stable = true};
+        for (int attempt = 0; attempt != 3; ++attempt) {
+            const auto before = version.load();
+            if ((before & 1) != 0) continue;
+            MapDetails result{true, calls.load(), cpuFailures.load(), stepSinceNs.load(), completedPages.load(), step.load(), total.Read(), last.Read(), slowest.Read()};
+            if (version.load() == before) return result;
+        }
+        return {};
+    }
+
+private:
+    std::atomic<std::uint64_t> version{0}, calls{0}, cpuFailures{0}, stepSinceNs{0}, completedPages{0};
+    std::atomic<MapStep> step{MapStep::None};
+    AtomicTimes total, last, slowest;
+};
+
 struct Snapshot {
     bool stable = false;
     std::uint64_t thread = 0;
@@ -66,6 +212,7 @@ struct Snapshot {
     std::uint64_t lastMapBytes = 0;
     std::uint64_t lastMapSinceNs = 0;
     std::uint64_t lastMapEndNs = 0;
+    MapDetails mapDetails;
 };
 
 class Lock;

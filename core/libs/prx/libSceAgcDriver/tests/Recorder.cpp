@@ -7626,6 +7626,44 @@ void memoryLockProbeTests() {
     const bool enabled = MemoryLockProbe::Enabled();
     MemoryLockProbe::Mutex mutex;
     const auto tid = MemoryLockProbe::Thread();
+    MemoryLockProbe::MapProbe mapProbe;
+    {
+        const MemoryLockProbe::MapProbe::Start started;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        MemoryLockProbe::Lock lock(mutex, "timing-test");
+        MemoryLockProbe::MapProbe::Timer timer(mapProbe, started, 16384);
+        timer.Step(MemoryLockProbe::MapStep::MapView);
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        MemoryLockProbe::MapDetails detail;
+        std::jthread reader([&] { detail = mapProbe.Read(); });
+        reader.join();
+        if (enabled) Require(detail.stable && detail.step == MemoryLockProbe::MapStep::MapView && detail.stepSinceNs != 0 && detail.calls == 0, "map probe cannot sample a running step");
+        timer.Step(MemoryLockProbe::MapStep::Bookkeeping);
+        timer.PageDone();
+    }
+    auto detail = mapProbe.Read();
+    if (enabled) {
+        const auto& last = detail.last;
+        Require(detail.stable && detail.calls == 1 && detail.step == MemoryLockProbe::MapStep::None && last.thread == tid && last.bytes == 16384 && last.pages == 1, "map probe lost a completed map");
+        Require(last.steps[0] >= 20000000 && last.steps[4] >= 20000000, "map probe lost lock wait or map step time");
+        std::uint64_t accounted = 0;
+        for (const auto step : last.steps) accounted += step;
+        Require(accounted == last.endNs - last.sinceNs && detail.total.endNs == accounted && detail.slowest.endNs == last.endNs, "map step accounting lost wall time");
+#ifdef _WIN32
+        Require(last.cpuValid && detail.cpuFailures == 0, "map probe could not query thread CPU time");
+#endif
+    } else {
+        Require(detail.stable && detail.calls == 0 && detail.last.endNs == 0, "disabled map probe recorded timings");
+    }
+    try {
+        const MemoryLockProbe::MapProbe::Start started;
+        MemoryLockProbe::Lock lock(mutex, "timing-failed");
+        MemoryLockProbe::MapProbe::Timer timer(mapProbe, started, 32768);
+        timer.Step(MemoryLockProbe::MapStep::Protect);
+        throw std::runtime_error("map timing unwind");
+    } catch (const std::runtime_error&) {}
+    detail = mapProbe.Read();
+    if (enabled) Require(detail.calls == 2 && detail.last.failed && detail.step == MemoryLockProbe::MapStep::None && detail.total.bytes == 49152, "map timing failed to finish after exception");
     {
         MemoryLockProbe::Lock lock(mutex, "map-test", 32768);
         MemoryLockProbe::Snapshot sampled;
@@ -7658,6 +7696,18 @@ void memoryLockProbeTests() {
     const auto after = MemoryLockProbe::WindowsMappingsLockSnapshot_nid_no_patch();
     Require(after.stable && after.thread == 0, "Windows mapping probe retains released owner");
     if (enabled) Require(after.maps == before.maps + 1 && after.lastMapThread == tid && after.lastMapBytes == bytes && std::string_view(after.lastMapOperation) == "map", "Windows mapping probe missed actual map in libc");
+    if (enabled) {
+        const auto& timing = after.mapDetails;
+        Require(timing.stable && timing.calls == before.mapDetails.calls + 1 && timing.last.thread == tid && timing.last.bytes == bytes && timing.last.pages == 2 && timing.last.cpuValid && !timing.last.failed, "Windows map step probe missed actual two-page map");
+        std::uint64_t accounted = 0;
+        for (const auto step : timing.last.steps) {
+            Require(step != 0, "Windows map probe missed a step");
+            accounted += step;
+        }
+        Require(accounted == timing.last.endNs - timing.last.sinceNs, "Windows map steps do not account for whole map call");
+    } else {
+        Require(after.mapDetails.calls == 0, "disabled Windows map probe recorded a map");
+    }
     std::memset(memory, 0x5a, bytes);
     Require(static_cast<const unsigned char*>(memory)[bytes - 1] == 0x5a, "Windows mapping changed content");
     GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);

@@ -23,7 +23,11 @@ class WindowsMappings {
 public:
     enum class Collection { All, Armed, Fresh };
 
-    MemoryLockProbe::Snapshot Probe() const { return mutex.Read(); }
+    MemoryLockProbe::Snapshot Probe() const {
+        auto result = mutex.Read();
+        result.mapDetails = mapProbe.Read();
+        return result;
+    }
 
     static WindowsMappings& Get() {
         static WindowsMappings mappings;
@@ -78,21 +82,29 @@ public:
     }
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection) {
+        const MemoryLockProbe::MapProbe::Start started;
         MemoryLockProbe::Lock lock(mutex, "map", bytes);
+        MemoryLockProbe::MapProbe::Timer timer(mapProbe, started, bytes);
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
+        timer.Step(MemoryLockProbe::MapStep::Setup);
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) fail("keep shared guest section");
         const auto owned = std::make_shared<Section>(duplicate);
         for (std::size_t done = 0; done < bytes; done += pageBytes) {
+            timer.Step(MemoryLockProbe::MapStep::Split);
             split(cursor + done, pageBytes);
             void* page = reinterpret_cast<void*>(cursor + done);
+            timer.Step(MemoryLockProbe::MapStep::MapView);
             if (!map(section, GetCurrentProcess(), page, offset + done, pageBytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map shared guest page");
+            timer.Step(MemoryLockProbe::MapStep::QueryCommit);
             MEMORY_BASIC_INFORMATION memory{};
             if (VirtualQuery(page, &memory, sizeof(memory)) != sizeof(memory)) fail("query shared guest page");
             if (memory.State == MEM_RESERVE && !VirtualAlloc(page, pageBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
             DWORD previous;
+            timer.Step(MemoryLockProbe::MapStep::Protect);
             if (!VirtualProtect(page, pageBytes, protection, &previous)) fail("protect shared guest page");
+            timer.Step(MemoryLockProbe::MapStep::Bookkeeping);
             const auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done);
             auto shared = physical[key].lock();
             if (!shared) {
@@ -104,6 +116,7 @@ public:
             views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0});
             remember(freshRanges, base, base + pageBytes);
             invalidate(*shared);
+            timer.PageDone();
         }
     }
 
@@ -608,6 +621,7 @@ private:
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::map<std::uintptr_t, std::size_t> splitAliases;
     MemoryLockProbe::Mutex mutex;
+    MemoryLockProbe::MapProbe mapProbe;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;
