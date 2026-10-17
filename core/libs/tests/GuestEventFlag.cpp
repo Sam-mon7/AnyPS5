@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <cstring>
 
 extern "C" {
 int APS5_VABI sceKernelCreateEventFlag(KernelEventFlag*, const char*, uint32_t, uint64_t, const void*);
@@ -17,6 +18,12 @@ int APS5_VABI sceKernelWaitEventFlag(KernelEventFlag, uint64_t, uint32_t, uint64
 
 static void Require(bool value) { if (!value) std::abort(); }
 
+[[gnu::noinline]] static uint64_t WaitAtSelectedSite(KernelEventFlag flag) {
+    uint64_t pattern = 0;
+    Require(sceKernelWaitEventFlag(flag, 1, 0x11, &pattern, nullptr) == 0);
+    return pattern;
+}
+
 static void AwaitWaiter(KernelEventFlag flag) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (sceKernelPollEventFlag(flag, 1, 1, nullptr) != static_cast<int>(0x80020001u)) {
@@ -25,21 +32,24 @@ static void AwaitWaiter(KernelEventFlag flag) {
     }
 }
 
-int main(int argc, char**) {
+int main(int argc, char** argv) {
     KernelEventFlag flag = nullptr, other = nullptr;
     Require(sceKernelCreateEventFlag(&flag, "trace-target", 0x10, 0, nullptr) == 0);
     Require(sceKernelCreateEventFlag(&other, "trace-other", 0x10, 0, nullptr) == 0);
     char address[32] = {};
-    if (argc > 1) std::snprintf(address, sizeof(address), "0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(flag)));
+    if (argc > 1 && std::strcmp(argv[1], "trace") == 0) std::snprintf(address, sizeof(address), "0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(flag)));
 #ifdef _WIN32
     Require(_putenv_s("APS5_TRACE_EVENT_FLAG", address) == 0);
 #else
     Require(setenv("APS5_TRACE_EVENT_FLAG", address, 1) == 0);
 #endif
     Require(sceKernelSetEventFlag(other, 1) == 0);
+    std::thread otherWaiter([&] { Require(WaitAtSelectedSite(other) == 1); });
+    otherWaiter.join();
     Require(sceKernelSetEventFlag(flag, 3) == 0);
     uint64_t pattern = 0;
-    Require(sceKernelWaitEventFlag(flag, 1, 0x11, &pattern, nullptr) == 0 && pattern == 3);
+    Require(WaitAtSelectedSite(flag) == 3);
+    Require(sceKernelSetEventFlag(other, 1) == 0);
     Require(sceKernelPollEventFlag(flag, 1, 1, &pattern) == static_cast<int>(0x80020010u) && pattern == 0);
     Require(sceKernelSetEventFlag(flag, 7) == 0);
     Require(sceKernelClearEventFlag(flag, ~uint64_t{2}) == 0);

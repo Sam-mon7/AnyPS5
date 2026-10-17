@@ -11,8 +11,11 @@
 #include <cstdlib>
 #include <functional>
 #include <thread>
+#include <atomic>
+#include <cstring>
 #ifdef _WIN32
 #include <windows.h>
+static const DWORD eventFlagLoadThread = GetCurrentThreadId();
 #endif
 
 static constexpr int SCE_OK = 0;
@@ -48,19 +51,31 @@ static bool TraceSync() {
     return enabled;
 }
 
+static std::uintptr_t TraceAddress(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return 0;
+    char* end = nullptr;
+    const auto address = std::strtoull(value, &end, 0);
+    return end != value && *end == '\0' ? static_cast<std::uintptr_t>(address) : 0;
+}
+
 static void TraceEventFlag(KernelEventFlag flag, const char* operation, uint64_t bits, uint32_t mode, uint64_t before, const void* caller, int result = 0, int64_t timeout = -1) {
-    static const auto target = [] {
-        const char* value = std::getenv("APS5_TRACE_EVENT_FLAG");
-        if (value == nullptr || value[0] == '\0') return std::uintptr_t{0};
-        char* end = nullptr;
-        const auto address = std::strtoull(value, &end, 0);
-        return end != value && *end == '\0' ? static_cast<std::uintptr_t>(address) : std::uintptr_t{0};
-    }();
-    if (target == 0 || reinterpret_cast<std::uintptr_t>(flag) != target) return;
+    static const auto target = TraceAddress("APS5_TRACE_EVENT_FLAG");
 #ifdef _WIN32
+    static const auto waitCaller = [] {
+        const auto address = TraceAddress("APS5_TRACE_EVENT_FLAG_WAIT_CALLER_RVA");
+        if (address != 0) std::fprintf(stderr, "[event-flag-target] wait-caller-rva=0x%llx load-tid=%lu image=%p\n", static_cast<unsigned long long>(address), eventFlagLoadThread, static_cast<void*>(GetModuleHandleW(nullptr)));
+        return address;
+    }();
+    static std::atomic<std::uintptr_t> selected{0};
+    if (target == 0 && waitCaller == 0) return;
     const auto thread = static_cast<unsigned long long>(GetCurrentThreadId());
-    const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    static const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    if (target == 0 && thread == eventFlagLoadThread && reinterpret_cast<std::uintptr_t>(caller) - image == waitCaller && std::strcmp(operation, "wait-begin") == 0)
+        selected.store(reinterpret_cast<std::uintptr_t>(flag), std::memory_order_relaxed);
+    if (reinterpret_cast<std::uintptr_t>(flag) != (target ? target : selected.load(std::memory_order_relaxed))) return;
 #else
+    if (target == 0 || reinterpret_cast<std::uintptr_t>(flag) != target) return;
     const auto thread = static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
     const std::uintptr_t image = 0;
 #endif
