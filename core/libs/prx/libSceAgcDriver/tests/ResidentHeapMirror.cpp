@@ -555,8 +555,13 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         GuestAllocations::Mutation().Remove(metadata.data());
         checkRead(dispatch(false), label);
         prepared = capture();
+        Require(HostImportsIdentity(context).device == VK_NULL_HANDLE, "dispatch heap fixture unexpectedly has host imports");
+        const auto beforeImportClear = DispatchHeapRefreshCounters();
         ClearHostImports(context.device);
-        checkFallback(prepared, label);
+        checkRead(dispatch(false, {}, prepared), label);
+        const auto afterImportClear = DispatchHeapRefreshCounters();
+        Require(afterImportClear.applied == beforeImportClear.applied + (enabled ? 1 : 0) &&
+            afterImportClear.fallback == beforeImportClear.fallback, "clearing absent imports invalidated a current dispatch heap plan");
         prepared = capture();
         ClearImageMirrors(context.device);
         checkFallback(prepared, label);

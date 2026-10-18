@@ -16,6 +16,12 @@
 #include <windows.h>
 #endif
 
+namespace AgcDriver {
+struct VulkanDeviceTestAccess {
+    static std::weak_ptr<Graphics::BufferPool> Pool(const VulkanDevice& device) { return device.graphicsContext().bufferPool; }
+};
+}
+
 namespace {
 
 using namespace AgcDriver::Graphics;
@@ -114,6 +120,8 @@ void Run(std::shared_ptr<AgcDriver::VulkanDevice>& device, GuestBlock& guest) {
     std::atomic<bool> ready{false}, release{false};
     std::exception_ptr error;
     const std::weak_ptr<AgcDriver::VulkanDevice> alive = device;
+    const auto pool = AgcDriver::VulkanDeviceTestAccess::Pool(*device);
+    Require(!pool.expired(), "production heap fixture has no retained buffer pool");
     {
         std::jthread worker([owner = device, &shader, &ready, &release, &error]() mutable {
             try {
@@ -138,6 +146,7 @@ void Run(std::shared_ptr<AgcDriver::VulkanDevice>& device, GuestBlock& guest) {
         worker.join();
         if (error) std::rethrow_exception(error);
         Require(preparedBeforeTeardown && held && alive.expired(), "prepared dispatch device ownership did not span teardown");
+        Require(pool.expired(), "production dispatch heap buffers outlived their Vulkan device");
     }
     device = std::make_shared<AgcDriver::VulkanDevice>();
     words[0] = 0x66778899u;
