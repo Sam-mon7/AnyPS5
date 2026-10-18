@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureDuplicates.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -70,6 +71,11 @@ VkComponentMapping ViewComponents(const GuestTextureResource& resource) {
     return {channel(resource.dstSelX), channel(resource.dstSelY), channel(resource.dstSelZ), channel(resource.dstSelW)};
 }
 
+bool TextureDedupe() {
+    static const bool enabled = std::getenv("APS5_TEXTURE_DEDUPE") != nullptr;
+    return enabled;
+}
+
 // Sampled textures are reused across draws and dispatches while their guest bytes are unchanged; a
 // byte copy of the guest surface validates each reuse, so CPU or GPU writes to it force a re-upload.
 // The key is everything a lookup matches: the device, the eight descriptor words and the swizzle.
@@ -100,6 +106,7 @@ TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words,
     std::copy(words.begin(), words.end(), key.words.begin());
     key.words[5] &= ~((0xfffu << 8u) | (1u << 25u));
     key.words[6] &= ~0xffu;
+    if (TextureDedupe()) CanonicalizeTextureWords(key.words);
     return key;
 }
 
@@ -132,6 +139,7 @@ struct TextureCache {
     std::list<CachedTexture> entries;
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
+    std::unordered_multimap<std::uint64_t, std::list<CachedTexture>::iterator> byAddress;
     std::uint64_t bytes = 0;
     std::uint64_t snapshotBytes = 0;
     std::uint64_t omittedSnapshotBytes = 0;
@@ -163,6 +171,8 @@ struct TextureCache {
         std::uint64_t importTextures = 0;
         std::uint64_t importBytes = 0;
         std::array<std::uint64_t, 5> importFallbacks{};
+        std::uint64_t superseded = 0;
+        std::uint64_t supersededBytes = 0;
     } counts;
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
     VkPhysicalDevice budgetDevice = VK_NULL_HANDLE;
@@ -379,11 +389,41 @@ void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
             }
         }
     }
+    if (TextureDedupe()) {
+        for (auto [entry, last] = cache.byAddress.equal_range(it->address); entry != last; ++entry) {
+            if (entry->second == it) {
+                cache.byAddress.erase(entry);
+                break;
+            }
+        }
+    }
     if (it->texture.use_count() > 1) noteReleased(it->texture);
     spareSnapshot(cache, std::move(it->bytes));
     cache.index.erase(it->key);
     cache.entries.erase(it);
     ++cache.erasures;
+}
+
+bool snapshotStale(const CachedTexture& entry) {
+    if (entry.source != nullptr || entry.mirrorProof.identity != 0 || entry.generation == 0) return false;
+    if (entry.committed.has_value()) return !GuestMemory::UnchangedCommittedSince(*entry.committed, entry.generation);
+    return !GuestMemory::UnchangedSince(entry.address, entry.surfaceBytes, entry.generation);
+}
+
+void dropSupersededTextures(TextureCache& cache, const TextureKey& key, std::uint64_t address, std::span<const std::byte> current) {
+    const auto present = Recorder::Presents();
+    std::vector<std::list<CachedTexture>::iterator> victims;
+    for (auto [entry, last] = cache.byAddress.equal_range(address); entry != last; ++entry) {
+        const auto it = entry->second;
+        if (it->key == key || it->key.device != key.device || it->present + 1u >= present || it->texture.use_count() > 1 || !snapshotStale(*it)) continue;
+        if (!current.empty() && it->bytes.size() == current.size() && std::memcmp(it->bytes.data(), current.data(), current.size()) == 0) continue;
+        victims.push_back(it);
+    }
+    for (const auto victim : victims) {
+        ++cache.counts.superseded;
+        cache.counts.supersededBytes += victim->accounted;
+        eraseTexture(cache, victim);
+    }
 }
 
 void dropUncachedViews(TextureCache& cache) {
@@ -516,6 +556,8 @@ void reportPrint(const char* format, TArgs... args) {
     else std::fprintf(stderr, format, args...);
 }
 
+void reportTextureDuplicates(TextureCache& cache, const TextureCache::Counts& counts);
+
 void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || textureCacheReport();
     if (!profile) return;
@@ -527,6 +569,7 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     if (Texture::ImportDetileEnabled()) reportPrint("[texture-import] (10 s): %llu textures (%llu MiB) detiled straight from imported guest pages, no snapshot or staging copy; %llu kept the snapshot path: %llu DCC surfaces, %llu without write stamps or partly resident, %llu under 64 KiB, %llu not imported, %llu lost their import\n", static_cast<unsigned long long>(counts.importTextures), static_cast<unsigned long long>(counts.importBytes >> 20u), static_cast<unsigned long long>(std::accumulate(counts.importFallbacks.begin(), counts.importFallbacks.end(), std::uint64_t{0})), static_cast<unsigned long long>(counts.importFallbacks[0]), static_cast<unsigned long long>(counts.importFallbacks[1]), static_cast<unsigned long long>(counts.importFallbacks[2]), static_cast<unsigned long long>(counts.importFallbacks[3]), static_cast<unsigned long long>(counts.importFallbacks[4]));
     reportPrint("[texture-snapshots] cache CPU bytes: %llu retained, %llu omitted; %llu resnapshots after failed proof; %llu snapshots made (%llu MiB), %llu of them in reused buffers, %llu MiB spare (10 s)\n", static_cast<unsigned long long>(cache.snapshotBytes), static_cast<unsigned long long>(cache.omittedSnapshotBytes), static_cast<unsigned long long>(counts.resnapshots), static_cast<unsigned long long>(counts.snapshotsMade), static_cast<unsigned long long>(counts.snapshotBytesMade >> 20u), static_cast<unsigned long long>(counts.snapshotsReused), static_cast<unsigned long long>(cache.spareBytes >> 20u));
     if (VramTextures()) reportPrint("[texture-mirrors] cumulative: %llu GPU snapshots, %llu storage detiles, %llu CPU snapshots\n", static_cast<unsigned long long>(cache.mirrorSnapshotsMade), static_cast<unsigned long long>(StorageTexture::MirrorUploads()), static_cast<unsigned long long>(cache.snapshotsMade));
+    reportTextureDuplicates(cache, counts);
 }
 
 struct ImageMemoEntry {
@@ -1046,6 +1089,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
+    if (TextureDedupe()) dropSupersededTextures(cache, key, address, entry.bytes);
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
     const bool pressured = TextureAgeEviction() && context.bufferPool != nullptr && VramBudget::PressureFor(context.bufferPool->Vram().Current()).victims != 0;
@@ -1068,6 +1112,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
+    if (TextureDedupe()) cache.byAddress.emplace(address, cache.entries.begin());
     reportCacheCounts(cache, budget);
     reportTextureCounters();
     if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
@@ -1111,6 +1156,102 @@ StorageTextureCache& StorageTextures() {
 
 std::uint64_t storageCacheBytes() {
     return StorageTextures().bytes.load(std::memory_order_relaxed);
+}
+
+void describeTextureCopy(const GuestTextureResource& resource, TextureCopy& copy) {
+    copy.pipeBankXor = resource.pipeBankXor;
+    copy.width = resource.width;
+    copy.height = resource.height;
+    copy.depth = resource.depthOrLastArray;
+    copy.mips = resource.mipCount;
+    copy.dimension = static_cast<std::uint32_t>(resource.dimension);
+    copy.tile = static_cast<std::uint32_t>(resource.tileMode);
+    copy.format = resource.format;
+    copy.elementBytes = BytesPerElement(resource.format);
+    copy.blockWidth = BlockWidth(resource.format);
+    copy.compressed = IsBlockCompressed(resource.format);
+    copy.baseLevel = resource.baseLevel;
+    copy.lastLevel = resource.lastLevel;
+    copy.baseArray = resource.baseArray;
+    copy.minLod = static_cast<std::uint32_t>(EffectiveMinLod(resource) * 256.0f);
+    copy.other = resource.dccAddress ^ (static_cast<std::uint64_t>(resource.bcSwizzle) << 56u);
+}
+
+std::optional<TextureCopy> sampledTextureCopy(const CachedTexture& entry) {
+    TextureCopy copy;
+    copy.address = entry.address;
+    copy.guestBytes = entry.surfaceBytes;
+    copy.counted = entry.accounted;
+    copy.used = entry.present;
+    copy.depthCompare = entry.key.depthCompare;
+    copy.components = entry.key.components;
+    copy.stale = snapshotStale(entry);
+    if (entry.source != nullptr) copy.backing = entry.texture->IsDepthCopy() ? TextureBacking::DepthCopy : TextureBacking::StorageView;
+    else copy.backing = entry.mirrorProof.identity != 0 ? TextureBacking::Mirror : TextureBacking::Snapshot;
+    copy.gpuBytes = copy.backing == TextureBacking::StorageView ? 0u : entry.texture->AllocationBytes();
+    try {
+        describeTextureCopy(DecodeTextureResource(entry.key.words), copy);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return copy;
+}
+
+TextureCopy storageTextureCopy(const StorageTexture& image) {
+    TextureCopy copy;
+    copy.address = image.Descriptor().baseAddress;
+    copy.guestBytes = image.GuestBytes();
+    copy.gpuBytes = image.AllocationBytes();
+    copy.counted = copy.gpuBytes;
+    copy.used = ~std::uint64_t{0};
+    copy.backing = TextureBacking::Storage;
+    describeTextureCopy(image.Descriptor(), copy);
+    return copy;
+}
+
+void reportTextureDuplicates(TextureCache& cache, const TextureCache::Counts& counts) {
+    try {
+        std::vector<TextureCopy> copies;
+        copies.reserve(cache.entries.size() + 64u);
+        std::unordered_set<const StorageTexture*> listed;
+        std::size_t undecoded = 0;
+        bool storageBusy = false;
+        {
+            auto& storage = StorageTextures();
+            std::unique_lock lock(storage.mutex, std::try_to_lock);
+            storageBusy = !lock.owns_lock();
+            if (!storageBusy) {
+                for (const auto& entry : storage.entries) {
+                    listed.insert(entry.texture.get());
+                    copies.push_back(storageTextureCopy(*entry.texture));
+                }
+            }
+        }
+        const auto cachedImages = copies.size();
+        for (const auto& entry : cache.entries) {
+            if (entry.source != nullptr && listed.insert(entry.source.get()).second) copies.push_back(storageTextureCopy(*entry.source));
+            if (const auto copy = sampledTextureCopy(entry)) copies.push_back(*copy);
+            else ++undecoded;
+        }
+        const auto summary = SummarizeTextureDuplicates(copies);
+        const auto mib = [](std::uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0; };
+        const auto count = [](std::size_t value) { return static_cast<unsigned long long>(value); };
+        const auto& kinds = summary.kinds;
+        const auto& fields = summary.viewFields;
+        reportPrint("[texture-duplicates] (10 s): %llu sampled entries, %llu storage images (%llu cached%s); %llu device images hold %.0f MiB at %llu guest addresses; %llu addresses hold more than one copy, %.0f MiB in the extra copies\n", count(cache.entries.size()), count(listed.size()), count(cachedImages), storageBusy ? ", the cache's list was busy" : "", count(summary.images), mib(summary.heldBytes), count(summary.ranges), count(summary.duplicatedRanges), mib(summary.extraBytes));
+        reportPrint("[texture-duplicates] extra copies by kind: %s %llu (%.0f MiB), %s %llu (%.0f MiB), %s %llu (%.0f MiB), %s %llu (%.0f MiB), %s %llu (%.0f MiB), %s %llu (%.0f MiB)\n",
+            DuplicateKindName(DuplicateKind::SampledStorage), count(kinds[0].copies), mib(kinds[0].bytes), DuplicateKindName(DuplicateKind::ViewVariant), count(kinds[1].copies), mib(kinds[1].bytes), DuplicateKindName(DuplicateKind::SameDescriptor), count(kinds[2].copies), mib(kinds[2].bytes),
+            DuplicateKindName(DuplicateKind::FormatVariant), count(kinds[3].copies), mib(kinds[3].bytes), DuplicateKindName(DuplicateKind::ShapeVariant), count(kinds[4].copies), mib(kinds[4].bytes), DuplicateKindName(DuplicateKind::Superseded), count(kinds[5].copies), mib(kinds[5].bytes));
+        reportPrint("[texture-duplicates] view variants differ in (a copy counts under each field): %s %llu (%.0f MiB), %s %llu (%.0f MiB), %s %llu (%.0f MiB), %s %llu (%.0f MiB), %s %llu (%.0f MiB)\n",
+            ViewFieldName(0), count(fields[0].copies), mib(fields[0].bytes), ViewFieldName(1), count(fields[1].copies), mib(fields[1].bytes), ViewFieldName(2), count(fields[2].copies), mib(fields[2].bytes), ViewFieldName(3), count(fields[3].copies), mib(fields[3].bytes), ViewFieldName(4), count(fields[4].copies), mib(fields[4].bytes));
+        reportPrint("[texture-duplicates] %llu stale snapshots hold %.0f MiB; %llu images (%.0f MiB) overlap a copy at a lower base address, %llu of them (%.0f MiB) lie wholly inside one; %llu depth copies hold %.0f MiB, %.0f MiB of it outside the cache budget; %llu sampled entries not decoded\n", count(summary.stale.copies), mib(summary.stale.bytes), count(summary.overlapping.copies), mib(summary.overlapping.bytes), count(summary.nested.copies), mib(summary.nested.bytes), count(summary.depthCopies.copies), mib(summary.depthCopies.bytes), mib(summary.uncounted.bytes), count(undecoded));
+        for (std::size_t rank = 0; rank < summary.top.size(); ++rank) {
+            const auto& range = summary.top[rank];
+            reportPrint("[texture-duplicates] top %zu: 0x%llx %ux%u mips %u format %u: %llu copies hold %.1f MiB, %.1f MiB extra (%s)\n", rank + 1u, static_cast<unsigned long long>(range.address), range.width, range.height, range.mips, range.format, count(range.copies), mib(range.heldBytes), mib(range.extraBytes), DescribeDuplicateKinds(range).c_str());
+        }
+        if (TextureDedupe()) reportPrint("[texture-dedupe] (10 s): %llu superseded snapshots dropped, %.0f MiB\n", static_cast<unsigned long long>(counts.superseded), mib(counts.supersededBytes));
+    } catch (const std::exception&) {
+    }
 }
 
 std::list<CachedStorageTexture>::iterator findStorage(StorageTextureCache& cache, const StorageKey& key) {
