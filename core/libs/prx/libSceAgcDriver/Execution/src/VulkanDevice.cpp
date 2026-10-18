@@ -2064,8 +2064,9 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     // import table. Debug aid: APS5_NO_OPPORTUNISTIC_REAP=1 skips it.
     if (OpportunisticReap()) recorder.Reap();
     const auto context = graphicsContext();
-    const Graphics::HostImport* import = Graphics::HostImportFor(context, address, bytes);
-    if (import == nullptr) return false;
+    const bool mirrorFill = Graphics::VramLazyWrites() && Graphics::LazyMirrorFillCovers(context, address, bytes);
+    const Graphics::HostImport* import = mirrorFill ? nullptr : Graphics::HostImportForFill(context, address, bytes);
+    if (import == nullptr && !mirrorFill) return false;
     // Earlier recorded work that stores into the range must land before the fill, or it would
     // overwrite the fill later. Stores the GPU makes (direct dispatch writes, GPU labels, earlier
     // fills, GPU-direct write-backs) are ordered by the fill's own barrier below (ALL_COMMANDS ->
@@ -2118,8 +2119,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
             syncedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - syncStart).count();
             // The sync ran completions, whose write-backs can refresh the import table and retire
             // the import looked up above; the caller stores the fill itself when it is gone.
-            import = Graphics::HostImportFor(context, address, bytes);
-            if (import == nullptr) return false;
+            if (mirrorFill ? !Graphics::LazyMirrorFillCovers(context, address, bytes) : (import = Graphics::HostImportForFill(context, address, bytes)) == nullptr) return false;
         } else {
             ++ordered;
         }
@@ -2175,6 +2175,8 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     }
     // A queued label store over the range lands before the fill (program order).
     recorder.FlushStoresOverlapping(address, bytes);
+    const auto lazyFill = mirrorFill ? Graphics::BeginLazyMirrorFill(context, recorder, address, bytes) : Graphics::LazyMirrorFill{};
+    const VkBuffer target = mirrorFill ? lazyFill.buffer : import->buffer;
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
@@ -2191,15 +2193,15 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         Graphics::Recorder::CountBarriers(CommandClass::Fill);
     }
-    const auto offset = address - import->base;
+    const auto offset = mirrorFill ? lazyFill.offset : address - import->base;
     if (uniform) {
         ++uniformFills;
-        context.Resolved(&Graphics::DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, import->buffer, offset, bytes, pattern[0]);
+        context.Resolved(&Graphics::DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, target, offset, bytes, pattern[0]);
     } else if (patternBuffer != nullptr) {
         ++patternFills;
         std::vector<VkBufferCopy> copies;
         for (std::size_t done = 0; done < bytes; done += PatternBufferBytes) copies.push_back({0, offset + done, std::min(PatternBufferBytes, bytes - done)});
-        Graphics::CopyBuffers(context, commands, patternBuffer->Handle(), import->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
+        Graphics::CopyBuffers(context, commands, patternBuffer->Handle(), target, static_cast<std::uint32_t>(copies.size()), copies.data());
     } else {
         ++patternFills;
         // A 16-byte pattern is seeded once and doubled in place until the range is covered.
@@ -2207,13 +2209,13 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         std::memcpy(seed->Bytes().data(), pattern.data(), 16);
         recorder.Keep(seed);
         const VkBufferCopy first{0, offset, 16};
-        Graphics::CopyBuffers(context, commands, seed->Handle(), import->buffer, 1, &first);
+        Graphics::CopyBuffers(context, commands, seed->Handle(), target, 1, &first);
         for (std::size_t done = 16; done < bytes;) {
             const auto chunk = std::min(done, bytes - done);
             Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             Graphics::Recorder::CountBarriers(CommandClass::Fill);
             const VkBufferCopy copy{offset, offset + done, chunk};
-            Graphics::CopyBuffers(context, commands, import->buffer, import->buffer, 1, &copy);
+            Graphics::CopyBuffers(context, commands, target, target, 1, &copy);
             done += chunk;
             ++doublingSteps;
         }
@@ -2228,6 +2230,12 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     recorder.EndGpuTiming(timing, bytes);
     recorder.MarkCovered(filledAccess);
     phase(recordMs);
+    if (mirrorFill) {
+        Graphics::FinishLazyMirrorFill(recorder, lazyFill, address, bytes);
+        phase(notesMs);
+        return true;
+    }
+    Graphics::CountLazyImportFill(bytes);
     if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) recorder.NotePendingFill(address, bytes, static_cast<std::uint8_t>(pattern[0]));
     else recorder.NotePendingWrite(address, bytes);
     GuestMemory::MarkWritten(address, bytes);

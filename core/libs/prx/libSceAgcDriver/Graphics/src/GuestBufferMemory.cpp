@@ -969,8 +969,9 @@ std::uint64_t evictableBytes(const HostImports& state, std::uint64_t begin, std:
 }
 
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true) {
-    if (VramLazyWrites()) return nullptr;
-    Require(!aliasesLiveMirror(context.device, address, static_cast<std::size_t>(end != 0 ? end - address : 1)), "a GPU-registered alias conflicts with a live VRAM mirror");
+    const bool aliased = aliasesLiveMirror(context.device, address, static_cast<std::size_t>(end != 0 ? end - address : 1));
+    if (aliased && VramLazyWrites()) return nullptr;
+    Require(!aliased, "a GPU-registered alias conflicts with a live VRAM mirror");
     if (mirrorBackingOverlaps(context.device, address, end != 0 ? end : address + 1)) return nullptr;
     const bool fresh = !importsStale(context, state);
     if (fresh) {
@@ -1001,8 +1002,9 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
 }
 
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict) {
-    if (VramLazyWrites()) return nullptr;
-    Require(!aliasesLiveMirror(context.device, run.base, static_cast<std::size_t>(run.bytes)), "a GPU import aliases a live VRAM mirror");
+    const bool aliased = aliasesLiveMirror(context.device, run.base, static_cast<std::size_t>(run.bytes));
+    if (aliased && VramLazyWrites()) return nullptr;
+    Require(!aliased, "a GPU import aliases a live VRAM mirror");
     if (VramDescriptors() && std::any_of(run.ranges.begin(), run.ranges.end(), [&](const auto& range) { return rangeBacking(context.device, range) == RangeBacking::Mirror; })) return nullptr;
     static const bool traceRefusal = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     const auto base = run.base;
@@ -1425,12 +1427,89 @@ LazyMirrors& LazyState() {
     return state;
 }
 
+struct LazyImports {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::uint64_t> unordered;
+    std::map<std::string, std::uint64_t> refusals;
+    std::uint64_t unorderedBytes = 0;
+    std::atomic<std::uint64_t> unorderedBuilds{0};
+    std::atomic<std::uint64_t> readOnlyBuilds{0};
+};
+
+LazyImports& LazyImportState() {
+    static LazyImports state;
+    return state;
+}
+
+thread_local const char* mirrorRefusal = nullptr;
+
+std::nullptr_t refuseMirror(const char* reason) {
+    mirrorRefusal = reason;
+    return nullptr;
+}
+
+void noteMirrorRefusal(const GuestAllocations::Range& range, const char* reason) {
+    if (!VramLazyWrites() || reason == nullptr) return;
+    auto& state = LazyImportState();
+    std::lock_guard lock(state.mutex);
+    if (state.refusals[reason]++ != 0) return;
+    bool hostRegion = false;
+#ifdef _WIN32
+    hostRegion = GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(range.address), static_cast<std::size_t>(range.bytes));
+#endif
+    std::fprintf(stderr, "[vram-lazy] first mirror refusal \"%s\": 0x%llx+0x%llx (%.1f MiB, %s, %s, host region %d)\n", reason,
+        static_cast<unsigned long long>(range.address), static_cast<unsigned long long>(range.bytes), range.bytes / 1048576.0,
+        range.writable ? "writable" : "read-only", range.releasable ? "heap" : "image", hostRegion ? 1 : 0);
+}
+
+void noteUnorderedImport(const GuestAllocations::Range& range, const char* reason) {
+    auto& state = LazyImportState();
+    state.unorderedBuilds.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(state.mutex);
+    if (!state.unordered.emplace(range.address, range.address + range.bytes).second) return;
+    state.unorderedBytes += range.bytes;
+    std::fprintf(stderr, "[vram-lazy] unordered writable import 0x%llx+0x%llx (%.1f MiB): no mirror (%s)\n",
+        static_cast<unsigned long long>(range.address), static_cast<unsigned long long>(range.bytes), range.bytes / 1048576.0, reason != nullptr ? reason : "mirrors unavailable");
+}
+
+bool unorderedImport(std::uint64_t begin, std::uint64_t end) {
+    auto& state = LazyImportState();
+    std::lock_guard lock(state.mutex);
+    auto found = state.unordered.upper_bound(begin);
+    if (found == state.unordered.begin()) return false;
+    --found;
+    return found->first <= begin && end <= found->second;
+}
+
+bool lazyImportAllowed(bool writable, std::uint64_t begin, std::uint64_t end, bool addressable) {
+    return !VramLazyWrites() || !writable || (addressable && unorderedImport(begin, end));
+}
+
+bool lazyAddressWritersOutstanding() {
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    return std::any_of(state.entries.begin(), state.entries.end(), [](const auto& entry) {
+        return entry.second->lazyAddressWriter != nullptr && !entry.second->lazyAddressWriter->complete;
+    });
+}
+
 void reportLazyWrites() {
     auto& state = LazyState();
     const auto now = std::chrono::steady_clock::now();
     if (now - state.lastReport < std::chrono::seconds(10)) return;
     state.lastReport = now;
     const auto& c = state.counts;
+    {
+        auto& imports = LazyImportState();
+        std::lock_guard lock(imports.mutex);
+        std::string refusals;
+        for (const auto& [reason, count] : imports.refusals) refusals += " " + reason + "=" + std::to_string(count);
+        AgcDriver::ProfilePrint_nid_no_patch("[vram-lazy] fills: mirror %llu (%.1f MiB), import %llu (%.1f MiB, %llu beside a BDA writer), CPU %llu (%.1f MiB); unordered writable imports %zu ranges (%.1f MiB) in %llu builds; read-only import builds %llu; mirror refusals:%s\n",
+            static_cast<unsigned long long>(c.mirrorFills), c.mirrorFillBytes / 1048576.0, static_cast<unsigned long long>(c.importFills), c.importFillBytes / 1048576.0,
+            static_cast<unsigned long long>(c.importFillsBesideBda), static_cast<unsigned long long>(c.cpuFills), c.cpuFillBytes / 1048576.0,
+            imports.unordered.size(), imports.unorderedBytes / 1048576.0, static_cast<unsigned long long>(imports.unorderedBuilds.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(imports.readOnlyBuilds.load(std::memory_order_relaxed)), refusals.empty() ? " none" : refusals.c_str());
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[vram-lazy] cumulative: pages protected record %llu completion %llu, pending %llu; copy-in avoided %.1f MiB, copy-back avoided %.1f MiB; GPU-owned refresh pages skipped %llu, hook ranges bypassed %llu; faults %llu, downloaded %llu pages (%.3f ms), writer waits %llu (%.3f ms), conflicts %llu, fallback descriptors %llu; fault waits page %llu (%.3f ms), BDA %llu (%.3f ms); protect %llu runs, %llu calls (%.3f ms); snapshots %llu (%.3f ms)\n",
         static_cast<unsigned long long>(c.protectedAtRecord), static_cast<unsigned long long>(c.protectedAtCompletion), static_cast<unsigned long long>(c.pendingPages),
         c.copyInAvoided / 1048576.0, c.copyBackAvoided / 1048576.0, static_cast<unsigned long long>(c.refreshPagesSkipped), static_cast<unsigned long long>(c.hookRangesSkipped),
@@ -2601,7 +2680,8 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
 // registered Range object changed (a protection change). Null when the range cannot be mirrored. An
 // existing writable mirror's blocks are appended to `blocks` for the caller's one compare of every
 std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::shared_ptr<const GuestAllocations::Range>& range, std::vector<RefreshBlock>& blocks, bool heap, bool videoOnly = false, std::uint64_t minimumBytes = 0) {
-    if (rangeBacking(context.device, range) == RangeBacking::Import) return nullptr;
+    mirrorRefusal = nullptr;
+    if (rangeBacking(context.device, range) == RangeBacking::Import) return refuseMirror("import backing");
     auto& state = Mirrors();
     std::shared_ptr<ImageMirror> mirror;
     std::shared_ptr<ImageMirror> replaced;
@@ -2617,7 +2697,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             state.collectedPresent = UINT64_MAX;
             ++state.version;
         }
-        if (state.failed.contains(range->address)) return nullptr;
+        if (state.failed.contains(range->address)) return refuseMirror("earlier failure");
         const auto found = state.entries.find(range->address);
         if (found != state.entries.end() && sameRange(found->second->range, range) && found->second->reserved == range->bytes && found->second->writable == range->writable && found->second->heap == heap) mirror = found->second;
     }
@@ -2636,7 +2716,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             if (auto* recorder = Recorder::Active()) {
                 if (Recorder::InCompletion() && !VramWritable()) {
                     countDescriptors({.resizeFallbacks = 1});
-                    return nullptr;
+                    return refuseMirror("sparse resize during completion");
                 }
                 Require(!Recorder::InCompletion(), "cannot resize a sparse mirror during completion");
                 countDescriptors({.recorderSyncs = 1});
@@ -2647,25 +2727,25 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             std::lock_guard lock(state.mutex);
             if (replaced->activeUsers.load(std::memory_order_acquire) != 0 && !VramWritable()) {
                 countDescriptors({.resizeFallbacks = 1});
-                return nullptr;
+                return refuseMirror("sparse resize while in use");
             }
             Require(replaced->activeUsers.load(std::memory_order_acquire) == 0, "cannot resize a sparse mirror while a prepared or uploaded build still holds it");
         }
     }
     Pieces pieces;
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->address), range->bytes, range->writable && !heap)) {
-        if (!heap || !sparseMirrorsEnabled()) return nullptr;
+        if (!heap || !sparseMirrorsEnabled()) return refuseMirror("inaccessible pages");
         pieces = GuestMemory::DescribeCommitted(range->address, range->bytes).ranges;
-        if (pieces.empty()) return nullptr;
+        if (pieces.empty()) return refuseMirror("no committed pages");
     }
     const bool sparse = !pieces.empty();
     if (VramMirrorWrites() && heap) {
         const auto backed = sparse ? pieces : Pieces{{range->address, range->address + range->bytes}};
-        for (const auto& [begin, end] : backed) if (registeredGpuAliases(context.device, begin, static_cast<std::size_t>(end - begin))) return nullptr;
+        for (const auto& [begin, end] : backed) if (registeredGpuAliases(context.device, begin, static_cast<std::size_t>(end - begin))) return refuseMirror("registered GPU alias");
 #ifdef _WIN32
         if (range->writable) {
             for (const auto& [begin, end] : backed) {
-                if (!GuestArena::GuestArenaCanProtectGpuAccess_nid_no_patch(begin, static_cast<std::size_t>(end - begin))) return nullptr;
+                if (!GuestArena::GuestArenaCanProtectGpuAccess_nid_no_patch(begin, static_cast<std::size_t>(end - begin))) return refuseMirror("not protectable");
             }
         }
 #endif
@@ -2677,7 +2757,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (range->bytes > limit - std::min(limit, rebar.live.load())) {
             VramMirrorCounters().refused.fetch_add(1, std::memory_order_relaxed);
             VramMirrorCounters().refusedBytes.fetch_add(range->bytes, std::memory_order_relaxed);
-            return nullptr;
+            return refuseMirror("ReBAR budget");
         }
     }
     mirror = std::make_shared<ImageMirror>();
@@ -2694,14 +2774,14 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     if (VramCleanup()) mirror->lastUsePresent.store(Recorder::Presents(), std::memory_order_relaxed);
     if (VramWritable() && heap && !VramDeviceLocalMirrors()) {
         const auto limit = RebarLimit(context);
-        if (mirror->bytes > limit - std::min(limit, RebarMemory().live.load())) return nullptr;
+        if (mirror->bytes > limit - std::min(limit, RebarMemory().live.load())) return refuseMirror("ReBAR budget");
     }
     if (VramDeviceLocalMirrors() && heap) {
         const auto report = GetBufferPool(context)->Vram().Current();
         if (report.target != 0 && mirror->bytes > report.target - std::min(report.target, report.usage)) {
             VramMirrorCounters().refused.fetch_add(1, std::memory_order_relaxed);
             VramMirrorCounters().refusedBytes.fetch_add(mirror->bytes, std::memory_order_relaxed);
-            return nullptr;
+            return refuseMirror("VRAM budget");
         }
     }
     if (heap) {
@@ -2718,12 +2798,12 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (generation == 0) {
             std::lock_guard lock(state.mutex);
             ++state.heapUnwatched;
-            return nullptr;
+            return refuseMirror("not write-watched");
         }
         if (heapMirrorsBeside(*range) + mirror->bytes > heapMirrorBudget()) {
             sweepMirrors();
             if (const auto held = heapMirrorsBeside(*range); held + mirror->bytes > heapMirrorBudget()) {
-                if (VramWritable()) return nullptr;
+                if (VramWritable()) return refuseMirror("heap mirror budget");
                 throw std::runtime_error(heapMirrorError(*range, held, "past the budget"));
             }
         }
@@ -2743,7 +2823,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
                 counts.createdBytes.fetch_add(mirror->bytes, std::memory_order_relaxed);
             } else {
                 counts.hostFallbacks.fetch_add(1, std::memory_order_relaxed);
-                if (videoHeap || VramWritable()) return nullptr;
+                if (videoHeap || VramWritable()) return refuseMirror("host memory fallback");
             }
         }
     } catch (const std::runtime_error& error) {
@@ -2751,7 +2831,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         std::fprintf(stderr, "[gpu] image mirror of 0x%llx+0x%llx failed: %s; falling back to copies\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), error.what());
         std::lock_guard lock(state.mutex);
         state.failed.insert(range->address);
-        return nullptr;
+        return refuseMirror("mirror allocation failed");
     }
     // Read stores GPU results pending in the range first (write-backs of earlier copies of it);
     // named for the [hooksync] attribution like the refresh's flush.
@@ -2778,7 +2858,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     Require(!VramCleanup() || !heap || mirror->shadow.empty(), "VRAM cleanup forbids whole heap shadows");
     std::lock_guard lock(state.mutex);
     if (replaced != nullptr) Require(replaced->activeUsers.load(std::memory_order_acquire) == 0 && state.entries.find(range->address) != state.entries.end() && state.entries.at(range->address) == replaced, "sparse mirror acquired another owner during resize");
-    if (!claimRangeBackings(context.device, std::span(&range, 1), RangeBacking::Mirror, mirror, replaced)) return nullptr;
+    if (!claimRangeBackings(context.device, std::span(&range, 1), RangeBacking::Mirror, mirror, replaced)) return refuseMirror("backing claimed");
     if (replaced != nullptr) countDescriptors({.sparseResizes = 1});
     if (replaced != nullptr) replaced->retired.store(true, std::memory_order_release);
     ++state.rebuilds;
@@ -3631,7 +3711,14 @@ VramWritableStats VramWritableCounters() {
 
 VramLazyStats VramLazyCounters() {
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    return LazyState().counts;
+    auto counts = LazyState().counts;
+    auto& imports = LazyImportState();
+    std::lock_guard lock(imports.mutex);
+    counts.unorderedImportRanges = imports.unordered.size();
+    counts.unorderedImportBytes = imports.unorderedBytes;
+    counts.unorderedImportBuilds = imports.unorderedBuilds.load(std::memory_order_relaxed);
+    counts.readOnlyImportBuilds = imports.readOnlyBuilds.load(std::memory_order_relaxed);
+    return counts;
 }
 
 bool HasVramMirrorWriters() {
@@ -3722,8 +3809,9 @@ void RetireVramMirrorRecorder(Recorder& recorder) noexcept {
     }
 }
 
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
-    if (VramLazyWrites()) return nullptr;
+namespace {
+
+const HostImport* hostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
     std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
     if (VramMirrorWrites()) gpu.lock();
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
@@ -3751,6 +3839,109 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     refreshImports(context, state, lease);
     if (!runCovers(lease, address, address + bytes)) return ready(findImport(state, address, address + bytes));
     return ready(importAccess(context, state, address, address + bytes, lease));
+}
+
+struct LazyFillWriter {
+    std::shared_ptr<ImageMirror> mirror;
+    std::shared_ptr<MirrorWriteInterval> interval;
+};
+
+std::shared_ptr<ImageMirror> lazyFillMirror(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (!VramLazyWrites() || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
+    auto mirror = findMirror(context, address, address + bytes);
+    if (mirror == nullptr || !mirror->heap || !mirror->writable || mirror->sparse || mirror->buffer == nullptr || mirror->base % 4 != 0 || mirror->bytes % 4 != 0) return nullptr;
+    return mirror;
+}
+
+}
+
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (VramLazyWrites()) return nullptr;
+    return hostImportFor(context, address, bytes);
+}
+
+const HostImport* HostImportForFill(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (!VramLazyWrites()) return hostImportFor(context, address, bytes);
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || aliasesLiveMirror(context.device, address, bytes)) return nullptr;
+    return hostImportFor(context, address, bytes);
+}
+
+bool LazyMirrorFillCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
+    return lazyFillMirror(context, address, bytes) != nullptr;
+}
+
+LazyMirrorFill BeginLazyMirrorFill(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    GuestMemory::AssertGpuLockHeld("lazy mirror fill");
+    auto mirror = lazyFillMirror(context, address, bytes);
+    Require(mirror != nullptr, "a lazy mirror fill lost its mirror");
+    auto interval = std::make_shared<MirrorWriteInterval>();
+    interval->context = context;
+    interval->lease = mirror->range.lock();
+    Require(interval->lease != nullptr, "a lazy mirror fill lost its registered range");
+    const auto from = address & ~std::uint64_t{4095};
+    const auto to = (address + bytes + 4095) & ~std::uint64_t{4095};
+    Require(from >= mirror->base && to <= mirror->base + mirror->bytes, "lazy fill protection exceeds its mirror");
+    interval->watched.emplace_back(from, to);
+    interval->started = true;
+    interval->recorder = &recorder;
+    interval->serial = recorder.Submissions() + 1;
+    interval->order = ++LazyState().order;
+    interval->generation = GuestMemory::TrackerGeneration();
+    std::vector<MirrorUpload> uploads;
+    for (const auto page : protectLazyRange(*mirror, interval, from, to, false)) {
+        if (page >= address && page + 4096 <= address + bytes) continue;
+        const auto generation = mirror->generations[static_cast<std::size_t>(page / 65536 - mirror->base / 65536)];
+        if (GuestMemory::UnchangedSinceCollected(page, 4096, generation)) continue;
+#ifdef _WIN32
+        std::array<std::byte, 4096> snapshot;
+        const auto started = std::chrono::steady_clock::now();
+        ++LazyState().counts.snapshotCalls;
+        Require(GuestArena::GuestArenaSnapshotGpuPage_nid_no_patch(page, snapshot.data()), "a lazy mirror fill could not snapshot its newly protected page");
+        LazyState().counts.snapshotUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+        stageMirrorBlock({mirror.get(), page, 4096, generation, 0, snapshot.data()}, uploads);
+#endif
+    }
+    recordMirrorUploads(uploads);
+    recorder.Keep(mirror);
+    return {mirror->buffer->Handle(), address - mirror->base, std::make_shared<LazyFillWriter>(LazyFillWriter{mirror, interval})};
+}
+
+void FinishLazyMirrorFill(Recorder& recorder, const LazyMirrorFill& fill, std::uint64_t address, std::size_t bytes) {
+    GuestMemory::AssertGpuLockHeld("lazy mirror fill completion");
+    const auto writer = std::static_pointer_cast<LazyFillWriter>(fill.writer);
+    Require(writer != nullptr && writer->interval->recorder == &recorder && writer->interval->serial == recorder.Submissions() + 1, "a lazy mirror fill was recorded outside its batch");
+    const auto mirror = writer->mirror;
+    const auto interval = writer->interval;
+    interval->recorded = true;
+    interval->ready = true;
+    interval->completionCount = recorder.CompletionCount();
+    ++mirror->gpuRevision;
+    recorder.OnComplete([mirror, interval] {
+        interval->complete = true;
+        interval->recorder = nullptr;
+    });
+    GuestMemory::MarkWritten(address, bytes);
+    auto& counts = LazyState().counts;
+    ++counts.mirrorFills;
+    counts.mirrorFillBytes += bytes;
+    reportLazyWrites();
+}
+
+void CountLazyImportFill(std::size_t bytes) {
+    if (!VramLazyWrites()) return;
+    GuestMemory::AssertGpuLockHeld("lazy import fill count");
+    auto& counts = LazyState().counts;
+    ++counts.importFills;
+    counts.importFillBytes += bytes;
+    if (lazyAddressWritersOutstanding()) ++counts.importFillsBesideBda;
+}
+
+void CountLazyCpuFill(std::size_t bytes) {
+    if (!VramLazyWrites()) return;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    auto& counts = LazyState().counts;
+    ++counts.cpuFills;
+    counts.cpuFillBytes += bytes;
 }
 
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
@@ -3974,12 +4165,13 @@ void GuestBufferMemory::AcquireRegistered() {
             const HostImport* entry = nullptr;
             const bool mirrorFirst = vramMirrors() && mirrorsEnabled() && (!range->writable || VramMirrorWrites());
             if (mirrorFirst) VramMirrorCounters().readOnlyRanges.fetch_add(1, std::memory_order_relaxed);
-            if (importable && !mirrorFirst) {
+            if (importable && !mirrorFirst && !(VramLazyWrites() && range->writable)) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
                 entry = importAllocation(context, state, range->address, lease, 0, false);
             }
             lap(timing.importsUs, at);
+            const char* refusal = nullptr;
             if (entry == nullptr && mirrorsEnabled()) {
                 ResourcePhase mirrorPhase("mirrors");
                 region.mirror = acquireMirror(context, range, blocks, range->releasable, mirrorFirst);
@@ -3995,6 +4187,8 @@ void GuestBufferMemory::AcquireRegistered() {
                     regions.push_back(std::move(region));
                     continue;
                 }
+                refusal = mirrorRefusal;
+                noteMirrorRefusal(*range, refusal);
             }
             if (entry == nullptr && importable) {
                 auto& state = Imports();
@@ -4003,6 +4197,8 @@ void GuestBufferMemory::AcquireRegistered() {
                 lap(timing.importsUs, at);
             }
             if (entry != nullptr) {
+                if (VramLazyWrites() && range->writable) noteUnorderedImport(*range, refusal);
+                else if (VramLazyWrites()) LazyImportState().readOnlyBuilds.fetch_add(1, std::memory_order_relaxed);
                 region.hostBacked = true;
                 // Reused by Upload while no import was dropped since (see importsEpoch).
                 region.direct = entry;
@@ -4021,7 +4217,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 committed = 0;
                 for (const auto& [first, last] : copied.backed) committed += last - first;
             }
-            const char* reason = !mirrorsEnabled() ? "mirrors disabled by APS5_NO_LEASE_MIRROR" : copied.sparse ? "unreadable pages" : !range->releasable ? "image mirror refused" : "outside the write-watched arena";
+            const char* reason = !mirrorsEnabled() ? "mirrors disabled by APS5_NO_LEASE_MIRROR" : copied.sparse ? "unreadable pages" : !range->releasable ? "image mirror refused" : VramLazyWrites() && refusal != nullptr ? refusal : "outside the write-watched arena";
             copies.push_back({copied.begin, copied.end, committed, reason});
         }
         releaseImportedMirrors(context, imported);
@@ -4721,7 +4917,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         const bool stale = importsStale(context, state);
         for (auto& region : regions) {
             if (region.mirror != nullptr) continue;
-            if (sparseHeapCandidate(region)) {
+            if (sparseHeapCandidate(region) || !lazyImportAllowed(region.writable, region.begin, region.end, addressable)) {
                 region.direct = nullptr;
                 region.pending = true;
                 continue;
@@ -4880,7 +5076,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         if (importsStale(context, state)) refreshImports(context, state, importRanges());
         importsRefreshed = true;
         for (const auto& region : regions) {
-            if (!region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region)) continue;
+            if (!region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region) || !lazyImportAllowed(region.writable, region.begin, region.end, addressable)) continue;
             if (findImport(state, region.begin, region.end) != nullptr || runCovers(importRanges(), region.begin, region.end)) continue;
             static_cast<void>(importJoined(context, state, region.begin, region.end, importRanges()));
         }
@@ -5031,7 +5227,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             }
         }
         bool copyOnGpu = false;
-        if (context.hostImportAlignment != 0) {
+        const bool importAllowed = lazyImportAllowed(region.writable, region.begin, region.end, addressable);
+        if (!importAllowed) region.direct = nullptr;
+        if (context.hostImportAlignment != 0 && importAllowed) {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
             // Imports are made on demand for the registered range around each region.

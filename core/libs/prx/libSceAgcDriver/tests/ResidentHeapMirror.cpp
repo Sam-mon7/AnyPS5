@@ -1167,6 +1167,31 @@ void RunVramLazyTests(const AgcDriver::Graphics::Context& device, AgcDriver::Gra
         recorder.Sync();
         Require(*reinterpret_cast<volatile std::uint32_t*>(alias + 4 * page) == 0xaabbccddu && *reinterpret_cast<volatile std::uint32_t*>(alias + 5 * page) == 0xaabbccddu,
             "coalesced lazy protection lost GPU results on a native alias");
+        {
+            const auto fillAddress = address + 8 * page + 64;
+            const std::size_t fillBytes = 2 * page + 64;
+            volatile std::uint8_t* const native = alias;
+            native[8 * page + 8] = 0x5c;
+            native[10 * page + 200] = 0x6d;
+            const auto beforeFill = VramLazyCounters();
+            Require(LazyMirrorFillCovers(context, fillAddress, fillBytes), "a writable lazy mirror did not cover its fill");
+            const auto fill = BeginLazyMirrorFill(context, recorder, fillAddress, fillBytes);
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, fill.buffer, fill.offset, fillBytes, 0xc3c3c3c3u);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+            FinishLazyMirrorFill(recorder, fill, fillAddress, fillBytes);
+            const auto filled = VramLazyCounters();
+            Require(filled.mirrorFills == beforeFill.mirrorFills + 1 && filled.mirrorFillBytes == beforeFill.mirrorFillBytes + fillBytes && filled.protectedAtRecord == beforeFill.protectedAtRecord + 3 && filled.snapshotCalls == beforeFill.snapshotCalls + 2,
+                "a mirror fill did not protect its pages or snapshot its changed edges");
+            Require(GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(address + 9 * page, page), "a mirror fill left its page unprotected");
+            recorder.Submit();
+            Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "lazy mirror fill GPU wait");
+            Require(native[9 * page + 100] == 0xc3 && VramLazyCounters().faultPageWaits == filled.faultPageWaits + 1, "a CPU read of a mirror fill did not fault and wait for it");
+            Require(native[8 * page + 8] == 0x5c && native[8 * page + 63] == 0x11 && native[8 * page + 64] == 0xc3 && native[10 * page + 127] == 0xc3 && native[10 * page + 128] == 0x11 && native[10 * page + 200] == 0x6d,
+                "a mirror fill lost the CPU bytes beside it");
+            Require(VramLazyCounters().downloadedPages == filled.downloadedPages + 3, "a mirror fill did not download exactly its pages");
+        }
         if (imports) {
             auto* flag = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, block, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
             Require(flag != nullptr, "cannot allocate a native lazy readiness flag");
@@ -1174,7 +1199,10 @@ void RunVramLazyTests(const AgcDriver::Graphics::Context& device, AgcDriver::Gra
             const auto flagAddress = reinterpret_cast<std::uint64_t>(flag);
             const auto* imported = HostImportFor(context, flagAddress, block);
             Require(imported == nullptr, "lazy writes allowed a native readiness flag to bypass completion publication");
+            const auto beforeUnordered = VramLazyCounters();
             bdaWrite(address + block, 0x13579bdfu);
+            Require(VramLazyCounters().unorderedImportRanges == beforeUnordered.unorderedImportRanges + 1 && VramLazyCounters().unorderedImportBytes == beforeUnordered.unorderedImportBytes + block,
+                "an unmirrorable writable range was not counted as an unordered import");
             write(flagAddress, 0x5a5a5a5au);
             recorder.Submit();
             Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "native lazy readiness GPU wait");
@@ -1183,7 +1211,33 @@ void RunVramLazyTests(const AgcDriver::Graphics::Context& device, AgcDriver::Gra
             Require(!ready && *static_cast<volatile std::uint32_t*>(flag) == 0x5a5a5a5au &&
                 *reinterpret_cast<volatile std::uint32_t*>(alias + block) == 0x13579bdfu,
                 "a native readiness flag overtook lazy BDA publication");
+            auto* readOnly = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, block, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            Require(readOnly != nullptr, "cannot allocate a native read-only range");
+            GuestAllocations::Mutation().Add(readOnly, block, true, false, true);
+            const auto readOnlyAddress = reinterpret_cast<std::uint64_t>(readOnly);
+            const auto beforeReadOnly = VramLazyCounters();
+            {
+                Memory::BumpCollectEpoch();
+                GuestBufferMemory space(context);
+                space.SetAddressWrites(false);
+                space.AcquireRegistered();
+                space.Upload(true);
+                const auto ranges = space.AddressRanges();
+                const auto permissions = [&](std::uint64_t at) {
+                    const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= at && at < range.end; });
+                    Require(found != ranges.end(), "a native range is absent from the BDA table");
+                    return found->permissions;
+                };
+                Require(permissions(readOnlyAddress) == ShaderRecompiler::BdaAbi::Read && HostImportCovers(context, readOnlyAddress, block), "an unmirrorable read-only range was not served by a read-only import");
+                Require(permissions(flagAddress) == (ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write), "an unordered writable import lost its BDA write permission");
+                space.WriteBack();
+            }
+            const auto counted = VramLazyCounters();
+            Require(counted.readOnlyImportBuilds > beforeReadOnly.readOnlyImportBuilds && counted.unorderedImportBuilds > beforeReadOnly.unorderedImportBuilds && counted.unorderedImportRanges == beforeReadOnly.unorderedImportRanges,
+                "read-only and unordered imports were not counted per build");
             recorder.FlushDeferredReleases();
+            GuestAllocations::Mutation().Remove(readOnly);
+            VirtualFree(readOnly, 0, MEM_RELEASE);
             GuestAllocations::Mutation().Remove(flag);
             VirtualFree(flag, 0, MEM_RELEASE);
         }
@@ -1211,6 +1265,9 @@ void RunVramLazyTests(const AgcDriver::Graphics::Context& device, AgcDriver::Gra
         const auto beforeClear = VramLazyCounters();
         ClearImageMirrors(context.device);
         Require(VramLazyCounters().pendingPages == 0 && VramLazyCounters().downloadedPages > beforeClear.downloadedPages && *reinterpret_cast<volatile std::uint32_t*>(alias) == 0x11223344u, "clearing mirrors lost lazy GPU data");
-    } else Require(VramLazyCounters().protectedAtRecord == initial.protectedAtRecord && VramLazyCounters().downloadedPages == initial.downloadedPages, "disabled lazy writes changed page ownership");
+    } else {
+        Require(!LazyMirrorFillCovers(context, address, page) && VramLazyCounters().mirrorFills == 0, "disabled lazy writes offered a mirror fill");
+        Require(VramLazyCounters().protectedAtRecord == initial.protectedAtRecord && VramLazyCounters().downloadedPages == initial.downloadedPages, "disabled lazy writes changed page ownership");
+    }
 #endif
 }

@@ -250,8 +250,30 @@ struct VramLazyStats {
     std::uint64_t snapshotUs = 0;
     std::uint64_t conflicts = 0;
     std::uint64_t fallbacks = 0;
+    std::uint64_t mirrorFills = 0;
+    std::uint64_t mirrorFillBytes = 0;
+    std::uint64_t importFills = 0;
+    std::uint64_t importFillBytes = 0;
+    std::uint64_t importFillsBesideBda = 0;
+    std::uint64_t cpuFills = 0;
+    std::uint64_t cpuFillBytes = 0;
+    std::uint64_t unorderedImportRanges = 0;
+    std::uint64_t unorderedImportBytes = 0;
+    std::uint64_t unorderedImportBuilds = 0;
+    std::uint64_t readOnlyImportBuilds = 0;
 };
 VramLazyStats VramLazyCounters();
+struct LazyMirrorFill {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    std::uint64_t offset = 0;
+    std::shared_ptr<void> writer;
+};
+bool LazyMirrorFillCovers(const Context& context, std::uint64_t address, std::size_t bytes);
+LazyMirrorFill BeginLazyMirrorFill(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes);
+void FinishLazyMirrorFill(Recorder& recorder, const LazyMirrorFill& fill, std::uint64_t address, std::size_t bytes);
+const HostImport* HostImportForFill(const Context& context, std::uint64_t address, std::size_t bytes);
+void CountLazyImportFill(std::size_t bytes);
+void CountLazyCpuFill(std::size_t bytes);
 struct VramCleanupStats {
     std::uint64_t evictedMirrors = 0;
     std::uint64_t evictedBytes = 0;
