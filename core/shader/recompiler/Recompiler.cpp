@@ -1236,7 +1236,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (artifact.registrationModule) runtimeSelectors.at(input.location / RuntimeAbi::VertexSelectorsPerDword) |= (selectors & 0xfffu) << (input.location % RuntimeAbi::VertexSelectorsPerDword * 16u);
         }
     }
-    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel) {
+    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel || (IndirectSgprRuntime() && artifact.indirectSgprs)) {
         {
             std::shared_lock lock(plan->mutex);
             if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second.Lock();
@@ -1298,6 +1298,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.bdaWrites = variant.info.info.bdaWrites;
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
+    if (IndirectSgprRuntime() && artifact.indirectSgprs && entry->module->pushData) {
+        if (request.layout.pushConstantOffsetBytes != 0u || result.pushConstants.size() > IndirectSgprPushOffset) throw IndirectSgprUnsupported(IndirectSgprFailure::Stage);
+        result.pushConstants.resize(IndirectSgprPushOffset + IndirectSgprPushBytes);
+    }
     if (!artifact.stencilReferences.empty()) {
         if (artifact.stencilReferenceDword * sizeof(std::uint32_t) != result.pushConstants.size() || result.pushConstants.size() + sizeof(std::uint32_t) > request.layout.pushConstantSizeBytes) throw std::runtime_error("stencil replay push constant lies outside the stage range");
         result.pushConstants.resize(result.pushConstants.size() + sizeof(std::uint32_t));

@@ -296,7 +296,10 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         Require(mesh.maxVertices <= context.meshLimits.maxMeshOutputVertices && mesh.maxPrimitives <= context.meshLimits.maxMeshOutputPrimitives && static_cast<std::uint64_t>(mesh.ldsSizeDwords) * 4 <= context.meshLimits.maxMeshSharedMemorySize, "mesh output or LDS exceeds device limits");
     }
     const auto pushStages = PushConstantStages(shaders);
-    Require(pushStages == 0 || context.limits.maxPushConstantsSize >= PushBlockBytes(dynamicRendering), "graphics push constant range exceeds device limit");
+    if (!dynamicRendering && ShaderRecompiler::IndirectSgprRuntime() && std::ranges::any_of(shaders, [](const auto& shader) { return shader.program->indirectSgprs.has_value(); })) {
+        for (const auto& shader : shaders) if (!shader.program->pushConstants.empty()) pushConstantBytes = std::max(pushConstantBytes, shader.pushConstantOffset + static_cast<std::uint32_t>(shader.program->pushConstants.size()));
+    }
+    Require(pushStages == 0 || context.limits.maxPushConstantsSize >= (dynamicRendering ? PushBlockBytes(true) : pushConstantBytes), "graphics push constant range exceeds device limit");
     if (dynamicRendering) {
         for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || (shader.pushConstantOffset >= PipelinePushSlotBytes) == (shader.stage == ShaderRecompiler::ShaderStage::Fragment), "a stage's push constants lie outside its push constant slot");
     }
@@ -323,7 +326,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         // A descriptor set layout with the same bindings as this one is compatible with the pipeline
         // layout, so later draws bind their own ShaderResources' set under it.
         const std::array<VkDescriptorSetLayout, 2> setLayouts{resources.main, resources.fragment};
-        const VkPushConstantRange push{pushStages, 0, PipelinePushSlotBytes};
+        const VkPushConstantRange push{pushStages, 0, pushConstantBytes};
         const std::array<VkPushConstantRange, 2> slots{{{pushStagesOf(context), 0, PipelinePushSlotBytes}, {VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes}}};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layoutInfo.flags = resources.split ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT : 0;
@@ -735,7 +738,7 @@ void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages
         context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes, bytes.data() + PipelinePushSlotBytes);
         return;
     }
-    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, stages, 0, PipelinePushSlotBytes, bytes.data());
+    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, stages, 0, pushConstantBytes, bytes.data());
 }
 
 namespace {
