@@ -251,6 +251,7 @@ target_include_directories(libSceAgcDriver PRIVATE
         ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
         ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR}
 )
+target_include_directories(libSceAgcDriver INTERFACE ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
 
 file(GLOB_RECURSE agcShaderCacheGuardSources CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
