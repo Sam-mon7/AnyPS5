@@ -10,6 +10,7 @@
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "IntermediateRepresentation/IrBlock.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -2175,6 +2176,42 @@ int runtimeSgprCache(const char* self) {
     require(MatchesPreparedShader(request, *legacy) != active, "prepared shader reused the wrong entry initialization");
     const auto runtime = PrepareShader(request);
     require((GetPreparedArtifact(*legacy).spirv.Words() != GetPreparedArtifact(*runtime).spirv.Words()) == active, "runtime builtin compilation did not follow the switch");
+    const auto checkPushConstants = [&](const RecompileResult& compiled) {
+        const auto words = compiled.spirv.Read();
+        std::uint32_t blocks = 0;
+        for (std::size_t cursor = 5; cursor < words.size(); cursor += words[cursor] >> 16u) {
+            if ((words[cursor] & 0xffffu) == spv::OpVariable && words[cursor] >> 16u >= 4u && words[cursor + 3u] == spv::StorageClassPushConstant) ++blocks;
+        }
+        require(blocks == 1u, "runtime arguments did not share a single push constant block");
+        if (active) {
+            require(compiled.pushConstants.size() == IndirectSgprPushOffset + IndirectSgprPushBytes, "runtime metadata is absent from the reflected push range");
+            require(std::ranges::all_of(std::span(compiled.pushConstants).subspan(IndirectSgprPushOffset), [](auto byte) { return byte == std::byte{}; }), "runtime argument placeholders were not zero initialized");
+        }
+    };
+    const auto runtimeResult = Recompile(request);
+    checkPushConstants(runtimeResult);
+    if (active) require(runtime->artifact->bindings.layout.userDataRegisters.empty(), "runtime metadata regression requires no forwarded user words");
+    else {
+        auto unpatched = request;
+        unpatched.indirectSgprs.reset();
+        requireSameResult(runtimeResult, Recompile(unpatched), "disabled runtime push interface");
+    }
+    std::vector<std::byte> encodedRuntime;
+    ShaderDiskCache::EncodeResult(runtimeResult, encodedRuntime);
+    RecompileResult decodedRuntime;
+    require(ShaderDiskCache::DecodeResult(encodedRuntime, decodedRuntime), "runtime push reflection did not deserialize");
+    requireSameResult(runtimeResult, decodedRuntime, "runtime push reflection round trip");
+    auto forwardedRequest = request;
+    auto forwardedCode = code;
+    forwardedCode[1] = 0x7e020209u;
+    forwardedRequest.shader.code = forwardedCode;
+    const auto forwarded = Recompile(forwardedRequest);
+    checkPushConstants(forwarded);
+    const auto forwardedWord = std::ranges::find(forwarded.shaderDataUserWords, 1u);
+    require(forwardedWord != forwarded.shaderDataUserWords.end(), "runtime reflection lost the forwarded user word");
+    std::uint32_t forwardedValue = 0;
+    std::memcpy(&forwardedValue, forwarded.pushConstants.data() + (forwardedWord - forwarded.shaderDataUserWords.begin()) * sizeof(forwardedValue), sizeof(forwardedValue));
+    require(forwardedValue == sample.userData[1], "runtime metadata overwrote a forwarded user word");
     auto result = sampleResult();
     std::vector<std::byte> before, after;
     ShaderDiskCache::EncodeResult(result, before);

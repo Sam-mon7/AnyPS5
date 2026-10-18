@@ -471,8 +471,8 @@ std::array<std::byte, 1024> SubmitRuntimeRun(bool scattered, bool direct, bool q
         if (direct) {
             if (records[record][0] == 0 || records[record][2] >= 3) continue;
             Append(commands, 0x76, {0x8c, records[record][3], 0, records[record][4], 0});
-            Append(commands, 0x27, {3, static_cast<std::uint32_t>(indices), static_cast<std::uint32_t>(indices >> 32u), std::min(records[record][0], 3u), 2});
-        } else Append(commands, 0x25, {offsets[record], 0x8c, 0x8e, 2});
+            Append(commands, 0x27, {3, static_cast<std::uint32_t>(indices), static_cast<std::uint32_t>(indices >> 32u), std::min(records[record][0], 3u), 0});
+        } else Append(commands, 0x25, {offsets[record], 0x8c, 0x8e, 0});
     }
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "indexed indirect packet run submission failed");

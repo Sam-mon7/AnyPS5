@@ -88,6 +88,7 @@ private:
     std::shared_ptr<OptimizedPipeline> optimized;
     std::vector<std::shared_ptr<PipelineLibraryPart>> libraryParts;
     bool dynamicRendering = false;
+    std::uint32_t pushConstantBytes = PipelinePushSlotBytes;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::vector<std::uint32_t> colorSlots;

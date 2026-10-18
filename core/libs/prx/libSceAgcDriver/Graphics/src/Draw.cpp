@@ -1751,7 +1751,8 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
         stages = PushConstantStages(shaders);
     }
     if (indirectTable != 0) {
-        for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::IndirectSgprPushOffset, "stage push constants overlap indirect arguments");
+        static_assert(ShaderRecompiler::IndirectSgprPushOffset + ShaderRecompiler::IndirectSgprPushBytes == PipelinePushSlotBytes);
+        for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::IndirectSgprPushOffset || (ShaderRecompiler::IndirectSgprRuntime() && shader.stage == ShaderRecompiler::ShaderStage::Vertex && shader.program->indirectSgprs && shader.pushConstantOffset == 0u && shader.program->pushConstants.size() == PipelinePushSlotBytes), "stage push constants overlap indirect arguments");
         const std::array<std::uint32_t, 4> words{static_cast<std::uint32_t>(indirectTable), static_cast<std::uint32_t>(indirectTable >> 32u), indirectTableStride, 0u};
         std::memcpy(block.data() + ShaderRecompiler::IndirectSgprPushOffset, words.data(), sizeof(words));
         stages |= VK_SHADER_STAGE_VERTEX_BIT;
