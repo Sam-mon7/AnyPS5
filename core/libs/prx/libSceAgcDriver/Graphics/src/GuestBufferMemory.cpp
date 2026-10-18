@@ -2798,12 +2798,16 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         const auto limit = RebarLimit(context);
         if (mirror->bytes > limit - std::min(limit, RebarMemory().live.load())) return refuseMirror("ReBAR budget");
     }
+    bool hostMirror = false;
     if (VramDeviceLocalMirrors() && heap) {
         const auto report = GetBufferPool(context)->Vram().Current();
         if (report.target != 0 && mirror->bytes > report.target - std::min(report.target, report.usage)) {
-            VramMirrorCounters().refused.fetch_add(1, std::memory_order_relaxed);
-            VramMirrorCounters().refusedBytes.fetch_add(mirror->bytes, std::memory_order_relaxed);
-            return refuseMirror("VRAM budget");
+            if (!VramLazyWrites()) hostMirror = true;
+            else {
+                VramMirrorCounters().refused.fetch_add(1, std::memory_order_relaxed);
+                VramMirrorCounters().refusedBytes.fetch_add(mirror->bytes, std::memory_order_relaxed);
+                return refuseMirror("VRAM budget");
+            }
         }
     }
     if (heap) {
@@ -2833,10 +2837,10 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     try {
         const bool resident = heap && !sparse && range->writable && ResidentHeapMirrors() && RebarMirrors();
         const bool video = vramMirrors() && (!sparse || VramWritable());
-        const bool staged = VramDeviceLocalMirrors() && mirror->base % 4 == 0 && mirror->bytes % 4 == 0;
+        const bool staged = VramDeviceLocalMirrors() && !hostMirror && mirror->base % 4 == 0 && mirror->bytes % 4 == 0;
         const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | (staged ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
         mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(mirror->bytes), usage,
-            staged ? Buffer::Access::DeviceMirror : resident || video ? Buffer::Access::ResidentMirror : Buffer::Access::Default);
+            staged ? Buffer::Access::DeviceMirror : !hostMirror && (resident || video) ? Buffer::Access::ResidentMirror : Buffer::Access::Default);
         if (staged) ++UploadCounts().deviceMirrors;
         if (video && heap) {
             auto& counts = VramMirrorCounters();

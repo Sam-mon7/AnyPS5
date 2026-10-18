@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -536,6 +537,56 @@ void deviceMirrorImportBackingTests(const Device& device, Recorder& recorder) {
     GuestAllocations::Mutation().Add(block + 2 * blockBytes, blockBytes, true, true, true);
     const auto permissions = build();
     if (VramDeviceLocalMirrors()) Require((permissions & ShaderRecompiler::BdaAbi::Write) != 0 && HostImportCovers(context, address, blockBytes), "a range held by an import was copied once its grown run could not be imported");
+}
+
+VKAPI_ATTR void VKAPI_CALL fullVramProperties2(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
+    for (auto* next = static_cast<VkBaseOutStructure*>(properties->pNext); next != nullptr; next = next->pNext) {
+        if (next->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) continue;
+        auto& budget = *reinterpret_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(next);
+        for (std::size_t heap = 0; heap < VK_MAX_MEMORY_HEAPS; ++heap) {
+            budget.heapBudget[heap] = 8ull << 30u;
+            budget.heapUsage[heap] = 8ull << 30u;
+        }
+    }
+}
+
+void deviceMirrorHostFallbackTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    context.integratedGpu = false;
+    context.memoryProperties2 = fullVramProperties2;
+    context.bufferPool.reset();
+    constexpr std::size_t blockBytes = 65536;
+    void* section = nullptr;
+    auto* block = static_cast<std::uint8_t*>(AllocateDescriptorWatched(blockBytes, blockBytes, section));
+    Require(block != nullptr, "host fallback fixture requires watched memory");
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        void* section;
+        ~Release() {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            GuestAllocations::Mutation().Remove(block);
+            ClearImageMirrors(context.device);
+            ReleaseDescriptorWatched(block, blockBytes, section);
+        }
+    } release{context, recorder, block, section};
+    std::memset(block, 0x24, blockBytes);
+    GuestAllocations::Mutation().Add(block, blockBytes, true, true, true);
+    GetBufferPool(context)->Vram().Refresh();
+    const auto before = MirrorCounters();
+    {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        GuestBufferMemory space(context);
+        space.SetAddressWrites(false);
+        space.AcquireRegistered();
+        space.Upload(true);
+        space.WriteBack();
+    }
+    if (VramDeviceLocalMirrors()) Require(MirrorCounters().heapMirrors > before.heapMirrors, "a writable heap over the VRAM target was copied instead of mirrored in host memory");
 }
 
 void vramDescriptorTests(const Device& device, Recorder& recorder) {
@@ -8545,6 +8596,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--vram-device-only") {
             deviceMirrorUploadTests(device, recorder);
             deviceMirrorImportBackingTests(device, recorder);
+            deviceMirrorHostFallbackTests(device, recorder);
             vramDescriptorTests(device, recorder);
             vramDescriptorBoundaryTests(device, recorder);
             vramDescriptorSparseGrowthTests(device, recorder);
