@@ -109,7 +109,13 @@ add_custom_command(
         VERBATIM
 )
 
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lanes/Submission.inc PROPERTIES HEADER_FILE_ONLY TRUE)
 set(agcDriverSources
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/include/Driver/Lanes/WorkerPool.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/include/Driver/Lanes/Scheduler.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/include/Driver/Lanes/SubmissionCursor.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/include/Driver/Lanes/VulkanQueues.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lanes/Submission.inc
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
@@ -2987,4 +2993,44 @@ if(BUILD_TESTING)
     set_property(TEST agc_page_tracker_on PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=1")
     set_property(TEST agc_page_tracker_nonexact PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=01")
     set_property(TEST agc_page_tracker_unset APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PAGE_TRACKER=unset:")
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(agc_gpu_lanes_tests tests/GpuLanes.cpp)
+    target_include_directories(agc_gpu_lanes_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+    set_target_properties(agc_gpu_lanes_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_gpu_lanes_tests)
+    foreach(lanesMode IN ITEMS off on nonexact unset)
+        add_test(NAME agc_gpu_lanes_${lanesMode} COMMAND agc_gpu_lanes_tests)
+        set_tests_properties(agc_gpu_lanes_${lanesMode} PROPERTIES TIMEOUT 15)
+    endforeach()
+    set_property(TEST agc_gpu_lanes_off PROPERTY ENVIRONMENT "APS5_GPU_LANES=0")
+    set_property(TEST agc_gpu_lanes_on PROPERTY ENVIRONMENT "APS5_GPU_LANES=1")
+    set_property(TEST agc_gpu_lanes_nonexact PROPERTY ENVIRONMENT "APS5_GPU_LANES=01")
+    set_property(TEST agc_gpu_lanes_unset PROPERTY ENVIRONMENT_MODIFICATION "APS5_GPU_LANES=unset:")
+    foreach(lanesMode IN ITEMS off on)
+        if(lanesMode STREQUAL "on")
+            set(lanesValue 1)
+        else()
+            set(lanesValue 0)
+        endif()
+        foreach(lanesTest IN ITEMS gpu_lane_pm4 gpu_lane_queues gpu_indirect_arguments_written_ahead)
+            add_test(NAME agc_gpu_lanes_${lanesTest}_${lanesMode} COMMAND agc_driver_${lanesTest}_tests)
+            set_tests_properties(agc_gpu_lanes_${lanesTest}_${lanesMode} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+                ENVIRONMENT "APS5_GPU_LANES=${lanesValue};APS5_ASYNC_COMPUTE_QUEUES=1;ANYPS5_NO_SHADER_CACHE=1"
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            if(WIN32)
+                set_property(TEST agc_gpu_lanes_${lanesTest}_${lanesMode} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            endif()
+        endforeach()
+    endforeach()
+    add_test(NAME agc_gpu_lanes_pm4_submit_worker COMMAND agc_driver_gpu_lane_pm4_tests)
+    set_tests_properties(agc_gpu_lanes_pm4_submit_worker PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_GPU_LANES=1;APS5_SUBMIT_WORKER=1")
+    add_test(NAME agc_gpu_lanes_queues_graphics COMMAND agc_driver_gpu_lane_queues_tests)
+    set_tests_properties(agc_gpu_lanes_queues_graphics PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_GPU_LANES=1;APS5_ASYNC_COMPUTE_QUEUES=0")
+    add_test(NAME agc_gpu_lanes_shutdown COMMAND agc_driver_wait_shutdown_tests)
+    set_tests_properties(agc_gpu_lanes_shutdown PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_GPU_LANES=1")
+    if(WIN32)
+        set_tests_properties(agc_gpu_lanes_pm4_submit_worker agc_gpu_lanes_queues_graphics agc_gpu_lanes_shutdown PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
 endif()

@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/SubmissionCursor.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -393,25 +395,7 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
     }
 }
 
-void Driver::enqueue(Submission submission) {
-    const auto queue = submission.queue;
-    submission.waitFree = waitFree(submission);
-    auto& worker = workers[queue];
-    for (const auto dword : submission.labelWrites) ++worker.unfinishedWrites[dword];
-    worker.pending.push_back(std::move(submission));
-    worker.queued.fetch_add(1, std::memory_order_acq_rel);
-    if (!worker.thread.joinable()) worker.thread = std::thread([this, queue] {
-        char role[32];
-        std::snprintf(role, sizeof(role), "queue 0x%x worker", queue);
-        try {
-            RaiseWorkerThreadPriority(role);
-        } catch (...) {
-            ReportFailure(std::current_exception());
-            return;
-        }
-        run(queue);
-    });
-}
+#include "../Lanes/Submission.inc"
 
 void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
     const auto packet = std::span<const std::uint32_t>(submission.commands).subspan(cursor, std::min<std::size_t>(Pm4::PacketWords(submission.commands[cursor]), submission.commands.size() - cursor));
