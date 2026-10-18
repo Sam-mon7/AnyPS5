@@ -115,6 +115,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/include/Driver/Lanes/Scheduler.hpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/include/Driver/Lanes/SubmissionCursor.hpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/include/Driver/Lanes/VulkanQueues.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/include/Driver/Lanes/ComputeDispatch.hpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lanes/Submission.inc
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
@@ -3459,7 +3460,7 @@ if(BUILD_TESTING)
         else()
             set(lanesValue 0)
         endif()
-        foreach(lanesTest IN ITEMS gpu_lane_pm4 gpu_lane_queues gpu_indirect_arguments_written_ahead)
+        foreach(lanesTest IN ITEMS gpu_lane_pm4 gpu_lane_queues gpu_lane_render_sample gpu_indirect_arguments_written_ahead)
             add_test(NAME agc_gpu_lanes_${lanesTest}_${lanesMode} COMMAND agc_driver_${lanesTest}_tests)
             set_tests_properties(agc_gpu_lanes_${lanesTest}_${lanesMode} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
                 ENVIRONMENT "APS5_GPU_LANES=${lanesValue};APS5_ASYNC_COMPUTE_QUEUES=1;ANYPS5_NO_SHADER_CACHE=1"
@@ -3473,9 +3474,16 @@ if(BUILD_TESTING)
     set_tests_properties(agc_gpu_lanes_pm4_submit_worker PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_GPU_LANES=1;APS5_SUBMIT_WORKER=1")
     add_test(NAME agc_gpu_lanes_queues_graphics COMMAND agc_driver_gpu_lane_queues_tests)
     set_tests_properties(agc_gpu_lanes_queues_graphics PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_GPU_LANES=1;APS5_ASYNC_COMPUTE_QUEUES=0")
+    add_test(NAME agc_gpu_lanes_render_sample_submit_worker COMMAND agc_driver_gpu_lane_render_sample_tests)
+    set_tests_properties(agc_gpu_lanes_render_sample_submit_worker PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "APS5_GPU_LANES=1;APS5_ASYNC_COMPUTE_QUEUES=1;APS5_SUBMIT_WORKER=1;ANYPS5_NO_SHADER_CACHE=1"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_gpu_lanes_queues_submit_worker COMMAND agc_driver_gpu_lane_queues_tests)
+    set_tests_properties(agc_gpu_lanes_queues_submit_worker PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+        ENVIRONMENT "APS5_GPU_LANES=1;APS5_ASYNC_COMPUTE_QUEUES=1;APS5_SUBMIT_WORKER=1;ANYPS5_NO_SHADER_CACHE=1")
     add_test(NAME agc_gpu_lanes_shutdown COMMAND agc_driver_wait_shutdown_tests)
     set_tests_properties(agc_gpu_lanes_shutdown PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_GPU_LANES=1")
     if(WIN32)
-        set_tests_properties(agc_gpu_lanes_pm4_submit_worker agc_gpu_lanes_queues_graphics agc_gpu_lanes_shutdown PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        set_tests_properties(agc_gpu_lanes_pm4_submit_worker agc_gpu_lanes_queues_graphics agc_gpu_lanes_render_sample_submit_worker agc_gpu_lanes_queues_submit_worker agc_gpu_lanes_shutdown PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
 endif()

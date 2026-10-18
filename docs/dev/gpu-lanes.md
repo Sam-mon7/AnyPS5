@@ -159,9 +159,108 @@ and semaphores. API clients must release their queue handles before destroying
 the owning device.
 
 These are real VkQueues and the semaphore API is exercised by the Vulkan test.
-Existing dispatches continue through their current recorder. PM4 label waits
-do not yet generate `Dependency` objects for that API. Switching live dispatch
-onto these queues requires the recorder and resource-ownership work below.
+Eligible imported-buffer dispatches now use those queues as described below.
+Other dispatches continue through the graphics recorder.
+
+## H2 imported-buffer routing
+
+With both switches exactly `1`, a live async-queue dispatch can record its bind,
+push constants and direct or indirect dispatch in a separate compute-family
+command pool. Admission requires a reusable resource set containing only
+nonempty guest storage-buffer descriptors, with every descriptor's entire
+range present in `InPlaceReads()` and backed by a host import. This excludes
+copied/staged buffers, device-local buffer-cache bindings, image mirrors, image
+and sampler bindings, shader-data/SRT buffers, BDA, completion work, device-memory
+LDS and checkpoint recording. Oversized direct dispatches retain their existing
+split/error path. Resident heap mirrors always retain their existing path.
+Missing dedicated compute families or timeline support also retain graphics.
+
+Each admitted dispatch transfers the complete, deduplicated imported VkBuffers
+from graphics to its compute family and back using matched release/acquire
+barriers. Indirect arguments include their own import in those transfers.
+The graphics recorder submits the release, its graphics timeline marker feeds
+the compute submit, and an empty graphics submit waits for the compute timeline
+before the recorder's acquire. The next graphics batch retains the compute
+command pool, fence, pipeline and resources through completion. Pool destruction
+waits for its compute fence, already signaled on normal retirement, including
+when a handoff fails after compute submission. Guest writer declarations,
+pending reads/writes, host visibility and resource retirement continue through
+the existing recorder. Optional submit-worker calls retain their FIFO ordering.
+
+This intentionally serializes the graphics/compute handoff. It establishes
+live queue routing and ownership for this admitted subset; it does not establish
+GPU overlap or four-worker recording. A pool is allocated per routed dispatch
+until per-worker recorder retirement can safely recycle it.
+
+GPU-recorded PM4 labels are submitted and associated with a graphics timeline
+marker, storing their dword values in a bounded 4096-entry table. A satisfied
+PM4 memory wait carries matching label dependencies to the next routed dispatch
+on its guest queue; repeated semaphore dependencies merge to their highest
+value. Changed label values do not contribute an edge. Clearing the bounded
+table only loses redundant edges because waits still require actual guest
+memory publication and the graphics handoff orders every admitted dispatch.
+CPU/completion-action labels retain that existing publication requirement.
+This does not yet suspend on an uncompleted timeline producer instead of guest
+memory, or permit unrelated queues to overlap.
+
+`agc_gpu_lanes_gpu_lane_queues_{off,on}` now also execute an atomic counter
+through graphics, guest compute queues 0x20 and 0x21, and graphics again. They
+assert two routed dispatches when host imports, dedicated compute and timelines
+are available, verify that a subsequent GPU label contributes a timeline edge,
+and verify the counter on fallback devices. The existing
+`agc_gpu_lanes_queues_graphics` and new `agc_gpu_lanes_queues_submit_worker` cover
+async-off and submit-worker configurations. CPU mock tests additionally check
+both directions of ownership barriers, nested queue scopes, 64-bit label edge
+merging and overwritten-label rejection.
+
+`agc_gpu_lanes_gpu_lane_render_sample_{off,on}` submit actual PM4 containing
+128 draws to an R32 float color target followed by a compute sample, then repeat
+with a different color without a CPU wait between the two sequences. Every
+sampled lane must see its producer's value. The fixture checks the first forced
+chunk boundary explicitly. `agc_gpu_lanes_render_sample_submit_worker` adds the
+submit-worker configuration. Image-bearing dispatches exercise the graphics
+fallback; this regression does not claim cross-family image coverage.
+
+## H2 remaining implementation plan
+
+1. In `SubmissionCursor` and the lane preparation stage, decode immutable
+   operation/register snapshots in PM4 order and declare earlier logical GPU
+   writes before capturing each operation's shader/SRT, indirect, buffer,
+   texture and target ranges with `RecordProof::Capture`. Carry writer-chunk
+   identity and pinned cache generations beside those proofs. Validate with
+   `RecordProof::Check` before publishing a prepared chunk. Changed, uncovered,
+   pending-producer and aliased ranges must resolve serially or reprepare after
+   the producer; a newer token cannot validate older prepared bytes.
+2. Make resource/pipeline/texture lookup publication concurrent before removing
+   `GpuMutex`: shared locks or shards around immutable entry lookup, per-key
+   future/build ownership on misses, exclusive insertion/eviction, and fence
+   pins on all returned versions. Move mutable resource validation and LRU
+   touches out of shared-reader sections, preserve the existing descriptor
+   allocator locks, and serialize access to the Vulkan pipeline-cache handle.
+   Buffer/import and texture generation/layout APIs must expose pinned versions
+   before their current mutable state can be used by preparation lanes.
+3. Give each worker an independent lane recorder using its family-specific
+   `CommandPools` slot, descriptor scratch and resource-state journal. Retire
+   pools only after the owning timeline/fence. Replace legacy execution closures
+   with prepared command buffers; the existing ordered worker must publish
+   resource states and submit in each queue's PM4 order, inserting producer and
+   label edges. Allow multiple in-flight chunks of a queue only after dependency
+   extraction proves preparation independent. Validate forced preparation
+   reordering, failure cancellation and four-worker image equivalence before
+   removing the legacy mutex path.
+4. Extend routing to shader-data, buffer-cache and image versions through an
+   explicit Vulkan resource/ownership snapshot. Add cross-family image
+   release/acquire and layout transitions, retain producer image versions, and
+   permit pending-label timeline waits only when CPU visibility is unnecessary.
+   Replace the conservative graphics handoff with proven resource dependencies
+   to obtain actual compute/graphics overlap. Add a dedicated-family image
+   regression and indirect GPU-writer chain before claiming full step 4.
+
+Reconfigure CMake to discover `GpuLaneRenderSample.cpp`; add
+`GpuLaneRenderSample` and `GpuLaneQueues` to `ANYPS5_AGC_EXECUTION_TESTS` when
+filtered. H2 only ran syntax/conventions checks in its isolated worktree. The
+integrator must run the registered Vulkan tests with validation enabled and
+confirm routing on hardware exposing a dedicated compute family.
 
 ## Shared caches and migration
 
