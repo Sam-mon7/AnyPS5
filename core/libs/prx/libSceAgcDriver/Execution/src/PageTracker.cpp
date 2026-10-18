@@ -406,6 +406,14 @@ Reasons Tracker::PageReasons(const Region& region, std::size_t page) {
     return result;
 }
 
+std::uint64_t Tracker::CoveredWord(const Region& region, std::size_t word, bool proof) {
+    const auto& reasons = region.reasons;
+    const auto at = [&](Reason reason) { return reasons[static_cast<std::size_t>(reason)][word]; };
+    const auto mechanisms = at(Reason::PrivateWatch) | at(Reason::ProtectedSection) | at(Reason::Immutable);
+    const auto blockers = at(Reason::OpenWriter) | at(Reason::ExcludedImport) | at(Reason::HostAlias) | at(Reason::Unsupported) | at(Reason::Unmapped) | at(Reason::PendingGpu);
+    return mechanisms & ~blockers & (proof ? ~at(Reason::PrivateWatch) : ~std::uint64_t{0});
+}
+
 bool Tracker::Covered(Reasons reasons, bool proof) {
     constexpr auto mechanisms = Bit(Reason::PrivateWatch) | Bit(Reason::ProtectedSection) | Bit(Reason::Immutable);
     constexpr auto blockers = Bit(Reason::OpenWriter) | Bit(Reason::ExcludedImport) | Bit(Reason::HostAlias) | Bit(Reason::Unsupported) | Bit(Reason::Unmapped) | Bit(Reason::PendingGpu);
@@ -425,12 +433,18 @@ Observation Tracker::Observe(std::span<const Range> ranges, Poll poll) {
         Visit(range, false, [&](auto id, auto offset, auto bytes, auto* region) {
             observation.regions.push_back({id, region != nullptr ? region->mapEpoch : 0});
             if (region == nullptr) return;
-            for (auto page = offset / PageBytes; page < (offset + bytes + PageBytes - 1) / PageBytes; ++page) {
-                if ((PageReasons(*region, page) & Bit(Reason::PrivateWatch)) == 0) continue;
-                const auto address = id * RegionBytes + page * PageBytes;
-                if (!privateRanges.empty() && privateRanges.back().address + privateRanges.back().bytes == address) privateRanges.back().bytes += PageBytes;
-                else privateRanges.push_back({address, PageBytes});
-            }
+            const auto& privateWatch = region->reasons[static_cast<std::size_t>(Reason::PrivateWatch)];
+            Words(offset, bytes, [&](auto word, auto mask) {
+                auto pages = privateWatch[word] & mask;
+                while (pages != 0) {
+                    const auto first = static_cast<std::uint64_t>(std::countr_zero(pages));
+                    const auto count = static_cast<std::uint64_t>(std::countr_one(pages >> first));
+                    const auto address = id * RegionBytes + (word * 64 + first) * PageBytes;
+                    if (!privateRanges.empty() && privateRanges.back().address + privateRanges.back().bytes == address) privateRanges.back().bytes += count * PageBytes;
+                    else privateRanges.push_back({address, count * PageBytes});
+                    pages &= count == 64 ? 0 : ~(((1ull << count) - 1) << first);
+                }
+            });
         });
     }
     std::sort(observation.regions.begin(), observation.regions.end());
@@ -469,11 +483,11 @@ Epoch Tracker::CaptureEpoch(Range range, const Observation* observation) const {
         token.regions.push_back({id, region->mapEpoch, region->cpuEpoch, region->gpuEpoch});
         if (region->mapEpoch == 0 || region->cpuEpoch == 0 || region->gpuEpoch == 0) token.covered = false;
         bool privatePages = false;
-        for (auto page = offset / PageBytes; page < (offset + bytes + PageBytes - 1) / PageBytes; ++page) {
-            const auto reasons = PageReasons(*region, page);
-            privatePages |= (reasons & Bit(Reason::PrivateWatch)) != 0;
-            if (!Covered(reasons, !observed)) token.covered = false;
-        }
+        const auto& privateWatch = region->reasons[static_cast<std::size_t>(Reason::PrivateWatch)];
+        Words(offset, bytes, [&](auto word, auto mask) {
+            privatePages |= (privateWatch[word] & mask) != 0;
+            if ((CoveredWord(*region, word, !observed) & mask) != mask) token.covered = false;
+        });
         if (privatePages) {
             token.observationTracker = this;
             if (!observed || std::none_of(observation->regions.begin(), observation->regions.end(), [&](const auto& before) { return before.regionId == id && before.mapEpoch == region->mapEpoch; })) token.covered = false;

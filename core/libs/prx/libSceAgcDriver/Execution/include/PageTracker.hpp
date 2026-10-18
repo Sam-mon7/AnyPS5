@@ -143,6 +143,7 @@ private:
     static void Advance(std::uint64_t& epoch);
     static Reasons PageReasons(const Region& region, std::size_t page);
     static bool Covered(Reasons reasons, bool proof);
+    static std::uint64_t CoveredWord(const Region& region, std::size_t word, bool proof);
     mutable std::shared_mutex directoryMutex;
     mutable std::map<std::uint64_t, std::unique_ptr<Region>> directory;
     mutable std::mutex countsMutex;
