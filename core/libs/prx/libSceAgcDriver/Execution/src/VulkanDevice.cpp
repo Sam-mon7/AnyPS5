@@ -10,6 +10,7 @@
 #endif
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/VulkanQueues.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/ComputeDispatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DispatchCoverage.hpp"
@@ -2094,6 +2095,10 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // The table entry and the label's own pending-write note (Recorder::NoteLabel).
     recorder.NoteLabel(address, bytes, stamp, queue);
     GuestMemory::MarkWritten(address, bytes.size());
+    if (DriverDetail::Lanes::AsyncComputeEnabled() && !Graphics::ResidentHeapMirrors() && state->laneQueues && state->laneQueues->Dedicated() && state->laneQueues->Timeline()) {
+        recorder.Submit();
+        state->laneQueues->NoteLabel(address, bytes, state->laneQueues->Submit(0, {}));
+    }
     // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
     // wait on its range, after APS5_LABEL_FLUSH_US, or at the submission's end (Driver.cpp).
     // Debug aid: APS5_LABEL_SUBMIT_NOW=1 submits every label at once, as before.
@@ -4189,6 +4194,41 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         timer.add(which, std::chrono::duration<double, std::milli>(now - recordFrom).count());
         recordFrom = now;
     };
+    const auto guestQueue = DriverDetail::Lanes::AsyncComputeEnabled() ? DriverDetail::Lanes::RecordingQueue() : 0u;
+    if (DriverDetail::Lanes::AsyncComputeEnabled() && guestQueue >= 0x20 && guestQueue < 0x58 && state->laneQueues && state->laneQueues->Dedicated() && state->laneQueues->Timeline() &&
+        !Graphics::ResidentHeapMirrors() && state->checkpointMarker == nullptr && record.shader->program->workgroupMemoryDwords == 0 &&
+        (argumentImport != nullptr || (record.x <= state->properties.limits.maxComputeWorkGroupCount[0] && record.y <= state->properties.limits.maxComputeWorkGroupCount[1] && record.z <= state->properties.limits.maxComputeWorkGroupCount[2]))) {
+        auto buffers = DriverDetail::Lanes::ImportedDispatchBuffers(context, resources, *record.shader->program);
+        if (!buffers.empty()) {
+            if (argumentImport != nullptr && std::find(buffers.begin(), buffers.end(), argumentImport->buffer) == buffers.end()) buffers.push_back(argumentImport->buffer);
+            auto routed = std::make_shared<DriverDetail::Lanes::ComputeDispatch>(context, state->laneQueues, guestQueue);
+            const auto commands = routed->Commands();
+            DriverDetail::Lanes::TransferBuffers(*state->laneQueues, commands, buffers, state->laneQueues->Family(0), state->laneQueues->Family(guestQueue), false);
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+            context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
+            resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+            if (record.pushStages != 0) context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
+            if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
+            else context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            DriverDetail::Lanes::TransferBuffers(*state->laneQueues, commands, buffers, state->laneQueues->Family(guestQueue), state->laneQueues->Family(0), true);
+            recorder.FlushKeyStores();
+            recorder.FlushStores();
+            resources.BeginGpuWrites(recorder);
+            recorder.Keep(record.objects);
+            recorder.Keep(record.resources);
+            routed->Submit(guestQueue, recorder, buffers);
+            recorder.Keep(record.objects);
+            recorder.Keep(record.resources);
+            recorder.Keep(routed);
+            if (argumentImport != nullptr) recorder.NotePendingRead(arguments, 12, Graphics::Recorder::ReadKind::Indirect);
+            resources.MarkGpuWrites(recorder);
+            resources.ReadyForSubmit(recorder);
+            recordStep(PhaseRecordBind);
+            return;
+        }
+    }
     if (Graphics::Recorder::RecordWorkerEnabled() && state->checkpointMarker == nullptr && record.shader->program->workgroupMemoryDwords == 0 &&
         (record.dataRefresh == RecordedDispatch::DataRefresh::None || (record.dataRefresh == RecordedDispatch::DataRefresh::Hash && resources.DataWordsHash() == record.dataWordsHash)) &&
         (argumentImport != nullptr || (record.x <= state->properties.limits.maxComputeWorkGroupCount[0] && record.y <= state->properties.limits.maxComputeWorkGroupCount[1] && record.z <= state->properties.limits.maxComputeWorkGroupCount[2])) &&

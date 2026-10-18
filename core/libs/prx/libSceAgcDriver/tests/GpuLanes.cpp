@@ -112,6 +112,12 @@ VKAPI_ATTR VkResult VKAPI_CALL CreatePool(VkDevice, const VkCommandPoolCreateInf
     return VK_SUCCESS;
 }
 VKAPI_ATTR void VKAPI_CALL DestroyPool(VkDevice, VkCommandPool, const VkAllocationCallbacks*) { ++poolsDestroyed; }
+std::vector<VkBufferMemoryBarrier> transferred;
+std::pair<VkPipelineStageFlags, VkPipelineStageFlags> transferStages;
+VKAPI_ATTR void VKAPI_CALL Barrier(VkCommandBuffer, VkPipelineStageFlags source, VkPipelineStageFlags destination, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t count, const VkBufferMemoryBarrier* buffers, std::uint32_t, const VkImageMemoryBarrier*) {
+    transferred.assign(buffers, buffers + count);
+    transferStages = {source, destination};
+}
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Proc(VkDevice, const char* name) {
     if (std::strcmp(name, "vkGetDeviceQueue") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&GetQueue);
     if (std::strcmp(name, "vkCreateSemaphore") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&CreateSemaphore);
@@ -119,6 +125,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Proc(VkDevice, const char* name) {
     if (std::strcmp(name, "vkQueueSubmit") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&Submit);
     if (std::strcmp(name, "vkCreateCommandPool") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&CreatePool);
     if (std::strcmp(name, "vkDestroyCommandPool") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&DestroyPool);
+    if (std::strcmp(name, "vkCmdPipelineBarrier") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&Barrier);
     throw std::runtime_error(name);
 }
 
@@ -143,6 +150,43 @@ void Queues() {
         Require(lastQueue == queues.Queue(0) && submittedWaits.size() == 1 && submittedWaits[0].value == 2 && submittedWaits[0].semaphore == first.semaphore, "compute-to-graphics dependencies were lost or duplicated");
         queues.Submit(0x21, {}, std::span(&graphics, 1));
         Require(lastQueue == queues.Queue(0x21) && submittedWaits[0].semaphore == graphics.semaphore, "graphics-to-compute dependency was lost");
+        alignas(8) std::array<std::uint32_t, 2> label{7, 9};
+        const auto address = reinterpret_cast<std::uintptr_t>(label.data());
+        queues.NoteLabel(address, std::as_bytes(std::span(label)), graphics);
+        queues.WaitLabel(0x20, address, sizeof(label));
+        auto labelDependencies = queues.LabelDependencies(0x20);
+        Require(labelDependencies.size() == 1 && labelDependencies[0].semaphore == graphics.semaphore && labelDependencies[0].value == graphics.value, "64-bit label dependency was lost or duplicated");
+        Require(queues.LabelDependencies(0x20).empty(), "label dependency was consumed twice");
+        queues.NoteLabel(address, std::as_bytes(std::span(label).first(1)), first);
+        queues.NoteLabel(address + 4, std::as_bytes(std::span(label).last(1)), second);
+        queues.WaitLabel(0x20, address, sizeof(label));
+        labelDependencies = queues.LabelDependencies(0x20);
+        Require(labelDependencies.size() == 1 && labelDependencies[0].semaphore == second.semaphore && labelDependencies[0].value == second.value, "label dependencies did not keep the highest producer value");
+        label = {0, 0};
+        queues.WaitLabel(0x21, address, sizeof(label));
+        Require(queues.LabelDependencies(0x21).empty(), "an overwritten label retained its dependency");
+        Require(RecordingQueue() == 0, "initial recording queue changed");
+        {
+            const QueueScope compute(0x20);
+            Require(RecordingQueue() == 0x20, "recording queue scope was not installed");
+            const QueueScope nested(0x21);
+            Require(RecordingQueue() == 0x21, "nested recording queue scope was lost");
+        }
+        Require(RecordingQueue() == 0, "recording queue scope was not restored");
+        const std::array<VkBuffer, 2> buffers{Handle<VkBuffer>(101), Handle<VkBuffer>(102)};
+        for (const auto families : {std::pair{0u, 1u}, std::pair{1u, 0u}}) {
+            TransferBuffers(queues, Handle<VkCommandBuffer>(1), buffers, families.first, families.second, true);
+            Require(transferStages.first == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && transferStages.second == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT && transferred.size() == 2, "ownership release scopes changed");
+            const auto release = transferred;
+            TransferBuffers(queues, Handle<VkCommandBuffer>(2), buffers, families.first, families.second, false);
+            Require(transferStages.first == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT && transferStages.second == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && transferred.size() == release.size(), "ownership acquire scopes changed");
+            for (std::size_t index = 0; index < transferred.size(); ++index) {
+                const auto& acquire = transferred[index];
+                Require(acquire.buffer == buffers[index] && acquire.buffer == release[index].buffer && acquire.size == VK_WHOLE_SIZE && release[index].size == acquire.size && acquire.offset == release[index].offset, "ownership barriers describe different buffer ranges");
+                Require(acquire.srcQueueFamilyIndex == families.first && acquire.dstQueueFamilyIndex == families.second && acquire.srcQueueFamilyIndex == release[index].srcQueueFamilyIndex && acquire.dstQueueFamilyIndex == release[index].dstQueueFamilyIndex, "ownership barriers describe different families");
+                Require(acquire.srcAccessMask == 0 && release[index].dstAccessMask == 0 && acquire.dstAccessMask == (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT) && release[index].srcAccessMask == acquire.dstAccessMask, "ownership barriers lost memory access scopes");
+            }
+        }
         std::barrier rendezvous(2);
         WorkerPool pool(2);
         std::array<std::future<void>, 2> work;

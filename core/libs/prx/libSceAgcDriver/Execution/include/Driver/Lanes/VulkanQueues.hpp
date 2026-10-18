@@ -5,8 +5,12 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <array>
+#include <atomic>
+#include <cstddef>
 #include <map>
 #include <span>
+#include <utility>
+#include "prx/libc/include/HostThreadLocal.hpp"
 
 namespace AgcDriver::DriverDetail::Lanes {
 
@@ -78,6 +82,17 @@ struct Dependency {
     std::uint64_t value = 0;
 };
 
+inline std::uint32_t& RecordingQueue() {
+    struct RecordingQueueStorage {};
+    return HostThreadLocal<std::uint32_t, RecordingQueueStorage>();
+}
+
+struct QueueScope {
+    explicit QueueScope(std::uint32_t queue) : previous(RecordingQueue()) { RecordingQueue() = queue; }
+    ~QueueScope() { RecordingQueue() = previous; }
+    std::uint32_t previous;
+};
+
 class VulkanQueues {
 public:
     using OrderedCall = std::function<VkResult(const std::function<VkResult()>&)>;
@@ -107,6 +122,33 @@ public:
     bool Timeline() const { return timeline; }
     CommandPools& Pools(std::uint32_t guest) { return guest == 0 || !plan.Dedicated() ? graphicsPools : computePools; }
     PFN_vkVoidFunction Function(const char* name) const { return proc(device, name); }
+    void NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, Dependency dependency) {
+        std::lock_guard lock(mutex);
+        for (std::size_t offset = 0; offset + 4 <= bytes.size(); offset += 4) {
+            if (labels.size() >= 4096) labels.clear();
+            std::uint32_t value;
+            std::memcpy(&value, bytes.data() + offset, sizeof(value));
+            labels[address + offset] = {value, dependency};
+        }
+    }
+    void WaitLabel(std::uint32_t guest, std::uint64_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        auto& waits = labelWaits[guest];
+        for (std::size_t offset = 0; offset + 4 <= bytes; offset += 4) {
+            const auto found = labels.find(address + offset);
+            if (found == labels.end() || found->second.value != *reinterpret_cast<const volatile std::uint32_t*>(address + offset)) continue;
+            const auto dependency = found->second.dependency;
+            const auto previous = std::find_if(waits.begin(), waits.end(), [&](const Dependency& wait) { return wait.semaphore == dependency.semaphore; });
+            if (previous == waits.end()) waits.push_back(dependency);
+            else previous->value = std::max(previous->value, dependency.value);
+        }
+    }
+    std::vector<Dependency> LabelDependencies(std::uint32_t guest) {
+        std::lock_guard lock(mutex);
+        return std::exchange(labelWaits[guest], {});
+    }
+    void NoteRoutedDispatch() { routedDispatches.fetch_add(1, std::memory_order_relaxed); }
+    std::uint64_t RoutedDispatches() const { return routedDispatches.load(std::memory_order_relaxed); }
 
     Dependency Submit(std::uint32_t guest, std::span<const VkCommandBuffer> commands, std::span<const Dependency> dependencies = {}, VkFence fence = VK_NULL_HANDLE) {
         std::lock_guard lock(mutex);
@@ -166,10 +208,32 @@ private:
     bool timeline;
     OrderedCall orderedCall;
     std::mutex mutex;
+    struct Label { std::uint32_t value; Dependency dependency; };
+    std::map<std::uint64_t, Label> labels;
+    std::map<std::uint32_t, std::vector<Dependency>> labelWaits;
+    std::atomic<std::uint64_t> routedDispatches{0};
     QueueState graphics;
     std::vector<QueueState> compute;
     CommandPools graphicsPools, computePools;
 };
+
+inline void TransferBuffers(VulkanQueues& queues, VkCommandBuffer commands, std::span<const VkBuffer> buffers, std::uint32_t source, std::uint32_t destination, bool release) {
+    std::vector<VkBufferMemoryBarrier> barriers;
+    for (const auto buffer : buffers) {
+        VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        barrier.srcAccessMask = release ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT : 0;
+        barrier.dstAccessMask = release ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.srcQueueFamilyIndex = source;
+        barrier.dstQueueFamilyIndex = destination;
+        barrier.buffer = buffer;
+        barrier.size = VK_WHOLE_SIZE;
+        barriers.push_back(barrier);
+    }
+    reinterpret_cast<PFN_vkCmdPipelineBarrier>(queues.Function("vkCmdPipelineBarrier"))(commands,
+        release ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        release ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0, 0, nullptr, barriers.size(), barriers.data(), 0, nullptr);
+}
 
 inline std::mutex registryMutex;
 inline std::map<VkDevice, std::weak_ptr<VulkanQueues>> registry;

@@ -26,6 +26,7 @@ void Driver::enqueue(Submission submission) {
     current->submission = std::move(submission);
     // ponytail: legacy recording stays serial until G4-G7 provide concurrent resource and recorder state.
     auto executeChunk = [this](const Submission& chunk) {
+        const Lanes::QueueScope queueScope(chunk.queue);
         onWorkerThread() = true;
         workerQueued() = nullptr;
         DrawPipeline::Active() = false;
@@ -129,8 +130,14 @@ void Driver::enqueue(Submission submission) {
                     queue0Awaited.store(0, std::memory_order_release);
                     queue0AwaitsTitle.store(false, std::memory_order_release);
                 }
-                return {Lanes::Chunk{source.queue, 0, [](std::size_t) -> Lanes::Commit {
-                    return [] { bumpEpoch(&EpochBumps::waits); gateOpened() = true; };
+                return {Lanes::Chunk{source.queue, 0, [this, queue = source.queue, address, bytes](std::size_t) -> Lanes::Commit {
+                    return [this, queue, address, bytes] {
+                        if (Lanes::AsyncComputeEnabled()) if (const auto localDevice = device.Load()) {
+                            if (const auto queues = Lanes::FindQueues(localDevice->Device()); queues && queues->Dedicated() && queues->Timeline()) queues->WaitLabel(queue, address, bytes);
+                        }
+                        bumpEpoch(&EpochBumps::waits);
+                        gateOpened() = true;
+                    };
                 }}, false};
             }
             if (!Pm4::FillerPacket(packet[0]) && (opcode == 0x22 || opcode == 0x3f || wait)) {
