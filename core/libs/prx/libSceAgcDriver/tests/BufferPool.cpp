@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GpuCopyCheckpoints.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
@@ -534,9 +535,9 @@ void Slabs() {
         for (const auto& taken : slots) distinct.insert({taken.memory, taken.offset});
         Expect(distinct.size() == slots.size(), "a slab handed out one slot twice");
         for (const auto& taken : slots) pool.PutSlot(taken.memory, taken.offset);
-        Expect(mock.frees == 1 && pool.SlabBlocks() == 1, "emptied blocks were not freed down to one spare");
+        Expect(mock.frees == (VramCleanup() ? 2u : 1u) && pool.SlabBlocks() == (VramCleanup() ? 0u : 1u), "emptied blocks did not follow the configured spare retention");
         const auto reused = pool.TakeSlot(context, 1, slot, false);
-        Expect(mock.allocations == 2, "the spare block was not reused");
+        Expect(mock.allocations == (VramCleanup() ? 3u : 2u), "a slab allocation did not follow the configured spare retention");
         pool.PutSlot(reused.memory, reused.offset);
     }
     Expect(mock.liveBytes == 0, "slab blocks outlived their pool");
@@ -622,7 +623,7 @@ void ReclaimSlabs() {
         const auto before = mock.attempts;
         try {
             const auto recovered = pool.TakeSlot(context, 1, 256 * 1024, false);
-            Expect(mock.attempts == before + 2 && mock.frees == 1 && pool.SlabBlocks() == 1, "a spare slab without cached buffers was not reclaimed");
+            Expect(mock.attempts == before + (VramCleanup() ? 1u : 2u) && mock.frees == 1 && pool.SlabBlocks() == 1, "an empty slab was neither released immediately nor reclaimed on demand");
             pool.PutSlot(recovered.memory, recovered.offset);
         } catch (const std::exception& error) {
             Expect(false, std::string("spare slab did not permit recovery: ") + error.what());
@@ -683,6 +684,198 @@ void PartialSlabDoesNotRetry() {
         Expect(mock.liveBuffers.size() == 1 && mock.liveBuffers.contains(active.Handle()) && context.bufferPool->SlabBlocks() == 1, "reclaim changed a live slab allocation");
     }
     Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "partial slab failure leaked a resource");
+}
+
+void CleanupBudgetPolicy() {
+    VramReport report{0, 8 * 1024 * MiB, 8 * 1024 * MiB, 0, 7 * 1024 * MiB};
+    report.usage = report.target - report.target / 10u - 1;
+    Expect(VramBudget::PressureFor(report).victims == 0, "mirror collection started below its trigger");
+    ++report.usage;
+    auto pressure = VramBudget::PressureFor(report);
+    Expect(pressure.age == 160 && pressure.victims == 4, "trigger pressure did not retain young mirrors or bound its pass");
+    report.usage = report.target;
+    pressure = VramBudget::PressureFor(report);
+    Expect(pressure.age == 80 && pressure.victims == 8, "target pressure used the wrong mirror age or pass bound");
+    report.usage = report.target + (report.budget - report.target) / 2;
+    pressure = VramBudget::PressureFor(report);
+    Expect(pressure.age == 16 && pressure.victims == 16, "critical pressure did not use the bounded oldest-mirror pass");
+    report.usage = 6 * 1024 * MiB;
+    Expect(VramBudget::RebarAllowance(report, 1024 * MiB, UINT64_MAX) == 2 * 1024 * MiB, "adaptive ReBAR allowance counted its own live bytes as other usage");
+    Expect(VramBudget::RebarAllowance(report, 1024 * MiB, 256 * MiB) == 256 * MiB, "adaptive ReBAR allowance exceeded its configured ceiling");
+    Expect(VramBudget::RebarAllowance(report, 1024 * MiB, 0) == 0, "zero ReBAR ceiling permitted an allocation");
+    report.usage = 9 * 1024 * MiB;
+    Expect(VramBudget::RebarAllowance(report, 1024 * MiB, UINT64_MAX) == 0, "adaptive ReBAR allowance underflowed under external pressure");
+    mock = MockDevice{};
+    mock.heapBudget = HeapBytes;
+    mock.otherUsage = 1024 * MiB;
+    auto context = budgetContext();
+    auto& vram = GetBufferPool(context)->Vram();
+    const auto first = vram.Current();
+    vram.Released(64 * MiB);
+    const auto released = vram.Current();
+    Expect(first.sampleId != 0 && released.sampleId == first.sampleId && released.usage + 64 * MiB == first.usage, "released allocations were not deducted from the current VRAM sample");
+    mock.otherUsage = 2 * 1024 * MiB;
+    vram.Refresh();
+    const auto next = vram.Current();
+    Expect(next.sampleId > first.sampleId && next.usage == mock.otherUsage, "a new VRAM sample retained old release deductions");
+    const auto fixed = RebarMemory().limit.load();
+    const auto limit = RebarLimit(context);
+    Expect(limit == (VramCleanup() ? HeapTarget - mock.otherUsage : fixed), "ReBAR allowance did not follow the cleanup switch");
+    if (!VramCleanup()) return;
+    Require(RebarMemory().Reserve(64 * MiB), "cannot reserve ReBAR bytes for sample-pinning test");
+    Expect(RebarLimit(context) == limit, "allocations enlarged ReBAR allowance within one stale usage sample");
+    mock.otherUsage += 64 * MiB;
+    vram.Refresh();
+    Expect(RebarLimit(context) == limit, "a fresh usage sample charged live ReBAR bytes twice");
+    RebarMemory().Release(64 * MiB);
+    mock.otherUsage = HeapTarget;
+    vram.Refresh();
+    Expect(RebarLimit(context) == (VramCleanup() ? 0 : fixed), "rising external pressure did not shrink the ReBAR allowance");
+    mock.otherUsage = 1024 * MiB;
+    vram.Refresh();
+    Expect(RebarLimit(context) == (VramCleanup() ? HeapTarget - mock.otherUsage : fixed), "falling external pressure did not restore the ReBAR allowance");
+    RebarMemory().limit.store(fixed);
+}
+
+void CleanupRetention() {
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        const auto pool = GetBufferPool(context);
+        const auto initial = pool->Stats();
+        Expect(initial.smallLimit == (VramCleanup() ? 16u : 64u) * MiB, "small-buffer retention budget did not follow cleanup mode");
+        Expect(initial.largeLimit == (VramCleanup() ? 128u : 512u) * MiB, "large-buffer retention budget did not follow cleanup mode");
+        Expect(initial.deviceLimit == (VramCleanup() ? 256u : 512u) * MiB, "staging retention budget did not follow cleanup mode");
+        std::vector<std::unique_ptr<Buffer>> small;
+        for (int i = 0; i < 40; ++i) small.push_back(std::make_unique<Buffer>(context, 512 * 1024, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+        Expect(pool->Stats().slabBytes >= 20 * MiB, "pool statistics omitted physical slab bytes");
+        small.clear();
+        const auto smallStats = pool->Stats();
+        Expect(smallStats.smallRetained <= initial.smallLimit, "small-buffer retention exceeded its cleanup ceiling");
+        std::vector<std::unique_ptr<Buffer>> large;
+        for (int i = 0; i < 3; ++i) large.push_back(std::make_unique<Buffer>(context, 64 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+        large.clear();
+        Expect(pool->Stats().largeRetained == (VramCleanup() ? 128u : 192u) * MiB, "large-buffer retention did not release memory at its cleanup ceiling");
+        const auto before = mock.liveBytes;
+        { Buffer mirror(context, 2 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, Buffer::Access::ResidentMirror); }
+        Expect(mock.liveBytes == before + (VramCleanup() ? 0 : 2 * MiB), "retired resident mirrors did not follow the cleanup pool bypass");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "cleanup retention tests leaked allocations");
+}
+
+void CleanupPhysicalRetention() {
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        const auto pool = GetBufferPool(context);
+        std::vector<std::unique_ptr<Buffer>> live;
+        for (const bool addressable : {false, true}) {
+            const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (addressable ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
+            for (std::size_t bytes = 256; bytes <= 512 * 1024; bytes *= 2) live.push_back(std::make_unique<Buffer>(context, bytes, usage));
+        }
+        Expect(mock.liveBytes > 16 * MiB, "physical retention fixture did not exceed the cleanup cap");
+        live.clear();
+        const auto stats = pool->Stats();
+        Expect(stats.smallRetained < 4 * MiB, "physical retention fixture did not leave sparsely occupied slabs");
+        if (VramCleanup()) {
+            Expect(stats.smallPhysicalRetained <= 16 * MiB && mock.liveBytes <= 16 * MiB, "small logical slots retained physical slabs beyond the cleanup cap");
+            Expect(stats.smallPhysicalRetained == mock.liveBytes && stats.slabBytes == mock.liveBytes, "retention statistics did not report the actual idle slab allocations");
+        } else Expect(mock.liveBytes > 16 * MiB, "cleanup-off mode unexpectedly applied the new physical slab cap");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "physical retention tests leaked allocations");
+}
+
+void CleanupPressureAccounting() {
+    mock = MockDevice{};
+    mock.heapBudget = HeapBytes;
+    mock.otherUsage = 1024 * MiB;
+    {
+        auto context = budgetContext();
+        context.memory.memoryTypeCount = 3;
+        context.memory.memoryTypes[2] = {HostVisible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0};
+        const auto pool = GetBufferPool(context);
+        { Buffer host(context, 2 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); }
+        auto device = std::make_unique<Buffer>(context, 2 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, HostVisible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        const auto type = mock.memoryTypes.at(MemoryOf(device->Handle()));
+        Expect((context.memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && mock.liveBytes == 4 * MiB, "mixed retention fixture did not allocate separate host and device memory");
+        mock.otherUsage = HeapTarget + 8 * MiB;
+        pool->Vram().Refresh();
+        const auto before = pool->Vram().Current();
+        device.reset();
+        const auto after = pool->Vram().Current();
+        if (VramCleanup()) {
+            Expect(mock.liveBytes == 0 && mock.frees == 2, "pressure did not release the mixed host and device cache tier");
+            Expect(after.sampleId == before.sampleId && after.usage + 2 * MiB == before.usage, "host RAM eviction was incorrectly deducted from device-local VRAM usage");
+        } else Expect(mock.liveBytes == 4 * MiB && after.usage == before.usage, "cleanup-off mode changed host-visible device memory retention");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "mixed pressure accounting tests leaked allocations");
+}
+
+void CleanupStagingZero() {
+    const auto* setting = std::getenv("APS5_STAGING_POOL_MIB");
+    Require(setting != nullptr && std::strcmp(setting, "0") == 0, "zero staging fixture requires APS5_STAGING_POOL_MIB=0");
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        const auto pool = GetBufferPool(context);
+        VkBuffer small = VK_NULL_HANDLE;
+        VkBuffer large = VK_NULL_HANDLE;
+        {
+            Buffer hostSmall(context, 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            Buffer hostLarge(context, 2 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            small = hostSmall.Handle();
+            large = hostLarge.Handle();
+        }
+        const auto before = pool->Stats();
+        const auto hostBytes = mock.liveBytes;
+        {
+            DeviceBuffer device(context, 2 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            Expect(mock.liveBytes == hostBytes + 2 * MiB, "zero staging fixture did not make its device allocation");
+        }
+        const auto after = pool->Stats();
+        Expect(after.deviceLimit == 0 && after.deviceRetained == 0, "zero staging budget retained allocations in the device tier");
+        Expect(mock.liveBytes == hostBytes + (VramCleanup() ? 0 : 2 * MiB), "zero staging retention did not follow the cleanup switch");
+        Expect(after.smallRetained == before.smallRetained && after.largeRetained == before.largeRetained + (VramCleanup() ? 0 : 2 * MiB), "zero staging budget changed host retention or moved device allocations to a host tier");
+        Buffer reusedSmall(context, 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        Buffer reusedLarge(context, 2 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        Expect(reusedSmall.Handle() == small && reusedLarge.Handle() == large, "zero staging retention discarded reusable host buffers");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "zero staging retention tests leaked allocations");
+}
+
+void CleanupCopyLimits() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto before = VramCleanupCounters();
+    const std::vector<std::byte> source(32 * MiB);
+    GuestBufferMemory memory(context);
+    memory.AddSnapshot({0x10000000, source});
+    memory.AddSnapshot({0x20000000, source});
+    bool refused = false;
+    try { memory.AddSnapshot({0x30000000, std::span<const std::byte>(source).first(1)}); }
+    catch (const std::runtime_error&) { refused = true; }
+    Expect(refused == VramCleanup(), "snapshot copies did not enforce the per-build cleanup boundary");
+    const auto after = VramCleanupCounters();
+    Expect(!VramCleanup() || (after.snapshotBytes - before.snapshotBytes == 64 * MiB && after.snapshotRefusals == before.snapshotRefusals + 1), "snapshot cleanup counters did not report accepted and refused bytes");
+    Expect(mock.allocations == 0, "snapshot-cap validation allocated GPU memory");
+    const std::vector<std::byte> first(33 * MiB, std::byte{0x11});
+    const std::vector<std::byte> second(33 * MiB, std::byte{0x22});
+    GuestBufferMemory copied(context);
+    copied.AddReadable(reinterpret_cast<std::uint64_t>(first.data()), first.size());
+    copied.AddReadable(reinterpret_cast<std::uint64_t>(second.data()), second.size());
+    const auto copiesBefore = VramCleanupCounters();
+    refused = false;
+    try { copied.Upload(false); }
+    catch (const std::runtime_error& error) { refused = std::string(error.what()).find("per-build fallback copy limit") != std::string::npos; }
+    Expect(refused == VramCleanup(), "CPU fallback copies did not enforce their aggregate per-build cleanup boundary");
+    const auto copiesAfter = VramCleanupCounters();
+    Expect(!VramCleanup() || (copiesAfter.copyBytes - copiesBefore.copyBytes == first.size() && copiesAfter.copyRefusals == copiesBefore.copyRefusals + 1 && mock.allocations == 1), "fallback copy limit allocated or copied the refused range");
+    SetHostImportBudget(2 * 1024 * MiB);
+    Expect(EffectiveHostImportBudget(context) == (VramCleanup() ? 1024u : 2048u) * MiB, "cleanup did not cap host imports at 1 GiB");
+    SetHostImportBudget(128 * MiB);
+    Expect(EffectiveHostImportBudget(context) == 128 * MiB, "cleanup enlarged a smaller configured host import budget");
+    SetHostImportBudget(0);
 }
 
 }
@@ -762,8 +955,14 @@ void RebarUploadReuse() {
     Expect(RebarMemory().live == 0 && mock.liveBytes == 0, "ReBAR allocations stayed charged after the pool was freed");
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--staging-zero-only") {
+            CleanupStagingZero();
+            if (failures != 0) return 1;
+            std::puts("zero staging retention tests passed");
+            return 0;
+        }
         RebarEligibilityAndBudget();
         RebarUploadReuse();
         CopyDiagnostics();
@@ -791,6 +990,11 @@ int main() {
         VramOverTargetReleases();
         VramTrimsPool();
         VramIntegratedKeepsPool();
+        CleanupBudgetPolicy();
+        CleanupRetention();
+        CleanupPhysicalRetention();
+        CleanupPressureAccounting();
+        CleanupCopyLimits();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

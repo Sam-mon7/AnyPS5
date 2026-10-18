@@ -70,6 +70,7 @@
 void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, bool sparse);
 void RunVramWritableTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu);
 void RunVramDeferredTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
+void RunVramCleanupTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 
 namespace {
 
@@ -8324,6 +8325,10 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--vram-cleanup-only") {
+            RunVramCleanupTests(device.GetContext(), recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--vram-writable-only") {
             RunVramWritableTests(device.GetContext(), recorder, gpu);
             return 0;

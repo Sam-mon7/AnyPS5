@@ -1,6 +1,7 @@
 #include "BdaShader.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
@@ -103,6 +104,155 @@ private:
     VkShaderModule module = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
+
+VkDeviceSize cleanupUsage = 1024ull << 20u;
+
+VKAPI_ATTR void VKAPI_CALL cleanupMemoryProperties2(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
+    for (auto* next = static_cast<VkBaseOutStructure*>(properties->pNext); next != nullptr; next = next->pNext) {
+        if (next->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) continue;
+        auto& budget = *reinterpret_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(next);
+        for (std::size_t heap = 0; heap < VK_MAX_MEMORY_HEAPS; ++heap) {
+            budget.heapBudget[heap] = 8ull << 30u;
+            budget.heapUsage[heap] = cleanupUsage;
+        }
+    }
+}
+}
+
+void RunVramCleanupTests(const AgcDriver::Graphics::Context& device, AgcDriver::Graphics::Recorder& recorder) {
+#ifndef _WIN32
+    throw std::runtime_error("VRAM cleanup fixture requires Windows guest page protection");
+#else
+    using namespace AgcDriver::Graphics;
+    namespace Memory = AgcDriver::GuestMemory;
+    Require(VramWritable() && VramOption("APS5_VRAM_DEFERRED"), "VRAM cleanup fixture requires writable deferred mirrors");
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    ClearImageMirrors(device.device);
+    ClearHostImports(device.device);
+    auto context = device;
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    context.integratedGpu = false;
+    context.memoryProperties2 = cleanupMemoryProperties2;
+    context.bufferPool.reset();
+    cleanupUsage = 1024ull << 20u;
+    constexpr std::size_t block = 65536;
+    auto* raw = GuestArena::GuestArenaAllocate_nid_postfix(block, block);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, block, nullptr);
+    Require(section != nullptr, "cannot create shared cleanup fixture memory");
+    GuestArena::GuestArenaMap_nid_postfix(raw, block, section, 0, PAGE_READWRITE);
+    std::memset(raw, 0x11, block);
+    const auto address = reinterpret_cast<std::uint64_t>(raw);
+    GuestAllocations::Mutation().Add(raw, block, true, true, true);
+    const auto acquire = [&](bool written) {
+        Memory::BumpCollectEpoch();
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->SetAddressWrites(written);
+        memory->AcquireRegistered();
+        if (written) memory->AddWritable(address, sizeof(std::uint32_t));
+        memory->Upload(true);
+        Require(HostImportFor(context, address, block) == nullptr, "cleanup fixture unexpectedly imported its shared heap");
+        return memory;
+    };
+    auto held = acquire(false);
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    {
+        const auto copied = VramCleanupCounters().snapshotBytes;
+        GuestBufferMemory snapshot(context);
+        snapshot.AddSnapshot({address, std::span(static_cast<const std::byte*>(raw), 16)});
+        snapshot.Upload(false);
+        std::uint32_t snapshotAdjustment = 0;
+        const auto view = snapshot.Descriptor(address, 16, snapshotAdjustment);
+        std::uint32_t mirrorAdjustment = 0;
+        const auto backing = held->Descriptor(address, 16, mirrorAdjustment);
+        Require(view.buffer == backing.buffer, "a standalone snapshot changed its registered range's mirror backing");
+        Require(!VramCleanup() || (snapshot.CopiedBytes() == 0 && VramCleanupCounters().snapshotBytes == copied), "a snapshot copied bytes already served by a mirror");
+    }
+    const auto first = VramCleanupCounters();
+    Require(first.heapShadowBytes == 0, "writable heap mirrors retained whole-range CPU shadows");
+    cleanupUsage = 8ull << 30u;
+    GetBufferPool(context)->Vram().Refresh();
+    const auto cached = AddressSpaceCounters();
+    Require(cached.enabled, "cleanup cache retention fixture requires the address-space cache");
+    Recorder::CountPresent();
+    CollectVramMirrors(context);
+    { auto recent = acquire(false); }
+    const auto reused = AddressSpaceCounters();
+    Require(reused.hits == cached.hits + 1 && reused.rebuiltFirst == cached.rebuiltFirst, "pressure discarded the cached address space when every mirror was too recent to evict");
+    cleanupUsage = 1024ull << 20u;
+    GetBufferPool(context)->Vram().Refresh();
+    for (int i = 0; i < 160; ++i) Recorder::CountPresent();
+    CollectVramMirrors(context);
+    Require(VramCleanupCounters().evictedMirrors == first.evictedMirrors, "an unpressured cache evicted a mirror");
+    cleanupUsage = 8ull << 30u;
+    GetBufferPool(context)->Vram().Refresh();
+    Recorder::CountPresent();
+    CollectVramMirrors(context);
+    Require(VramCleanupCounters().evictedMirrors == first.evictedMirrors, "collection retired a mirror held by a prepared build");
+    held.reset();
+    CollectVramMirrors(context);
+    Require(VramCleanupCounters().evictedMirrors == first.evictedMirrors, "collection ran twice in one present");
+    Recorder::CountPresent();
+    CollectVramMirrors(context);
+    const auto retired = VramCleanupCounters();
+    Require(retired.evictedMirrors == first.evictedMirrors + (VramCleanup() ? 1 : 0), "old released mirror eviction did not follow the cleanup switch");
+    Require(retired.evictedBytes == first.evictedBytes + (VramCleanup() ? block : 0), "mirror eviction reported the wrong released byte count");
+    cleanupUsage = 1024ull << 20u;
+    GetBufferPool(context)->Vram().Refresh();
+    const auto rebuilt = MirrorCounters().rebuilds;
+    auto writer = acquire(true);
+    Require(MirrorCounters().rebuilds == rebuilt + (VramCleanup() ? 1 : 0), "using an evicted mirror did not recreate its backing");
+    std::uint32_t adjustment = 0;
+    const auto destination = writer->Descriptor(address, sizeof(std::uint32_t), adjustment);
+    writer->BeginGpuWrites(recorder);
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, destination.buffer, destination.offset + adjustment, sizeof(std::uint32_t), 0x12345678u);
+    writer->RecordCopyBacks(recorder);
+    recorder.Keep(writer);
+    recorder.OnComplete([writer] { writer->WriteBack(); });
+    writer->ReadyForSubmit(recorder);
+    static_cast<volatile std::uint8_t*>(raw)[8] = 0x55;
+    recorder.Sync();
+    writer.reset();
+    recorder.FlushDeferredReleases();
+    Require(VramWritableCounters().pendingPages != 0 && GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(address, block), "deferred write results were not pending before age collection");
+    const auto pending = VramCleanupCounters();
+    cleanupUsage = 8ull << 30u;
+    GetBufferPool(context)->Vram().Refresh();
+    for (int i = 0; i < 15; ++i) Recorder::CountPresent();
+    CollectVramMirrors(context);
+    Require(VramCleanupCounters().evictedMirrors == pending.evictedMirrors, "critical pressure evicted a mirror before its minimum age");
+    Recorder::CountPresent();
+    CollectVramMirrors(context);
+    Require(VramCleanupCounters().evictedMirrors == pending.evictedMirrors + (VramCleanup() ? 1 : 0), "critical age collection did not retire a pending mirror");
+    if (VramCleanup()) Require(!GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(address, block), "retirement did not publish pending GPU pages before releasing their mirror");
+    Require(*static_cast<volatile std::uint32_t*>(raw) == 0x12345678u && static_cast<volatile std::uint8_t*>(raw)[8] == 0x55, "age retirement lost GPU bytes or disjoint CPU stores");
+    cleanupUsage = 1024ull << 20u;
+    GetBufferPool(context)->Vram().Refresh();
+    auto reader = acquire(false);
+    auto readback = std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto source = reader->Descriptor(address, 16, adjustment);
+    const auto copyCommands = recorder.Commands();
+    RecordMemoryBarrier(context, copyCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, copyCommands, source.buffer, source.offset + adjustment, readback->Handle(), 0, 16);
+    RecordMemoryBarrier(context, copyCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(reader);
+    recorder.Keep(readback);
+    recorder.Sync();
+    Require(*reinterpret_cast<const std::uint32_t*>(readback->Bytes().data()) == 0x12345678u && readback->Bytes()[8] == std::byte{0x55}, "recreated mirror did not upload the published merged bytes");
+    reader.reset();
+    recorder.FlushDeferredReleases();
+    GuestAllocations::Mutation().Remove(raw);
+    ClearImageMirrors(context.device);
+    ClearHostImports(context.device);
+    GuestArena::GuestArenaReset_nid_postfix(raw, block);
+    GuestArena::GuestArenaRelease_nid_postfix(raw, block);
+    CloseHandle(section);
+    std::cout << "VRAM cleanup pressure, age, held-resource, pending-publication and recreation tests passed\n";
+#endif
 }
 
 void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcDriver::Graphics::Recorder& recorder, bool sparse) {
