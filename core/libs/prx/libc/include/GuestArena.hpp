@@ -3,18 +3,35 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 
 // Guest virtual memory is placed inside one reserved arena below the PS5 application map limit
 // absolute address and breaks on host addresses outside that range.
 namespace GuestArena {
 
-enum class PageEvent : std::uint8_t { PrivateMap, PrivatePollRange, SectionMap, Invalidate, Unmap, SectionState, WriteFault, HostWrite };
+enum class PageEvent : std::uint8_t { PrivateMap, PrivatePollRange, SectionMap, Invalidate, Unmap, SectionState, WriteFault, HostWrite, ObservationFault };
 enum PageCoverage : std::uint32_t {
     PagePrivateWatch = 1u << 0, PageProtectedSection = 1u << 1, PageImmutable = 1u << 2,
     PageOpenWriter = 1u << 3, PageExcludedImport = 1u << 4, PageHostAlias = 1u << 5,
     PageUnsupported = 1u << 6, PageUnmapped = 1u << 7, PagePendingGpu = 1u << 8
 };
 using PageObserver = void (*)(PageEvent event, std::uintptr_t address, std::size_t bytes, std::uint32_t reasons) noexcept;
+
+enum class PageFaultKind : std::uint8_t { Observation, Legacy, GpuRead, GpuWrite, Rejected, Stale, Nested, Count };
+enum class PageArmRefusal : std::uint8_t { InvalidRange, UnknownMapping, Identity, Metadata, Permission, Pinned, HostWriter, HostAlias, Protection, Count };
+struct PageTiming {
+    std::uint64_t calls = 0, ns = 0, maxNs = 0;
+    std::array<std::uint64_t, 32> histogram{};
+};
+struct PageObservationStatistics {
+    std::array<PageTiming, static_cast<std::size_t>(PageFaultKind::Count)> faults{};
+    std::array<std::uint64_t, static_cast<std::size_t>(PageArmRefusal::Count)> refusals{};
+    PageTiming protection, checkpoint, mappingWait;
+    std::uint64_t physicalPages = 0, aliasPages = 0, protectionPages = 0, armedPages = 0, rearmedPages = 0, outstanding = 0;
+    std::uint64_t frames = 0, fallbackWindows = 0, framePages = 0, maxFramePages = 0, fallbackPages = 0;
+    std::uint64_t frameFaults = 0, maxFrameFaults = 0, fallbackFaults = 0;
+    std::array<std::uint64_t, 32> frameFaultHistogram{};
+};
 
 #ifndef _WIN32
 using SharedBackingResolver = bool (*)(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
@@ -39,6 +56,11 @@ void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes);
 #ifdef _WIN32
 void GuestArenaSetPageObserver_nid_no_patch(PageObserver callback);
 bool GuestArenaHasPageObserver_nid_no_patch();
+void GuestArenaEnablePageObservation_nid_no_patch(bool (*ready)() noexcept);
+bool GuestArenaArmPageObservation_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+bool GuestArenaPageObservationCheckpoint_nid_no_patch(bool frame);
+PageObservationStatistics GuestArenaPageObservationCounts_nid_no_patch();
+void GuestArenaSetPageObservationFaultHook_nid_no_patch(void (*hook)() noexcept);
 std::size_t GuestArenaPageObserverMetadataBytes_nid_no_patch();
 void GuestArenaVisitPageAliases_nid_no_patch(std::uintptr_t address, std::size_t bytes, void (*visitor)(std::uintptr_t, std::size_t, void*), void* context);
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);

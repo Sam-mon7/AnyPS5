@@ -42,7 +42,7 @@ bool Split(Range range, Function&& function) {
     return true;
 }
 
-enum class Kind : std::uint8_t { Private, Section, Import, Unknown, Count };
+enum class Kind : std::uint8_t { Private, Section, Import, Unknown, Immutable, Count };
 enum class Reason : std::uint8_t { PrivateWatch, ProtectedSection, Immutable, OpenWriter, ExcludedImport, HostAlias, Unsupported, Unmapped, PendingGpu, Count };
 enum class Source : std::uint8_t { PrivatePoll, SectionFault, HostWrite, DriverStore, GpuDeclaration, BdaReport, BdaOverflow, Copyback, SectionCollect, Count };
 using Reasons = std::uint32_t;
@@ -63,6 +63,7 @@ struct Statistics {
     std::array<std::uint64_t, static_cast<std::size_t>(Source::Count)> sources{};
     std::uint64_t polledPages = 0, faultPages = 0, gpuPages = 0, pollCalls = 0, pollNs = 0, pollErrors = 0;
     std::uint64_t regions = 0, metadataBytes = 0;
+    std::uint64_t uniquePolledPages = 0, framePolledPages = 0, fallbackPolledPages = 0;
     bool poisoned = false;
 };
 
@@ -80,14 +81,16 @@ public:
     void ObserveRead(Range range, GuestMemory::ReadSite site);
     void NotePoll(std::uint64_t pages, std::uint64_t ns, bool complete);
     void ObservePolledPage(Range range);
+    void Checkpoint(bool frame);
     Statistics Counts() const;
     std::string ProfileLine() const;
     void Poison() noexcept { poisoned.store(true, std::memory_order_release); }
+    bool Poisoned() const noexcept { return poisoned.load(std::memory_order_acquire); }
 
 private:
     struct Region {
         mutable std::mutex mutex;
-        Bitmap cpuDirty{}, gpuDirty{};
+        Bitmap cpuDirty{}, gpuDirty{}, observedPrivate{};
         std::array<Bitmap, static_cast<std::size_t>(Reason::Count)> reasons{};
         std::array<Bitmap, static_cast<std::size_t>(Kind::Count)> kinds{};
         std::uint64_t mapEpoch = 1, cpuEpoch = 1, gpuEpoch = 1;
@@ -112,6 +115,8 @@ private:
 };
 
 bool Enabled();
+bool ArmEnabled();
+void CompletedFrame();
 Tracker* Get();
 void Initialize();
 void ReportIfDue(void (*print)(const char*));

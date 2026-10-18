@@ -59,6 +59,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     timing.Mark("validate");
     try {
         bool submitted = false;
+        bool completedFrame = false;
         bool presentable = false;
         bool trailing = false;
         double waitedMs = 0;
@@ -102,6 +103,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 submitted = presenting->PresentClear(window.width, window.height, opaque);
                 timing.Mark("present_clear");
             }
+            completedFrame = submitted;
             if (submitted && syncFlip) {
                 waitedMs = presenting->FinishPresent();
                 timing.Mark("render_fence_wait");
@@ -130,6 +132,10 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         gpuReady(context);
         timing.Mark("release_and_callback");
         TracyZone::MarkFrame();
+        if (PageTracker::ArmEnabled()) {
+            if (completedFrame) PageTracker::CompletedFrame();
+            PageTracker::ReportIfDue([](const char* line) { AgcDriver::ProfilePrint_nid_no_patch("%s", line); });
+        }
         if (profile) reportPresents(waitedMs, inFlight);
         CheckFailure();
     } catch (const ProcessShutdown&) {
