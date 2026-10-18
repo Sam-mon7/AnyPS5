@@ -109,6 +109,7 @@ struct ImageMirror {
     std::map<std::uint64_t, std::shared_ptr<MirrorWriteInterval>> lazyPages;
     std::shared_ptr<MirrorWriteInterval> lazyAddressWriter;
     std::uint64_t gpuRevision = 0;
+    std::vector<std::uint64_t> gpuStamps;
     std::uint64_t aliasesGeneration = 0;
     std::uint64_t aliasesMappingGeneration = 0;
     std::atomic<std::uint64_t> lastUsePresent{0};
@@ -1534,6 +1535,26 @@ void reportLazyWrites() {
         static_cast<unsigned long long>(c.snapshotCalls), c.snapshotUs / 1000.0);
 }
 
+void stampGpuBlocks(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end) {
+    constexpr std::uint64_t block = 65536;
+    begin = std::max(begin, mirror.base);
+    end = std::min(end, mirror.base + mirror.bytes);
+    if (mirror.gpuStamps.empty() || begin >= end) return;
+    const auto stop = std::min<std::uint64_t>((end - 1) / block - mirror.base / block + 1, mirror.gpuStamps.size());
+    for (auto index = begin / block - mirror.base / block; index < stop; ++index) mirror.gpuStamps[static_cast<std::size_t>(index)] = mirror.gpuRevision;
+}
+
+std::uint64_t gpuStampOver(const ImageMirror& mirror, std::uint64_t begin, std::uint64_t end) {
+    constexpr std::uint64_t block = 65536;
+    begin = std::max(begin, mirror.base);
+    end = std::min(end, mirror.base + mirror.bytes);
+    if (mirror.gpuStamps.empty() || begin >= end) return 0;
+    const auto stop = std::min<std::uint64_t>((end - 1) / block - mirror.base / block + 1, mirror.gpuStamps.size());
+    std::uint64_t newest = 0;
+    for (auto index = begin / block - mirror.base / block; index < stop; ++index) newest = std::max(newest, mirror.gpuStamps[static_cast<std::size_t>(index)]);
+    return newest;
+}
+
 void finishLazyAddressWriter(ImageMirror& mirror, bool fault = false) {
     const auto interval = mirror.lazyAddressWriter;
     if (interval == nullptr || interval->complete) return;
@@ -2821,6 +2842,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         }
         constexpr std::uint64_t block = 65536;
         mirror->generations.assign(static_cast<std::size_t>(((mirror->base + mirror->bytes + block - 1) / block) - mirror->base / block), generation);
+        mirror->gpuStamps.assign(mirror->generations.size(), 0);
         if (generation == 0) {
             std::lock_guard lock(state.mutex);
             ++state.heapUnwatched;
@@ -3942,6 +3964,7 @@ void FinishLazyMirrorFill(Recorder& recorder, const LazyMirrorFill& fill, std::u
     interval->ready = true;
     interval->completionCount = recorder.CompletionCount();
     ++mirror->gpuRevision;
+    stampGpuBlocks(*mirror, address, address + bytes);
     recorder.OnComplete([mirror, interval] {
         interval->complete = true;
         interval->recorder = nullptr;
@@ -6244,7 +6267,10 @@ void GuestBufferMemory::recordMirrorWrites(Recorder* recorder) {
             interval->recorded = true;
             interval->completionCount = recorder != nullptr ? recorder->CompletionCount() : 0;
             ++mirror->gpuRevision;
-            for (const auto& [begin, end] : interval->watched) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+            for (const auto& [begin, end] : interval->watched) {
+                stampGpuBlocks(*mirror, begin, end);
+                GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+            }
         }
         return;
     }
@@ -6277,6 +6303,10 @@ void GuestBufferMemory::QueueBdaWrites(std::uint64_t address, std::size_t bytes)
         for (const auto& [mirror, interval] : mirrorWrites) {
             const auto begin = std::max(address, mirror->base);
             const auto end = std::min(address + bytes, mirror->base + mirror->bytes);
+            if (begin < end) {
+                ++mirror->gpuRevision;
+                stampGpuBlocks(*mirror, begin, end);
+            }
             for (const auto page : protectLazyRange(*mirror, interval, begin, end, true))
                 if (!GuestMemory::UnchangedSinceCollected(page, 4096, interval->generation)) ++LazyState().counts.conflicts;
         }
@@ -6710,7 +6740,7 @@ std::optional<MirrorSource> MirrorSourceFor(const Context& context, std::uint64_
         }
         ~Use() { mirror->activeUsers.fetch_sub(1, std::memory_order_release); }
     };
-    MirrorSource source{mirror->buffer->Handle(), address - mirror->base, std::make_shared<Use>(mirror, std::move(lease)), {mirror->serial, mirror->gpuRevision, {}}};
+    MirrorSource source{mirror->buffer->Handle(), address - mirror->base, std::make_shared<Use>(mirror, std::move(lease)), {mirror->serial, VramLazyWrites() ? gpuStampOver(*mirror, address, address + bytes) : mirror->gpuRevision, {}}};
     if (mirror->heap) {
         const auto first = static_cast<std::size_t>(address / 65536 - mirror->base / 65536);
         const auto last = static_cast<std::size_t>((address + bytes - 1) / 65536 - mirror->base / 65536);
@@ -6725,7 +6755,7 @@ bool MirrorSourceUnchanged(const Context& context, std::uint64_t address, std::s
     if (!VramTextures() || proof.identity == 0 || generation == 0 || bytes == 0 || bytes > UINT64_MAX - address) return false;
     Require(GuestMemory::GpuMutex().HeldByThisThread(), "a mirror texture proof requires the GPU lock");
     const auto mirror = findMirror(context, address, address + bytes);
-    if (mirror == nullptr || mirror->serial != proof.identity || mirror->gpuRevision != proof.revision) return false;
+    if (mirror == nullptr || mirror->serial != proof.identity || (VramLazyWrites() ? gpuStampOver(*mirror, address, address + bytes) : mirror->gpuRevision) != proof.revision) return false;
     const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, false);
     if (range == nullptr || !range->readable || !sameRange(mirror->range, range)) return false;
     return GuestMemory::CollectWritesUncached(address, bytes) != 0 && GuestMemory::UnchangedSince(address, bytes, generation);

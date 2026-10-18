@@ -1192,6 +1192,19 @@ void RunVramLazyTests(const AgcDriver::Graphics::Context& device, AgcDriver::Gra
                 "a mirror fill lost the CPU bytes beside it");
             Require(VramLazyCounters().downloadedPages == filled.downloadedPages + 3, "a mirror fill did not download exactly its pages");
         }
+        if (VramTextures()) {
+            const auto texture = address + 24 * page;
+            const auto source = MirrorSourceFor(context, texture, 2 * page);
+            Require(source.has_value(), "a lazy heap mirror offered no texture source");
+            const auto generation = Memory::CollectWritesUncached(texture, 2 * page);
+            Require(MirrorSourceUnchanged(context, texture, 2 * page, source->proof, generation), "a fresh mirror texture proof did not hold");
+            write(address + 4 * page, 0x0badf00du);
+            recorder.Sync();
+            Require(MirrorSourceUnchanged(context, texture, 2 * page, source->proof, generation), "a GPU write elsewhere in the heap invalidated a mirror texture proof");
+            write(texture, 0x600dcafeu);
+            recorder.Sync();
+            Require(!MirrorSourceUnchanged(context, texture, 2 * page, source->proof, generation), "a GPU write into the texture kept its mirror proof");
+        }
         if (imports) {
             auto* flag = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, block, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
             Require(flag != nullptr, "cannot allocate a native lazy readiness flag");
