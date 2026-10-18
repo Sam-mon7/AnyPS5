@@ -70,6 +70,9 @@ struct MirrorWriteInterval {
     bool recorded = false;
     bool complete = false;
     bool pending = false;
+    std::uint64_t generation = 0;
+    std::uint64_t order = 0;
+    bool addressable = false;
 };
 
 // Image mirrors. The main guest image (the PE at 0x7ff6b...) is MEM_IMAGE memory, which
@@ -103,6 +106,8 @@ struct ImageMirror {
     std::atomic<bool> retired{false};
     std::atomic<std::uint64_t> activeUsers{0};
     std::shared_ptr<MirrorWriteInterval> writer;
+    std::map<std::uint64_t, std::shared_ptr<MirrorWriteInterval>> lazyPages;
+    std::shared_ptr<MirrorWriteInterval> lazyAddressWriter;
     std::uint64_t gpuRevision = 0;
     std::uint64_t aliasesGeneration = 0;
     std::uint64_t aliasesMappingGeneration = 0;
@@ -964,6 +969,7 @@ std::uint64_t evictableBytes(const HostImports& state, std::uint64_t begin, std:
 }
 
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true) {
+    if (VramLazyWrites()) return nullptr;
     Require(!aliasesLiveMirror(context.device, address, static_cast<std::size_t>(end != 0 ? end - address : 1)), "a GPU-registered alias conflicts with a live VRAM mirror");
     if (mirrorBackingOverlaps(context.device, address, end != 0 ? end : address + 1)) return nullptr;
     const bool fresh = !importsStale(context, state);
@@ -995,6 +1001,7 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
 }
 
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict) {
+    if (VramLazyWrites()) return nullptr;
     Require(!aliasesLiveMirror(context.device, run.base, static_cast<std::size_t>(run.bytes)), "a GPU import aliases a live VRAM mirror");
     if (VramDescriptors() && std::any_of(run.ranges.begin(), run.ranges.end(), [&](const auto& range) { return rangeBacking(context.device, range) == RangeBacking::Mirror; })) return nullptr;
     static const bool traceRefusal = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
@@ -1407,8 +1414,164 @@ void disarmInterval(MirrorWriteInterval& interval) {
     interval.lease.reset();
 }
 
+struct LazyMirrors {
+    VramLazyStats counts;
+    std::uint64_t order = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+LazyMirrors& LazyState() {
+    static LazyMirrors state;
+    return state;
+}
+
+void reportLazyWrites() {
+    auto& state = LazyState();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state.lastReport < std::chrono::seconds(10)) return;
+    state.lastReport = now;
+    const auto& c = state.counts;
+    AgcDriver::ProfilePrint_nid_no_patch("[vram-lazy] cumulative: pages protected record %llu completion %llu, pending %llu; copy-in avoided %.1f MiB, copy-back avoided %.1f MiB; GPU-owned refresh pages skipped %llu, hook ranges bypassed %llu; faults %llu, downloaded %llu pages (%.3f ms), writer waits %llu (%.3f ms), conflicts %llu, fallback descriptors %llu; fault waits page %llu (%.3f ms), BDA %llu (%.3f ms); protect %llu runs, %llu calls (%.3f ms); snapshots %llu (%.3f ms)\n",
+        static_cast<unsigned long long>(c.protectedAtRecord), static_cast<unsigned long long>(c.protectedAtCompletion), static_cast<unsigned long long>(c.pendingPages),
+        c.copyInAvoided / 1048576.0, c.copyBackAvoided / 1048576.0, static_cast<unsigned long long>(c.refreshPagesSkipped), static_cast<unsigned long long>(c.hookRangesSkipped),
+        static_cast<unsigned long long>(c.faults), static_cast<unsigned long long>(c.downloadedPages), c.downloadUs / 1000.0,
+        static_cast<unsigned long long>(c.writerWaits), c.writerWaitUs / 1000.0, static_cast<unsigned long long>(c.conflicts), static_cast<unsigned long long>(c.fallbacks),
+        static_cast<unsigned long long>(c.faultPageWaits), c.faultPageWaitUs / 1000.0, static_cast<unsigned long long>(c.faultBdaWaits), c.faultBdaWaitUs / 1000.0,
+        static_cast<unsigned long long>(c.protectRuns), static_cast<unsigned long long>(c.protectCalls), c.protectUs / 1000.0,
+        static_cast<unsigned long long>(c.snapshotCalls), c.snapshotUs / 1000.0);
+}
+
+void finishLazyAddressWriter(ImageMirror& mirror, bool fault = false) {
+    const auto interval = mirror.lazyAddressWriter;
+    if (interval == nullptr || interval->complete) return;
+    Require(interval->recorded && interval->ready && interval->recorder != nullptr && !Recorder::InCompletion(), "a lazy BDA writer cannot be completed from this access");
+    const auto started = std::chrono::steady_clock::now();
+    auto* recorder = interval->recorder;
+    if (interval->serial > recorder->Submissions()) recorder->Submit();
+    recorder->FinishUpTo(interval->serial);
+    Require(interval->complete, "a lazy BDA writer has no completion action");
+    const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+    ++LazyState().counts.writerWaits;
+    LazyState().counts.writerWaitUs += elapsed;
+    if (fault) { ++LazyState().counts.faultBdaWaits; LazyState().counts.faultBdaWaitUs += elapsed; }
+}
+
+void publishLazyPages(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end, bool fault = false) {
+    finishLazyAddressWriter(mirror, fault);
+    auto next = mirror.lazyPages.lower_bound(begin & ~std::uint64_t{4095});
+    if (next == mirror.lazyPages.end() || next->first >= end) return;
+    const auto started = std::chrono::steady_clock::now();
+    auto& counts = LazyState().counts;
+    auto& state = WritableState();
+    const auto& context = mirror.uploadContext;
+    if (state.device != context.device) {
+        state.readback.reset();
+        state.device = context.device;
+    }
+    constexpr std::size_t capacity = 256;
+    if (state.readback == nullptr) state.readback = std::make_shared<Buffer>(context, capacity * 4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    while (next != mirror.lazyPages.end() && next->first < end) {
+        std::vector<std::uint64_t> pages;
+        while (next != mirror.lazyPages.end() && next->first < end && pages.size() < capacity) {
+            const auto page = next->first;
+            const auto interval = next->second;
+            if (!interval->complete) {
+                Require(interval->recorded && interval->ready && interval->recorder != nullptr, "a lazy mirror CPU access has no submitted writer");
+                Require(!Recorder::InCompletion(), "a lazy mirror CPU access cannot wait for another writer during completion");
+                const auto waited = std::chrono::steady_clock::now();
+                auto* recorder = interval->recorder;
+                if (interval->serial > recorder->Submissions()) recorder->Submit();
+                recorder->FinishUpTo(interval->serial);
+                Require(interval->complete, "a lazy mirror writer has no completion action");
+                const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waited).count());
+                ++counts.writerWaits;
+                counts.writerWaitUs += elapsed;
+                if (fault) { ++counts.faultPageWaits; counts.faultPageWaitUs += elapsed; }
+                next = mirror.lazyPages.lower_bound(page);
+                if (next == mirror.lazyPages.end() || next->first != page) continue;
+                if (next->second != interval) continue;
+            }
+            pages.push_back(page);
+            ++next;
+        }
+        if (pages.empty()) continue;
+        CommandBatch batch(context, CommandBatch::Mode::Independent);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        for (std::size_t index = 0; index < pages.size(); ++index) CopyBuffer(context, batch.Handle(), mirror.buffer->Handle(), pages[index] - mirror.base, state.readback->Handle(), index * 4096, 4096);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        const auto bytes = state.readback->ReadBytes(0, pages.size() * 4096);
+        for (std::size_t index = 0; index < pages.size(); ++index) {
+            const auto page = pages[index];
+#ifdef _WIN32
+            Require(GuestArena::GuestArenaPublishGpuPage_nid_no_patch(page, bytes.data() + index * 4096, nullptr), "a lazy mirror page could not be published");
+#endif
+            GuestMemory::MarkWritten(page, 4096);
+            Recorder::NoteWrittenBack(page, 4096);
+            mirror.lazyPages.erase(page);
+            --counts.pendingPages;
+            ++counts.downloadedPages;
+        }
+        next = mirror.lazyPages.upper_bound(pages.back());
+    }
+    counts.downloadUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+    reportLazyWrites();
+}
+
+std::vector<std::uint64_t> protectLazyRange(ImageMirror& mirror, const std::shared_ptr<MirrorWriteInterval>& interval, std::uint64_t begin, std::uint64_t end, bool completion) {
+    std::vector<std::uint64_t> added;
+    for (auto page = begin; page < end;) {
+        const auto found = mirror.lazyPages.lower_bound(page);
+        if (found != mirror.lazyPages.end() && found->first == page) {
+            if (found->second->order <= interval->order) found->second = interval;
+            page += 4096;
+            continue;
+        }
+        const auto stop = found == mirror.lazyPages.end() ? end : std::min(end, found->first);
+        std::uint64_t calls = 0;
+        const auto started = std::chrono::steady_clock::now();
+        try {
+            for (auto at = page; at < stop; at += 4096) {
+                mirror.lazyPages.emplace(at, interval);
+                added.push_back(at);
+            }
+#ifdef _WIN32
+            Require(GuestArena::GuestArenaProtectGpuWrites_nid_no_patch(page, static_cast<std::size_t>(stop - page), &calls), "a lazy mirror range cannot protect CPU access");
+#endif
+        } catch (...) {
+            mirror.lazyPages.erase(mirror.lazyPages.lower_bound(page), mirror.lazyPages.lower_bound(stop));
+            throw;
+        }
+        auto& counts = LazyState().counts;
+        ++counts.protectRuns;
+        counts.protectCalls += calls;
+        counts.protectUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+        const auto pages = (stop - page) / 4096;
+        counts.pendingPages += pages;
+        (completion ? counts.protectedAtCompletion : counts.protectedAtRecord) += pages;
+        page = stop;
+    }
+    return added;
+}
+
+void completeAbandonedLazyWriter(ImageMirror& mirror, const std::shared_ptr<MirrorWriteInterval>& interval, bool executed) {
+    if (executed && interval->addressable) {
+        const auto protect = [&](std::uint64_t begin, std::uint64_t end) {
+            for (const auto page : protectLazyRange(mirror, interval, begin, end, true))
+                if (!GuestMemory::UnchangedSinceCollected(page, 4096, interval->generation)) ++LazyState().counts.conflicts;
+            GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+        };
+        if (mirror.sparse) for (const auto& [begin, end] : mirror.committed) protect(begin, end);
+        else protect(mirror.base, mirror.base + mirror.bytes);
+    }
+    interval->complete = true;
+    interval->recorder = nullptr;
+    if (mirror.lazyAddressWriter == interval) mirror.lazyAddressWriter.reset();
+}
+
 bool writablePageFault(std::uintptr_t page, bool write) {
-    if (!VramWritable()) return false;
+    if (!VramMirrorWrites()) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::shared_ptr<MirrorWriteInterval> interval;
     std::shared_ptr<ImageMirror> mirror;
@@ -1420,6 +1583,12 @@ bool writablePageFault(std::uintptr_t page, bool write) {
         mirror = std::prev(found)->second;
         if (page < mirror->base || page + 4096 > mirror->base + mirror->bytes) return false;
         interval = mirror->writer;
+    }
+    if (VramLazyWrites()) {
+        if (!mirror->lazyPages.contains(page)) return false;
+        ++LazyState().counts.faults;
+        publishLazyPages(*mirror, page, page + 4096, true);
+        return true;
     }
     if (interval == nullptr || !interval->active || !intervalCovers(*interval, page)) return false;
     if (interval->sealed) {
@@ -1535,7 +1704,7 @@ bool registeredGpuAliases(VkDevice device, std::uint64_t address, std::size_t by
 }
 
 void validateMirrorAliases(ImageMirror& mirror) {
-    if (!VramWritable() || !mirror.heap) return;
+    if (!VramMirrorWrites() || !mirror.heap) return;
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
 #ifdef _WIN32
     const auto mappingGeneration = GuestArena::GuestArenaCommitGeneration_nid_postfix();
@@ -1551,7 +1720,7 @@ void validateMirrorAliases(ImageMirror& mirror) {
 }
 
 bool aliasesLiveMirror(VkDevice device, std::uint64_t address, std::size_t bytes) {
-    if (!VramWritable()) return false;
+    if (!VramMirrorWrites()) return false;
 #ifdef _WIN32
     struct Probe { VkDevice device; bool conflict = false; } probe{device};
     GuestArena::GuestArenaVisitGpuAliases_nid_no_patch(address, bytes, [](std::uintptr_t alias, std::size_t length, void* data) {
@@ -1800,6 +1969,7 @@ struct RefreshBlock {
     std::size_t length;
     std::uint64_t generation = 0;
     std::uint8_t fill = 0;
+    const std::byte* source = nullptr;
 };
 
 bool refreshWritableHeap(ImageMirror& mirror, std::vector<RefreshBlock>& blocks, bool uncached = false);
@@ -1815,7 +1985,7 @@ struct MirrorUpload {
     const Context* context;
 };
 
-void recordMirrorUploads(std::vector<MirrorUpload>& uploads) {
+void recordMirrorUploads(std::vector<MirrorUpload>& uploads, bool synchronous = false) {
     if (uploads.empty()) return;
     const auto& context = *uploads.front().context;
     const auto record = [&](VkCommandBuffer commands) {
@@ -1825,7 +1995,7 @@ void recordMirrorUploads(std::vector<MirrorUpload>& uploads) {
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     };
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion()) {
+    if (auto* recorder = Recorder::Active(); !synchronous && recorder != nullptr && !Recorder::InCompletion()) {
         record(recorder->Commands());
         for (const auto& upload : uploads) {
             recorder->Keep(upload.source.buffer, upload.bytes);
@@ -1859,7 +2029,7 @@ void stageMirrorBlock(const RefreshBlock& block, std::vector<MirrorUpload>& uplo
     }
     auto target = slice.buffer->WriteBytes().subspan(static_cast<std::size_t>(slice.offset), block.length);
     if (block.fill == SparseZero) std::memset(target.data(), 0, target.size());
-    else std::memcpy(target.data(), reinterpret_cast<const void*>(block.address), target.size());
+    else std::memcpy(target.data(), block.source != nullptr ? block.source : reinterpret_cast<const std::byte*>(block.address), target.size());
     uploads.push_back({slice, mirror.buffer, offset, block.length, &context});
     UploadCounts().bytes += block.length;
     ++UploadCounts().blocks;
@@ -2056,6 +2226,47 @@ void prepareRange(std::uint64_t address, std::uint64_t bytes) {
     syncRange(address, bytes);
 }
 
+void prepareMirrorRange(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes) {
+    if (!VramLazyWrites() || mirror.lazyPages.empty()) {
+        prepareRange(address, bytes);
+        return;
+    }
+    const auto end = address + bytes;
+    auto cursor = address;
+    for (auto it = mirror.lazyPages.lower_bound(address & ~std::uint64_t{4095}); it != mirror.lazyPages.end() && it->first < end; ++it) {
+        if (cursor < it->first) prepareRange(cursor, it->first - cursor);
+        cursor = std::max(cursor, std::min(end, it->first + 4096));
+        ++LazyState().counts.hookRangesSkipped;
+    }
+    if (cursor < end) prepareRange(cursor, end - cursor);
+}
+
+void filterLazyChanges(ImageMirror& mirror, std::uint64_t address, std::span<std::uint8_t> changed, std::uint64_t collected) {
+    if (!VramLazyWrites() || mirror.lazyPages.empty()) return;
+    const auto aligned = address & ~std::uint64_t{65535};
+    for (std::size_t index = 0; index < changed.size(); ++index) {
+        if (changed[index] == 0) continue;
+        const auto begin = std::max(mirror.base, aligned + index * 65536);
+        const auto end = std::min(mirror.base + mirror.bytes, aligned + (index + 1) * 65536);
+        const auto slot = static_cast<std::size_t>(begin / 65536 - mirror.base / 65536);
+        const auto generation = mirror.generations[slot];
+        if (generation == 0) continue;
+        auto cursor = begin;
+        bool stored = false;
+        std::uint64_t skipped = 0;
+        for (auto it = mirror.lazyPages.lower_bound(begin); it != mirror.lazyPages.end() && it->first < end; ++it) {
+            if (cursor < it->first && GuestMemory::StoredOver(cursor, static_cast<std::size_t>(it->first - cursor), generation)) { stored = true; break; }
+            cursor = std::min(end, it->first + 4096);
+            ++skipped;
+        }
+        if (stored || (cursor < end && GuestMemory::StoredOver(cursor, static_cast<std::size_t>(end - cursor), generation))) continue;
+        changed[index] = 0;
+        mirror.generations[slot] = collected;
+        LazyState().counts.refreshPagesSkipped += skipped;
+        if (skipped != 0) ++LazyState().counts.hookRangesSkipped;
+    }
+}
+
 bool prepareRefresh(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes) {
     if ((!mirror.writable && !mirror.heap) || bytes == 0) return false;
     prepareRange(address, bytes);
@@ -2075,6 +2286,25 @@ void appendBlocks(std::vector<RefreshBlock>& blocks, ImageMirror& mirror, std::u
 // Compares the gathered blocks (of one or many mirrors) and counts them.
 void compareBlocks(std::span<const RefreshBlock> blocks) {
     if (blocks.empty()) return;
+    std::vector<RefreshBlock> filtered;
+    if (VramLazyWrites()) {
+        for (const auto& block : blocks) {
+            auto& mirror = *block.mirror;
+            if (mirror.lazyPages.empty()) {
+                filtered.push_back(block);
+                continue;
+            }
+            const auto end = block.address + block.length;
+            for (auto at = block.address; at < end;) {
+                const auto next = std::min(end, (at + 4096) & ~std::uint64_t{4095});
+                if (!mirror.lazyPages.contains(at & ~std::uint64_t{4095})) filtered.push_back({&mirror, at, static_cast<std::size_t>(next - at), block.generation, block.fill});
+                else ++LazyState().counts.refreshPagesSkipped;
+                at = next;
+            }
+            if (mirror.heap && block.fill == 0) mirror.generations[static_cast<std::size_t>(block.address / 65536 - mirror.base / 65536)] = block.generation;
+        }
+        blocks = filtered;
+    }
     const auto copied = RefreshPool::Get().Run(blocks);
     auto& state = Mirrors();
     state.blocksCompared += blocks.size();
@@ -2084,7 +2314,7 @@ void compareBlocks(std::span<const RefreshBlock> blocks) {
 
 // Brings [address, address + bytes) of a writable mirror up to date with guest memory.
 void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes, bool uncached = false) {
-    if (VramWritable() && mirror.heap && mirror.sparse) {
+    if (VramMirrorWrites() && mirror.heap && mirror.sparse) {
         std::vector<RefreshBlock> blocks;
         Require(refreshWritableHeap(mirror, blocks, uncached), "a writable mirror grew during refresh");
         compareBlocks(blocks);
@@ -2096,7 +2326,7 @@ void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t byt
         constexpr std::uint64_t block = 65536;
         const auto begin = std::max(mirror.base, address / block * block);
         const auto end = std::min(mirror.base + mirror.bytes, (address + bytes + block - 1) / block * block);
-        if (VramWritable()) {
+        if (VramMirrorWrites()) {
             validateMirrorAliases(mirror);
             Require(GuestMemory::Accessible(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin)), "image mirror range became inaccessible");
         } else prepareRange(begin, end - begin);
@@ -2109,12 +2339,14 @@ void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t byt
         std::vector<std::uint8_t> changed(count);
         const auto scan = [&] {
             GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), generations, changed);
+            filterLazyChanges(mirror, begin, changed, generation);
             countDescriptors({.refreshBlocks = count});
         };
         scan();
-        if (VramWritable() && std::any_of(changed.begin(), changed.end(), [](auto value) { return value != 0; })) {
+        if (VramMirrorWrites() && std::any_of(changed.begin(), changed.end(), [](auto value) { return value != 0; })) {
+            if (VramLazyWrites()) finishLazyAddressWriter(mirror);
             if (mirror.writer != nullptr) finishMirrorWriter(mirror);
-            prepareRange(begin, end - begin);
+            prepareMirrorRange(mirror, begin, end - begin);
             generation = collect();
             Require(generation != 0, "a descriptor heap refill is no longer write-watched");
             scan();
@@ -2164,7 +2396,7 @@ void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t ge
 }
 
 void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshBlock>& blocks) {
-    if (VramWritable()) {
+    if (VramMirrorWrites()) {
         for (auto* mirror : mirrors) Require(refreshWritableHeap(*mirror, blocks), "a writable heap grew during refresh");
         return;
     }
@@ -2296,10 +2528,12 @@ bool refreshWritableHeap(ImageMirror& mirror, std::vector<RefreshBlock>& blocks,
     Require(generation != 0, "a writable heap mirror is no longer write-watched");
     std::vector<std::uint8_t> changed(mirror.generations.size());
     GuestMemory::ChangedBlocks(mirror.base, static_cast<std::size_t>(mirror.bytes), mirror.generations, changed);
+    filterLazyChanges(mirror, mirror.base, changed, generation);
     const bool dirty = (mirror.sparse && pieces != mirror.committed) || std::any_of(changed.begin(), changed.end(), [](auto value) { return value != 0; });
     if (!dirty) return true;
+    if (VramLazyWrites()) finishLazyAddressWriter(mirror);
     if (mirror.writer != nullptr) finishMirrorWriter(mirror);
-    for (const auto& [begin, end] : pieces) prepareRange(begin, end - begin);
+    for (const auto& [begin, end] : pieces) prepareMirrorRange(mirror, begin, end - begin);
     generation = collect();
     Require(generation != 0, "a writable heap refill is no longer write-watched");
     if (mirror.sparse) appendSparseBlocks(mirror, std::move(pieces), generation, blocks);
@@ -2311,7 +2545,7 @@ bool refreshWritableHeap(ImageMirror& mirror, std::vector<RefreshBlock>& blocks,
 }
 
 bool refreshSparseMirror(ImageMirror& mirror, std::vector<RefreshBlock>& blocks) {
-    if (VramWritable()) return refreshWritableHeap(mirror, blocks);
+    if (VramMirrorWrites()) return refreshWritableHeap(mirror, blocks);
     auto pieces = GuestMemory::DescribeCommitted(mirror.base, static_cast<std::size_t>(mirror.reserved)).ranges;
     if (!pieces.empty() && pieces.back().second > mirror.base + mirror.bytes) return false;
     syncRange(mirror.base, mirror.bytes);
@@ -2345,7 +2579,7 @@ void planSpaceMirrors(GuestBufferMemory::AddressSpace& space) {
 }
 
 std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
-    if (VramWritable()) {
+    if (VramMirrorWrites()) {
         for (auto* mirror : space.heapMirrors) Require(refreshWritableHeap(*mirror, blocks), "a writable heap grew during refresh");
         return {};
     }
@@ -2374,6 +2608,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     {
         std::lock_guard lock(state.mutex);
         if (state.device != context.device) {
+            Require(!VramLazyWrites() || std::none_of(state.entries.begin(), state.entries.end(), [](const auto& entry) { return !entry.second->lazyPages.empty() || entry.second->lazyAddressWriter != nullptr; }), "switching mirror devices with lazy GPU results is not implemented");
             Require(!pendingHeapMirrors.load(std::memory_order_acquire) && (!VramWritable() || std::none_of(state.entries.begin(), state.entries.end(), [](const auto& entry) { return entry.second->writer != nullptr; })), "switching mirror devices with resident results is not implemented");
             state.entries.clear();
             state.failed.clear();
@@ -2424,7 +2659,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (pieces.empty()) return nullptr;
     }
     const bool sparse = !pieces.empty();
-    if (VramWritable() && heap) {
+    if (VramMirrorWrites() && heap) {
         const auto backed = sparse ? pieces : Pieces{{range->address, range->address + range->bytes}};
         for (const auto& [begin, end] : backed) if (registeredGpuAliases(context.device, begin, static_cast<std::size_t>(end - begin))) return nullptr;
 #ifdef _WIN32
@@ -2895,6 +3130,20 @@ std::shared_ptr<const GuestAllocations::Range> LeaseRegisteredRange(std::uint64_
 bool HeapMirrorExportInProgress() { return exportingHeapMirrors; }
 
 void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force) {
+    if (VramLazyWrites() && bytes != 0) {
+        if (!force && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::MirrorRefresh) return;
+        const auto end = address + std::min<std::uint64_t>(bytes, std::numeric_limits<std::uint64_t>::max() - address);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        std::vector<std::shared_ptr<ImageMirror>> mirrors;
+        {
+            auto& state = Mirrors();
+            std::lock_guard lock(state.mutex);
+            for (const auto& [base, mirror] : state.entries)
+                if ((!mirror->lazyPages.empty() || mirror->lazyAddressWriter != nullptr) && address < base + mirror->bytes && base < end) mirrors.push_back(mirror);
+        }
+        for (const auto& mirror : mirrors) publishLazyPages(*mirror, address, end);
+        return;
+    }
     if (VramWritable() && bytes != 0) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
         std::vector<std::shared_ptr<ImageMirror>> mirrors;
@@ -3060,7 +3309,7 @@ void ClearImageMirrors(VkDevice device) {
         disarmInterval(*mirror->writer);
         mirror->writer.reset();
     }
-    if (VramWritable() && WritableState().device == device) {
+    if (VramMirrorWrites() && WritableState().device == device) {
         WritableState().readback.reset();
         WritableState().device = VK_NULL_HANDLE;
     }
@@ -3380,7 +3629,22 @@ VramWritableStats VramWritableCounters() {
     return state.total;
 }
 
+VramLazyStats VramLazyCounters() {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    return LazyState().counts;
+}
+
 bool HasVramMirrorWriters() {
+    if (VramLazyWrites()) {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        auto& state = Mirrors();
+        std::lock_guard lock(state.mutex);
+        return std::any_of(state.entries.begin(), state.entries.end(), [](const auto& entry) {
+            const auto& mirror = *entry.second;
+            return (mirror.lazyAddressWriter != nullptr && !mirror.lazyAddressWriter->complete) ||
+                std::any_of(mirror.lazyPages.begin(), mirror.lazyPages.end(), [](const auto& page) { return !page.second->complete; });
+        });
+    }
     if (!VramWritable()) return false;
     auto& mirrors = Mirrors();
     std::lock_guard lock(mirrors.mutex);
@@ -3401,6 +3665,36 @@ void SealVramMirrorSubmission(Recorder& recorder) {
 }
 
 void RetireVramMirrorRecorder(Recorder& recorder) noexcept {
+    if (VramLazyWrites()) {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        std::vector<std::shared_ptr<ImageMirror>> mirrors;
+        {
+            auto& state = Mirrors();
+            std::lock_guard lock(state.mutex);
+            for (const auto& [base, mirror] : state.entries) mirrors.push_back(mirror);
+        }
+        for (const auto& mirror : mirrors) {
+            const auto addressWriter = mirror->lazyAddressWriter;
+            try {
+                if (addressWriter != nullptr && addressWriter->recorder == &recorder) {
+                    const bool executed = addressWriter->serial <= recorder.Submissions();
+                    if (executed) Check(addressWriter->context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(addressWriter->context.queue), "vkQueueWaitIdle lazy BDA retirement");
+                    completeAbandonedLazyWriter(*mirror, addressWriter, executed);
+                }
+            } catch (const std::exception& error) { std::fprintf(stderr, "[gpu] lazy BDA retirement: %s\n", error.what()); }
+            const auto retire = [&](const std::shared_ptr<MirrorWriteInterval>& interval) {
+                if (interval == nullptr || interval->recorder != &recorder) return;
+                interval->recorder = nullptr;
+                interval->complete = true;
+            };
+            retire(mirror->lazyAddressWriter);
+            for (const auto& [page, interval] : mirror->lazyPages) retire(interval);
+            try { publishLazyPages(*mirror, mirror->base, mirror->base + mirror->bytes); }
+            catch (const std::exception& error) { std::fprintf(stderr, "[gpu] lazy mirror retirement: %s\n", error.what()); }
+            mirror->lazyAddressWriter.reset();
+        }
+        return;
+    }
     if (!VramWritable()) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::vector<std::shared_ptr<ImageMirror>> held;
@@ -3429,8 +3723,9 @@ void RetireVramMirrorRecorder(Recorder& recorder) noexcept {
 }
 
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (VramLazyWrites()) return nullptr;
     std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
-    if (VramWritable()) gpu.lock();
+    if (VramMirrorWrites()) gpu.lock();
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     Require(!aliasesLiveMirror(context.device, address, bytes), "a GPU descriptor alias conflicts with a live VRAM mirror");
     if (mirrorBackingOverlaps(context.device, address, address + bytes)) return nullptr;
@@ -3459,7 +3754,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 }
 
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
-    if (VramWritable()) return true;
+    if (VramMirrorWrites()) return true;
     if (context.hostImportAlignment == 0) return true;
     ensurePinWaiter();
     auto& state = Imports();
@@ -3538,7 +3833,7 @@ bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t
 GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) {
     ValidateVramOptions();
 #ifdef _WIN32
-    if (VramWritable()) GuestArena::GuestArenaSetGpuPageFault_nid_no_patch(writablePageFault);
+    if (VramMirrorWrites()) GuestArena::GuestArenaSetGpuPageFault_nid_no_patch(writablePageFault);
 #endif
 }
 
@@ -3677,7 +3972,7 @@ void GuestBufferMemory::AcquireRegistered() {
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
             const HostImport* entry = nullptr;
-            const bool mirrorFirst = vramMirrors() && mirrorsEnabled() && (!range->writable || VramWritable());
+            const bool mirrorFirst = vramMirrors() && mirrorsEnabled() && (!range->writable || VramMirrorWrites());
             if (mirrorFirst) VramMirrorCounters().readOnlyRanges.fetch_add(1, std::memory_order_relaxed);
             if (importable && !mirrorFirst) {
                 auto& state = Imports();
@@ -4245,6 +4540,29 @@ void ShutdownGuestBufferWorkers() {
 }
 
 GuestBufferMemory::~GuestBufferMemory() {
+    if (VramLazyWrites() && !mirrorWrites.empty()) {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        for (const auto& [mirror, interval] : mirrorWrites) {
+            if (!interval->started || interval->complete) continue;
+            try {
+                if (interval->recorder != nullptr) {
+                    interval->recorded = true;
+                    interval->ready = true;
+                    interval->recorder->Keep(mirror);
+                    interval->recorder->OnComplete([mirror, interval] {
+                        completeAbandonedLazyWriter(*mirror, interval, true);
+                    });
+                } else {
+                    if (synchronousSubmission != nullptr && *synchronousSubmission)
+                        Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle lazy mirror retirement");
+                    completeAbandonedLazyWriter(*mirror, interval, synchronousSubmission != nullptr && *synchronousSubmission);
+                    publishLazyPages(*mirror, mirror->base, mirror->base + mirror->bytes);
+                }
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[gpu] lazy mirror abandonment: %s\n", error.what());
+            }
+        }
+    }
     if (VramWritable() && synchronousWrites && !mirrorWrites.empty()) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
         try {
@@ -4468,7 +4786,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             region.pending = true;
             continue;
         }
-        if (sparseHeapCandidate(region) || (region.writable && (VramWritable() || WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))))) {
+        if (sparseHeapCandidate(region) || (region.writable && (VramMirrorWrites() || WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))))) {
             region.pending = true;
             continue;
         }
@@ -4494,7 +4812,7 @@ void GuestBufferMemory::completeSpaceWrites() const {
         OverlappedRanges(std::span<const Region>(base), next, writes, candidates);
         next = base.size();
         for (const auto index : candidates) {
-            if (VramWritable() && base[index].mirror != nullptr && base[index].mirror->heap) continue;
+            if (VramMirrorWrites() && base[index].mirror != nullptr && base[index].mirror->heap) continue;
             if (!CompletePendingCpuWrites(context, base[index].begin, static_cast<std::size_t>(base[index].end - base[index].begin))) continue;
             next = index + 1;
             break;
@@ -4504,12 +4822,12 @@ void GuestBufferMemory::completeSpaceWrites() const {
 
 void GuestBufferMemory::UploadFinish(bool addressable) {
     std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
-    if (VramWritable()) gpu.lock();
+    if (VramMirrorWrites()) gpu.lock();
     CollectVramMirrors(context);
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
-    for (const auto& region : regions) if (!VramWritable() || !mirrorOverlaps(context, region.begin, region.end)) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+    for (const auto& region : regions) if (!VramMirrorWrites() || !mirrorOverlaps(context, region.begin, region.end)) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     if (space != nullptr) completeSpaceWrites();
     uploaded = true;
     for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
@@ -4617,7 +4935,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         if (!region.pending) continue;
         region.pending = false;
         const auto bytes = region.end - region.begin;
-        if (VramWritable() && mirrorsEnabled() && region.writable && !region.sparse && region.mirror == nullptr && region.direct == nullptr) {
+        if (VramMirrorWrites() && mirrorsEnabled() && region.writable && !region.sparse && region.mirror == nullptr && region.direct == nullptr) {
             const auto& ranges = importRanges();
             const auto* range = containingRange(ranges, region.begin, region.end);
             if (range != nullptr && range->readable && range->writable && range->releasable) {
@@ -5204,7 +5522,7 @@ ShaderRecompiler::BdaAbi::Range GuestBufferMemory::addressRange(const Region& re
     Require(region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr, "incomplete guest GPU upload");
     const auto address = region.direct != nullptr ? region.direct->address + (region.begin - region.direct->base) : region.mirror != nullptr && !region.gpuCopy ? region.mirror->buffer->DeviceAddress() + (region.begin - region.mirror->base) : region.buffer->DeviceAddress();
     Require(region.end - region.begin <= std::numeric_limits<std::uint64_t>::max() - address, "GPU address range overflow");
-    const auto permissions = ShaderRecompiler::BdaAbi::Read | (region.writable && (region.direct != nullptr || (VramWritable() && region.mirror != nullptr && region.mirror->heap && region.mirror->writable)) ? ShaderRecompiler::BdaAbi::Write : 0u);
+    const auto permissions = ShaderRecompiler::BdaAbi::Read | (region.writable && (region.direct != nullptr || (VramMirrorWrites() && region.mirror != nullptr && region.mirror->heap && region.mirror->writable)) ? ShaderRecompiler::BdaAbi::Write : 0u);
     return {region.begin, region.direct != nullptr ? inPlaceEnd(region) : servedEnd(region), address, permissions, 0};
 }
 
@@ -5315,7 +5633,7 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
 }
 
 bool GuestBufferMemory::HasCopiedWrites() const {
-    if (VramWritable() && !mirrorWrites.empty()) return true;
+    if (VramMirrorWrites() && !mirrorWrites.empty()) return true;
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin);
         if (found == nullptr) continue;
@@ -5413,11 +5731,11 @@ void storeSparse(ImageMirror& mirror, std::uint64_t address, std::span<const std
     forget(cursor, end);
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> mergeWrites(std::vector<std::pair<std::uint64_t, std::uint64_t>> writes) {
+std::vector<std::pair<std::uint64_t, std::uint64_t>> mergeWrites(std::vector<std::pair<std::uint64_t, std::uint64_t>> writes, bool adjacent = false) {
     std::sort(writes.begin(), writes.end());
     std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
     for (const auto& range : writes) {
-        if (!merged.empty() && range.first < merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        if (!merged.empty() && (range.first < merged.back().second || (adjacent && range.first == merged.back().second))) merged.back().second = std::max(merged.back().second, range.second);
         else merged.push_back(range);
     }
     return merged;
@@ -5440,7 +5758,114 @@ void GuestBufferMemory::releaseMirrorUses() {
     mirrorUses.clear();
 }
 
+void GuestBufferMemory::prepareLazyWrites(bool addressable) {
+    GuestMemory::AssertGpuLockHeld("lazy mirror preparation");
+    std::map<ImageMirror*, std::pair<std::shared_ptr<ImageMirror>, std::shared_ptr<MirrorWriteInterval>>> targets;
+    const auto target = [&](const std::shared_ptr<ImageMirror>& mirror) -> std::shared_ptr<MirrorWriteInterval> {
+        if (mirror == nullptr || !mirror->heap || !mirror->writable) return {};
+        auto& entry = targets[mirror.get()];
+        if (entry.second == nullptr) {
+            entry.first = mirror;
+            entry.second = std::make_shared<MirrorWriteInterval>();
+            entry.second->context = context;
+            entry.second->lease = mirror->range.lock();
+            Require(entry.second->lease != nullptr, "a lazy mirror lost its registered range");
+        }
+        return entry.second;
+    };
+    if (addressable && addressWrites) {
+        const auto gather = [&](const auto& list) { for (const auto& region : list) if (region.writable) if (auto interval = target(region.mirror)) interval->addressable = true; };
+        if (space != nullptr) gather(space->base);
+        gather(regions);
+    }
+    for (const auto& [begin, end] : mergeWrites(writes)) {
+        const auto* region = owner(begin);
+        if (region == nullptr) continue;
+        bool served = false;
+        const auto append = [&](const std::shared_ptr<ImageMirror>& mirror, std::uint64_t first, std::uint64_t last) {
+            const auto interval = target(mirror);
+            if (interval == nullptr || first >= last) return;
+            const auto from = first & ~std::uint64_t{4095};
+            const auto to = (last + 4095) & ~std::uint64_t{4095};
+            Require(from >= mirror->base && to <= mirror->base + mirror->bytes, "lazy descriptor protection exceeds its mirror");
+            interval->watched.emplace_back(from, to);
+            if (!region->gpuCopy) {
+                LazyState().counts.copyInAvoided += last - first;
+                LazyState().counts.copyBackAvoided += last - first;
+            }
+            served = true;
+        };
+        if (region->mirror != nullptr) append(region->mirror, begin, std::min(end, region->end));
+        for (const auto& piece : region->mirrorPieces) append(piece.mirror, std::max(begin, piece.begin), std::min(end, piece.end));
+        if (!served) ++LazyState().counts.fallbacks;
+    }
+    for (auto& [key, entry] : targets) {
+        entry.second->watched = mergeWrites(std::move(entry.second->watched), true);
+        mirrorWrites.push_back(std::move(entry));
+    }
+}
+
+void GuestBufferMemory::beginLazyWrites(Recorder* recorder) {
+    GuestMemory::AssertGpuLockHeld("lazy mirror command recording");
+    std::vector<MirrorUpload> uploads;
+    for (const auto& [mirror, interval] : mirrorWrites) {
+        Require(!interval->started, "a lazy mirror writer cannot be recorded twice");
+        interval->started = true;
+        interval->recorder = recorder;
+        interval->serial = recorder != nullptr ? recorder->Submissions() + 1 : 0;
+        interval->order = ++LazyState().order;
+        interval->generation = GuestMemory::TrackerGeneration();
+        if (interval->addressable) mirror->lazyAddressWriter = interval;
+        for (const auto& [begin, end] : interval->watched) {
+            for (const auto page : protectLazyRange(*mirror, interval, begin, end, false)) {
+                const auto generation = mirror->generations[static_cast<std::size_t>(page / 65536 - mirror->base / 65536)];
+                if (GuestMemory::UnchangedSinceCollected(page, 4096, generation)) continue;
+#ifdef _WIN32
+                std::array<std::byte, 4096> snapshot;
+                const auto started = std::chrono::steady_clock::now();
+                ++LazyState().counts.snapshotCalls;
+                Require(GuestArena::GuestArenaSnapshotGpuPage_nid_no_patch(page, snapshot.data()), "a lazy mirror could not snapshot its newly protected page");
+                LazyState().counts.snapshotUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+                stageMirrorBlock({mirror.get(), page, 4096, generation, 0, snapshot.data()}, uploads);
+#endif
+            }
+        }
+        if (recorder != nullptr) recorder->Keep(mirror);
+    }
+    recordMirrorUploads(uploads, recorder == nullptr);
+    if (recorder != nullptr) RecordMemoryBarrier(context, recorder->Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    reportLazyWrites();
+}
+
+void GuestBufferMemory::completeLazyWrites() {
+    for (const auto& [mirror, interval] : mirrorWrites) {
+        Require(interval->recorded && interval->ready, "a lazy mirror writer completed without registration");
+        interval->complete = true;
+        interval->recorder = nullptr;
+        if (mirror->lazyAddressWriter == interval) mirror->lazyAddressWriter.reset();
+    }
+    mirrorWrites.clear();
+    reportLazyWrites();
+}
+
+void GuestBufferMemory::NotePendingWrites(Recorder& recorder) const {
+    if (!VramLazyWrites()) {
+        recorder.NotePendingWrites(writes);
+        return;
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pending;
+    for (const auto& range : writes) {
+        const auto* region = owner(range.first);
+        if (region != nullptr && region->mirror != nullptr && region->mirror->heap) continue;
+        if (region != nullptr && !region->mirrorPieces.empty() && std::all_of(region->mirrorPieces.begin(), region->mirrorPieces.end(), [](const auto& piece) { return piece.mirror->heap; })) continue;
+        pending.push_back(range);
+    }
+    recorder.NotePendingWrites(pending);
+}
+
 void GuestBufferMemory::prepareMirrorWrites(bool addressable) {
+    if (VramLazyWrites()) { prepareLazyWrites(addressable); return; }
     if (!VramWritable()) return;
     GuestMemory::AssertGpuLockHeld("writable mirror preparation");
     const auto coherent = [](const Region& region) {
@@ -5515,6 +5940,7 @@ void GuestBufferMemory::prepareMirrorWrites(bool addressable) {
 }
 
 void GuestBufferMemory::BeginGpuWrites(Recorder& recorder) {
+    if (VramLazyWrites()) { beginLazyWrites(&recorder); return; }
     if (!VramWritable()) return;
     GuestMemory::AssertGpuLockHeld("VRAM mirror command recording");
     for (const auto& [mirror, interval] : mirrorWrites) {
@@ -5525,8 +5951,17 @@ void GuestBufferMemory::BeginGpuWrites(Recorder& recorder) {
     }
 }
 
+void GuestBufferMemory::BeginGpuWrites(CommandBatch& batch) {
+    if (!VramLazyWrites()) return;
+    synchronousWrites = true;
+    synchronousSubmission = batch.TrackSubmission();
+    beginLazyWrites(nullptr);
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+}
+
 void GuestBufferMemory::ReadyForSubmit(Recorder& recorder) {
-    if (!VramWritable()) return;
+    if (!VramMirrorWrites()) return;
     GuestMemory::AssertGpuLockHeld("VRAM mirror completion registration");
     for (const auto& [mirror, interval] : mirrorWrites) {
         Require(interval->started && interval->recorded && interval->recorder == &recorder && interval->serial == recorder.Submissions() + 1 && recorder.CompletionCount() > interval->completionCount, "a VRAM mirror writer needs its own completion before submission");
@@ -5535,6 +5970,16 @@ void GuestBufferMemory::ReadyForSubmit(Recorder& recorder) {
 }
 
 void GuestBufferMemory::SealForSubmit(CommandBatch* batch) {
+    if (VramLazyWrites()) {
+        if (!synchronousWrites) {
+            synchronousWrites = true;
+            if (batch != nullptr) synchronousSubmission = batch->TrackSubmission();
+            beginLazyWrites(nullptr);
+        }
+        recordMirrorWrites(nullptr);
+        for (const auto& [mirror, interval] : mirrorWrites) interval->ready = true;
+        return;
+    }
     if (!VramWritable()) return;
     GuestMemory::AssertGpuLockHeld("synchronous VRAM mirror submission");
     Require(std::all_of(mirrorWrites.begin(), mirrorWrites.end(), [](const auto& item) { return item.second->recorder == nullptr; }), "a recorded VRAM mirror writer cannot use a synchronous submission");
@@ -5549,6 +5994,17 @@ void GuestBufferMemory::SealForSubmit(CommandBatch* batch) {
 }
 
 void GuestBufferMemory::recordMirrorWrites(Recorder* recorder) {
+    if (VramLazyWrites()) {
+        for (const auto& [mirror, interval] : mirrorWrites) {
+            if (interval->recorded) continue;
+            Require(interval->started && interval->recorder == recorder, "lazy mirror work was not begun before recording");
+            interval->recorded = true;
+            interval->completionCount = recorder != nullptr ? recorder->CompletionCount() : 0;
+            ++mirror->gpuRevision;
+            for (const auto& [begin, end] : interval->watched) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+        }
+        return;
+    }
     if (!VramWritable()) return;
     for (const auto& [mirror, interval] : mirrorWrites) {
         if (interval->recorded) continue;
@@ -5573,6 +6029,17 @@ void GuestBufferMemory::recordMirrorWrites(Recorder* recorder) {
 }
 
 void GuestBufferMemory::QueueBdaWrites(std::uint64_t address, std::size_t bytes) const {
+    if (VramLazyWrites()) {
+        Require(address % 4096 == 0 && bytes % 4096 == 0, "a lazy BDA write report is not page aligned");
+        for (const auto& [mirror, interval] : mirrorWrites) {
+            const auto begin = std::max(address, mirror->base);
+            const auto end = std::min(address + bytes, mirror->base + mirror->bytes);
+            for (const auto page : protectLazyRange(*mirror, interval, begin, end, true))
+                if (!GuestMemory::UnchangedSinceCollected(page, 4096, interval->generation)) ++LazyState().counts.conflicts;
+        }
+        GuestMemory::MarkWritten(address, bytes);
+        return;
+    }
     if (!VramWritable()) { GuestMemory::MarkWritten(address, bytes); return; }
     Require(address % 4096 == 0 && bytes % 4096 == 0, "a BDA write report is not page aligned");
     for (auto page = address; page < address + bytes; page += 4096) {
@@ -5588,6 +6055,16 @@ void GuestBufferMemory::QueueBdaWrites(std::uint64_t address, std::size_t bytes)
 }
 
 void GuestBufferMemory::QueueBdaOverflow() const {
+    if (VramLazyWrites()) {
+        for (const auto& [mirror, interval] : mirrorWrites) {
+            if (mirror->sparse) for (const auto& [begin, end] : mirror->committed) QueueBdaWrites(begin, static_cast<std::size_t>(end - begin));
+            else QueueBdaWrites(mirror->base, static_cast<std::size_t>(mirror->bytes));
+        }
+        const auto mark = [](const auto& list) { for (const auto& region : list) if (region.direct != nullptr && region.writable) GuestMemory::MarkWritten(region.begin, static_cast<std::size_t>(region.end - region.begin)); };
+        if (space != nullptr) mark(space->base);
+        mark(regions);
+        return;
+    }
     Require(VramWritable(), "BDA overflow fallback needs writable mirrors");
     countWritable({.overflowFallbacks = 1});
     for (const auto& [mirror, interval] : mirrorWrites) for (const auto& [begin, end] : interval->watched) for (auto page = begin; page < end; page += 4096) interval->written.insert(page);
@@ -5597,6 +6074,7 @@ void GuestBufferMemory::QueueBdaOverflow() const {
 }
 
 void GuestBufferMemory::completeMirrorWrites() {
+    if (VramLazyWrites()) { completeLazyWrites(); return; }
     if (!VramWritable()) return;
     recordMirrorWrites(nullptr);
     for (const auto& [mirror, interval] : mirrorWrites) {
@@ -5640,7 +6118,7 @@ void GuestBufferMemory::takeHeapReferences() {
     mirrorReadbacks.clear();
     const auto appendReadback = [&](std::uint64_t begin, std::uint64_t end, const std::shared_ptr<ImageMirror>& mirror) {
         if (begin >= end || !mirror->writable) return;
-        if (VramWritable() && mirror->heap) return;
+        if (VramMirrorWrites() && mirror->heap) return;
         const auto copied = static_cast<std::size_t>(((end + 3) & ~std::uint64_t{3}) - (begin & ~std::uint64_t{3}));
         Require((begin & ~std::uint64_t{3}) >= mirror->base && (begin & ~std::uint64_t{3}) + copied <= mirror->base + mirror->bytes, "mirror readback alignment exceeds its backing");
         constexpr auto properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
@@ -5691,7 +6169,7 @@ void GuestBufferMemory::takeHeapReferences() {
 }
 
 void GuestBufferMemory::recordMirrorResults(Recorder* recorder) {
-    const bool copiedMirror = VramWritable() && std::any_of(regions.begin(), regions.end(), [](const auto& region) { return (region.mirror != nullptr || !region.mirrorPieces.empty()) && region.gpuCopy && !region.copiedBack; });
+    const bool copiedMirror = VramMirrorWrites() && std::any_of(regions.begin(), regions.end(), [](const auto& region) { return (region.mirror != nullptr || !region.mirrorPieces.empty()) && region.gpuCopy && !region.copiedBack; });
     if (!copiedMirror && (mirrorReadbacks.empty() || std::all_of(mirrorReadbacks.begin(), mirrorReadbacks.end(), [](const auto& readback) { return readback.recorded; }))) return;
     const auto record = [&](VkCommandBuffer commands) {
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);

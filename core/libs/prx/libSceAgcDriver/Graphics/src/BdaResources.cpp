@@ -141,7 +141,7 @@ BdaResources::BdaResources(const Context& context) {
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
-    if (VramWritable()) memoryOwner = &memory;
+    if (VramMirrorWrites()) memoryOwner = &memory;
     const auto cached = memory.CachedAddressTable();
     struct AddressRangesStorage {};
     auto& built = HostThreadLocal<std::vector<ShaderRecompiler::BdaAbi::Range>, AddressRangesStorage>();

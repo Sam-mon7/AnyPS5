@@ -2488,6 +2488,21 @@ if(BUILD_TESTING AND WIN32)
     endforeach()
     set_property(TEST agc_vram_device_on agc_vram_device_fallback APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DEVICE_LOCAL_MIRRORS=set:1")
     set_property(TEST agc_vram_device_fallback APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_SNAPSHOT_RING=set:0")
+    foreach(vramLazyMode IN ITEMS off on)
+        add_test(NAME agc_vram_lazy_${vramLazyMode} COMMAND agc_driver_recorder_tests --vram-lazy-only)
+        set_tests_properties(agc_vram_lazy_${vramLazyMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_DEVICE_LOCAL_MIRRORS=1;APS5_VRAM_LAZY_WRITES=0;APS5_RESIDENT_HEAP_MIRRORS=0;APS5_REBAR_MIB=0"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_WRITABLE_STRICT=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:")
+    endforeach()
+    set_property(TEST agc_vram_lazy_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_LAZY_WRITES=set:1")
+    add_test(NAME agc_vram_lazy_imports COMMAND agc_driver_recorder_tests --vram-lazy-imports)
+    set_tests_properties(agc_vram_lazy_imports PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_DEVICE_LOCAL_MIRRORS=1;APS5_VRAM_LAZY_WRITES=1;APS5_RESIDENT_HEAP_MIRRORS=0;APS5_REBAR_MIB=0"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_WRITABLE_STRICT=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:")
+    add_test(NAME agc_vram_lazy_requires_device COMMAND agc_vram_options_tests "APS5_VRAM_LAZY_WRITES requires APS5_VRAM_DEVICE_LOCAL_MIRRORS=1")
+    set_tests_properties(agc_vram_lazy_requires_device PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_LAZY_WRITES=set:1;APS5_VRAM_DEVICE_LOCAL_MIRRORS=unset:")
+    add_test(NAME agc_vram_lazy_replaces_writable COMMAND agc_vram_options_tests "APS5_VRAM_LAZY_WRITES replaces APS5_VRAM_WRITABLE; do not enable both")
+    set_tests_properties(agc_vram_lazy_replaces_writable PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_LAZY_WRITES=set:1;APS5_VRAM_DEVICE_LOCAL_MIRRORS=set:1;APS5_VRAM_WRITABLE=set:1")
     add_test(NAME agc_vram_device_recorder COMMAND agc_driver_recorder_tests)
     add_test(NAME agc_vram_device_bda COMMAND agc_driver_bda_device_tests)
     add_test(NAME agc_vram_device_graphics COMMAND agc_driver_graphics_tests)

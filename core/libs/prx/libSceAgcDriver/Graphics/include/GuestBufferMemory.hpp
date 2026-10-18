@@ -226,6 +226,32 @@ struct VramUploadStats {
     std::uint64_t syncUs = 0;
 };
 VramUploadStats VramUploadCounters();
+struct VramLazyStats {
+    std::uint64_t protectedAtRecord = 0;
+    std::uint64_t protectedAtCompletion = 0;
+    std::uint64_t pendingPages = 0;
+    std::uint64_t copyInAvoided = 0;
+    std::uint64_t copyBackAvoided = 0;
+    std::uint64_t refreshPagesSkipped = 0;
+    std::uint64_t hookRangesSkipped = 0;
+    std::uint64_t faults = 0;
+    std::uint64_t downloadedPages = 0;
+    std::uint64_t downloadUs = 0;
+    std::uint64_t writerWaits = 0;
+    std::uint64_t writerWaitUs = 0;
+    std::uint64_t faultPageWaits = 0;
+    std::uint64_t faultPageWaitUs = 0;
+    std::uint64_t faultBdaWaits = 0;
+    std::uint64_t faultBdaWaitUs = 0;
+    std::uint64_t protectRuns = 0;
+    std::uint64_t protectCalls = 0;
+    std::uint64_t protectUs = 0;
+    std::uint64_t snapshotCalls = 0;
+    std::uint64_t snapshotUs = 0;
+    std::uint64_t conflicts = 0;
+    std::uint64_t fallbacks = 0;
+};
+VramLazyStats VramLazyCounters();
 struct VramCleanupStats {
     std::uint64_t evictedMirrors = 0;
     std::uint64_t evictedBytes = 0;
@@ -366,7 +392,9 @@ public:
     // regions was recorded (ShaderResources::MarkGpuWrites), under GuestMemory::GpuMutex. A use that
     // never calls it (a synchronous draw) stores the staging bytes from the CPU in WriteBack.
     void RecordCopyBacks(Recorder& recorder);
+    void NotePendingWrites(Recorder& recorder) const;
     void BeginGpuWrites(Recorder& recorder);
+    void BeginGpuWrites(CommandBatch& batch);
     void ReadyForSubmit(Recorder& recorder);
     void SealForSubmit(CommandBatch* batch = nullptr);
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
@@ -511,6 +539,9 @@ private:
     void prepareMirrorWrites(bool addressable);
     void recordMirrorWrites(Recorder* recorder);
     void completeMirrorWrites();
+    void prepareLazyWrites(bool addressable);
+    void beginLazyWrites(Recorder* recorder);
+    void completeLazyWrites();
     Context context;
     bool stagingAllowed = false;
     bool adjustedRegions = false;

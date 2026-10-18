@@ -366,6 +366,14 @@ bool GuestArenaPublishGpuPage_nid_no_patch(std::uintptr_t address, const void* g
     return WindowsMappings::Get().PublishGpuPage(address, gpu, firstCpuBase);
 }
 
+bool GuestArenaSnapshotGpuPage_nid_no_patch(std::uintptr_t address, void* bytes) {
+    return WindowsMappings::Get().SnapshotGpuPage(address, bytes);
+}
+
+bool GuestArenaProtectGpuWrites_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* calls) {
+    return WindowsMappings::Get().ArmGpuWriteWatch(address, bytes, true, calls);
+}
+
 bool GuestArenaGpuOverlayProtection_nid_no_patch(std::uintptr_t address, std::uint32_t* protection, bool* pending) {
     return WindowsMappings::Get().GpuOverlayProtection(address, protection, pending);
 }

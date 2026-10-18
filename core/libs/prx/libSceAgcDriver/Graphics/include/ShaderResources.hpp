@@ -182,6 +182,7 @@ public:
     // once the work completed.
     void MarkGpuWrites(Recorder& recorder);
     void BeginGpuWrites(Recorder& recorder) { guestMemory.BeginGpuWrites(recorder); }
+    void BeginGpuWrites(CommandBatch& batch) { guestMemory.BeginGpuWrites(batch); }
     void ReadyForSubmit(Recorder& recorder) { guestMemory.ReadyForSubmit(recorder); }
     void SealForSubmit(CommandBatch* batch = nullptr) { guestMemory.SealForSubmit(batch); }
     void WriteBackBuffers();

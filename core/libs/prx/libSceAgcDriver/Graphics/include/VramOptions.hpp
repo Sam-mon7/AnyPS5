@@ -27,6 +27,13 @@ inline bool VramWritable() {
     return enabled;
 }
 
+inline bool VramLazyWrites() {
+    static const bool enabled = VramOption("APS5_VRAM_LAZY_WRITES");
+    return enabled;
+}
+
+inline bool VramMirrorWrites() { return VramWritable() || VramLazyWrites(); }
+
 inline bool VramWritableStrict() {
     static const bool enabled = VramOption("APS5_VRAM_WRITABLE_STRICT");
     return enabled;
@@ -53,6 +60,10 @@ inline bool TextureAgeEviction() {
 }
 
 inline void ValidateVramOptions() {
+    if (VramLazyWrites() && !VramDeviceLocalMirrors())
+        throw std::runtime_error("APS5_VRAM_LAZY_WRITES requires APS5_VRAM_DEVICE_LOCAL_MIRRORS=1");
+    if (VramLazyWrites() && VramWritable())
+        throw std::runtime_error("APS5_VRAM_LAZY_WRITES replaces APS5_VRAM_WRITABLE; do not enable both");
     if (VramDeviceLocalMirrors() && !VramDescriptors())
         throw std::runtime_error("APS5_VRAM_DEVICE_LOCAL_MIRRORS requires APS5_VRAM_DESCRIPTORS=1");
     if (VramDeviceLocalMirrors() && VramOption("APS5_RESIDENT_HEAP_MIRRORS"))
@@ -72,7 +83,7 @@ inline void ValidateVramOptions() {
     if (VramTextures() && !VramDeferred())
         throw std::runtime_error("APS5_VRAM_TEXTURES requires APS5_VRAM_DEFERRED=1");
 #ifndef _WIN32
-    if (VramWritable())
+    if (VramMirrorWrites())
         throw std::runtime_error("APS5_VRAM_WRITABLE requires Windows guest page protection support");
 #endif
     if (VramOption("APS5_VRAM_MIRRORS") && VramOption("APS5_RESIDENT_HEAP_MIRRORS"))

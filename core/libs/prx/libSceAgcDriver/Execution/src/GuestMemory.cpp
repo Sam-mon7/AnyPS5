@@ -1279,7 +1279,7 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return import();
     std::unique_lock gpuLock(GpuMutex(), std::defer_lock);
-    if (Graphics::VramWritable()) {
+    if (Graphics::VramMirrorWrites()) {
         gpuLock.lock();
 #ifdef _WIN32
         if (GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(address, bytes)) FlushGpuWrites(address, bytes);
@@ -1384,7 +1384,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     if (bytes == 0) return 0;
     std::unique_lock gpuLock(GpuMutex(), std::defer_lock);
     std::optional<GuestArena::HostWrite> hostWrite;
-    if (Graphics::VramWritable()) {
+    if (Graphics::VramMirrorWrites()) {
         gpuLock.lock();
 #ifdef _WIN32
         if (GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(address, bytes)) {

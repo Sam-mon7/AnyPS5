@@ -41,6 +41,8 @@ bool GuestArenaHasGpuOverlay_nid_no_patch(std::uintptr_t address, std::size_t by
 bool GuestArenaArmGpuWriteWatch_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaDisarmGpuWriteWatch_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 bool GuestArenaPublishGpuPage_nid_no_patch(std::uintptr_t address, const void* gpu, const void* firstCpuBase);
+bool GuestArenaSnapshotGpuPage_nid_no_patch(std::uintptr_t address, void* bytes);
+bool GuestArenaProtectGpuWrites_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* calls);
 bool GuestArenaGpuOverlayProtection_nid_no_patch(std::uintptr_t address, std::uint32_t* protection, bool* pending);
 bool GuestArenaApplyGpuProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint32_t protection);
 bool GuestArenaVisitGpuAliases_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool (*visitor)(std::uintptr_t alias, std::size_t bytes, void* context), void* context);

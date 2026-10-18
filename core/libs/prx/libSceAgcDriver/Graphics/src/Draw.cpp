@@ -2316,6 +2316,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
     if (recorded) resources->BeginGpuWrites(*recorder);
+    else resources->BeginGpuWrites(*batch);
     if (recorded) recorder->PrepareSampleSlot();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.

@@ -947,3 +947,270 @@ void RunVramDeferredTests(const AgcDriver::Graphics::Context& context, AgcDriver
     std::cout << "VRAM deferred publication tests passed\n";
 #endif
 }
+
+void RunVramLazyTests(const AgcDriver::Graphics::Context& device, AgcDriver::Graphics::Recorder& recorder, bool imports) {
+#ifndef _WIN32
+    throw std::runtime_error("lazy mirror fixture requires Windows guest page protection");
+#else
+    using namespace AgcDriver::Graphics;
+    namespace Memory = AgcDriver::GuestMemory;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 2 * block;
+    constexpr std::size_t page = 4096;
+    auto context = device;
+    if (!imports) {
+        context.hostImportAlignment = 0;
+        context.dmaBufImport = false;
+    }
+    auto* raw = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    auto* alias = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    Require(raw != nullptr && alias != nullptr && section != nullptr, "cannot create lazy mirror fixture");
+    GuestArena::GuestArenaMap_nid_postfix(raw, bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(alias, bytes, section, 0, PAGE_READWRITE);
+    std::memset(raw, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(raw);
+    GuestAllocations::Mutation().Add(raw, bytes, true, true, true);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        std::uint8_t* raw;
+        std::uint8_t* alias;
+        HANDLE section;
+        ~Release() {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            GuestAllocations::Mutation().Remove(raw);
+            for (auto* mapping : {raw, alias}) {
+                GuestArena::GuestArenaReset_nid_postfix(mapping, bytes);
+                GuestArena::GuestArenaRelease_nid_postfix(mapping, bytes);
+            }
+            CloseHandle(section);
+        }
+    } release{context, recorder, raw, alias, section};
+    {
+        GuestBufferMemory seed(context);
+        seed.SetAddressWrites(false);
+        seed.AcquireRegistered();
+        seed.Upload(true);
+        seed.WriteBack();
+    }
+    const auto write = [&](std::uint64_t at, std::uint32_t value, bool lateCpu = false, std::size_t width = sizeof(std::uint32_t)) {
+        Memory::BumpCollectEpoch();
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddWritable(at, width, true);
+        memory->Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = memory->Descriptor(at, width, adjustment);
+        if (lateCpu) alias[8] = 0x66;
+        memory->BeginGpuWrites(recorder);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + adjustment, width, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        memory->RecordCopyBacks(recorder);
+        memory->NotePendingWrites(recorder);
+        recorder.Keep(memory);
+        recorder.OnComplete([memory] { memory->WriteBack(); });
+        memory->ReadyForSubmit(recorder);
+        return view.buffer;
+    };
+    const auto read = [&] {
+        Memory::BumpCollectEpoch();
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddReadable(address, 2 * page);
+        memory->Upload(false);
+        memory->BeginGpuWrites(recorder);
+        std::uint32_t adjustment = 0;
+        const auto view = memory->Descriptor(address, 2 * page, adjustment);
+        auto output = std::make_shared<Buffer>(context, 2 * page, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, recorder.Commands(), view.buffer, view.offset + adjustment, output->Handle(), 0, 2 * page);
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(memory);
+        recorder.Keep(output);
+        recorder.OnComplete([memory] { memory->WriteBack(); });
+        return output;
+    };
+    const auto initial = VramLazyCounters();
+    const auto backing = write(address, 0x12345678u, true);
+    const auto first = VramLazyCounters();
+    if (VramLazyWrites()) Require(first.snapshotCalls == initial.snapshotCalls + 1, "the late CPU snapshot was not counted");
+    Require(write(address, 0x76543210u) == backing, "repeated lazy descriptor writes changed buffer ownership");
+    alias[page + 8] = 0x55;
+    const auto beforeRead = VramLazyCounters();
+    auto output = read();
+    recorder.Sync();
+    const auto result = output->ReadBytes(0, 2 * page);
+    Require(*reinterpret_cast<const std::uint32_t*>(result.data()) == 0x76543210u && result[8] == std::byte{0x66} && result[page + 8] == std::byte{0x55}, "GPU reuse lost a GPU store or a neighbouring CPU store");
+    if (VramLazyWrites()) {
+        const auto after = VramLazyCounters();
+        Require(first.protectedAtRecord == initial.protectedAtRecord + 1 && after.protectedAtRecord == first.protectedAtRecord, "repeated writes reprotected a GPU-owned page or protected a whole heap");
+        Require(after.downloadedPages == beforeRead.downloadedPages && after.pendingPages == initial.pendingPages + 1, "GPU-only reuse downloaded its mirror");
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(alias, &info, sizeof(info)) == sizeof(info) && info.Protect == PAGE_NOACCESS, "the native alias of a lazy page was not protected");
+        Require(VirtualQuery(alias + page, &info, sizeof(info)) == sizeof(info) && info.Protect != PAGE_NOACCESS, "an unrelated page was protected");
+    }
+    const auto beforeFault = VramLazyCounters();
+    Require(*reinterpret_cast<volatile std::uint32_t*>(alias) == 0x76543210u, "native read missed lazy GPU writes");
+    if (VramLazyWrites()) Require(VramLazyCounters().downloadedPages == beforeFault.downloadedPages + 1, "native read did not download exactly its page");
+    write(address, 0x89abcdefu);
+    const auto beforeWriteFault = VramLazyCounters();
+    alias[9] = 0x63;
+    if (VramLazyWrites()) Require(VramLazyCounters().faultPageWaits == beforeWriteFault.faultPageWaits + 1, "a descriptor writer fault wait was not classified");
+    output = read();
+    recorder.Sync();
+    const auto merged = output->ReadBytes(0, 2 * page);
+    Require(*reinterpret_cast<const std::uint32_t*>(merged.data()) == 0x89abcdefu && merged[9] == std::byte{0x63}, "native write fault lost CPU or GPU data");
+    {
+        GuestBufferMemory synchronous(context);
+        synchronous.AddWritable(address, sizeof(std::uint32_t));
+        synchronous.Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = synchronous.Descriptor(address, sizeof(std::uint32_t), adjustment);
+        CommandBatch batch(context);
+        alias[10] = 0x42;
+        synchronous.BeginGpuWrites(batch);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(batch.Handle(), view.buffer, view.offset + adjustment, sizeof(std::uint32_t), 0xabcdef01u);
+        synchronous.SealForSubmit(&batch);
+        batch.SubmitAndWait();
+        synchronous.WriteBack();
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias) == 0xabcdef01u && alias[10] == 0x42, "synchronous lazy submission missed its final CPU snapshot or GPU write");
+    }
+    if (VramLazyWrites()) {
+        {
+            auto abandoned = std::make_unique<GuestBufferMemory>(context);
+            abandoned->AddWritable(address, sizeof(std::uint32_t));
+            abandoned->Upload(false);
+            abandoned->BeginGpuWrites(recorder);
+        }
+        recorder.Sync();
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias) == 0xabcdef01u, "abandoned recorded work left an unwakeable lazy page");
+        {
+            GuestBufferMemory abandoned(context);
+            abandoned.AddWritable(address, sizeof(std::uint32_t));
+            abandoned.Upload(false);
+            CommandBatch batch(context);
+            abandoned.BeginGpuWrites(batch);
+            abandoned.SealForSubmit(&batch);
+        }
+        Require(!GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(address, page) && *reinterpret_cast<volatile std::uint32_t*>(alias) == 0xabcdef01u, "abandoned synchronous work retained lazy protection");
+        const auto bdaWrite = [&](std::uint64_t at, std::uint32_t value, bool abandon = false) {
+            Memory::BumpCollectEpoch();
+            auto memory = std::make_shared<GuestBufferMemory>(context);
+            memory->SetAddressWrites(true);
+            memory->AcquireRegistered();
+            memory->Upload(true);
+            auto bda = std::make_shared<BdaResources>(context, *memory);
+            auto output = std::make_shared<Buffer>(context, 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            const std::array<std::uint32_t, 2> values{value, value};
+            const auto code = MakeBdaDwordWriteTestShader(at, values.size(), values.data());
+            const std::array<VkDescriptorBufferInfo, 3> bindings{bda->Table(), bda->Fault(), VkDescriptorBufferInfo{output->Handle(), 0, output->Size()}};
+            auto pipeline = std::make_shared<Pipeline>(context, code, bindings);
+            memory->BeginGpuWrites(recorder);
+            pipeline->Record(recorder);
+            memory->RecordCopyBacks(recorder);
+            memory->NotePendingWrites(recorder);
+            if (!abandon) recorder.Keep(memory);
+            recorder.Keep(bda);
+            recorder.Keep(output);
+            recorder.Keep(pipeline);
+            if (!abandon) {
+                recorder.OnComplete([memory, bda] { bda->CheckFault(); memory->WriteBack(); });
+                memory->ReadyForSubmit(recorder);
+            }
+        };
+        const auto beforeBda = VramLazyCounters();
+        bdaWrite(address + page, 0x2468ace0u);
+        Require(!GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(address + page, page), "raw-pointer writes protected their heap before completion");
+        *reinterpret_cast<volatile std::uint32_t*>(alias + page) = 0xdeadbeefu;
+        std::uint32_t label = 0;
+        const std::uint32_t ready = 0x55aa55aau;
+        recorder.AfterCompletions(reinterpret_cast<std::uint64_t>(&label), std::as_bytes(std::span(&ready, 1)), 1, 0, false);
+        recorder.Sync();
+        Require(label == ready && GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(address + page, page), "BDA protection was not established before completion labels");
+        Require(VramLazyCounters().protectedAtCompletion == beforeBda.protectedAtCompletion + 1 && VramLazyCounters().conflicts > beforeBda.conflicts, "BDA page publication missed its CPU-write conflict");
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias + page) == 0x2468ace0u, "GPU bytes did not win the counted BDA conflict");
+        bdaWrite(address + 3 * page, 0x10293847u);
+        write(address, 0xabcdef01u);
+        const auto beforeGpuReuse = VramLazyCounters();
+        const auto beforeGpuUploads = VramUploadCounters();
+        {
+            GuestBufferMemory gpuOnly(context);
+            gpuOnly.SetAddressWrites(false);
+            gpuOnly.AcquireRegistered();
+            gpuOnly.Upload(true);
+            gpuOnly.WriteBack();
+        }
+        Require(VramLazyCounters().writerWaits == beforeGpuReuse.writerWaits && VramUploadCounters().bytes == beforeGpuUploads.bytes,
+            "GPU-only write markers caused a mirror refresh or writer wait");
+        const auto beforeBdaFault = VramLazyCounters();
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias) == 0xabcdef01u && VramLazyCounters().faultBdaWaits == beforeBdaFault.faultBdaWaits + 1,
+            "a raw-pointer writer fault wait was not classified");
+        recorder.Sync();
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias + 3 * page) == 0x10293847u, "GPU-only mirror reuse lost a raw-pointer result");
+        const std::byte hostLabel{0x77};
+        Memory::StoreOwnBytes(address + page + 8, std::span(&hostLabel, 1));
+        output = read();
+        recorder.Sync();
+        Require(output->ReadBytes(0, 2 * page)[page + 8] == hostLabel, "lazy refresh ignored a driver CPU store beside a protected page");
+        const auto beforeCoalesced = VramLazyCounters();
+        write(address + 4 * page, 0x8899aabbu, false, 2 * page);
+        const auto coalesced = VramLazyCounters();
+        Require(coalesced.protectRuns == beforeCoalesced.protectRuns + 1 && coalesced.protectCalls == beforeCoalesced.protectCalls + 2,
+            "contiguous pages did not share one protection call per native alias");
+        write(address + 4 * page, 0xaabbccddu, false, 2 * page);
+        Require(VramLazyCounters().protectRuns == coalesced.protectRuns, "GPU-only reuse reprotected an existing range");
+        recorder.Sync();
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias + 4 * page) == 0xaabbccddu && *reinterpret_cast<volatile std::uint32_t*>(alias + 5 * page) == 0xaabbccddu,
+            "coalesced lazy protection lost GPU results on a native alias");
+        if (imports) {
+            auto* flag = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, block, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            Require(flag != nullptr, "cannot allocate a native lazy readiness flag");
+            GuestAllocations::Mutation().Add(flag, block, true, true, true);
+            const auto flagAddress = reinterpret_cast<std::uint64_t>(flag);
+            const auto* imported = HostImportFor(context, flagAddress, block);
+            Require(imported == nullptr, "lazy writes allowed a native readiness flag to bypass completion publication");
+            bdaWrite(address + block, 0x13579bdfu);
+            write(flagAddress, 0x5a5a5a5au);
+            recorder.Submit();
+            Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "native lazy readiness GPU wait");
+            const bool ready = *static_cast<volatile std::uint32_t*>(flag) == 0x5a5a5a5au;
+            recorder.Sync();
+            Require(!ready && *static_cast<volatile std::uint32_t*>(flag) == 0x5a5a5a5au &&
+                *reinterpret_cast<volatile std::uint32_t*>(alias + block) == 0x13579bdfu,
+                "a native readiness flag overtook lazy BDA publication");
+            recorder.FlushDeferredReleases();
+            GuestAllocations::Mutation().Remove(flag);
+            VirtualFree(flag, 0, MEM_RELEASE);
+        }
+        {
+            auto* privateBytes = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(block, block));
+            GuestArena::GuestArenaCommit_nid_postfix(privateBytes, block, PAGE_READWRITE, block);
+            std::memset(privateBytes, 0x11, block);
+            GuestAllocations::Mutation().Add(privateBytes, block, true, true, true);
+            const auto privateAddress = reinterpret_cast<std::uint64_t>(privateBytes);
+            const auto beforeFallback = VramLazyCounters();
+            write(privateAddress, 0x98765432u);
+            recorder.Sync();
+            Require(*reinterpret_cast<volatile std::uint32_t*>(privateBytes) == 0x98765432u && VramLazyCounters().fallbacks > beforeFallback.fallbacks,
+                "unprotectable private memory did not retain a coherent fallback");
+            recorder.FlushDeferredReleases();
+            GuestAllocations::Mutation().Remove(privateBytes);
+            GuestArena::GuestArenaReset_nid_postfix(privateBytes, block);
+            GuestArena::GuestArenaRelease_nid_postfix(privateBytes, block);
+        }
+        bdaWrite(address + 2 * page, 0x31415926u, true);
+        recorder.Sync();
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias + 2 * page) == 0x31415926u, "abandoned raw-pointer work lost its GPU result");
+        write(address, 0x11223344u);
+        recorder.Sync();
+        const auto beforeClear = VramLazyCounters();
+        ClearImageMirrors(context.device);
+        Require(VramLazyCounters().pendingPages == 0 && VramLazyCounters().downloadedPages > beforeClear.downloadedPages && *reinterpret_cast<volatile std::uint32_t*>(alias) == 0x11223344u, "clearing mirrors lost lazy GPU data");
+    } else Require(VramLazyCounters().protectedAtRecord == initial.protectedAtRecord && VramLazyCounters().downloadedPages == initial.downloadedPages, "disabled lazy writes changed page ownership");
+#endif
+}

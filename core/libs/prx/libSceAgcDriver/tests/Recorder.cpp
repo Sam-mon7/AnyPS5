@@ -70,6 +70,7 @@
 
 void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, bool sparse);
 void RunVramWritableTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu);
+void RunVramLazyTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, bool imports);
 void RunVramDeferredTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 void RunVramCleanupTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 
@@ -8460,6 +8461,11 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && (std::string_view(argv[1]) == "--vram-lazy-only" || std::string_view(argv[1]) == "--vram-lazy-imports")) {
+            RunVramLazyTests(device.GetContext(), recorder, std::string_view(argv[1]) == "--vram-lazy-imports");
+            std::cout << "Lazy mirror coherence tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--vram-cleanup-only") {
             RunVramCleanupTests(device.GetContext(), recorder);
             return 0;
