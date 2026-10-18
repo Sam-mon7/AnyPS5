@@ -1,10 +1,15 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ConcurrentCaches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <atomic>
+#include <barrier>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -13,9 +18,11 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 #if defined(ANYPS5_AFTERMATH_TESTING)
 #include <filesystem>
@@ -56,6 +63,13 @@ struct MockDevice {
     bool recordLocked = false;
     std::vector<std::thread::id> recordThreads;
     std::vector<bool> recordLocks;
+    std::set<VkPipelineLayout> pipelineLayouts;
+    std::set<VkPipeline> graphicsPipelines;
+    std::set<VkFramebuffer> framebuffers;
+    std::set<VkRenderPass> renderPasses;
+    std::set<VkShaderModule> modules;
+    std::uint64_t graphicsBuilds = 0;
+    bool failGraphics = false;
 };
 
 MockDevice mock;
@@ -63,6 +77,52 @@ std::mutex mockMutex;
 std::promise<void>* recordEntered = nullptr;
 std::shared_future<void> recordAllowed;
 std::atomic<bool> recordBlocked{false};
+std::promise<void>* pipelineEntered = nullptr;
+std::shared_future<void> pipelineAllowed;
+
+template<class Handle>
+VkResult createGraphicsHandle(Handle* handle, std::set<Handle>& live) {
+    std::lock_guard lock(mockMutex);
+    *handle = reinterpret_cast<Handle>(mock.next++);
+    live.insert(*handle);
+    return VK_SUCCESS;
+}
+
+template<class Handle>
+void destroyGraphicsHandle(Handle handle, std::set<Handle>& live) {
+    std::lock_guard lock(mockMutex);
+    Expect(live.erase(handle) == 1, "a graphics handle was destroyed twice");
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule* handle) { return createGraphicsHandle(handle, mock.modules); }
+VKAPI_ATTR void VKAPI_CALL mockDestroyShaderModule(VkDevice, VkShaderModule handle, const VkAllocationCallbacks*) { destroyGraphicsHandle(handle, mock.modules); }
+VKAPI_ATTR VkResult VKAPI_CALL mockCreatePipelineLayout(VkDevice, const VkPipelineLayoutCreateInfo*, const VkAllocationCallbacks*, VkPipelineLayout* handle) { return createGraphicsHandle(handle, mock.pipelineLayouts); }
+VKAPI_ATTR void VKAPI_CALL mockDestroyPipelineLayout(VkDevice, VkPipelineLayout handle, const VkAllocationCallbacks*) { destroyGraphicsHandle(handle, mock.pipelineLayouts); }
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateRenderPass(VkDevice, const VkRenderPassCreateInfo*, const VkAllocationCallbacks*, VkRenderPass* handle) { return createGraphicsHandle(handle, mock.renderPasses); }
+VKAPI_ATTR void VKAPI_CALL mockDestroyRenderPass(VkDevice, VkRenderPass handle, const VkAllocationCallbacks*) { destroyGraphicsHandle(handle, mock.renderPasses); }
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateFramebuffer(VkDevice, const VkFramebufferCreateInfo*, const VkAllocationCallbacks*, VkFramebuffer* handle) { return createGraphicsHandle(handle, mock.framebuffers); }
+VKAPI_ATTR void VKAPI_CALL mockDestroyFramebuffer(VkDevice, VkFramebuffer handle, const VkAllocationCallbacks*) { destroyGraphicsHandle(handle, mock.framebuffers); }
+VKAPI_ATTR void VKAPI_CALL mockDestroyGraphicsPipeline(VkDevice, VkPipeline handle, const VkAllocationCallbacks*) { destroyGraphicsHandle(handle, mock.graphicsPipelines); }
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo*, const VkAllocationCallbacks*, VkPipeline* handles) {
+    std::promise<void>* entered;
+    std::shared_future<void> allowed;
+    bool fail;
+    {
+        std::lock_guard lock(mockMutex);
+        ++mock.graphicsBuilds;
+        entered = std::exchange(pipelineEntered, nullptr);
+        allowed = pipelineAllowed;
+        fail = std::exchange(mock.failGraphics, false);
+    }
+    if (entered != nullptr) {
+        entered->set_value();
+        allowed.wait();
+    }
+    if (fail) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    for (std::uint32_t i = 0; i < count; ++i) createGraphicsHandle(handles + i, mock.graphicsPipelines);
+    return VK_SUCCESS;
+}
 
 std::uint64_t SubmitCount() {
     std::lock_guard lock(mockMutex);
@@ -198,6 +258,10 @@ VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineSta
     mock.barriers.push_back({source, destination, count != 0 ? barriers[0].srcAccessMask : 0u, count != 0 ? barriers[0].dstAccessMask : 0u});
 }
 VKAPI_ATTR void VKAPI_CALL mockCmdBeginQuery(VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {}
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateUnavailableQueryPool(VkDevice, const VkQueryPoolCreateInfo*, const VkAllocationCallbacks*, VkQueryPool* pool) {
+    *pool = VK_NULL_HANDLE;
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+}
 VKAPI_ATTR void VKAPI_CALL mockCmdEndQuery(VkCommandBuffer, VkQueryPool, std::uint32_t) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdResetQueryPool(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdCopyQueryPoolResults(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize, VkDeviceSize, VkQueryResultFlags) {}
@@ -244,6 +308,17 @@ VKAPI_ATTR void VKAPI_CALL mockCmdEndRenderPass(VkCommandBuffer) {
 
 PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
     static const std::map<std::string_view, PFN_vkVoidFunction> table{
+        {"vkCreateShaderModule", reinterpret_cast<PFN_vkVoidFunction>(mockCreateShaderModule)},
+        {"vkDestroyShaderModule", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyShaderModule)},
+        {"vkCreatePipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockCreatePipelineLayout)},
+        {"vkDestroyPipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyPipelineLayout)},
+        {"vkCreateRenderPass", reinterpret_cast<PFN_vkVoidFunction>(mockCreateRenderPass)},
+        {"vkDestroyRenderPass", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyRenderPass)},
+        {"vkCreateFramebuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCreateFramebuffer)},
+        {"vkDestroyFramebuffer", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyFramebuffer)},
+        {"vkCreateGraphicsPipelines", reinterpret_cast<PFN_vkVoidFunction>(mockCreateGraphicsPipelines)},
+        {"vkDestroyPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyGraphicsPipeline)},
+        {"vkCreateQueryPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateUnavailableQueryPool)},
         {"vkCreateCommandPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateCommandPool)},
         {"vkDestroyCommandPool", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyCommandPool)},
         {"vkAllocateCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateCommandBuffers)},
@@ -1084,6 +1159,226 @@ void ParseTimeLabelTests() {
     Expect(counts.parsed - labelsBefore.parsed == (enabled ? 3u : 0u), "parse-time label counter included a refused label");
 }
 
+struct PipelineFixture {
+    Context context = mockContext();
+    ShaderRecompiler::RecompileResult vertex;
+    VertexInputLayout input;
+    State state{};
+    PipelineSetLayouts layouts{};
+    std::array<CompiledShader, 1> shaders;
+
+    PipelineFixture() : shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}} {
+        vertex.variantId = 1;
+        vertex.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010000u, 0, 1, 0};
+        context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        context.limits.maxFramebufferWidth = context.limits.maxFramebufferHeight = 1024;
+        context.limits.maxFramebufferLayers = 1;
+        context.limits.maxColorAttachments = 8;
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
+    ~PipelineFixture() { ClearCachedPipelines(context.device); }
+    std::shared_ptr<Pipeline> Lookup(std::uint32_t key) const {
+        auto keyed = state;
+        keyed.blendConstants[0] = static_cast<float>(key);
+        return CachedPipeline(context, keyed, input, layouts, shaders);
+    }
+};
+
+bool pipelineValid(const std::shared_ptr<Pipeline>& pipeline) {
+    if (pipeline == nullptr) return false;
+    std::lock_guard lock(mockMutex);
+    return mock.pipelineLayouts.contains(pipeline->Layout());
+}
+
+void PipelineReaderWriterStress() {
+    mock = MockDevice{};
+    PipelineFixture fixture;
+    const auto pinned = fixture.Lookup(0);
+    std::atomic<unsigned> invalid{0};
+    std::atomic<unsigned> written{0};
+    std::barrier start(12);
+    std::vector<std::thread> threads;
+    std::mutex legacyFramebuffer;
+    for (unsigned reader = 0; reader < 8; ++reader) {
+        threads.emplace_back([&, reader] {
+            start.arrive_and_wait();
+            for (unsigned i = 0; i < 4096; ++i) {
+                auto pipeline = fixture.Lookup((i + reader) % 32);
+                if (!pipelineValid(pipeline)) ++invalid;
+                std::unique_lock lock(legacyFramebuffer, std::defer_lock);
+                if (!ConcurrentCachesEnabled()) lock.lock();
+                auto framebuffer = pipeline->AcquireFramebuffer({}, {}, {1 + i % 16, 1});
+                std::lock_guard mockLock(mockMutex);
+                if (!mock.framebuffers.contains(framebuffer->Handle())) ++invalid;
+            }
+        });
+    }
+    for (unsigned writer = 0; writer < 2; ++writer) {
+        threads.emplace_back([&, writer] {
+            start.arrive_and_wait();
+            for (unsigned i = 0; i < 1536; ++i) {
+                auto pipeline = fixture.Lookup(32 + 2 * i + writer);
+                if (!pipelineValid(pipeline)) ++invalid;
+                written.fetch_add(1, std::memory_order_release);
+            }
+        });
+    }
+    threads.emplace_back([&] {
+        start.arrive_and_wait();
+        while (written.load(std::memory_order_acquire) < 1200) std::this_thread::yield();
+        for (unsigned i = 0; i < 8; ++i) {
+            ClearCachedPipelines(fixture.context.device);
+            if (!pipelineValid(pinned)) ++invalid;
+            std::this_thread::yield();
+        }
+    });
+    start.arrive_and_wait();
+    for (auto& thread : threads) thread.join();
+    Expect(invalid == 0, "pipeline/framebuffer readers observed a destroyed handle during publication or eviction");
+    const auto counts = PipelineConcurrencyCountersOf();
+    if (ConcurrentCachesEnabled()) {
+        Expect(counts.lookups >= 8 * 4096 + 2 * 1536 && counts.hits != 0 && counts.builds != 0, "concurrent pipeline counters missed cache operations");
+        if (std::getenv("APS5_PREPARED_SHADER_MIB") == nullptr) Expect(counts.evicted != 0, "stress did not exercise the concurrent pipeline bound");
+    } else {
+        Expect(counts.lookups == 0 && counts.readContention == 0 && counts.buildContention == 0, "disabled pipeline cache changed concurrent counters");
+    }
+}
+
+void PipelinePublicationOrder() {
+    mock = MockDevice{};
+    PipelineFixture fixture;
+    auto pinned = fixture.Lookup(0);
+    std::promise<void> entered, allowed;
+    auto enteredFuture = entered.get_future();
+    {
+        std::lock_guard lock(mockMutex);
+        pipelineEntered = &entered;
+        pipelineAllowed = allowed.get_future().share();
+    }
+    auto builder = std::async(std::launch::async, [&] { return fixture.Lookup(1); });
+    enteredFuture.wait();
+    std::promise<void> readerEntered;
+    auto readerStarted = readerEntered.get_future();
+    auto reader = std::async(std::launch::async, [&] {
+        readerEntered.set_value();
+        return fixture.Lookup(0);
+    });
+    readerStarted.wait();
+    const auto readTimeout = ConcurrentCachesEnabled() ? std::chrono::milliseconds(5000) : std::chrono::milliseconds(100);
+    const bool readWhileBuilding = reader.wait_for(readTimeout) == std::future_status::ready;
+    const auto beforeContention = PipelineConcurrencyCountersOf().buildContention;
+    std::barrier competingStart(9);
+    std::vector<std::future<std::shared_ptr<Pipeline>>> competitors;
+    for (unsigned i = 0; i < 8; ++i) competitors.push_back(std::async(std::launch::async, [&] {
+        competingStart.arrive_and_wait();
+        return fixture.Lookup(1);
+    }));
+    competingStart.arrive_and_wait();
+    if (ConcurrentCachesEnabled()) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (PipelineConcurrencyCountersOf().buildContention == beforeContention && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        Expect(PipelineConcurrencyCountersOf().buildContention > beforeContention, "blocked pipeline builders did not increment contention");
+    }
+    allowed.set_value();
+    const auto built = builder.get();
+    Expect(readWhileBuilding == ConcurrentCachesEnabled(), "pipeline hits used the wrong lock while a miss was building");
+    Expect(reader.get() == pinned, "an unrelated build invalidated a live identity pin");
+    for (auto& competitor : competitors) Expect(competitor.get() == built, "competing pipeline misses published multiple objects for one key");
+    if (ConcurrentCachesEnabled()) Expect(PipelineConcurrencyCountersOf().buildWaitNs != 0, "blocked pipeline builders did not report wait time");
+    {
+        std::lock_guard lock(mockMutex);
+        Expect(mock.graphicsBuilds == 2, "competing pipeline misses compiled the same key more than once");
+        mock.failGraphics = true;
+    }
+    bool failed = false;
+    try { static_cast<void>(fixture.Lookup(2)); } catch (const std::runtime_error&) { failed = true; }
+    Expect(failed && pipelineValid(pinned) && pipelineValid(fixture.Lookup(2)), "a failed build poisoned cache publication or an existing reader");
+    std::thread clear([&] { ClearCachedPipelines(fixture.context.device); });
+    clear.join();
+    Expect(fixture.Lookup(0) != pinned && pipelineValid(pinned), "clear resurrected a thread-local identity or destroyed a pin");
+    auto anonymous = fixture.shaders;
+    ShaderRecompiler::RecompileResult unidentified;
+    anonymous.front().program = &unidentified;
+    const auto privatePipeline = CachedPipeline(fixture.context, fixture.state, fixture.input, fixture.layouts, anonymous);
+    Expect(CachedPipeline(fixture.context, fixture.state, fixture.input, fixture.layouts, anonymous) != privatePipeline, "an unidentified shader was cached");
+    if (ConcurrentCachesEnabled()) {
+        const auto current = fixture.Lookup(0);
+        PipelineFixture other;
+        const auto otherPipeline = other.Lookup(0);
+        ClearCachedPipelines(other.context.device);
+        Expect(fixture.Lookup(0) == current && pipelineValid(current) && pipelineValid(otherPipeline), "a second live device invalidated another device's pipeline or a retained pin");
+    }
+}
+
+void PipelineLazyExpiry() {
+    mock = MockDevice{};
+    PipelineFixture fixture;
+    const auto pinned = fixture.Lookup(0);
+    std::weak_ptr<Pipeline> cold = fixture.Lookup(1);
+    ClearPreparedPipelineObjects(fixture.context.device);
+    if (std::getenv("APS5_PREPARED_SHADER_MIB") != nullptr) {
+        Expect(cold.expired(), "a weak prepared pipeline stayed alive after budget eviction");
+        const auto before = PipelineExpiryCountersOf();
+        for (unsigned i = 0; i < 512; ++i) Expect(fixture.Lookup(0) == pinned, "expiry lost a pinned identity entry");
+        const auto after = PipelineExpiryCountersOf();
+        Expect(after.removed > before.removed && after.checked > before.checked, "lazy expiry did not retire weak pipeline entries");
+        if (ConcurrentCachesEnabled()) Expect(after.scans - before.scans == 2, "concurrent expiry did not run once per 256 lookups");
+    }
+    const auto replacement = fixture.Lookup(1);
+    Expect(pipelineValid(replacement) && fixture.Lookup(1) == replacement, "an expired pipeline could not be republished");
+}
+
+void PipelineGpuRetirement() {
+    mock = MockDevice{};
+    PipelineFixture fixture;
+    std::weak_ptr<Pipeline> weakPipeline;
+    std::weak_ptr<Framebuffer> weakFramebuffer;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(fixture.context);
+        auto pipeline = fixture.Lookup(0);
+        auto framebuffer = pipeline->AcquireFramebuffer({}, {}, {1, 1});
+        weakPipeline = pipeline;
+        weakFramebuffer = framebuffer;
+        for (unsigned batch = 0; batch < 2; ++batch) {
+            recorder.Keep(pipeline);
+            recorder.Keep(framebuffer);
+            recorder.Submit();
+        }
+        DrainSubmits();
+        ClearCachedPipelines(fixture.context.device);
+        pipeline.reset();
+        framebuffer.reset();
+        Expect(!weakPipeline.expired() && !weakFramebuffer.expired(), "eviction released an object before either GPU batch completed");
+        std::array<VkFence, 2> fences;
+        {
+            std::lock_guard lock(mockMutex);
+            Expect(mock.submitted.size() == 2, "GPU retirement fixture did not submit both batches");
+            fences = {mock.submitted.at(0), mock.submitted.at(1)};
+            mock.signaled.at(fences[0]) = true;
+        }
+        recorder.Reap();
+        Expect(!weakPipeline.expired() && !weakFramebuffer.expired(), "the first completed batch released an object still used by the second");
+        {
+            std::lock_guard lock(mockMutex);
+            mock.signaled.at(fences[1]) = true;
+        }
+        recorder.Reap();
+    }
+    Expect(weakPipeline.expired() && weakFramebuffer.expired(), "completed GPU batches leaked evicted pipeline objects");
+}
+
+void ConcurrentPipelineTests() {
+    const char* value = std::getenv("APS5_CONCURRENT_CACHES");
+    Expect(ConcurrentCachesEnabled() == (value != nullptr && std::strcmp(value, "1") == 0), "concurrent cache switch did not require the exact value 1");
+    PipelineReaderWriterStress();
+    PipelinePublicationOrder();
+    PipelineLazyExpiry();
+    PipelineGpuRetirement();
+    std::lock_guard lock(mockMutex);
+    Expect(mock.pipelineLayouts.empty() && mock.graphicsPipelines.empty() && mock.framebuffers.empty() && mock.renderPasses.empty() && mock.modules.empty(), "concurrent pipeline fixture leaked Vulkan objects");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1093,7 +1388,9 @@ int main(int argc, char** argv) {
         std::puts("Aftermath capture precedes failed recorder batch release");
         return 0;
 #endif
-        if (argc == 2 && std::string_view(argv[1]) == "compute-chains") {
+        if (argc == 2 && std::string_view(argv[1]) == "concurrent-pipelines") {
+            ConcurrentPipelineTests();
+        } else if (argc == 2 && std::string_view(argv[1]) == "compute-chains") {
             ComputeChainTests();
             ComputeChainWorkerOrder();
             if (Recorder::RecordWorkerEnabled()) RecordWorkerOrderAndSync();

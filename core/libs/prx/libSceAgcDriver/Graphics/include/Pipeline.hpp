@@ -94,6 +94,7 @@ private:
     std::vector<std::uint32_t> colorSlots;
     bool sampleLocationsEnabled = false;
     std::vector<CachedFramebuffer> framebuffers;
+    std::mutex framebufferMutex;
 };
 
 // The pipeline for this configuration, shared across draws and frames: keyed by the stages' variant
@@ -128,6 +129,12 @@ struct PipelineExpiryCounters {
     double ms = 0;
 };
 PipelineExpiryCounters PipelineExpiryCountersOf();
+struct PipelineConcurrencyCounters {
+    std::uint64_t lookups = 0, hits = 0, identityHits = 0, builds = 0, evicted = 0;
+    std::uint64_t readContention = 0, writeContention = 0, buildContention = 0, framebufferContention = 0;
+    std::uint64_t readWaitNs = 0, writeWaitNs = 0, buildWaitNs = 0, framebufferWaitNs = 0;
+};
+PipelineConcurrencyCounters PipelineConcurrencyCountersOf();
 bool HasStencil(VkFormat format);
 // Device limit checks of the viewport, which is dynamic state and so no longer checked by Pipeline.
 void ValidateViewport(const Context& context, const VkViewport& viewport);

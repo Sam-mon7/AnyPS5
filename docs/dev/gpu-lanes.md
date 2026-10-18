@@ -344,6 +344,75 @@ cache lookup/publication paths.
 
 ## Shared caches and migration
 
+### W5a pipeline cache slice and W5b handoff
+
+Exact `APS5_CONCURRENT_CACHES=1` selects a separate graphics pipeline store in
+`Pipeline.cpp`, independently of the lane switch. Unset, `0`, `01` and other
+values retain the original store, mutex, identity and optional lazy expiry.
+`APS5_GPU_LANES=1` alone does not enable this path. A worker must require both
+exact switches; this slice does not change worker admission or remove any
+`GpuMutex` hold from the W4g inventory above.
+
+Shared reader locks pin immutable cache entries. Hits update atomic access
+timestamps, and thread-local identity keeps only a weak entry plus the cache
+generation. Publication, eviction and expiry invalidate that generation under
+the exclusive lock. Expiry runs once per 256 concurrent lookups irrespective
+of `APS5_LAZY_PIPELINE_EXPIRY`; the legacy cadence is unchanged. The concurrent
+store retains at most 1024 lookup entries, including when evicted versions
+remain pinned by readers or GPU batches. Retired owners are released outside
+the lookup lock. Full keys and the weak buffer-pool identity distinguish device
+instances, and lookups do not abandon pipelines belonging to another live
+device. Misses share one build mutex and recheck after waiting; compilation
+holds no lookup lock. A future per-key build owner can replace that measured
+serialization point without changing the pin contract.
+
+W5b should use the existing `CachedPipeline` overloads and
+`Pipeline::AcquireFramebuffer`, retaining both returned shared pointers in
+**each** recorder batch using them. A pin in a prepared chunk alone does not
+cover GPU execution. Keep the owning Vulkan device through completion, drain
+workers before device teardown, and call `ClearCachedPipelines` before destroying
+the device. Cache clear waits for a current cache build but cannot make an
+already returned handle independent of its device. Framebuffer LRU operations
+have a per-pipeline mutex in concurrent mode. Neither cache retirement nor a
+clear changes a returned pipeline's handles. Existing draw recording already
+keeps its pipeline/framebuffer pair through completion; no recorder or lane
+implementation changes are made here.
+
+`PipelineConcurrencyCountersOf()` exposes cumulative operations and contention
+counts/wait nanoseconds for reader, writer, build and framebuffer locks. The
+concurrent `[pipecache]` profile line includes these and expiry statistics;
+switch-off profile text is unchanged. These do not measure worker acquisition
+of `GpuMutex`.
+
+The ten `agc_concurrent_pipeline_cache_*` variants cover off, on, unset,
+nonexact, lanes-only, both switches, identity disabled, prepared-budget off/on
+and background release. They use the production cache and recorder with mock
+Vulkan handles/fences, eight readers, two writers and a clearer, a blocked-build
+ordering check, duplicate-miss exclusion, failure/retry, expiry, identity clear
+and two-batch retirement. Off-mode framebuffer calls retain external
+serialization. Reconfigure CMake for these registrations; no new `.cpp` or
+execution-test filter entry is needed. The lane syntax-checks sources only;
+the integrator must execute these tests, sanitizer builds where available and
+the existing Vulkan pipeline/library/record-worker image regressions.
+
+Remaining cache work before W5b can admit general live resource preparation:
+
+1. `ResourceCache`/`SharedResourceCache`: concurrent entry publication and
+   lookup, protected or immutable `ShaderResources` validation/data refresh,
+   GPU pins, eviction and contention reporting.
+2. Draw cache: concurrent immutable entry lookup, safe recipe publication,
+   validation/counter ownership and bounded GPU-safe eviction.
+3. Dispatch cache: concurrent lookup/insertion, variant/proof validation,
+   recipe publication, counter ownership and GPU-safe eviction.
+4. Sampled/storage texture lookup: concurrent publication, pinned generations
+   and aliases, pending-writer/layout ownership, and retirement after all GPU
+   batches. The storage and pending registries in `Texture.cpp` and the lookup
+   helpers in `ShaderResources.cpp` must be handled together.
+
+Each remaining cache needs its own on/off stress and ordering regressions.
+Retain the W4g GPU-lock inventory until those resource contracts and W5b's
+independent recorders are implemented and validated.
+
 | Shared state | Requirement before parallel resource preparation/recording |
 | --- | --- |
 | Draw/dispatch records and shader/SRT proofs | Immutable versioned records, epoch proof publication, concurrent lookup and bounded insertion |

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ConcurrentCaches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -15,13 +16,48 @@
 #include <cstdio>
 #include <cstdlib>
 #include <list>
+#include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 namespace AgcDriver::Graphics {
+
+namespace {
+
+enum class PipelineLock : std::size_t { Read, Write, Build, Framebuffer };
+
+struct PipelineLockCounts {
+    std::atomic<std::uint64_t> contention{0}, waitNs{0};
+};
+
+struct ConcurrentPipelineCounts {
+    std::atomic<std::uint64_t> lookups{0}, hits{0}, identityHits{0}, builds{0}, evicted{0};
+    std::array<PipelineLockCounts, 4> locks;
+};
+
+ConcurrentPipelineCounts& ConcurrentCounts() {
+    static auto* counts = new ConcurrentPipelineCounts;
+    return *counts;
+}
+
+template<class Lock, class Mutex>
+Lock lockPipeline(Mutex& mutex, PipelineLock kind) {
+    Lock lock(mutex, std::defer_lock);
+    if (!lock.try_lock()) {
+        auto& counts = ConcurrentCounts().locks[static_cast<std::size_t>(kind)];
+        counts.contention.fetch_add(1, std::memory_order_relaxed);
+        const auto start = std::chrono::steady_clock::now();
+        lock.lock();
+        counts.waitNs.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
+    }
+    return lock;
+}
+
+}
 
 void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline) {
     if (!context.pipelineExecutableInfo) return;
@@ -591,6 +627,8 @@ VkPipelineLayout Pipeline::Layout() const {
 }
 
 std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers, std::span<const std::uint8_t> persistent) {
+    std::unique_lock<std::mutex> lock;
+    if (ConcurrentCachesEnabled()) lock = lockPipeline<std::unique_lock<std::mutex>>(framebufferMutex, PipelineLock::Framebuffer);
     Require(targets.size() == attachments && owners.size() == colorAttachments, "render targets do not match the pipeline's attachments");
     bool resident = true;
     for (std::size_t i = 0; i < owners.size(); ++i) resident = resident && (owners[i] != nullptr || (i < persistent.size() && persistent[i] != 0));
@@ -946,6 +984,142 @@ void reportPipelines(PipelineStore& store) {
     store.hits = store.misses = store.uncached = store.evicted = store.identityHits = 0;
 }
 
+struct ConcurrentPipelineEntry {
+    ConcurrentPipelineEntry(const Context& context, const std::shared_ptr<Pipeline>& pipeline, std::uint64_t used) : device(context.device), pool(context.bufferPool), tracksPool(context.bufferPool != nullptr), pipeline(pipeline, context.device), used(used) {}
+    const VkDevice device;
+    const std::weak_ptr<BufferPool> pool;
+    const bool tracksPool;
+    const PreparedObjectReference<Pipeline> pipeline;
+    std::atomic<std::uint64_t> used;
+
+    bool Matches(const Context& context) const {
+        return device == context.device && tracksPool == (context.bufferPool != nullptr) && pool.lock() == context.bufferPool;
+    }
+};
+
+struct ConcurrentPipelineStore {
+    std::shared_mutex mutex;
+    std::mutex buildMutex;
+    std::map<std::vector<std::byte>, std::shared_ptr<ConcurrentPipelineEntry>> entries;
+    std::uint64_t generation = 1;
+    PipelineExpiryCounters expiry;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+ConcurrentPipelineStore& ConcurrentPipelines() {
+    static auto* store = new ConcurrentPipelineStore;
+    return *store;
+}
+
+struct ConcurrentLastPipeline {
+    std::vector<std::byte> key, scratch;
+    std::weak_ptr<ConcurrentPipelineEntry> entry;
+    std::uint64_t generation = 0;
+};
+
+ConcurrentLastPipeline& ThreadLastConcurrentPipeline() {
+    thread_local ConcurrentLastPipeline* last = nullptr;
+    return ShaderRecompiler::ThreadOwned(last);
+}
+
+void reportConcurrentPipelines(ConcurrentPipelineStore& store) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile || std::chrono::steady_clock::now() - store.lastReport < std::chrono::seconds(10)) return;
+    store.lastReport = std::chrono::steady_clock::now();
+    const auto counts = PipelineConcurrencyCountersOf();
+    AgcDriver::ProfilePrint_nid_no_patch("[pipecache] concurrent cumulative: %llu lookups, %llu hits (%llu identity), %llu builds, %llu evicted, %zu cached; contention read/write/build/framebuffer %llu/%llu/%llu/%llu, wait-ns %llu/%llu/%llu/%llu; expiry %llu scans, %llu checked, %llu expired, %.3f ms\n",
+        static_cast<unsigned long long>(counts.lookups), static_cast<unsigned long long>(counts.hits), static_cast<unsigned long long>(counts.identityHits), static_cast<unsigned long long>(counts.builds), static_cast<unsigned long long>(counts.evicted), store.entries.size(),
+        static_cast<unsigned long long>(counts.readContention), static_cast<unsigned long long>(counts.writeContention), static_cast<unsigned long long>(counts.buildContention), static_cast<unsigned long long>(counts.framebufferContention),
+        static_cast<unsigned long long>(counts.readWaitNs), static_cast<unsigned long long>(counts.writeWaitNs), static_cast<unsigned long long>(counts.buildWaitNs), static_cast<unsigned long long>(counts.framebufferWaitNs),
+        static_cast<unsigned long long>(store.expiry.scans), static_cast<unsigned long long>(store.expiry.checked), static_cast<unsigned long long>(store.expiry.removed), store.expiry.ms);
+}
+
+void maintainConcurrentPipelines() {
+    auto& store = ConcurrentPipelines();
+    std::vector<std::shared_ptr<ConcurrentPipelineEntry>> retired;
+    auto lock = lockPipeline<std::unique_lock<std::shared_mutex>>(store.mutex, PipelineLock::Write);
+    const auto start = std::chrono::steady_clock::now();
+    ++store.expiry.scans;
+    store.expiry.checked += store.entries.size();
+    for (auto it = store.entries.begin(); it != store.entries.end();) {
+        if (!it->second->pipeline.Expired()) { ++it; continue; }
+        retired.push_back(std::move(it->second));
+        it = store.entries.erase(it);
+        ++store.generation;
+        ++store.expiry.removed;
+    }
+    store.expiry.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    reportConcurrentPipelines(store);
+}
+
+std::shared_ptr<Pipeline> cachedPipelineConcurrent(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    auto& store = ConcurrentPipelines();
+    auto& counts = ConcurrentCounts();
+    const auto used = counts.lookups.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((used & 255u) == 0) maintainConcurrentPipelines();
+    auto& last = ThreadLastConcurrentPipeline();
+    pipelineKey(last.scratch, context, state, vertexInput, resources, shaders, attachmentLayout);
+    const auto& key = last.scratch;
+    if (key.empty()) {
+        auto buildLock = lockPipeline<std::unique_lock<std::mutex>>(store.buildMutex, PipelineLock::Build);
+        auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+        counts.builds.fetch_add(1, std::memory_order_relaxed);
+        return pipeline;
+    }
+    const auto find = [&]() -> std::shared_ptr<Pipeline> {
+        std::shared_ptr<ConcurrentPipelineEntry> entry;
+        const bool identity = pipelineIdentity() && last.generation == store.generation && last.key == key;
+        if (identity) entry = last.entry.lock();
+        if (entry == nullptr) {
+            const auto found = store.entries.find(key);
+            if (found == store.entries.end()) return nullptr;
+            entry = found->second;
+        }
+        if (!entry->Matches(context)) return nullptr;
+        auto pipeline = entry->pipeline.Pin();
+        if (pipeline == nullptr) return nullptr;
+        entry->used.store(used, std::memory_order_relaxed);
+        counts.hits.fetch_add(1, std::memory_order_relaxed);
+        if (identity) counts.identityHits.fetch_add(1, std::memory_order_relaxed);
+        last.key = key;
+        last.entry = entry;
+        last.generation = store.generation;
+        return pipeline;
+    };
+    {
+        auto lock = lockPipeline<std::shared_lock<std::shared_mutex>>(store.mutex, PipelineLock::Read);
+        if (auto pipeline = find()) return pipeline;
+    }
+    auto buildLock = lockPipeline<std::unique_lock<std::mutex>>(store.buildMutex, PipelineLock::Build);
+    {
+        auto lock = lockPipeline<std::shared_lock<std::shared_mutex>>(store.mutex, PipelineLock::Read);
+        if (auto pipeline = find()) return pipeline;
+    }
+    auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    auto entry = std::make_shared<ConcurrentPipelineEntry>(context, pipeline, used);
+    counts.builds.fetch_add(1, std::memory_order_relaxed);
+    std::vector<std::shared_ptr<ConcurrentPipelineEntry>> retired;
+    {
+        auto lock = lockPipeline<std::unique_lock<std::shared_mutex>>(store.mutex, PipelineLock::Write);
+        auto& slot = store.entries[key];
+        if (slot != nullptr) {
+            retired.push_back(std::move(slot));
+            ++store.generation;
+        }
+        slot = std::move(entry);
+        while (store.entries.size() > 1024) {
+            const auto victim = std::min_element(store.entries.begin(), store.entries.end(), [](const auto& a, const auto& b) { return a.second->used.load(std::memory_order_relaxed) < b.second->used.load(std::memory_order_relaxed); });
+            retired.push_back(std::move(victim->second));
+            store.entries.erase(victim);
+            ++store.generation;
+            counts.evicted.fetch_add(1, std::memory_order_relaxed);
+        }
+        reportConcurrentPipelines(store);
+    }
+    static_cast<void>(ShaderRecompiler::MaintainPreparedShaderCache());
+    return pipeline;
+}
+
 }
 
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
@@ -955,6 +1129,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (ConcurrentCachesEnabled()) return cachedPipelineConcurrent(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -1045,9 +1220,26 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 }
 
 PipelineExpiryCounters PipelineExpiryCountersOf() {
+    if (ConcurrentCachesEnabled()) {
+        auto& store = ConcurrentPipelines();
+        auto lock = lockPipeline<std::shared_lock<std::shared_mutex>>(store.mutex, PipelineLock::Read);
+        auto result = store.expiry;
+        result.lookups = ConcurrentCounts().lookups.load(std::memory_order_relaxed);
+        return result;
+    }
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     return store.expiry;
+}
+
+PipelineConcurrencyCounters PipelineConcurrencyCountersOf() {
+    if (!ConcurrentCachesEnabled()) return {};
+    const auto& counts = ConcurrentCounts();
+    const auto contention = [&](PipelineLock kind) { return counts.locks[static_cast<std::size_t>(kind)].contention.load(std::memory_order_relaxed); };
+    const auto wait = [&](PipelineLock kind) { return counts.locks[static_cast<std::size_t>(kind)].waitNs.load(std::memory_order_relaxed); };
+    return {counts.lookups.load(std::memory_order_relaxed), counts.hits.load(std::memory_order_relaxed), counts.identityHits.load(std::memory_order_relaxed), counts.builds.load(std::memory_order_relaxed), counts.evicted.load(std::memory_order_relaxed),
+        contention(PipelineLock::Read), contention(PipelineLock::Write), contention(PipelineLock::Build), contention(PipelineLock::Framebuffer),
+        wait(PipelineLock::Read), wait(PipelineLock::Write), wait(PipelineLock::Build), wait(PipelineLock::Framebuffer)};
 }
 
 void ClearPreparedPipelineObjects(VkDevice device) {
@@ -1055,6 +1247,23 @@ void ClearPreparedPipelineObjects(VkDevice device) {
 }
 
 void ClearCachedPipelines(VkDevice device) {
+    if (ConcurrentCachesEnabled()) {
+        auto& store = ConcurrentPipelines();
+        std::vector<std::shared_ptr<ConcurrentPipelineEntry>> retired;
+        auto buildLock = lockPipeline<std::unique_lock<std::mutex>>(store.buildMutex, PipelineLock::Build);
+        {
+            auto lock = lockPipeline<std::unique_lock<std::shared_mutex>>(store.mutex, PipelineLock::Write);
+            for (auto it = store.entries.begin(); it != store.entries.end();) {
+                if (it->second->device != device) { ++it; continue; }
+                retired.push_back(std::move(it->second));
+                it = store.entries.erase(it);
+                ++store.generation;
+            }
+        }
+        ClearPipelineLibraries(device);
+        ShaderRecompiler::ClearPreparedObjects(reinterpret_cast<std::uintptr_t>(device));
+        return;
+    }
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     for (auto it = store.entries.begin(); it != store.entries.end();) {
