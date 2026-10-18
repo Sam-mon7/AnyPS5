@@ -44,6 +44,11 @@ void Driver::enqueue(Submission submission) {
         CheckFailure();
         bumpEpoch(&EpochBumps::submissions);
         execute(chunk);
+        if (Graphics::Recorder::ComputeChainsEnabled()) {
+            if (chunk.queue == 0 && DrawPipeline::Depth() != 0) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (auto* recorder = Graphics::Recorder::Active()) recorder->EndComputeChain(Graphics::Recorder::ComputeChainReason::Lanes);
+        }
     };
     scheduler->Enqueue(queue, {
         [this, current, executeChunk]() -> Lanes::Step {

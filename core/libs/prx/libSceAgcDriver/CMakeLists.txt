@@ -1094,6 +1094,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcComputeChainImageSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/ComputeChainImage.comp)
+set(agcComputeChainImageSpv ${agcTestShaderGeneratedRoot}/ComputeChainImage.spv)
+set(agcComputeChainImageHeader ${agcTestShaderGeneratedRoot}/ComputeChainImage_spv.h)
+add_custom_command(
+        OUTPUT "${agcComputeChainImageHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcComputeChainImageSpv}" "${agcComputeChainImageSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcComputeChainImageSpv} -DOUTPUT=${agcComputeChainImageHeader}
+        -DSYMBOL=COMPUTE_CHAIN_IMAGE_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcComputeChainImageSource}" glslang-standalone
+        VERBATIM
+)
+
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
         tests/ResidentHeapMirror.cpp
@@ -1104,6 +1117,7 @@ add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         ${agcSampleArrayShaderHeader}
         ${agcCoverShaderHeaders}
         ${agcBufferUpdateHeader}
+        ${agcComputeChainImageHeader}
 )
 
 target_include_directories(agc_driver_recorder_tests PRIVATE
@@ -1337,10 +1351,12 @@ set_target_properties(agc_recorder_kept_bytes_tests PROPERTIES CXX_EXTENSIONS OF
 configure_windows_unwind(agc_recorder_kept_bytes_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_recorder_kept_bytes_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
-    foreach(computeMode IN ITEMS off on zero nonexact full_barriers worker lanes)
+    foreach(computeMode IN ITEMS off on zero nonexact full_barriers worker_off worker worker_submit worker_lanes lanes)
         add_test(NAME agc_compute_chains_${computeMode} COMMAND agc_recorder_kept_bytes_tests compute-chains)
-        set(computeTests agc_compute_chains_${computeMode})
-        if(computeMode MATCHES "^(off|on|zero|nonexact)$")
+        add_test(NAME agc_compute_chains_images_${computeMode} COMMAND agc_driver_recorder_tests --compute-chain-images-only)
+        set(computeTests agc_compute_chains_${computeMode} agc_compute_chains_images_${computeMode})
+        set_tests_properties(agc_compute_chains_images_${computeMode} PROPERTIES SKIP_RETURN_CODE 77)
+        if(NOT computeMode STREQUAL "full_barriers")
             add_test(NAME agc_compute_chains_device_${computeMode} COMMAND agc_driver_recorder_tests --compute-chains-only)
             list(APPEND computeTests agc_compute_chains_device_${computeMode})
             set_tests_properties(agc_compute_chains_device_${computeMode} PROPERTIES SKIP_RETURN_CODE 77)
@@ -1351,15 +1367,20 @@ if(BUILD_TESTING)
             set_property(TEST ${computeTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_COMPUTE_CHAINS=set:0")
         elseif(computeMode STREQUAL "nonexact")
             set_property(TEST ${computeTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_COMPUTE_CHAINS=set:true")
-        elseif(NOT computeMode STREQUAL "off")
+        elseif(NOT computeMode MATCHES "^(off|worker_off)$")
             set_property(TEST ${computeTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_COMPUTE_CHAINS=set:1")
         endif()
         if(computeMode STREQUAL "full_barriers")
             set_property(TEST ${computeTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_FULL_BARRIERS=set:1")
-        elseif(computeMode STREQUAL "worker")
+        endif()
+        if(computeMode MATCHES "^worker")
             set_property(TEST ${computeTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RECORD_WORKER=set:1")
-        elseif(computeMode STREQUAL "lanes")
+        endif()
+        if(computeMode MATCHES "^(lanes|worker_lanes)$")
             set_property(TEST ${computeTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_GPU_LANES=set:1")
+        endif()
+        if(computeMode STREQUAL "worker_submit")
+            set_property(TEST ${computeTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_SUBMIT_WORKER=set:1")
         endif()
         if(WIN32)
             set_property(TEST ${computeTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
