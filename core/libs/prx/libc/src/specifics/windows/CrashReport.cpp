@@ -584,9 +584,13 @@ DWORD WINAPI FlushStderr(LPVOID) {
 }
 
 void BufferStderr() {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&FlushStderr), &module)) return;
     static char buffer[1 << 16];
     if (std::setvbuf(stderr, buffer, _IOFBF, sizeof(buffer)) != 0) return;
-    CreateThread(nullptr, 0, FlushStderr, nullptr, 0, nullptr);
+    const auto thread = CreateThread(nullptr, 0, FlushStderr, nullptr, 0, nullptr);
+    if (thread != nullptr) CloseHandle(thread);
+    else std::setvbuf(stderr, nullptr, _IONBF, 0);
 }
 
 const bool g_crashReportInstalled = [] {
