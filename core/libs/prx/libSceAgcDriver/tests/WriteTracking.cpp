@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -640,6 +641,17 @@ public:
         GuestAllocations::GuestAllocationsInvalidate_nid_postfix(Address(block), Block);
     }
 
+    void Protect(std::size_t block, bool readable, bool writable) {
+#ifdef _WIN32
+        const auto protection = !readable ? PAGE_NOACCESS : writable ? PAGE_READWRITE : PAGE_READONLY;
+        GuestArena::GuestArenaSetProtection_nid_postfix(Address(block), Block, protection);
+#else
+        const auto protection = !readable ? PROT_NONE : writable ? PROT_READ | PROT_WRITE : PROT_READ;
+        Require(mprotect(memory + block * Block, Block, protection) == 0, "cannot protect a committed test block");
+#endif
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(Address(block), Block);
+    }
+
     std::uint8_t* Data() const { return memory; }
     std::uint64_t Address(std::size_t block = 0) const { return reinterpret_cast<std::uint64_t>(memory) + block * Block; }
 
@@ -671,6 +683,18 @@ void CheckCommittedRanges() {
     Require(written > synced && runs == first && !UnchangedCommittedSince(runs, synced) && UnchangedCommittedSince(runs, written), "a CPU write to the committed part was missed");
     Require(MarkWritten(base + 16, 4) != 0 && !UnchangedCommittedSince(first, written), "a driver store into the committed part was missed");
     Require(UnchangedCommittedSince(first, CollectCommitted(range, runs)), "a collect after a driver store reads the committed part as changed");
+
+    for (unsigned i = 0; i < 8; ++i) {
+        Require(DescribeCommitted(base, PartlyCommitted::Bytes).ranges == first, "a repeated description changed its committed runs");
+        Require(DescribeCommitted(base + 1, Block - 2).whole, "an unaligned committed range is not whole");
+    }
+    range.Protect(0, true, false);
+    Require(DescribeCommitted(base, PartlyCommitted::Bytes).ranges == first, "read-only protection hid readable memory");
+    Require(DescribeCommitted(base, PartlyCommitted::Bytes, true).ranges.empty(), "read-only protection retained cached write access");
+    range.Protect(0, false, false);
+    Require(DescribeCommitted(base, PartlyCommitted::Bytes).ranges.empty(), "no-access protection retained cached read access");
+    range.Protect(0, true, true);
+    Require(DescribeCommitted(base, PartlyCommitted::Bytes, true).ranges == first, "restored write protection is not described");
 
     const auto beforeCommit = CollectCommitted(range, runs);
     range.Commit(2);
@@ -722,6 +746,34 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
+#ifdef _WIN32
+bool RefuseQueryTestFault(std::uintptr_t, bool) { return false; }
+
+void CheckScopedPageQueries() {
+    PartlyCommitted range;
+    range.Commit(0);
+    GuestArena::GuestArenaSetGpuPageFault_nid_no_patch(&RefuseQueryTestFault);
+    struct Restore {
+        std::uint64_t address;
+        bool armed = false;
+        ~Restore() {
+            if (armed) GuestArena::GuestArenaDisarmGpuWriteWatch_nid_no_patch(address, Block);
+            GuestArena::GuestArenaSetGpuPageFault_nid_no_patch(nullptr);
+        }
+    } restore{range.Address()};
+    restore.armed = GuestArena::GuestArenaArmGpuWriteWatch_nid_no_patch(range.Address(), Block);
+    Require(restore.armed, "cannot arm query test pages");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(range.Address(), Block);
+    const auto before = ThreadCachedPageQueries();
+    Require(DescribeCommitted(range.Address(), Block, true).whole, "GPU overlay changed logical page accessibility");
+    const auto reused = ThreadCachedPageQueries() - before;
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        const bool cached = std::getenv("APS5_CACHE_MAPPING_QUERIES") != nullptr;
+        Require(cached ? reused != 0 : reused == 0, "the scoped query cache did not follow its switch");
+    }
+}
+#endif
+
 int main() {
     try {
         if (!WriteWatched()) {
@@ -749,6 +801,9 @@ int main() {
         CheckImportWindow();
         CheckUnwatchedImport();
         CheckCommittedRanges();
+#ifdef _WIN32
+        CheckScopedPageQueries();
+#endif
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

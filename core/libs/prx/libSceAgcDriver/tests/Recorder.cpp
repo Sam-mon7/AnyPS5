@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ResourcePhase.hpp"
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
@@ -3540,28 +3541,7 @@ void drawSnapshotPatchTests(const Device& device) {
 void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
-    const char* previous = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
-    const std::string saved = previous != nullptr ? previous : "";
-#ifdef _WIN32
-    Require(_putenv_s("APS5_DRAW_SNAPSHOT_MAX_MIB", "1") == 0, "cannot set snapshot cap");
-#else
-    Require(setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", "1", 1) == 0, "cannot set snapshot cap");
-#endif
-    struct RestoreCap {
-        const char* previous;
-        std::string saved;
-        ~RestoreCap() {
-#ifdef _WIN32
-            _putenv_s("APS5_DRAW_SNAPSHOT_MAX_MIB", saved.c_str());
-#else
-            if (previous != nullptr) {
-                setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", saved.c_str(), 1);
-            } else {
-                unsetenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
-            }
-#endif
-        }
-    } restore{previous, saved};
+    Require(ShaderResources::MaxDrawSnapshotBytes() == 1024 * 1024, "run the snapshot cap test with APS5_DRAW_SNAPSHOT_MAX_MIB=1");
     constexpr std::size_t bytes = 3 * 1024 * 1024;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
@@ -7777,8 +7757,34 @@ void pipelineCacheTests(const Device& device, bool benchmark) {
     Require(lookup(input) != unidentified, "pipeline cache retained an unidentified shader");
     vertex.variantId = 1;
     Require(lookup(input) == first, "an unidentified shader disturbed the retained pipeline");
+    const auto beforeExpiry = PipelineExpiryCountersOf();
+    if (ShaderRecompiler::PreparedShaderBudgetEnabled() && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        state.cullMode = VK_CULL_MODE_FRONT_BIT;
+        std::weak_ptr<Pipeline> expired = lookup(input);
+        state.cullMode = 0;
+        Require(lookup(input) == first, "another key displaced a retained pipeline");
+        ShaderRecompiler::ClearPreparedObjects(reinterpret_cast<std::uintptr_t>(context.device));
+        Require(expired.expired(), "the expiry test pipeline is still retained");
+        for (unsigned i = 0; i < 512; ++i) Require(lookup(input) == first, "an expiry scan invalidated a live identity entry");
+        Require(PipelineExpiryCountersOf().removed > beforeExpiry.removed, "expiry scans did not remove an unused pipeline");
+        state.cullMode = VK_CULL_MODE_FRONT_BIT;
+        expired = lookup(input);
+        ShaderRecompiler::ClearPreparedObjects(reinterpret_cast<std::uintptr_t>(context.device));
+        Require(expired.expired(), "the identity expiry test pipeline is still retained");
+        const auto replaced = lookup(input);
+        Require(replaced != nullptr && lookup(input) == replaced, "an expired identity entry was not replaced");
+        state.cullMode = 0;
+    }
+    const auto beforeHits = PipelineExpiryCountersOf();
+    for (unsigned i = 0; i < 512; ++i) Require(lookup(input) == first, "periodic expiry lost a live pipeline");
+    const auto afterHits = PipelineExpiryCountersOf();
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        const bool lazy = std::getenv("APS5_LAZY_PIPELINE_EXPIRY") != nullptr;
+        Require(afterHits.lookups - beforeHits.lookups == 512 && afterHits.scans - beforeHits.scans == (lazy ? 2 : 512), "pipeline expiry scan cadence differs");
+    }
     ClearCachedPipelines(context.device);
-    Require(lookup(input) != first, "clearing the pipeline cache retained its old entry");
+    const auto cleared = lookup(input);
+    Require(cleared != first && lookup(input) == cleared, "clearing the pipeline cache retained its old identity entry");
     std::cout << "Pipeline cache key and retained lifetime tests passed\n";
 }
 
@@ -8878,7 +8884,6 @@ int main(int argc, char** argv) {
         misalignedRegionTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
         drawDescriptorWriteTests(device, recorder);
-        drawSnapshotCapTests(device, recorder);
         drawSnapshotEvictionTests(device);
         drawInputReuseTests(device, recorder);
         drawInputInPlaceTests(device, recorder);

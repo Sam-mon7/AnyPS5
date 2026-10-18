@@ -2334,19 +2334,25 @@ void syncRange(std::uint64_t address, std::uint64_t bytes, bool flush = true) {
     // recorded work notes a write inside the range (a descriptor written inside a writable exe
     // range; the lease itself maps the range read-only). The access is the whole range.
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
-    if (flush) GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
+    if (flush) {
+        ResourcePhase phase("mirror-flush");
+        GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
+    }
     auto& state = Mirrors();
     if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes))) {
         Recorder::CountSync(4);
         ++state.syncs;
         countDescriptors({.recorderSyncs = 1});
+        ResourcePhase phase("mirror-recorder-sync");
         recorder->Sync();
     }
     ++state.refreshes;
 }
 
 void prepareRange(std::uint64_t address, std::uint64_t bytes, bool flush = true) {
+    ResourcePhase access("mirror-access");
     Require(GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
+    access.End();
     syncRange(address, bytes, flush);
 }
 
@@ -2415,6 +2421,7 @@ void appendBlocks(std::vector<RefreshBlock>& blocks, ImageMirror& mirror, std::u
 // Compares the gathered blocks (of one or many mirrors) and counts them.
 void compareBlocks(std::span<const RefreshBlock> blocks) {
     if (blocks.empty()) return;
+    ResourcePhase phase("mirror-compare-copy");
     std::vector<RefreshBlock> filtered;
     if (VramLazyWrites()) {
         for (const auto& block : blocks) {
@@ -2536,8 +2543,11 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
         const auto begin = mirrors[first]->base;
         const auto bytes = mirrors[last - 1]->base + mirrors[last - 1]->bytes - begin;
         prepareRange(begin, bytes);
+        ResourcePhase collect("mirror-collect");
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
+        collect.End();
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
+        ResourcePhase changed("mirror-changed-blocks");
         appendChangedBlocks(std::span<ImageMirror* const>(mirrors).subspan(first, last - first), generation, blocks);
         first = last;
     }
@@ -3265,6 +3275,7 @@ std::shared_ptr<const GuestAllocations::Range> LeaseRegisteredRange(std::uint64_
 bool HeapMirrorExportInProgress() { return exportingHeapMirrors; }
 
 void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force) {
+    ResourcePhase phase("mirror-writeback");
     if (VramLazyWrites() && bytes != 0) {
         if (!force && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::MirrorRefresh) return;
         const auto end = address + std::min<std::uint64_t>(bytes, std::numeric_limits<std::uint64_t>::max() - address);
