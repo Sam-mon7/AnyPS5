@@ -463,6 +463,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/PageTracker.cpp
 )
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -483,6 +484,7 @@ configure_windows_unwind(agc_shared_write_tests)
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/PageTracker.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_write_tracking_tests PRIVATE shader_recompiler_agc_driver libc)
