@@ -342,7 +342,7 @@ constexpr std::array<const char*, PartCount> PipelinePartNames{"checks", "indire
 enum SyncReason : std::size_t { SyncNone, SyncNotResident, SyncNoRecorder, SyncDisabled, SyncCopiedWrites, SyncLease, SyncCount };
 constexpr std::array<const char*, SyncCount> SyncReasonNames{"none", "non-resident target", "no recorder", "disabled", "copied writes", "lease"};
 constexpr std::size_t IndirectPathCount = static_cast<std::size_t>(IndirectDrawPath::Count);
-constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-side", "patched SGPR not folded", "fetch offset unknown", "non-vertex path", "GE_INDX_OFFSET", "draw index", "vertex range too large", "feature gap", "pending image results", "pending label or copied write", "not imported", "disabled"};
+constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-side", "patched SGPR not folded", "fetch offset unknown", "non-vertex path", "GE_INDX_OFFSET", "draw index", "vertex range too large", "feature gap", "pending image results", "pending label or copied write", "not imported", "disabled", "runtime SGPR", "runtime SGPR feature", "runtime SGPR stage", "runtime SGPR original argument", "runtime SGPR resource dependency", "runtime SGPR fetch"};
 
 // What became of one draw, for the totals.
 struct DrawOutcome {
@@ -545,14 +545,16 @@ void reportDraw(const std::array<double, PhaseCount>& us, const std::array<doubl
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; hook waits inside draws %.1f ms (max %.1f; the draws' own syncs, %.1f ms, not counted)", profile.hookWaitUs / 1000.0, profile.maxHookWaitUs / 1000.0, profile.ownSyncUs / 1000.0);
     std::uint64_t indirectCpu = 0;
-    for (std::size_t i = 1; i < IndirectPathCount; ++i) indirectCpu += profile.indirect[i];
-    if ((profile.indirect[0] != 0 || indirectCpu != 0) && room()) {
-        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; indirect: gpu-side %llu (%llu rewritten), cpu-side %llu (", static_cast<unsigned long long>(profile.indirect[0]), static_cast<unsigned long long>(profile.indirectRewritten), static_cast<unsigned long long>(indirectCpu));
+    for (std::size_t i = 1; i < IndirectPathCount; ++i) if (i != static_cast<std::size_t>(IndirectDrawPath::RuntimeSgpr)) indirectCpu += profile.indirect[i];
+    const auto runtimeSgprs = profile.indirect[static_cast<std::size_t>(IndirectDrawPath::RuntimeSgpr)];
+    if ((profile.indirect[0] != 0 || runtimeSgprs != 0 || indirectCpu != 0) && room()) {
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; indirect: gpu-side %llu (%llu rewritten), cpu-side %llu (", static_cast<unsigned long long>(profile.indirect[0] + runtimeSgprs), static_cast<unsigned long long>(profile.indirectRewritten), static_cast<unsigned long long>(indirectCpu));
         for (std::size_t i = 1; i < IndirectPathCount && room(); ++i) {
-            if (profile.indirect[i] != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", IndirectDrawPathNames[i], static_cast<unsigned long long>(profile.indirect[i]));
+            if (i != static_cast<std::size_t>(IndirectDrawPath::RuntimeSgpr) && profile.indirect[i] != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", IndirectDrawPathNames[i], static_cast<unsigned long long>(profile.indirect[i]));
         }
         if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "), argument reads %.1f ms", profile.indirectReadUs / 1000.0);
     }
+    if (runtimeSgprs != 0 && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; runtime SGPR %llu", static_cast<unsigned long long>(runtimeSgprs));
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; skipped packets:");
     for (std::size_t i = 0; i < profile.skips.size() && room(); ++i) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu in %.1f ms", DrawSkipNames[i], static_cast<unsigned long long>(profile.skips[i]), profile.skipUs[i] / 1000.0);
@@ -1340,6 +1342,30 @@ struct IndirectRecord {
     double readMs = 0;
 };
 
+std::shared_ptr<Buffer> runtimeFallbackArguments(const Context& context, VkCommandBuffer commands, const Pm4::DrawParameters& draw, const IndirectRecord& indirect) {
+    using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+    const auto& args = *indirect.args;
+    const auto bytes = indirect.records.size() * args.recordBytes;
+    Require(bytes != 0, "runtime SGPR fallback without records");
+    auto buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+    for (std::size_t index = 0; index < indirect.records.size(); ++index) {
+        const auto& record = indirect.records[index];
+        const auto instance = args.instanceRule == Rule::InPlace ? record.firstInstance : args.instanceConstant;
+        const auto vertex = args.vertexRule == Rule::InPlace ? (draw.indexed ? record.vertexOffset : record.firstVertexOrIndex) : args.vertexConstant;
+        const auto count = !draw.indexed ? record.count : record.firstVertexOrIndex >= draw.indexCount ? 0u : std::min(record.count, draw.indexCount - record.firstVertexOrIndex);
+        auto* destination = buffer->Bytes().data() + index * args.recordBytes;
+        if (draw.indexed) {
+            const VkDrawIndexedIndirectCommand command{count, record.instances, record.firstVertexOrIndex, static_cast<std::int32_t>(vertex), instance};
+            std::memcpy(destination, &command, sizeof(command));
+        } else {
+            const VkDrawIndirectCommand command{count, record.instances, vertex, instance};
+            std::memcpy(destination, &command, sizeof(command));
+        }
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    return buffer;
+}
+
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
 void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset, std::uint32_t firstIndex = 0) {
@@ -1359,6 +1385,18 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
     if (args == nullptr) {
         if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, draw.indexCount, draw.instanceCount, firstIndex, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
         else context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, draw.firstVertex, draw.firstInstance);
+    } else if (args->runtimeSgprs && indirect->path != IndirectDrawPath::Gpu) {
+        const auto count = static_cast<std::uint32_t>(indirect->records.size());
+        if (count <= 1 || context.multiDrawIndirect) {
+            if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect")(commands, argumentBuffer, 0, count, args->recordBytes);
+            else context.Resolved(&DeviceFunctions::cmdDrawIndirect, "vkCmdDrawIndirect")(commands, argumentBuffer, 0, count, args->recordBytes);
+        } else {
+            Require(args->runtimeSgprs->drawIndex < 0, "runtime draw index requires multi draw support");
+            for (std::uint32_t record = 0; record < count; ++record) {
+                if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect")(commands, argumentBuffer, static_cast<VkDeviceSize>(record) * args->recordBytes, 1, args->recordBytes);
+                else context.Resolved(&DeviceFunctions::cmdDrawIndirect, "vkCmdDrawIndirect")(commands, argumentBuffer, static_cast<VkDeviceSize>(record) * args->recordBytes, 1, args->recordBytes);
+            }
+        }
     } else if (indirect->path == IndirectDrawPath::Gpu) {
         if (args->countIndirect) {
             if (draw.indexed) context.Function<PFN_vkCmdDrawIndexedIndirectCountKHR>("vkCmdDrawIndexedIndirectCountKHR")(commands, argumentBuffer, argumentOffset, indirect->countImport->buffer, args->countAddress - indirect->countImport->base, args->count, args->stride);
@@ -1761,7 +1799,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory, inputs.inPlaceReads};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || (args != nullptr && args->runtimeSgprs), fenced, passAccess);
     resources.BeginGpuWrites(*recorder);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -1786,6 +1824,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
     std::unique_ptr<DeviceBuffer> scratch;
+    std::shared_ptr<Buffer> runtimeArguments;
     std::shared_ptr<Buffer> meshArguments;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
     VkDeviceSize argumentOffset = 0;
@@ -1809,6 +1848,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             argumentBuffer = meshArguments->Handle();
         } else if (gpuIndirect) {
             rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
+        } else if (args != nullptr && args->runtimeSgprs) {
+            runtimeArguments = runtimeFallbackArguments(context, commands, draw, *record.indirect);
+            argumentBuffer = runtimeArguments->Handle();
+            countBarrier(1);
         }
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
@@ -1840,8 +1883,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
+    if (runtimeArguments != nullptr) recorder->Keep(runtimeArguments);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
-    if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
+    if (args != nullptr) CountIndirectDraw(gpuIndirect && args->runtimeSgprs ? IndirectDrawPath::RuntimeSgpr : record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
     std::function<void(VkCommandBuffer)> storeProxies;
@@ -2389,6 +2433,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         countBarrier();
     }
     APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
+    std::shared_ptr<Buffer> runtimeArguments;
     std::shared_ptr<Buffer> meshArguments;
     if (state.stages.mesh && args != nullptr) {
         meshArguments = recordMeshArguments(context, commands, recorder, recorded, state, draw, indirect, countBarrier, inputs.restartTable);
@@ -2397,6 +2442,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     } else if (gpuIndirect) {
         rewritten = recordIndirectArguments(context, commands, recorder, recorded, indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
+    } else if (args != nullptr && args->runtimeSgprs) {
+        runtimeArguments = runtimeFallbackArguments(context, commands, draw, indirect);
+        argumentBuffer = runtimeArguments->Handle();
+        countBarrier(1);
     }
     for (auto& binding : targets) {
         if (binding.proxied) {
@@ -2444,8 +2493,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
     }
+    if (runtimeArguments != nullptr && recorded) recorder->Keep(runtimeArguments);
     if (meshArguments != nullptr && recorded) recorder->Keep(meshArguments);
-    if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, rewritten);
+    if (args != nullptr) CountIndirectDraw(gpuIndirect && args->runtimeSgprs ? IndirectDrawPath::RuntimeSgpr : indirect.path, indirect.readMs, rewritten);
     auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
     if (recorded) recorder->EndPassSamples();

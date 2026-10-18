@@ -11,6 +11,7 @@
 #include "Translation/EmbeddedVertexFetch.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -220,7 +221,7 @@ alignas(256) constexpr std::array<std::uint32_t, 5> PixelCode{0x7e0002f2u, 0x7e0
 constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 32;
 alignas(256) std::array<std::byte, Width * Height * 4> Pixels{};
-alignas(256) std::array<std::uint32_t, 4 * Slots> Output{};
+alignas(256) std::array<std::uint32_t, 8 * Slots> Output{};
 alignas(256) std::array<std::uint32_t, 2048> VertexSlots{};
 alignas(256) std::array<std::uint32_t, 60000> InstanceSlots{};
 alignas(256) std::array<std::uint32_t, 8> BufferTable{};
@@ -291,7 +292,7 @@ public:
         return userData;
     }
 
-    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, bool expectOffsets = true) const {
+    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, bool expectOffsets = true, std::optional<ShaderRecompiler::IndirectSgprPatch> patch = std::nullopt) const {
         ShaderRecompiler::ShaderVertexStageInfo info{};
         info.resourcesNum = 2;
         info.resources[0].fields = {BufferTable[0], BufferTable[1], BufferTable[2], BufferTable[3]};
@@ -312,6 +313,7 @@ public:
             {0, 0, 0, 64}
         };
         request.useCache = false;
+        request.indirectSgprs = patch;
         auto result = ShaderRecompiler::Recompile(request);
         Require(result.vertexOffsetSgpr == (expectOffsets ? static_cast<std::int32_t>(BaseVertexSgpr) : -1) && result.instanceOffsetSgpr == (expectOffsets ? static_cast<std::int32_t>(StartInstanceSgpr) : -1), "the fetch adds of s16 and s17 did not follow the fold switch (vertex " + std::to_string(result.vertexOffsetSgpr) + ", instance " + std::to_string(result.instanceOffsetSgpr) + ")");
         return result;
@@ -334,7 +336,7 @@ public:
         return state;
     }
 
-    void Draw(const ShaderRecompiler::RecompileResult& vertex, const AgcDriver::Pm4::DrawParameters& draw) {
+    void Draw(const ShaderRecompiler::RecompileResult& vertex, const AgcDriver::Pm4::DrawParameters& draw, bool clear = true) {
         const auto vertexPush = static_cast<std::uint32_t>(vertex.pushConstants.size());
         ShaderRecompiler::ShaderPixelStageInfo pixelInfo{};
         pixelInfo.wave32 = true;
@@ -344,16 +346,15 @@ public:
         pixelRequest.useCache = false;
         const auto pixel = ShaderRecompiler::Recompile(pixelRequest);
         const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderStage::Vertex, &vertex, 0u}, {ShaderStage::Fragment, &pixel, PixelPushOffset(vertexPush, device->Target())}}};
-        std::fill(output.begin(), output.end(), Unwritten);
+        if (clear) std::fill(output.begin(), output.end(), Unwritten);
         device->Draw(State(), draw, shaders);
         if (!writableSync) device->WaitIdle();
     }
 
-    void Place(std::uint32_t firstVertexFetch, std::span<const std::uint32_t> fetchedVertices, std::uint32_t firstInstanceFetch) {
-        VertexSlots.fill(Unwritten);
-        InstanceSlots.fill(Unwritten);
+    void Place(std::uint32_t firstVertexFetch, std::span<const std::uint32_t> fetchedVertices, std::uint32_t firstInstanceFetch, std::uint32_t record = 0) {
+        if (record == 0) { VertexSlots.fill(Unwritten); InstanceSlots.fill(Unwritten); }
         for (std::uint32_t vertex = 0; vertex < fetchedVertices.size(); ++vertex) VertexSlots[firstVertexFetch + fetchedVertices[vertex]] = vertex;
-        for (std::uint32_t instance = 0; instance < Instances; ++instance) InstanceSlots[firstInstanceFetch + instance] = instance * Vertices;
+        for (std::uint32_t instance = 0; instance < Instances; ++instance) InstanceSlots[firstInstanceFetch + instance] = record * Slots + instance * Vertices;
     }
 
     std::string Check(const std::string& what, std::span<const std::uint32_t> rawVertices, std::uint32_t baseVertex, std::uint32_t startInstance, bool checkRaw) const {
@@ -377,6 +378,8 @@ public:
     std::uint32_t* Records() const {
         return records;
     }
+
+    std::vector<std::uint32_t> Readback() const { return {output.begin(), output.end()}; }
 
     std::uint64_t OutputAddress() const { return reinterpret_cast<std::uintptr_t>(output.data()); }
 
@@ -770,6 +773,84 @@ void FoldReasons(Fixture& fixture) {
     Require(IndirectFoldReasonCounters().packets == 0, "reported fold window did not reset");
 }
 
+std::atomic<unsigned> RuntimeRecordReads{0};
+std::uint64_t RuntimeArguments = 0;
+void ObserveRuntimeArguments(std::uint64_t address, std::size_t) {
+    if (AgcDriver::GuestMemory::CurrentReadSite() == AgcDriver::GuestMemory::ReadSite::IndirectArguments && address >= RuntimeArguments && address < RuntimeArguments + 64) ++RuntimeRecordReads;
+}
+
+std::string RuntimeSgprs(Fixture& fixture) {
+    const auto support = fixture.device->DrawIndirectSupport();
+    if (!support.firstInstance || !support.parameters || !support.multi) return {};
+    Require(ShaderRecompiler::IndirectSgprRuntime(), "runtime fixture requires the runtime switch");
+    auto stale = fixture.UserData(81, 98);
+    stale.resize(11);
+    stale[10] = 123;
+    alignas(256) auto drawIndexCode = VertexCode;
+    drawIndexCode[0] = 0x7e020212u;
+    alignas(256) const std::array<std::uint16_t, 3> signedIndices{5, 3, 4};
+    const std::array<std::uint32_t, 3> autoIndices{0, 1, 2};
+    const std::array<std::uint32_t, 3> indexedIndices{5, 3, 4};
+    for (const bool indexed : {false, true}) {
+        for (const bool missingBase : {false, true}) for (const bool drawIndex : {false, true}) {
+            const auto code = drawIndex ? std::span<const std::uint32_t>(drawIndexCode) : std::span<const std::uint32_t>(VertexCode);
+            const std::array<std::uint32_t, 2> bases{indexed && !missingBase ? 0xfffffffdu : 300u, 700u};
+            const std::array<std::uint32_t, 2> instances{7, 40};
+            const std::uint32_t ge = !indexed && missingBase ? 5u : 0u;
+            const ShaderRecompiler::IndirectSgprPatch patch{missingBase ? -1 : static_cast<std::int32_t>(BaseVertexSgpr), static_cast<std::int32_t>(StartInstanceSgpr), drawIndex ? 18 : -1, ge, indexed};
+            const auto vertex = fixture.Vertex(code, stale, true, patch);
+            Require(vertex.indirectSgprs == patch, "runtime reflection lost its patch map");
+            for (std::size_t record = 0; record < 2; ++record) {
+                const auto first = (missingBase ? stale[BaseVertexSgpr - 8u] : bases[record]) + ge;
+                fixture.Place(first, indexed ? std::span<const std::uint32_t>(indexedIndices) : std::span<const std::uint32_t>(autoIndices), instances[record], static_cast<std::uint32_t>(record));
+            }
+            for (std::size_t record = 0; record < 2; ++record) {
+                auto data = fixture.UserData(missingBase ? stale[BaseVertexSgpr - 8u] : bases[record], instances[record]);
+                data.resize(11);
+                data[10] = static_cast<std::uint32_t>(record);
+                const auto cpu = fixture.Vertex(code, data);
+                AgcDriver::Pm4::DrawParameters direct{indexed ? reinterpret_cast<std::uintptr_t>(signedIndices.data()) : 0u, Vertices, indexed ? 2u : 0u, Instances, 0, indexed, ge, 0};
+                fixture.Draw(cpu, FoldedDraw(cpu, data, direct), record == 0);
+            }
+            const auto expected = fixture.Readback();
+            const auto pixels = Pixels;
+            auto* records = fixture.Records();
+            for (std::uint32_t record = 0; record < 2; ++record) {
+                if (indexed) {
+                    const std::array<std::uint32_t, 5> words{Vertices, Instances, 0, bases[record], instances[record]};
+                    std::copy(words.begin(), words.end(), records + record * 5u);
+                } else {
+                    const std::array<std::uint32_t, 4> words{Vertices, Instances, bases[record], instances[record]};
+                    std::copy(words.begin(), words.end(), records + record * 4u);
+                }
+            }
+            AgcDriver::Pm4::DrawParameters draw{indexed ? reinterpret_cast<std::uintptr_t>(signedIndices.data()) : 0u, indexed ? 3u : 0u, indexed ? 2u : 0u, 0, 0, indexed, 0, 0};
+            draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(records), indexed ? 0x38u : 0x2cu, indexed ? 20u : 16u, indexed ? 20u : 16u, 2, false, 0, missingBase ? NoLocation : 0x10u, 0x11, drawIndex ? 0x12u : NoLocation, drawIndex, ge};
+            draw.indirect->baseVertexSgpr = patch.baseVertex;
+            draw.indirect->startInstanceSgpr = patch.firstInstance;
+            draw.indirect->drawIndexSgpr = patch.drawIndex;
+            draw.indirect->runtimeSgprs = patch;
+            Require(!AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(), Program(stale, VertexCode), fixture.device, draw, false), "shared runtime SGPRs fell back");
+            RuntimeArguments = reinterpret_cast<std::uintptr_t>(records);
+            RuntimeRecordReads = 0;
+            AgcDriver::GuestMemory::SetReadGuard(ObserveRuntimeArguments);
+            fixture.Draw(vertex, draw);
+            AgcDriver::GuestMemory::SetReadGuard(nullptr);
+            Require(RuntimeRecordReads == (std::getenv("APS5_NO_GPU_INDIRECT_DRAW") != nullptr ? 2u : 0u), "runtime SGPR GPU path read argument records on the CPU");
+            Require(fixture.Readback() == expected && Pixels == pixels, "runtime SGPR multi-draw differs from CPU expansion");
+            auto countDraw = draw;
+            records[32] = 99;
+            countDraw.indirect->countAddress = reinterpret_cast<std::uintptr_t>(records + 32);
+            countDraw.indirect->countIndirect = true;
+            if (support.count) {
+                fixture.Draw(vertex, countDraw);
+                Require(fixture.Readback() == expected, "runtime indirect count did not clamp to the packet maximum");
+            }
+        }
+    }
+    return {};
+}
+
 std::string WritableSync(Fixture& fixture) {
 #ifdef _WIN32
     using namespace AgcDriver::Graphics;
@@ -814,6 +895,7 @@ std::string WritableSync(Fixture& fixture) {
 
 int main(int argc, char** argv) {
     try {
+        const bool runtime = argc == 2 && std::strcmp(argv[1], "--runtime-sgprs") == 0;
         const bool writableSync = argc == 2 && std::strcmp(argv[1], "--vram-writable-sync") == 0;
 #ifndef _WIN32
         if (writableSync) return VulkanTestSkipped;
@@ -823,7 +905,7 @@ int main(int argc, char** argv) {
         Fixture fixture(device, writableSync);
         const bool foldReasons = argc == 2 && std::strcmp(argv[1], "--indirect-fold-reasons") == 0;
         if (foldReasons) FoldReasons(fixture);
-        const auto failures = foldReasons ? std::string{} : writableSync ? WritableSync(fixture) : Run(fixture) + ExtendedFold(fixture);
+        const auto failures = foldReasons ? std::string{} : writableSync ? WritableSync(fixture) : runtime && ShaderRecompiler::IndirectSgprRuntime() ? RuntimeSgprs(fixture) : Run(fixture) + ExtendedFold(fixture);
         if (!failures.empty()) {
             std::cerr << "vertex and instance indices differ from the guest's:\n" << failures;
             return 1;

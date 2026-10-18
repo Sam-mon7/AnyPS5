@@ -54,6 +54,7 @@ public:
         append(key, request.context.floatMode);
         appendMesh(key, request);
         appendTessellation(key, request);
+        appendIndirectSgprs(key, request);
         std::uint64_t hash = 0xcbf29ce484222325ull;
         for (const auto value : key) {
             hash ^= value;
@@ -86,10 +87,17 @@ private:
         append(key, request.context.floatMode);
         appendMesh(key, request);
         appendTessellation(key, request);
+        appendIndirectSgprs(key, request);
         append(key, request.target);
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
         append(key, RayTracingMiss());
+    }
+
+    static void appendIndirectSgprs(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
+        if (!IndirectSgprRuntime() || !request.indirectSgprs) return;
+        const auto& patch = *request.indirectSgprs;
+        for (const auto value : {std::uint64_t{0x53475052554e0001ull}, static_cast<std::uint64_t>(patch.baseVertex), static_cast<std::uint64_t>(patch.firstInstance), static_cast<std::uint64_t>(patch.drawIndex), static_cast<std::uint64_t>(patch.indxOffset), static_cast<std::uint64_t>(patch.indexed)}) append(key, value);
     }
 
     static void appendMesh(std::vector<std::uint64_t>& key, const RecompileRequest& request) {

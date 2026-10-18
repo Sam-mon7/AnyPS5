@@ -154,7 +154,7 @@ AgcDriver::DriverDetail::DrawProgram Program(const std::vector<std::uint32_t>& u
     return program;
 }
 
-ShaderRecompiler::RecompileResult Vertex(const std::shared_ptr<AgcDriver::VulkanDevice>& device, const std::vector<std::uint32_t>& userData, std::span<const std::uint32_t> code = VertexCode, bool eligible = true) {
+ShaderRecompiler::RecompileResult Vertex(const std::shared_ptr<AgcDriver::VulkanDevice>& device, const std::vector<std::uint32_t>& userData, std::span<const std::uint32_t> code = VertexCode, bool eligible = true, bool runtime = false) {
     ShaderRecompiler::ShaderVertexStageInfo info{};
     const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
         {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
@@ -166,6 +166,7 @@ ShaderRecompiler::RecompileResult Vertex(const std::shared_ptr<AgcDriver::Vulkan
         device->Target(), {0, 0, 0, 64}
     };
     request.useCache = false;
+    if (runtime) request.indirectSgprs = ShaderRecompiler::IndirectSgprPatch{-1, 10, -1, 0, false};
     auto result = ShaderRecompiler::Recompile(request);
     Require(result.instanceOffsetSgpr == (Enabled() && eligible ? 10 : -1) && result.vertexOffsetSgpr == -1 && !result.instanceOffsetShared, "recompiled ordinary vertex shader has incorrect offset metadata");
     return result;
@@ -245,6 +246,13 @@ void Run(const std::shared_ptr<AgcDriver::VulkanDevice>& device) {
             Require(indirect.indirect->vertexRule == Rule::Constant && indirect.indirect->instanceRule == Rule::InPlace, "different-destination offset rules are incorrect");
             Draw(device, vertex, indirect);
         }
+    }
+    if (ShaderRecompiler::IndirectSgprRuntime() && Enabled() && device->DrawIndirectSupport().parameters && device->DrawIndirectSupport().firstInstance) {
+        const auto runtime = Vertex(device, stale, VertexCode, true, true);
+        indirect.indirect->runtimeSgprs = runtime.indirectSgprs;
+        Require(runtime.indirectSgprs.has_value(), "ordinary instance runtime variant was not compiled");
+        Require(!AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(runtime, State(), Program(stale), device, indirect, false), "ordinary runtime instance offset did not classify GPU-side");
+        Draw(device, runtime, indirect);
     }
     {
         GuestAllocations::Mutation mutation;

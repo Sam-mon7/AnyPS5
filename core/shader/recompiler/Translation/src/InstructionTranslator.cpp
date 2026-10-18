@@ -176,6 +176,10 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         return entryIr.Emit(IrOpcode::GetBuiltin, IrOpcodeType(IrOpcode::GetBuiltin), {&entryIr.Constant(static_cast<std::uint32_t>(kind)), &entryIr.Constant(component)});
     };
     const auto drawIndex = [&entryIr, &options, &builtin](StageInputKind kind) -> IrValue& {
+        if (options.indirectSgprs != nullptr) {
+            auto& raw = entryIr.ISub(builtin(kind), builtin(kind == StageInputKind::VertexIndex ? StageInputKind::BaseVertex : StageInputKind::BaseInstance));
+            return kind == StageInputKind::VertexIndex && !options.indirectSgprs->indexed ? entryIr.IAdd(raw, entryIr.Constant(options.indirectSgprs->indxOffset)) : raw;
+        }
         const auto* fetch = options.embeddedFetch;
         const std::int32_t folded = fetch == nullptr ? -1 : kind == StageInputKind::VertexIndex ? fetch->vertexOffsetSgpr : fetch->instanceOffsetAddPc.has_value() ? -1 : fetch->instanceOffsetSgpr;
         IrValue& index = builtin(kind);
@@ -187,7 +191,9 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
 
     for (std::uint32_t index = 0; index < options.userDataCount; index++) {
         const auto reg = static_cast<ScalarReg>(options.userDataBaseRegister + index);
-        IrValue& value = entryIr.GetUserData(reg);
+        const auto* patch = options.indirectSgprs;
+        const auto sgpr = static_cast<std::int32_t>(options.userDataBaseRegister + index);
+        IrValue& value = patch != nullptr && sgpr == patch->baseVertex ? builtin(StageInputKind::BaseVertex) : patch != nullptr && sgpr == patch->firstInstance ? builtin(StageInputKind::BaseInstance) : patch != nullptr && sgpr == patch->drawIndex ? builtin(StageInputKind::DrawIndex) : entryIr.GetUserData(reg);
         entryIr.SetScalarReg(reg, value);
         entryIr.SetScalarMaskTag(reg, entryIr.ConstantBool(false));
     }
@@ -531,7 +537,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
                 continue;
             }
             if (options.embeddedFetch != nullptr) {
-                if (options.embeddedFetch->instanceOffsetAddPc == instruction.programCounter) {
+                if (options.indirectSgprs == nullptr && options.embeddedFetch->instanceOffsetAddPc == instruction.programCounter) {
                     context.TranslateInstanceOffset(instruction);
                     continue;
                 }

@@ -182,6 +182,46 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
 }
 
 IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation) {
+    if (IndirectSgprRuntime() && request.indirectSgprs) {
+        const auto& patch = *request.indirectSgprs;
+        const auto reject = [](IndirectSgprFailure reason) { throw IndirectSgprUnsupported(reason); };
+        if (request.shader.stage != ShaderStage::Vertex || request.context.userDataBaseRegister != 8u || !request.context.vertex || (request.graphics && (request.graphics->mesh || request.graphics->tessellation))) reject(IndirectSgprFailure::Stage);
+        if (std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) == request.target.supportedCapabilities.end()) reject(IndirectSgprFailure::Feature);
+        const auto dynamic = [&](std::uint32_t reg) { return static_cast<std::int32_t>(reg) == patch.baseVertex || static_cast<std::int32_t>(reg) == patch.firstInstance || static_cast<std::int32_t>(reg) == patch.drawIndex; };
+        for (const auto reg : {patch.baseVertex, patch.firstInstance, patch.drawIndex}) {
+            if (reg >= 0 && (static_cast<std::uint32_t>(reg) < request.context.userDataBaseRegister || static_cast<std::uint32_t>(reg) - request.context.userDataBaseRegister >= request.context.userData.size())) reject(IndirectSgprFailure::Stage);
+        }
+        if ((patch.baseVertex >= 0 && patch.baseVertex == patch.firstInstance) || (patch.drawIndex >= 0 && (patch.drawIndex == patch.baseVertex || patch.drawIndex == patch.firstInstance))) reject(IndirectSgprFailure::OriginalArgument);
+        const auto& vertex = *request.context.vertex;
+        if (vertex.resourcesNum != 0) {
+            if (!vertex.fetchEmbedded) reject(IndirectSgprFailure::ResourceDependency);
+            for (const auto reg : {vertex.fetchAttribReg + 8u, vertex.fetchAttribReg + 9u, vertex.fetchBufferReg + 8u, vertex.fetchBufferReg + 9u}) {
+                if (dynamic(reg)) reject(IndirectSgprFailure::ResourceDependency);
+            }
+        }
+        auto legacy = request;
+        legacy.indirectSgprs.reset();
+        const auto plan = GetResourcePlan(legacy);
+        if (!plan->resourceTrackingComplete || !plan->srtPlanComplete || plan->requiresSpecializationMemory) reject(IndirectSgprFailure::ResourceDependency);
+        std::vector<const IrValue*> pending;
+        for (const auto& source : plan->descriptorSources) for (std::uint32_t i = 0; i < source.dwordCount; ++i) pending.push_back(source.dwords.at(i));
+        for (const auto& read : plan->srtReads) pending.push_back(read.value);
+        for (const auto& block : plan->controlFlow) if (block.condition != nullptr) pending.push_back(block.condition);
+        for (const auto* value : plan->uniformFill.values) if (value != nullptr) pending.push_back(value);
+        std::set<const IrValue*> visited;
+        while (!pending.empty()) {
+            const auto* value = pending.back();
+            pending.pop_back();
+            if (value == nullptr) reject(IndirectSgprFailure::ResourceDependency);
+            value = value->Resolve();
+            if (!visited.insert(value).second) continue;
+            if (value->Opcode() == IrOpcode::GetUserData && (value->ArgumentCount() != 1 || dynamic(value->Argument(0)->Register().index))) reject(IndirectSgprFailure::ResourceDependency);
+            for (const auto* argument : value->Arguments()) pending.push_back(argument);
+        }
+        if (plan->info.vertexOffsetConflict || plan->info.instanceOffsetConflict) reject(IndirectSgprFailure::Fetch);
+        if ((plan->info.vertexOffsetSgpr >= 0 && dynamic(static_cast<std::uint32_t>(plan->info.vertexOffsetSgpr)) && plan->info.vertexOffsetSgpr != patch.baseVertex) || (plan->info.instanceOffsetSgpr >= 0 && dynamic(static_cast<std::uint32_t>(plan->info.instanceOffsetSgpr)) && plan->info.instanceOffsetSgpr != patch.firstInstance)) reject(IndirectSgprFailure::OriginalArgument);
+        if ((patch.baseVertex >= 0 && patch.baseVertex != plan->info.vertexOffsetSgpr) || (patch.firstInstance >= 0 && patch.firstInstance != plan->info.instanceOffsetSgpr) || (!patch.indexed && patch.baseVertex >= 0 && patch.indxOffset != 0)) reject(IndirectSgprFailure::OriginalArgument);
+    }
     frontEndBuilds.fetch_add(1, std::memory_order_relaxed);
     ShaderPreparationContext local;
     const auto frontend = (preparation != nullptr ? *preparation : local).AcquireFrontend(request);
@@ -203,6 +243,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.inputInfo = inputInfo;
+    if (IndirectSgprRuntime() && request.indirectSgprs) translateOptions.indirectSgprs = &*request.indirectSgprs;
 
     constexpr InstructionTranslator translator;
 
@@ -765,6 +806,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         result.spirv = spirvEmitter.Emit(program, emitInputInfo, bindings, targetOptions);
     }
     result.registrationModule = registration;
+    if (IndirectSgprRuntime()) result.indirectSgprs = request.indirectSgprs;
     result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
     if (stencilReplay) {
         result.stencilReferences = StencilReferenceValues(program);
@@ -1152,6 +1194,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .stencilReferenceDword = artifact.stencilReferenceDword,
         .variantId = artifact.variantId
     };
+    result.indirectSgprs = artifact.indirectSgprs;
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
@@ -1576,6 +1619,8 @@ template <typename Impl>
 auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltype(impl()) {
     try {
         return impl();
+    } catch (const IndirectSgprUnsupported&) {
+        throw;
     } catch (const std::exception& e) {
         constexpr auto requestSerializer = RequestSerializer{};
         const auto inputInfo = "\nRecompileRequest:\n" + requestSerializer.Serialize(request);

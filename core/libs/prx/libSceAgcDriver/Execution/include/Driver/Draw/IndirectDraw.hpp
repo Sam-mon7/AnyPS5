@@ -16,7 +16,8 @@ namespace AgcDriver::DriverDetail {
 enum class IndirectFoldReason : std::size_t {
     VertexMissing, VertexDifferent, VertexShared, InstanceMissing, InstanceDifferent, InstanceShared,
     NonVertex, RectList, DrawIndex, CountUnsupported, MultiCountUnsupported, VertexConflict, InstanceConflict,
-    IndxOffset, FirstInstanceUnsupported, ConstantRecordLimit, VertexRange, MultiplePatched, Count
+    IndxOffset, FirstInstanceUnsupported, ConstantRecordLimit, VertexRange, MultiplePatched,
+    RuntimeFeature, RuntimeStage, RuntimeOriginalArgument, RuntimeResource, RuntimeFetch, Count
 };
 
 struct IndirectFoldDimension {

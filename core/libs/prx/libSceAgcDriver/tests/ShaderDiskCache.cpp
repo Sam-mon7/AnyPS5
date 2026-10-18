@@ -2135,6 +2135,90 @@ void verifyHitVerification(const char* self) {
     require(std::vector<std::uint32_t>(words.begin(), words.end()) != damaged, "the damaged entry is still stored");
 }
 
+int runtimeSgprCache(const char* self) {
+    constexpr std::uint64_t baseline = 0x29e5f633bdc9df6dull;
+    const bool active = IndirectSgprRuntime();
+    require(ShaderDiskCache::OutputVersion() == (active ? IndirectSgprVersion(baseline) : baseline), "runtime SGPR output version violated the legacy version contract");
+    require(IndirectSgprVersion(baseline) != baseline, "runtime SGPR version aliases the legacy version");
+    const auto directory = std::filesystem::temp_directory_path() / ("aps5-runtime-sgpr-" + std::to_string(std::random_device{}()));
+    setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
+    setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
+    require(ShaderDiskCache::SourceVersion() == ShaderDiskCache::OutputVersion(), "runtime cache test requires output keys");
+    require(ShaderDiskCache::EntryDirectory().filename() == hexVersion(ShaderDiskCache::OutputVersion()), "runtime modules occupy the wrong version directory");
+    require((ShaderDiskCache::EntryDirectory().filename() != hexVersion(baseline)) == active, "runtime and legacy modules share a directory");
+    SampleRequest sample;
+    auto& request = sample.request;
+    const std::array<std::uint32_t, 8> code{0x7e000208u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf80008cfu, 0x03020100u, 0xbf810000u, 0xbf810000u};
+    const std::array<std::uint32_t, 3> capabilities{1, 61, 4427};
+    request.shader = {ShaderStage::Vertex, 0x20000, code, 0, {}};
+    request.context = {32, 8, sample.userData, {}, {}, ShaderVertexStageInfo{}, {}};
+    request.target.supportedCapabilities = capabilities;
+    std::vector<std::uint64_t> legacyKey, legacyInterface;
+    RecompileCacheKey::Build(request, legacyKey);
+    RecompileCacheKey::BuildInterface(request, legacyInterface);
+    const auto legacyHash = RecompileCacheKey::ContextHash(request);
+    std::vector<std::byte> legacyDisk;
+    ShaderDiskCache::BuildKey(request, 32, legacyDisk);
+    const auto serialized = RequestSerializer{}.Serialize(request);
+    const auto legacy = PrepareShader(request);
+    request.indirectSgprs = IndirectSgprPatch{-1, -1, 8, 0, false};
+    std::vector<std::uint64_t> runtimeKey, runtimeInterface;
+    RecompileCacheKey::Build(request, runtimeKey);
+    RecompileCacheKey::BuildInterface(request, runtimeInterface);
+    require((legacyKey != runtimeKey) == active && (legacyInterface != runtimeInterface) == active && (legacyHash != RecompileCacheKey::ContextHash(request)) == active, "runtime patch maps alias a legacy source or alter a disabled key");
+    std::vector<std::byte> runtimeDisk;
+    ShaderDiskCache::BuildKey(request, 32, runtimeDisk);
+    require((legacyDisk != runtimeDisk) == active, "runtime disk key did not follow the mode");
+    const auto roundTrip = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(request));
+    require(roundTrip.request.indirectSgprs == (active ? request.indirectSgprs : std::nullopt), "runtime patch request serialization did not follow the switch");
+    require((serialized != RequestSerializer{}.Serialize(request)) == active, "disabled runtime SGPRs changed request serialization");
+    require(MatchesPreparedShader(request, *legacy) != active, "prepared shader reused the wrong entry initialization");
+    const auto runtime = PrepareShader(request);
+    require((GetPreparedArtifact(*legacy).spirv.Words() != GetPreparedArtifact(*runtime).spirv.Words()) == active, "runtime builtin compilation did not follow the switch");
+    auto result = sampleResult();
+    std::vector<std::byte> before, after;
+    ShaderDiskCache::EncodeResult(result, before);
+    result.indirectSgprs = request.indirectSgprs;
+    ShaderDiskCache::EncodeResult(result, after);
+    require((before != after) == active, "disabled runtime SGPRs changed artifact serialization");
+    RecompileResult decoded;
+    require(ShaderDiskCache::DecodeResult(after, decoded) && decoded.indirectSgprs == (active ? request.indirectSgprs : std::nullopt), "runtime reflection did not survive disk serialization");
+    if (active) {
+        auto changed = request;
+        changed.indirectSgprs->drawIndex = 9;
+        require(!MatchesPreparedShader(changed, *runtime), "different runtime maps share a prepared shader");
+        auto noFeature = request;
+        noFeature.target.supportedCapabilities = std::span(capabilities).first(2);
+        try { static_cast<void>(PrepareShader(noFeature)); require(false, "runtime mode ignored missing shaderDrawParameters"); }
+        catch (const IndirectSgprUnsupported& failure) { require(failure.reason == IndirectSgprFailure::Feature, "wrong missing-feature fallback reason"); }
+        auto resource = request;
+        const std::array<std::uint32_t, 4> memoryCode{0xe0700000u, 0x80020000u, 0xbf810000u, 0xbf810000u};
+        resource.shader.code = memoryCode;
+        try { static_cast<void>(PrepareShader(resource)); require(false, "runtime SGPR reached a CPU descriptor"); }
+        catch (const IndirectSgprUnsupported& failure) { require(failure.reason == IndirectSgprFailure::ResourceDependency, "wrong descriptor dependency fallback reason"); }
+    }
+    const auto* originalRuntime = std::getenv("APS5_INDIRECT_SGPR_RUNTIME");
+    const auto savedRuntime = originalRuntime != nullptr ? std::optional<std::string>(originalRuntime) : std::nullopt;
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "runtime-switch-keys.bin";
+    unsetEnvironment("APS5_INDIRECT_SGPR_RUNTIME");
+    const auto absent = childStageKeys(self, path, nullptr, "1");
+    setEnvironment("APS5_INDIRECT_SGPR_RUNTIME", "0");
+    require(childStageKeys(self, path, nullptr, "1") == absent, "explicit runtime SGPR zero changed legacy disk keys");
+    setEnvironment("APS5_INDIRECT_SGPR_RUNTIME", "false");
+    require(childStageKeys(self, path, nullptr, "1") == absent, "a non-exact runtime switch enabled a new cache key");
+    setEnvironment("APS5_INDIRECT_SGPR_RUNTIME", "1");
+    require(childStageKeys(self, path, nullptr, "1") != absent, "runtime modules reused legacy disk keys");
+    if (savedRuntime) setEnvironment("APS5_INDIRECT_SGPR_RUNTIME", *savedRuntime);
+    else unsetEnvironment("APS5_INDIRECT_SGPR_RUNTIME");
+    ShaderDiskCache::Flush();
+    std::error_code error;
+    std::filesystem::remove_all(directory, error);
+    require(!error, "cannot remove runtime SGPR test cache");
+    std::cout << "runtime SGPR cache contract passed (" << (active ? "on" : "off") << ")\n";
+    return 0;
+}
+
 void verifyDefaultDirectory(const char* self) {
     setEnvironment("ANYPS5_SHADER_CACHE_DIR", "");
     setEnvironment("ANYPS5_NO_SHADER_CACHE", "1");
@@ -2150,6 +2234,7 @@ void verifyDefaultDirectory(const char* self) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--runtime-sgpr-cache") return runtimeSgprCache(argv[0]);
         if (argc == 2 && std::string_view(argv[1]) == "--specialized-suite") return verifySpecializedAcrossProcesses(argv[0]);
         if (argc == 2 && std::string_view(argv[1]).starts_with("--specialized-")) return runSpecializedProcess(argv[1]);
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();

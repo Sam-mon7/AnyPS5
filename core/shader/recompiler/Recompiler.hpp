@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
 #include "RuntimeAbi.hpp"
+#include "IndirectSgpr.hpp"
 #include "PipelineSpecialization.hpp"
 #include <array>
 #include <cstddef>
@@ -335,6 +336,7 @@ struct RecompileRequest {
     BindingLayout layout;
     std::optional<GraphicsCompileContext> graphics;
     bool useCache = true;
+    std::optional<IndirectSgprPatch> indirectSgprs;
 };
 
 enum class DescriptorKind {
@@ -524,6 +526,7 @@ struct CompiledShaderArtifact {
     bool stencilReplaySafe = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
     std::uint64_t variantId = 0;
+    std::optional<IndirectSgprPatch> indirectSgprs;
 };
 
 struct ShaderInvocation {

@@ -99,7 +99,20 @@ std::optional<Graphics::IndirectDrawPath> Driver::classifyIndirectDraw(const Sha
             if (graphics.rectList) diagnostic->reasons |= std::uint64_t{1} << static_cast<std::size_t>(Reason::RectList);
         }
     }
-    if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) fail(Path::DrawIndex, Reason::DrawIndex);
+    const bool runtime = ShaderRecompiler::IndirectSgprRuntime() && result.indirectSgprs && indirect.runtimeSgprs == result.indirectSgprs;
+    if (ShaderRecompiler::IndirectSgprRuntime() && !runtime) {
+        using Failure = ShaderRecompiler::IndirectSgprFailure;
+        switch (indirect.runtimeFailure) {
+        case Failure::None: break;
+        case Failure::Feature: fail(Path::RuntimeFeature, Reason::RuntimeFeature); break;
+        case Failure::Stage: fail(Path::RuntimeStage, Reason::RuntimeStage); break;
+        case Failure::OriginalArgument: fail(Path::RuntimeOriginalArgument, Reason::RuntimeOriginalArgument); break;
+        case Failure::ResourceDependency: fail(Path::RuntimeResource, Reason::RuntimeResource); break;
+        case Failure::Fetch: fail(Path::RuntimeFetch, Reason::RuntimeFetch); break;
+        }
+    }
+    if (runtime && (!support.parameters || (result.indirectSgprs->drawIndex >= 0 && indirect.count > 1 && !support.multi))) fail(Path::RuntimeFeature, Reason::RuntimeFeature);
+    if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0 && !runtime) fail(Path::DrawIndex, Reason::DrawIndex);
     if (indirect.countIndirect && !support.count) fail(Path::FeatureGap, Reason::CountUnsupported);
     if (indirect.countIndirect && indirect.count > 1 && !support.multi) fail(Path::FeatureGap, Reason::MultiCountUnsupported);
     const auto dimension = [&](std::int32_t k, std::int32_t p, bool shared, bool conflict, std::uint32_t x, Rule& rule, std::uint32_t& constant, std::size_t index) {
@@ -109,7 +122,7 @@ std::optional<Graphics::IndirectDrawPath> Driver::classifyIndirectDraw(const Sha
             require(offset <= std::numeric_limits<std::uint32_t>::max() - x, "draw vertex offset overflow");
             constant = x + offset;
         } else if (conflict) fail(Path::FetchUnknown, index == 0 ? Reason::VertexConflict : Reason::InstanceConflict);
-        else if (k != p || shared) {
+        else if (k != p || (shared && !runtime)) {
             const auto reason = static_cast<Reason>(index * 3 + (k < 0 ? 0 : k != p ? 1 : 2));
             fail(Path::NotFolded, reason);
             if constexpr (Diagnose) {
@@ -217,7 +230,8 @@ const char* IndirectFoldReasonName(IndirectFoldReason reason) {
     static constexpr std::array names{
         "vertex.missing", "vertex.different", "vertex.shared-or-index-observed", "instance.missing", "instance.different", "instance.shared-or-index-observed",
         "non-vertex", "rect-list", "draw-index", "count-unsupported", "multi-count-unsupported", "vertex.conflict", "instance.conflict",
-        "indx-offset", "first-instance-unsupported", "constant-record-limit", "vertex-range", "multiple-patched-sgprs"
+        "indx-offset", "first-instance-unsupported", "constant-record-limit", "vertex-range", "multiple-patched-sgprs",
+        "runtime.feature", "runtime.stage", "runtime.original-argument", "runtime.resource", "runtime.fetch"
     };
     return names.at(static_cast<std::size_t>(reason));
 }
