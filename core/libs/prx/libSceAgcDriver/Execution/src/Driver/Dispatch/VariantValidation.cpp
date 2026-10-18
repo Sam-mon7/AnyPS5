@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordProof.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
@@ -73,6 +74,33 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     const DataMask mask{variant.dataPositions, live};
     PendingView pending;
     pending.Load();
+    auto* tracker = RecordProof::Enabled() ? PageTracker::Get() : nullptr;
+    const auto proofGate = [&] {
+        if (Graphics::StorageTexture::AnyPendingOverlaps(variant.runs) || Graphics::AnyShadowedOverlaps(variant.runs)) return RecordProofResult::Pending;
+        for (const auto& [begin, end] : variant.runs) {
+            if (end <= begin) return RecordProofResult::Ranges;
+            if (pending.Overlaps(begin, end - begin)) return RecordProofResult::Pending;
+            for (const auto& label : deferredLabels().labels) {
+                if (label.address < end && begin < label.address + label.size) return RecordProofResult::Label;
+            }
+        }
+        return RecordProofResult::Accepted;
+    };
+    if (tracker != nullptr) {
+        const auto publish = Graphics::Recorder::PublishGeneration();
+        const auto pendingSerial = Graphics::StorageTexture::PendingSerial();
+        const auto forget = GuestMemory::ForgetSerial();
+        pending.Load();
+        const auto proof = variant.recordProof.load(std::memory_order_acquire);
+        auto result = proofGate();
+        if (result == RecordProofResult::Accepted) result = RecordProof::Check(*tracker, proof.get(), variant.runs, forget);
+        if (result == RecordProofResult::Accepted && Graphics::Recorder::PublishGeneration() != publish) result = RecordProofResult::Publish;
+        if (result == RecordProofResult::Accepted && Graphics::StorageTexture::PendingSerial() != pendingSerial) result = RecordProofResult::Pending;
+        if (result == RecordProofResult::Accepted && GuestMemory::ForgetSerial() != forget) result = RecordProofResult::Forget;
+        RecordProof::Account(result);
+        if (result == RecordProofResult::Accepted) return EntryOutcome::Equal;
+        variant.recordProof.store(nullptr, std::memory_order_release);
+    }
     if (!syncPendingRuns(program, queue, *variant.compiled, regions, runsSynced, pending, sampling)) return EntryOutcome::Differing;
     auto publish = Graphics::Recorder::PublishGeneration();
     auto pendingSerial = Graphics::StorageTexture::PendingSerial();
@@ -102,11 +130,24 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     }
 
     pending.Load();
+    std::shared_ptr<const RecordProof> proof;
+    if (tracker != nullptr) {
+        for (const auto& [begin, end] : variant.runs) {
+            if (end > begin) GuestMemory::CollectWritesUncached(begin, end - begin);
+        }
+        proof = RecordProof::Capture(*tracker, variant.runs, forget);
+    }
     bool unmapped = false;
     if (!validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked ? &mask : nullptr)) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
     if (Graphics::Recorder::PublishGeneration() != publish) return EntryOutcome::PublishMoved;
     if (Graphics::StorageTexture::PendingSerial() != pendingSerial) return EntryOutcome::PendingMoved;
     if (GuestMemory::ForgetSerial() != forget) return EntryOutcome::ForgetMoved;
+    if (proof != nullptr && (!masked || live->empty())) {
+        pending.Load();
+        const bool stable = proofGate() == RecordProofResult::Accepted && RecordProof::Check(*tracker, proof.get(), variant.runs, forget) == RecordProofResult::Accepted;
+        if (stable) variant.recordProof.store(std::move(proof), std::memory_order_release);
+        RecordProof::Recorded(stable);
+    }
     return masked && !live->empty() ? EntryOutcome::EqualData : EntryOutcome::Equal;
 }
 

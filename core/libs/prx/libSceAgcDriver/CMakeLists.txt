@@ -132,6 +132,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawDecode.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawLookup.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/RecordProof.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
@@ -3077,4 +3078,44 @@ if(BUILD_TESTING)
     set_property(TEST agc_page_tracker_on PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=1")
     set_property(TEST agc_page_tracker_nonexact PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=01")
     set_property(TEST agc_page_tracker_unset APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PAGE_TRACKER=unset:")
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(agc_record_proof_tests tests/RecordProof.cpp Execution/src/Driver/Draw/RecordProof.cpp Execution/src/PageTracker.cpp)
+    target_include_directories(agc_record_proof_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_record_proof_tests PRIVATE libc)
+    configure_windows_unwind(agc_record_proof_tests)
+    foreach(recordProofMode IN ITEMS off on nonexact unset tracker_off)
+        add_test(NAME agc_record_proof_${recordProofMode} COMMAND agc_record_proof_tests)
+        set_tests_properties(agc_record_proof_${recordProofMode} PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_PAGE_TRACKER=1;APS5_EPOCH_PROOFS=0")
+        if(WIN32)
+            set_property(TEST agc_record_proof_${recordProofMode} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_property(TEST agc_record_proof_on PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=1;APS5_EPOCH_PROOFS=1")
+    set_property(TEST agc_record_proof_nonexact PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=1;APS5_EPOCH_PROOFS=01")
+    set_property(TEST agc_record_proof_unset APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_EPOCH_PROOFS=unset:")
+    set_property(TEST agc_record_proof_tracker_off PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=0;APS5_EPOCH_PROOFS=1")
+    foreach(recordProofMode IN ITEMS off on)
+        add_test(NAME agc_record_proof_draw_${recordProofMode} COMMAND agc_driver_draw_cache_reuse_tests)
+        set_tests_properties(agc_record_proof_draw_${recordProofMode} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_ENTRIES=16;APS5_PAGE_TRACKER=1;APS5_EPOCH_PROOFS=0")
+        if(recordProofMode STREQUAL "on")
+            set_property(TEST agc_record_proof_draw_${recordProofMode} PROPERTY ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_ENTRIES=16;APS5_PAGE_TRACKER=1;APS5_EPOCH_PROOFS=1")
+        endif()
+        if(WIN32)
+            set_property(TEST agc_record_proof_draw_${recordProofMode} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    foreach(recordProofMode IN ITEMS off on)
+        add_test(NAME agc_record_proof_dispatch_${recordProofMode} COMMAND agc_driver_epoch_proof_tests)
+        set_tests_properties(agc_record_proof_dispatch_${recordProofMode} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=0;APS5_PAGE_TRACKER=1;APS5_EPOCH_PROOFS=0")
+        if(recordProofMode STREQUAL "on")
+            set_property(TEST agc_record_proof_dispatch_${recordProofMode} PROPERTY ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=0;APS5_PAGE_TRACKER=1;APS5_EPOCH_PROOFS=1")
+        endif()
+        if(WIN32)
+            set_property(TEST agc_record_proof_dispatch_${recordProofMode} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
 endif()
