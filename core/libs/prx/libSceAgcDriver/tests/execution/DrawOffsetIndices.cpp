@@ -589,6 +589,187 @@ std::string ExtendedFold(Fixture& fixture) {
     return failures;
 }
 
+void FoldReasons(Fixture& fixture) {
+    using namespace AgcDriver::DriverDetail;
+    using Reason = IndirectFoldReason;
+    const bool enabled = IndirectFoldReasonsEnabled();
+    const auto userData = fixture.UserData(0, 0);
+    auto program = Program(userData, PostAddCode);
+    program.binary.codeHash = 0x100;
+    auto vertex = fixture.Vertex(PostAddCode, userData);
+    vertex.vertexAttributes.clear();
+    vertex.vertexOffsetSgpr = BaseVertexSgpr;
+    vertex.instanceOffsetSgpr = -1;
+    vertex.vertexOffsetShared = vertex.instanceOffsetShared = false;
+    vertex.vertexOffsetConflict = vertex.instanceOffsetConflict = false;
+    vertex.shaderDataUserWords = {BaseVertexSgpr - program.firstUserSgpr};
+    auto state = fixture.State();
+    AgcDriver::Pm4::DrawParameters packet{};
+    packet.indexed = true;
+    packet.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{};
+    packet.indirect->opcode = 0x25;
+    packet.indirect->count = 1;
+    packet.indirect->baseVertexSgpr = BaseVertexSgpr;
+    packet.indirect->startInstanceSgpr = -1;
+    packet.indirect->baseVertexLocation = 0x10;
+    packet.indirect->startInstanceLocation = NoLocation;
+    packet.indirect->drawIndexLocation = NoLocation;
+    const auto check = [&](const auto& result, const auto& graphics, auto draw, Path expectedPath, Reason first, std::uint8_t mask) {
+        auto probe = draw;
+        const auto plain = Driver::ClassifyIndirectDraw(result, graphics, program, fixture.device, probe, false);
+        const auto before = IndirectFoldReasonCounters().packets;
+        IndirectFoldDiagnostic diagnostic{};
+        const auto path = Driver::ClassifyIndirectDraw(result, graphics, program, fixture.device, draw, false, enabled ? &diagnostic : nullptr);
+        Require(path == expectedPath && path == plain, "fold reasons changed the fallback path");
+        Require(draw.indirect->vertexRule == probe.indirect->vertexRule && draw.indirect->instanceRule == probe.indirect->instanceRule && draw.indirect->vertexConstant == probe.indirect->vertexConstant && draw.indirect->instanceConstant == probe.indirect->instanceConstant, "fold reasons changed the offset rules");
+        Require(IndirectFoldReasonCounters().packets == before, "classifier probes counted a fallback");
+        if (enabled) {
+            Require(diagnostic.first == first && diagnostic.notFoldedMask == mask, "fold reason or simultaneous mask differs");
+            Require(diagnostic.dimensions[0].k == result.vertexOffsetSgpr && diagnostic.dimensions[1].p == draw.indirect->startInstanceSgpr, "fold diagnostic lost k/p");
+            Require(diagnostic.patched[0] == draw.indirect->baseVertexSgpr && diagnostic.userBase == program.firstUserSgpr, "fold diagnostic mixed absolute SGPRs with user words");
+        }
+        CountIndirectFold(diagnostic);
+        const auto after = IndirectFoldReasonCounters();
+        Require(after.packets == before + (enabled ? 1 : 0), "fallback packet was not counted exactly once");
+        if (enabled) Require(after.reasons[static_cast<std::size_t>(first)].first != 0, "first fold reason was not counted");
+        return diagnostic;
+    };
+    auto missing = vertex;
+    missing.vertexOffsetSgpr = -1;
+    const auto initial = check(missing, state, packet, Path::NotFolded, Reason::VertexMissing, 1);
+    check(missing, state, packet, Path::NotFolded, Reason::VertexMissing, 1);
+    for (std::uint64_t hash = 1; hash <= 9; ++hash) {
+        program.binary.codeHash = 0x100 + hash;
+        check(missing, state, packet, Path::NotFolded, Reason::VertexMissing, 1);
+    }
+    program.binary.codeHash = 0x100;
+    if (enabled) {
+        const auto bucket = IndirectFoldReasonCounters().reasons[static_cast<std::size_t>(Reason::VertexMissing)];
+        Require(bucket.packets == 11 && bucket.shaders.size() == 10 && bucket.samples.size() == 8, "distinct shaders or eight-sample bound differs");
+        Require(bucket.samples.front().dimensions[0].k == -1 && bucket.samples.front().dimensions[0].p == BaseVertexSgpr && bucket.samples.front().patched == initial.patched, "sample lost its rejected offset or patch set");
+    }
+    auto different = vertex;
+    different.vertexOffsetSgpr = StartInstanceSgpr;
+    check(different, state, packet, Path::NotFolded, Reason::VertexDifferent, 2);
+    auto shared = vertex;
+    shared.vertexOffsetShared = true;
+    check(shared, state, packet, Path::NotFolded, Reason::VertexShared, 4);
+    auto instancePacket = packet;
+    instancePacket.indirect->baseVertexSgpr = -1;
+    instancePacket.indirect->baseVertexLocation = NoLocation;
+    instancePacket.indirect->startInstanceSgpr = StartInstanceSgpr;
+    instancePacket.indirect->startInstanceLocation = 0x11;
+    check(missing, state, instancePacket, Path::NotFolded, Reason::InstanceMissing, 8);
+    auto instance = missing;
+    instance.instanceOffsetSgpr = BaseVertexSgpr;
+    check(instance, state, instancePacket, Path::NotFolded, Reason::InstanceDifferent, 16);
+    instance.instanceOffsetSgpr = StartInstanceSgpr;
+    instance.instanceOffsetShared = true;
+    check(instance, state, instancePacket, Path::NotFolded, Reason::InstanceShared, 32);
+    auto multiple = packet;
+    multiple.indirect->startInstanceSgpr = StartInstanceSgpr;
+    multiple.indirect->startInstanceLocation = 0x11;
+    auto simultaneous = missing;
+    simultaneous.vertexOffsetShared = simultaneous.instanceOffsetShared = true;
+    check(simultaneous, state, multiple, Path::NotFolded, Reason::VertexMissing, 45);
+    auto conflict = vertex;
+    conflict.vertexOffsetConflict = true;
+    check(conflict, state, packet, Path::FetchUnknown, Reason::VertexConflict, 0);
+    conflict = instance;
+    conflict.instanceOffsetConflict = true;
+    check(conflict, state, instancePacket, Path::FetchUnknown, Reason::InstanceConflict, 0);
+    auto geometry = state;
+    geometry.stages.path = AgcDriver::Graphics::ShaderPath::Geometry;
+    check(vertex, geometry, packet, Path::NonVertexPath, Reason::NonVertex, 0);
+    check(simultaneous, geometry, multiple, Path::NonVertexPath, Reason::NonVertex, 45);
+    geometry.rectList = true;
+    check(vertex, geometry, packet, Path::NonVertexPath, Reason::NonVertex, 0);
+    auto rect = state;
+    rect.rectList = true;
+    check(vertex, rect, packet, Path::NonVertexPath, Reason::RectList, 0);
+    auto drawIndex = packet;
+    drawIndex.indirect->drawIndexEnabled = true;
+    drawIndex.indirect->drawIndexLocation = 0x12;
+    drawIndex.indirect->drawIndexSgpr = 18;
+    check(vertex, state, drawIndex, Path::DrawIndex, Reason::DrawIndex, 0);
+    auto indxOffset = packet;
+    indxOffset.indexed = false;
+    indxOffset.indirect->indxOffset = 5;
+    check(vertex, state, indxOffset, Path::IndxOffset, Reason::IndxOffset, 0);
+    auto large = packet;
+    large.indirect->count = 257;
+    check(vertex, state, large, Path::FeatureGap, Reason::ConstantRecordLimit, 0);
+    auto range = vertex;
+    range.vertexAttributes.resize(1);
+    range.vertexAttributes[0].resource.fields[1] = 0;
+    range.vertexAttributes[0].resource.fields[2] = 0xffffffffu;
+    check(range, state, packet, Path::VertexRange, Reason::VertexRange, 0);
+    const auto support = fixture.device->DrawIndirectSupport();
+    if (!support.count) {
+        auto count = packet;
+        count.indirect->countIndirect = true;
+        check(vertex, state, count, Path::FeatureGap, Reason::CountUnsupported, 0);
+    }
+    if (!support.multi) {
+        auto multiCount = packet;
+        multiCount.indirect->countIndirect = true;
+        multiCount.indirect->count = 2;
+        check(vertex, state, multiCount, Path::FeatureGap, support.count ? Reason::MultiCountUnsupported : Reason::CountUnsupported, 0);
+        if (enabled) Require(IndirectFoldReasonCounters().reasons[static_cast<std::size_t>(Reason::MultiCountUnsupported)].packets != 0, "later multi-count rejection was not counted");
+    }
+    if (!support.firstInstance) {
+        instance.instanceOffsetShared = false;
+        check(instance, state, instancePacket, Path::FeatureGap, Reason::FirstInstanceUnsupported, 0);
+    }
+    const auto* foldSetting = std::getenv("APS5_INDIRECT_SGPR_FOLD");
+    const bool folded = foldSetting != nullptr && std::strcmp(foldSetting, "1") == 0;
+    auto unused = packet;
+    unused.indirect->baseVertexSgpr = 18;
+    unused.indirect->baseVertexLocation = 0x12;
+    if (folded) {
+        IndirectFoldDiagnostic diagnostic{};
+        Require(!Driver::ClassifyIndirectDraw(missing, state, program, fixture.device, unused, false, enabled ? &diagnostic : nullptr), "unused patch became a fallback");
+        if (enabled) Require(diagnostic.unusedAvailable && diagnostic.dimensions[0].patchedUnused && diagnostic.notFoldedMask == 0 && !diagnostic.dimensions[0].rejected, "unused patch acquired a fold rejection");
+    } else check(missing, state, unused, Path::NotFolded, Reason::VertexMissing, 1);
+    if (enabled) {
+        auto diagnostic = initial;
+        ShaderRecompiler::SrtUserDataUse use;
+        use.asBase = std::uint64_t{1} << (BaseVertexSgpr - program.firstUserSgpr);
+        use.asValue = use.asBase;
+        SetIndirectFoldSrt(diagnostic, 0x1234, &use);
+        auto cached = initial;
+        SetIndirectFoldSrt(cached, 0x1234, nullptr);
+        Require(cached.srtKnown && cached.srtBase == use.asBase && cached.srtValue == use.asValue, "cache hit lost its SRT patch use");
+        diagnostic.storageData = true;
+        CountIndirectFold(diagnostic);
+        const auto counters = IndirectFoldReasonCounters();
+        std::uint64_t firstTotal = 0;
+        for (const auto& reason : counters.reasons) firstTotal += reason.first;
+        Require(firstTotal == counters.packets, "first-failure reasons did not partition fallback packets");
+        const auto& bucket = counters.reasons[static_cast<std::size_t>(Reason::VertexMissing)];
+        Require(bucket.srtBase == 1 && bucket.srtValue == 1 && bucket.storage == 1 && bucket.push > 0 && bucket.forwarded > 0, "SRT/forwarded/push/storage counters differ");
+        Require(counters.notFoldedMasks[45] == 2 && counters.reasons[static_cast<std::size_t>(Reason::MultiplePatched)].packets >= 1 && counters.reasons[static_cast<std::size_t>(Reason::MultiplePatched)].first == 0, "overlapping failures or multiple-patch characteristic differs");
+        for (const auto reason : {Reason::VertexMissing, Reason::VertexDifferent, Reason::VertexShared, Reason::InstanceMissing, Reason::InstanceDifferent, Reason::InstanceShared, Reason::NonVertex, Reason::RectList, Reason::DrawIndex, Reason::VertexConflict, Reason::InstanceConflict, Reason::IndxOffset, Reason::ConstantRecordLimit, Reason::VertexRange}) Require(counters.reasons[static_cast<std::size_t>(reason)].packets != 0, "a provoked rejection was not counted");
+    }
+    const std::unique_ptr<std::FILE, decltype(&std::fclose)> log(std::tmpfile(), &std::fclose);
+    Require(log != nullptr, "cannot capture fold reasons output");
+    const auto now = std::chrono::steady_clock::now();
+    Require(!ReportIndirectFoldReasons(log.get(), now), "fold reasons reported before ten seconds");
+    Require(ReportIndirectFoldReasons(log.get(), now + std::chrono::seconds(11)) == enabled, "fold reasons reporting switch differs");
+    Require(!ReportIndirectFoldReasons(log.get(), now + std::chrono::seconds(12)), "fold reasons reported twice in ten seconds");
+    std::fflush(log.get());
+    Require((std::ftell(log.get()) > 0) == enabled, "disabled fold reasons printed output");
+    std::rewind(log.get());
+    std::string output;
+    std::array<char, 4096> buffer{};
+    while (const auto size = std::fread(buffer.data(), 1, buffer.size(), log.get())) output.append(buffer.data(), size);
+    if (enabled) {
+        Require(output.find("[indirect-fold]") != std::string::npos && output.find("reason=instance.missing") != std::string::npos && output.find("hash-or-variant=0x100 k=-1/-1 p=16/-1 patched={16,-1,-1}") != std::string::npos, "fold reason report lost counters or sample details");
+        std::fwrite(output.data(), 1, output.size(), stderr);
+    }
+    Require(IndirectFoldReasonCounters().packets == 0, "reported fold window did not reset");
+}
+
 std::string WritableSync(Fixture& fixture) {
 #ifdef _WIN32
     using namespace AgcDriver::Graphics;
@@ -640,7 +821,9 @@ int main(int argc, char** argv) {
         std::shared_ptr<AgcDriver::VulkanDevice> device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Fixture fixture(device, writableSync);
-        const auto failures = writableSync ? WritableSync(fixture) : Run(fixture) + ExtendedFold(fixture);
+        const bool foldReasons = argc == 2 && std::strcmp(argv[1], "--indirect-fold-reasons") == 0;
+        if (foldReasons) FoldReasons(fixture);
+        const auto failures = foldReasons ? std::string{} : writableSync ? WritableSync(fixture) : Run(fixture) + ExtendedFold(fixture);
         if (!failures.empty()) {
             std::cerr << "vertex and instance indices differ from the guest's:\n" << failures;
             return 1;
