@@ -881,6 +881,11 @@ bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
     return sameRun(entry, entry.joined ? joinedRun(lease, entry.base, entry.base + entry.bytes) : importRun(lease, entry.base));
 }
 
+bool rangesRegistered(const HostImport& entry, const GuestAllocations::Lease& lease) {
+    if (entry.joined || entry.ranges.empty() || entry.base != entry.ranges.front()->address || entry.base + entry.bytes != entry.ranges.back()->address + entry.ranges.back()->bytes) return false;
+    return std::all_of(entry.ranges.begin(), entry.ranges.end(), [&](const auto& range) { return leasedRangeOwner(lease, range->address) == range; });
+}
+
 bool pointerHeld(const HostImports& state, const HostImport& entry) {
     return entry.lastUse >= state.buildFloor;
 }
@@ -1241,7 +1246,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     std::erase_if(state.sparseRunEnds, [&](const auto& entry) { return !starts(entry.first); });
     std::erase_if(state.sparseRunJoins, [&](const auto& entry) { return !starts(entry.first); });
     for (auto it = state.imports.begin(); it != state.imports.end();) {
-        if (sameRange(it->second, lease)) {
+        if (sameRange(it->second, lease) || (VramDeviceLocalMirrors() && rangesRegistered(it->second, lease))) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
@@ -4212,6 +4217,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
                 entry = VramLazyWrites() ? importSingleRange(context, state, range, lease) : importAllocation(context, state, range->address, lease);
+                if (entry == nullptr && VramDeviceLocalMirrors()) entry = findImport(state, range->address, range->address + range->bytes);
                 lap(timing.importsUs, at);
             }
             if (entry != nullptr) {

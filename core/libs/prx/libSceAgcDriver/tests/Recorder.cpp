@@ -484,6 +484,60 @@ void deviceMirrorUploadTests(const Device& device, Recorder& recorder) {
     } else Require(VramUploadCounters().bytes == before.bytes, "disabled device mirrors recorded uploads");
 }
 
+void deviceMirrorImportBackingTests(const Device& device, Recorder& recorder) {
+    const auto context = device.GetContext();
+    if (context.hostImportAlignment == 0) return;
+    constexpr std::size_t blockBytes = 65536;
+    constexpr std::size_t bytes = 3 * blockBytes;
+    void* section = nullptr;
+    auto* block = static_cast<std::uint8_t*>(AllocateDescriptorWatched(bytes, blockBytes, section));
+    Require(block != nullptr, "import backing fixture requires watched memory");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        std::uint8_t* block;
+        void* section;
+        ~Release() {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            SetHostImportBudget(0);
+            {
+                GuestAllocations::Mutation mutation;
+                for (std::size_t index = 0; index < 3; ++index) mutation.Remove(block + index * blockBytes);
+            }
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            ReleaseDescriptorWatched(block, bytes, section);
+        }
+    } release{context, recorder, block, section};
+    std::memset(block, 0x42, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, blockBytes, true, true, true);
+        mutation.Add(block + blockBytes, blockBytes, true, true, true);
+    }
+    const auto build = [&] {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        GuestBufferMemory space(context);
+        space.SetAddressWrites(false);
+        space.AcquireRegistered();
+        space.Upload(true);
+        const auto ranges = space.AddressRanges();
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= address && address < range.end; });
+        Require(found != ranges.end(), "an import-backed range is absent from the BDA table");
+        const auto permissions = found->permissions;
+        space.WriteBack();
+        return permissions;
+    };
+    build();
+    if (!HostImportCovers(context, address, 2 * blockBytes)) return;
+    SetHostImportBudget(2 * blockBytes);
+    GuestAllocations::Mutation().Add(block + 2 * blockBytes, blockBytes, true, true, true);
+    const auto permissions = build();
+    if (VramDeviceLocalMirrors()) Require((permissions & ShaderRecompiler::BdaAbi::Write) != 0 && HostImportCovers(context, address, blockBytes), "a range held by an import was copied once its grown run could not be imported");
+}
+
 void vramDescriptorTests(const Device& device, Recorder& recorder) {
     namespace Memory = AgcDriver::GuestMemory;
     auto context = device.GetContext();
@@ -8490,6 +8544,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--vram-device-only") {
             deviceMirrorUploadTests(device, recorder);
+            deviceMirrorImportBackingTests(device, recorder);
             vramDescriptorTests(device, recorder);
             vramDescriptorBoundaryTests(device, recorder);
             vramDescriptorSparseGrowthTests(device, recorder);
