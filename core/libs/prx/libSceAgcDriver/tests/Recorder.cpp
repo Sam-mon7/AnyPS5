@@ -7504,6 +7504,117 @@ void atomicViewTests(const Device& device, Recorder& recorder) {
     }
 }
 
+class DrawPassCounter {
+public:
+    explicit DrawPassCounter(Context& context) : context(context), previous(context.functions),
+        begin(context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")) {
+        if (previous != nullptr) functions = *previous;
+        functions.cmdBeginRenderPass = captureBegin;
+        context.functions = &functions;
+        active = this;
+    }
+    ~DrawPassCounter() { context.functions = previous; active = nullptr; }
+    std::atomic<unsigned> begins{0};
+
+private:
+    static VKAPI_ATTR void VKAPI_CALL captureBegin(VkCommandBuffer commands, const VkRenderPassBeginInfo* info, VkSubpassContents contents) {
+        ++active->begins;
+        active->begin(commands, info, contents);
+    }
+    Context& context;
+    const DeviceFunctions* previous;
+    DeviceFunctions functions{};
+    PFN_vkCmdBeginRenderPass begin;
+    static inline DrawPassCounter* active = nullptr;
+};
+
+bool drawWorkerTests(const Device& device, Recorder& previous) {
+    if (!device.Graphics()) return false;
+    constexpr std::size_t unit = 65536;
+    void* watched = AllocateWatched(unit, unit);
+    std::vector<std::byte> fallback(watched == nullptr ? 2 * unit : 0);
+    auto* block = watched != nullptr ? static_cast<std::byte*>(watched) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(fallback.data()) + unit - 1) & ~(unit - 1));
+    struct Release {
+        void* watched;
+        ~Release() { if (watched != nullptr) ReleaseWatched(watched, unit); }
+    } release{watched};
+    std::fill_n(block, unit, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    previous.Sync();
+    auto context = device.GetContext();
+    context.graphicsPipelineLibrary = false;
+    DrawPassCounter passes(context);
+    Recorder recorder(context);
+    context.recorder = &recorder;
+    recorder.Activate();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    GuestAllocations::Mutation().Add(block, unit, true, true, true);
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        Recorder& previous;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            recorder.FlushDeferredReleases();
+            GuestAllocations::Mutation().Remove(block);
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), unit);
+            previous.Activate();
+        }
+    } cleanup{context, recorder, previous, block};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    const auto before = Recorder::RecordCounts();
+    {
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.spirv = std::vector<std::uint32_t>(std::begin(COVER_VERT_SPV), std::end(COVER_VERT_SPV));
+        fragment.spirv = std::vector<std::uint32_t>(std::begin(COVER_FRAG_SPV), std::end(COVER_FRAG_SPV));
+        vertex.variantId = 901;
+        fragment.variantId = 902;
+        const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+        AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+        for (const auto [width, mask] : std::array<std::pair<unsigned, unsigned>, 3>{{{64, 9}, {32, 2}, {16, 4}}}) {
+            state.scissor.extent.width = width;
+            state.blend.colorWriteMask = mask;
+            state.blends = {state.blend};
+            Draw(context, state, triangle, shaders);
+        }
+        triangle.indexCount = 0;
+        state.scissor.extent = {0, 0};
+    }
+    WaitForOptimizedPipelines(context.device);
+    SharedResourceCache().Clear();
+    ClearCachedPipelines(context.device);
+    recorder.Sync();
+    Require(passes.begins == 1, "direct draws did not continue one render pass");
+    const auto recorded = Recorder::RecordCounts().commands - before.commands;
+    Require(Recorder::RecordWorkerEnabled() ? recorded == 4 : recorded == 0, "draw worker switch selected the wrong recording path");
+    std::vector<std::byte> texels(64 * 64 * 4);
+    ReadColorTarget(state.color, texels);
+    for (unsigned y = 0; y < 64; ++y) {
+        for (unsigned x = 0; x < 64; ++x) {
+            const std::array expected{std::byte{255}, x < 32 ? std::byte{255} : std::byte{0}, x < 16 ? std::byte{255} : std::byte{0}, std::byte{255}};
+            Require(std::equal(expected.begin(), expected.end(), texels.begin() + (y * 64 + x) * 4), "queued draw lost its state, order or retained pipeline");
+        }
+    }
+    std::cout << "Draw worker pixels, immutable state, continuation and cache eviction tests passed\n";
+    return true;
+}
+
 bool drawEvictionTests(const Device& device, Recorder& recorder) {
     if (!device.Graphics()) return false;
     constexpr std::size_t unit = 65536;
@@ -8775,6 +8886,12 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--record-worker-only") {
             copiedDirectOrderingTests(device, recorder, true);
             std::cout << "Record worker device tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-worker-only") {
+            if (!drawWorkerTests(device, recorder)) return 77;
+            Require(vertexTargetRangeTests(device, recorder, false), "copied vertex/index worker fixture was skipped");
+            if (device.GetContext().hostImportAlignment != 0) vertexTargetRangeTests(device, recorder, true);
             return 0;
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--vram-lazy-only" || std::string_view(argv[1]) == "--vram-lazy-imports")) {

@@ -228,6 +228,13 @@ VKAPI_ATTR void VKAPI_CALL mockCmdDispatchIndirect(VkCommandBuffer commands, VkB
     mockCmdDispatch(commands, static_cast<std::uint32_t>(offset), 1, 1);
 }
 
+VKAPI_ATTR void VKAPI_CALL mockCmdEndRenderPass(VkCommandBuffer) {
+    std::lock_guard lock(mockMutex);
+    mock.recording.push_back('E');
+    mock.recordThreads.push_back(std::this_thread::get_id());
+    mock.recordLocks.push_back(AgcDriver::GuestMemory::GpuMutex().HeldByThisThread());
+}
+
 PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
     static const std::map<std::string_view, PFN_vkVoidFunction> table{
         {"vkCreateCommandPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateCommandPool)},
@@ -252,6 +259,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
         {"vkCmdDispatchIndirect", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatchIndirect)},
+        {"vkCmdEndRenderPass", reinterpret_cast<PFN_vkVoidFunction>(mockCmdEndRenderPass)},
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -828,6 +836,79 @@ void RecordWorkerOrderAndSync() {
     Expect(mock.signaled.empty() && mock.pools.empty() && mock.commandPools.empty(), "record worker teardown leaked mock Vulkan objects");
 }
 
+void DrawWorkerPassOrder() {
+    mock = MockDevice{};
+    const bool enabled = Recorder::RecordWorkerEnabled();
+    std::promise<void> entered, allow, appended;
+    auto enteredFuture = entered.get_future();
+    auto appendedFuture = appended.get_future();
+    recordBlocked = false;
+    recordEntered = enabled ? &entered : nullptr;
+    recordAllowed = allow.get_future().share();
+    std::weak_ptr<int> kept;
+    bool aliveAtCompletion = false;
+    std::thread::id producer;
+    std::exception_ptr failure;
+    std::thread caller([&] {
+        try {
+            producer = std::this_thread::get_id();
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(mockContext());
+            auto object = std::make_shared<int>(42);
+            kept = object;
+            recorder.Keep(object);
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> writes{{0x1000, 0x1010}};
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+            for (unsigned i = 0; i < 260; ++i) {
+                const PassAccess access{reads, i == 0 ? GuestRangeList{writes} : GuestRangeList{}, {}, {}};
+                const auto start = recorder.StartDrawPass(1, false, false, access, enabled);
+                Require(start.continued == (i != 0), "queued draws did not continue their pass");
+                recorder.RecordCommand([i, object](VkCommandBuffer commands) {
+                    Require(*object == 42, "queued draw lost its immutable object");
+                    mockCmdDispatch(commands, i, 1, 1);
+                });
+                recorder.LeaveRenderPassOpen(1, Recorder::NoTiming, false, access);
+            }
+            writes.clear();
+            reads = {{0x1000, 0x1010}};
+            const PassAccess dependent{reads, {}, {}, {}};
+            const auto start = recorder.StartDrawPass(1, false, false, dependent, enabled);
+            Require(!start.continued && start.barrier, "queued RAW hazard was lost before replay");
+            recorder.RecordCommand([](VkCommandBuffer commands) { mockCmdDispatch(commands, 260, 1, 1); });
+            recorder.LeaveRenderPassOpen(1, Recorder::NoTiming, false, dependent);
+            object.reset();
+            recorder.OnComplete([&] { aliveAtCompletion = !kept.expired(); });
+            appended.set_value();
+            mockCmdDispatch(recorder.Commands(), 261, 1, 1);
+            recorder.Sync();
+        } catch (...) {
+            failure = std::current_exception();
+            try { appended.set_value(); } catch (...) {}
+        }
+    });
+    const bool queued = appendedFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    Expect(queued, "producer drained the worker during pass continuation or a hazard split");
+    if (enabled && queued) {
+        Expect(enteredFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready, "draw chunk was not published");
+        Expect(!kept.expired(), "unreplayed draws lost their retained objects");
+        std::lock_guard lock(mockMutex);
+        Expect(mock.recording.empty() && mock.submits == 0, "pass end or direct commands overtook blocked draw replay");
+    }
+    allow.set_value();
+    caller.join();
+    recordEntered = nullptr;
+    recordAllowed = {};
+    if (failure) std::rethrow_exception(failure);
+    Expect(aliveAtCompletion && kept.expired(), "draw objects did not live through completion or escaped the chunk pool");
+    Expect(mock.dispatches.size() == 262, "draw records were lost or duplicated");
+    for (std::size_t i = 0; i < mock.dispatches.size(); ++i) Expect(mock.dispatches[i] == i, "draw records changed order");
+    const std::string expected = std::string(260, 'D') + "ED" + "EBD" + "B";
+    Expect(std::string(mock.recording.begin(), mock.recording.end()) == expected, "draw pass ends or barriers changed order");
+    for (std::size_t i = 0; i < 263 && i < mock.recordThreads.size(); ++i) Expect((mock.recordThreads[i] == producer) == !enabled && mock.recordLocks[i] == !enabled, "draw replay or pass end used the wrong thread");
+    Expect(mock.submits == 1 && !mock.waitedBeforeSubmit, "draw recording changed submission order");
+    Expect(mock.signaled.empty() && mock.pools.empty(), "draw worker teardown leaked Vulkan objects");
+}
+
 void ParseTimeLabelTests() {
     using namespace AgcDriver;
     mock = MockDevice{};
@@ -894,6 +975,8 @@ int main(int argc, char** argv) {
             if (Recorder::RecordWorkerEnabled()) RecordWorkerOrderAndSync();
         } else if (argc == 2 && std::string_view(argv[1]) == "record-worker") {
             RecordWorkerOrderAndSync();
+        } else if (argc == 2 && std::string_view(argv[1]) == "draw-worker") {
+            DrawWorkerPassOrder();
         } else if (argc == 2 && std::string_view(argv[1]) == "parse-time-labels") {
             ParseTimeLabelTests();
         } else if (argc == 2 && std::string_view(argv[1]) == "submit-worker") {

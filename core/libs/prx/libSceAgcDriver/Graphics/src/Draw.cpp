@@ -1900,12 +1900,51 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory, inputs.inPlaceReads};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || (args != nullptr && args->runtimeSgprs), fenced, passAccess);
+    const bool deferred = recorder->CanRecordDraw() && !capture && args == nullptr && !state.stages.mesh && !state.stages.tessellation && record.stencilReplay.empty() && record.proxies.empty() && !record.waited && resources.Reusable() && !resources.NeedsCompletion();
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || (args != nullptr && args->runtimeSgprs), fenced, passAccess, deferred);
     resources.BeginGpuWrites(*recorder);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = start.commands;
+    if (deferred) {
+        auto push = record.pushBytes != nullptr ? *record.pushBytes : AssemblePushConstants(shaders);
+        const auto stages = record.pushBytes != nullptr ? record.pushStages : PushConstantStages(shaders);
+        if (record.pushBytes == nullptr) resources.PatchPushConstants(push);
+        auto replayContext = context;
+        replayContext.recorder = nullptr;
+        recorder->RecordCommand([replayContext, state, draw, inputs, pipeline = record.pipeline, framebuffer = record.framebuffer, resources = record.resources, drawBindings, push, stages, start](VkCommandBuffer commands) {
+            if (start.continued) pipeline->Continue(commands, state);
+            else {
+                if (start.barrier) RecordMemoryBarrier(replayContext, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                pipeline->Begin(commands, *framebuffer, state.renderExtent, state);
+            }
+            if (drawBindings != nullptr) {
+                const auto set = drawBindings->allocation.set;
+                const auto fragmentSet = drawBindings->fragmentAllocation.set;
+                if (set != VK_NULL_HANDLE) replayContext.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), 0, 1, &set, 0, nullptr);
+                if (fragmentSet != VK_NULL_HANDLE) replayContext.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+            } else resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
+            pipeline->PushConstants(commands, stages, push);
+            recordDrawCommands(replayContext, commands, state, draw, inputs, nullptr, VK_NULL_HANDLE, 0);
+            if (pipeline->SplitsFaces()) {
+                pipeline->ContinueBackFaces(commands, state);
+                recordDrawCommands(replayContext, commands, state, draw, inputs, nullptr, VK_NULL_HANDLE, 0);
+            }
+            if (pipeline->SplitsSecondChannel()) {
+                pipeline->ContinueSecondChannel(commands);
+                recordDrawCommands(replayContext, commands, state, draw, inputs, nullptr, VK_NULL_HANDLE, 0);
+            }
+        });
+        if (!continued && start.barrier) countBarrier(1);
+        recorder->LeaveRenderPassOpen(passKey, Recorder::NoTiming, fenced, passAccess);
+        timer.phase(PhaseRecord);
+        keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), {}, {}, record.listed, record.completion, outcome);
+        timer.phase(PhaseKeep);
+        return;
+    }
     if (!continued) recorder->PrepareSampleSlot();
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a

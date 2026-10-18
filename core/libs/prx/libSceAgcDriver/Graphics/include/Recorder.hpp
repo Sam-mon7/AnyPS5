@@ -87,6 +87,8 @@ public:
         bool leading = true;
     };
     void RecordDispatch(const DispatchCommand& command);
+    bool CanRecordDraw() const;
+    void RecordCommand(std::function<void(VkCommandBuffer)> command);
     bool TryRecordDispatch(VkPipeline pipeline, VkPipelineLayout layout, std::shared_ptr<void> objects, std::shared_ptr<ShaderResources> resources, std::span<const std::byte> push, std::uint32_t x, std::uint32_t y, std::uint32_t z, VkBuffer indirect = VK_NULL_HANDLE, VkDeviceSize offset = 0, std::uint64_t arguments = 0);
     struct RecordStatistics {
         std::uint64_t commands, chunks, producerNs, workerNs, waitNs, queueDepth, maxQueueDepth;
@@ -106,7 +108,7 @@ public:
         bool continued = false;
         bool barrier = true;
     };
-    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool deferred = false);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
@@ -668,6 +670,7 @@ private:
         } tracker;
         struct RenderPass {
             bool open = false;
+            bool deferred = false;
             bool fenced = false;
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
@@ -775,7 +778,7 @@ private:
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
-    void endOpenRenderPass(bool barrier = true);
+    void endOpenRenderPass(bool barrier = true, bool deferred = false);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);
