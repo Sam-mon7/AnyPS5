@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <mutex>
@@ -34,6 +35,10 @@ class ShaderResources;
 class PlaceholderImages;
 class GpuAddressBindings;
 class GpuCopyCheckpoints;
+
+bool SubmitWorkerEnabled();
+std::shared_future<void> EnqueueSubmitWork(std::function<void()> work);
+VkResult OrderedQueueCall(const std::function<VkResult()>& work);
 
 class PipelineCacheSynchronization {
 public:
@@ -222,6 +227,7 @@ struct Context {
     std::shared_ptr<GpuAddressBindings> addressBindings;
     std::shared_ptr<GpuCopyCheckpoints> copyCheckpoints;
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
+    std::uint32_t queueFamilyIndex = 0;
 
     PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};

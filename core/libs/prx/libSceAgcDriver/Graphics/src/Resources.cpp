@@ -11,10 +11,57 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 
 namespace AgcDriver::Graphics {
 
 namespace {
+
+class SubmitWorker {
+public:
+    SubmitWorker() : thread([this] {
+        for (;;) {
+            std::packaged_task<void()> work;
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [&] { return stopping || !pending.empty(); });
+                if (pending.empty()) return;
+                work = std::move(pending.front());
+                pending.pop_front();
+            }
+            work();
+        }
+    }) {}
+
+    ~SubmitWorker() {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        wake.notify_one();
+        thread.join();
+    }
+
+    std::shared_future<void> Enqueue(std::function<void()> function) {
+        std::packaged_task<void()> work(std::move(function));
+        auto done = work.get_future().share();
+        {
+            std::lock_guard lock(mutex);
+            pending.push_back(std::move(work));
+        }
+        wake.notify_one();
+        return done;
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<std::packaged_task<void()>> pending;
+    bool stopping = false;
+    std::thread thread;
+};
 
 template<typename TRegion, typename TSource, typename TDestination>
 std::uint64_t beginCopy(const Context& context, VkCommandBuffer commands, GpuCopyCheckpoints::Kind kind, TSource source, TDestination destination, std::uint32_t count, const TRegion* regions) {
@@ -51,6 +98,23 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
     return buffer;
 }
 
+}
+
+bool SubmitWorkerEnabled() {
+    static const bool enabled = std::getenv("APS5_SUBMIT_WORKER") != nullptr;
+    return enabled;
+}
+
+std::shared_future<void> EnqueueSubmitWork(std::function<void()> work) {
+    static SubmitWorker worker;
+    return worker.Enqueue(std::move(work));
+}
+
+VkResult OrderedQueueCall(const std::function<VkResult()>& work) {
+    if (!SubmitWorkerEnabled()) return work();
+    VkResult result = VK_SUCCESS;
+    EnqueueSubmitWork([&] { result = work(); }).get();
+    return result;
 }
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, Access access) : Buffer(context, size, usage, access == Access::DeviceMirror ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, access, __builtin_return_address(0)) {}
@@ -501,7 +565,7 @@ CommandBatch::~CommandBatch() {
 void CommandBatch::release() noexcept {
     if (pending) {
         auto result = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence);
-        if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        if (result == VK_NOT_READY) result = OrderedQueueCall([&] { return context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue); });
         Aftermath::Notify(result);
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
     }
@@ -531,7 +595,7 @@ void CommandBatch::Submit() {
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    Check(OrderedQueueCall([&] { return context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence); }), "vkQueueSubmit graphics");
     timing.Mark("queue_submit");
     pending = true;
     submitted = true;
