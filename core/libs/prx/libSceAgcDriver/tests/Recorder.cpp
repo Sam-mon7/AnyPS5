@@ -70,7 +70,7 @@
 #include <thread>
 #include <vector>
 
-void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, bool sparse);
+void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, bool sparse, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>* gpu = nullptr);
 void RunVramWritableTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu);
 void RunVramLazyTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, bool imports);
 void RunVramDeferredTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
@@ -8655,6 +8655,12 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext(), submitWorkerTest);
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--dispatch-heap-refresh-only") {
+            if (!AgcDriver::GuestMemory::WriteWatched()) return 77;
+            RunResidentHeapMirrorTests(device.GetContext(), recorder, false, &gpu);
+            std::cout << "Dispatch heap staging, fallback and producer/consumer tests passed\n";
+            return 0;
+        }
         if (submitWorkerTest) {
             readTrackingTests(device, recorder);
             directCompletionLabelTests(recorder);
