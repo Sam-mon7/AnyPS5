@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderObjectMemory.hpp"
 #include "VulkanTestDevice.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "ShaderDiskCache.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -725,6 +726,62 @@ void DeferredUndecodableRegistration() {
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "unsupported MIMG opcode");
 }
 
+void ReleaseShaderData(AgcDriver::VulkanDevice& device) {
+    using namespace ShaderRecompiler;
+    using namespace AgcDriver::DriverDetail;
+    const bool enabled = ReleaseShaderDataEnabled();
+    Require(ShaderDiskCache::OutputVersion() == 0x29e5f633bdc9df6dull, "shader release changed the legacy output version");
+    ShaderSnapshot snapshot{0x100000, 0, 0, {0xbf810000u}, {}};
+    const ShaderComputeStageInfo compute{{1, 1, 1}, 0, {}, false, 1, {}};
+    const RecompileRequest request{{ShaderStage::Compute, snapshot.codeAddress, snapshot.code, 0, {}}, {32, 0, {}, compute, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+    std::shared_ptr<const RecompileResult> result;
+    std::weak_ptr<const SourceHandle> source;
+    std::weak_ptr<SourceEntry> translation;
+    std::vector<std::uint32_t> preparedWords;
+    {
+        const auto invocation = InvocationFor(snapshot, 0, request);
+        source = snapshot.prepared->entries.front().Pin();
+        const auto prepared = GetPreparedArtifact(*snapshot.prepared->entries.front().Pin()).spirv.Read();
+        preparedWords.assign(prepared.begin(), prepared.end());
+        const auto capture = invocation.Capture({});
+        translation = capture->source;
+        result = invocation.Materialize(*capture);
+    }
+    ShaderDiskCache::Flush();
+    Require(source.expired() == enabled && translation.expired() == enabled, "prepared source, IR or result memo retained unexpected ownership");
+    const auto view = result->spirv.Read();
+    const std::vector<std::uint32_t> expected(view.begin(), view.end());
+    std::vector<std::byte> encodedBefore;
+    ShaderDiskCache::EncodeResult(*result, encodedBefore);
+    const auto memoryBefore = ShaderDataReleaseTotals();
+    const auto pipelinesBefore = AgcDriver::VulkanDevice::ComputePipelineCounts().created;
+    device.Dispatch(*result, 1, 1, 1);
+    device.WaitIdle();
+    const auto released = ShaderDataReleaseTotals();
+    Require((released.releasedBytes > memoryBefore.releasedBytes) == enabled, "module creation did not apply the release switch");
+    auto variant = *result;
+    variant.variantId = 0;
+    variant.specializationId = 0;
+    device.Dispatch(variant, 1, 1, 1);
+    device.WaitIdle();
+    Require(AgcDriver::VulkanDevice::ComputePipelineCounts().created >= pipelinesBefore + 2, "second dispatch reused a pipeline instead of regenerating module words");
+    Require((ShaderDataReleaseTotals().regenerations > released.regenerations) == enabled, "later pipeline did not use the backing-cache regeneration path");
+    Require(std::ranges::equal(result->spirv.Read(), expected), "release changed retained SPIR-V words");
+    std::vector<std::byte> encodedAfter;
+    ShaderDiskCache::EncodeResult(*result, encodedAfter);
+    Require(encodedBefore == encodedAfter, "release changed the serialized disk-cache payload");
+    const auto diskBefore = ShaderDiskCache::Totals();
+    {
+        const auto handle = SourceHandleFor(snapshot, 0, request);
+        Require(std::ranges::equal(GetPreparedArtifact(*handle).spirv.Read(), preparedWords), "re-preparation changed shader output");
+    }
+    if (enabled) {
+        Require(ShaderDataReleaseTotals().sourceReprepares != 0, "expired prepared source did not count regeneration");
+        if (ShaderDiskCache::Enabled()) Require(ShaderDiskCache::Totals().hits > diskBefore.hits && ShaderDiskCache::Totals().planHits > diskBefore.planHits, "re-preparation did not recover both variant and plan from disk");
+    }
+    std::cout << "shader release, later pipeline creation, source regeneration and disk payload checks passed\n";
+}
+
 void SourceMemoMemory(AgcDriver::VulkanDevice& device) {
     using namespace ShaderRecompiler;
     Require(PreparedShaderBudgetEnabled(), "source memo memory fixture requires a budget");
@@ -857,6 +914,12 @@ void PreparedBudget(AgcDriver::VulkanDevice* device, bool lru) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--release-data") {
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            ReleaseShaderData(*device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--budget-maintenance") {
             PreparedMaintenance();
             return 0;

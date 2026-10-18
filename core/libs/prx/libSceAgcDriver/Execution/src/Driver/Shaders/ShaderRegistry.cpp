@@ -33,12 +33,20 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+bool PreparedDataEvictable() {
+    return ShaderRecompiler::PreparedShaderBudgetEnabled() || ShaderRecompiler::ReleaseShaderDataEnabled();
+}
+
+}
+
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PreparedShaderState::Entry::Pin() const {
     return handle != nullptr ? handle : cached.lock();
 }
 
 void PreparedShaderState::Entry::CacheOnly() {
-    if (ShaderRecompiler::PreparedShaderBudgetEnabled() && handle != nullptr) {
+    if (PreparedDataEvictable() && handle != nullptr) {
         cached = handle;
         handle.reset();
     }
@@ -49,7 +57,7 @@ std::shared_ptr<const ShaderRecompiler::RectListShaders> PreparedShaderState::Re
 }
 
 void PreparedShaderState::Rectangle::CacheOnly() {
-    if (!ShaderRecompiler::PreparedShaderBudgetEnabled() || shaders == nullptr) return;
+    if (!PreparedDataEvictable() || shaders == nullptr) return;
     cached = shaders;
     const auto weak = cached;
     ShaderRecompiler::CachePreparedObject(shaders, ShaderRecompiler::PreparedObjectKind::Host, [weak] {
@@ -62,7 +70,7 @@ void PreparedShaderState::Rectangle::CacheOnly() {
 namespace {
 
 void PinPreparedEntries(PreparedShaderState& prepared) {
-    if (!ShaderRecompiler::PreparedShaderBudgetEnabled()) return;
+    if (!PreparedDataEvictable()) return;
     bool expired = false;
     for (auto& entry : prepared.entries) {
         entry.handle = entry.Pin();
@@ -80,7 +88,7 @@ void PinPreparedEntries(PreparedShaderState& prepared) {
 }
 
 void CachePreparedEntries(PreparedShaderState& prepared) {
-    if (!ShaderRecompiler::PreparedShaderBudgetEnabled()) return;
+    if (!PreparedDataEvictable()) return;
     for (auto& entry : prepared.entries) entry.CacheOnly();
     for (auto& rectangle : prepared.rectangles) rectangle.CacheOnly();
 }
@@ -476,7 +484,7 @@ void ReportPreparedAtUse(const ShaderSnapshot& snapshot, const ShaderRecompiler:
         return;
     }
     if (!snapshot.header.empty()) {
-        if (!snapshot.prepared->deferred && !ShaderRecompiler::PreparedShaderBudgetEnabled()) APS5_LOG_ERR("Shader 0x%llx stage %u has no artifact prepared at registration for the state of this draw or dispatch; preparing it at use", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<std::uint32_t>(request.shader.stage));
+        if (!snapshot.prepared->deferred && !PreparedDataEvictable()) APS5_LOG_ERR("Shader 0x%llx stage %u has no artifact prepared at registration for the state of this draw or dispatch; preparing it at use", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<std::uint32_t>(request.shader.stage));
         return;
     }
     if (request.shader.stage == ShaderRecompiler::ShaderStage::Compute) {
@@ -541,7 +549,7 @@ ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, con
 }
 
 ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& pixel, const ShaderRecompiler::SpirvTarget& target) {
-    if (!ShaderRecompiler::PreparedShaderBudgetEnabled()) return DrawRectangle(front, fragment, vertex.variantId, pixel.variantId, target);
+    if (!PreparedDataEvictable()) return DrawRectangle(front, fragment, vertex.variantId, pixel.variantId, target);
     {
         std::lock_guard lock(front.prepared->mutex);
         for (const auto& rectangle : front.prepared->rectangles) {
@@ -1170,7 +1178,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     const auto primitiveType = state.userConfig.find(0x242u);
     for (const auto& abi : transaction.Read(*owner).graphicsAbis) {
         if (abi.key != key || abi.registry.lock() != registry) continue;
-        if (ShaderRecompiler::PreparedShaderBudgetEnabled() && std::ranges::any_of(abi.stages, [&](const auto& stage) {
+        if (PreparedDataEvictable() && std::ranges::any_of(abi.stages, [&](const auto& stage) {
             const auto snapshot = stage.lock();
             return snapshot == nullptr || std::ranges::any_of(transaction.Read(*snapshot).entries, [](const auto& entry) { return entry.Pin() == nullptr; }) || transaction.Read(*snapshot).entries.empty();
         })) continue;

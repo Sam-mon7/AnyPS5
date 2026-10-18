@@ -27,10 +27,56 @@ std::size_t PrivateBytes() {
 }
 #endif
 
+void ReleaseMemory() {
+    using namespace ShaderRecompiler;
+    constexpr std::size_t Count = 256u * 1024u;
+    constexpr std::uint32_t Pattern = 0x12345678u;
+    const bool enabled = ReleaseShaderDataEnabled();
+    const SharedSpirv original(std::vector<std::uint32_t>(Count, Pattern));
+    const auto copy = original;
+    const auto view = original.Read();
+    const auto memory = original.MemoryBytes();
+    const auto before = ShaderDataReleaseTotals();
+    Require(original.ModuleWords().data() == view.data(), "module read replaced immutable words");
+    std::atomic<bool> correct{true};
+    std::array<std::thread, 4> readers;
+    for (auto& reader : readers) reader = std::thread([&] {
+        for (unsigned i = 0; i < 1000; ++i) {
+            if (copy.Read()[i] != Pattern || view[Count - i - 1] != Pattern) correct.store(false);
+        }
+    });
+    original.ReleaseAfterModule();
+    for (auto& reader : readers) reader.join();
+    Require(correct.load() && original.Read().data() == view.data(), "release invalidated an active reader");
+    const auto released = ShaderDataReleaseTotals();
+    Require(released.releasedBytes - before.releasedBytes == (enabled ? Count * sizeof(std::uint32_t) : 0), "private SPIR-V release bytes are wrong");
+    Require(memory - original.MemoryBytes() == released.releasedBytes - before.releasedBytes, "SPIR-V private allocation was retained");
+    copy.ReleaseAfterModule();
+    Require(ShaderDataReleaseTotals().releasedBytes == released.releasedBytes, "shared release counted one allocation twice");
+    const auto regenerated = copy.ModuleWords();
+    Require(std::ranges::equal(regenerated, view), "backing-cache regeneration changed SPIR-V");
+    Require(ShaderDataReleaseTotals().regenerations - before.regenerations == (enabled ? 1u : 0u), "module regeneration counter is wrong");
+    auto edited = copy;
+    edited[7] = 0xffu;
+    const auto* editable = edited.data();
+    edited.ReleaseAfterModule();
+    Require(editable[7] == 0xffu && original[7] == Pattern, "release broke copy-on-write or an exposed mutable pointer");
+    const SharedSpirv borrowed(std::vector<std::uint32_t>(32, Pattern));
+    const auto& legacy = borrowed.Words();
+    borrowed.ReleaseAfterModule();
+    Require(legacy[7] == Pattern, "release invalidated a borrowed vector reference");
+    SharedSpirv{}.ReleaseAfterModule();
+    std::printf("shader data release=%u: release, regeneration, concurrent reads and write isolation passed\n", enabled);
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--release-memory") {
+            ReleaseMemory();
+            return 0;
+        }
         using ShaderRecompiler::SharedSpirv;
         constexpr std::size_t Count = 16u << 20u;
         constexpr std::uint32_t Pattern = 0x12345678u;

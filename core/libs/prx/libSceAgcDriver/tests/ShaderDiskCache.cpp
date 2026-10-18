@@ -2056,6 +2056,12 @@ void verifySwitchScoping(const char* self, const std::filesystem::path& director
     const auto path = directory / "switch-keys.bin";
     const auto budget = childStageKeys(self, path, "64", nullptr);
     require(budget.first == compute && budget.second == vertex, "APS5_PREPARED_SHADER_MIB changed a cache key, though the budget never changes compiled output");
+    for (const auto* mode : {"0", "1"}) {
+        setEnvironment("APS5_RELEASE_SHADER_DATA", mode);
+        const auto release = childStageKeys(self, path, nullptr, nullptr);
+        require(release.first == compute && release.second == vertex, "APS5_RELEASE_SHADER_DATA changed the disk-cache keys");
+    }
+    unsetEnvironment("APS5_RELEASE_SHADER_DATA");
     setEnvironment("APS5_CACHE_SPECIALIZED_COMPUTE", "1");
     const auto specialized = childStageKeys(self, path, nullptr, nullptr);
     unsetEnvironment("APS5_CACHE_SPECIALIZED_COMPUTE");

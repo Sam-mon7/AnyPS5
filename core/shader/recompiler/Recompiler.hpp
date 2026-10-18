@@ -445,6 +445,16 @@ struct BarycentricEmulationLayout {
 
 [[nodiscard]] BarycentricEmulationLayout LayoutBarycentricEmulation(std::span<const FragmentParameter> parameters, const BarycentricEmulation& emulation);
 
+struct ShaderDataReleaseStats {
+    std::uint64_t releasedBytes = 0;
+    std::uint64_t regenerations = 0;
+    std::uint64_t sourceReprepares = 0;
+};
+
+[[nodiscard]] bool ReleaseShaderDataEnabled();
+[[nodiscard]] ShaderDataReleaseStats ShaderDataReleaseTotals();
+void NoteShaderDataReprepare();
+
 // Compiled SPIR-V shared between a cached variant and every result materialized from it: results
 // are copied per dispatch and draw, so the words are reference counted and only duplicated when a
 // holder writes to them (tests and tools patch modules in place). Reads look like a vector.
@@ -463,6 +473,8 @@ public:
     [[nodiscard]] std::size_t size() const { return Read().size(); }
     [[nodiscard]] bool empty() const { return Read().empty(); }
     [[nodiscard]] std::size_t MemoryBytes() const;
+    [[nodiscard]] std::span<const std::uint32_t> ModuleWords() const;
+    void ReleaseAfterModule() const;
     [[nodiscard]] const std::uint32_t* data() const { return Read().data(); }
     [[nodiscard]] std::uint32_t* data() { return Mutable().data(); }
     [[nodiscard]] const std::uint32_t& operator[](std::size_t index) const { return Read()[index]; }

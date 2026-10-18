@@ -371,7 +371,7 @@ struct SourceMemoryAccount {
     PreparedShaderMemory memory;
 
     void Set(const PreparedShaderMemory& next) {
-        static const bool enabled = PreparedShaderBudgetEnabled() || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        static const bool enabled = PreparedShaderBudgetEnabled() || ReleaseShaderDataEnabled() || std::getenv("APS5_PROFILE_DRAW") != nullptr;
         if (!enabled) return;
         auto& totals = sourceMemoryTotals();
         std::lock_guard lock(totals.mutex);
@@ -461,7 +461,7 @@ template<class T> struct CacheReference {
     std::shared_ptr<T> strong;
     std::weak_ptr<T> weak;
     explicit CacheReference(const std::shared_ptr<T>& source) {
-        if (PreparedShaderBudgetEnabled()) weak = source;
+        if (PreparedShaderBudgetEnabled() || ReleaseShaderDataEnabled()) weak = source;
         else strong = source;
     }
     std::shared_ptr<T> Lock() const { return strong != nullptr ? strong : weak.lock(); }
@@ -469,7 +469,7 @@ template<class T> struct CacheReference {
 using SourceReference = CacheReference<SourceEntry>;
 
 template<class TKey, class T> std::shared_ptr<T> cachedEntry(std::map<TKey, CacheReference<T>>& entries, const TKey& key) {
-    if (PreparedShaderBudgetEnabled()) std::erase_if(entries, [](const auto& entry) { return entry.second.weak.expired(); });
+    if (PreparedShaderBudgetEnabled() || ReleaseShaderDataEnabled()) std::erase_if(entries, [](const auto& entry) { return entry.second.weak.expired(); });
     const auto found = entries.find(key);
     if (found != entries.end()) {
         if (auto entry = found->second.Lock()) return entry;
@@ -523,7 +523,7 @@ std::size_t artifactBytes(const CompiledShaderArtifact& artifact) {
 
 bool trackSourceMemory() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    return PreparedShaderBudgetEnabled() || profile;
+    return PreparedShaderBudgetEnabled() || ReleaseShaderDataEnabled() || profile;
 }
 
 void addSourceSpirv(SourceEntry& source, const SharedSpirv& words) {
@@ -680,6 +680,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
             auto& bucket = position->second;
             if (inserted) cache.entryBytes += vectorBytes(position->first) + sizeof(*position) + sizeof(void*);
             cache.entryBytes -= vectorBytes(bucket);
+            if (ReleaseShaderDataEnabled()) std::erase_if(bucket, [](const auto& reference) { return reference.Lock() == nullptr; });
             if (!bucket.empty()) {
                 // A second entry under one key is a code hash collision (or the unhashed key with
                 // identical code, which cannot happen); each is reported under the profile switch.
@@ -731,7 +732,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
             }
         }
     }
-    if (PreparedShaderBudgetEnabled() || std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+    if (PreparedShaderBudgetEnabled() || ReleaseShaderDataEnabled() || std::getenv("APS5_PROFILE_DRAW") != nullptr) {
         std::lock_guard lock(source->mutex);
         if (source->accounting.memory.sources == 0) {
             if (source->plan != nullptr) source->planMemory = planBytes(*source->plan);
@@ -1639,7 +1640,7 @@ bool PreparedShaderBudgetEnabled() { return preparedLimit().has_value(); }
 
 void TouchPreparedShader(const std::shared_ptr<const SourceHandle>& handle) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!PreparedShaderBudgetEnabled() && !profile) return;
+    if (!PreparedShaderBudgetEnabled() && !ReleaseShaderDataEnabled() && !profile) return;
     if (handle == nullptr) return;
     {
         auto& cache = PreparedCacheStorage();
@@ -1659,7 +1660,7 @@ void TouchPreparedShader(const std::shared_ptr<const SourceHandle>& handle) {
 
 void CachePreparedObject(const std::shared_ptr<const void>& object, PreparedObjectKind kind, std::function<std::uint64_t()> bytes, std::uintptr_t owner) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if ((!PreparedShaderBudgetEnabled() && !profile) || object == nullptr) return;
+    if ((!PreparedShaderBudgetEnabled() && !ReleaseShaderDataEnabled() && !profile) || object == nullptr) return;
     auto& cache = PreparedCacheStorage();
     std::lock_guard lock(cache.mutex);
     auto found = cache.index.find(object.get());
@@ -1670,7 +1671,8 @@ void CachePreparedObject(const std::shared_ptr<const void>& object, PreparedObje
     if (found != cache.index.end()) cache.handles.splice(cache.handles.begin(), cache.handles, found->second);
     else {
         const auto measured = bytes();
-        cache.handles.push_front({PreparedShaderBudgetEnabled() ? object : nullptr, object, object.get(), kind, owner, measured});
+        const bool retain = PreparedShaderBudgetEnabled() && !(ReleaseShaderDataEnabled() && kind == PreparedObjectKind::Host && owner == 0);
+        cache.handles.push_front({retain ? object : nullptr, object, object.get(), kind, owner, measured});
         cache.index.emplace(object.get(), cache.handles.begin());
         cache.bytes[static_cast<std::size_t>(kind)] += measured;
     }
@@ -1692,6 +1694,7 @@ void AdjustPreparedObjectMemory(PreparedObjectKind kind, std::uint64_t allocated
 }
 
 void NotePreparedShaderReprepare() {
+    NoteShaderDataReprepare();
     if (!PreparedShaderBudgetEnabled()) return;
     auto& cache = PreparedCacheStorage();
     std::lock_guard lock(cache.mutex);
@@ -1701,7 +1704,7 @@ void NotePreparedShaderReprepare() {
 PreparedShaderCacheStats MaintainPreparedShaderCache() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto limit = preparedLimit();
-    if (!limit && !profile) return {};
+    if (!limit && !profile && !ReleaseShaderDataEnabled()) return {};
     auto& cache = PreparedCacheStorage();
     std::unique_lock lock(cache.mutex);
     const auto now = std::chrono::steady_clock::now();
