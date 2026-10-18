@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDuplicates.hpp"
@@ -1562,6 +1563,19 @@ void epochMetadataTests() {
 }
 
 #ifdef _WIN32
+PFN_vkGetDeviceProcAddr epochDeviceProc = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL epochCreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator, VkImage* image) {
+    auto readable = *info;
+    readable.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    return reinterpret_cast<PFN_vkCreateImage>(epochDeviceProc(device, "vkCreateImage"))(device, &readable, allocator, image);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL epochGetDeviceProc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&epochCreateImage);
+    return epochDeviceProc(device, name);
+}
+
 class EpochTextureMemory {
 public:
     static constexpr std::size_t Bytes = 4 * AgcDriver::PageTracker::RegionBytes;
@@ -1604,6 +1618,222 @@ std::vector<std::byte> epochImageBytes(const Context& context, Recorder& recorde
     recorder.Sync();
     const auto bytes = readback.ReadBytes(0, readback.Size());
     return {bytes.begin(), bytes.end()};
+}
+
+std::vector<std::byte> epochSurfaceBytes(const Context& context, Recorder& recorder, VkImage image, VkImageLayout layout, const GuestTextureResource& descriptor) {
+    const auto geometry = DescribeSurface(descriptor);
+    std::vector<VkBufferImageCopy> regions;
+    std::size_t size = 0;
+    for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+        VkBufferImageCopy region{};
+        region.bufferOffset = size;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, geometry.imageLayers};
+        region.imageExtent = {std::max(descriptor.width >> level, 1u), std::max(descriptor.height >> level, 1u), std::max(geometry.imageDepth >> level, 1u)};
+        regions.push_back(region);
+        size += static_cast<std::size_t>((region.imageExtent.width + BlockWidth(descriptor.format) - 1u) / BlockWidth(descriptor.format)) * ((region.imageExtent.height + BlockHeight(descriptor.format) - 1u) / BlockHeight(descriptor.format)) * region.imageExtent.depth * geometry.imageLayers * BytesPerElement(descriptor.format);
+    }
+    Buffer readback(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    VkImageMemoryBarrier source{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    source.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+    source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    source.oldLayout = layout;
+    source.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    source.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    source.image = image;
+    source.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    const auto barrier = context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &source);
+    CopyImageToBuffer(context, commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+    auto done = source;
+    done.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    done.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    done.oldLayout = source.newLayout;
+    done.newLayout = layout;
+    barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &done);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Submit();
+    recorder.Sync();
+    const auto bytes = readback.ReadBytes(0, size);
+    return {bytes.begin(), bytes.end()};
+}
+
+void epochLayoutTextureTests(const Context& context, std::uint32_t format, std::uint32_t tileMode, bool volume) {
+    using namespace AgcDriver::PageTracker;
+    const bool enabled = TextureEpoch::Enabled();
+    const auto counters = TextureEpoch::ProfileLine();
+    EpochTextureMemory memory;
+    auto words = RgbaWords(memory.Range().address, IsBlockCompressed(format) ? 259 : 129);
+    const auto lastLevel = volume ? 5u : 3u;
+    words[1] = (words[1] & ~(0x1ffu << 20u)) | (format << 20u);
+    words[3] = (words[3] & 0xffffu) | (lastLevel << 16u) | (tileMode << 20u) | ((volume ? 10u : 13u) << 28u);
+    words[4] = volume ? 18 : 1;
+    words[5] = lastLevel << 4u;
+    if (tileMode == TileR64KBX || tileMode == 0x19u || tileMode == 0x1au) words[0] |= 0xcfu;
+    const auto descriptor = DecodeTextureResource(words);
+    const auto geometry = DescribeSurface(descriptor);
+    Require(geometry.guestBytes > 2 * PageBytes && geometry.guestBytes < EpochTextureMemory::Bytes, "extended epoch fixture size is invalid");
+    ClearCachedTextures(context.device);
+    Recorder recorder(context);
+    recorder.Activate();
+    std::shared_ptr<StorageTexture> storage;
+    if (!IsBlockCompressed(format)) storage = StorageTexture::Create(context, *context.detiler, descriptor, 0);
+    auto sampled = CachedSampledTexture(context, words);
+    Require(!sampled->ViewsStorageImage(), "extended epoch fixture needs its own sampled image");
+    auto initial = epochSurfaceBytes(context, recorder, sampled->Image(), sampled->Layout(), descriptor);
+    unsigned value = 64;
+    const auto* path = IsBlockCompressed(format) ? "partial-bc" : geometry.thick ? "partial-thick" : tileMode == 0 ? "partial-linear" : "partial-tiled";
+    bool pixelsChanged = false;
+    std::vector<std::uint64_t> pages{0, PageBytes, (geometry.guestBytes / 2) & ~(PageBytes - 1), (geometry.guestBytes - 1) & ~(PageBytes - 1)};
+    const auto mode = geometry.thick ? (tileMode == 0x05u || tileMode == 0x09u ? tileMode : XorSwizzleMode(descriptor.tileMode)) | 0x100u : EquationSwizzleMode(descriptor.tileMode);
+    const auto* equation = FindTextureSwizzleEquation(mode, BytesPerElement(format));
+    for (const auto& mip : geometry.mips) {
+        if (!mip.tail) continue;
+        if (equation != nullptr) {
+            auto offset = descriptor.pipeBankXor;
+            const auto coordinate = mip.tailX | (mip.tailY << 12u);
+            for (unsigned bit = 0; bit < 16; ++bit) offset ^= (std::popcount(equation->bits[bit] & coordinate) & 1u) << bit;
+            pages.push_back((mip.tiledOffset + offset) & ~(PageBytes - 1));
+        } else {
+            for (std::uint64_t offset = 0; offset < mip.tiledSize; offset += PageBytes) pages.push_back(mip.tiledOffset + offset);
+            break;
+        }
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    for (const auto page : pages) {
+        const auto bytes = std::min(PageBytes, geometry.guestBytes - page);
+        value = value >= 224 ? 96 : value + 32;
+        memory.Write(page, bytes, value);
+        const auto partials = epochCount("partial");
+        const auto uploaded = epochCount("bytes-uploaded");
+        const auto layoutPartials = enabled ? epochCount(path) : 0;
+        if (enabled) {
+            memory.Protect(0, EpochTextureMemory::Bytes, PAGE_NOACCESS);
+            memory.Protect(page, PageBytes, PAGE_READWRITE);
+        }
+        const auto changed = CachedSampledTexture(context, words);
+        if (enabled) {
+            Require(changed == sampled && epochCount("partial") == partials + 1 && epochCount("bytes-uploaded") - uploaded <= PageBytes, "extended sampled update did not stay within its dirty page");
+            Require(epochCount(path) == layoutPartials + 1, "extended sampled update used the wrong path counter");
+        } else Require(changed != sampled, "disabled extended epoch update changed sampled rebuilds");
+        sampled = changed;
+        if (storage != nullptr) {
+            const auto storagePartials = enabled ? epochCount("storage-partial") : 0;
+            Require(!storage->Refresh(), "extended storage CPU write did not refresh");
+            if (enabled) Require(epochCount("storage-partial") == storagePartials + 1, "extended storage update missed its partial path");
+        }
+        if (enabled) memory.Protect(0, EpochTextureMemory::Bytes, PAGE_READWRITE);
+        const auto actual = epochSurfaceBytes(context, recorder, sampled->Image(), sampled->Layout(), descriptor);
+        const auto snapshot = std::span(reinterpret_cast<const std::byte*>(descriptor.baseAddress), static_cast<std::size_t>(geometry.guestBytes));
+        Texture reference(context, *context.detiler, descriptor, {}, snapshot);
+        const auto expected = epochSurfaceBytes(context, recorder, reference.Image(), reference.Layout(), descriptor);
+        Require(actual == expected, "extended partial image differs from a complete detile, including mip edges and layers");
+        pixelsChanged = pixelsChanged || actual != initial;
+        if (storage != nullptr) Require(epochSurfaceBytes(context, recorder, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, descriptor) == expected, "extended storage partial image differs from a complete detile");
+        if (enabled) {
+            memory.Protect(0, EpochTextureMemory::Bytes, PAGE_NOACCESS);
+            Require(CachedSampledTexture(context, words) == sampled && (storage == nullptr || storage->Refresh()), "extended refresh did not advance its epoch");
+            memory.Protect(0, EpochTextureMemory::Bytes, PAGE_READWRITE);
+        }
+    }
+    Require(pixelsChanged, "extended epoch fixture never changed image data");
+    if (storage != nullptr) {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkClearColorValue clear{};
+        for (auto& channel : clear.float32) channel = 128.f / 255.f;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        storage->MarkDirty();
+        const auto fallbacks = enabled ? epochCount("storage-fallback") : 0;
+        Require(storage->Refresh(), "GPU-written extended storage image was overwritten by a CPU epoch upload");
+        if (enabled) Require(epochCount("storage-fallback") == fallbacks + 1, "pending GPU storage refresh did not count its fallback");
+        const auto gpu = epochSurfaceBytes(context, recorder, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, descriptor);
+        Require(std::all_of(gpu.begin(), gpu.end(), [](std::byte byte) { return byte == std::byte{128}; }), "GPU clear did not reach every storage mip and depth slice");
+        storage->WriteBack();
+        recorder.Sync();
+        std::vector<std::byte> snapshot(static_cast<std::size_t>(geometry.guestBytes));
+        AgcDriver::GuestMemory::ReadCommitted(descriptor.baseAddress, snapshot);
+        Texture reference(context, *context.detiler, descriptor, {}, snapshot);
+        Require(epochSurfaceBytes(context, recorder, reference.Image(), reference.Layout(), descriptor) == gpu, "partial-refresh baseline lost GPU writes during storage write-back");
+        storage->Refresh();
+        Require(epochSurfaceBytes(context, recorder, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, descriptor) == gpu, "storage refresh rolled back its published GPU writes");
+    }
+    recorder.Sync();
+    ClearCachedTextures(context.device);
+    if (!enabled) Require(TextureEpoch::ProfileLine() == counters, "disabled extended epochs changed profiling output");
+}
+
+void epochFallbackTextureTests(const Context& context) {
+    const bool enabled = TextureEpoch::Enabled();
+    const auto counters = TextureEpoch::ProfileLine();
+    EpochTextureMemory memory;
+    auto words = RgbaWords(memory.Range().address + 256, 256);
+    words[3] = (words[3] & ~(0x1fu << 20u)) | (0x05u << 20u);
+    const auto descriptor = DecodeTextureResource(words);
+    Require(descriptor.baseAddress % 65536 != 0, "alignment fallback fixture became aligned");
+    Recorder recorder(context);
+    recorder.Activate();
+    auto storage = StorageTexture::Create(context, *context.detiler, descriptor, 0);
+    auto sampled = CachedSampledTexture(context, words);
+    memory.Write(AgcDriver::PageTracker::PageBytes, AgcDriver::PageTracker::PageBytes, 128);
+    const auto alignment = enabled ? epochCount("fallback-tiled-base-alignment") : 0;
+    Require(!storage->Refresh(), "unaligned storage update did not refresh");
+    if (enabled) Require(epochCount("fallback-tiled-base-alignment") == alignment + 1, "storage alignment fallback reason is missing");
+    const auto changed = CachedSampledTexture(context, words);
+    Require(changed != sampled, "unaligned sampled update did not rebuild");
+    if (enabled) Require(epochCount("fallback-tiled-base-alignment") == alignment + 2, "sampled alignment fallback was not counted exactly once");
+    const auto expected = epochSurfaceBytes(context, recorder, changed->Image(), changed->Layout(), descriptor);
+    Require(epochSurfaceBytes(context, recorder, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, descriptor) == expected, "alignment fallback pixels differ between storage and sampled images");
+    if (auto* tracker = AgcDriver::PageTracker::Get()) tracker->InvalidateRange(memory.Range());
+    const auto unavailable = enabled ? epochCount("fallback-unavailable") : 0;
+    Require(storage->Refresh(), "unknown coverage changed clean storage content");
+    if (enabled) Require(epochCount("fallback-unavailable") == unavailable + 1, "unknown coverage fallback reason is missing");
+    recorder.Sync();
+    ClearCachedTextures(context.device);
+    if (!enabled) Require(TextureEpoch::ProfileLine() == counters, "disabled fallback checks changed profiling output");
+}
+
+void epochDccFallbackTests(const Context& context) {
+    const bool enabled = TextureEpoch::Enabled();
+    const auto counters = TextureEpoch::ProfileLine();
+    EpochTextureMemory memory;
+    const auto keys = memory.Range().address + EpochTextureMemory::Bytes / 2;
+    auto words = RgbaWords(memory.Range().address, 256);
+    words[6] = (1u << 21u) | (static_cast<std::uint32_t>(keys >> 8u) << 24u);
+    words[7] = static_cast<std::uint32_t>(keys >> 16u);
+    const auto descriptor = DecodeTextureResource(words);
+    const auto geometry = DescribeSurface(descriptor);
+    Require(descriptor.dccAddress == keys, "DCC fixture metadata address changed");
+    memory.Write(EpochTextureMemory::Bytes / 2, 65536, 255);
+    Recorder recorder(context);
+    recorder.Activate();
+    auto storage = StorageTexture::Create(context, *context.detiler, descriptor, 0);
+    auto sampled = CachedSampledTexture(context, words);
+    for (const auto key : {0u, 0xffu, 0xc0u}) {
+        memory.Write(EpochTextureMemory::Bytes / 2, 65536, key);
+        memory.Write(AgcDriver::PageTracker::PageBytes, AgcDriver::PageTracker::PageBytes, 96);
+        const auto reasons = enabled ? epochCount("fallback-dcc-metadata") : 0;
+        const auto partials = epochCount("partial");
+        Require(!storage->Refresh(), "DCC metadata change did not refresh storage");
+        if (enabled) Require(epochCount("fallback-dcc-metadata") == reasons + 1, "DCC storage fallback did not report its metadata reason exactly once");
+        const auto sampledReasons = enabled ? epochCount("fallback-dcc-metadata") : 0;
+        sampled = CachedSampledTexture(context, words);
+        if (enabled) Require(epochCount("fallback-dcc-metadata") == sampledReasons + 1, "DCC sampled fallback did not report its metadata reason exactly once");
+        const auto actual = epochSurfaceBytes(context, recorder, sampled->Image(), sampled->Layout(), descriptor);
+        std::vector<std::byte> snapshot(static_cast<std::size_t>(geometry.guestBytes));
+        ReadTextureSurface(descriptor, TextureClearKeys(descriptor, geometry.guestBytes), snapshot);
+        Texture reference(context, *context.detiler, descriptor, {}, snapshot);
+        const auto expected = epochSurfaceBytes(context, recorder, reference.Image(), reference.Layout(), descriptor);
+        Require(actual == expected && epochSurfaceBytes(context, recorder, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, descriptor) == expected, "DCC fallback pixels differ from a complete metadata-aware upload");
+        if (enabled) Require(epochCount("partial") == partials, "DCC fallback used an unsafe partial upload");
+    }
+    recorder.Sync();
+    ClearCachedTextures(context.device);
+    if (!enabled) Require(TextureEpoch::ProfileLine() == counters, "disabled DCC fallback changed profiling output");
 }
 
 void epochPageTextureTests(const Context& context, bool linear, std::uint32_t tileMode = TileR64KBX) {
@@ -1790,7 +2020,8 @@ int main(int argc, char** argv) {
         const bool memory = argc > 1 && std::string(argv[1]) == "memory";
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool epochPages = mode == "epoch-pages-linear" || mode == "epoch-pages-tiled";
-        const bool epochTextures = mode == "epoch-textures" || epochPages;
+        const bool epochExtended = mode == "epoch-bc" || mode == "epoch-thick" || mode == "epoch-storage" || mode == "epoch-dcc";
+        const bool epochTextures = mode == "epoch-textures" || epochPages || epochExtended;
         if (mode == "epoch-metadata") {
             epochMetadataTests();
             std::puts("epoch texture metadata tests passed");
@@ -1816,19 +2047,34 @@ int main(int argc, char** argv) {
 #endif
         std::unique_ptr<Device> device;
         try {
-            device = std::make_unique<Device>(resources, mirrors || importDetile);
+            device = std::make_unique<Device>(resources, mirrors || importDetile || mode == "epoch-bc");
         } catch (const std::exception& error) {
             if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
             std::printf("skipped, no usable Vulkan device: %s\n", error.what());
             return VulkanTestSkipped;
         }
         auto context = device->GetContext();
+#ifdef _WIN32
+        if (epochExtended) {
+            epochDeviceProc = context.deviceProc;
+            context.deviceProc = &epochGetDeviceProc;
+        }
+#endif
         TextureDetiler detiler(context);
         context.detiler = &detiler;
         if (epochTextures) {
 #ifdef _WIN32
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
-            if (mode == "epoch-pages-linear") epochPageTextureTests(context, true);
+            if (mode == "epoch-bc") {
+                for (const auto format : {169u, 170u, 171u, 172u, 173u, 174u, 175u, 176u, 177u, 178u, 179u, 180u, 181u, 182u})
+                    for (const auto tileMode : {0u, 0x05u, 0x09u, TileR64KBX}) epochLayoutTextureTests(context, format, tileMode, false);
+            } else if (mode == "epoch-thick") {
+                for (const auto tileMode : {0x05u, 0x09u, 0x19u, 0x1au}) epochLayoutTextureTests(context, 56, tileMode, true);
+            } else if (mode == "epoch-storage") {
+                for (const auto tileMode : {0u, 0x05u, TileR64KBX}) epochLayoutTextureTests(context, 56, tileMode, false);
+                epochFallbackTextureTests(context);
+            } else if (mode == "epoch-dcc") epochDccFallbackTests(context);
+            else if (mode == "epoch-pages-linear") epochPageTextureTests(context, true);
             else if (epochPages) for (const auto tileMode : {0x05u, 0x09u, TileR64KBX}) epochPageTextureTests(context, false, tileMode);
             else epochTextureTests(context);
             std::puts("epoch texture upload tests passed");

@@ -43,7 +43,7 @@ struct TextureEpoch {
     static bool Enabled();
     void Capture(PageTracker::Range range);
     Update Check(PageTracker::Range range) const;
-    static void Count(Action action, std::uint64_t bytes = 0);
+    static void Count(Action action, std::uint64_t bytes = 0, const GuestTextureResource* descriptor = nullptr, bool storage = false);
     static std::string ProfileLine();
     PageTracker::Epoch token;
 };
@@ -107,6 +107,7 @@ public:
     Texture& operator=(const Texture&) = delete;
 
     VkImageView View() const;
+    VkImage Image() const { return image; }
     VkImageView FirstLayerView() const { return firstLayerView; }
     VkImageView BaseLevelView() const;
     struct ViewRange {
