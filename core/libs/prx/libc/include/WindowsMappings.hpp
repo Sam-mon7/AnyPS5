@@ -55,6 +55,14 @@ public:
         return enabled;
     }
 
+    static bool TrustGpuAliases() {
+        static const bool enabled = [] {
+            const auto* value = std::getenv("APS5_PAGE_TRACKER_TRUST_GPU_ALIASES");
+            return ObservationRequested() && value != nullptr && std::string_view(value) == "1";
+        }();
+        return enabled;
+    }
+
     void EnablePageObservation(bool (*ready)() noexcept) {
         if (!ObservationRequested()) return;
         MemoryLockProbe::Lock lock(mutex, "page-observation-enable", 0);
@@ -1154,13 +1162,13 @@ private:
         if (observationReady == nullptr || !observationReady()) return refuseObservation(PageArmRefusal::Metadata);
         if (compare == nullptr) return refuseObservation(PageArmRefusal::Identity);
         bool anyWritable = false;
-        if (observationOldAliases || observationHostAliases.contains(key)) return refuseObservation(PageArmRefusal::HostAlias);
+        if (observationOldAliases || (!TrustGpuAliases() && observationHostAliases.contains(key))) return refuseObservation(PageArmRefusal::HostAlias);
         for (const auto alias : observationPhysical.at(key)) {
             const auto& view = views.at(alias);
             anyWritable |= writable(view.protection);
             if (view.page->pins != 0) return refuseObservation(PageArmRefusal::Pinned);
             if (view.hostWrites != 0) return refuseObservation(PageArmRefusal::HostWriter);
-            if (view.page->hostAliases != 0) return refuseObservation(PageArmRefusal::HostAlias);
+            if (!TrustGpuAliases() && view.page->hostAliases != 0) return refuseObservation(PageArmRefusal::HostAlias);
         }
         if (!anyWritable) return refuseObservation(PageArmRefusal::Permission);
         mask &= static_cast<std::uint8_t>(~page.armed);
@@ -1283,10 +1291,10 @@ private:
         const auto& aliases = observationPhysical.at(key);
         for (std::size_t sub = 0; sub < subpages; ++sub) {
             bool anyWritable = false, open = false, hostAlias = observationOldAliases, pending = false;
-            if (const auto host = observationHostAliases.find(key); host != observationHostAliases.end()) hostAlias |= host->second != 0;
+            if (const auto host = observationHostAliases.find(key); !TrustGpuAliases() && host != observationHostAliases.end()) hostAlias |= host->second != 0;
             for (const auto alias : aliases) {
                 const auto& view = views.at(alias);
-                hostAlias |= view.page->hostAliases != 0;
+                hostAlias |= !TrustGpuAliases() && view.page->hostAliases != 0;
                 const auto owner = gpuOwner(alias + sub * subpageBytes);
                 pending |= owner != 0 && gpuPages.at(owner).pending;
                 anyWritable |= writable(view.protection);
@@ -1639,7 +1647,7 @@ private:
                 const auto key = observationViews.at(cursor);
                 keys.push_back(key);
                 ++observationHostAliases[key];
-                if (observationEnabled.load(std::memory_order_relaxed)) openObservation(cursor, allSubpages);
+                if (observationEnabled.load(std::memory_order_relaxed) && !TrustGpuAliases()) openObservation(cursor, allSubpages);
                 observeState(key);
             }
         }

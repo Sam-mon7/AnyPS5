@@ -46,6 +46,11 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+bool trustedAliases() {
+    const auto* value = std::getenv("APS5_PAGE_TRACKER_TRUST_GPU_ALIASES");
+    return ArmEnabled() && value != nullptr && std::string_view(value) == "1";
+}
+
 void geometry() {
     static_assert(PageBytes == 4096 && RegionBytes == 4 * 1024 * 1024 && RegionPages == 1024 && sizeof(Bitmap) == 128);
     std::vector<std::array<std::uint64_t, 3>> pieces;
@@ -339,7 +344,7 @@ void armingRefusals() {
     *static_cast<volatile unsigned*>(views.a) = 47;
     GuestArena::GuestArenaEndHostWrite_nid_postfix(views.a, PageBytes);
     auto* alias = GuestArena::GuestArenaMapAlias_nid_postfix(address, views.bytes);
-    require(!GuestArena::GuestArenaArmPageObservation_nid_no_patch(address, PageBytes), "unnotified host alias armed");
+    require(GuestArena::GuestArenaArmPageObservation_nid_no_patch(address, PageBytes) == trustedAliases(), "host alias arming ignored the trust switch");
     GuestArena::GuestArenaUnmapAlias_nid_postfix(alias);
     require(GuestArena::GuestArenaArmPageObservation_nid_no_patch(address, PageBytes), "closed host alias rearm failed");
     for (auto* pointer : {views.a, views.b}) {
@@ -353,10 +358,12 @@ void armingRefusals() {
     require(!GuestArena::GuestArenaArmPageObservation_nid_no_patch(address, PageBytes), "missing tracker metadata armed");
     GuestArena::GuestArenaEnablePageObservation_nid_no_patch([]() noexcept { return !Get()->Poisoned(); });
     const auto after = GuestArena::GuestArenaPageObservationCounts_nid_no_patch();
-    for (const auto reason : {GuestArena::PageArmRefusal::InvalidRange, GuestArena::PageArmRefusal::UnknownMapping, GuestArena::PageArmRefusal::Metadata, GuestArena::PageArmRefusal::Pinned, GuestArena::PageArmRefusal::HostWriter, GuestArena::PageArmRefusal::HostAlias, GuestArena::PageArmRefusal::Permission}) {
+    for (const auto reason : {GuestArena::PageArmRefusal::InvalidRange, GuestArena::PageArmRefusal::UnknownMapping, GuestArena::PageArmRefusal::Metadata, GuestArena::PageArmRefusal::Pinned, GuestArena::PageArmRefusal::HostWriter, GuestArena::PageArmRefusal::Permission}) {
         const auto i = static_cast<std::size_t>(reason);
         require(after.refusals[i] > before.refusals[i], "arming refusal reason not counted");
     }
+    const auto hostAlias = static_cast<std::size_t>(GuestArena::PageArmRefusal::HostAlias);
+    require((after.refusals[hostAlias] > before.refusals[hostAlias]) != trustedAliases(), "host alias refusal ignored the trust switch");
     const auto line = Get()->ProfileLine();
     require(line.find("redzone-marker=") != std::string::npos && line.find("fallback-ms=1000") != std::string::npos && line.find("immutable:") != std::string::npos && line.find("import-read-share=") != std::string::npos, "armed diagnostics missing");
     GuestArena::GuestArenaSetProtection_nid_postfix(address, views.bytes, PAGE_EXECUTE_READWRITE);
@@ -519,7 +526,7 @@ void aliases(bool enabled) {
         auto* alias = GuestArena::GuestArenaMapAlias_nid_postfix(a.address, bytes);
         require(tracker->DirtySince(a, tokenA) && tracker->DirtySince(b, tokenB), "persistent host alias proved clean");
         tracker->ObserveRead(a, AgcDriver::GuestMemory::ReadSite::BufferUpload);
-        require(tracker->Counts().reads[static_cast<std::size_t>(AgcDriver::GuestMemory::ReadSite::BufferUpload)][static_cast<std::size_t>(Kind::Import)].total >= a.bytes, "host import read kind missing");
+        if (!trustedAliases()) require(tracker->Counts().reads[static_cast<std::size_t>(AgcDriver::GuestMemory::ReadSite::BufferUpload)][static_cast<std::size_t>(Kind::Import)].total >= a.bytes, "host import read kind missing");
         GuestArena::GuestArenaUnmapAlias_nid_postfix(alias);
         const auto closedA = tracker->CaptureEpoch(a), closedB = tracker->CaptureEpoch(b);
         require(!tracker->DirtySince(a, closedA) && !tracker->DirtySince(b, closedB), "closed host alias stayed unprovable");
@@ -536,6 +543,30 @@ void aliases(bool enabled) {
     GuestArena::GuestArenaReset_nid_postfix(second, bytes);
     GuestArena::GuestArenaRelease_nid_postfix(first, bytes);
     GuestArena::GuestArenaRelease_nid_postfix(second, bytes);
+}
+
+void trustedAliasCoverage() {
+    constexpr std::size_t bytes = 0x4000;
+    auto* view = GuestArena::GuestArenaAllocate_nid_postfix(bytes, RegionBytes);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    require(section != nullptr, "trusted alias test section failed");
+    GuestArena::GuestArenaMap_nid_postfix(view, bytes, section, 0, PAGE_READWRITE);
+    CloseHandle(section);
+    const Range a{reinterpret_cast<std::uintptr_t>(view), PageBytes};
+    auto* tracker = Get();
+    std::array<void*, 16> pages{};
+    std::size_t count = pages.size();
+    require(GuestArena::GuestArenaCollectWrites_nid_postfix(a.address, bytes, pages.data(), &count, true), "trusted alias collection failed");
+    auto* alias = GuestArena::GuestArenaMapAlias_nid_postfix(a.address, bytes);
+    const auto token = tracker->CaptureEpoch(a);
+    require(tracker->DirtySince(a, token) != trustedAliases(), "GPU alias coverage ignored the trust switch");
+    if (trustedAliases()) {
+        require(GuestArena::GuestArenaHandleWrite_nid_postfix(a.address), "write fault under a trusted alias rejected");
+        require(tracker->DirtySince(a, token), "CPU write under a trusted alias was not observed");
+    }
+    GuestArena::GuestArenaUnmapAlias_nid_postfix(alias);
+    GuestArena::GuestArenaReset_nid_postfix(view, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(view, bytes);
 }
 
 void declarationSkips() {
@@ -608,6 +639,7 @@ int main() {
         inaccessible();
         aliases(enabled);
         if (enabled) declarationSkips();
+        if (ArmEnabled()) trustedAliasCoverage();
         protectedObservation();
         armingRefusals();
         mixedProtections();
