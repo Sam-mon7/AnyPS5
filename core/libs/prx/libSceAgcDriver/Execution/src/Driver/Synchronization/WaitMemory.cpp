@@ -138,8 +138,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         ++outcomes.atEntry;
         return;
     }
-    if (heldAtSubmit) return;
-    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+    if (heldAtSubmit && !Graphics::Recorder::ParseTimeLabels()) return;
+    if (std::uint32_t writer = queue; !Graphics::Recorder::ParseTimeLabels() && !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
         if (writer != queue) notePendingWait(packet, queue, received);
         else epochPoint.bump = false;
         return;

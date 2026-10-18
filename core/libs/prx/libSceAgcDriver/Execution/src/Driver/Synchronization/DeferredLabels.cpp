@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "ThreadOwned.hpp"
 #include <cstdlib>
 
@@ -10,6 +11,21 @@ namespace AgcDriver::DriverDetail {
 DeferredLabels& deferredLabels() {
     static thread_local DeferredLabels* deferred = nullptr;
     return ShaderRecompiler::ThreadOwned(deferred);
+}
+
+bool TryParseTimeLabelPacket(std::span<const std::uint32_t> packet) {
+    if (!Graphics::Recorder::ParseTimeLabels() || packet.empty() || !deferredLabels().labels.empty()) return false;
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    if (opcode == 0x49) {
+        if (packet.size() < 7 || (packet[2] >> 29u) == 0 || (packet[2] >> 29u) > 2 || ((packet[2] >> 24u) & 7u) != 0) return false;
+    } else if (opcode != 0x37) {
+        return false;
+    }
+    const auto label = Pm4::DecodeLabelWrite(packet);
+    if (!label.has_value()) return false;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    return Graphics::Recorder::TryParseTimeLabel(label->address, label->Bytes());
 }
 
 bool DeferLabels() {

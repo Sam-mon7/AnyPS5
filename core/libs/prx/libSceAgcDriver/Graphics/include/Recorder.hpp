@@ -56,6 +56,29 @@ public:
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
     VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    static bool RecordWorkerEnabled();
+    struct DispatchCommand {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        const ShaderResources* resources = nullptr;
+        std::array<std::byte, 128> push{};
+        std::uint32_t pushBytes = 0;
+        std::uint32_t x = 1, y = 1, z = 1;
+        VkBuffer indirect = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        bool leading = true;
+    };
+    void RecordDispatch(const DispatchCommand& command);
+    bool TryRecordDispatch(VkPipeline pipeline, VkPipelineLayout layout, std::shared_ptr<void> objects, std::shared_ptr<ShaderResources> resources, std::span<const std::byte> push, std::uint32_t x, std::uint32_t y, std::uint32_t z, VkBuffer indirect = VK_NULL_HANDLE, VkDeviceSize offset = 0, std::uint64_t arguments = 0);
+    struct RecordStatistics {
+        std::uint64_t commands, chunks, producerNs, workerNs, waitNs, queueDepth, maxQueueDepth;
+    };
+    static RecordStatistics RecordCounts();
+    static bool ParseTimeLabels();
+    static bool TryParseTimeLabel(std::uint64_t address, std::span<const std::byte> bytes);
+    static void CountCompletionLabel();
+    struct ParseLabelStatistics { std::uint64_t parsed, completion; };
+    static ParseLabelStatistics ParseLabelCounts();
     // After a trailing barrier with ALL_COMMANDS as its destination stage: `access` is its
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
@@ -776,6 +799,9 @@ private:
     bool unsignaled(std::uint64_t serial) const;
 
     Context context;
+    struct RecordingWorker;
+    std::unique_ptr<RecordingWorker> recordingWorker;
+    void finishRecording();
     struct SubmitProgress;
     std::shared_ptr<SubmitProgress> submitProgress;
     struct CompletionProbe;

@@ -43,6 +43,7 @@ void reportSync() {
 }
 
 void countLabelOutcome(int reason) {
+    if (reason == 0 || reason == 5) Graphics::Recorder::CountCompletionLabel();
     if (reason == 0) ++gpuLabels;
     else if (reason == 5) ++completionLabels;
     else ++labelFallbacks[std::min(reason, 4)];

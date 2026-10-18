@@ -73,7 +73,10 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !endOfPipeInterrupt && (opcode == 0x49 || opcode == 0x37)) {
         if (const auto label = Pm4::DecodeLabelWrite(packet)) {
             const auto bytes = label->Bytes();
-            if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
+            if (TryParseTimeLabelPacket(packet)) {
+                noteLabelStore(label->address, bytes, ++eventSerial, submission.queue);
+                wroteOnGpu = true;
+            } else if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
 
                 auto& deferred = deferredLabels();
                 if (deferred.labels.empty()) deferred.since = std::chrono::steady_clock::now();
@@ -343,6 +346,10 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     const auto interruptSelect = opcode == 0x49 ? (packet[2] >> 24u) & 7u : 0u;
     const bool endOfPipeInterrupt = interruptSelect != 0 && interruptSelect != 3;
     const auto label = Pm4::DecodeLabelWrite(packet);
+    if (Graphics::Recorder::ParseTimeLabels() && !endOfPipeInterrupt && label.has_value() && !DrawPipeline::Queue0().Busy() && TryParseTimeLabelPacket(packet)) {
+        noteLabelStore(label->address, label->Bytes(), ++eventSerial, queue);
+        return true;
+    }
     if (!label.has_value()) {
         if (opcode != 0x49) return false;
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;

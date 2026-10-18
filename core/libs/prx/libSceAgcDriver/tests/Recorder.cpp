@@ -1052,7 +1052,7 @@ void vramDescriptorSparseGrowthTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
-void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
+void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool recordWorker = false) {
     auto context = device.GetContext();
     context.nullDescriptors = device.NullDescriptors();
     if (context.hostImportAlignment == 0 || !context.nullDescriptors || !AgcDriver::GuestMemory::WriteWatched()) {
@@ -1128,7 +1128,9 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, release.module, "main", nullptr};
     pipelineInfo.layout = release.layout;
     Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &release.pipeline), "ordering pipeline");
+    const auto recordCountsBefore = Recorder::RecordCounts();
     const auto update = [&](const std::shared_ptr<ShaderResources>& resources, std::uint32_t delta, std::uint32_t count = 1) {
+        if (recordWorker && recorder.TryRecordDispatch(release.pipeline, release.layout, {}, resources, std::as_bytes(std::span(&delta, 1)), count, 1, 1)) return;
         const auto commands = recorder.Commands();
         recorder.Keep(resources);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -1193,6 +1195,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     update(direct, 2);
     recorder.Sync();
     Require(*block == 45, "direct consumers lost GPU-ordered updates");
+    if (recordWorker && Recorder::RecordWorkerEnabled()) Require(Recorder::RecordCounts().commands > recordCountsBefore.commands, "direct dispatches did not reach the recording worker");
     {
         TextureDetiler detiler(context);
         auto imageContext = context;
@@ -8667,6 +8670,11 @@ int main(int argc, char** argv) {
             recorder.FinishUpTo(serial);
             Require(completed && recorder.Idle(), "timeline wait did not complete the handed-off batch");
             std::cout << "Submit worker device tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--record-worker-only") {
+            copiedDirectOrderingTests(device, recorder, true);
+            std::cout << "Record worker device tests passed\n";
             return 0;
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--vram-lazy-only" || std::string_view(argv[1]) == "--vram-lazy-imports")) {

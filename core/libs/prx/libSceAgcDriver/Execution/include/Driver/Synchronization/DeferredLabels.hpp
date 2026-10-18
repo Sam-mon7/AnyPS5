@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -27,6 +28,7 @@ struct DeferredLabels {
 DeferredLabels& deferredLabels();
 
 bool DeferLabels();
+bool TryParseTimeLabelPacket(std::span<const std::uint32_t> packet);
 
 bool QueuedLabelTable();
 
