@@ -175,6 +175,11 @@ void Driver::execute(const Submission& submission) {
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (Graphics::Recorder::ComputeChainsEnabled() && Graphics::Recorder::ComputeChainPacketBoundary(header)) {
+            if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (auto* recorder = Graphics::Recorder::Active()) recorder->EndComputeChain(Graphics::Recorder::ComputeChainReason::Pm4);
+        }
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
