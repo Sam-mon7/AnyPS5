@@ -1261,7 +1261,7 @@ void ReportRecording() {
     if (Recorder::RecordWorkerEnabled()) {
         const auto counts = Recorder::RecordCounts();
         const auto saved = static_cast<std::int64_t>(counts.workerNs) - static_cast<std::int64_t>(counts.producerNs + counts.waitNs);
-        AgcDriver::ProfilePrint_nid_no_patch("[recorder] record worker: %llu dispatches, %llu chunks, producer append %.1f us, worker replay %.1f us, producer waits %.1f us, estimated producer time saved %.1f us, queue %llu / max %llu chunks\n",
+        AgcDriver::ProfilePrint_nid_no_patch("[recorder] record worker: %llu commands, %llu chunks, producer append %.1f us, worker replay %.1f us, producer waits %.1f us, estimated producer time saved %.1f us, queue %llu / max %llu chunks\n",
             static_cast<unsigned long long>(counts.commands), static_cast<unsigned long long>(counts.chunks), counts.producerNs / 1000.0, counts.workerNs / 1000.0, counts.waitNs / 1000.0, saved / 1000.0,
             static_cast<unsigned long long>(counts.queueDepth), static_cast<unsigned long long>(counts.maxQueueDepth));
     }
@@ -1276,10 +1276,14 @@ void ReportRecording() {
 struct Recorder::RecordingWorker {
     static constexpr std::size_t ChunkBytes = 64 * 1024;
     static constexpr std::size_t PublishCommands = 128;
+    struct Command {
+        DispatchCommand dispatch;
+        std::function<void(VkCommandBuffer)> replay;
+    };
     struct Chunk {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         std::size_t count = 0;
-        std::array<DispatchCommand, ChunkBytes / sizeof(DispatchCommand)> records;
+        std::array<Command, ChunkBytes / sizeof(Command)> records;
     };
     static_assert(std::tuple_size_v<decltype(Chunk::records)> >= PublishCommands);
     Context context;
@@ -1320,7 +1324,7 @@ struct Recorder::RecordingWorker {
         recordChunks.fetch_add(1, std::memory_order_relaxed);
         wake.notify_one();
     }
-    void Append(VkCommandBuffer commands, const DispatchCommand& command) {
+    void Append(VkCommandBuffer commands, Command command) {
         if (pending == nullptr) {
             {
                 std::lock_guard lock(mutex);
@@ -1333,7 +1337,7 @@ struct Recorder::RecordingWorker {
             pending->commands = commands;
             pending->count = 0;
         }
-        pending->records[pending->count++] = command;
+        pending->records[pending->count++] = std::move(command);
         batchRecording = true;
         if (pending->count == PublishCommands) Publish();
     }
@@ -1352,7 +1356,12 @@ struct Recorder::RecordingWorker {
         const auto bind = context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline");
         const auto push = context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants");
         for (std::size_t i = 0; i < chunk.count; ++i) {
-            const auto& record = chunk.records[i];
+            const auto& entry = chunk.records[i];
+            if (entry.replay) {
+                entry.replay(chunk.commands);
+                continue;
+            }
+            const auto& record = entry.dispatch;
             if (record.indirect != VK_NULL_HANDLE) {
                 const VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
                 barrier(chunk.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
@@ -1382,6 +1391,7 @@ struct Recorder::RecordingWorker {
             const auto start = std::chrono::steady_clock::now();
             try { if (failure == nullptr) Replay(*chunk); }
             catch (...) { failure = std::current_exception(); }
+            for (std::size_t i = 0; i < chunk->count; ++i) chunk->records[i] = {};
             recordWorkerNs.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
             recordQueueDepth.fetch_sub(1, std::memory_order_relaxed);
             {
@@ -1409,6 +1419,23 @@ void Recorder::finishRecording() {
     recordingWorker->batchRecording = false;
 }
 
+bool Recorder::CanRecordDraw() const {
+    return recordingWorker != nullptr && !GpuTimingEnabled() && !BarrierValidate() && !countingSamples && !VramMirrorWrites();
+}
+
+void Recorder::RecordCommand(std::function<void(VkCommandBuffer)> command) {
+    const auto start = std::chrono::steady_clock::now();
+    ensureOpen();
+    if (recordingWorker == nullptr) {
+        command(open->commands);
+        return;
+    }
+    recordingWorker->Append(open->commands, {{}, std::move(command)});
+    recordCommands.fetch_add(1, std::memory_order_relaxed);
+    recordProducerNs.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
+    if (recordQueueDepth.load(std::memory_order_relaxed) >= 64) finishRecording();
+}
+
 void Recorder::RecordDispatch(const DispatchCommand& command) {
     const auto start = std::chrono::steady_clock::now();
     Require(command.pushBytes <= command.push.size() && command.pushBytes % 4 == 0, "invalid recorded dispatch push constants");
@@ -1416,14 +1443,14 @@ void Recorder::RecordDispatch(const DispatchCommand& command) {
         RecordingWorker inlineWorker(context, false);
         RecordingWorker::Chunk chunk;
         chunk.commands = Commands();
-        chunk.records[0] = command;
+        chunk.records[0].dispatch = command;
         chunk.count = 1;
         inlineWorker.Replay(chunk);
         return;
     }
     if (open != nullptr && (open->renderPass.open || open->run.open || !open->run.queued.empty() || !open->keyStores.empty())) Submit();
     ensureOpen();
-    recordingWorker->Append(open->commands, command);
+    recordingWorker->Append(open->commands, {command, {}});
     recordCommands.fetch_add(1, std::memory_order_relaxed);
     recordProducerNs.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
     if (command.leading) CountBarriers(CommandClass::DispatchLeading);
@@ -1874,12 +1901,25 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
-Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
-    finishRecording();
+Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool deferred) {
+    Require(!deferred || CanRecordDraw(), "draw cannot use deferred recording");
+    if (!deferred) finishRecording();
     ensureOpen();
     auto& pass = open->renderPass;
+    if (pass.open && pass.deferred != deferred) endOpenRenderPass();
+    const auto commandsForDraw = [&] {
+        if (!deferred) return Commands();
+        if (pass.open) endOpenRenderPass(true, true);
+        if (open->run.open && !LabelRunsPerBatch()) {
+            finishRecording();
+            closeStoreRun();
+        }
+        open->coveredAccess = 0;
+        pass.deferred = true;
+        return open->commands;
+    };
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
-        const auto commands = Commands();
+        const auto commands = commandsForDraw();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
         return {commands, false, true};
@@ -1888,8 +1928,8 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
-    endOpenRenderPass(!merge);
-    const auto commands = Commands();
+    endOpenRenderPass(!merge, deferred);
+    const auto commands = commandsForDraw();
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
     return {commands, false, !elide};
@@ -1908,8 +1948,24 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     open->passHazards.Add(access);
 }
 
-void Recorder::endOpenRenderPass(bool barrier) {
+void Recorder::endOpenRenderPass(bool barrier, bool deferred) {
     auto& pass = open->renderPass;
+    if (pass.deferred) {
+        Require(!open->segmentActive && pass.timing == NoTiming, "deferred pass has active queries");
+        RecordCommand([context = context, barrier, afterPass = std::move(pass.afterPass)](VkCommandBuffer commands) {
+            EndRenderPass(context, commands);
+            if (barrier) RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            if (afterPass) afterPass(commands);
+        });
+        if (barrier) CountBarriers(CommandClass::Draw);
+        open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
+        open->hostReadOwed = true;
+        pass = {};
+        if (!deferred) finishRecording();
+        return;
+    }
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
