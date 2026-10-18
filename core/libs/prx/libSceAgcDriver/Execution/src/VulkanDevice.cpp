@@ -9,6 +9,7 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/VulkanQueues.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DispatchCoverage.hpp"
@@ -73,6 +74,12 @@
 #include <utility>
 
 namespace AgcDriver {
+
+std::shared_ptr<DriverDetail::Lanes::VulkanQueues> DriverDetail::Lanes::FindQueues(VkDevice device) {
+    std::lock_guard lock(registryMutex);
+    const auto found = registry.find(device);
+    return found == registry.end() ? nullptr : found->second.lock();
+}
 namespace {
 
 void check(VkResult result, const char* operation) {
@@ -253,6 +260,7 @@ struct VulkanDevice::State {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    std::shared_ptr<DriverDetail::Lanes::VulkanQueues> laneQueues;
     VkCommandPool pool = VK_NULL_HANDLE;
     void* window = nullptr;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -669,6 +677,11 @@ struct VulkanDevice::State {
             const auto idle = Graphics::OrderedQueueCall([&] { return reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device); });
             Graphics::Aftermath::Notify(idle);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+            if (laneQueues) {
+                DriverDetail::Lanes::PublishQueues(device, nullptr);
+                laneQueues->Close();
+                laneQueues.reset();
+            }
             // Resident images kept for unfinished presentations go before the caches they came from.
             {
                 std::lock_guard lock(presentMutex);
@@ -1406,9 +1419,28 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     queueInfo.queueFamilyIndex = family;
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &priority;
+    DriverDetail::Lanes::QueuePlan lanePlan{family, family, 1};
+    if (DriverDetail::Lanes::AsyncComputeEnabled()) {
+        std::uint32_t count = 0;
+        auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+        getFamilies(selected, &count, nullptr);
+        std::vector<VkQueueFamilyProperties> families(count);
+        getFamilies(selected, &count, families.data());
+        lanePlan = DriverDetail::Lanes::SelectQueues(families, family, true);
+    }
+    std::array<float, DriverDetail::Lanes::AsyncQueueCount> computePriorities;
+    computePriorities.fill(priority);
+    std::array<VkDeviceQueueCreateInfo, 2> laneQueueInfos{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+    laneQueueInfos[1].queueFamilyIndex = lanePlan.compute;
+    laneQueueInfos[1].queueCount = lanePlan.count;
+    laneQueueInfos[1].pQueuePriorities = computePriorities.data();
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
+    if (lanePlan.Dedicated()) {
+        deviceInfo.queueCreateInfoCount = laneQueueInfos.size();
+        deviceInfo.pQueueCreateInfos = laneQueueInfos.data();
+    }
     VkPhysicalDeviceFeatures available{};
     state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures>("vkGetPhysicalDeviceFeatures")(selected, &available);
     require(available.vertexPipelineStoresAndAtomics && available.fragmentStoresAndAtomics, "graphics shader buffer writes and atomics are unavailable");
@@ -1759,6 +1791,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
+    if (DriverDetail::Lanes::Enabled()) {
+        state->laneQueues = std::make_shared<DriverDetail::Lanes::VulkanQueues>(state->device, lanePlan, state->deviceProc, state->timelineSemaphores,
+            [](const std::function<VkResult()>& work) { return Graphics::OrderedQueueCall(work); });
+        DriverDetail::Lanes::PublishQueues(state->device, state->laneQueues);
+    }
     if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
     if (state->checkpointMarker != nullptr && std::getenv("APS5_GPU_COPY_CHECKPOINTS") != nullptr) {
         state->copyCheckpoints = std::make_shared<Graphics::GpuCopyCheckpoints>(state->device, state->checkpointMarker);

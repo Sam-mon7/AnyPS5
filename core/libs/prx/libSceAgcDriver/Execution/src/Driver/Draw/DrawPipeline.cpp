@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/WorkerPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include <algorithm>
@@ -27,6 +28,7 @@ DrawPipeline& DrawPipeline::Queue0() {
 }
 
 std::size_t DrawPipeline::Depth() {
+    if (Lanes::Enabled()) return 0;
     static const std::size_t depth = [] {
         const char* text = std::getenv("APS5_PIPELINED_DRAWS");
         if (std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr || std::getenv("APS5_DRAW_DRAIN") != nullptr || std::getenv("APS5_DRAIN_ALL") != nullptr || std::getenv("APS5_NO_WORDWISE_CAPTURE") != nullptr) return std::size_t{0};
