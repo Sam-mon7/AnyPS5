@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PageTracker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -113,6 +114,7 @@ void Driver::stop() {
 }
 
 Driver::Driver() {
+    PageTracker::Initialize();
     static_cast<void>(GuestMemory::TrackerGeneration());
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
     try {

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PageTracker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ResourcePhase.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -1621,6 +1622,7 @@ void publishLazyPages(ImageMirror& mirror, std::uint64_t begin, std::uint64_t en
 #ifdef _WIN32
             Require(GuestArena::GuestArenaPublishGpuPage_nid_no_patch(page, bytes.data() + index * 4096, nullptr), "a lazy mirror page could not be published");
 #endif
+            PageTracker::Publish({page, 4096});
             GuestMemory::MarkWritten(page, 4096);
             Recorder::NoteWrittenBack(page, 4096);
             mirror.lazyPages.erase(page);
@@ -1750,6 +1752,7 @@ void publishMirrorPages(ImageMirror& mirror, const std::shared_ptr<MirrorWriteIn
 #else
             Require(false, "writable mirror publication requires Windows guest page tracking");
 #endif
+            PageTracker::Publish({page, 4096});
             GuestMemory::MarkWritten(page, 4096);
             Recorder::NoteWrittenBack(page, 4096);
             ++added.pagesWritten;
@@ -3923,6 +3926,7 @@ bool LazyMirrorFillCovers(const Context& context, std::uint64_t address, std::si
 }
 
 LazyMirrorFill BeginLazyMirrorFill(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    PageTracker::GpuWrite({address, bytes});
     GuestMemory::AssertGpuLockHeld("lazy mirror fill");
     auto mirror = lazyFillMirror(context, address, bytes);
     Require(mirror != nullptr, "a lazy mirror fill lost its mirror");
@@ -5959,6 +5963,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
         const auto& region = *found;
         if (region.direct != nullptr || (region.mirror == nullptr && region.mirrorPieces.empty() && region.gpuCopy && region.copiedBack)) {
             const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            PageTracker::Publish({begin, end - begin});
             GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
             if (profile) {
                 const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -5971,6 +5976,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
 namespace {
 
 void storeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
+    PageTracker::Publish({address, current.size()});
     const auto writable = GuestMemory::DescribeCommitted(address, current.size(), true);
     if (writable.whole) {
         GuestMemory::WriteChanged(address, current, original);
@@ -5995,6 +6001,7 @@ void storeChanged(std::uint64_t address, std::span<const std::byte> current, std
 }
 
 void storeSparse(ImageMirror& mirror, std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
+    PageTracker::Publish({address, current.size()});
     constexpr std::uint64_t block = 65536;
     const auto end = address + current.size();
     const auto forget = [&](std::uint64_t from, std::uint64_t to) {
@@ -6221,7 +6228,18 @@ void GuestBufferMemory::prepareMirrorWrites(bool addressable) {
     }
 }
 
+void GuestBufferMemory::declarePageWrites() const {
+    if (!PageTracker::Enabled()) return;
+    for (const auto& [begin, end] : writes) PageTracker::GpuWrite({begin, end - begin});
+    const auto mark = [](const auto& list) {
+        for (const auto& region : list) if (region.direct != nullptr && region.writable) PageTracker::GpuWrite({region.begin, region.end - region.begin});
+    };
+    if (space != nullptr) mark(space->base);
+    mark(regions);
+}
+
 void GuestBufferMemory::BeginGpuWrites(Recorder& recorder) {
+    declarePageWrites();
     if (VramLazyWrites()) { beginLazyWrites(&recorder); return; }
     if (!VramWritable()) return;
     GuestMemory::AssertGpuLockHeld("VRAM mirror command recording");
@@ -6234,6 +6252,7 @@ void GuestBufferMemory::BeginGpuWrites(Recorder& recorder) {
 }
 
 void GuestBufferMemory::BeginGpuWrites(CommandBatch& batch) {
+    declarePageWrites();
     if (!VramLazyWrites()) return;
     synchronousWrites = true;
     synchronousSubmission = batch.TrackSubmission();
@@ -6252,6 +6271,7 @@ void GuestBufferMemory::ReadyForSubmit(Recorder& recorder) {
 }
 
 void GuestBufferMemory::SealForSubmit(CommandBatch* batch) {
+    declarePageWrites();
     if (VramLazyWrites()) {
         if (!synchronousWrites) {
             synchronousWrites = true;
@@ -6314,6 +6334,7 @@ void GuestBufferMemory::recordMirrorWrites(Recorder* recorder) {
 }
 
 void GuestBufferMemory::QueueBdaWrites(std::uint64_t address, std::size_t bytes) const {
+    PageTracker::GpuWrite({address, bytes}, PageTracker::Source::BdaReport);
     if (VramLazyWrites()) {
         Require(address % 4096 == 0 && bytes % 4096 == 0, "a lazy BDA write report is not page aligned");
         for (const auto& [mirror, interval] : mirrorWrites) {
@@ -6344,6 +6365,14 @@ void GuestBufferMemory::QueueBdaWrites(std::uint64_t address, std::size_t bytes)
 }
 
 void GuestBufferMemory::QueueBdaOverflow() const {
+    if (PageTracker::Enabled()) {
+        for (const auto& [mirror, interval] : mirrorWrites) for (const auto& [begin, end] : interval->watched) PageTracker::GpuWrite({begin, end - begin}, PageTracker::Source::BdaOverflow);
+        const auto mark = [](const auto& list) {
+            for (const auto& region : list) if (region.direct != nullptr && region.writable) PageTracker::GpuWrite({region.begin, region.end - region.begin}, PageTracker::Source::BdaOverflow);
+        };
+        if (space != nullptr) mark(space->base);
+        mark(regions);
+    }
     if (VramLazyWrites()) {
         for (const auto& [mirror, interval] : mirrorWrites) {
             if (mirror->sparse) for (const auto& [begin, end] : mirror->committed) QueueBdaWrites(begin, static_cast<std::size_t>(end - begin));
@@ -6504,6 +6533,7 @@ void GuestBufferMemory::recordMirrorResults(Recorder* recorder) {
 
 void GuestBufferMemory::WriteBack() {
     Require(uploaded && !committed, "guest memory cannot be committed twice or before upload");
+    if (PageTracker::Enabled()) for (const auto& [begin, end] : writes) PageTracker::Publish({begin, end - begin});
     recordMirrorResults(nullptr);
     completeMirrorWrites();
     for (const auto& readback : mirrorReadbacks) {
@@ -6514,6 +6544,7 @@ void GuestBufferMemory::WriteBack() {
         const auto original = readback.reference->ReadBytes(offset, readback.bytes);
         auto& mirror = *readback.mirror;
         Recorder::NoteWrittenBack(readback.begin, readback.bytes);
+        PageTracker::Publish({readback.begin, readback.bytes});
         if (mirror.sparse) storeSparse(mirror, readback.begin, current, original);
         else storeChanged(readback.begin, current, original);
         if (!mirror.heap) std::memcpy(mirror.shadow.data() + readback.begin - mirror.base, current.data(), readback.bytes);

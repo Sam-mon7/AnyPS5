@@ -447,6 +447,7 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
 
 private:
+    void declarePageWrites() const;
     struct MirrorPiece {
         std::uint64_t begin;
         std::uint64_t end;
