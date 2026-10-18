@@ -7476,6 +7476,87 @@ void atomicViewTests(const Device& device, Recorder& recorder) {
     }
 }
 
+bool drawEvictionTests(const Device& device, Recorder& recorder) {
+    if (!device.Graphics()) return false;
+    constexpr std::size_t unit = 65536;
+    void* watched = AllocateWatched(unit, unit);
+    std::vector<std::byte> fallback(watched == nullptr ? 2 * unit : 0);
+    auto* block = watched != nullptr ? static_cast<std::byte*>(watched) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(fallback.data()) + unit - 1) & ~(unit - 1));
+    struct Release {
+        void* watched;
+        ~Release() { if (watched != nullptr) ReleaseWatched(watched, unit); }
+    } release{watched};
+    std::fill_n(block, unit, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, unit, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), unit);
+        }
+    } cleanup{context, recorder, block};
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto firstVertex = shader(COVER_VERT_SPV, 301);
+    auto firstPixel = shader(COVER_FRAG_SPV, 302);
+    auto secondVertex = shader(COVER_VERT_SPV, 303);
+    auto secondPixel = shader(COVER_FRAG_SPV, 304);
+    const std::array first{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &firstVertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &firstPixel, 0}};
+    const std::array second{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &secondVertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &secondPixel, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    const bool deferred = std::getenv("APS5_DEFER_DRAW_EVICTION") != nullptr;
+    const auto before = DrawEvictionsDeferred();
+    for (int round = 0; round < 2; ++round) {
+        Draw(context, state, triangle, first);
+        Draw(context, state, triangle, second);
+    }
+    WaitForOptimizedPipelines(context.device);
+    recorder.Sync();
+    const auto evictions = DrawEvictionsDeferred() - before;
+    Require(SharedResourceCache().Size() == 1, "the recorded draws did not enter a one-entry resource cache");
+    Require(deferred ? evictions >= 3 : evictions == 0, deferred ? "the draws' evicted resources were not handed to the recorder" : "evicted draw resources were deferred with the switch off");
+    std::vector<std::byte> texels(64 * 64 * 4);
+    ReadColorTarget(state.color, texels);
+    Require(std::all_of(texels.begin(), texels.end(), [](std::byte value) { return value == std::byte{255}; }), "the draws around the evictions did not cover the target");
+    std::cout << "Draw eviction tests passed (" << (deferred ? "deferred" : "inline") << ", " << evictions << " handed to the recorder)\n";
+    return true;
+}
+
 bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool imported) {
     if (!device.Graphics() || (imported && device.GetContext().hostImportAlignment == 0)) return false;
     constexpr std::size_t unit = 65536;
@@ -8570,6 +8651,9 @@ int main(int argc, char** argv) {
             RunVramLazyTests(device.GetContext(), recorder, std::string_view(argv[1]) == "--vram-lazy-imports");
             std::cout << "Lazy mirror coherence tests passed\n";
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-eviction-only") {
+            return drawEvictionTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--vram-cleanup-only") {
             RunVramCleanupTests(device.GetContext(), recorder);

@@ -822,6 +822,19 @@ std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters
     return *writers;
 }
 
+namespace {
+
+std::atomic<std::uint64_t>& DeferredDrawEvictions() {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
+}
+
+std::uint64_t DrawEvictionsDeferred() {
+    return DeferredDrawEvictions().load(std::memory_order_relaxed);
+}
+
 const char* IndirectDrawPathName(IndirectDrawPath path) {
     return IndirectDrawPathNames[static_cast<std::size_t>(path)];
 }
@@ -2209,7 +2222,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
-    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    if (cacheable && built != nullptr && recorded && resources->Reusable()) {
+        static const bool deferEviction = std::getenv("APS5_DEFER_DRAW_EVICTION") != nullptr;
+        std::vector<std::shared_ptr<ShaderResources>> evicted;
+        SharedResourceCache().Insert(contentKey, resources, deferEviction ? &evicted : nullptr);
+        DeferredDrawEvictions().fetch_add(evicted.size(), std::memory_order_relaxed);
+        for (auto& object : evicted) recorder->Keep(std::move(object));
+    }
     timer.part(PartInsert);
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
