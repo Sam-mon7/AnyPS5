@@ -2025,6 +2025,7 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    if (state->recorder != nullptr) state->recorder->EndComputeChain(Graphics::Recorder::ComputeChainReason::Label);
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
     if (Graphics::PendingStorageOverlaps(address, bytes.size(), nullptr)) return 3;
     auto& recorder = *state->recorder;
@@ -4220,7 +4221,29 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    Graphics::Recorder::ComputeDispatchStart computeStart;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> computeReads;
+    std::vector<std::pair<VkImage, bool>> computeImages;
+    Graphics::PassAccess computeAccess{};
+    if (Graphics::Recorder::ComputeChainsEnabled()) {
+        using Reason = Graphics::Recorder::ComputeChainReason;
+        auto fallback = Reason::Count;
+        if (resources.HoldsLease() || resources.UsesAddressTable() || !resources.Reusable()) fallback = Reason::Unknown;
+        if (resources.NeedsCompletion() || resources.CopiedBytes() != 0) fallback = Reason::Copied;
+        if (record.dataRefresh != RecordedDispatch::DataRefresh::None && (record.dataRefresh != RecordedDispatch::DataRefresh::Hash || resources.DataWordsHash() != record.dataWordsHash)) fallback = Reason::Refresh;
+        if (argumentImport != nullptr) fallback = Reason::Indirect;
+        static const bool residentHeapMirrors = Graphics::VramOption("APS5_RESIDENT_HEAP_MIRRORS");
+        if (Graphics::VramMirrorWrites() || residentHeapMirrors) fallback = Reason::Mirror;
+        if (record.shader->program->workgroupMemoryDwords != 0 || record.x > state->properties.limits.maxComputeWorkGroupCount[0] || record.y > state->properties.limits.maxComputeWorkGroupCount[1] || record.z > state->properties.limits.maxComputeWorkGroupCount[2]) fallback = Reason::Unknown;
+        computeImages = resources.StorageImages();
+        computeReads = resources.DeviceReads();
+        computeAccess = {computeReads, resources.GpuWrites(), computeImages, {}};
+        computeStart = recorder.BeginComputeDispatch(computeAccess, fallback);
+        covered = computeStart.covered;
+    } else {
+        computeStart.commands = recorder.Commands(&covered);
+    }
+    const auto commands = computeStart.commands;
     resources.BeginGpuWrites(recorder);
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
@@ -4264,7 +4287,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     // Results of earlier recorded work are visible to this dispatch, its own to everything after.
     constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    if ((covered & shaderAccess) == shaderAccess && barrierElision) {
+    if (computeStart.continued || ((covered & shaderAccess) == shaderAccess && barrierElision)) {
         ++d.preBarriersSkipped;
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else {
@@ -4317,12 +4340,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     recorder.EndGpuTiming(gpuTiming);
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (computeStart.deferred) {
+        recorder.DeferComputeBarrier(computeAccess);
+    } else {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(dispatchedAccess);
+    }
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
     recordStep(PhaseRecordMarks);

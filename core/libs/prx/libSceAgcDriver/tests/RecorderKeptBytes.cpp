@@ -50,6 +50,7 @@ struct MockDevice {
     std::uint64_t failAt = 1;
     std::vector<std::uint32_t> dispatches, pushes;
     std::vector<char> recording;
+    std::vector<std::array<std::uint32_t, 4>> barriers;
     std::thread::id recordThread;
     bool recordLocked = false;
     std::vector<std::thread::id> recordThreads;
@@ -190,9 +191,10 @@ VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t count, con
 }
 
 VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, const void*) {}
-VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
+VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags source, VkPipelineStageFlags destination, VkDependencyFlags, std::uint32_t count, const VkMemoryBarrier* barriers, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
     std::lock_guard lock(mockMutex);
     mock.recording.push_back('B');
+    mock.barriers.push_back({source, destination, count != 0 ? barriers[0].srcAccessMask : 0u, count != 0 ? barriers[0].dstAccessMask : 0u});
 }
 VKAPI_ATTR void VKAPI_CALL mockCmdBeginQuery(VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdEndQuery(VkCommandBuffer, VkQueryPool, std::uint32_t) {}
@@ -627,6 +629,121 @@ void SubmitWorkerFailure(bool endFailure, std::uint64_t failAt = 1, bool deviceL
     Expect(mock.signaled.empty() && mock.pools.empty() && mock.commandPools.empty(), "failed submit teardown leaked mock Vulkan objects");
 }
 
+void ComputeChainTests() {
+    using Reason = Recorder::ComputeChainReason;
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto context = mockContext();
+    Recorder recorder(context);
+    recorder.Activate();
+    const bool enabled = Recorder::ComputeChainsEnabled();
+    const auto* value = std::getenv("APS5_COMPUTE_CHAINS");
+    Expect(enabled == (value != nullptr && std::string_view(value) == "1"), "compute chains must require the exact switch value 1");
+    const auto* lanes = std::getenv("APS5_GPU_LANES");
+    const bool admitted = enabled && Recorder::MergeBarriers() && !Recorder::RecordWorkerEnabled() && (lanes == nullptr || std::string_view(lanes) != "1");
+    const auto reasonCount = [](const auto& counts, Reason reason) { return counts.fallbacks[static_cast<std::size_t>(reason)]; };
+    const std::pair<std::uint64_t, std::uint64_t> a{0x1000, 0x1100}, b{0x2000, 0x2100};
+    const PassAccess writeA{{}, std::span(&a, 1), {}, {}}, writeB{{}, std::span(&b, 1), {}, {}}, readA{std::span(&a, 1), {}, {}, {}};
+    constexpr auto shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    constexpr auto trailingAccess = shaderAccess | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    const auto dispatch = [&](const PassAccess& access, Reason fallback = Reason::Count) {
+        const auto start = recorder.BeginComputeDispatch(access, fallback);
+        if (!start.continued && (!Recorder::MergeBarriers() || (start.covered & shaderAccess) != shaderAccess)) {
+            RecordMemoryBarrier(context, start.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, shaderAccess);
+        }
+        mockCmdDispatch(start.commands, 1, 1, 1);
+        if (start.deferred) recorder.DeferComputeBarrier(access);
+        else {
+            RecordMemoryBarrier(context, start.commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, trailingAccess);
+            recorder.MarkCovered(trailingAccess);
+        }
+        return start;
+    };
+    for (bool sync : {false, true}) {
+        AgcDriver::GuestMemory::SetCurrentPacket(0x15, 0);
+        const auto before = Recorder::ComputeChainCounts();
+        const auto first = mock.recording.size();
+        dispatch(writeA);
+        Expect(dispatch(writeB).continued == admitted, "disjoint dispatch did not follow the chain policy");
+        const auto beforeBoundary = mock.barriers.size();
+        if (sync) recorder.EndComputeChain(Reason::Pm4);
+        Expect(!dispatch(readA).continued, "RAW dispatch crossed a writer or a PM4 sync point");
+        if (admitted) {
+            constexpr auto stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+            const auto& barrier = mock.barriers.at(beforeBoundary);
+            Expect(mock.barriers.size() == beforeBoundary + 1 && barrier[0] == stages && barrier[1] == stages &&
+                (barrier[2] & VK_ACCESS_MEMORY_WRITE_BIT) != 0 && (barrier[3] & (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT)) == (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT), "sync or hazard did not record one global memory barrier");
+        }
+        recorder.Sync();
+        const auto counts = Recorder::ComputeChainCounts();
+        const auto barriers = std::count(mock.recording.begin() + first, mock.recording.end(), 'B');
+        const auto expected = admitted ? 3 : Recorder::MergeBarriers() ? 4 : 6;
+        Expect(barriers == expected, "dispatch barrier count changed from the enabled/disabled baseline");
+        Expect(counts.chained - before.chained == (admitted ? 1u : 0u) && counts.saved - before.saved == (admitted ? 1u : 0u), "chain counters disagree with barriers saved");
+        Expect(reasonCount(counts, Reason::Raw) - reasonCount(before, Reason::Raw) == (admitted && !sync ? 1u : 0u), "RAW did not force a barrier at the correct boundary");
+    }
+    for (const auto reason : {Reason::Waw, Reason::War}) {
+        const auto before = Recorder::ComputeChainCounts();
+        dispatch(reason == Reason::War ? readA : writeA);
+        dispatch(writeB);
+        Expect(!dispatch(writeA).continued, "buffer write hazard continued a chain");
+        recorder.Sync();
+        Expect(reasonCount(Recorder::ComputeChainCounts(), reason) - reasonCount(before, reason) == (admitted ? 1u : 0u), "write hazard lost its fallback reason");
+    }
+    for (const auto reason : {Reason::Indirect, Reason::Unknown, Reason::Refresh, Reason::Copied, Reason::Mirror}) {
+        dispatch(writeA);
+        Expect(!dispatch(writeB, reason).deferred, "an unsupported dispatch deferred its trailing barrier");
+        recorder.Sync();
+    }
+    const std::pair<VkImage, bool> image{reinterpret_cast<VkImage>(1), true};
+    const PassAccess imageAccess{{}, {}, std::span(&image, 1), {}};
+    dispatch(writeA);
+    Expect(!dispatch(imageAccess).deferred, "storage image alias uncertainty admitted a chain");
+    recorder.Sync();
+    dispatch(writeA);
+    AgcDriver::GuestMemory::SetCurrentPacket(0x15, 1);
+    const auto beforeQueue = Recorder::ComputeChainCounts();
+    Expect(!dispatch(writeB).continued, "a chain crossed recording queues");
+    recorder.Sync();
+    Expect(reasonCount(Recorder::ComputeChainCounts(), Reason::Queue) - reasonCount(beforeQueue, Reason::Queue) == (admitted ? 1u : 0u), "queue switch did not close the chain");
+    AgcDriver::GuestMemory::SetCurrentPacket(0x15, 0);
+    const auto beforeLimit = Recorder::ComputeChainCounts();
+    for (int i = 0; i < 129; ++i) dispatch(readA);
+    recorder.Sync();
+    Expect(reasonCount(Recorder::ComputeChainCounts(), Reason::Limit) - reasonCount(beforeLimit, Reason::Limit) == (admitted ? 1u : 0u), "chain tracking did not stop at its size bound");
+    for (const auto boundary : {Reason::Command, Reason::Label, Reason::Batch}) {
+        dispatch(writeA);
+        const auto first = mock.recording.size();
+        if (boundary == Reason::Command) recorder.Commands();
+        else if (boundary == Reason::Batch) recorder.Submit();
+        else {
+            const std::uint32_t label = 1;
+            recorder.RecordStore(reinterpret_cast<VkBuffer>(1), 0, std::as_bytes(std::span(&label, 1)), 0x3000);
+        }
+        Expect(!admitted || mock.recording.size() > first, "recorder boundary failed to emit the deferred global barrier");
+        recorder.Sync();
+    }
+    dispatch(writeA);
+    const auto beforeEop = mock.recording.size();
+    bool completed = false;
+    Expect(recorder.AfterRecordedWork([&] { completed = true; }), "EOP completion did not attach to the open batch");
+    Expect(!admitted || mock.recording.size() == beforeEop + 1, "EOP completion without a GPU store did not close the chain");
+    Expect(!completed, "EOP callback ran before submission");
+    recorder.Sync();
+    Expect(completed, "EOP callback was lost after the chain boundary");
+    for (const auto opcode : {0x37u, 0x3cu, 0x42u, 0x46u, 0x47u, 0x48u, 0x49u, 0x58u, 0x93u}) {
+        Expect(Recorder::ComputeChainPacketBoundary(0xc0000000u | (opcode << 8u)), "PM4 synchronization packet could continue a chain");
+    }
+    for (const auto opcode : {0x15u, 0x16u, 0x69u, 0x76u, 0x79u, 0x7au}) {
+        Expect(!Recorder::ComputeChainPacketBoundary(0xc0000000u | (opcode << 8u)), "dispatch/register packet unexpectedly closes a chain");
+    }
+    Expect(Recorder::ComputeChainPacketBoundary(0xc0001501u), "predicated dispatch could read CPU memory inside a chain");
+    if (!enabled) {
+        const auto counts = Recorder::ComputeChainCounts();
+        Expect(counts.deferred == 0 && counts.barriers == 0 && counts.chained == 0 && counts.saved == 0, "disabled compute chains changed counters");
+    }
+}
+
 void RecordWorkerOrderAndSync() {
     mock = MockDevice{};
     const bool enabled = Recorder::RecordWorkerEnabled();
@@ -772,7 +889,10 @@ int main(int argc, char** argv) {
         std::puts("Aftermath capture precedes failed recorder batch release");
         return 0;
 #endif
-        if (argc == 2 && std::string_view(argv[1]) == "record-worker") {
+        if (argc == 2 && std::string_view(argv[1]) == "compute-chains") {
+            ComputeChainTests();
+            if (Recorder::RecordWorkerEnabled()) RecordWorkerOrderAndSync();
+        } else if (argc == 2 && std::string_view(argv[1]) == "record-worker") {
             RecordWorkerOrderAndSync();
         } else if (argc == 2 && std::string_view(argv[1]) == "parse-time-labels") {
             ParseTimeLabelTests();

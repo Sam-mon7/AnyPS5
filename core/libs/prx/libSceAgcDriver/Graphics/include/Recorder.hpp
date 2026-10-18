@@ -56,6 +56,24 @@ public:
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
     VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    static bool ComputeChainsEnabled();
+    enum class ComputeChainReason : std::uint8_t { Raw, Waw, War, Image, Indirect, Unknown, Refresh, Copied, Mirror, Worker, Lanes, FullBarriers, Profiling, Queue, Limit, Pm4, Command, Batch, Label, Count };
+    static constexpr std::size_t ComputeChainReasons = static_cast<std::size_t>(ComputeChainReason::Count);
+    struct ComputeChainStatistics {
+        std::uint64_t chained, deferred, barriers, saved;
+        std::array<std::uint64_t, ComputeChainReasons> fallbacks;
+    };
+    static ComputeChainStatistics ComputeChainCounts();
+    static bool ComputeChainPacketBoundary(std::uint32_t header);
+    struct ComputeDispatchStart {
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkAccessFlags covered = 0;
+        bool continued = false;
+        bool deferred = false;
+    };
+    ComputeDispatchStart BeginComputeDispatch(const PassAccess& access, ComputeChainReason fallback = ComputeChainReason::Count);
+    void DeferComputeBarrier(const PassAccess& access);
+    void EndComputeChain(ComputeChainReason reason = ComputeChainReason::Command);
     static bool RecordWorkerEnabled();
     struct DispatchCommand {
         VkPipeline pipeline = VK_NULL_HANDLE;
@@ -799,6 +817,9 @@ private:
     bool unsignaled(std::uint64_t serial) const;
 
     Context context;
+    PassHazards computeHazards;
+    std::uint32_t computeQueue = 0;
+    std::uint32_t computeDispatches = 0;
     struct RecordingWorker;
     std::unique_ptr<RecordingWorker> recordingWorker;
     void finishRecording();

@@ -1058,7 +1058,7 @@ void vramDescriptorSparseGrowthTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
-void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool recordWorker = false) {
+void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool recordWorker = false, bool computeChains = false) {
     auto context = device.GetContext();
     context.nullDescriptors = device.NullDescriptors();
     if (context.hostImportAlignment == 0 || !context.nullDescriptors || !AgcDriver::GuestMemory::WriteWatched()) {
@@ -1137,16 +1137,54 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
     const auto recordCountsBefore = Recorder::RecordCounts();
     const auto update = [&](const std::shared_ptr<ShaderResources>& resources, std::uint32_t delta, std::uint32_t count = 1) {
         if (recordWorker && recorder.TryRecordDispatch(release.pipeline, release.layout, {}, resources, std::as_bytes(std::span(&delta, 1)), count, 1, 1)) return;
-        const auto commands = recorder.Commands();
+        Recorder::ComputeDispatchStart start;
+        const auto reads = computeChains ? resources->DeviceReads() : std::vector<std::pair<std::uint64_t, std::uint64_t>>{};
+        const PassAccess access{reads, resources->GpuWrites(), {}, {}};
+        if (computeChains) start = recorder.BeginComputeDispatch(access);
+        else start.commands = recorder.Commands();
+        const auto commands = start.commands;
         recorder.Keep(resources);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        constexpr auto shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        if (!computeChains || (!start.continued && (!Recorder::MergeBarriers() || (start.covered & shaderAccess) != shaderAccess))) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, shaderAccess);
+        }
         context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, release.pipeline);
         resources->Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, release.layout);
         context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, release.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(delta), &delta);
         context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, count, 1, 1);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        if (start.deferred) recorder.DeferComputeBarrier(access);
+        else {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+            if (computeChains) recorder.MarkCovered(shaderAccess | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        }
         resources->MarkGpuWrites(recorder);
     };
+    if (computeChains) {
+        auto separateProgram = program;
+        separateProgram.bindings[0].guestDescriptor[0] += 4096;
+        const CompiledShader separateCompute{ShaderRecompiler::ShaderStage::Compute, &separateProgram, 0};
+        auto separate = std::make_shared<ShaderResources>(context, separateCompute);
+        Require(direct->Reusable() && separate->Reusable() && direct->CopiedBytes() == 0 && separate->CopiedBytes() == 0, "compute chain fixture requires tracked direct buffers");
+        recorder.Sync();
+        AgcDriver::GuestMemory::SetCurrentPacket(0x15, 0);
+        for (bool sync : {false, true}) {
+            *block = 10;
+            block[1024] = 30;
+            const auto before = Recorder::ComputeChainCounts();
+            update(direct, 1);
+            update(separate, 2);
+            if (sync) recorder.EndComputeChain(Recorder::ComputeChainReason::Pm4);
+            update(direct, 3);
+            recorder.Sync();
+            Require(*block == 14 && block[1024] == 32, "compute chain RAW consumer read stale producer bytes");
+            const auto after = Recorder::ComputeChainCounts();
+            const auto raw = static_cast<std::size_t>(Recorder::ComputeChainReason::Raw);
+            Require(after.chained - before.chained == (Recorder::ComputeChainsEnabled() ? 1u : 0u) && after.saved - before.saved == (Recorder::ComputeChainsEnabled() ? 1u : 0u), "device dispatches did not save the expected chain barrier");
+            Require(after.fallbacks[raw] - before.fallbacks[raw] == (Recorder::ComputeChainsEnabled() && !sync ? 1u : 0u), "device RAW hazard was not closed by its dependency or sync point");
+        }
+        std::cout << "Compute chain producer/consumer tests passed\n";
+        return;
+    }
     for (int mode = 0; mode < 3; ++mode) {
         *block = 10;
         auto copiedContext = context;
@@ -8709,6 +8747,11 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext(), submitWorkerTest || dispatchHeapTest);
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--compute-chains-only") {
+            if (device.GetContext().hostImportAlignment == 0 || !device.NullDescriptors() || !AgcDriver::GuestMemory::WriteWatched()) return 77;
+            copiedDirectOrderingTests(device, recorder, false, true);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--dispatch-heap-refresh-only") {
             if (!AgcDriver::GuestMemory::WriteWatched()) return 77;
             RunResidentHeapMirrorTests(device.GetContext(), recorder, false, &gpu);
