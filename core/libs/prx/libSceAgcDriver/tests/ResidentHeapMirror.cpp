@@ -290,7 +290,7 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
     const auto rebarBefore = RebarMemory().allocations.load();
     const auto fallbackBefore = RebarMemory().overBudget.load();
     const auto liveBefore = RebarMemory().live.load();
-    if (VramWritable() && RebarMemory().limit == 0) {
+    if (VramWritable() && !VramDeviceLocalMirrors() && RebarMemory().limit == 0) {
         const auto submissions = recorder.Submissions();
         bool refused = false;
         try {
@@ -357,7 +357,9 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
     dispatch(true, [&] { static_cast<volatile std::uint8_t*>(raw)[8] = 0x55; });
     const auto* vramValue = std::getenv("APS5_VRAM_MIRRORS");
     const bool vramMirrors = vramValue != nullptr && std::strcmp(vramValue, "1") == 0;
-    if (resident && RebarMirrors()) {
+    if (VramDeviceLocalMirrors()) {
+        Require(RebarMemory().allocations.load() == rebarBefore, "device-local heap mirror allocated ReBAR memory");
+    } else if (resident && RebarMirrors()) {
         if (context.RebarMemoryType(UINT32_MAX) && RebarMemory().limit >= liveBefore + 2 * block) Require(RebarMemory().live.load() >= liveBefore + 2 * block, "resident heap was not allocated in budgeted ReBAR memory");
         if (RebarMemory().limit == 0) Require(RebarMemory().overBudget.load() > fallbackBefore, "resident heap did not fall back when the ReBAR budget was full");
     } else if (vramMirrors && (!sparse || VramWritable())) {

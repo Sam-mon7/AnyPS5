@@ -52,9 +52,9 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
 
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, Access access) : Buffer(context, size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, access) {}
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, Access access) : Buffer(context, size, usage, access == Access::DeviceMirror ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, access) {}
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, Access access) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties), uploadOnly(access == Access::UploadOnly && RebarUploads()), residentMirror(access == Access::ResidentMirror) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, Access access) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties), uploadOnly(access == Access::UploadOnly && RebarUploads()), residentMirror(access == Access::ResidentMirror || access == Access::DeviceMirror) {
     Require(size != 0, "zero-sized GPU buffer");
     const bool rebarRequested = uploadOnly || access == Access::ResidentMirror;
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
@@ -92,7 +92,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         }
         ready = true;
     };
-    if (!rebarRequested) if (const auto allocation = cache->Take(size, this->usage, properties)) {
+    if (!rebarRequested && access != Access::DeviceMirror) if (const auto allocation = cache->Take(size, this->usage, properties)) {
         reuse(*allocation);
         return;
     }
@@ -120,6 +120,15 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             }
         } else {
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, properties);
+        }
+        if (access == Access::DeviceMirror) {
+            memoryType = allocation.memoryTypeIndex;
+            if (const auto pooled = cache->Take(size, this->usage, properties, memoryType)) {
+                context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+                buffer = VK_NULL_HANDLE;
+                reuse(*pooled);
+                return;
+            }
         }
         if (rebarRequested) {
             const auto hostType = allocation.memoryTypeIndex;

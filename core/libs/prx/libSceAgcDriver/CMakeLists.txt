@@ -2474,6 +2474,29 @@ if(BUILD_TESTING AND WIN32)
         ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_RESIDENT_HEAP_MIRRORS=0"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_WRITABLE_STRICT=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
     set_property(TEST agc_vram_descriptors_heap_fallback APPEND PROPERTY ENVIRONMENT "APS5_REBAR_MIB=0")
+    foreach(vramDeviceMode IN ITEMS off on fallback)
+        add_test(NAME agc_vram_device_${vramDeviceMode} COMMAND agc_driver_recorder_tests --vram-device-only)
+        set_tests_properties(agc_vram_device_${vramDeviceMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_DEVICE_LOCAL_MIRRORS=0;APS5_RESIDENT_HEAP_MIRRORS=0;APS5_REBAR_MIB=0;APS5_SNAPSHOT_RING_KIB=256"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_WRITABLE_STRICT=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
+    endforeach()
+    set_property(TEST agc_vram_device_on agc_vram_device_fallback APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DEVICE_LOCAL_MIRRORS=set:1")
+    set_property(TEST agc_vram_device_fallback APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_SNAPSHOT_RING=set:0")
+    add_test(NAME agc_vram_device_recorder COMMAND agc_driver_recorder_tests)
+    add_test(NAME agc_vram_device_bda COMMAND agc_driver_bda_device_tests)
+    add_test(NAME agc_vram_device_graphics COMMAND agc_driver_graphics_tests)
+    add_test(NAME agc_vram_device_writable COMMAND agc_driver_recorder_tests --vram-writable-recorder-only)
+    add_test(NAME agc_vram_device_deferred COMMAND agc_driver_recorder_tests --vram-deferred-only)
+    set_tests_properties(agc_vram_device_recorder agc_vram_device_bda agc_vram_device_graphics agc_vram_device_writable agc_vram_device_deferred
+        PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_DEVICE_LOCAL_MIRRORS=1;APS5_RESIDENT_HEAP_MIRRORS=0"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_WRITABLE_STRICT=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
+    set_property(TEST agc_vram_device_writable agc_vram_device_deferred APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_WRITABLE=set:1;APS5_VRAM_WRITABLE_STRICT=set:1")
+    set_property(TEST agc_vram_device_deferred APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DEFERRED=set:1")
+    add_test(NAME agc_vram_device_requires_descriptors COMMAND agc_vram_options_tests "APS5_VRAM_DEVICE_LOCAL_MIRRORS requires APS5_VRAM_DESCRIPTORS=1")
+    set_tests_properties(agc_vram_device_requires_descriptors PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_DEVICE_LOCAL_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=unset:")
+    add_test(NAME agc_vram_device_rejects_resident COMMAND agc_vram_options_tests "APS5_VRAM_DEVICE_LOCAL_MIRRORS requires APS5_RESIDENT_HEAP_MIRRORS=0")
+    set_tests_properties(agc_vram_device_rejects_resident PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_DEVICE_LOCAL_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_VRAM_MIRRORS=set:1;APS5_RESIDENT_HEAP_MIRRORS=set:1")
     foreach(vramWritableMode IN ITEMS off on)
         add_test(NAME agc_vram_writable_${vramWritableMode} COMMAND agc_driver_recorder_tests --vram-writable-only)
         add_test(NAME agc_vram_writable_label_${vramWritableMode} COMMAND agc_driver_vram_writable_label_tests)

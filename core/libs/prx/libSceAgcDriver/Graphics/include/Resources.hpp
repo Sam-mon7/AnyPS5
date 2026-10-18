@@ -8,7 +8,7 @@ namespace AgcDriver::Graphics {
 
 class Buffer {
 public:
-    enum class Access { Default, UploadOnly, ResidentMirror };
+    enum class Access { Default, UploadOnly, ResidentMirror, DeviceMirror };
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, Access access = Access::Default);
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, Access access);
     ~Buffer();

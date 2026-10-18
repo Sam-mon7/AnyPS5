@@ -213,6 +213,15 @@ struct MirrorStats {
     std::uint64_t sparseBinds = 0;
 };
 MirrorStats MirrorCounters();
+struct VramUploadStats {
+    std::uint64_t bytes = 0;
+    std::uint64_t blocks = 0;
+    std::uint64_t ringSlices = 0;
+    std::uint64_t fallbackSlices = 0;
+    std::uint64_t initialWaits = 0;
+    std::uint64_t deviceMirrors = 0;
+};
+VramUploadStats VramUploadCounters();
 struct VramCleanupStats {
     std::uint64_t evictedMirrors = 0;
     std::uint64_t evictedBytes = 0;

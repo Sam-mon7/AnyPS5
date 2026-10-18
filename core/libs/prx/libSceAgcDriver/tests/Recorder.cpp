@@ -364,6 +364,92 @@ void ReleaseDescriptorWatched(void* block, std::size_t bytes, void* section) {
     ReleaseWatched(block, bytes);
 }
 
+void deviceMirrorUploadTests(const Device& device, Recorder& recorder) {
+    namespace Memory = AgcDriver::GuestMemory;
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    constexpr std::size_t blockBytes = 65536;
+    constexpr std::size_t bytes = 5u << 20u;
+    constexpr std::size_t iterations = 40;
+    void* section = nullptr;
+    auto* block = static_cast<std::uint8_t*>(AllocateDescriptorWatched(bytes, blockBytes, section));
+    Require(block != nullptr, "device mirror fixture requires watched memory");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        void* section;
+        ~Release() {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            GuestAllocations::Mutation().Remove(block);
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            ReleaseDescriptorWatched(block, bytes, section);
+        }
+    } release{context, recorder, block, section};
+    std::memset(block, 0x31, bytes);
+    GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+    const auto before = VramUploadCounters();
+    GuestBufferMemory seed(context);
+    seed.SetAddressWrites(false);
+    seed.AcquireRegistered();
+    seed.Upload(true);
+    seed.WriteBack();
+    recorder.Sync();
+    if (VramDeviceLocalMirrors()) {
+        const auto after = VramUploadCounters();
+        Require(after.deviceMirrors > before.deviceMirrors && after.initialWaits >= before.initialWaits + 2,
+            "device mirror did not use bounded initial upload chunks");
+        Buffer probe(context, blockBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, Buffer::Access::DeviceMirror);
+        Require(probe.DeviceLocal() && !probe.Mapped(), "device mirror has host placement or a CPU mapping");
+    }
+    auto output = std::make_shared<Buffer>(context, iterations * 64, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto refreshed = VramUploadCounters();
+    for (std::size_t index = 0; index < iterations; ++index) {
+        const auto at = address + (index % 4) * blockBytes;
+        std::memset(reinterpret_cast<void*>(at), static_cast<int>(0x40 + index), blockBytes);
+        Memory::BumpCollectEpoch();
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddReadable(at, 64);
+        memory->Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = memory->Descriptor(at, 64, adjustment);
+        Require(adjustment == 0, "device mirror fixture descriptor is misaligned");
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, view.buffer, view.offset, output->Handle(), index * 64, 64);
+        recorder.Keep(memory);
+        recorder.Keep(output);
+        recorder.OnComplete([memory] { memory->WriteBack(); });
+        if (!VramDeviceLocalMirrors()) recorder.Sync();
+    }
+    RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Sync();
+    for (std::size_t index = 0; index < iterations; ++index) {
+        const auto expected = static_cast<std::byte>(0x40 + index);
+        const auto actual = output->ReadBytes(index * 64, 64);
+        Require(std::all_of(actual.begin(), actual.end(), [&](auto value) { return value == expected; }),
+            "device mirror uploads overwrote an earlier queued read or reused live staging bytes");
+    }
+    if (VramDeviceLocalMirrors()) {
+        const auto after = VramUploadCounters();
+        Require(after.bytes - refreshed.bytes == iterations * blockBytes, "device mirror refreshed more than the dirty blocks");
+        Require(after.ringSlices > refreshed.ringSlices || after.fallbackSlices > refreshed.fallbackSlices, "device mirror refresh did not stage its bytes");
+        Memory::BumpCollectEpoch();
+        GuestBufferMemory unchanged(context);
+        unchanged.AddReadable(address + 3 * blockBytes, 64);
+        unchanged.Upload(false);
+        unchanged.WriteBack();
+        recorder.Sync();
+        Require(VramUploadCounters().bytes == after.bytes, "unchanged device mirror was uploaded again");
+    } else Require(VramUploadCounters().bytes == before.bytes, "disabled device mirrors recorded uploads");
+}
+
 void vramDescriptorTests(const Device& device, Recorder& recorder) {
     namespace Memory = AgcDriver::GuestMemory;
     auto context = device.GetContext();
@@ -8358,6 +8444,13 @@ int main(int argc, char** argv) {
             vramDescriptorSparseGrowthTests(device, recorder);
             RunResidentHeapMirrorTests(device.GetContext(), recorder, false);
             RunResidentHeapMirrorTests(device.GetContext(), recorder, true);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--vram-device-only") {
+            deviceMirrorUploadTests(device, recorder);
+            vramDescriptorTests(device, recorder);
+            vramDescriptorBoundaryTests(device, recorder);
+            vramDescriptorSparseGrowthTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--vram-descriptors-only") {

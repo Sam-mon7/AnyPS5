@@ -79,6 +79,7 @@ struct MirrorWriteInterval {
 // mprotect, which replaces the registered Range object, and a mirror whose Range is gone is rebuilt.
 // Writable ranges keep a shadow of the guest bytes and copy the 64 KiB blocks that differ on each use.
 struct ImageMirror {
+    Context uploadContext;
     VkDevice device = VK_NULL_HANDLE;
     std::uint64_t base = 0;
     std::uint64_t bytes = 0;
@@ -1730,6 +1731,11 @@ VramMirrorCounts& VramMirrorCounters() {
     return counts;
 }
 
+VramUploadStats& UploadCounts() {
+    static VramUploadStats counts;
+    return counts;
+}
+
 void reportVramMirrors() {
     if (!vramMirrors()) return;
     auto& counts = VramMirrorCounters();
@@ -1745,6 +1751,12 @@ void reportVramMirrors() {
     const auto fallbacks = take(counts.hostFallbacks);
     auto& rebar = RebarMemory();
     std::fprintf(stderr, "[vram-mirrors] (10 s): %llu read-only ranges mapped mirror first; %llu heap mirrors made in VRAM (%llu MiB), %llu refused for the VRAM budget (%llu MiB), %llu placed in host memory; ReBAR %llu of %llu MiB live, peak %llu MiB\n", readOnly, created, createdMiB, refused, refusedMiB, fallbacks, static_cast<unsigned long long>(rebar.live.load() >> 20u), static_cast<unsigned long long>(rebar.limit >> 20u), static_cast<unsigned long long>(rebar.peak.load() >> 20u));
+    if (VramDeviceLocalMirrors()) {
+        const auto& uploads = UploadCounts();
+        std::fprintf(stderr, "[vram-mirrors] device-local uploads cumulative: %llu mirrors, %llu blocks, %.1f MiB; arena slices %llu, fallback slices %llu, initial chunk waits %llu\n",
+            static_cast<unsigned long long>(uploads.deviceMirrors), static_cast<unsigned long long>(uploads.blocks), static_cast<double>(uploads.bytes) / (1u << 20u),
+            static_cast<unsigned long long>(uploads.ringSlices), static_cast<unsigned long long>(uploads.fallbackSlices), static_cast<unsigned long long>(uploads.initialWaits));
+    }
 }
 
 std::uint64_t heapMirrorBudget() {
@@ -1793,10 +1805,80 @@ bool refreshWritableHeap(ImageMirror& mirror, std::vector<RefreshBlock>& blocks,
 constexpr std::uint8_t SparseCopy = 1;
 constexpr std::uint8_t SparseZero = 2;
 
+void stageMirrorBlock(const RefreshBlock& block) {
+    auto& mirror = *block.mirror;
+    const auto& context = mirror.uploadContext;
+    const auto offset = block.address - mirror.base;
+    Require(offset % 4 == 0 && block.length % 4 == 0, "device mirror upload is not DWORD aligned");
+    auto* recorder = Recorder::Active();
+    Recorder::SnapshotSlice slice;
+    if (recorder != nullptr && !Recorder::InCompletion() && Recorder::SnapshotRingEnabled()) slice = recorder->AllocateDrawSnapshot(block.length);
+    if (slice.buffer != nullptr) ++UploadCounts().ringSlices;
+    else {
+        slice.buffer = std::make_shared<Buffer>(context, block.length, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        ++UploadCounts().fallbackSlices;
+    }
+    auto target = slice.buffer->WriteBytes().subspan(static_cast<std::size_t>(slice.offset), block.length);
+    if (block.fill == SparseZero) std::memset(target.data(), 0, target.size());
+    else std::memcpy(target.data(), reinterpret_cast<const void*>(block.address), target.size());
+    const auto record = [&](VkCommandBuffer commands) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        CopyBuffer(context, commands, slice.buffer->Handle(), slice.offset, mirror.buffer->Handle(), offset, block.length);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    };
+    if (recorder != nullptr && !Recorder::InCompletion()) {
+        record(recorder->Commands());
+        recorder->Keep(slice.buffer, block.length);
+        recorder->Keep(mirror.buffer);
+    } else {
+        CommandBatch batch(context, CommandBatch::Mode::Independent);
+        record(batch.Handle());
+        batch.SubmitAndWait();
+    }
+    UploadCounts().bytes += block.length;
+    ++UploadCounts().blocks;
+    if (mirror.heap && block.fill == 0) mirror.generations[static_cast<std::size_t>(block.address / 65536 - mirror.base / 65536)] = block.generation;
+    if (!mirror.shadow.empty()) std::memcpy(mirror.shadow.data() + offset, target.data(), target.size());
+}
+
+void initializeDeviceMirror(ImageMirror& mirror, std::span<const std::pair<std::uint64_t, std::uint64_t>> pieces) {
+    constexpr std::size_t chunkBytes = 4u << 20u;
+    const auto& context = mirror.uploadContext;
+    Buffer staging(context, std::min<std::size_t>(chunkBytes, mirror.bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    for (std::size_t offset = 0; offset < mirror.bytes; offset += chunkBytes) {
+        const auto size = std::min<std::size_t>(chunkBytes, mirror.bytes - offset);
+        auto target = staging.WriteBytes().first(size);
+        if (mirror.sparse) {
+            std::memset(target.data(), 0, target.size());
+            for (const auto& [begin, end] : pieces) {
+                const auto first = std::max(begin, mirror.base + offset);
+                const auto last = std::min(end, mirror.base + offset + size);
+                if (first < last) GuestMemory::Read(first, target.subspan(static_cast<std::size_t>(first - mirror.base - offset), static_cast<std::size_t>(last - first)));
+            }
+        } else GuestMemory::Read(mirror.base + offset, target);
+        if (!mirror.shadow.empty()) std::memcpy(mirror.shadow.data() + offset, target.data(), size);
+        CommandBatch batch(context, CommandBatch::Mode::Independent);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, batch.Handle(), staging.Handle(), 0, mirror.buffer->Handle(), offset, size);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        batch.SubmitAndWait();
+        UploadCounts().bytes += size;
+        UploadCounts().blocks += (size + 65535) / 65536;
+        ++UploadCounts().initialWaits;
+    }
+}
+
 // Compares a block's guest bytes with the mirror's shadow and copies a changed block into the device
 bool compareBlock(const RefreshBlock& block) {
     const auto offset = static_cast<std::size_t>(block.address - block.mirror->base);
     const auto* guest = reinterpret_cast<const std::byte*>(block.address);
+    if (!block.mirror->buffer->Mapped()) {
+        if (block.fill == 0 && !block.mirror->heap && std::memcmp(block.mirror->shadow.data() + offset, guest, block.length) == 0) return false;
+        stageMirrorBlock(block);
+        return true;
+    }
     if (block.fill != 0) {
         auto* target = block.mirror->buffer->WriteBytes().data() + offset;
         if (block.fill == SparseZero) std::memset(target, 0, block.length);
@@ -1828,6 +1910,11 @@ public:
 
     // Compares `blocks` and returns how many were copied.
     std::uint64_t Run(std::span<const RefreshBlock> blocks) {
+        if (VramDeviceLocalMirrors()) {
+            std::uint64_t copied = 0;
+            for (const auto& block : blocks) copied += compareBlock(block) ? 1 : 0;
+            return copied;
+        }
         // Small jobs are not worth waking the helpers (a sub-range refresh at Upload is a few blocks).
         if (helpers == 0 || blocks.size() < 8) {
             std::uint64_t copied = 0;
@@ -2313,7 +2400,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
 #endif
     }
     const bool videoHeap = videoOnly && heap && !sparse && vramMirrors();
-    if (videoHeap) {
+    if (videoHeap && !VramDeviceLocalMirrors()) {
         auto& rebar = RebarMemory();
         const auto limit = RebarLimit(context);
         if (range->bytes > limit - std::min(limit, rebar.live.load())) {
@@ -2323,6 +2410,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         }
     }
     mirror = std::make_shared<ImageMirror>();
+    if (VramDeviceLocalMirrors()) mirror->uploadContext = context;
     mirror->device = context.device;
     mirror->base = range->address;
     mirror->bytes = sparse ? sparseExtent(range->address, range->bytes, pieces) : range->bytes;
@@ -2333,9 +2421,17 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     mirror->heap = heap;
     mirror->range = range;
     if (VramCleanup()) mirror->lastUsePresent.store(Recorder::Presents(), std::memory_order_relaxed);
-    if (VramWritable() && heap) {
+    if (VramWritable() && heap && !VramDeviceLocalMirrors()) {
         const auto limit = RebarLimit(context);
         if (mirror->bytes > limit - std::min(limit, RebarMemory().live.load())) return nullptr;
+    }
+    if (VramDeviceLocalMirrors() && heap) {
+        const auto report = GetBufferPool(context)->Vram().Current();
+        if (report.target != 0 && mirror->bytes > report.target - std::min(report.target, report.usage)) {
+            VramMirrorCounters().refused.fetch_add(1, std::memory_order_relaxed);
+            VramMirrorCounters().refusedBytes.fetch_add(mirror->bytes, std::memory_order_relaxed);
+            return nullptr;
+        }
     }
     if (heap) {
         std::uint64_t generation = 0;
@@ -2364,7 +2460,11 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     try {
         const bool resident = heap && !sparse && range->writable && ResidentHeapMirrors() && RebarMirrors();
         const bool video = vramMirrors() && (!sparse || VramWritable());
-        mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(mirror->bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, resident || video ? Buffer::Access::ResidentMirror : Buffer::Access::Default);
+        const bool staged = VramDeviceLocalMirrors() && mirror->base % 4 == 0 && mirror->bytes % 4 == 0;
+        const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | (staged ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
+        mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(mirror->bytes), usage,
+            staged ? Buffer::Access::DeviceMirror : resident || video ? Buffer::Access::ResidentMirror : Buffer::Access::Default);
+        if (staged) ++UploadCounts().deviceMirrors;
         if (video && heap) {
             auto& counts = VramMirrorCounters();
             if (mirror->buffer->DeviceLocal()) {
@@ -2387,17 +2487,20 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     {
         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
         if ((heap && !sparse && range->writable && ResidentHeapMirrors()) || (!heap && !sparse && range->writable && vramMirrors())) mirror->shadow.resize(static_cast<std::size_t>(mirror->bytes));
-        const auto target = mirror->shadow.empty() ? mirror->buffer->WriteBytes().first(static_cast<std::size_t>(mirror->bytes)) : std::span<std::byte>(mirror->shadow);
-        if (!sparse) GuestMemory::Read(range->address, target);
-        std::size_t cursor = 0;
-        for (const auto& [first, last] : pieces) {
-            const auto at = static_cast<std::size_t>(first - mirror->base);
-            std::memset(target.data() + cursor, 0, at - cursor);
-            GuestMemory::Read(first, target.subspan(at, static_cast<std::size_t>(last - first)));
-            cursor = static_cast<std::size_t>(last - mirror->base);
+        if (!mirror->buffer->Mapped()) initializeDeviceMirror(*mirror, pieces);
+        else {
+            const auto target = mirror->shadow.empty() ? mirror->buffer->WriteBytes().first(static_cast<std::size_t>(mirror->bytes)) : std::span<std::byte>(mirror->shadow);
+            if (!sparse) GuestMemory::Read(range->address, target);
+            std::size_t cursor = 0;
+            for (const auto& [first, last] : pieces) {
+                const auto at = static_cast<std::size_t>(first - mirror->base);
+                std::memset(target.data() + cursor, 0, at - cursor);
+                GuestMemory::Read(first, target.subspan(at, static_cast<std::size_t>(last - first)));
+                cursor = static_cast<std::size_t>(last - mirror->base);
+            }
+            if (sparse) std::memset(target.data() + cursor, 0, target.size() - cursor);
+            if (!mirror->shadow.empty()) std::memcpy(mirror->buffer->WriteBytes().data(), mirror->shadow.data(), mirror->shadow.size());
         }
-        if (sparse) std::memset(target.data() + cursor, 0, target.size() - cursor);
-        if (!mirror->shadow.empty()) std::memcpy(mirror->buffer->WriteBytes().data(), mirror->shadow.data(), mirror->shadow.size());
         mirror->committed = std::move(pieces);
     }
     if (range->writable && !heap && mirror->shadow.empty()) mirror->shadow.assign(mirror->buffer->Bytes().begin(), mirror->buffer->Bytes().end());
@@ -3167,6 +3270,11 @@ VramCleanupStats VramCleanupCounters() {
     return result;
 }
 
+VramUploadStats VramUploadCounters() {
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    return UploadCounts();
+}
+
 void CollectVramMirrors(const Context& context) {
     if (!VramCleanup()) return;
     GuestMemory::AssertGpuLockHeld("VRAM mirror collection");
@@ -3434,7 +3542,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
 
 void GuestBufferMemory::AcquireRegistered() {
     std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
-    if (VramWritable()) gpu.lock();
+    if (VramWritable() || VramDeviceLocalMirrors()) gpu.lock();
     CollectVramMirrors(context);
     Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
     reportVramMirrors();

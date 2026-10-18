@@ -17,6 +17,11 @@ inline bool VramDescriptors() {
     return enabled;
 }
 
+inline bool VramDeviceLocalMirrors() {
+    static const bool enabled = VramOption("APS5_VRAM_DEVICE_LOCAL_MIRRORS");
+    return enabled;
+}
+
 inline bool VramWritable() {
     static const bool enabled = VramOption("APS5_VRAM_WRITABLE");
     return enabled;
@@ -48,6 +53,10 @@ inline bool TextureAgeEviction() {
 }
 
 inline void ValidateVramOptions() {
+    if (VramDeviceLocalMirrors() && !VramDescriptors())
+        throw std::runtime_error("APS5_VRAM_DEVICE_LOCAL_MIRRORS requires APS5_VRAM_DESCRIPTORS=1");
+    if (VramDeviceLocalMirrors() && VramOption("APS5_RESIDENT_HEAP_MIRRORS"))
+        throw std::runtime_error("APS5_VRAM_DEVICE_LOCAL_MIRRORS requires APS5_RESIDENT_HEAP_MIRRORS=0");
     if (VramDescriptors() && !VramOption("APS5_VRAM_MIRRORS"))
         throw std::runtime_error("APS5_VRAM_DESCRIPTORS requires APS5_VRAM_MIRRORS=1");
     if (VramWritable() && !VramDescriptors())
