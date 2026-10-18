@@ -590,8 +590,10 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
                             GuestAllocations::Mutation().Add(raw, 2 * block, true, true, true);
                         } else {
                             GuestAllocations::Mutation().Protect(raw, 2 * block, true, false, true, [&] {
-                                DWORD previous = 0;
-                                Require(VirtualProtect(raw, 2 * block, PAGE_READONLY, &previous) != 0, "cannot protect the staged heap");
+                                for (std::size_t offset = 0; offset < 2 * block; offset += block) {
+                                    DWORD previous = 0;
+                                    Require(VirtualProtect(static_cast<std::byte*>(raw) + offset, block, PAGE_READONLY, &previous) != 0, "cannot protect the staged heap");
+                                }
                                 applied.store(true, std::memory_order_release);
                             });
                         }
@@ -621,8 +623,10 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
             if (mutationError) std::rethrow_exception(mutationError);
             Require(applied.load(std::memory_order_acquire), "mapping mutation never applied");
             if (!remap) GuestAllocations::Mutation().Protect(raw, 2 * block, true, true, true, [&] {
-                DWORD previous = 0;
-                Require(VirtualProtect(raw, 2 * block, PAGE_READWRITE, &previous) != 0, "cannot restore the staged heap protection");
+                for (std::size_t offset = 0; offset < 2 * block; offset += block) {
+                    DWORD previous = 0;
+                    Require(VirtualProtect(static_cast<std::byte*>(raw) + offset, block, PAGE_READWRITE, &previous) != 0, "cannot restore the staged heap protection");
+                }
             });
             checkRead(dispatch(false), label);
         }
