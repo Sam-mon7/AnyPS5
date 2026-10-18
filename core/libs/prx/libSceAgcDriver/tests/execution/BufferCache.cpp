@@ -3,6 +3,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PageTracker.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <cstring>
 #ifdef _WIN32
 #include <windows.h>
@@ -186,9 +189,147 @@ void RingAndBudget(const Context& context, const Memory& memory) {
     }
     BufferCache::Clear(context.device);
 }
+
+void Writable(const Context& context, const Memory& memory, bool cpuRead) {
+    BufferCache::Clear(context.device);
+    std::memset(reinterpret_cast<void*>(memory.address), 0x35, 5 * PageBytes);
+    const auto label = memory.address + 4 * PageBytes;
+    *reinterpret_cast<std::uint32_t*>(label) = 0;
+    memory.Track();
+    Recorder recorder(context);
+    recorder.Activate();
+    const auto before = BufferCache::Counters();
+    const auto range = PageTracker::Range{memory.address + PageBytes, PageBytes};
+    const auto proof = PageTracker::Get() != nullptr ? PageTracker::Get()->CaptureEpoch(range) : PageTracker::Epoch{};
+    auto writer = std::make_shared<GuestBufferMemory>(context);
+    BufferCache::PermitBindings(writer.get(), true);
+    writer->AddReadable(memory.address, 3 * PageBytes);
+    writer->AddWritable(range.address, PageBytes);
+    writer->Upload(false);
+    Require(BufferCache::HasBindings(writer.get()) == BufferCache::WritesEnabled(), "writable binding ignored the write switch");
+    std::uint32_t adjustment = 0;
+    const auto view = writer->Descriptor(range.address, PageBytes, adjustment);
+    writer->BeginGpuWrites(recorder);
+    if (PageTracker::Get() != nullptr) Require(PageTracker::Get()->DirtySince(range, proof), "recording a GPU write did not invalidate its tracker proof");
+    context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(recorder.Commands(), view.buffer, view.offset, cpuRead ? 4 : PageBytes, 0xababababu);
+    writer->RecordCopyBacks(recorder);
+    writer->NotePendingWrites(recorder);
+    writer->MarkDirectWrites();
+    if (writer->HasCopiedWrites()) recorder.OnComplete([writer] { writer->WriteBack(); });
+    recorder.Keep(writer);
+    if (BufferCache::WritesEnabled()) {
+        std::array<std::byte, 4> clean{};
+        GuestMemory::Read(memory.address, clean);
+        Require(clean.front() == std::byte{0x35} && recorder.Submissions() == 0, "clean-page CPU read waited for an unrelated cached writer");
+    }
+    recorder.Submit();
+    recorder.Sync();
+    const auto completed = BufferCache::Counters();
+    if (BufferCache::WritesEnabled()) {
+        Require(completed.completedWrites - before.completedWrites == PageBytes, "batch completion did not publish the cached writer");
+        Require(completed.copiedBack == before.copiedBack, "batch completion eagerly downloaded GPU writes");
+        Require(*reinterpret_cast<const std::uint8_t*>(range.address) == 0x35, "GPU bytes reached guest memory without a sync");
+        GuestBufferMemory consumer(context);
+        const auto cached = Upload(consumer, memory.address, 3 * PageBytes);
+        Require(cached.buffer == view.buffer, "a GPU consumer did not retain the cached writer's block");
+        Require(BufferCache::Counters().copiedBack == before.copiedBack, "cached GPU consumption caused a readback");
+        if (context.bufferDeviceAddress) {
+            const auto ranges = consumer.AddressRanges();
+            const VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, cached.buffer};
+            const auto address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &info);
+            Require(ranges.size() == 1 && ranges.front().begin == memory.address && ranges.front().end == memory.address + 3 * PageBytes, "BDA ranges did not cover the whole cached range");
+            Require(address != 0 && ranges.front().deviceAddress == address + cached.offset && ranges.front().deviceAddress + ranges.front().end - ranges.front().begin <= address + BufferCache::BlockBytes, "BDA address escaped the merged cached block");
+        }
+    }
+    writer.reset();
+    if (cpuRead) {
+        *reinterpret_cast<std::uint8_t*>(range.address + 128) = 0x92;
+        PageTracker::CpuWrite({range.address + 128, 1});
+        std::array<std::byte, 4> data{};
+        GuestMemory::Read(range.address, data);
+        Require(data.front() == std::byte{0xab}, "driver CPU read did not download the dirty page");
+        Require(*reinterpret_cast<const std::uint8_t*>(range.address + 128) == 0x92, "copyback rolled back an untouched CPU byte");
+    } else {
+        const std::array<std::uint32_t, 5> signal{0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 0x76543210u};
+        Require(DriverDetail::TryParseTimeLabelPacket(signal), "idle label did not use the synchronization hook");
+        const std::array<std::uint32_t, 7> wait{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 0x76543210u, 0xffffffffu, 0x19u};
+        Require(Pm4::WaitSatisfiedUnchecked(wait), "guest wait did not observe the published label");
+        Require(*reinterpret_cast<const std::uint8_t*>(range.address) == 0xab && *reinterpret_cast<const std::uint8_t*>(range.address + PageBytes - 1) == 0xab, "CPU read after guest wait missed the GPU write");
+    }
+    Require(*reinterpret_cast<const std::uint8_t*>(memory.address) == 0x35 && *reinterpret_cast<const std::uint8_t*>(memory.address + 2 * PageBytes) == 0x35, "copyback changed a clean neighboring page");
+    if (BufferCache::WritesEnabled()) Require(BufferCache::Counters().copiedBack - before.copiedBack == PageBytes, "copyback downloaded pages outside the GPU-dirty set");
+    BufferCache::Clear(context.device);
 }
 
-int main() {
+void AsyncRing(const Context& context, const Memory& memory) {
+    BufferCache::Clear(context.device);
+    memory.Track();
+    Recorder recorder(context);
+    recorder.Activate();
+    const auto before = BufferCache::Counters();
+    {
+        GuestBufferMemory first(context), second(context);
+        const auto firstView = Upload(first, memory.address, BufferCache::BlockBytes);
+        const auto secondView = Upload(second, memory.address + BufferCache::BlockBytes, BufferCache::BlockBytes);
+        const auto queued = BufferCache::Counters();
+        if (BufferCache::WritesEnabled()) {
+            Require(recorder.Submissions() == 0 && queued.pendingUploads == 1, "upload ring synchronously retired an unsubmitted copy");
+            Require(queued.spills == before.spills + 1, "busy ring range was overwritten instead of spilled");
+        }
+        recorder.Sync();
+        const auto retired = BufferCache::Counters();
+        if (BufferCache::WritesEnabled()) Require(retired.pendingUploads == 0 && retired.retired > before.retired, "completed upload range was not retired");
+        Require(ReadGpu(context, firstView, PageBytes).front() == std::byte{0x35}, "ring wrap overwrote an earlier upload");
+        Require(ReadGpu(context, secondView, PageBytes).front() == std::byte{0x35}, "ring spill lost upload bytes");
+        std::memset(reinterpret_cast<void*>(memory.address), 0x74, PageBytes);
+        PageTracker::CpuWrite({memory.address, PageBytes});
+        GuestBufferMemory changed(context);
+        const auto changedView = Upload(changed, memory.address, PageBytes);
+        recorder.Sync();
+        if (BufferCache::WritesEnabled()) Require(BufferCache::Counters().spills == retired.spills, "retired ring bytes were not reusable");
+        Require(ReadGpu(context, changedView, PageBytes).front() == std::byte{0x74}, "retired ring did not upload the new bytes");
+    }
+    BufferCache::Clear(context.device);
+}
+
+void Reuse(const Context& context, const Memory& memory) {
+    BufferCache::Clear(context.device);
+    memory.Track();
+    GuestBufferMemory buffers(context);
+    Upload(buffers, memory.address, PageBytes);
+    const bool cached = BufferCache::HasBindings(&buffers);
+    Require(BufferCache::Reusable(&buffers) == (BufferCache::WritesEnabled() || !cached), "covered descriptor reuse ignored its switch");
+    PageTracker::CpuWrite({memory.address, PageBytes});
+    if (cached) Require(!BufferCache::Reusable(&buffers), "CPU epoch change accepted an old cached descriptor");
+    BufferCache::Clear(context.device);
+}
+
+void MappingRetirement(const Context& context, const Memory& memory) {
+    if (!BufferCache::WritesEnabled()) return;
+    BufferCache::Clear(context.device);
+    memory.Track();
+    Recorder recorder(context);
+    recorder.Activate();
+    const auto before = BufferCache::Counters().copiedBack;
+    auto writer = std::make_shared<GuestBufferMemory>(context);
+    BufferCache::PermitBindings(writer.get(), true);
+    writer->AddWritable(memory.address, PageBytes);
+    writer->Upload(false);
+    Require(BufferCache::HasBindings(writer.get()), "mapping retirement fixture missed the writable cache");
+    std::uint32_t adjustment = 0;
+    const auto view = writer->Descriptor(memory.address, PageBytes, adjustment);
+    writer->BeginGpuWrites(recorder);
+    context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(recorder.Commands(), view.buffer, view.offset, PageBytes, 0x63636363u);
+    recorder.Keep(writer);
+    writer.reset();
+    GuestAllocations::Mutation().RequireUnpinned(reinterpret_cast<void*>(memory.address + 2 * PageBytes), PageBytes);
+    Require(BufferCache::Counters().copiedBack == before + PageBytes && recorder.Idle(), "mapping waiter did not release the cached writer's allocation lease");
+    Require(*reinterpret_cast<const std::uint8_t*>(memory.address) == 0x63, "mapping waiter lost the cached GPU bytes");
+    BufferCache::Clear(context.device);
+}
+}
+
+int main(int argc, char** argv) {
     try {
         const bool expected = VramOption("APS5_BUFFER_CACHE") && PageTracker::Enabled();
         Require(BufferCache::Enabled() == expected, "cache switch does not require both exact values");
@@ -199,11 +340,24 @@ int main() {
         context.hostImportAlignment = 0;
         {
             Memory memory;
-            ReadOnly(context, memory);
-            Fallbacks(context, memory);
-            RingAndBudget(context, memory);
+            if (argc > 1) {
+                const bool expectedWrites = VramOption("APS5_BUFFER_CACHE_WRITES") && expected && !ResidentHeapMirrors() && !VramMirrorWrites();
+                Require(BufferCache::WritesEnabled() == expectedWrites, "write switch ignored a prerequisite or a conflicting mirror mode");
+                Writable(context, memory, std::strcmp(argv[1], "cpu-read") == 0);
+                AsyncRing(context, memory);
+                Reuse(context, memory);
+                MappingRetirement(context, memory);
+            } else {
+                ReadOnly(context, memory);
+                Fallbacks(context, memory);
+                RingAndBudget(context, memory);
+            }
         }
         BufferCache::Clear(context.device);
+        if (argc > 1 && !BufferCache::WritesEnabled()) {
+            const auto counts = BufferCache::Counters();
+            Require(counts.retired == 0 && counts.spills == 0 && counts.pendingUploads == 0 && counts.gpuWritten == 0 && counts.completedWrites == 0, "disabled write extension changed counters");
+        }
         if (!expected) {
             const auto counts = BufferCache::Counters();
             Require(counts.uploaded == 0 && counts.copiedBack == 0 && counts.hits == 0 && counts.misses == 0, "disabled cache changed counters");

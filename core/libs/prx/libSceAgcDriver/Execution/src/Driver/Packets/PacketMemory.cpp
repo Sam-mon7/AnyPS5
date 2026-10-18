@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -27,6 +28,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     const auto interruptSelect = opcode == 0x49 ? (packet[2] >> 24u) & 7u : 0u;
     endOfPipeInterrupt = interruptSelect != 0 && interruptSelect != 3;
     interruptDeferred = false;
+    if (Graphics::BufferCache::WritesEnabled() && endOfPipeInterrupt) Graphics::BufferCache::Flush();
     if (!drainAll && endOfPipeInterrupt) {
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
@@ -380,6 +382,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    if (Graphics::BufferCache::WritesEnabled()) Graphics::BufferCache::Flush();
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
     const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;

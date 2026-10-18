@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "ThreadOwned.hpp"
 #include <cstdlib>
 
@@ -14,6 +15,7 @@ DeferredLabels& deferredLabels() {
 }
 
 bool TryParseTimeLabelPacket(std::span<const std::uint32_t> packet) {
+    if (Graphics::BufferCache::WritesEnabled() && !packet.empty() && (((packet[0] >> 8u) & 0xffu) == 0x49 || ((packet[0] >> 8u) & 0xffu) == 0x37) && Pm4::DecodeLabelWrite(packet).has_value()) Graphics::BufferCache::Flush();
     if (!Graphics::Recorder::ParseTimeLabels() || packet.empty() || !deferredLabels().labels.empty()) return false;
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     if (opcode == 0x49) {
@@ -107,6 +109,7 @@ std::uint64_t Driver::batchCap() {
 void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue) {
     auto& deferred = deferredLabels();
     if (deferred.labels.empty()) return;
+    if (Graphics::BufferCache::WritesEnabled()) Graphics::BufferCache::Flush();
 
     static thread_local std::vector<DeferredLabel>* recording = nullptr;
     auto& labels = ShaderRecompiler::ThreadOwned(recording);

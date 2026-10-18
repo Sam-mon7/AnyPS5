@@ -2711,7 +2711,7 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled()) || BufferCache::HasBindings(&guestMemory)) return;
+    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled()) || !BufferCache::Reusable(&guestMemory)) return;
     if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
     const auto regions = guestMemory.DirectRegions();
@@ -3308,6 +3308,11 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || Recorder::InCompletion()) return false;
+    if (BufferCache::WritesEnabled()) {
+        const auto copied = BufferCache::Counters().copiedBack;
+        BufferCache::Flush(address, bytes);
+        if (BufferCache::Counters().copiedBack != copied) return true;
+    }
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return false;
     const auto drawWriters = DrawCopiedWriters();
@@ -3346,6 +3351,7 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    if (!BufferCache::Reusable(&guestMemory)) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
@@ -3569,7 +3575,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
     }
-    return finish(fast, true);
+    return finish(fast, BufferCache::Reusable(&guestMemory));
 }
 
 namespace {
