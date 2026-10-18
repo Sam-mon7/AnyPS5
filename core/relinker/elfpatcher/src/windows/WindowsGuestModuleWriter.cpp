@@ -5,6 +5,7 @@
 #include <elfpatcher/windows/WindowsPeWriter.hpp>
 #include <elfpatcher/windows/WindowsRelocationBuilder.hpp>
 #include <elfpatcher/windows/WindowsTrampolineBuilder.hpp>
+#include <elfpatcher/windows/WindowsRedZonePatcher.hpp>
 #include <io/BufferUtils.hpp>
 #include <algorithm>
 #include <map>
@@ -99,6 +100,11 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
         }
         if (!written) throw Domain::RelinkerException("Guest TLS target is unmapped", target);
         relocations.push_back(rva);
+    }
+    if (WindowsRedZonePatcher::Enabled()) {
+        auto fixedSlots = relocations;
+        for (const auto& import : runtime.Imports) fixedSlots.push_back(import.TargetRva);
+        WindowsRedZonePatcher().Build(guest.Bytes, guest.Headers, image, sections, nextRva, fixedSlots, guest.SourcePath.string());
     }
     for (const auto& header : guest.Headers) {
         if (header.Type != 0x6474e550) continue;

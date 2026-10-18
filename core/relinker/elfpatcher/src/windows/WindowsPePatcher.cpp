@@ -6,6 +6,7 @@
 #include <elfpatcher/windows/WindowsRelocationBuilder.hpp>
 #include <elfpatcher/windows/WindowsTlsBuilder.hpp>
 #include <elfpatcher/windows/WindowsTrampolineBuilder.hpp>
+#include <elfpatcher/windows/WindowsRedZonePatcher.hpp>
 #include <io/BufferUtils.hpp>
 #include <filesystem>
 
@@ -71,6 +72,13 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
     directories[9] = WindowsTlsBuilder().Build(sourceElf, originalHeaders, image, sections, relocations.BaseRelocations, nextRva, nullptr, [&](auto completed, auto total) { report(1500 + 6500 * completed / total); });
     report(8000);
     WindowsTrampolineBuilder().Build(trampolines, image, sections, nextRva);
+    if (WindowsRedZonePatcher::Enabled()) {
+        auto fixedSlots = relocations.BaseRelocations;
+        for (const auto& import : relocations.Imports) fixedSlots.push_back(import.TargetRva);
+        for (const auto& module : dynamicSection.GuestModules)
+            for (const auto& import : module.Imports) fixedSlots.push_back(import.TargetRva);
+        WindowsRedZonePatcher().Build(sourceElf, originalHeaders, image, sections, nextRva, fixedSlots);
+    }
     const WindowsImportBuilder importBuilder;
     auto nativeImports = importBuilder.Build(nextRva);
     directories[1] = nativeImports.Directory;
