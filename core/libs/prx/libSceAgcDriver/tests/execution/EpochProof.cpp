@@ -5,7 +5,6 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
-#include <atomic>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -17,11 +16,9 @@ using namespace AgcDriver::DriverDetail;
 using namespace AgcDriver::PageTracker;
 constexpr std::size_t InputBytes = 0x4000, OutputBytes = 0x10000;
 alignas(256) constexpr std::array<std::uint32_t, 9> Code{0xf4000200u, 0xfa000000u, 0xbf8cc07fu, 0x34020082u, 0x7e040208u, 0x4a040481u, 0xe0701000u, 0x80010201u, 0xbf810000u};
-std::uint64_t observedInput = 0;
-std::atomic<std::uint64_t> captureReads{0};
-
-void observeRead(std::uint64_t address, std::size_t bytes) {
-    if (AgcDriver::GuestMemory::CurrentReadSite() == AgcDriver::GuestMemory::ReadSite::Capture && address < observedInput + InputBytes && observedInput < address + bytes) captureReads.fetch_add(1, std::memory_order_relaxed);
+std::uint64_t validatedSectionBytes() {
+    const auto counts = Get()->Counts();
+    return counts.reads[static_cast<std::size_t>(AgcDriver::GuestMemory::ReadSite::DispatchCache)][static_cast<std::size_t>(Kind::Section)].total;
 }
 
 void require(bool condition, const char* message) {
@@ -70,13 +67,12 @@ void run() {
     shader.shader_size = sizeof(Code);
     shader.code = Code.data();
     AgcDriverRegisterShader_nid_postfix(&shader);
-    observedInput = address;
-    AgcDriver::GuestMemory::SetReadGuard(observeRead);
+    const auto bytesBeforeWarm = validatedSectionBytes();
     for (int warm = 0; warm < 4; ++warm) dispatch(input, output, 8);
-    require(captureReads.load(std::memory_order_relaxed) != 0, "dispatch fixture did not capture the protected input");
+    require(validatedSectionBytes() >= bytesBeforeWarm + sizeof(*input), "dispatch fixture did not byte-validate the protected input");
     if (RecordProof::Enabled()) {
         const auto before = RecordProof::Counts();
-        const auto readsBefore = captureReads.load(std::memory_order_relaxed);
+        const auto bytesBefore = validatedSectionBytes();
         require(before.recorded != 0 && before.results[static_cast<std::size_t>(RecordProofResult::Accepted)] != 0, "dispatch did not warm an epoch proof");
         DWORD previous = 0;
         require(VirtualProtect(input, InputBytes, PAGE_NOACCESS, &previous), "epoch proof noaccess protection failed");
@@ -92,7 +88,7 @@ void run() {
         DWORD ignored = 0;
         require(VirtualProtect(input, InputBytes, previous, &ignored), "epoch proof protection restore failed");
         const auto after = RecordProof::Counts();
-        require(queried == sizeof(state) && state.Protect == PAGE_NOACCESS && after.results[0] == before.results[0] + 1 && captureReads.load(std::memory_order_relaxed) == readsBefore, "dispatch lookup read captured guest pages");
+        require(queried == sizeof(state) && state.Protect == PAGE_NOACCESS && after.results[0] == before.results[0] + 1 && validatedSectionBytes() == bytesBefore, "dispatch lookup read captured guest pages");
     }
     const auto beforeCpu = RecordProof::Counts();
     {
@@ -121,7 +117,6 @@ void run() {
         require(RecordProof::Counts() == RecordProofCounts{} && RecordProof::ProfileLine().empty(), "off-mode dispatch changed proof counters or output");
     }
     AgcDriverShutdown_nid_postfix();
-    AgcDriver::GuestMemory::SetReadGuard(nullptr);
     GuestAllocations::Mutation().Remove(input);
     GuestAllocations::Mutation().Remove(output);
     GuestArena::GuestArenaReset_nid_postfix(input, InputBytes);
@@ -144,7 +139,6 @@ int main() {
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         try { AgcDriverShutdown_nid_postfix(); } catch (...) {}
-        AgcDriver::GuestMemory::SetReadGuard(nullptr);
         return 1;
     }
 #else
