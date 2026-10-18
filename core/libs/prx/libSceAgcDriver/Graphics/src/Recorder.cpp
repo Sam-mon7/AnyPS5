@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/RecordingContext.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/MemoryLockProbe.hpp"
@@ -1258,15 +1259,20 @@ namespace {
 
 std::atomic<std::uint64_t> recordCommands{0}, recordChunks{0}, recordProducerNs{0}, recordWorkerNs{0}, recordWaitNs{0}, recordQueueDepth{0}, recordQueueMax{0};
 std::atomic<std::uint64_t> parseLabels{0}, completedLabels{0};
+std::atomic<std::uint64_t> laneRecordChunks{0}, laneRecordCommands{0};
 
 void ReportRecording() {
     if (!DrawProfiled() && !Recorder::GpuTimingEnabled()) return;
-    if (Recorder::RecordWorkerEnabled()) {
+    if (Recorder::RecordWorkerEnabled() && !Recorder::LaneRecordersEnabled()) {
         const auto counts = Recorder::RecordCounts();
         const auto saved = static_cast<std::int64_t>(counts.workerNs) - static_cast<std::int64_t>(counts.producerNs + counts.waitNs);
         AgcDriver::ProfilePrint_nid_no_patch("[recorder] record worker: %llu commands, %llu chunks, producer append %.1f us, worker replay %.1f us, producer waits %.1f us, estimated producer time saved %.1f us, queue %llu / max %llu chunks\n",
             static_cast<unsigned long long>(counts.commands), static_cast<unsigned long long>(counts.chunks), counts.producerNs / 1000.0, counts.workerNs / 1000.0, counts.waitNs / 1000.0, saved / 1000.0,
             static_cast<unsigned long long>(counts.queueDepth), static_cast<unsigned long long>(counts.maxQueueDepth));
+    }
+    if (Recorder::LaneRecordersEnabled()) {
+        const auto counts = Recorder::LaneRecordCounts();
+        AgcDriver::ProfilePrint_nid_no_patch("[gpu-lanes] recorded chunks=%llu commands=%llu\n", static_cast<unsigned long long>(counts.chunks), static_cast<unsigned long long>(counts.commands));
     }
     if (Recorder::ParseTimeLabels()) {
         const auto counts = Recorder::ParseLabelCounts();
@@ -1429,21 +1435,90 @@ bool Recorder::RecordWorkerEnabled() {
     return enabled;
 }
 
+struct Recorder::LaneRecording {
+    struct Work {
+        std::shared_ptr<RecordingWorker::Chunk> records;
+        std::shared_ptr<DriverDetail::Lanes::RecordingContext> recorded;
+        std::future<void> done;
+    };
+    Context context;
+    std::shared_ptr<RecordingWorker::Chunk> pending;
+    std::vector<std::shared_ptr<Work>> ready;
+    std::exception_ptr failure;
+    DriverDetail::Lanes::WorkerPool pool;
+
+    explicit LaneRecording(const Context& context) : context(context) {}
+    void Publish() {
+        if (pending == nullptr) return;
+        auto work = std::make_shared<Work>();
+        work->records = std::move(pending);
+        work->done = pool.Enqueue({0, 0, [context = context, work](std::size_t) -> DriverDetail::Lanes::Commit {
+            auto recorded = std::make_shared<DriverDetail::Lanes::RecordingContext>(context);
+            work->records->commands = recorded->Commands();
+            RecordingWorker replay(context, false);
+            replay.Replay(*work->records);
+            recorded->End();
+            laneRecordCommands.fetch_add(work->records->count, std::memory_order_relaxed);
+            laneRecordChunks.fetch_add(1, std::memory_order_relaxed);
+            work->recorded = std::move(recorded);
+            work->records.reset();
+            return {};
+        }});
+        ready.push_back(std::move(work));
+    }
+    void Append(const DispatchCommand& command) {
+        if (failure != nullptr) std::rethrow_exception(failure);
+        if (pending == nullptr) pending = std::make_shared<RecordingWorker::Chunk>();
+        pending->records[pending->count++].dispatch = command;
+        if (pending->count == RecordingWorker::PublishCommands) Publish();
+    }
+    void Finish(Recorder& recorder) {
+        if (failure != nullptr) std::rethrow_exception(failure);
+        Publish();
+        for (const auto& work : ready) {
+            try { if (work->done.valid()) work->done.get(); }
+            catch (...) { if (failure == nullptr) failure = std::current_exception(); }
+        }
+        if (failure != nullptr) {
+            ready.clear();
+            std::rethrow_exception(failure);
+        }
+        try {
+            for (const auto& work : ready) {
+                recorder.Keep(work->recorded);
+                work->recorded->Execute(recorder.open->commands);
+            }
+        } catch (...) { failure = std::current_exception(); ready.clear(); throw; }
+        ready.clear();
+    }
+};
+
+bool Recorder::LaneRecordersEnabled() {
+    static const bool enabled = DriverDetail::Lanes::RecordersEnabled() && RecordWorkerEnabled() && !ComputeChainsEnabled() && !VramOption("APS5_RESIDENT_HEAP_MIRRORS") && !GpuTimingEnabled() && !BarrierValidate() && !VramMirrorWrites();
+    return enabled;
+}
+
+Recorder::LaneRecordStatistics Recorder::LaneRecordCounts() {
+    return {laneRecordChunks.load(std::memory_order_relaxed), laneRecordCommands.load(std::memory_order_relaxed)};
+}
+
 Recorder::RecordStatistics Recorder::RecordCounts() {
     return {recordCommands.load(), recordChunks.load(), recordProducerNs.load(), recordWorkerNs.load(), recordWaitNs.load(), recordQueueDepth.load(), recordQueueMax.load()};
 }
 
 void Recorder::finishRecording() {
+    if (laneRecording != nullptr) laneRecording->Finish(*this);
     if (recordingWorker == nullptr || !recordingWorker->batchRecording) return;
     recordingWorker->Wait();
     recordingWorker->batchRecording = false;
 }
 
 bool Recorder::CanRecordDraw() const {
-    return recordingWorker != nullptr && !GpuTimingEnabled() && !BarrierValidate() && !countingSamples && !VramMirrorWrites();
+    return laneRecording == nullptr && recordingWorker != nullptr && !GpuTimingEnabled() && !BarrierValidate() && !countingSamples && !VramMirrorWrites();
 }
 
 void Recorder::RecordCommand(std::function<void(VkCommandBuffer)> command) {
+    if (laneRecording != nullptr) laneRecording->Finish(*this);
     const auto start = std::chrono::steady_clock::now();
     ensureOpen();
     if (recordingWorker == nullptr) {
@@ -1474,7 +1549,17 @@ void Recorder::RecordDispatch(const DispatchCommand& command) {
     }
     if (open != nullptr && (open->renderPass.open || open->run.open || !open->run.queued.empty() || !open->keyStores.empty())) Submit();
     ensureOpen();
-    recordingWorker->Append(open->commands, {command, {}});
+    if (laneRecording != nullptr && !countingSamples) {
+        if (recordingWorker->batchRecording) {
+            recordingWorker->Wait();
+            recordingWorker->batchRecording = false;
+        }
+        laneRecording->Append(command);
+        if (laneRecording->ready.size() >= 64) laneRecording->Finish(*this);
+    } else {
+        if (laneRecording != nullptr) laneRecording->Finish(*this);
+        recordingWorker->Append(open->commands, {command, {}});
+    }
     recordCommands.fetch_add(1, std::memory_order_relaxed);
     recordProducerNs.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
     if (command.leading) CountBarriers(CommandClass::DispatchLeading);
@@ -1632,6 +1717,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         liveRecorders.push_back(id);
     }
     if (RecordWorkerEnabled()) recordingWorker = std::make_unique<RecordingWorker>(context);
+    if (LaneRecordersEnabled()) laneRecording = std::make_unique<LaneRecording>(context);
     if (SubmitWorkerEnabled()) {
         submitProgress = std::make_shared<SubmitProgress>();
     }
@@ -1685,6 +1771,7 @@ Recorder::~Recorder() {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
     recordingWorker.reset();
+    laneRecording.reset();
     if (RecordWorkerEnabled() && open != nullptr) {
         release(*open);
         open.reset();

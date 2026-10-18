@@ -342,6 +342,90 @@ dependency above with pinned versions and worker-owned state, then add a real
 per-worker mutex-acquisition hook and contention counters to the migrated
 cache lookup/publication paths.
 
+## W5b independent dispatch recording slice
+
+The additional exact-value switch `APS5_GPU_LANE_RECORDERS=1` requires
+`APS5_GPU_LANES=1` and the existing `APS5_RECORD_WORKER` switch (presence-based).
+It moves completed dispatch replay records into four independent recording
+contexts. Each context creates its own secondary command buffer and command
+pool on its recording thread. It reuses the existing replay format and its
+leading, indirect and trailing barriers. Workers can record dependent dispatch
+chunks concurrently because recording does not inspect their buffer contents;
+their execution remains ordered by the original primary buffer.
+
+The producer still resolves all resources, retains pipelines, resources and
+descriptor allocations, declares GPU writes, and owns completion and label
+state. The workers only bind those completed descriptors and record Vulkan
+commands. There is no worker cache lookup, so both settings of
+`APS5_CONCURRENT_CACHES` are safe without depending on W5a publication APIs.
+This is a recording ownership slice of step 3, not the remaining step 1:
+`SubmissionCursor` still uses the compatibility path, and the W4g rules for
+private observations and pending producers are unchanged.
+
+At a direct-command, label, pass or submit boundary, the ordered recorder waits
+for all preceding replay chunks, then executes their secondary buffers in
+record order. No secondary is published when any recording in that group
+fails. Its pool is kept by the existing primary batch until fence completion,
+including with `APS5_SUBMIT_WORKER`. No secondary pool is reset or reused while
+pending. Pools are currently allocated per chunk rather than recycled per
+worker. A batch can collect 128 dispatches per replay chunk and at most 64
+outstanding replay chunks before joining. This stage has its own four-worker
+pool; sharing it with preparation workers requires the later resource handoff.
+
+Compute chains and resident heap mirrors retain their previous recorder path.
+Timing, barrier validation and writable mirrors also retain their previous
+path. Parallel draw replay is excluded: a deferred render pass may span replay
+chunks and cannot be split into these compute secondary buffers. Arbitrary
+replay callbacks still use the legacy replay thread, with joins on either
+side when dispatch recording switches paths. `LaneRecordCounts` and the
+profile line report completed parallel dispatch commands and recording chunks.
+They are workload counters, not GPU-mutex acquisition counters.
+
+`agc_gpu_lane_recorders_{off,on,submit,concurrent,nonexact,unset,lanes_off,worker_off,chains,mirrors}`
+use the recorder mock. The on variants force four simultaneous recording
+threads while the producer holds the actual `GpuMutex`, delay the first chunk
+until its followers have recorded, check execution order and fence-retained
+pool/resource lifetime, and reject a recording failure before publication.
+The blocking spy covers only the new dispatch replay/recording-context path;
+producer cache and resource work still acquires the mutex. Full acquisition
+counting by site is deferred with the remaining lock removal work.
+
+`agc_gpu_lane_recorders_{pm4,render_sample,queues,copied}_{off,on,submit,concurrent,compute}`
+register live equivalence checks. `render_sample` repeats each sample dispatch
+512 times after its 128-draw producer and places a label and wait between
+producer sequences. `queues` checks a counter incremented by 512 additional
+graphics dispatches plus the existing graphics/compute ownership chain;
+`compute` preserves H2 routing while the graphics dispatches use the new
+recorders. The fixture asserts that the new path actually recorded dispatches
+when admitted. `copied` reuses the device recorder write-back and indirect
+ordering tests; `pm4` reuses conditional, wait, FIFO and REWIND coverage. All
+modes check the same expected pixels/buffer/label values, with the parallel
+switch off as the baseline. The new mock and live tests require integrator
+execution; this worktree only ran the required syntax and conventions checks.
+
+Remaining W5b work, in dependency order:
+
+1. Decode real draw/dispatch operation dependencies in `SubmissionCursor`,
+   declare logical writes before proof capture, and carry pinned resource
+   generations plus producer edges. Keep unknown/aliased coverage serial.
+2. Supply a tracker-supported transferable boundary for private write-watch
+   observations and a producer-version handoff for pending GPU writes, then
+   validate W4g proofs before/after preparation and before publication.
+3. Move resource resolution into the workers against those proofs, using W5a
+   concurrent cache APIs only with `APS5_CONCURRENT_CACHES=1`, and serialize
+   cache access otherwise. Remove the corresponding producer mutex holds.
+4. Extend independent recording to complete draw/pass chunks and H2 compute
+   command buffers, with resource-state journals and family ownership edges.
+5. Count every worker GPU-mutex acquisition by site and add spies for each
+   newly migrated path. Run Vulkan validation, live equivalence and four-worker
+   image/scaling gates before claiming completion of G8.
+
+Reconfigure CMake for the new header source entry and 30 test registrations.
+There are no new `.cpp` files. Include `GpuLanePm4`, `GpuLaneQueues` and
+`GpuLaneRenderSample` in `ANYPS5_AGC_EXECUTION_TESTS` when filtered, and build
+the existing recorder test targets. No build, CTest or gameplay run was made
+in this worktree.
+
 ## Shared caches and migration
 
 | Shared state | Requirement before parallel resource preparation/recording |

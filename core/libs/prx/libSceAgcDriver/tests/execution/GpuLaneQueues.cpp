@@ -4,6 +4,7 @@
 #include <iostream>
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #ifdef _WIN32
 #include <windows.h>
@@ -17,7 +18,7 @@ void Check(VkResult result) {
     if (result != VK_SUCCESS) throw std::runtime_error("GPU lane Vulkan test failed: " + std::to_string(result));
 }
 
-void LiveDispatch(AgcDriver::VulkanDevice& device, const std::shared_ptr<VulkanQueues>& queues) {
+void LiveDispatch(AgcDriver::VulkanDevice& device, const std::shared_ptr<VulkanQueues>& queues, bool recorders) {
     constexpr std::size_t bytes = 65536;
 #ifdef _WIN32
     auto* output = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -55,15 +56,23 @@ void LiveDispatch(AgcDriver::VulkanDevice& device, const std::shared_ptr<VulkanQ
         request.useCache = false;
         const auto shader = ShaderRecompiler::Recompile(request);
         const auto before = queues ? queues->RoutedDispatches() : 0;
+        const auto recordedBefore = AgcDriver::Graphics::Recorder::LaneRecordCounts();
         for (const auto queue : {0u, 0x20u, 0x21u, 0u}) {
             const QueueScope scope(queue);
             device.Dispatch(shader, 1, 1, 1);
+        }
+        if (recorders) {
+            const QueueScope scope(0);
+            for (unsigned dispatch = 0; dispatch < 512; ++dispatch) device.Dispatch(shader, 1, 1, 1);
         }
         const std::uint32_t label = 0x12345678u;
         const auto labelPath = device.WriteLabelOnGpu(address + 256, std::as_bytes(std::span(&label, 1)), 1, 0x21);
         if (imported && !AgcDriver::Graphics::ResidentHeapMirrors() && labelPath != 0) throw std::runtime_error("lane pool retirement forced a GPU label onto CPU completion");
         device.WaitIdle();
-        if (output[0] != 4) throw std::runtime_error("live lane dispatch ownership chain returned " + std::to_string(output[0]) + ", expected 4");
+        const auto expected = recorders ? 516u : 4u;
+        if (output[0] != expected) throw std::runtime_error("live lane dispatch ownership chain returned " + std::to_string(output[0]) + ", expected " + std::to_string(expected));
+        const auto recordedAfter = AgcDriver::Graphics::Recorder::LaneRecordCounts();
+        if (recorders && AgcDriver::Graphics::Recorder::LaneRecordersEnabled() && recordedAfter.commands - recordedBefore.commands < 512) throw std::runtime_error("live dispatches bypassed the lane recorders");
         const auto after = queues ? queues->RoutedDispatches() : 0;
         if (AsyncComputeEnabled() && queues && queues->Dedicated() && queues->Timeline() && imported && !AgcDriver::Graphics::ResidentHeapMirrors()) {
             if (after - before != 2) throw std::runtime_error("eligible live dispatches did not use compute queues");
@@ -82,12 +91,12 @@ void LiveDispatch(AgcDriver::VulkanDevice& device, const std::shared_ptr<VulkanQ
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         auto queues = FindQueues(device->Device());
-        LiveDispatch(*device, queues);
+        LiveDispatch(*device, queues, argc == 2 && std::string_view(argv[1]) == "--lane-recorders");
         if (!Enabled()) {
             if (queues) throw std::runtime_error("compute queues were published with the switch off");
             return 0;

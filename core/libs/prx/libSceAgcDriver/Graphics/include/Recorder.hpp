@@ -80,6 +80,9 @@ public:
     void DeferComputeBarrier(const PassAccess& access, std::span<const ComputeImageAccess> images = {});
     void EndComputeChain(ComputeChainReason reason = ComputeChainReason::Command);
     static bool RecordWorkerEnabled();
+    static bool LaneRecordersEnabled();
+    struct LaneRecordStatistics { std::uint64_t chunks, commands; };
+    static LaneRecordStatistics LaneRecordCounts();
     struct DispatchCommand {
         VkPipeline pipeline = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -832,6 +835,8 @@ private:
     std::uint32_t computeDispatches = 0;
     struct RecordingWorker;
     std::unique_ptr<RecordingWorker> recordingWorker;
+    struct LaneRecording;
+    std::unique_ptr<LaneRecording> laneRecording;
     void finishRecording();
     struct SubmitProgress;
     std::shared_ptr<SubmitProgress> submitProgress;

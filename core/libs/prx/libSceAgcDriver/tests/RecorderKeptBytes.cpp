@@ -56,6 +56,11 @@ struct MockDevice {
     bool recordLocked = false;
     std::vector<std::thread::id> recordThreads;
     std::vector<bool> recordLocks;
+    std::map<VkCommandBuffer, std::vector<std::uint32_t>> secondaryDispatches;
+    std::vector<std::uint32_t> executedDispatches;
+    std::vector<VkCommandPool> executedPools;
+    std::map<VkCommandPool, std::thread::id> poolOwners;
+    std::vector<VkCommandBuffer> secondaryEnded;
 };
 
 MockDevice mock;
@@ -63,6 +68,10 @@ std::mutex mockMutex;
 std::promise<void>* recordEntered = nullptr;
 std::shared_future<void> recordAllowed;
 std::atomic<bool> recordBlocked{false};
+std::promise<void>* laneEntered = nullptr;
+std::promise<void>* laneFollowers = nullptr;
+std::shared_future<void> lanesAllowed, followersRecorded;
+std::atomic<unsigned> lanesEntered{0}, lanesFinished{0};
 
 std::uint64_t SubmitCount() {
     std::lock_guard lock(mockMutex);
@@ -77,12 +86,15 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateCommandPool(VkDevice, const VkCommandPo
     std::lock_guard lock(mockMutex);
     *pool = reinterpret_cast<VkCommandPool>(mock.next++);
     mock.pools[*pool] = info->queueFamilyIndex;
+    mock.poolOwners[*pool] = std::this_thread::get_id();
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL mockDestroyCommandPool(VkDevice, VkCommandPool pool, const VkAllocationCallbacks*) {
     std::lock_guard lock(mockMutex);
     mock.pools.erase(pool);
+    mock.poolOwners.erase(pool);
+    std::erase_if(mock.commandPools, [pool](const auto& entry) { return entry.second == pool; });
 }
 
 #if defined(ANYPS5_AFTERMATH_TESTING)
@@ -113,6 +125,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateCommandBuffers(VkDevice, const VkComm
     std::lock_guard lock(mockMutex);
     *commands = reinterpret_cast<VkCommandBuffer>(mock.next++);
     mock.commandPools[*commands] = info->commandPool;
+    if (info->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) mock.secondaryDispatches[*commands] = {};
     return VK_SUCCESS;
 }
 
@@ -175,6 +188,10 @@ VKAPI_ATTR VkResult VKAPI_CALL mockEndCommandBuffer(VkCommandBuffer commands) {
     mock.ended.push_back(commands);
     mock.endThread = std::this_thread::get_id();
     mock.endLocked = AgcDriver::GuestMemory::GpuMutex().HeldByThisThread();
+    if (mock.secondaryDispatches.contains(commands)) {
+        Expect(mock.poolOwners.at(mock.commandPools.at(commands)) == std::this_thread::get_id(), "secondary pool changed recording workers");
+        mock.secondaryEnded.push_back(commands);
+    }
     return mock.ended.size() >= mock.failAt ? mock.endResult : VK_SUCCESS;
 }
 
@@ -218,7 +235,12 @@ VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer, VkPipelineLayou
     mock.pushes.push_back(value);
     mock.recording.push_back('C');
 }
-VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t x, std::uint32_t, std::uint32_t) {
+VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer commands, std::uint32_t x, std::uint32_t, std::uint32_t) {
+    if (laneEntered != nullptr && x % 128 == 0) {
+        if (lanesEntered.fetch_add(1) == 3) laneEntered->set_value();
+        lanesAllowed.wait();
+        if (x == 0) followersRecorded.wait();
+    }
     if (recordEntered != nullptr && !recordBlocked.exchange(true)) {
         recordEntered->set_value();
         recordAllowed.wait();
@@ -230,6 +252,10 @@ VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t x, std
     mock.recordLocked = AgcDriver::GuestMemory::GpuMutex().HeldByThisThread();
     mock.recordThreads.push_back(mock.recordThread);
     mock.recordLocks.push_back(mock.recordLocked);
+    if (mock.secondaryDispatches.contains(commands)) mock.secondaryDispatches[commands].push_back(x);
+    if (laneFollowers != nullptr && x != 127 && x % 128 == 127 && lanesFinished.fetch_add(1) == 2) {
+        try { laneFollowers->set_value(); } catch (const std::future_error&) {}
+    }
 }
 VKAPI_ATTR void VKAPI_CALL mockCmdDispatchIndirect(VkCommandBuffer commands, VkBuffer, VkDeviceSize offset) {
     mockCmdDispatch(commands, static_cast<std::uint32_t>(offset), 1, 1);
@@ -240,6 +266,19 @@ VKAPI_ATTR void VKAPI_CALL mockCmdEndRenderPass(VkCommandBuffer) {
     mock.recording.push_back('E');
     mock.recordThreads.push_back(std::this_thread::get_id());
     mock.recordLocks.push_back(AgcDriver::GuestMemory::GpuMutex().HeldByThisThread());
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCmdExecuteCommands(VkCommandBuffer, std::uint32_t count, const VkCommandBuffer* commands) {
+    std::lock_guard lock(mockMutex);
+    Expect(AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "secondary publication escaped the ordered recorder");
+    for (std::uint32_t index = 0; index < count; ++index) {
+        Expect(std::find(mock.secondaryEnded.begin(), mock.secondaryEnded.end(), commands[index]) != mock.secondaryEnded.end(), "secondary was published before recording ended");
+        const auto pool = mock.commandPools.at(commands[index]);
+        Expect(mock.pools.contains(pool), "secondary pool retired before publication");
+        mock.executedPools.push_back(pool);
+        const auto& dispatches = mock.secondaryDispatches.at(commands[index]);
+        mock.executedDispatches.insert(mock.executedDispatches.end(), dispatches.begin(), dispatches.end());
+    }
 }
 
 PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
@@ -268,6 +307,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
         {"vkCmdDispatchIndirect", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatchIndirect)},
         {"vkCmdEndRenderPass", reinterpret_cast<PFN_vkVoidFunction>(mockCmdEndRenderPass)},
+        {"vkCmdExecuteCommands", reinterpret_cast<PFN_vkVoidFunction>(mockCmdExecuteCommands)},
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -1032,6 +1072,92 @@ void DrawWorkerPassOrder() {
     Expect(mock.signaled.empty() && mock.pools.empty(), "draw worker teardown leaked Vulkan objects");
 }
 
+void LaneRecorderTests() {
+    using namespace AgcDriver;
+    mock = MockDevice{};
+    const bool enabled = Recorder::LaneRecordersEnabled();
+    const auto before = Recorder::LaneRecordCounts();
+    std::promise<void> entered, allow, followers;
+    auto enteredFuture = entered.get_future();
+    lanesAllowed = allow.get_future().share();
+    followersRecorded = followers.get_future().share();
+    lanesEntered.store(0);
+    lanesFinished.store(0);
+    laneEntered = enabled ? &entered : nullptr;
+    laneFollowers = enabled ? &followers : nullptr;
+    std::weak_ptr<void> kept;
+    std::exception_ptr failure;
+    std::thread caller([&] {
+        try {
+            std::lock_guard gpu(GuestMemory::GpuMutex());
+            Recorder recorder(mockContext());
+            auto object = std::make_shared<int>(42);
+            kept = object;
+            recorder.Keep(std::move(object));
+            Recorder::DispatchCommand command;
+            command.pipeline = reinterpret_cast<VkPipeline>(1);
+            command.layout = reinterpret_cast<VkPipelineLayout>(2);
+            command.pushBytes = 4;
+            for (std::uint32_t index = 0; index < 512; ++index) {
+                command.x = index;
+                std::memcpy(command.push.data(), &index, sizeof(index));
+                recorder.RecordDispatch(command);
+            }
+            bool completed = false;
+            recorder.OnComplete([&] { completed = true; Expect(!kept.expired(), "lane resource expired before completion action"); });
+            recorder.Submit();
+            DrainSubmits();
+            Expect(!kept.expired(), "lane resources retired at CPU recording completion");
+            if (enabled) {
+                std::lock_guard lock(mockMutex);
+                Expect(mock.executedPools.size() == 4, "dispatch chunks did not use independent contexts");
+                for (const auto pool : mock.executedPools) Expect(mock.pools.contains(pool), "lane pool retired before its fence");
+            }
+            recorder.Sync();
+            Expect(completed, "lane completion action was lost");
+        } catch (...) { failure = std::current_exception(); }
+    });
+    bool overlapped = true;
+    if (enabled) overlapped = enteredFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    allow.set_value();
+    if (!overlapped) {
+        try { followers.set_value(); } catch (...) {}
+    }
+    caller.join();
+    laneEntered = nullptr;
+    laneFollowers = nullptr;
+    lanesAllowed = {};
+    followersRecorded = {};
+    if (failure) std::rethrow_exception(failure);
+    Expect(overlapped, "four recording workers could not progress while the producer held GpuMutex");
+    const auto& actual = enabled ? mock.executedDispatches : mock.dispatches;
+    Expect(actual.size() == 512, "lane recording lost or duplicated a dispatch");
+    for (std::size_t index = 0; index < actual.size(); ++index) Expect(actual[index] == index, "out-of-order recording changed execution order");
+    Expect(std::all_of(mock.recordLocks.begin(), mock.recordLocks.end(), [](bool held) { return held == !Recorder::RecordWorkerEnabled(); }), "recording used the wrong GpuMutex owner");
+    if (enabled) Expect(!mock.dispatches.empty() && mock.dispatches.front() != 0, "lane test did not force out-of-order recording");
+    Expect(mock.submits == 1 && kept.expired(), "lane resources or completion batches did not retire");
+    Expect(mock.pools.empty() && mock.signaled.empty(), "lane teardown leaked Vulkan resources");
+    const auto after = Recorder::LaneRecordCounts();
+    Expect(after.chunks - before.chunks == (enabled ? 4u : 0u) && after.commands - before.commands == (enabled ? 512u : 0u), "lane recorder counters included fallback work");
+    if (enabled) {
+        mock = MockDevice{};
+        mock.endResult = VK_ERROR_INITIALIZATION_FAILED;
+        bool rejected = false;
+        {
+            std::lock_guard gpu(GuestMemory::GpuMutex());
+            Recorder recorder(mockContext());
+            Recorder::DispatchCommand command;
+            for (unsigned index = 0; index < 256; ++index) recorder.RecordDispatch(command);
+            try { recorder.Submit(); } catch (const std::runtime_error&) { rejected = true; }
+            bool poisoned = false;
+            try { recorder.Submit(); } catch (const std::runtime_error&) { poisoned = true; }
+            Expect(poisoned, "a failed lane recording did not poison later publication");
+            Expect(mock.executedDispatches.empty() && SubmitCount() == 0, "failed lane recording published partial work");
+        }
+        Expect(rejected && mock.pools.empty(), "lane recording failure escaped or leaked command pools");
+    }
+}
+
 void ParseTimeLabelTests() {
     using namespace AgcDriver;
     mock = MockDevice{};
@@ -1097,6 +1223,8 @@ int main(int argc, char** argv) {
             ComputeChainTests();
             ComputeChainWorkerOrder();
             if (Recorder::RecordWorkerEnabled()) RecordWorkerOrderAndSync();
+        } else if (argc == 2 && std::string_view(argv[1]) == "lane-recorders") {
+            LaneRecorderTests();
         } else if (argc == 2 && std::string_view(argv[1]) == "record-worker") {
             RecordWorkerOrderAndSync();
         } else if (argc == 2 && std::string_view(argv[1]) == "draw-worker") {

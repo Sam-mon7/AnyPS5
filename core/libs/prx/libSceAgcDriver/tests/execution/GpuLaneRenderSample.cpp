@@ -1,6 +1,7 @@
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/SubmissionCursor.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include <array>
 #include <bit>
@@ -20,6 +21,7 @@ alignas(256) constexpr std::array<std::uint32_t, 10> SampleCode{
 alignas(256) constexpr std::array<std::array<float, 4>, 3> Triangle{{{-1, -1, 0.5f, 1}, {3, -1, 0.5f, 1}, {-1, 3, 0.5f, 1}}};
 alignas(256) std::array<std::byte, 65536> Color{};
 alignas(256) std::array<std::uint32_t, 64> Output{};
+alignas(64) std::array<std::uint32_t, 2> Labels{};
 
 struct Header { Shader shader{}; ShaderUserData userData{}; };
 alignas(8) Header VertexHeader{}, PixelHeader{};
@@ -41,7 +43,7 @@ void RegisterWord(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::
     words.insert(words.end(), {0xc0010000u | (opcode << 8u), offset, value});
 }
 
-std::vector<std::uint32_t> Frame() {
+std::vector<std::uint32_t> Frame(bool recorders) {
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         std::pair{0x2d5u, 0x2000u}, {0x1b6u, 0u}, {0x207u, 0u}, {0x200u, 0u}, {0x203u, 0x800u},
         {0x2dcu, 0xaa00u}, {0x2f8u, 0u}, {0x292u, 2u}, {0x293u, 0u},
@@ -85,14 +87,19 @@ std::vector<std::uint32_t> Frame() {
             (63u >> 2u) | (3u << 14u), 0x90000facu, 0u, 0u, 0u, 0u, 0x92u, 0u, 0u, 0u
         };
         for (std::uint32_t index = 0; index < data.size(); ++index) RegisterWord(words, 0x76, 0x240 + index, data[index]);
-        words.insert(words.end(), {0xc0031500u, 1u, 1u, 1u, 0x8041u});
+        for (unsigned dispatch = 0; dispatch < (recorders ? 512u : 1u); ++dispatch) words.insert(words.end(), {0xc0031500u, 1u, 1u, 1u, 0x8041u});
+        if (recorders) {
+            const auto label = Address(&Labels[pass]);
+            words.insert(words.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), pass + 1});
+            words.insert(words.end(), {0xc0053c00u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), pass + 1, UINT32_MAX, 0x19u});
+        }
     }
     return words;
 }
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         {
             const auto device = OpenVulkanTestDevice();
@@ -101,7 +108,9 @@ int main() {
         Register(VertexHeader, VertexCode, 2);
         Register(PixelHeader, PixelCode, 1);
         Output.fill(0xdeadbeefu);
-        auto words = Frame();
+        const bool recorders = argc == 2 && std::string_view(argv[1]) == "--lane-recorders";
+        const auto recordedBefore = AgcDriver::Graphics::Recorder::LaneRecordCounts();
+        auto words = Frame(recorders);
         AgcDriver::DriverDetail::Lanes::SubmissionCursor cursor;
         cursor.submission.commands = words;
         const auto boundary = cursor.End();
@@ -110,6 +119,8 @@ int main() {
         Require(sceAgcDriverSubmitDcb(&packet) == 0, "render/sample PM4 submit failed");
         AgcDriverWaitIdle_nid_postfix();
         for (std::size_t index = 0; index < Output.size(); ++index) Require(Output[index] == std::bit_cast<std::uint32_t>(index < 32 ? 0.25f : 0.75f), "a sampled render target was stale across chunks at lane " + std::to_string(index));
+        if (recorders) Require(Labels[0] == 1 && Labels[1] == 2, "lane recorder labels or waits were lost between chunks");
+        if (recorders && AgcDriver::Graphics::Recorder::LaneRecordersEnabled()) Require(AgcDriver::Graphics::Recorder::LaneRecordCounts().commands > recordedBefore.commands, "render/sample dispatches bypassed lane recording");
         AgcDriverShutdown_nid_postfix();
         std::cout << "GPU lane render-target sampling across chunks passed\n";
         return 0;
