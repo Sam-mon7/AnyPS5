@@ -1048,7 +1048,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     if (first != state.imports.begin() && std::prev(first)->second.base + std::prev(first)->second.bytes > base) --first;
     std::uint64_t replaced = 0;
     const auto held = [&](const HostImport& entry) {
-        if (joined || !pointerHeld(state, entry)) return false;
+        if (joined || !pointerHeld(state, entry) || (VramDeviceLocalMirrors() && !sameRange(entry, lease))) return false;
         const bool expandedWindow = run.ranges.size() == 1 && entry.ranges.size() == 1 && entry.range == run.ranges.front() && base <= entry.base && base + bytes >= entry.base + entry.bytes && bytes > entry.bytes;
         return !expandedWindow || Recorder::Active() == nullptr;
     };
