@@ -36,6 +36,7 @@
 #include "ResidentPresent.hpp"
 #include "SampleLod_spv.h"
 #include "BufferUpdate_spv.h"
+#include "ComputeChainImage_spv.h"
 #include "SampleArray_spv.h"
 #include "Cover_vert_spv.h"
 #include "Cover_frag_spv.h"
@@ -1135,15 +1136,24 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
     pipelineInfo.layout = release.layout;
     Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &release.pipeline), "ordering pipeline");
     const auto recordCountsBefore = Recorder::RecordCounts();
-    const auto update = [&](const std::shared_ptr<ShaderResources>& resources, std::uint32_t delta, std::uint32_t count = 1) {
-        if (recordWorker && recorder.TryRecordDispatch(release.pipeline, release.layout, {}, resources, std::as_bytes(std::span(&delta, 1)), count, 1, 1)) return;
+    const auto update = [&](const std::shared_ptr<ShaderResources>& resources, std::uint32_t delta, std::uint32_t count = 1, std::uint64_t arguments = 0) {
+        const auto* indirect = arguments != 0 ? HostImportFor(context, arguments, 12) : nullptr;
+        Require(arguments == 0 || indirect != nullptr, "compute chain indirect arguments were not imported");
+        if (recordWorker && recorder.TryRecordDispatch(release.pipeline, release.layout, {}, resources, std::as_bytes(std::span(&delta, 1)), count, 1, 1,
+            indirect != nullptr ? indirect->buffer : VK_NULL_HANDLE, indirect != nullptr ? arguments - indirect->base : 0, arguments)) return;
         Recorder::ComputeDispatchStart start;
-        const auto reads = computeChains ? resources->DeviceReads() : std::vector<std::pair<std::uint64_t, std::uint64_t>>{};
+        auto reads = computeChains ? resources->DeviceReads() : std::vector<std::pair<std::uint64_t, std::uint64_t>>{};
+        if (computeChains && arguments != 0) reads.emplace_back(arguments, arguments + 12);
         const PassAccess access{reads, resources->GpuWrites(), {}, {}};
         if (computeChains) start = recorder.BeginComputeDispatch(access);
         else start.commands = recorder.Commands();
         const auto commands = start.commands;
         recorder.Keep(resources);
+        if (indirect != nullptr) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+            recorder.NotePendingRead(arguments, 12, Recorder::ReadKind::Indirect);
+        }
         constexpr auto shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         if (!computeChains || (!start.continued && (!Recorder::MergeBarriers() || (start.covered & shaderAccess) != shaderAccess))) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, shaderAccess);
@@ -1151,7 +1161,8 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
         context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, release.pipeline);
         resources->Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, release.layout);
         context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, release.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(delta), &delta);
-        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, count, 1, 1);
+        if (indirect != nullptr) context.Function<PFN_vkCmdDispatchIndirect>("vkCmdDispatchIndirect")(commands, indirect->buffer, arguments - indirect->base);
+        else context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, count, 1, 1);
         if (start.deferred) recorder.DeferComputeBarrier(access);
         else {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
@@ -1182,6 +1193,28 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
             Require(after.chained - before.chained == (Recorder::ComputeChainsEnabled() ? 1u : 0u) && after.saved - before.saved == (Recorder::ComputeChainsEnabled() ? 1u : 0u), "device dispatches did not save the expected chain barrier");
             Require(after.fallbacks[raw] - before.fallbacks[raw] == (Recorder::ComputeChainsEnabled() && !sync ? 1u : 0u), "device RAW hazard was not closed by its dependency or sync point");
         }
+        auto argumentProgram = program;
+        argumentProgram.bindings[0].guestDescriptor[0] += 8192;
+        const CompiledShader argumentCompute{ShaderRecompiler::ShaderStage::Compute, &argumentProgram, 0};
+        auto argumentWriter = std::make_shared<ShaderResources>(context, argumentCompute);
+        Require(argumentWriter->Reusable() && argumentWriter->CopiedBytes() == 0, "indirect chain fixture needs a tracked argument writer");
+        for (const bool inside : {false, true}) {
+            *block = 10;
+            block[1] = 20;
+            block[2048] = inside ? 1 : 2;
+            block[2049] = block[2050] = 1;
+            const auto before = Recorder::ComputeChainCounts();
+            if (inside) update(argumentWriter, 1);
+            else update(separate, 2);
+            update(direct, 3, 1, address + 8192);
+            recorder.Sync();
+            Require(*block == 13 && block[1] == 23 && block[2048] == 2, "chained indirect dispatch used stale group counts");
+            const auto after = Recorder::ComputeChainCounts();
+            const auto raw = static_cast<std::size_t>(Recorder::ComputeChainReason::Raw);
+            Require(after.saved - before.saved == (Recorder::ComputeChainsEnabled() && !inside ? 1u : 0u), "indirect argument dependency saved the wrong number of barriers");
+            Require(after.fallbacks[raw] - before.fallbacks[raw] == (Recorder::ComputeChainsEnabled() && inside ? 1u : 0u), "indirect argument writer did not force the RAW barrier");
+        }
+        if (recordWorker && Recorder::RecordWorkerEnabled()) Require(Recorder::RecordCounts().commands > recordCountsBefore.commands, "compute chains bypassed dispatch worker replay");
         std::cout << "Compute chain producer/consumer tests passed\n";
         return;
     }
@@ -1331,6 +1364,147 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
         }
     }
     std::cout << "Copied producers precede fresh and reused direct consumers\n";
+}
+
+void computeChainImageTests(const Device& device, Recorder& recorder) {
+    const bool chains = Recorder::ComputeChainsEnabled() && Recorder::MergeBarriers();
+    auto context = device.GetContext();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.width = 64;
+    resource.height = 4;
+    resource.depthOrLastArray = 1;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 20;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+    std::array<std::vector<std::byte>, 5> memory;
+    std::array<std::shared_ptr<StorageTexture>, 5> images;
+    for (std::size_t i = 0; i < images.size(); ++i) {
+        memory[i].resize(bytes + 256);
+        resource.baseAddress = (reinterpret_cast<std::uintptr_t>(memory[i].data()) + 255) & ~std::uintptr_t{255};
+        images[i] = StorageTexture::Create(context, detiler, resource, 0);
+        recorder.Keep(images[i]);
+    }
+    recorder.Sync();
+    struct Program {
+        const Context& context;
+        Recorder& recorder;
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkShaderModule module = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        ~Program() {
+            recorder.Sync();
+            if (pool) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+            if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+            if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+            if (setLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, setLayout, nullptr);
+        }
+    } program{context, recorder};
+    const VkDescriptorSetLayoutBinding bindings[2]{{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    setInfo.bindingCount = 2;
+    setInfo.pBindings = bindings;
+    Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &setInfo, nullptr, &program.setLayout), "image chain set layout");
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t)};
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &program.setLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &push;
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &program.layout), "image chain layout");
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = sizeof(COMPUTE_CHAIN_IMAGE_SPV);
+    moduleInfo.pCode = COMPUTE_CHAIN_IMAGE_SPV;
+    Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &program.module), "image chain module");
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, program.module, "main", nullptr};
+    pipelineInfo.layout = program.layout;
+    Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &program.pipeline), "image chain pipeline");
+    const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 18};
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 9;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &program.pool), "image chain descriptor pool");
+    Buffer readback(context, 20, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    using Reason = Recorder::ComputeChainReason;
+    for (const auto reason : {Reason::Raw, Reason::War, Reason::Waw}) {
+        auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            VkClearColorValue clear{};
+            clear.uint32[0] = static_cast<std::uint32_t>((i + 1) * 10);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, images[i]->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        recorder.MarkShaderReadsCovered();
+        const auto before = Recorder::ComputeChainCounts();
+        const auto dispatch = [&](std::size_t source, std::size_t destination, std::uint32_t delta) {
+            VkDescriptorSetAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            allocateInfo.descriptorPool = program.pool;
+            allocateInfo.descriptorSetCount = 1;
+            allocateInfo.pSetLayouts = &program.setLayout;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocateInfo, &set), "image chain descriptors");
+            const VkDescriptorImageInfo imageInfo[2]{{VK_NULL_HANDLE, images[source]->StorageView(0, false), VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, images[destination]->StorageView(0, false), VK_IMAGE_LAYOUT_GENERAL}};
+            VkWriteDescriptorSet writes[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+            for (std::uint32_t i = 0; i < 2; ++i) {
+                writes[i].dstSet = set;
+                writes[i].dstBinding = i;
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                writes[i].pImageInfo = &imageInfo[i];
+            }
+            context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 2, writes, 0, nullptr);
+            const Recorder::ComputeImageAccess access[2]{{images[source]->Image(), false, range}, {images[destination]->Image(), true, range}};
+            const auto start = recorder.BeginComputeDispatch({}, Reason::Count, access, Recorder::RecordWorkerEnabled());
+            recorder.RecordCommand([context, start, set, delta, pipeline = program.pipeline, layout = program.layout](VkCommandBuffer commands) {
+                constexpr auto shader = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                if (!start.continued && (!Recorder::MergeBarriers() || (start.covered & shader) != shader))
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, shader);
+                context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+                context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(delta), &delta);
+                context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+                if (!start.deferred) RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, shader | VK_ACCESS_TRANSFER_READ_BIT);
+            });
+            if (start.deferred) recorder.DeferComputeBarrier({}, access);
+            else recorder.MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        };
+        dispatch(0, 1, 1);
+        dispatch(3, 4, 2);
+        dispatch(reason == Reason::Raw ? 1 : 2, reason == Reason::Raw ? 2 : reason == Reason::War ? 0 : 1, 3);
+        commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            VkBufferImageCopy copy{};
+            copy.bufferOffset = i * 4;
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {1, 1, 1};
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, images[i]->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        std::array<std::uint32_t, 5> result{};
+        std::memcpy(result.data(), readback.Bytes().data(), sizeof(result));
+        const std::array<std::uint32_t, 5> expected{reason == Reason::War ? 33u : 10u, reason == Reason::Waw ? 33u : 11u, reason == Reason::Raw ? 14u : 30u, 40u, 42u};
+        Require(result == expected, "storage image compute chain lost RAW/WAR/WAW ordering");
+        const auto after = Recorder::ComputeChainCounts();
+        Require(after.saved - before.saved == (chains ? 1u : 0u) && after.barriers - before.barriers == (chains ? 2u : 0u), "storage image chain barrier counts differ");
+        Require(after.fallbacks[static_cast<std::size_t>(reason)] - before.fallbacks[static_cast<std::size_t>(reason)] == (chains ? 1u : 0u), "storage image dependency closed for the wrong reason");
+    }
+    std::cout << "Storage image compute chain RAW/WAR/WAW tests passed\n";
 }
 
 void readTrackingTests(const Device& device, Recorder& recorder) {
@@ -8858,9 +9032,13 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext(), submitWorkerTest || dispatchHeapTest);
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--compute-chain-images-only") {
+            computeChainImageTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--compute-chains-only") {
             if (device.GetContext().hostImportAlignment == 0 || !device.NullDescriptors() || !AgcDriver::GuestMemory::WriteWatched()) return 77;
-            copiedDirectOrderingTests(device, recorder, false, true);
+            copiedDirectOrderingTests(device, recorder, Recorder::RecordWorkerEnabled(), true);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--dispatch-heap-refresh-only") {

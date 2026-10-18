@@ -71,8 +71,13 @@ public:
         bool continued = false;
         bool deferred = false;
     };
-    ComputeDispatchStart BeginComputeDispatch(const PassAccess& access, ComputeChainReason fallback = ComputeChainReason::Count);
-    void DeferComputeBarrier(const PassAccess& access);
+    struct ComputeImageAccess {
+        VkImage image;
+        bool written;
+        VkImageSubresourceRange range{~VkImageAspectFlags{0}, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    };
+    ComputeDispatchStart BeginComputeDispatch(const PassAccess& access, ComputeChainReason fallback = ComputeChainReason::Count, std::span<const ComputeImageAccess> images = {}, bool deferred = false);
+    void DeferComputeBarrier(const PassAccess& access, std::span<const ComputeImageAccess> images = {});
     void EndComputeChain(ComputeChainReason reason = ComputeChainReason::Command);
     static bool RecordWorkerEnabled();
     struct DispatchCommand {
@@ -821,6 +826,7 @@ private:
 
     Context context;
     PassHazards computeHazards;
+    std::vector<ComputeImageAccess> computeImages;
     std::uint32_t computeQueue = 0;
     std::uint32_t computeDispatches = 0;
     struct RecordingWorker;

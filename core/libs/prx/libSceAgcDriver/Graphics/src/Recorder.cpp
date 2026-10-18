@@ -1354,6 +1354,22 @@ struct Recorder::RecordingWorker {
         recordWaitNs.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
         if (error != nullptr) std::rethrow_exception(error);
     }
+    static void DispatchChain(const Context& context, VkCommandBuffer commands, const DispatchCommand& record) {
+        const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
+        const auto bind = context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline");
+        const auto push = context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants");
+        if (record.indirect != VK_NULL_HANDLE) {
+            const VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
+            barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
+        }
+        const VkMemoryBarrier leading{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+        if (record.leading) barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &leading, 0, nullptr, 0, nullptr);
+        bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.pipeline);
+        if (record.resources != nullptr) record.resources->Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.layout);
+        if (record.pushBytes != 0) push(commands, record.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, record.pushBytes, record.push.data());
+        if (record.indirect != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, record.indirect, record.offset);
+        else context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);
+    }
     void Replay(const Chunk& chunk) {
         const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
         const auto bind = context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline");
@@ -1469,16 +1485,31 @@ void Recorder::RecordDispatch(const DispatchCommand& command) {
 
 bool Recorder::TryRecordDispatch(VkPipeline pipeline, VkPipelineLayout layout, std::shared_ptr<void> objects, std::shared_ptr<ShaderResources> resources, std::span<const std::byte> push, std::uint32_t x, std::uint32_t y, std::uint32_t z, VkBuffer indirect, VkDeviceSize offset, std::uint64_t arguments) {
     if (recordingWorker == nullptr || GpuTimingEnabled() || BarrierValidate() || countingSamples || VramMirrorWrites() || !resources->Reusable() || resources->NeedsCompletion() || resources->CopiedBytes() != 0 || !resources->StorageImages().empty()) return false;
-    EndComputeChain(ComputeChainReason::Worker);
+    if (!ComputeChainsEnabled()) EndComputeChain(ComputeChainReason::Worker);
     if (recordQueueDepth.load(std::memory_order_relaxed) >= 64) Submit();
     if (open != nullptr && (open->renderPass.open || open->run.open || !open->run.queued.empty() || !open->keyStores.empty())) Submit();
     ensureOpen();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    PassAccess access{};
+    ComputeDispatchStart start;
+    if (ComputeChainsEnabled()) {
+        static const bool residentHeapMirrors = VramOption("APS5_RESIDENT_HEAP_MIRRORS");
+        if (residentHeapMirrors) EndComputeChain(ComputeChainReason::Mirror);
+        else if (resources->HoldsLease() || resources->UsesAddressTable()) EndComputeChain(ComputeChainReason::Unknown);
+        else {
+            reads = resources->DeviceReads();
+            if (indirect != VK_NULL_HANDLE) reads.emplace_back(arguments, arguments + 12);
+            access = {reads, resources->GpuWrites(), {}, {}};
+            start = BeginComputeDispatch(access, ComputeChainReason::Count, {}, true);
+        }
+    }
     Keep(std::move(objects));
     Keep(resources);
     resources->BeginGpuWrites(*this);
     DispatchCommand command;
     constexpr auto shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     command.leading = !MergeBarriers() || (open->coveredAccess & shaderAccess) != shaderAccess;
+    if (start.commands != VK_NULL_HANDLE) command.leading = !start.continued && (!MergeBarriers() || (start.covered & shaderAccess) != shaderAccess);
     command.pipeline = pipeline;
     command.layout = layout;
     command.resources = resources.get();
@@ -1489,7 +1520,15 @@ bool Recorder::TryRecordDispatch(VkPipeline pipeline, VkPipelineLayout layout, s
     command.indirect = indirect;
     command.offset = offset;
     if (indirect != VK_NULL_HANDLE) NotePendingRead(arguments, 12, ReadKind::Indirect);
-    RecordDispatch(command);
+    if (start.deferred) {
+        RecordCommand([context = context, command](VkCommandBuffer commands) { RecordingWorker::DispatchChain(context, commands, command); });
+        if (command.leading) CountBarriers(CommandClass::DispatchLeading);
+        else CountMerged(CommandClass::DispatchLeading);
+        if (indirect != VK_NULL_HANDLE) CountBarriers(CommandClass::IndirectArguments);
+        DeferComputeBarrier(access);
+    } else {
+        RecordDispatch(command);
+    }
     resources->MarkGpuWrites(*this);
     resources->ReadyForSubmit(*this);
     return true;
@@ -1913,19 +1952,16 @@ bool Recorder::ComputeChainPacketBoundary(std::uint32_t header) {
     }
 }
 
-Recorder::ComputeDispatchStart Recorder::BeginComputeDispatch(const PassAccess& access, ComputeChainReason fallback) {
+Recorder::ComputeDispatchStart Recorder::BeginComputeDispatch(const PassAccess& access, ComputeChainReason fallback, std::span<const ComputeImageAccess> images, bool deferred) {
     ComputeDispatchStart result;
     if (!ComputeChainsEnabled()) {
         result.commands = Commands(&result.covered);
         return result;
     }
-    static const bool lanes = [] { const auto* value = std::getenv("APS5_GPU_LANES"); return value != nullptr && std::strcmp(value, "1") == 0; }();
     if (!MergeBarriers()) fallback = ComputeChainReason::FullBarriers;
     else if (GpuTimingEnabled()) fallback = ComputeChainReason::Profiling;
-    else if (RecordWorkerEnabled()) fallback = ComputeChainReason::Worker;
-    else if (lanes) fallback = ComputeChainReason::Lanes;
     else if (access.anyReads || access.anyWrites) fallback = ComputeChainReason::Unknown;
-    else if (!access.images.empty() || !access.attachments.empty()) fallback = ComputeChainReason::Image;
+    else if (!access.attachments.empty()) fallback = ComputeChainReason::Image;
     if (fallback != ComputeChainReason::Count) {
         if (computeDispatches != 0) EndComputeChain(fallback);
         else computeFallbacks[static_cast<std::size_t>(fallback)].fetch_add(1, std::memory_order_relaxed);
@@ -1943,15 +1979,36 @@ Recorder::ComputeDispatchStart Recorder::BeginComputeDispatch(const PassAccess& 
             case PassHazard::None: break;
             default: EndComputeChain(ComputeChainReason::Unknown); break;
         }
+        const auto checkImage = [&](const ComputeImageAccess& use) {
+            const auto overlaps = [](std::uint32_t first, std::uint32_t count, std::uint32_t other, std::uint32_t otherCount) {
+                return count != 0 && otherCount != 0 && static_cast<std::uint64_t>(first) < static_cast<std::uint64_t>(other) + otherCount && static_cast<std::uint64_t>(other) < static_cast<std::uint64_t>(first) + count;
+            };
+            for (const auto& seen : computeImages) {
+                if (use.image == VK_NULL_HANDLE || use.image != seen.image || !(use.range.aspectMask & seen.range.aspectMask) ||
+                    !overlaps(use.range.baseMipLevel, use.range.levelCount, seen.range.baseMipLevel, seen.range.levelCount) ||
+                    !overlaps(use.range.baseArrayLayer, use.range.layerCount, seen.range.baseArrayLayer, seen.range.layerCount)) continue;
+                if (seen.written || use.written) {
+                    const auto reason = seen.written ? (use.written ? ComputeChainReason::Waw : ComputeChainReason::Raw) : ComputeChainReason::War;
+                    EndComputeChain(reason);
+                    break;
+                }
+            }
+        };
+        if (images.empty()) {
+            for (const auto& [image, written] : access.images) checkImage({image, written});
+        } else {
+            for (const auto& image : images) checkImage(image);
+        }
     }
     result.continued = computeDispatches != 0;
     if (result.continued) result.commands = open->commands;
     else result.commands = Commands(&result.covered);
+    if (!deferred) finishRecording();
     result.deferred = true;
     return result;
 }
 
-void Recorder::DeferComputeBarrier(const PassAccess& access) {
+void Recorder::DeferComputeBarrier(const PassAccess& access, std::span<const ComputeImageAccess> images) {
     Require(ComputeChainsEnabled() && open != nullptr, "compute chain needs an open batch");
     if (computeDispatches != 0) computeChained.fetch_add(1, std::memory_order_relaxed);
     computeQueue = GuestMemory::CurrentPacket().queue;
@@ -1959,7 +2016,14 @@ void Recorder::DeferComputeBarrier(const PassAccess& access) {
     computeDeferred.fetch_add(1, std::memory_order_relaxed);
     open->coveredAccess = 0;
     try {
-        computeHazards.Add(access);
+        auto buffers = access;
+        buffers.images = {};
+        computeHazards.Add(buffers);
+        if (images.empty()) {
+            for (const auto& [image, written] : access.images) computeImages.push_back({image, written});
+        } else {
+            computeImages.insert(computeImages.end(), images.begin(), images.end());
+        }
     } catch (...) {
         EndComputeChain(ComputeChainReason::Unknown);
         throw;
@@ -1978,6 +2042,7 @@ void Recorder::EndComputeChain(ComputeChainReason reason) {
     open->coveredAccess = access;
     computeDispatches = 0;
     computeHazards.Clear();
+    computeImages.clear();
 }
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {

@@ -4223,7 +4223,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     VkAccessFlags covered = 0;
     Graphics::Recorder::ComputeDispatchStart computeStart;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> computeReads;
-    std::vector<std::pair<VkImage, bool>> computeImages;
+    std::vector<Graphics::Recorder::ComputeImageAccess> computeImages;
     Graphics::PassAccess computeAccess{};
     if (Graphics::Recorder::ComputeChainsEnabled()) {
         using Reason = Graphics::Recorder::ComputeChainReason;
@@ -4231,14 +4231,22 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (resources.HoldsLease() || resources.UsesAddressTable() || !resources.Reusable()) fallback = Reason::Unknown;
         if (resources.NeedsCompletion() || resources.CopiedBytes() != 0) fallback = Reason::Copied;
         if (record.dataRefresh != RecordedDispatch::DataRefresh::None && (record.dataRefresh != RecordedDispatch::DataRefresh::Hash || resources.DataWordsHash() != record.dataWordsHash)) fallback = Reason::Refresh;
-        if (argumentImport != nullptr) fallback = Reason::Indirect;
         static const bool residentHeapMirrors = Graphics::VramOption("APS5_RESIDENT_HEAP_MIRRORS");
         if (Graphics::VramMirrorWrites() || residentHeapMirrors) fallback = Reason::Mirror;
         if (record.shader->program->workgroupMemoryDwords != 0 || record.x > state->properties.limits.maxComputeWorkGroupCount[0] || record.y > state->properties.limits.maxComputeWorkGroupCount[1] || record.z > state->properties.limits.maxComputeWorkGroupCount[2]) fallback = Reason::Unknown;
-        computeImages = resources.StorageImages();
+        for (std::size_t i = 0; i < resources.storageTextures.size(); ++i) {
+            const auto& image = resources.storageTextures[i];
+            if (image == nullptr) continue;
+            const auto baseLayer = image->Descriptor().baseArray;
+            computeImages.push_back({image->Image(), resources.storageWritten[i], {VK_IMAGE_ASPECT_COLOR_BIT, resources.storageMips[i], 1, baseLayer, resources.storageFirstLayer[i] ? 1u : image->ImageLayers() - baseLayer}});
+        }
+        for (const auto& texture : resources.textures) {
+            if (texture != nullptr && texture->StorageSource() != nullptr) computeImages.push_back({texture->StorageSource()->Image(), false});
+        }
         computeReads = resources.DeviceReads();
-        computeAccess = {computeReads, resources.GpuWrites(), computeImages, {}};
-        computeStart = recorder.BeginComputeDispatch(computeAccess, fallback);
+        if (argumentImport != nullptr) computeReads.emplace_back(arguments, arguments + 12);
+        computeAccess = {computeReads, resources.GpuWrites(), {}, {}};
+        computeStart = recorder.BeginComputeDispatch(computeAccess, fallback, computeImages);
         covered = computeStart.covered;
     } else {
         computeStart.commands = recorder.Commands(&covered);
@@ -4342,7 +4350,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.EndGpuTiming(gpuTiming);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     if (computeStart.deferred) {
-        recorder.DeferComputeBarrier(computeAccess);
+        recorder.DeferComputeBarrier(computeAccess, computeImages);
     } else {
         const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
