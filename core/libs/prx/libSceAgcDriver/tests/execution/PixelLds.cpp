@@ -127,8 +127,10 @@ void Draw(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, bool bounded)
     state.blends = {state.blend};
     state.blendConstants = {};
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(triangles.size()), 0, 1, 0, false};
+    const auto recorded = AgcDriver::Graphics::Recorder::RecordCounts().commands;
     device.Draw(state, draw, shaders);
     device.WaitIdle();
+    if (std::getenv("APS5_TEST_RECORD_COVERAGE") != nullptr) Require((AgcDriver::Graphics::Recorder::RecordCounts().commands > recorded) == AgcDriver::Graphics::Recorder::RecordWorkerEnabled(), "completion-bearing pixel draw selected the wrong worker path");
 }
 
 void Check(std::uint32_t waveSize, bool bounded) {

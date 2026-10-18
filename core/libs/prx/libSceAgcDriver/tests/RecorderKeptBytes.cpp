@@ -49,6 +49,7 @@ struct MockDevice {
     VkResult endResult = VK_SUCCESS, submitResult = VK_SUCCESS;
     std::uint64_t failAt = 1;
     std::vector<std::uint32_t> dispatches, pushes;
+    std::vector<VkDescriptorSet> workgroups;
     std::vector<char> recording;
     std::vector<std::array<std::uint32_t, 4>> barriers;
     std::thread::id recordThread;
@@ -204,6 +205,12 @@ VKAPI_ATTR void VKAPI_CALL mockCmdBindPipeline(VkCommandBuffer, VkPipelineBindPo
     std::lock_guard lock(mockMutex);
     mock.recording.push_back('P');
 }
+VKAPI_ATTR void VKAPI_CALL mockCmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, std::uint32_t first, std::uint32_t count, const VkDescriptorSet* sets, std::uint32_t, const std::uint32_t*) {
+    std::lock_guard lock(mockMutex);
+    Expect(first == ShaderRecompiler::WorkgroupMemoryDescriptorSet && count == 1, "recorded dispatch bound the wrong workgroup memory set");
+    mock.workgroups.push_back(sets[0]);
+    mock.recording.push_back('W');
+}
 VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t bytes, const void* data) {
     std::lock_guard lock(mockMutex);
     std::uint32_t value = 0;
@@ -256,6 +263,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdResetQueryPool", reinterpret_cast<PFN_vkVoidFunction>(mockCmdResetQueryPool)},
         {"vkCmdCopyQueryPoolResults", reinterpret_cast<PFN_vkVoidFunction>(mockCmdCopyQueryPoolResults)},
         {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
+        {"vkCmdBindDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindDescriptorSets)},
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
         {"vkCmdDispatchIndirect", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatchIndirect)},
@@ -780,6 +788,7 @@ void RecordWorkerOrderAndSync() {
                 command.pipeline = reinterpret_cast<VkPipeline>(1);
                 command.layout = reinterpret_cast<VkPipelineLayout>(2);
                 command.x = i;
+                command.workgroup = reinterpret_cast<VkDescriptorSet>(static_cast<std::uintptr_t>(i + 1));
                 command.pushBytes = sizeof(i);
                 std::memcpy(command.push.data(), &i, sizeof(i));
                 if (i % 2 != 0) {
@@ -820,13 +829,14 @@ void RecordWorkerOrderAndSync() {
     recordAllowed = {};
     if (failure) std::rethrow_exception(failure);
     Expect(aliveAtCompletion && kept.expired(), "dispatch resource lifetime missed replay or batch completion");
-    Expect(mock.dispatches.size() == 261 && mock.pushes.size() == 260, "dispatch records were lost or replayed twice");
+    Expect(mock.dispatches.size() == 261 && mock.pushes.size() == 260 && mock.workgroups.size() == 260, "dispatch records were lost or replayed twice");
     for (std::uint32_t i = 0; i < mock.dispatches.size(); ++i) Expect(mock.dispatches[i] == i, "dispatch replay changed batch order");
     for (std::uint32_t i = 0; i < mock.pushes.size(); ++i) Expect(mock.pushes[i] == i, "push constants were not copied into the chunk");
+    for (std::uint32_t i = 0; i < mock.workgroups.size(); ++i) Expect(mock.workgroups[i] == reinterpret_cast<VkDescriptorSet>(static_cast<std::uintptr_t>(i + 1)), "workgroup memory handles were not copied into the chunk");
     for (std::size_t i = 0; i < 260 && i < mock.recordThreads.size(); ++i) Expect((mock.recordThreads[i] == producer) == !enabled && mock.recordLocks[i] == !enabled, "dispatch recording used the wrong thread or the GPU mutex");
     std::size_t event = 0;
     for (unsigned i = 0; i < 260; ++i) {
-        const std::string expected = i % 2 != 0 ? "BBPCDB" : "BPCDB";
+        const std::string expected = i % 2 != 0 ? "BBPWCDB" : "BPWCDB";
         Expect(event + expected.size() <= mock.recording.size() && std::equal(expected.begin(), expected.end(), mock.recording.begin() + event), "dispatch barriers or binds were reordered");
         event += expected.size();
     }

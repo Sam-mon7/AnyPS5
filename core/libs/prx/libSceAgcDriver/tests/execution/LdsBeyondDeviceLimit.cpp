@@ -161,6 +161,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const ShaderRe
     const auto result = Compile(waveSize, bytes, target);
     Require(result.workgroupMemoryDwords == bytes / 4u + 1u, "lds beyond the device limit " + run + ": " + std::to_string(bytes) + " bytes of LDS gave " + std::to_string(result.workgroupMemoryDwords) + " device memory dwords per workgroup");
     fits(result, "LDS above the device limit");
+    const auto recorded = AgcDriver::Graphics::Recorder::RecordCounts().commands;
     if (indirect) {
         IndirectGroups = {groupsX, groupsY, groupsZ, 0u};
         const auto outcome = device.DispatchIndirect(result, reinterpret_cast<std::uintptr_t>(IndirectGroups.data()), {}, reinterpret_cast<std::uintptr_t>(Code.data()));
@@ -169,6 +170,11 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const ShaderRe
         device.Dispatch(result, groupsX, groupsY, groupsZ, {}, reinterpret_cast<std::uintptr_t>(Code.data()));
     }
     device.WaitIdle();
+    static bool checkedRecording = false;
+    if (!checkedRecording && std::getenv("APS5_TEST_RECORD_COVERAGE") != nullptr) {
+        Require((AgcDriver::Graphics::Recorder::RecordCounts().commands > recorded) == AgcDriver::Graphics::Recorder::RecordWorkerEnabled(), "workgroup-memory dispatch selected the wrong worker path");
+        checkedRecording = true;
+    }
     std::vector<bool> dispatched(MaxGroups, false);
     for (std::uint32_t z = 0; z < groupsZ; ++z) {
         for (std::uint32_t y = 0; y < groupsY; ++y) {

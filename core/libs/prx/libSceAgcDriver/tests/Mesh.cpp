@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "Recompiler.hpp"
 #include "execution/VulkanTestDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -209,8 +210,10 @@ void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
     state.blendConstants = {};
+    const auto recorded = AgcDriver::Graphics::Recorder::RecordCounts().commands;
     device.Draw(state, setup.draw, shaders);
     device.WaitIdle();
+    if (std::getenv("APS5_TEST_RECORD_COVERAGE") != nullptr && !setup.draw.indirect) Require((AgcDriver::Graphics::Recorder::RecordCounts().commands > recorded) == AgcDriver::Graphics::Recorder::RecordWorkerEnabled(), "direct mesh draw selected the wrong worker path");
 }
 
 constexpr ShaderRecompiler::MeshConfiguration SmallSubgroup{4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u};

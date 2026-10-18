@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "Recompiler.hpp"
 #include "SceShaders.hpp"
 #include "VulkanTestDevice.hpp"
@@ -327,8 +328,10 @@ void Draw(AgcDriver::VulkanDevice& device, const Stages& stages, VkCullModeFlags
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
     state.blendConstants = {};
+    const auto recorded = AgcDriver::Graphics::Recorder::RecordCounts().commands;
     device.Draw(state, {reinterpret_cast<std::uintptr_t>(patches.indices.data()), static_cast<std::uint32_t>(patches.indices.size()), 2, 1, 0, true}, shaders);
     device.WaitIdle();
+    if (std::getenv("APS5_TEST_RECORD_COVERAGE") != nullptr) Require((AgcDriver::Graphics::Recorder::RecordCounts().commands > recorded) == AgcDriver::Graphics::Recorder::RecordWorkerEnabled(), "tessellation draw selected the wrong worker path");
 }
 
 std::uint32_t CoveredPixels(std::uint32_t patch, bool interior) {

@@ -84,12 +84,13 @@ public:
         std::uint32_t x = 1, y = 1, z = 1;
         VkBuffer indirect = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
+        VkDescriptorSet workgroup = VK_NULL_HANDLE;
         bool leading = true;
     };
     void RecordDispatch(const DispatchCommand& command);
     bool CanRecordDraw() const;
     void RecordCommand(std::function<void(VkCommandBuffer)> command);
-    bool TryRecordDispatch(VkPipeline pipeline, VkPipelineLayout layout, std::shared_ptr<void> objects, std::shared_ptr<ShaderResources> resources, std::span<const std::byte> push, std::uint32_t x, std::uint32_t y, std::uint32_t z, VkBuffer indirect = VK_NULL_HANDLE, VkDeviceSize offset = 0, std::uint64_t arguments = 0);
+    bool TryRecordDispatch(VkPipeline pipeline, VkPipelineLayout layout, std::shared_ptr<void> objects, std::shared_ptr<ShaderResources> resources, std::span<const std::byte> push, std::uint32_t x, std::uint32_t y, std::uint32_t z, VkBuffer indirect = VK_NULL_HANDLE, VkDeviceSize offset = 0, std::uint64_t arguments = 0, VkDescriptorSet workgroup = VK_NULL_HANDLE, std::shared_ptr<void> workgroupMemory = {}, std::function<void()> completion = {});
     struct RecordStatistics {
         std::uint64_t commands, chunks, producerNs, workerNs, waitNs, queueDepth, maxQueueDepth;
     };

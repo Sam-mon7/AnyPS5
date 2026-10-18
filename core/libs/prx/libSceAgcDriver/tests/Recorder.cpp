@@ -1135,8 +1135,15 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
     pipelineInfo.layout = release.layout;
     Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &release.pipeline), "ordering pipeline");
     const auto recordCountsBefore = Recorder::RecordCounts();
+    unsigned workerCompletions = 0;
     const auto update = [&](const std::shared_ptr<ShaderResources>& resources, std::uint32_t delta, std::uint32_t count = 1) {
-        if (recordWorker && recorder.TryRecordDispatch(release.pipeline, release.layout, {}, resources, std::as_bytes(std::span(&delta, 1)), count, 1, 1)) return;
+        if (recordWorker) {
+            std::function<void()> completion;
+            if (resources->NeedsCompletion()) completion = [resources, &workerCompletions] { resources->WriteBackBuffers(); ++workerCompletions; };
+            const bool queued = recorder.TryRecordDispatch(release.pipeline, release.layout, {}, resources, std::as_bytes(std::span(&delta, 1)), count, 1, 1, VK_NULL_HANDLE, 0, 0, VK_NULL_HANDLE, {}, std::move(completion));
+            Require(queued == Recorder::RecordWorkerEnabled(), "copied or direct dispatch selected the wrong worker path");
+            if (queued) return;
+        }
         Recorder::ComputeDispatchStart start;
         const auto reads = computeChains ? resources->DeviceReads() : std::vector<std::pair<std::uint64_t, std::uint64_t>>{};
         const PassAccess access{reads, resources->GpuWrites(), {}, {}};
@@ -1195,8 +1202,8 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
         auto& pending = mode == 2 ? *DrawCopiedWriters() : writers;
         pending.push_back(copied);
         update(copied, 1);
-        recorder.OnComplete([copied, &pending] {
-            copied->WriteBackBuffers();
+        recorder.OnComplete([copied, &pending, recordWorker] {
+            if (!recordWorker || !Recorder::RecordWorkerEnabled()) copied->WriteBackBuffers();
             std::erase(pending, copied);
         });
         Require(!recorder.Idle() && *block == 10, "copied producer was completed before the consumer test");
@@ -1214,8 +1221,8 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
     auto copied = std::make_shared<ShaderResources>(copiedContext, compute);
     writers.push_back(copied);
     update(copied, 1);
-    recorder.OnComplete([copied, &writers] {
-        copied->WriteBackBuffers();
+    recorder.OnComplete([copied, &writers, recordWorker] {
+        if (!recordWorker || !Recorder::RecordWorkerEnabled()) copied->WriteBackBuffers();
         std::erase(writers, copied);
     });
     auto separateProgram = program;
@@ -1270,8 +1277,8 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
             auto producer = std::make_shared<ShaderResources>(copiedContext, compute);
             writers.push_back(producer);
             update(producer, 1);
-            recorder.OnComplete([producer, &writers] {
-                producer->WriteBackBuffers();
+            recorder.OnComplete([producer, &writers, recordWorker] {
+                if (!recordWorker || !Recorder::RecordWorkerEnabled()) producer->WriteBackBuffers();
                 std::erase(writers, producer);
             });
             if (reuse == 0) sampled = std::make_shared<ShaderResources>(imageContext, imageCompute);
@@ -1308,8 +1315,8 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
             auto producer = std::make_shared<ShaderResources>(copiedContext, keyCompute);
             writers.push_back(producer);
             update(producer, 0x40404040, static_cast<std::uint32_t>(keyBytes / 4));
-            recorder.OnComplete([producer, &writers] {
-                producer->WriteBackBuffers();
+            recorder.OnComplete([producer, &writers, recordWorker] {
+                if (!recordWorker || !Recorder::RecordWorkerEnabled()) producer->WriteBackBuffers();
                 std::erase(writers, producer);
             });
             if (reuse == 0) sampled = std::make_shared<ShaderResources>(imageContext, imageCompute);
@@ -1330,6 +1337,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool re
             Require(value == 0xff000000, "cached sampled image ignored copied compression-metadata writes");
         }
     }
+    if (recordWorker) Require(workerCompletions == (Recorder::RecordWorkerEnabled() ? 8u : 0u), "copied dispatch worker completions were lost or duplicated");
     std::cout << "Copied producers precede fresh and reused direct consumers\n";
 }
 
@@ -7528,7 +7536,7 @@ private:
     static inline DrawPassCounter* active = nullptr;
 };
 
-bool drawWorkerTests(const Device& device, Recorder& previous) {
+bool drawWorkerTests(const Device& device, Recorder& previous, bool proxy = false) {
     if (!device.Graphics()) return false;
     constexpr std::size_t unit = 65536;
     void* watched = AllocateWatched(unit, unit);
@@ -7570,7 +7578,8 @@ bool drawWorkerTests(const Device& device, Recorder& previous) {
     } cleanup{context, recorder, previous, block};
     State state{};
     state.stages.path = ShaderPath::Vertex;
-    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.color = {address, {64, 64}, proxy ? VK_FORMAT_R8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, proxy ? 1u : 4u};
+    if (proxy) Require(AttachmentProxyFormat(context, state.color.format) != VK_FORMAT_UNDEFINED, "draw worker fixture did not enable attachment proxies");
     state.colors = {state.color};
     state.hasColorTarget = true;
     state.renderExtent = {64, 64};
@@ -7593,6 +7602,12 @@ bool drawWorkerTests(const Device& device, Recorder& previous) {
             state.blends = {state.blend};
             Draw(context, state, triangle, shaders);
         }
+        if (proxy) {
+            recorder.Commands();
+            state.blend.colorWriteMask = 1;
+            state.blends = {state.blend};
+            Draw(context, state, triangle, shaders);
+        }
         triangle.indexCount = 0;
         state.scissor.extent = {0, 0};
     }
@@ -7600,15 +7615,16 @@ bool drawWorkerTests(const Device& device, Recorder& previous) {
     SharedResourceCache().Clear();
     ClearCachedPipelines(context.device);
     recorder.Sync();
-    Require(passes.begins == 1, "direct draws did not continue one render pass");
+    Require(passes.begins == (proxy ? 2u : 1u), "direct draws did not continue the expected render passes");
     const auto recorded = Recorder::RecordCounts().commands - before.commands;
-    Require(Recorder::RecordWorkerEnabled() ? recorded == 4 : recorded == 0, "draw worker switch selected the wrong recording path");
-    std::vector<std::byte> texels(64 * 64 * 4);
+    Require(Recorder::RecordWorkerEnabled() ? recorded == (proxy ? 6u : 4u) : recorded == 0, "draw worker switch selected the wrong recording path");
+    std::vector<std::byte> texels(64 * 64 * (proxy ? 1 : 4));
     ReadColorTarget(state.color, texels);
     for (unsigned y = 0; y < 64; ++y) {
         for (unsigned x = 0; x < 64; ++x) {
             const std::array expected{std::byte{255}, x < 32 ? std::byte{255} : std::byte{0}, x < 16 ? std::byte{255} : std::byte{0}, std::byte{255}};
-            Require(std::equal(expected.begin(), expected.end(), texels.begin() + (y * 64 + x) * 4), "queued draw lost its state, order or retained pipeline");
+            if (proxy) Require(texels[y * 64 + x] == std::byte{255}, "queued proxy load or store lost earlier attachment pixels");
+            else Require(std::equal(expected.begin(), expected.end(), texels.begin() + (y * 64 + x) * 4), "queued draw lost its state, order or retained pipeline");
         }
     }
     std::cout << "Draw worker pixels, immutable state, continuation and cache eviction tests passed\n";
@@ -8893,6 +8909,9 @@ int main(int argc, char** argv) {
             Require(vertexTargetRangeTests(device, recorder, false), "copied vertex/index worker fixture was skipped");
             if (device.GetContext().hostImportAlignment != 0) vertexTargetRangeTests(device, recorder, true);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-worker-proxy-only") {
+            return drawWorkerTests(device, recorder, true) ? 0 : 77;
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--vram-lazy-only" || std::string_view(argv[1]) == "--vram-lazy-imports")) {
             RunVramLazyTests(device.GetContext(), recorder, std::string_view(argv[1]) == "--vram-lazy-imports");

@@ -1373,6 +1373,7 @@ struct Recorder::RecordingWorker {
             if (record.leading) barrier(chunk.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &leading, 0, nullptr, 0, nullptr);
             bind(chunk.commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.pipeline);
             if (record.resources != nullptr) record.resources->Bind(chunk.commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.layout);
+            if (record.workgroup != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(chunk.commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &record.workgroup, 0, nullptr);
             if (record.pushBytes != 0) push(chunk.commands, record.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, record.pushBytes, record.push.data());
             if (record.indirect != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(chunk.commands, record.indirect, record.offset);
             else context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(chunk.commands, record.x, record.y, record.z);
@@ -1467,14 +1468,18 @@ void Recorder::RecordDispatch(const DispatchCommand& command) {
     MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
 }
 
-bool Recorder::TryRecordDispatch(VkPipeline pipeline, VkPipelineLayout layout, std::shared_ptr<void> objects, std::shared_ptr<ShaderResources> resources, std::span<const std::byte> push, std::uint32_t x, std::uint32_t y, std::uint32_t z, VkBuffer indirect, VkDeviceSize offset, std::uint64_t arguments) {
-    if (recordingWorker == nullptr || GpuTimingEnabled() || BarrierValidate() || countingSamples || VramMirrorWrites() || !resources->Reusable() || resources->NeedsCompletion() || resources->CopiedBytes() != 0 || !resources->StorageImages().empty()) return false;
+bool Recorder::TryRecordDispatch(VkPipeline pipeline, VkPipelineLayout layout, std::shared_ptr<void> objects, std::shared_ptr<ShaderResources> resources, std::span<const std::byte> push, std::uint32_t x, std::uint32_t y, std::uint32_t z, VkBuffer indirect, VkDeviceSize offset, std::uint64_t arguments, VkDescriptorSet workgroup, std::shared_ptr<void> workgroupMemory, std::function<void()> completion) {
+    if (recordingWorker == nullptr || GpuTimingEnabled() || BarrierValidate() || countingSamples || VramMirrorWrites() || (resources->NeedsCompletion() && !completion)) return false;
+    static const bool residentHeapMirrors = VramOption("APS5_RESIDENT_HEAP_MIRRORS");
+    if (residentHeapMirrors && (!resources->Reusable() || resources->NeedsCompletion() || resources->CopiedBytes() != 0 || !resources->StorageImages().empty() || workgroup != VK_NULL_HANDLE)) return false;
     EndComputeChain(ComputeChainReason::Worker);
     if (recordQueueDepth.load(std::memory_order_relaxed) >= 64) Submit();
     if (open != nullptr && (open->renderPass.open || open->run.open || !open->run.queued.empty() || !open->keyStores.empty())) Submit();
     ensureOpen();
     Keep(std::move(objects));
     Keep(resources);
+    KeepBytes(resources.get(), resources->CopiedBytes());
+    if (workgroupMemory != nullptr) Keep(std::move(workgroupMemory));
     resources->BeginGpuWrites(*this);
     DispatchCommand command;
     constexpr auto shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1488,9 +1493,11 @@ bool Recorder::TryRecordDispatch(VkPipeline pipeline, VkPipelineLayout layout, s
     command.x = x; command.y = y; command.z = z;
     command.indirect = indirect;
     command.offset = offset;
+    command.workgroup = workgroup;
     if (indirect != VK_NULL_HANDLE) NotePendingRead(arguments, 12, ReadKind::Indirect);
     RecordDispatch(command);
     resources->MarkGpuWrites(*this);
+    if (completion) OnComplete(std::move(completion));
     resources->ReadyForSubmit(*this);
     return true;
 }
