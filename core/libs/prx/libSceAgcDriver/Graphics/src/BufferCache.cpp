@@ -6,8 +6,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PageTracker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include <atomic>
 #include <chrono>
 #include <map>
+#include <mutex>
+#include <vector>
 
 namespace AgcDriver::Graphics::BufferCache {
 namespace {
@@ -96,6 +99,29 @@ struct State {
     bool flushing = false;
 };
 State& Cache() { static State state; return state; }
+struct ReleasedOwners {
+    std::mutex mutex;
+    std::atomic<bool> any{false};
+    std::vector<const void*> owners;
+};
+ReleasedOwners& Released() { static auto* const released = new ReleasedOwners(); return *released; }
+void EraseSession(std::map<const void*, Session>& sessions, std::map<const void*, Session>::iterator found) {
+    for (const auto& binding : found->second.bindings) if (binding.written) --binding.block->reservations;
+    sessions.erase(found);
+}
+std::map<const void*, Session>& Sessions() {
+    auto& sessions = Cache().sessions;
+    auto& released = Released();
+    if (!released.any.load(std::memory_order_acquire)) return sessions;
+    std::vector<const void*> owners;
+    {
+        std::lock_guard lock(released.mutex);
+        owners.swap(released.owners);
+        released.any.store(false, std::memory_order_release);
+    }
+    for (const auto* owner : owners) if (const auto found = sessions.find(owner); found != sessions.end()) EraseSession(sessions, found);
+    return sessions;
+}
 
 bool Valid(const Block& block, std::size_t page) { return (block.valid[page / 64] & (1ull << (page % 64))) != 0; }
 void Validate(Block& block, std::size_t page) { block.valid[page / 64] |= 1ull << (page % 64); }
@@ -371,14 +397,14 @@ bool ReadFaultsEnabled() {
 void PermitBindings(const void* owner, bool permitted) {
     if (!Enabled()) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    Cache().sessions[owner].permitted = permitted;
+    Sessions()[owner].permitted = permitted;
 }
 
 bool BindingsPermitted(const void* owner) {
     if (!Enabled()) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    const auto found = Cache().sessions.find(owner);
-    return found != Cache().sessions.end() && found->second.permitted;
+    const auto found = Sessions().find(owner);
+    return found != Sessions().end() && found->second.permitted;
 }
 
 namespace {
@@ -408,7 +434,7 @@ bool Bind(const Context& context, const void* owner, std::uint64_t address, std:
     StorageTexture::FlushPending(first, static_cast<std::size_t>(end - first), nullptr, "buffer cache read");
     auto* tracker = PageTracker::Get();
     if (tracker == nullptr) return Refuse(Fallback::Coverage);
-    auto& session = Cache().sessions.at(owner);
+    auto& session = Sessions().at(owner);
     if (session.device != VK_NULL_HANDLE && session.device != context.device) return Refuse(Fallback::Mapping);
     auto block = Acquire(context, Cache().devices[context.device], *tracker, {first, end - first}, base, written);
     if (block == nullptr) return false;
@@ -437,8 +463,8 @@ bool BindWritable(const Context& context, const void* owner, std::uint64_t addre
 std::optional<VkDescriptorBufferInfo> Descriptor(const void* owner, std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) {
     if (!Enabled()) return std::nullopt;
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    const auto found = Cache().sessions.find(owner);
-    if (found == Cache().sessions.end() || !PageTracker::Range{address, bytes}.Valid()) return std::nullopt;
+    const auto found = Sessions().find(owner);
+    if (found == Sessions().end() || !PageTracker::Range{address, bytes}.Valid()) return std::nullopt;
     for (const auto& binding : found->second.bindings) {
         if (address < binding.range.address || address + bytes > binding.range.address + binding.range.bytes) continue;
         const auto offset = address - binding.base;
@@ -451,8 +477,8 @@ std::optional<VkDescriptorBufferInfo> Descriptor(const void* owner, std::uint64_
 bool HasBindings(const void* owner) {
     if (!Enabled()) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    const auto found = Cache().sessions.find(owner);
-    return found != Cache().sessions.end() && !found->second.bindings.empty();
+    const auto found = Sessions().find(owner);
+    return found != Sessions().end() && !found->second.bindings.empty();
 }
 
 bool Contains(const void* owner, std::uint64_t address, std::size_t bytes) {
@@ -463,8 +489,8 @@ bool Contains(const void* owner, std::uint64_t address, std::size_t bytes) {
 bool Reusable(const void* owner) {
     if (!WritesEnabled()) return !HasBindings(owner);
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    const auto found = Cache().sessions.find(owner);
-    if (found == Cache().sessions.end()) return true;
+    const auto found = Sessions().find(owner);
+    if (found == Sessions().end()) return true;
     auto* tracker = PageTracker::Get();
     if (tracker == nullptr) return false;
     for (const auto& binding : found->second.bindings) {
@@ -477,8 +503,8 @@ bool Reusable(const void* owner) {
 void BeginWrites(const void* owner, Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {
     if (!WritesEnabled()) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    const auto found = Cache().sessions.find(owner);
-    if (found == Cache().sessions.end()) return;
+    const auto found = Sessions().find(owner);
+    if (found == Sessions().end()) return;
     for (auto& binding : found->second.bindings) {
         if (!binding.written) continue;
         Require(!binding.begun, "a cached buffer writer cannot be recorded twice");
@@ -586,8 +612,8 @@ void FlushAtSync() { FlushImpl(0, SIZE_MAX, ReadFaultsEnabled()); }
 void AddressRanges(const void* owner, std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
     if (!WritesEnabled()) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    const auto found = Cache().sessions.find(owner);
-    if (found == Cache().sessions.end()) return;
+    const auto found = Sessions().find(owner);
+    if (found == Sessions().end()) return;
     for (const auto& binding : found->second.bindings) {
         const auto address = binding.block->buffer->DeviceAddress();
         if (address != 0) ranges.push_back({binding.range.address, binding.range.address + binding.range.bytes, address + binding.range.address - binding.base, ShaderRecompiler::BdaAbi::Read, 0});
@@ -609,11 +635,18 @@ bool FlushForMapping(std::uint64_t address, std::size_t bytes) {
 
 void Release(const void* owner) {
     if (!Enabled()) return;
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+        auto& released = Released();
+        std::lock_guard lock(released.mutex);
+        released.owners.push_back(owner);
+        released.any.store(true, std::memory_order_release);
+        return;
+    }
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    const auto found = Cache().sessions.find(owner);
-    if (found == Cache().sessions.end()) return;
-    for (const auto& binding : found->second.bindings) if (binding.written) --binding.block->reservations;
-    Cache().sessions.erase(found);
+    auto& sessions = Sessions();
+    const auto found = sessions.find(owner);
+    if (found == sessions.end()) return;
+    EraseSession(sessions, found);
 }
 
 void Clear(VkDevice device) {
@@ -623,7 +656,7 @@ void Clear(VkDevice device) {
         Flush();
         if (auto* recorder = Recorder::Active()) recorder->Sync();
     }
-    std::erase_if(Cache().sessions, [&](const auto& entry) { return entry.second.device == device; });
+    std::erase_if(Sessions(), [&](const auto& entry) { return entry.second.device == device; });
     Cache().devices.erase(device);
 }
 
