@@ -187,6 +187,8 @@
 
 ### G4 runtime indirect SGPR builtin MVP
 
+Negative base vertex is untested on the runtime route: the legacy CPU expansion that serves as the test reference rejects it (indexed draw vertex range overflow, unsigned range arithmetic in Graphics::Draw), so the offsets fixture uses positive bases.
+
 `APS5_INDIRECT_SGPR_RUNTIME=1` supplies matching base vertex, first instance and draw index from Vulkan draw parameters. ABI revision 1 derives a separate output/cache version from the legacy version. Other values select the legacy ABI, including an explicit `0` in disk-cache switch keys.
 
 The original-argument route remains deferred: rewritten live fields, mismatched or unrecognised offset SGPRs, and non-indexed GE plus a dynamic base require GPU access to the original argument buffer. CPU resource/SRT dependencies, external vertex resource inputs and specialization memory remain rejected. Runtime requests first walk the legacy materialisation plan; no argument values or descriptor tables are populated from GPU-written records on the CPU for an eligible draw.

@@ -2149,7 +2149,7 @@ int runtimeSgprCache(const char* self) {
     SampleRequest sample;
     auto& request = sample.request;
     const std::array<std::uint32_t, 8> code{0x7e000208u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf80008cfu, 0x03020100u, 0xbf810000u, 0xbf810000u};
-    const std::array<std::uint32_t, 3> capabilities{1, 61, 4427};
+    const std::array<std::uint32_t, 4> capabilities{1, 32, 61, 4427};
     request.shader = {ShaderStage::Vertex, 0x20000, code, 0, {}};
     request.context = {32, 8, sample.userData, {}, {}, ShaderVertexStageInfo{}, {}};
     request.target.supportedCapabilities = capabilities;

@@ -794,7 +794,7 @@ std::string RuntimeSgprs(Fixture& fixture) {
     for (const bool indexed : {false, true}) {
         for (const bool missingBase : {false, true}) for (const bool drawIndex : {false, true}) {
             const auto code = drawIndex ? std::span<const std::uint32_t>(drawIndexCode) : std::span<const std::uint32_t>(VertexCode);
-            const std::array<std::uint32_t, 2> bases{indexed && !missingBase ? 0xfffffffdu : 300u, 700u};
+            const std::array<std::uint32_t, 2> bases{indexed && !missingBase ? 1u : 300u, 700u};
             const std::array<std::uint32_t, 2> instances{7, 40};
             const std::uint32_t ge = !indexed && missingBase ? 5u : 0u;
             const ShaderRecompiler::IndirectSgprPatch patch{missingBase ? -1 : static_cast<std::int32_t>(BaseVertexSgpr), static_cast<std::int32_t>(StartInstanceSgpr), drawIndex ? 18 : -1, ge, indexed};
