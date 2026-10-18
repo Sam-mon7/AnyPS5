@@ -109,6 +109,49 @@ void epochs() {
     require(tracker.DirtySince(range, tracker.CaptureEpoch(range)), "dropped observation proved clean");
 }
 
+void dirtyPages() {
+    Tracker tracker;
+    const Range range{Base + RegionBytes - 65 * PageBytes + 7, 67 * PageBytes - 13};
+    tracker.RegisterRange({Base, 2 * RegionBytes}, Kind::Section, Bit(Reason::ProtectedSection));
+    auto token = tracker.DirtyPagesSince(range, {}).token;
+    auto dirty = tracker.DirtyPagesSince(range, token);
+    require(dirty.precise && dirty.regions == std::vector<Bitmap>(2), "unchanged page query is dirty");
+    tracker.MarkCpuWritten({Base + RegionBytes - 65 * PageBytes, 2 * PageBytes}, Source::DriverStore);
+    tracker.MarkCpuWritten({Base + RegionBytes, 1}, Source::DriverStore);
+    dirty = tracker.DirtyPagesSince(range, token);
+    Bitmap first{}, second{};
+    first[14] = 1ull << 63;
+    first[15] = 1;
+    second[0] = 1;
+    require(dirty.precise && dirty.regions == std::vector<Bitmap>{first, second}, "page query missed bitmap or region boundaries");
+    const auto older = token;
+    token = dirty.token;
+    tracker.MarkCpuWritten({Base + RegionBytes, 1}, Source::DriverStore);
+    require(tracker.DirtyPagesSince(range, token).regions == std::vector<Bitmap>{Bitmap{}, second}, "repeated dirty page write was lost");
+    require(tracker.DirtyPagesSince(range, older).regions == std::vector<Bitmap>{first, second}, "newer consumer consumed older page history");
+    token = tracker.DirtyPagesSince(range, token).token;
+    tracker.MarkCpuWritten({Base, 1}, Source::DriverStore);
+    require(tracker.DirtyPagesSince(range, token).regions == std::vector<Bitmap>(2), "write outside range dirtied queried pages");
+    tracker.InvalidateRange({Base + RegionBytes, PageBytes});
+    tracker.SetCoverage({Base + RegionBytes, PageBytes}, Bit(Reason::ProtectedSection));
+    require(!tracker.DirtyPagesSince(range, token).precise, "mapping invalidation reused page history");
+    token = tracker.DirtyPagesSince(range, {}).token;
+    tracker.MarkCpuWritten({Base + RegionBytes, 1}, Source::SectionFault);
+    require(!tracker.DirtyPagesSince(range, token).token.covered, "open writer produced a page proof");
+    tracker.SetCoverage({Base + RegionBytes, PageBytes}, Bit(Reason::ProtectedSection));
+    require(tracker.DirtyPagesSince(range, token).precise && tracker.DirtyPagesSince(range, token).regions[1][0] == 1, "rearming lost the changed page");
+    token = tracker.DirtyPagesSince(range, {}).token;
+    tracker.SetCoverage({Base + RegionBytes, PageBytes}, Bit(Reason::Unsupported));
+    tracker.SetCoverage({Base + RegionBytes, PageBytes}, Bit(Reason::ProtectedSection));
+    require(!tracker.DirtyPagesSince(range, token).precise, "restored unknown coverage reused page history");
+    token = tracker.DirtyPagesSince(range, {}).token;
+    tracker.MarkGpuWritten({Base + RegionBytes, PageBytes}, Source::GpuDeclaration);
+    require(!tracker.DirtyPagesSince(range, token).token.covered, "pending GPU work produced a page proof");
+    require(!tracker.DirtyPagesSince({0, 0}, {}).precise, "invalid range produced a page proof");
+    tracker.Poison();
+    require(!tracker.DirtyPagesSince(range, token).token.covered, "poisoned page query proved clean");
+}
+
 void coverage() {
     Tracker tracker;
     tracker.RegisterRange({Base, PageBytes}, Kind::Private, Bit(Reason::PrivateWatch));
@@ -154,8 +197,9 @@ void inaccessible() {
     Tracker tracker;
     const Range range{reinterpret_cast<std::uintptr_t>(memory), PageBytes};
     tracker.RegisterRange(range, Kind::Section, Bit(Reason::Immutable));
-    const auto token = tracker.CaptureEpoch(range);
-    const auto clean = !tracker.DirtySince(range, token);
+    const auto token = tracker.DirtyPagesSince(range, {}).token;
+    const auto pages = tracker.DirtyPagesSince(range, token);
+    const auto clean = !tracker.DirtySince(range, token) && pages.precise && pages.regions == std::vector<Bitmap>(1);
     tracker.ObserveRead(range, AgcDriver::GuestMemory::ReadSite::Capture);
     tracker.InvalidateRange(range, true);
     const auto invalid = tracker.DirtySince(range, token);
@@ -436,6 +480,7 @@ int main() {
 #endif
         geometry();
         epochs();
+        dirtyPages();
         coverage();
         concurrentEpochs();
         if (!enabled) {

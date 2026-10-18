@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDuplicates.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
@@ -25,6 +26,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <chrono>
 #include <cstdint>
@@ -1538,11 +1540,13 @@ void epochMetadataTests() {
     Require(proof.Check(range).action == TextureEpoch::Action::Reuse, "unchanged texture did not reuse its epoch");
     tracker->MarkCpuWritten({range.address + RegionBytes + PageBytes, 1}, Source::DriverStore);
     auto update = proof.Check(range);
-    Require(update.action == TextureEpoch::Action::Partial && update.runs == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{RegionBytes, 2 * RegionBytes}}, "CPU write did not select its conservative dirty region");
-    tracker->MarkCpuWritten({range.address + 2 * RegionBytes, 1}, Source::DriverStore);
+    Require(update.action == TextureEpoch::Action::Partial && update.runs == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{RegionBytes + PageBytes, RegionBytes + 2 * PageBytes}}, "CPU write did not select its dirty page");
+    tracker->MarkCpuWritten({range.address + 2 * RegionBytes, 2 * RegionBytes - PageBytes}, Source::DriverStore);
     Require(proof.Check(range).action == TextureEpoch::Action::Partial, "half-dirty texture did not allow a partial upload");
-    tracker->MarkCpuWritten({range.address, 1}, Source::DriverStore);
-    Require(proof.Check(range).action == TextureEpoch::Action::Full, "majority-dirty texture did not require a full upload");
+    tracker->MarkCpuWritten({range.address, RegionBytes}, Source::DriverStore);
+    Require(proof.Check(range).action == TextureEpoch::Action::Partial, "majority-dirty texture widened its upload to clean pages");
+    tracker->MarkCpuWritten(range, Source::DriverStore);
+    Require(proof.Check(range).action == TextureEpoch::Action::Full, "fully dirty texture did not require a full upload");
     proof.Capture(range);
     tracker->MarkGpuWritten({range.address, PageBytes}, Source::GpuDeclaration);
     Require(proof.Check(range).action == TextureEpoch::Action::Fallback, "GPU-pending texture reused a proof");
@@ -1586,6 +1590,91 @@ private:
     void* allocation = nullptr;
     std::byte* memory = nullptr;
 };
+
+std::vector<std::byte> epochImageBytes(const Context& context, Recorder& recorder, const StorageTexture& texture, std::uint32_t side) {
+    Buffer readback(context, static_cast<std::size_t>(side) * side * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {side, side, 1};
+    CopyImageToBuffer(context, commands, texture.Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Submit();
+    recorder.Sync();
+    const auto bytes = readback.ReadBytes(0, readback.Size());
+    return {bytes.begin(), bytes.end()};
+}
+
+void epochPageTextureTests(const Context& context, bool linear, std::uint32_t tileMode = TileR64KBX) {
+    using namespace AgcDriver::PageTracker;
+    const bool enabled = TextureEpoch::Enabled();
+    const auto before = TextureEpoch::ProfileLine();
+    EpochTextureMemory memory;
+    auto words = RgbaWords(memory.Range().address, 256);
+    if (linear) words[3] &= ~(0x1fu << 20u);
+    else {
+        words[3] = (words[3] & ~(0x1fu << 20u)) | (tileMode << 20u);
+        if (tileMode == TileR64KBX) words[0] |= 0xcfu;
+    }
+    const auto descriptor = DecodeTextureResource(words);
+    const auto geometry = DescribeSurface(descriptor);
+    Require(geometry.guestBytes >= 2 * PageBytes, "page fixture is too small");
+    Recorder recorder(context);
+    recorder.Activate();
+    auto storage = StorageTexture::Create(context, *context.detiler, descriptor, 0);
+    const auto initial = epochImageBytes(context, recorder, *storage, 256);
+    ClearCachedTextures(context.device);
+    auto sampled = CachedSampledTexture(context, words);
+    MirrorSampleProgram sampler(context, recorder);
+    recorder.Sync();
+    auto centerOffset = std::uint64_t{128} * geometry.mips[0].pitchBytes + 128 * 4;
+    if (!linear) {
+        centerOffset = descriptor.pipeBankXor;
+        const auto* equation = FindTextureSwizzleEquation(EquationSwizzleMode(descriptor.tileMode), 4);
+        if (equation != nullptr) for (unsigned bit = 0; bit < 16; ++bit) centerOffset ^= (std::popcount(equation->bits[bit] & (128u | (128u << 12u))) & 1u) << bit;
+        const auto block = ThinBlockLayout(descriptor.tileMode, 4);
+        centerOffset += (128 / block[2] * geometry.mips[0].blocksPerRow + 128 / block[1]) * block[0];
+    }
+    const auto centerPage = centerOffset & ~(PageBytes - 1);
+    int value = 224;
+    for (const auto page : {PageBytes, centerPage, geometry.guestBytes - PageBytes, centerPage}) {
+        value -= 32;
+        memory.Write(page, PageBytes, value);
+        const auto uploaded = epochCount("bytes-uploaded");
+        const auto partials = epochCount("partial");
+        const auto read = enabled ? epochReadBytes() : 0;
+        if (enabled) {
+            memory.Protect(0, EpochTextureMemory::Bytes, PAGE_NOACCESS);
+            memory.Protect(page, PageBytes, PAGE_READWRITE);
+        }
+        const auto changed = CachedSampledTexture(context, words);
+        if (enabled) {
+            Require(changed == sampled && epochCount("partial") == partials + 1 && epochCount("bytes-uploaded") == uploaded + PageBytes, "sampled single-page write uploaded more than its page");
+            Require(epochReadBytes() == read + PageBytes, "sampled single-page update read outside its page");
+        } else Require(changed != sampled, "disabled page update changed legacy sampled rebuild");
+        sampled = changed;
+        const auto storageUploaded = epochCount("bytes-uploaded");
+        Require(!storage->Refresh(), "single-page storage write did not refresh");
+        if (enabled) {
+            Require(epochCount("bytes-uploaded") == storageUploaded + PageBytes, "storage single-page write uploaded more than its page");
+            memory.Protect(0, EpochTextureMemory::Bytes, PAGE_READWRITE);
+        }
+        const auto actual = epochImageBytes(context, recorder, *storage, 256);
+        auto reference = StorageTexture::Create(context, *context.detiler, descriptor, 0);
+        const auto expected = epochImageBytes(context, recorder, *reference, 256);
+        Require(actual == expected && actual != initial, "single-page update pixels differ from a complete detile");
+        expectRed(sampler.Red(sampled->View(), sampled->Layout(), 0), std::to_integer<unsigned>(actual[(128 * 256 + 128) * 4]) / 255.f, "single-page sampled pixel");
+        if (enabled) {
+            memory.Protect(0, EpochTextureMemory::Bytes, PAGE_NOACCESS);
+            Require(storage->Refresh() && CachedSampledTexture(context, words) == sampled, "page refresh did not advance its token");
+            memory.Protect(0, EpochTextureMemory::Bytes, PAGE_READWRITE);
+        }
+    }
+    recorder.Sync();
+    ClearCachedTextures(context.device);
+    if (!enabled) Require(TextureEpoch::ProfileLine() == before, "disabled page updates changed counters");
+}
 
 void epochTextureTests(const Context& context) {
     using namespace AgcDriver::PageTracker;
@@ -1700,7 +1789,8 @@ int main(int argc, char** argv) {
     try {
         const bool memory = argc > 1 && std::string(argv[1]) == "memory";
         const std::string mode = argc > 1 ? argv[1] : "";
-        const bool epochTextures = mode == "epoch-textures";
+        const bool epochPages = mode == "epoch-pages-linear" || mode == "epoch-pages-tiled";
+        const bool epochTextures = mode == "epoch-textures" || epochPages;
         if (mode == "epoch-metadata") {
             epochMetadataTests();
             std::puts("epoch texture metadata tests passed");
@@ -1738,7 +1828,9 @@ int main(int argc, char** argv) {
         if (epochTextures) {
 #ifdef _WIN32
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
-            epochTextureTests(context);
+            if (mode == "epoch-pages-linear") epochPageTextureTests(context, true);
+            else if (epochPages) for (const auto tileMode : {0x05u, 0x09u, TileR64KBX}) epochPageTextureTests(context, false, tileMode);
+            else epochTextureTests(context);
             std::puts("epoch texture upload tests passed");
             return 0;
 #else

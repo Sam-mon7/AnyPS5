@@ -412,7 +412,7 @@ private:
     // The windows moving the surface-relative runs: whole tile blocks of thin tiled mips, a tail
     // mip whole (its block holds every tail level), in slice order.
     std::vector<SliceWindow> sliceWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const;
-    static std::vector<SliceWindow> sliceWindows(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
+    static std::vector<SliceWindow> sliceWindows(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool pages = false);
     // The bytes of the surface-relative runs no element of the surface holds (the padding of partly
     // covered tile blocks and of linear rows, tail blocks, the bytes between mips; every byte of a
     // thick surface), ascending: a write-back keeps the guest's bytes there.
