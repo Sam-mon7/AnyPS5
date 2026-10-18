@@ -27,6 +27,16 @@ struct BufferAllocation {
     std::size_t bufferBytes = 0;
     std::uint32_t memoryType = UINT32_MAX;
     VkDeviceSize rebarBytes = 0;
+    bool residentMirror = false;
+    bool deviceLocal = false;
+};
+
+struct BufferPoolStats {
+    VkDeviceSize smallRetained = 0, smallLimit = 0;
+    VkDeviceSize largeRetained = 0, largeLimit = 0;
+    VkDeviceSize deviceRetained = 0, deviceLimit = 0;
+    VkDeviceSize slabBytes = 0;
+    VkDeviceSize smallPhysicalRetained = 0, largePhysicalRetained = 0, devicePhysicalRetained = 0;
 };
 
 struct SlabSlot {
@@ -72,6 +82,7 @@ public:
     SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, bool rebar = false);
     VkDeviceSize PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
+    BufferPoolStats Stats();
     VramBudget& Vram() { return vram; }
 
 private:
@@ -113,6 +124,8 @@ private:
         std::unordered_map<SlotKey, std::deque<Slot>, SlotKeyHash> free;
         std::size_t slots = 0;
         VkDeviceSize retainedBytes = 0;
+        VkDeviceSize physicalRetained = 0;
+        std::unordered_map<VkDeviceMemory, std::size_t> retainedSlabs;
         VkDeviceSize budget = 0;
         std::uint64_t hits = 0;
         std::uint64_t misses = 0;
@@ -132,6 +145,8 @@ private:
     void evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
     // The retained-slot bound of each tier (APS5_BUFFER_POOL_SLOTS, default `defaultSlots`), read once.
     static std::size_t MaxSlots();
+    static VkDeviceSize retentionCost(const Tier& tier, const BufferAllocation& allocation);
+    static void removeRetained(Tier& tier, const BufferAllocation& allocation);
     std::size_t maxSlots;
     VkDevice device;
     PFN_vkUnmapMemory unmap;

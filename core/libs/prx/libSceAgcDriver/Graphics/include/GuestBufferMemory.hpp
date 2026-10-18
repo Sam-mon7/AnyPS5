@@ -75,6 +75,7 @@ void SetHostImportWindow(std::uint64_t bytes);
 void SetHostImportRangeWindow(std::uint64_t bytes);
 void SetHostImportBudget(std::uint64_t bytes);
 std::uint64_t HostImportLiveBytes();
+std::uint64_t EffectiveHostImportBudget(const Context& context);
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
@@ -192,6 +193,17 @@ struct MirrorStats {
     std::uint64_t sparseBinds = 0;
 };
 MirrorStats MirrorCounters();
+struct VramCleanupStats {
+    std::uint64_t evictedMirrors = 0;
+    std::uint64_t evictedBytes = 0;
+    std::uint64_t copyBytes = 0;
+    std::uint64_t copyRefusals = 0;
+    std::uint64_t snapshotBytes = 0;
+    std::uint64_t snapshotRefusals = 0;
+    std::uint64_t heapShadowBytes = 0;
+};
+VramCleanupStats VramCleanupCounters();
+void CollectVramMirrors(const Context& context);
 struct VramDescriptorStats {
     std::uint64_t mirrorRegions = 0;
     std::uint64_t gpuCopies = 0;
@@ -462,6 +474,8 @@ private:
     bool adjustedRegions = false;
     bool addressWrites = true;
     bool synchronousWrites = false;
+    std::uint64_t fallbackCopyBytes = 0;
+    std::uint64_t snapshotCopyBytes = 0;
     std::shared_ptr<const bool> synchronousSubmission;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then

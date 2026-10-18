@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include <limits>
 #include <algorithm>
 #include <cstdlib>
@@ -33,6 +34,26 @@ RebarBudget& RebarMemory() {
     return budget;
 }
 
+std::uint64_t RebarLimit(const Context& context) {
+    auto& rebar = RebarMemory();
+    if (!VramCleanup()) return rebar.limit.load();
+    const auto pool = GetBufferPool(context);
+    const auto report = pool->Vram().Current();
+    static std::mutex mutex;
+    static std::weak_ptr<BufferPool> sampledPool;
+    static std::uint64_t sampleId = 0;
+    std::lock_guard lock(mutex);
+    if (sampledPool.lock() == pool && sampleId >= report.sampleId) return rebar.limit.load();
+    static const auto ceiling = [] {
+        const auto* value = std::getenv("APS5_REBAR_MIB");
+        return value != nullptr ? std::min<std::uint64_t>(std::strtoull(value, nullptr, 10), UINT64_MAX >> 20u) << 20u : UINT64_MAX;
+    }();
+    rebar.limit.store(report.heapBytes == 0 ? std::min<std::uint64_t>(ceiling, 1024ull << 20u) : VramBudget::RebarAllowance(report, rebar.live.load(), ceiling));
+    sampledPool = pool;
+    sampleId = report.sampleId;
+    return rebar.limit.load();
+}
+
 void RebarBudget::Report() {
     AgcDriver::ProfilePrint_nid_no_patch("[rebar] live %.1f MiB, peak %.1f MiB, allocations %llu, fallbacks ineligible %llu / over budget %llu\n", live.load() / 1048576.0, peak.load() / 1048576.0, static_cast<unsigned long long>(allocations.load()), static_cast<unsigned long long>(ineligible.load()), static_cast<unsigned long long>(overBudget.load()));
 }
@@ -55,8 +76,8 @@ constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
 }
 
 BufferPool::BufferPool(const Context& context) : device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), allocateMemory(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")), mapMemory(context.Function<PFN_vkMapMemory>("vkMapMemory")), maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))), vram(context) {
-    smallTier.budget = smallBudget;
-    largeTier.budget = budget;
+    smallTier.budget = VramCleanup() ? 16ull << 20u : smallBudget;
+    largeTier.budget = VramCleanup() ? 128ull << 20u : budget;
     deviceTier.budget = DeviceTierEnabled() ? DeviceBudget(context.memory) : 0;
 }
 
@@ -109,6 +130,7 @@ std::uint64_t BufferPool::SlabKey(std::uint32_t memoryType, std::size_t capacity
 }
 
 SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, bool rebar) {
+    if (rebar) RebarLimit(context);
     const auto key = SlabKey(memoryType, capacity, addressable);
     const auto takeFrom = [&](SlabBlock& block, Slab& slab) {
         const auto index = block.free.back();
@@ -179,7 +201,7 @@ VkDeviceSize BufferPool::PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noe
         if (block.free.empty()) slab.available.push_back(&block);
         block.free.push_back(static_cast<std::uint32_t>(offset / block.slotBytes));
         if (--block.used != 0) return 0;
-        if (slab.emptyBlocks == 0) {
+        if (!VramCleanup() && slab.emptyBlocks == 0) {
             ++slab.emptyBlocks;
             return 0;
         }
@@ -196,6 +218,22 @@ std::size_t BufferPool::SlabBlocks() {
     return slabBlocks.size();
 }
 
+BufferPoolStats BufferPool::Stats() {
+    BufferPoolStats result;
+    {
+        std::lock_guard lock(mutex);
+        result = {smallTier.retainedBytes, smallTier.budget, largeTier.retainedBytes, largeTier.budget, deviceTier.retainedBytes, deviceTier.budget};
+        result.smallPhysicalRetained = smallTier.physicalRetained;
+        result.largePhysicalRetained = largeTier.physicalRetained;
+        result.devicePhysicalRetained = deviceTier.physicalRetained;
+    }
+    {
+        std::lock_guard lock(slabMutex);
+        for (const auto& [memory, block] : slabBlocks) result.slabBytes += SlabBlockBytes(block->slotBytes);
+    }
+    return result;
+}
+
 bool BufferPool::DeviceTierEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_STAGING_POOL_MIB");
@@ -206,12 +244,13 @@ bool BufferPool::DeviceTierEnabled() {
 
 VkDeviceSize BufferPool::DeviceBudget(const VkPhysicalDeviceMemoryProperties& memory) {
     static const char* value = std::getenv("APS5_STAGING_POOL_MIB");
-    if (value != nullptr) return static_cast<VkDeviceSize>(std::strtoull(value, nullptr, 10)) << 20u;
+    const auto cap = VramCleanup() ? 256ull << 20u : std::numeric_limits<VkDeviceSize>::max();
+    if (value != nullptr) return std::min<VkDeviceSize>(static_cast<VkDeviceSize>(std::strtoull(value, nullptr, 10)) << 20u, cap);
     VkDeviceSize largest = 0;
     for (std::uint32_t heap = 0; heap < memory.memoryHeapCount && heap < VK_MAX_MEMORY_HEAPS; ++heap) {
         if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) largest = std::max(largest, memory.memoryHeaps[heap].size);
     }
-    return std::max<VkDeviceSize>(VkDeviceSize{512} << 20u, largest / 8u);
+    return std::min<VkDeviceSize>(std::max<VkDeviceSize>(VkDeviceSize{512} << 20u, largest / 8u), cap);
 }
 
 VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
@@ -228,7 +267,7 @@ VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
 }
 
 bool BufferPool::DeviceTiered(VkMemoryPropertyFlags properties) {
-    return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 && DeviceTierEnabled();
+    return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 && (DeviceTierEnabled() || VramCleanup());
 }
 
 std::size_t BufferPool::Capacity(std::size_t bytes, VkMemoryPropertyFlags properties) {
@@ -283,6 +322,7 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
     found->second.pop_back();
     --tier.slots;
     tier.retainedBytes -= result.allocationBytes;
+    removeRetained(tier, result);
     ++tier.hits;
     return result;
 }
@@ -293,9 +333,26 @@ void BufferPool::evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted)
     // First: a throw here leaves the slot retained and counted.
     evicted.push_back(oldest->second.front().allocation);
     tier.retainedBytes -= oldest->second.front().allocation.allocationBytes;
+    removeRetained(tier, oldest->second.front().allocation);
     oldest->second.pop_front();
     --tier.slots;
     ++tier.evictions;
+}
+
+VkDeviceSize BufferPool::retentionCost(const Tier& tier, const BufferAllocation& allocation) {
+    if (!VramCleanup() || !allocation.slab) return allocation.allocationBytes;
+    const auto found = tier.retainedSlabs.find(allocation.memory);
+    return found == tier.retainedSlabs.end() || found->second == 0 ? SlabBlockBytes(allocation.bytes) : 0;
+}
+
+void BufferPool::removeRetained(Tier& tier, const BufferAllocation& allocation) {
+    auto charge = allocation.allocationBytes;
+    if (VramCleanup() && allocation.slab) {
+        const auto found = tier.retainedSlabs.find(allocation.memory);
+        charge = --found->second == 0 ? SlabBlockBytes(allocation.bytes) : 0;
+        if (found->second == 0) tier.retainedSlabs.erase(found);
+    }
+    tier.physicalRetained -= charge;
 }
 
 std::size_t BufferPool::MaxSlots() {
@@ -319,6 +376,8 @@ VkDeviceSize BufferPool::trim() {
             tier->free.swap(retired->free);
             tier->evictions += tier->slots;
             tier->retainedBytes = 0;
+            tier->physicalRetained = 0;
+            tier->retainedSlabs.clear();
             tier->slots = 0;
         }
     }
@@ -347,15 +406,20 @@ VkDeviceSize BufferPool::trim() {
 }
 
 void BufferPool::Put(const BufferAllocation& allocation) noexcept {
+    if (VramCleanup() && allocation.residentMirror) {
+        const auto freed = destroy(allocation);
+        if (allocation.deviceLocal) vram.Released(freed);
+        return;
+    }
     // Evicted allocations are destroyed after the mutex is released (see evictOldest). The vector
     // may throw on growth; a Put that cannot retain simply destroys, as noexcept requires.
     std::vector<BufferAllocation> evicted;
     VkDeviceSize excess = 0;
     try {
-        if (DeviceTiered(allocation.properties)) excess = vram.Excess();
+        if (DeviceTiered(allocation.properties) || (VramCleanup() && allocation.deviceLocal)) excess = vram.Excess();
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
-        if (excess != 0 && &tier == &deviceTier) {
+        if (excess != 0 && (&tier == &deviceTier || (VramCleanup() && allocation.deviceLocal))) {
             auto dropped = allocation.allocationBytes;
             while (tier.slots != 0 && dropped < excess) {
                 evictOldest(tier, evicted);
@@ -364,20 +428,32 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
             evicted.push_back(allocation);
             vramDropped += evicted.size();
             vramDroppedBytes += dropped;
-        } else if (allocation.allocationBytes > tier.budget) {
+        } else if (retentionCost(tier, allocation) > tier.budget) {
             evicted.push_back(allocation);
         } else {
-            while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);
-            tier.free[{allocation.bytes, allocation.usage, allocation.properties, allocation.memoryType}].push_back({allocation, ++clock});
+            while (tier.slots != 0 && (tier.physicalRetained + retentionCost(tier, allocation) > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);
+            const auto charge = retentionCost(tier, allocation);
+            std::size_t* slabCount = VramCleanup() && allocation.slab ? &tier.retainedSlabs.try_emplace(allocation.memory, 0).first->second : nullptr;
+            try {
+                tier.free[{allocation.bytes, allocation.usage, allocation.properties, allocation.memoryType}].push_back({allocation, ++clock});
+            } catch (...) {
+                if (slabCount != nullptr && *slabCount == 0) tier.retainedSlabs.erase(allocation.memory);
+                throw;
+            }
+            if (slabCount != nullptr) ++*slabCount;
             ++tier.slots;
             tier.retainedBytes += allocation.allocationBytes;
+            tier.physicalRetained += charge;
         }
     } catch (...) {
         destroy(allocation);
     }
     VkDeviceSize freed = 0;
-    for (const auto& gone : evicted) freed += destroy(gone);
-    if (excess != 0) vram.Released(freed);
+    for (const auto& gone : evicted) {
+        const auto bytes = destroy(gone);
+        if (!VramCleanup() || gone.deviceLocal || (gone.properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) freed += bytes;
+    }
+    if (excess != 0 || VramCleanup()) vram.Released(freed);
 }
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context) {

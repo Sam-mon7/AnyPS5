@@ -60,6 +60,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
+    if (rebarRequested) RebarLimit(context);
     const auto reuse = [&](const BufferAllocation& entry) {
         const auto* allocation = &entry;
         buffer = allocation->buffer;
@@ -186,7 +187,7 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size, memoryType, rebarBytes});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size, memoryType, rebarBytes, residentMirror, DeviceLocal() || (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0});
         return;
     }
     if (slab) {

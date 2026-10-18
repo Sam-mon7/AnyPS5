@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -103,6 +104,7 @@ struct ImageMirror {
     std::uint64_t gpuRevision = 0;
     std::uint64_t aliasesGeneration = 0;
     std::uint64_t aliasesMappingGeneration = 0;
+    std::atomic<std::uint64_t> lastUsePresent{0};
 };
 
 // The address space. An address-based build maps every readable registered range; building that
@@ -897,13 +899,15 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
 std::atomic<std::uint64_t> budgetOverride{0};
 
 std::uint64_t importBudget(const Context& context) {
-    if (const auto set = budgetOverride.load(std::memory_order_relaxed); set != 0) return set;
+    constexpr std::uint64_t cleanupLimit = 1024ull << 20u;
+    const auto limited = [&](std::uint64_t value) { return VramCleanup() ? std::min(value, cleanupLimit) : value; };
+    if (const auto set = budgetOverride.load(std::memory_order_relaxed); set != 0) return limited(set);
     static const std::uint64_t configured = []() -> std::uint64_t {
         const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
         return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0u;
     }();
-    if (configured != 0) return configured;
-    return DefaultHostImportBudget(context.memory);
+    if (configured != 0 || (VramCleanup() && std::getenv("APS5_HOST_IMPORT_MIB") != nullptr)) return limited(configured);
+    return limited(DefaultHostImportBudget(context.memory));
 }
 
 std::atomic<std::uint64_t> rangeImportWindow{64ull << 20u};
@@ -1278,6 +1282,8 @@ struct ImageMirrors {
     std::uint64_t pinnedVersion = 0;
     std::uint64_t sweeps = 0;
     std::uint64_t heapChecks = 0;
+    std::uint64_t collectedPresent = UINT64_MAX;
+    VramCleanupStats cleanup;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -1316,6 +1322,15 @@ AddressBuildTotals& AddressBuilds() {
 ImageMirrors& Mirrors() {
     static ImageMirrors mirrors;
     return mirrors;
+}
+
+constexpr std::uint64_t CleanupCopyLimit = 64ull << 20u;
+
+void countCleanupCopy(std::uint64_t bytes, bool snapshot, bool refused) {
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    if (refused) ++(snapshot ? state.cleanup.snapshotRefusals : state.cleanup.copyRefusals);
+    else (snapshot ? state.cleanup.snapshotBytes : state.cleanup.copyBytes) += bytes;
 }
 
 struct WritableMirrors {
@@ -2215,6 +2230,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             state.failed.clear();
             state.heapBytes = 0;
             state.device = context.device;
+            state.collectedPresent = UINT64_MAX;
             ++state.version;
         }
         if (state.failed.contains(range->address)) return nullptr;
@@ -2222,6 +2238,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (found != state.entries.end() && sameRange(found->second->range, range) && found->second->reserved == range->bytes && found->second->writable == range->writable && found->second->heap == heap) mirror = found->second;
     }
     if (mirror != nullptr) {
+        if (VramCleanup()) mirror->lastUsePresent.store(Recorder::Presents(), std::memory_order_relaxed);
         validateMirrorAliases(*mirror);
         if (!mirror->sparse) {
             if (!heap && prepareRefresh(*mirror, range->address, range->bytes)) appendBlocks(blocks, *mirror, range->address, range->bytes);
@@ -2264,7 +2281,8 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     const bool videoHeap = videoOnly && heap && !sparse && vramMirrors();
     if (videoHeap) {
         auto& rebar = RebarMemory();
-        if (rebar.live.load() + range->bytes > rebar.limit) {
+        const auto limit = RebarLimit(context);
+        if (range->bytes > limit - std::min(limit, rebar.live.load())) {
             VramMirrorCounters().refused.fetch_add(1, std::memory_order_relaxed);
             VramMirrorCounters().refusedBytes.fetch_add(range->bytes, std::memory_order_relaxed);
             return nullptr;
@@ -2280,7 +2298,11 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     mirror->writable = range->writable;
     mirror->heap = heap;
     mirror->range = range;
-    if (VramWritable() && heap && RebarMemory().live.load() + mirror->bytes > RebarMemory().limit) return nullptr;
+    if (VramCleanup()) mirror->lastUsePresent.store(Recorder::Presents(), std::memory_order_relaxed);
+    if (VramWritable() && heap) {
+        const auto limit = RebarLimit(context);
+        if (mirror->bytes > limit - std::min(limit, RebarMemory().live.load())) return nullptr;
+    }
     if (heap) {
         std::uint64_t generation = 0;
         if (sparse) {
@@ -2345,6 +2367,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         mirror->committed = std::move(pieces);
     }
     if (range->writable && !heap && mirror->shadow.empty()) mirror->shadow.assign(mirror->buffer->Bytes().begin(), mirror->buffer->Bytes().end());
+    Require(!VramCleanup() || !heap || mirror->shadow.empty(), "VRAM cleanup forbids whole heap shadows");
     std::lock_guard lock(state.mutex);
     if (replaced != nullptr) Require(replaced->activeUsers.load(std::memory_order_acquire) == 0 && state.entries.find(range->address) != state.entries.end() && state.entries.at(range->address) == replaced, "sparse mirror acquired another owner during resize");
     if (!claimRangeBackings(context.device, std::span(&range, 1), RangeBacking::Mirror, mirror, replaced)) return nullptr;
@@ -2370,6 +2393,7 @@ std::shared_ptr<ImageMirror> findMirror(const Context& context, std::uint64_t be
     --found;
     const auto& mirror = found->second;
     if ((mirror->heap && !VramDescriptors()) || begin < mirror->base || end > mirror->base + mirror->bytes || mirror->range.expired() || mirror->retired.load(std::memory_order_acquire)) return nullptr;
+    if (VramCleanup()) mirror->lastUsePresent.store(Recorder::Presents(), std::memory_order_relaxed);
     return mirror;
 }
 
@@ -3097,6 +3121,75 @@ std::uint64_t HostImportLiveBytes() {
     return state.liveBytes;
 }
 
+std::uint64_t EffectiveHostImportBudget(const Context& context) {
+    return importBudget(context);
+}
+
+VramCleanupStats VramCleanupCounters() {
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    auto result = state.cleanup;
+    for (const auto& [base, mirror] : state.entries) if (mirror->heap) result.heapShadowBytes += mirror->shadow.size();
+    return result;
+}
+
+void CollectVramMirrors(const Context& context) {
+    if (!VramCleanup()) return;
+    GuestMemory::AssertGpuLockHeld("VRAM mirror collection");
+    const auto pool = GetBufferPool(context);
+    const auto report = pool->Vram().Current();
+    const auto pressure = VramBudget::PressureFor(report);
+    const auto present = Recorder::Presents();
+    auto& state = Mirrors();
+    bool collectible = false;
+    {
+        std::lock_guard lock(state.mutex);
+        if (state.device != context.device || state.collectedPresent == present) return;
+        state.collectedPresent = present;
+        if (pressure.victims != 0) for (const auto& [base, mirror] : state.entries) {
+            const auto used = mirror->lastUsePresent.load(std::memory_order_relaxed);
+            if (mirror->activeUsers.load(std::memory_order_acquire) == 0 && used <= present && present - used >= pressure.age) { collectible = true; break; }
+        }
+    }
+    if (collectible) {
+        Spaces().current.store(nullptr);
+        std::vector<std::shared_ptr<ImageMirror>> candidates;
+        {
+            std::lock_guard lock(state.mutex);
+            for (const auto& [base, mirror] : state.entries) {
+                const auto used = mirror->lastUsePresent.load(std::memory_order_relaxed);
+                if (mirror->activeUsers.load(std::memory_order_acquire) != 0 || mirror.use_count() != 1 || used > present || present - used < pressure.age) continue;
+                candidates.push_back(mirror);
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) { return left->lastUsePresent.load(std::memory_order_relaxed) < right->lastUsePresent.load(std::memory_order_relaxed); });
+        if (candidates.size() > pressure.victims) candidates.resize(pressure.victims);
+        for (const auto& mirror : candidates) {
+            FlushHeapMirrorWrites(mirror->base, static_cast<std::size_t>(mirror->bytes), true);
+            std::lock_guard lock(state.mutex);
+            const auto found = state.entries.find(mirror->base);
+            const auto used = mirror->lastUsePresent.load(std::memory_order_relaxed);
+            if (found == state.entries.end() || found->second != mirror || mirror->activeUsers.load(std::memory_order_acquire) != 0 || mirror.use_count() != 2 || used > present || present - used < pressure.age || mirror->writer != nullptr) continue;
+            mirror->retired.store(true, std::memory_order_release);
+            if (mirror->heap) state.heapBytes -= mirror->bytes;
+            ++state.cleanup.evictedMirrors;
+            state.cleanup.evictedBytes += mirror->bytes;
+            state.entries.erase(found);
+            ++state.version;
+        }
+        candidates.clear();
+        sweepBackings();
+    }
+    static auto lastReport = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    const auto counts = VramCleanupCounters();
+    const auto buffers = pool->Stats();
+    AgcDriver::ProfilePrint_nid_no_patch("[vram-cleanup] frame %llu, usage %.1f MiB / target %.1f MiB, age %llu; mirrors evicted %llu (%.1f MiB), heap shadows %.1f MiB; imports %.1f / %.1f MiB; CPU copies %.1f MiB (%llu refused), snapshots %.1f MiB (%llu refused)\n", static_cast<unsigned long long>(present), report.usage / 1048576.0, report.target / 1048576.0, static_cast<unsigned long long>(pressure.age), static_cast<unsigned long long>(counts.evictedMirrors), counts.evictedBytes / 1048576.0, counts.heapShadowBytes / 1048576.0, HostImportLiveBytes() / 1048576.0, importBudget(context) / 1048576.0, counts.copyBytes / 1048576.0, static_cast<unsigned long long>(counts.copyRefusals), counts.snapshotBytes / 1048576.0, static_cast<unsigned long long>(counts.snapshotRefusals));
+    AgcDriver::ProfilePrint_nid_no_patch("[bufferpool-cleanup] physical retained small %.1f / %.1f MiB, large %.1f / %.1f MiB, staging %.1f / %.1f MiB; slab allocations %.1f MiB; logical cached slots %.1f MiB\n", buffers.smallPhysicalRetained / 1048576.0, buffers.smallLimit / 1048576.0, buffers.largePhysicalRetained / 1048576.0, buffers.largeLimit / 1048576.0, buffers.devicePhysicalRetained / 1048576.0, buffers.deviceLimit / 1048576.0, buffers.slabBytes / 1048576.0, (buffers.smallRetained + buffers.largeRetained + buffers.deviceRetained) / 1048576.0);
+}
+
 VramDescriptorStats VramDescriptorCounters() {
     auto& counts = DescriptorCounters();
     std::lock_guard lock(counts.mutex);
@@ -3308,6 +3401,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
 void GuestBufferMemory::AcquireRegistered() {
     std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
     if (VramWritable()) gpu.lock();
+    CollectVramMirrors(context);
     Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
     reportVramMirrors();
     ensurePinWaiter();
@@ -3458,7 +3552,11 @@ void GuestBufferMemory::AcquireRegistered() {
             const char* value = std::getenv("APS5_ADDRESS_COPY_MAX_MIB");
             return (value ? std::strtoull(value, nullptr, 10) : 64ull) << 20u;
         }();
-        if (const auto overflow = AddressCopyOverflow(std::move(copies), copyLimit); !overflow.empty()) {
+        if (const auto overflow = AddressCopyOverflow(std::move(copies), VramCleanup() ? std::min(copyLimit, CleanupCopyLimit) : copyLimit); !overflow.empty()) {
+            if (VramCleanup()) {
+                countCleanupCopy(0, false, true);
+                Require(false, overflow);
+            }
             std::fprintf(stderr, "FATAL: %s\n", overflow.c_str());
             std::fflush(stderr);
             std::abort();
@@ -3759,6 +3857,26 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         Require(std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) == 0, "guest snapshot differs from registered memory");
         if (profile) Snapshots().checked.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
+    if (VramCleanup()) {
+        auto mirror = findMirror(context, snapshot.address, end);
+        if (mirror != nullptr || HostImportCovers(context, snapshot.address, snapshot.bytes.size())) {
+            static const bool check = std::getenv("APS5_NO_SNAPSHOT_CHECK") == nullptr;
+            if (check && !AnyShadowedOverlaps(snapshot.address, snapshot.bytes.size())) Require(std::memcmp(reinterpret_cast<const void*>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) == 0, "guest snapshot differs from registered memory");
+            Region region{snapshot.address, end, false, {}, nullptr};
+            region.hostBacked = true;
+            region.pending = true;
+            region.mirror = std::move(mirror);
+            region.subrangeMirror = region.mirror != nullptr;
+            if (region.mirror != nullptr) holdMirror(region.mirror);
+            regions.push_back(std::move(region));
+            regionsSorted = false;
+            return;
+        }
+        const bool refused = snapshot.bytes.size() > CleanupCopyLimit - snapshotCopyBytes;
+        countCleanupCopy(snapshot.bytes.size(), true, refused);
+        Require(!refused, "VRAM cleanup per-build snapshot copy limit of 64 MiB exceeded");
+        snapshotCopyBytes += snapshot.bytes.size();
     }
     regions.push_back({snapshot.address, end, false, {snapshot.bytes.begin(), snapshot.bytes.end()}, nullptr});
     regionsSorted = false;
@@ -4208,6 +4326,7 @@ void GuestBufferMemory::completeSpaceWrites() const {
 void GuestBufferMemory::UploadFinish(bool addressable) {
     std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
     if (VramWritable()) gpu.lock();
+    CollectVramMirrors(context);
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
@@ -4527,6 +4646,10 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
 
 void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     Require(!mirrorBackingOverlaps(context.device, region.begin, region.end), "a mirror-backed descriptor could not be served; refusing a stale CPU copy");
+    if (VramCleanup() && HostImportCovers(context, region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+        countCleanupCopy(0, false, true);
+        Require(false, "VRAM cleanup refuses a CPU copy of an imported range; a GPU copy or direct binding is required");
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool noReuse = std::getenv("APS5_NO_READONLY_FALLBACK_REUSE") != nullptr;
     const auto bytes = region.end - region.begin;
@@ -4572,6 +4695,12 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         region.bufferEnd = end < region.end ? end : 0;
     }
     const auto allocated = region.bufferEnd != 0 ? region.bufferEnd - region.begin : bytes;
+    if (VramCleanup()) {
+        const bool refused = allocated > CleanupCopyLimit - fallbackCopyBytes;
+        countCleanupCopy(allocated, false, refused);
+        Require(!refused, "VRAM cleanup per-build fallback copy limit of 64 MiB exceeded");
+        fallbackCopyBytes += allocated;
+    }
     // A buffer made by UploadPrepare for a GPU copy that fell back here (its import went) is kept.
     const bool shared = region.buffer == nullptr && !region.hostBacked && !region.writable && !region.sparse && region.bufferEnd == 0 && region.snapshot.size() == bytes;
     if (shared) region.buffer = snapshotCopy(context, region.begin, region.snapshot, usage);
@@ -5095,6 +5224,7 @@ void GuestBufferMemory::holdMirror(const std::shared_ptr<ImageMirror>& mirror) {
     Require(!mirror->retired.load(std::memory_order_acquire), "a prepared build references a retired mirror");
     mirrorUses.push_back(mirror);
     mirror->activeUsers.fetch_add(1, std::memory_order_release);
+    if (VramCleanup()) mirror->lastUsePresent.store(Recorder::Presents(), std::memory_order_relaxed);
 }
 
 void GuestBufferMemory::releaseMirrorUses() {
