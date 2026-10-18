@@ -4,12 +4,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <memory>
 
 // Guest virtual memory is placed inside one reserved arena below the PS5 application map limit
 // absolute address and breaks on host addresses outside that range.
 namespace GuestArena {
 
-enum class PageEvent : std::uint8_t { PrivateMap, PrivatePollRange, SectionMap, Invalidate, Unmap, SectionState, WriteFault, HostWrite, ObservationFault };
+enum class PageEvent : std::uint8_t { PrivateMap, PrivatePollRange, SectionMap, Invalidate, Unmap, SectionState, WriteFault, HostWrite, ObservationFault, GpuReadback };
 enum PageCoverage : std::uint32_t {
     PagePrivateWatch = 1u << 0, PageProtectedSection = 1u << 1, PageImmutable = 1u << 2,
     PageOpenWriter = 1u << 3, PageExcludedImport = 1u << 4, PageHostAlias = 1u << 5,
@@ -61,6 +62,9 @@ bool GuestArenaArmPageObservation_nid_no_patch(std::uintptr_t address, std::size
 bool GuestArenaPageObservationCheckpoint_nid_no_patch(bool frame);
 PageObservationStatistics GuestArenaPageObservationCounts_nid_no_patch();
 void GuestArenaSetPageObservationFaultHook_nid_no_patch(void (*hook)() noexcept);
+PageArmRefusal GuestArenaArmPageRead_nid_no_patch(std::uintptr_t address, std::shared_ptr<void> owner, const void* original, bool (*download)(void*) noexcept, void* context);
+bool GuestArenaResolvePageRead_nid_no_patch(std::uintptr_t address);
+bool GuestArenaPublishPageRead_nid_no_patch(std::uintptr_t address, const void* source);
 std::size_t GuestArenaPageObserverMetadataBytes_nid_no_patch();
 void GuestArenaVisitPageAliases_nid_no_patch(std::uintptr_t address, std::size_t bytes, void (*visitor)(std::uintptr_t, std::size_t, void*), void* context);
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);

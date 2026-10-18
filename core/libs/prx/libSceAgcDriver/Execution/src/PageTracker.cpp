@@ -44,6 +44,48 @@ std::atomic<std::int64_t> observationStarted{0};
 constexpr std::array readSites{"unknown", "capture", "dispatch-cache", "texture-compare", "texture-read", "buffer-upload", "index", "vertex", "registers", "indirect", "wait", "label", "scanout", "store", "mirror-refresh", "draw-cache"};
 
 #ifdef _WIN32
+struct ReadbackRequest {
+    void* context;
+    bool (*download)(void*, bool) noexcept;
+    ReadbackRequest* next = nullptr;
+    std::atomic<unsigned> done{0};
+    bool result = false;
+};
+static_assert(std::atomic<ReadbackRequest*>::is_always_lock_free && std::atomic<unsigned>::is_always_lock_free);
+struct ReadbackWorker {
+    std::atomic<ReadbackRequest*> requests{nullptr};
+    HANDLE wake = nullptr;
+    decltype(&WaitOnAddress) wait = nullptr;
+    decltype(&WakeByAddressSingle) signal = nullptr;
+    ReadbackWorker() {
+        const auto module = GetModuleHandleW(L"kernelbase.dll");
+        wait = reinterpret_cast<decltype(wait)>(GetProcAddress(module, "WaitOnAddress"));
+        signal = reinterpret_cast<decltype(signal)>(GetProcAddress(module, "WakeByAddressSingle"));
+        if (wait == nullptr || signal == nullptr) throw std::runtime_error("readback address waits unavailable");
+        wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (wake == nullptr) throw std::runtime_error("readback event creation failed");
+        try {
+            std::thread([this] {
+                for (;;) {
+                    WaitForSingleObject(wake, INFINITE);
+                    auto* request = requests.exchange(nullptr, std::memory_order_acquire);
+                    while (request != nullptr) {
+                        auto* next = request->next;
+                        {
+                            std::lock_guard gpu(GuestMemory::GpuMutex());
+                            request->result = request->download(request->context, false);
+                        }
+                        request->done.store(1, std::memory_order_release);
+                        signal(&request->done);
+                        request = next;
+                    }
+                }
+            }).detach();
+        } catch (...) { CloseHandle(wake); throw; }
+    }
+};
+std::atomic<ReadbackWorker*> readbackWorker{nullptr};
+
 bool redZoneMarker() {
     static const bool present = [] {
         const auto* base = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
@@ -167,6 +209,7 @@ void mappingEvent(GuestArena::PageEvent event, std::uintptr_t address, std::size
         case GuestArena::PageEvent::WriteFault: tracker->MarkCpuWritten(range, Source::SectionFault); break;
         case GuestArena::PageEvent::ObservationFault: tracker->MarkCpuWritten(range, Source::SectionFault); break;
         case GuestArena::PageEvent::HostWrite: tracker->MarkCpuWritten(range, Source::HostWrite); break;
+        case GuestArena::PageEvent::GpuReadback: tracker->ReadbackGpuWrites(range); break;
         }
     } catch (...) { tracker->Poison(); }
 }
@@ -293,6 +336,15 @@ void Tracker::MarkGpuWritten(Range range, Source source) {
 }
 
 void Tracker::PublishGpuWrites(Range range) { MarkGpuWritten(range, Source::Copyback); }
+
+void Tracker::ReadbackGpuWrites(Range range) {
+    Visit(range, false, [&](auto, auto offset, auto bytes, auto* region) {
+        if (region == nullptr) return;
+        Advance(region->gpuEpoch);
+        Assign(region->gpuDirty, offset, bytes, false);
+        Assign(region->reasons[static_cast<std::size_t>(Reason::PendingGpu)], offset, bytes, false);
+    });
+}
 
 Reasons Tracker::PageReasons(const Region& region, std::size_t page) {
     Reasons result = 0;
@@ -550,6 +602,44 @@ bool ProofsEnabled() {
 bool ArmEnabled() {
     static const bool enabled = [] { const auto* text = std::getenv("APS5_PAGE_TRACKER_ARM"); return Enabled() && text != nullptr && std::string_view(text) == "1"; }();
     return enabled;
+}
+
+bool PrepareReadbacks() {
+#ifdef _WIN32
+    static const bool enabled = [] {
+        if (!ArmEnabled()) return false;
+        for (const auto* name : {"APS5_BUFFER_CACHE_READ_FAULTS", "APS5_BUFFER_CACHE_WRITES", "APS5_BUFFER_CACHE"}) {
+            const auto* value = std::getenv(name);
+            if (value == nullptr || std::string_view(value) != "1") return false;
+        }
+        return true;
+    }();
+    if (!enabled) return false;
+    try {
+        static auto* worker = new ReadbackWorker;
+        readbackWorker.store(worker, std::memory_order_release);
+        return true;
+    } catch (const std::exception&) { return false; }
+#else
+    return false;
+#endif
+}
+
+bool ResolveReadback(void* context, bool (*download)(void*, bool) noexcept) noexcept {
+#ifdef _WIN32
+    if (GuestMemory::GpuMutex().HeldByThisThread()) return download(context, true);
+    auto* worker = readbackWorker.load(std::memory_order_acquire);
+    if (worker == nullptr) return false;
+    ReadbackRequest request{context, download};
+    auto* head = worker->requests.load(std::memory_order_relaxed);
+    do { request.next = head; } while (!worker->requests.compare_exchange_weak(head, &request, std::memory_order_release, std::memory_order_relaxed));
+    SetEvent(worker->wake);
+    unsigned waiting = 0;
+    while (request.done.load(std::memory_order_acquire) == 0) worker->wait(&request.done, &waiting, sizeof(waiting), INFINITE);
+    return request.result;
+#else
+    return false;
+#endif
 }
 
 void CompletedFrame() {

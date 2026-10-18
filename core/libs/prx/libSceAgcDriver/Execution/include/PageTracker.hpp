@@ -97,6 +97,7 @@ public:
     void MarkCpuWritten(Range range, Source source);
     void MarkGpuWritten(Range range, Source source);
     void PublishGpuWrites(Range range);
+    void ReadbackGpuWrites(Range range);
     bool Current(Range range, const Observation* observation) const;
     Epoch CaptureEpoch(Range range, const Observation* observation = nullptr) const;
     bool DirtySince(Range range, const Epoch& token, const Observation* observation = nullptr) const;
@@ -149,6 +150,8 @@ bool Enabled();
 bool ProofsEnabled();
 Observation PollCpuWrites(std::span<const Range> ranges);
 bool ArmEnabled();
+bool PrepareReadbacks();
+bool ResolveReadback(void* context, bool (*download)(void*, bool) noexcept) noexcept;
 void CompletedFrame();
 Tracker* Get();
 void Initialize();

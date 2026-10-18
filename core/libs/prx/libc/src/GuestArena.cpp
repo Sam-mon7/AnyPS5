@@ -380,6 +380,18 @@ bool GuestArenaArmGpuWriteWatch_nid_no_patch(std::uintptr_t address, std::size_t
     return WindowsMappings::Get().ArmGpuWriteWatch(address, bytes);
 }
 
+PageArmRefusal GuestArenaArmPageRead_nid_no_patch(std::uintptr_t address, std::shared_ptr<void> owner, const void* original, bool (*download)(void*) noexcept, void* context) {
+    return WindowsMappings::Get().ArmPageRead(address, std::move(owner), original, download, context);
+}
+
+bool GuestArenaResolvePageRead_nid_no_patch(std::uintptr_t address) {
+    return WindowsMappings::Get().ResolvePageRead(address);
+}
+
+bool GuestArenaPublishPageRead_nid_no_patch(std::uintptr_t address, const void* source) {
+    return WindowsMappings::Get().PublishPageRead(address, source);
+}
+
 void GuestArenaDisarmGpuWriteWatch_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     WindowsMappings::Get().DisarmGpuWriteWatch(address, bytes);
 }
