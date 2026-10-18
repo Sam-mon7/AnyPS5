@@ -186,12 +186,13 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         const auto& patch = *request.indirectSgprs;
         const auto reject = [](IndirectSgprFailure reason) { throw IndirectSgprUnsupported(reason); };
         if (request.shader.stage != ShaderStage::Vertex || request.context.userDataBaseRegister != 8u || !request.context.vertex || (request.graphics && (request.graphics->mesh || request.graphics->tessellation))) reject(IndirectSgprFailure::Stage);
-        if (std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) == request.target.supportedCapabilities.end()) reject(IndirectSgprFailure::Feature);
+        for (const auto capability : {spv::CapabilityDrawParameters, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses}) {
+            if (std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) == request.target.supportedCapabilities.end()) reject(IndirectSgprFailure::Feature);
+        }
         const auto dynamic = [&](std::uint32_t reg) { return static_cast<std::int32_t>(reg) == patch.baseVertex || static_cast<std::int32_t>(reg) == patch.firstInstance || static_cast<std::int32_t>(reg) == patch.drawIndex; };
         for (const auto reg : {patch.baseVertex, patch.firstInstance, patch.drawIndex}) {
             if (reg >= 0 && (static_cast<std::uint32_t>(reg) < request.context.userDataBaseRegister || static_cast<std::uint32_t>(reg) - request.context.userDataBaseRegister >= request.context.userData.size())) reject(IndirectSgprFailure::Stage);
         }
-        if ((patch.baseVertex >= 0 && patch.baseVertex == patch.firstInstance) || (patch.drawIndex >= 0 && (patch.drawIndex == patch.baseVertex || patch.drawIndex == patch.firstInstance))) reject(IndirectSgprFailure::OriginalArgument);
         const auto& vertex = *request.context.vertex;
         if (vertex.resourcesNum != 0) {
             if (!vertex.fetchEmbedded) reject(IndirectSgprFailure::ResourceDependency);
@@ -219,8 +220,6 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
             for (const auto* argument : value->Arguments()) pending.push_back(argument);
         }
         if (plan->info.vertexOffsetConflict || plan->info.instanceOffsetConflict) reject(IndirectSgprFailure::Fetch);
-        if ((plan->info.vertexOffsetSgpr >= 0 && dynamic(static_cast<std::uint32_t>(plan->info.vertexOffsetSgpr)) && plan->info.vertexOffsetSgpr != patch.baseVertex) || (plan->info.instanceOffsetSgpr >= 0 && dynamic(static_cast<std::uint32_t>(plan->info.instanceOffsetSgpr)) && plan->info.instanceOffsetSgpr != patch.firstInstance)) reject(IndirectSgprFailure::OriginalArgument);
-        if ((patch.baseVertex >= 0 && patch.baseVertex != plan->info.vertexOffsetSgpr) || (patch.firstInstance >= 0 && patch.firstInstance != plan->info.instanceOffsetSgpr) || (!patch.indexed && patch.baseVertex >= 0 && patch.indxOffset != 0)) reject(IndirectSgprFailure::OriginalArgument);
     }
     frontEndBuilds.fetch_add(1, std::memory_order_relaxed);
     ShaderPreparationContext local;

@@ -26,6 +26,8 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         {0, 0, pushOffset, (graphics.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : graphics.stages.tessellation && pushOffset < Graphics::PipelinePushSlotBytes ? ShaderRecompiler::TessellationLevelPushOffsetBytes : Graphics::PipelinePushSlotBytes) - pushOffset % Graphics::PipelinePushSlotBytes},
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
+    const auto legacyPushBytes = request.layout.pushConstantSizeBytes;
+    if (drawParameters.indirect && drawParameters.indirect->runtimeSgprs && pushOffset < Graphics::PipelinePushSlotBytes) request.layout.pushConstantSizeBytes = ShaderRecompiler::IndirectSgprPushOffset - pushOffset;
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     if (i == 0 && drawParameters.indirect && ShaderRecompiler::IndirectSgprRuntime()) request.indirectSgprs = drawParameters.indirect->runtimeSgprs;
     const auto invocation = [&] {
@@ -36,6 +38,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
             drawParameters.indirect->runtimeFailure = failure.reason;
             drawParameters.indirect->runtimeSgprs.reset();
             request.indirectSgprs.reset();
+            request.layout.pushConstantSizeBytes = legacyPushBytes;
             return InvocationFor(*program.snapshot, program.codeOffset, request);
         }
     }();

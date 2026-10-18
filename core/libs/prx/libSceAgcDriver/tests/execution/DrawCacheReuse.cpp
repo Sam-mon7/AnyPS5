@@ -179,6 +179,7 @@ struct IndirectInputs {
     bool patchedOffsets = false;
     bool direct = false;
     bool runtimeIndex = false;
+    bool omitBasePatch = false;
 };
 
 void ObserveIndirectCapture(std::uint64_t address, std::size_t bytes) {
@@ -232,12 +233,12 @@ std::array<std::byte, 1024> SubmitIndirect(std::span<const IndirectRecord> recor
         for (std::size_t index = 0; index < count; ++index) {
             const auto& record = records[index];
             if (record[0] == 0 || record[1] == 0) continue;
-            Append(commands, 0x76, {0x8c, record[2], static_cast<std::uint32_t>(index), record[3], 0});
+            Append(commands, 0x76, {0x8c, inputs.omitBasePatch ? 0u : record[2], static_cast<std::uint32_t>(index), record[3], 0});
             Append(commands, 0x2f, {record[1]});
             Append(commands, 0x2d, {record[0], 2});
         }
     } else if (records.size() == 1 && !drawCount && !inputs.patchedOffsets) Append(commands, 0x24, {0, 0x280, instance, 2});
-    else Append(commands, 0x2c, {0, inputs.patchedOffsets ? 0x8cu : 0x280u, instance, (inputs.patchedOffsets || inputs.runtimeIndex ? 0x8000008du : 0x280u) | (drawCount ? 1u << 30u : 0u), static_cast<std::uint32_t>(records.size()), drawCount ? static_cast<std::uint32_t>(countAddress) : 0u, drawCount ? static_cast<std::uint32_t>(countAddress >> 32u) : 0u, sizeof(IndirectRecord), 2});
+    else Append(commands, 0x2c, {0, inputs.patchedOffsets && !inputs.omitBasePatch ? 0x8cu : 0x280u, instance, (inputs.patchedOffsets || inputs.runtimeIndex ? 0x8000008du : 0x280u) | (drawCount ? 1u << 30u : 0u), static_cast<std::uint32_t>(records.size()), drawCount ? static_cast<std::uint32_t>(countAddress) : 0u, drawCount ? static_cast<std::uint32_t>(countAddress >> 32u) : 0u, sizeof(IndirectRecord), 2});
 
     for (auto& count : IndirectRecordReads) count = 0;
     IndirectCountReads = 0;
@@ -250,7 +251,7 @@ std::array<std::byte, 1024> SubmitIndirect(std::span<const IndirectRecord> recor
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "indirect capture regression submission failed");
     AgcDriverWaitIdle_nid_postfix();
-    if (cpuFallback && !inputs.direct && !inputs.runtimeIndex) {
+    if (cpuFallback && !inputs.direct && !inputs.runtimeIndex && !(ShaderRecompiler::IndirectSgprRuntime() && inputs.patchedOffsets)) {
         const auto count = std::min(static_cast<std::uint32_t>(records.size()), drawCount.value_or(static_cast<std::uint32_t>(records.size())));
         for (std::size_t index = 0; index < IndirectRecordReads.size(); ++index) {
             Require(IndirectRecordReads[index] == (index < count ? 1u : 0u), "CPU indirect arguments were skipped or reread instead of reusing the ordered snapshot");
@@ -426,7 +427,121 @@ void RuntimeSgprPixels() {
     auto control = inputs;
     control.direct = true;
     const std::array fallback{IndirectRecord{3, 1, std::bit_cast<std::uint32_t>(-0.5f), std::bit_cast<std::uint32_t>(-0.25f)}, IndirectRecord{3, 2, 0, 0}};
-    Require(SubmitIndirect(fallback, true, true, false, std::nullopt, inputs) == SubmitIndirect(fallback, true, false, false, std::nullopt, control), "original-argument fallback pixels differ from CPU expansion");
+    Require(SubmitIndirect(fallback, true, true, false, std::nullopt, inputs) == SubmitIndirect(fallback, true, false, false, std::nullopt, control), "original-argument pixels differ from CPU expansion");
+}
+
+alignas(4096) std::array<std::uint32_t, 64> RunRecords{};
+alignas(16) std::array<std::uint16_t, 3> RunIndices{0, 1, 2};
+
+std::array<std::byte, 1024> SubmitRuntimeRun(bool scattered, bool direct, bool queued) {
+    std::array<std::byte, 1024> clear;
+    clear.fill(std::byte{0x40});
+    AgcDriver::GuestMemory::Write(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), clear);
+    const auto arguments = reinterpret_cast<std::uintptr_t>(RunRecords.data());
+    const auto indices = reinterpret_cast<std::uintptr_t>(RunIndices.data());
+    const auto fragment = reinterpret_cast<std::uintptr_t>(&FragmentInput[540]);
+    const std::uint32_t red = std::bit_cast<std::uint32_t>(1.0f);
+    AgcDriver::GuestMemory::Write(fragment, std::as_bytes(std::span(&red, 1)));
+    auto commands = DrawCommands();
+    const auto vertex = reinterpret_cast<std::uintptr_t>(PatchedIndirectVertexCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(IndirectPixelCode.data());
+    Append(commands, 0x79, {0x24a, 0});
+    Append(commands, 0x76, {0xc8, static_cast<std::uint32_t>(vertex >> 8u), static_cast<std::uint32_t>(vertex >> 40u)});
+    Append(commands, 0x76, {0x8b, 4u << 1u, 0, 0, 0, 0});
+    Append(commands, 0x76, {0x008, static_cast<std::uint32_t>(pixel >> 8u), static_cast<std::uint32_t>(pixel >> 40u)});
+    Append(commands, 0x76, {0x00b, 2u << 1u, static_cast<std::uint32_t>(fragment), static_cast<std::uint32_t>(fragment >> 32u)});
+    Append(commands, 0x11, {1, static_cast<std::uint32_t>(arguments), static_cast<std::uint32_t>(arguments >> 32u)});
+    Append(commands, 0x26, {static_cast<std::uint32_t>(indices), static_cast<std::uint32_t>(indices >> 32u)});
+    Append(commands, 0x13, {3});
+    Append(commands, 0x2f, {1});
+    Append(commands, 0x2a, {0});
+    const std::array<std::uint32_t, 3> offsets{0u, scattered ? 64u : 20u, scattered ? 148u : 40u};
+    const std::array<std::array<std::uint32_t, 5>, 3> records{{
+        {3, 1, 0, 0, 0},
+        {3, 1, 99, 0, 0},
+        {5, 1, 0, std::bit_cast<std::uint32_t>(-0.5f), std::bit_cast<std::uint32_t>(-0.25f)}
+    }};
+    for (std::uint32_t record = 0; record < records.size(); ++record) {
+        const auto address = arguments + offsets[record];
+        const std::array<std::uint32_t, 5> empty{};
+        AgcDriver::GuestMemory::Write(address, std::as_bytes(std::span(queued ? empty : records[record])));
+        if (queued) Append(commands, 0x37, {0x00100200u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), records[record][0], records[record][1], records[record][2], records[record][3], records[record][4]});
+    }
+    for (std::uint32_t record = 0; record < records.size(); ++record) {
+        if (direct) {
+            if (records[record][0] == 0 || records[record][2] >= 3) continue;
+            Append(commands, 0x76, {0x8c, records[record][3], 0, records[record][4], 0});
+            Append(commands, 0x27, {3, static_cast<std::uint32_t>(indices), static_cast<std::uint32_t>(indices >> 32u), std::min(records[record][0], 3u), 2});
+        } else Append(commands, 0x25, {offsets[record], 0x8c, 0x8e, 2});
+    }
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "indexed indirect packet run submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    return ColorMemory;
+}
+
+void RuntimeSgprRuns() {
+    Registered(PatchedIndirectVertexHeader, PatchedIndirectVertexCode.data(), sizeof(PatchedIndirectVertexCode), 2);
+    Registered(IndirectPixelHeader, IndirectPixelCode.data(), sizeof(IndirectPixelCode), 1);
+    for (const bool scattered : {false, true}) for (const bool queued : {false, true}) {
+        const auto expected = SubmitRuntimeRun(scattered, true, false);
+        Require(std::ranges::any_of(expected, [](auto byte) { return byte != std::byte{0x40}; }), "packet-run reference did not render pixels");
+        const auto before = AgcDriver::Graphics::RuntimeIndirectDrawCounts();
+        Require(SubmitRuntimeRun(scattered, false, queued) == expected, "indexed packet-run pixels differ from CPU expansion");
+        const auto after = AgcDriver::Graphics::RuntimeIndirectDrawCounts();
+        if (ShaderRecompiler::IndirectSgprRuntime()) {
+            Require(after.calls - before.calls == 1 && after.records - before.records == 3, "compatible indexed packets did not use one multi-draw call");
+            Require(after.scattered - before.scattered == 1, "packet run did not retain original record addresses");
+        } else Require(after.calls == before.calls, "disabled runtime mode recorded a runtime packet run");
+    }
+}
+
+void RuntimeSgprCache() {
+    ShaderRecompiler::RecompileResult emptyPush;
+    emptyPush.indirectSgprs = ShaderRecompiler::IndirectSgprPatch{8, -1, -1, 0, false};
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> emptyStages{{{ShaderRecompiler::ShaderStage::Vertex, &emptyPush, 0}}};
+    Require((AgcDriver::Graphics::PushConstantStages(emptyStages) == VK_SHADER_STAGE_VERTEX_BIT) == ShaderRecompiler::IndirectSgprRuntime(), "runtime metadata lost its push range when no user words were forwarded");
+    Registered(PatchedIndirectVertexHeader, PatchedIndirectVertexCode.data(), sizeof(PatchedIndirectVertexCode), 2);
+    Registered(IndirectPixelHeader, IndirectPixelCode.data(), sizeof(IndirectPixelCode), 1);
+    IndirectInputs inputs{&FragmentInput[520], false, 1.0f, true};
+    const std::array records{IndirectRecord{3, 1, 0, 0}, IndirectRecord{3, 1, std::bit_cast<std::uint32_t>(-0.5f), 0}};
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto expected = SubmitIndirect(records, true, false, false, std::nullopt, inputs);
+    for (unsigned repeat = 0; repeat < 4; ++repeat) Require(SubmitIndirect(records, true, false, false, std::nullopt, inputs) == expected, "cached runtime packet changed pixels");
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    if (ShaderRecompiler::IndirectSgprRuntime() && std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr) Require(std::ranges::all_of(IndirectRecordReads, [](const auto& reads) { return reads.load() == 0; }), "original-argument runtime packets read records on the CPU");
+    if (ShaderRecompiler::IndirectSgprRuntime()) Require(after.hits > before.hits && after.inserts > before.inserts, "repeated runtime packets bypassed draw-entry reuse");
+    auto changed = records;
+    changed[0][2] = std::bit_cast<std::uint32_t>(-0.25f);
+    const auto hits = after.hits;
+    const auto actual = SubmitIndirect(changed, true, false, false, std::nullopt, inputs);
+    Require(actual != expected, "runtime cache fixture did not distinguish changed argument fields");
+    if (ShaderRecompiler::IndirectSgprRuntime()) Require(AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters().hits > hits, "argument values entered the runtime packet cache key");
+    inputs.direct = true;
+    Require(actual == SubmitIndirect(changed, true, false, false, std::nullopt, inputs), "a runtime cache hit retained old argument fields");
+    inputs.alternateArguments = true;
+    inputs.direct = false;
+    const auto beforeAddress = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters().hits;
+    const auto otherAddress = SubmitIndirect(changed, true, false, false, std::nullopt, inputs);
+    Require(otherAddress == actual, "an argument address change retained an old record view");
+    if (ShaderRecompiler::IndirectSgprRuntime()) Require(AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters().hits > beforeAddress, "argument addresses entered the runtime draw cache key");
+    inputs.direct = true;
+    inputs.omitBasePatch = true;
+    const auto alternate = SubmitIndirect(changed, true, false, false, std::nullopt, inputs);
+    inputs.direct = false;
+    for (unsigned repeat = 0; repeat < 4; ++repeat) Require(SubmitIndirect(changed, true, false, false, std::nullopt, inputs) == alternate, "different patch maps reused the wrong cached runtime stage");
+    using Indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw;
+    Indirect map{};
+    map.recordBytes = 16;
+    map.baseVertexLocation = 0x8c;
+    map.startInstanceLocation = 0x8e;
+    const auto key = map.PatchKey();
+    map.arguments = 0x12340000;
+    map.stride = 64;
+    map.count = 20;
+    Require(map.PatchKey() == key, "record addresses entered packet patch identity");
+    map.startInstanceLocation = 0x8d;
+    Require(map.PatchKey() != key, "different packet patch maps alias");
 }
 
 void QueuedFragmentWordInvalidatesFrontPage() {
@@ -452,14 +567,29 @@ int main(int argc, char** argv) {
 #endif
         SightingsKeepCollidingKeys();
         bool libraries = false;
+        bool runtimeSupported = false;
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
             libraries = device->GraphicsPipelineLibraries();
+            const auto indirect = device->DrawIndirectSupport();
+            const auto capabilities = device->Target().supportedCapabilities;
+            runtimeSupported = indirect.parameters && indirect.multi && indirect.firstInstance && indirect.maxCount >= 3 && std::ranges::find(capabilities, 11u) != capabilities.end() && std::ranges::find(capabilities, 5347u) != capabilities.end();
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         if (argc == 2 && std::string(argv[1]) == "--runtime-sgprs") {
             RuntimeSgprPixels();
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && (std::string(argv[1]) == "--runtime-sgpr-cache" || std::string(argv[1]) == "--runtime-sgpr-runs") && ShaderRecompiler::IndirectSgprRuntime() && !runtimeSupported) return VulkanTestSkipped;
+        if (argc == 2 && std::string(argv[1]) == "--runtime-sgpr-cache") {
+            RuntimeSgprCache();
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--runtime-sgpr-runs") {
+            RuntimeSgprRuns();
             AgcDriverShutdown_nid_postfix();
             return 0;
         }

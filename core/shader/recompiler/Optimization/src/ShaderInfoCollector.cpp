@@ -1,4 +1,5 @@
 #include "Optimization/ShaderInfoCollector.hpp"
+#include "IndirectSgpr.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -129,6 +130,9 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                     const auto kind = static_cast<StageInputKind>(kindValue->ImmediateU32());
                     const auto component = componentValue->ImmediateU32();
                     switch (kind) {
+                        case StageInputKind::IndirectArgument:
+                            if (program.Resources().stage != IrShaderStage::Vertex || (component > 4u && component != IndirectSgprDrawIndex)) return Fail("invalid indirect argument field");
+                            break;
                         case StageInputKind::PackedAncillary: {
                             std::string uses;
                             for (const IrValue* user : inst->Uses()) {
@@ -354,6 +358,10 @@ void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
                     break;
                 case StageInputKind::DrawIndex:
                     AddInput(info, kind, 0, 1, "gl_DrawID");
+                    break;
+                case StageInputKind::IndirectArgument:
+                    AddInput(info, kind, 0, 1, "indirect_argument");
+                    AddInput(info, StageInputKind::DrawIndex, 0, 1, "gl_DrawID");
                     break;
                 case StageInputKind::InvocationId:
                     AddInput(info, kind, 0, 1, "gl_InvocationID");

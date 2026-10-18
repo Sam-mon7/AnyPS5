@@ -47,7 +47,7 @@ struct DrawParameters {
         std::uint32_t drawIndexLocation;
         bool drawIndexEnabled;
         std::uint32_t indxOffset;
-        enum class Rule : std::uint8_t { InPlace, Constant };
+        enum class Rule : std::uint8_t { InPlace, Constant, Argument };
         Rule vertexRule = Rule::Constant;
         Rule instanceRule = Rule::Constant;
         std::uint32_t vertexConstant = 0;
@@ -55,10 +55,28 @@ struct DrawParameters {
         std::int32_t baseVertexSgpr = -1;
         std::int32_t startInstanceSgpr = -1;
         std::int32_t drawIndexSgpr = -1;
+        std::vector<std::uint64_t> argumentAddresses;
+        std::uint32_t vertexField = ShaderRecompiler::IndirectSgprConstant;
+        std::uint32_t instanceField = ShaderRecompiler::IndirectSgprConstant;
         std::optional<ShaderRecompiler::IndirectSgprPatch> runtimeSgprs;
         ShaderRecompiler::IndirectSgprFailure runtimeFailure = ShaderRecompiler::IndirectSgprFailure::None;
         // Bytes of the record range: (count - 1) * stride + recordBytes, or 0 for no records.
         std::uint64_t RangeBytes() const { return count == 0 ? 0 : static_cast<std::uint64_t>(count - 1) * stride + recordBytes; }
+        std::uint64_t RecordAddress(std::uint32_t record) const { return argumentAddresses.empty() ? arguments + static_cast<std::uint64_t>(record) * stride : argumentAddresses.at(record); }
+        template <typename F> void ArgumentRanges(F&& f) const {
+            if (argumentAddresses.empty()) f(arguments, RangeBytes());
+            else for (const auto address : argumentAddresses) f(address, recordBytes);
+        }
+        bool ArgumentsOverlap(std::uint64_t begin, std::uint64_t end) const {
+            bool overlap = false;
+            ArgumentRanges([&](auto address, auto bytes) { overlap |= begin < address + bytes && address < end; });
+            return overlap;
+        }
+        std::uint64_t PatchKey() const {
+            std::uint64_t key = 0x53475052554e0002ull;
+            for (const auto word : {recordBytes, baseVertexLocation, startInstanceLocation, drawIndexLocation, static_cast<std::uint32_t>(drawIndexEnabled), indxOffset}) key = (key ^ word) * 0x100000001b3ull;
+            return key;
+        }
         std::uint32_t VertexDwordOffset() const { return recordBytes == 20 ? 12u : 8u; }
         std::uint32_t InstanceDwordOffset() const { return recordBytes == 20 ? 16u : 12u; }
     };

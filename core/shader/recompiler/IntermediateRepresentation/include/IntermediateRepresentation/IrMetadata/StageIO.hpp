@@ -49,6 +49,7 @@ enum class StageInputKind {
     BaseVertex,
     BaseInstance,
     DrawIndex,
+    IndirectArgument,
 };
 
 enum class StageOutputKind {

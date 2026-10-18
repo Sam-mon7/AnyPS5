@@ -161,6 +161,7 @@ void Driver::execute(const Submission& submission) {
     struct ClearAhead {
         ~ClearAhead() { clearResolvedAhead(); }
     } clearAhead;
+    std::size_t rejectedIndirectRunEnd = 0;
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -343,7 +344,28 @@ void Driver::execute(const Submission& submission) {
 
                 try {
                     std::string rejected;
-                    const auto verdict = draw(queue, packet, submission, rejected);
+                    std::vector<std::uint64_t> addresses;
+                    if (ShaderRecompiler::IndirectSgprRuntime() && opcode == 0x25 && count == 5 && cursor >= rejectedIndirectRunEnd && !predicated && !CaptureTrace::Enabled()) {
+                        const auto first = Pm4::ResolveDraw(packet, queue);
+                        addresses.push_back(first.indirect->arguments);
+                        for (auto next = cursor + count; addresses.size() < 64 && next + count <= submission.commands.size(); next += count) {
+                            const auto following = std::span(submission.commands).subspan(next, count);
+                            if (following[0] != header || !std::equal(packet.begin() + 2, packet.end(), following.begin() + 2)) break;
+                            addresses.push_back(Pm4::ResolveDraw(following, queue).indirect->arguments);
+                        }
+                        if (addresses.size() < 2) addresses.clear();
+                    }
+                    std::span<const std::uint64_t> run(addresses);
+                    const auto verdict = draw(queue, packet, submission, rejected, run.empty() ? nullptr : &run);
+                    if (!run.empty()) {
+                        nextCursor = cursor + count * run.size();
+                        for (std::size_t record = 1; record < run.size(); ++record) {
+                            ++packetsDone;
+                            recent.Record(cursor + record * count);
+                            if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
+                            Graphics::Recorder::CountRecordedWork();
+                        }
+                    } else if (!addresses.empty()) rejectedIndirectRunEnd = cursor + count * addresses.size();
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {

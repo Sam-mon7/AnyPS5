@@ -772,7 +772,7 @@ DrawArguments ReadDrawArguments(const DrawParameters::IndirectDraw& indirect, st
     std::array<std::uint32_t, 5> words{};
     // Named for the [hooksync] attribution (the read goes through the flush hook).
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::IndirectArguments);
-    GuestMemory::Read(indirect.arguments + static_cast<std::uint64_t>(record) * indirect.stride, std::as_writable_bytes(std::span(words)).first(indirect.recordBytes), 4);
+    GuestMemory::Read(indirect.RecordAddress(record), std::as_writable_bytes(std::span(words)).first(indirect.recordBytes), 4);
     if (indirect.recordBytes == 20) return {words[0], words[1], words[2], words[3], words[4]};
     return {words[0], words[1], words[2], 0, words[3]};
 }

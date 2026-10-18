@@ -94,6 +94,12 @@ bool DrawRecipes();
 // `rewritten` counts a GPU-side draw whose records were copied and patched with a constant.
 enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVertexPath, IndxOffset, DrawIndex, VertexRange, FeatureGap, PendingImage, PendingLabelOrCopy, NotImported, Disabled, RuntimeSgpr, RuntimeFeature, RuntimeStage, RuntimeOriginalArgument, RuntimeResource, RuntimeFetch, Count };
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = false);
+struct IndirectSgprDrawCounts {
+    std::uint64_t calls;
+    std::uint64_t records;
+    std::uint64_t scattered;
+};
+IndirectSgprDrawCounts RuntimeIndirectDrawCounts();
 const char* IndirectDrawPathName(IndirectDrawPath path);
 
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes

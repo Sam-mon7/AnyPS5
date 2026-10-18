@@ -67,12 +67,22 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         case Failure::Fetch: fail(Path::RuntimeFetch); break;
         }
     }
-    if (runtime && (!support.parameters || (result.indirectSgprs->drawIndex >= 0 && indirect.count > 1 && !support.multi))) fail(Path::RuntimeFeature);
+    if (runtime && (!support.parameters || (indirect.count > 1 && !support.multi) || indirect.count > support.maxCount)) fail(Path::RuntimeFeature);
     if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0 && !runtime) fail(Path::DrawIndex);
     if (indirect.countIndirect && !support.count) fail(Path::FeatureGap);
     if (indirect.countIndirect && indirect.count > 1 && !support.multi) fail(Path::FeatureGap);
     const auto dimension = [&](std::int32_t k, std::int32_t p, bool shared, bool conflict, std::uint32_t x, Rule& rule, std::uint32_t& constant) {
-        if (p < 0 || (p < 64 && (unused & (std::uint64_t{1} << p)) != 0)) {
+        if (runtime) {
+            if (conflict) { fail(Path::RuntimeFetch); return; }
+            const auto& patch = *result.indirectSgprs;
+            auto& field = &rule == &indirect.vertexRule ? indirect.vertexField : indirect.instanceField;
+            field = k >= 0 && k == patch.drawIndex ? ShaderRecompiler::IndirectSgprDrawIndex : k >= 0 && k == patch.firstInstance ? indirect.InstanceDwordOffset() / 4u : k >= 0 && k == patch.baseVertex ? indirect.VertexDwordOffset() / 4u : ShaderRecompiler::IndirectSgprConstant;
+            rule = field == ShaderRecompiler::IndirectSgprConstant ? Rule::Constant : Rule::Argument;
+            const auto offset = field == ShaderRecompiler::IndirectSgprConstant && k >= 0 ? drawUserWord(frontProgram, k) : 0u;
+            require(offset <= std::numeric_limits<std::uint32_t>::max() - x, "draw vertex offset overflow");
+            constant = x + offset;
+            if (field == (&rule == &indirect.vertexRule ? indirect.VertexDwordOffset() : indirect.InstanceDwordOffset()) / 4u && x == 0) rule = Rule::InPlace;
+        } else if (p < 0 || (p < 64 && (unused & (std::uint64_t{1} << p)) != 0)) {
             rule = Rule::Constant;
             const auto offset = k >= 0 ? drawUserWord(frontProgram, k) : 0u;
             require(offset <= std::numeric_limits<std::uint32_t>::max() - x, "draw vertex offset overflow");
@@ -84,8 +94,8 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     };
     dimension(result.vertexOffsetSgpr, indirect.baseVertexSgpr, result.vertexOffsetShared, result.vertexOffsetConflict, drawParameters.indexed ? 0u : indirect.indxOffset, indirect.vertexRule, indirect.vertexConstant);
     dimension(result.instanceOffsetSgpr, indirect.startInstanceSgpr, result.instanceOffsetShared, result.instanceOffsetConflict, 0u, indirect.instanceRule, indirect.instanceConstant);
-    if (!support.firstInstance && (indirect.instanceRule == Rule::InPlace || indirect.instanceConstant != 0)) fail(Path::FeatureGap);
-    if ((indirect.vertexRule == Rule::Constant || indirect.instanceRule == Rule::Constant) && indirect.count > 256) fail(Path::FeatureGap);
+    if (!support.firstInstance && (indirect.instanceRule != Rule::Constant || indirect.instanceConstant != 0)) fail(Path::FeatureGap);
+    if (!runtime && (indirect.vertexRule == Rule::Constant || indirect.instanceRule == Rule::Constant) && indirect.count > 256) fail(Path::FeatureGap);
 
     static const std::uint64_t vertexCap = [] { const char* text = std::getenv("APS5_INDIRECT_VERTEX_MIB"); return (text ? std::strtoull(text, nullptr, 10) : 64ull) << 20u; }();
     for (const auto& attribute : result.vertexAttributes) {
@@ -95,7 +105,7 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     }
     if (traceIndirect) {
         const auto location = [](std::uint32_t value, std::int32_t sgpr) { char text[24]; if (value == 0x280u) std::snprintf(text, sizeof(text), "none"); else std::snprintf(text, sizeof(text), "0x%x(s%d)", value, sgpr); return std::string(text); };
-        const auto rule = [](Rule value, std::uint32_t constant) { char text[24]; if (value == Rule::InPlace) std::snprintf(text, sizeof(text), "in-place"); else std::snprintf(text, sizeof(text), "const %u", constant); return std::string(text); };
+        const auto rule = [](Rule value, std::uint32_t constant) { char text[24]; if (value == Rule::InPlace) std::snprintf(text, sizeof(text), "in-place"); else if (value == Rule::Argument) std::snprintf(text, sizeof(text), "argument + %u", constant); else std::snprintf(text, sizeof(text), "const %u", constant); return std::string(text); };
         std::string decision = indirectCpu ? "cpu (" + std::string(Graphics::IndirectDrawPathName(*indirectCpu)) + ")" : "gpu vertex=" + rule(indirect.vertexRule, indirect.vertexConstant) + " instance=" + rule(indirect.instanceRule, indirect.instanceConstant);
         std::fprintf(stderr, "[draw] indirect 0x%x args 0x%llx stride %u count %u%s locs base=%s inst=%s idx=%s%s analyzer v=%d i=%d shared=%d/%d conflict=%d/%d indx=%u -> %s\n", indirect.opcode, static_cast<unsigned long long>(indirect.arguments), indirect.stride, indirect.count, indirect.countIndirect ? " (indirect)" : "", location(indirect.baseVertexLocation, indirect.baseVertexSgpr).c_str(), location(indirect.startInstanceLocation, indirect.startInstanceSgpr).c_str(), location(indirect.drawIndexLocation, indirect.drawIndexSgpr).c_str(), indirect.drawIndexEnabled ? " (enabled)" : "", result.vertexOffsetSgpr, result.instanceOffsetSgpr, result.vertexOffsetShared ? 1 : 0, result.instanceOffsetShared ? 1 : 0, result.vertexOffsetConflict ? 1 : 0, result.instanceOffsetConflict ? 1 : 0, indirect.indxOffset, decision.c_str());
     }

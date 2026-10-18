@@ -2139,7 +2139,7 @@ int runtimeSgprCache(const char* self) {
     constexpr std::uint64_t baseline = 0x29e5f633bdc9df6dull;
     const bool active = IndirectSgprRuntime();
     require(ShaderDiskCache::OutputVersion() == (active ? IndirectSgprVersion(baseline) : baseline), "runtime SGPR output version violated the legacy version contract");
-    require(IndirectSgprVersion(baseline) != baseline, "runtime SGPR version aliases the legacy version");
+    require(IndirectSgprVersion(baseline) != baseline && IndirectSgprVersion(baseline) != 0xea40245e1ee0a484ull, "runtime SGPR ABI revision aliases an old version");
     const auto directory = std::filesystem::temp_directory_path() / ("aps5-runtime-sgpr-" + std::to_string(std::random_device{}()));
     setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
     setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
@@ -2149,7 +2149,7 @@ int runtimeSgprCache(const char* self) {
     SampleRequest sample;
     auto& request = sample.request;
     const std::array<std::uint32_t, 8> code{0x7e000208u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf80008cfu, 0x03020100u, 0xbf810000u, 0xbf810000u};
-    const std::array<std::uint32_t, 3> capabilities{1, 61, 4427};
+    const std::array<std::uint32_t, 5> capabilities{1, 61, 4427, 11, 5347};
     request.shader = {ShaderStage::Vertex, 0x20000, code, 0, {}};
     request.context = {32, 8, sample.userData, {}, {}, ShaderVertexStageInfo{}, {}};
     request.target.supportedCapabilities = capabilities;

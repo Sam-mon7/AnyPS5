@@ -22,6 +22,20 @@ struct IndirectSgprPatch {
     bool operator==(const IndirectSgprPatch&) const = default;
 };
 
+inline constexpr std::uint32_t IndirectSgprPushOffset = 112u;
+inline constexpr std::uint32_t IndirectSgprPushBytes = 16u;
+inline constexpr std::uint32_t IndirectSgprConstant = 0xffffffffu;
+inline constexpr std::uint32_t IndirectSgprDrawIndex = 0xfffffffeu;
+
+struct IndirectSgprArgument {
+    std::uint64_t address;
+    std::uint32_t stride;
+    std::uint32_t recordBase;
+    std::uint32_t drawIndexBase;
+    std::uint32_t drawIndexStep;
+};
+static_assert(sizeof(IndirectSgprArgument) == 24u);
+
 enum class IndirectSgprFailure : std::uint8_t { None, Feature, Stage, OriginalArgument, ResourceDependency, Fetch };
 
 class IndirectSgprUnsupported : public std::runtime_error {
@@ -31,7 +45,7 @@ public:
 };
 
 constexpr std::uint64_t IndirectSgprVersion(std::uint64_t legacy) {
-    return (legacy ^ 0x53475052554e0001ull) * 0x100000001b3ull;
+    return (legacy ^ 0x53475052554e0002ull) * 0x100000001b3ull;
 }
 
 }

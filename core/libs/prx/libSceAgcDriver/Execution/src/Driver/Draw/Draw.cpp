@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -13,7 +14,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
+DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected, std::span<const std::uint64_t>* argumentRun) {
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
@@ -33,6 +34,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return DrawVerdict::Drawn;
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
+    if (argumentRun != nullptr && !argumentRun->empty()) {
+        auto& indirect = *drawParameters.indirect;
+        indirect.argumentAddresses.assign(argumentRun->begin(), argumentRun->end());
+        indirect.count = static_cast<std::uint32_t>(argumentRun->size());
+    }
     const bool pipelined = DrawPipeline::Active();
     const bool pipelineIndirect = pipelined && drawParameters.indirect && DrawPipeline::PipelineIndirect();
     if (pipelined && drawParameters.indirect && !pipelineIndirect) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
@@ -69,7 +75,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
-    const bool useDrawEntries = !(ShaderRecompiler::IndirectSgprRuntime() && drawParameters.indirect) && drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
+    const auto packetPatchKey = ShaderRecompiler::IndirectSgprRuntime() && drawParameters.indirect ? drawParameters.indirect->PatchKey() : 0ull;
+    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
@@ -81,7 +88,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::shared_ptr<const DrawRelocation> relocation;
-        if (drawRelocationEnabled()) {
+        if (drawRelocationEnabled() && packetPatchKey == 0) {
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
             std::lock_guard cacheLock(drawCacheMutex);
             learnPendingRelocation();
@@ -89,6 +96,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (known != drawRelocations.end()) relocation = known->second;
         }
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, relocation.get(), &drawAlias);
+        if (packetPatchKey != 0) {
+            drawKey = (drawKey ^ packetPatchKey) * 0x100000001b3ull;
+            shapeKey = (shapeKey ^ packetPatchKey) * 0x100000001b3ull;
+            drawAlias = 0;
+        }
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -192,7 +204,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             const auto support = localDevice->DrawIndirectSupport();
             const auto otherStage = [&](std::uint32_t location) { const auto word = locate(location); return word && word->first != 0; };
             if (graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList || graphics.stages.mesh || graphics.stages.tessellation || otherStage(indirect.baseVertexLocation) || otherStage(indirect.startInstanceLocation) || (indirect.drawIndexEnabled && otherStage(indirect.drawIndexLocation))) indirect.runtimeFailure = Failure::Stage;
-            else if (!support.parameters || (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0 && indirect.count > 1 && !support.multi)) indirect.runtimeFailure = Failure::Feature;
+            else if (!support.parameters || (indirect.count > 1 && !support.multi) || indirect.count > support.maxCount) indirect.runtimeFailure = Failure::Feature;
             else if (indirect.baseVertexSgpr >= 0 || indirect.startInstanceSgpr >= 0 || (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0)) indirect.runtimeSgprs = ShaderRecompiler::IndirectSgprPatch{indirect.baseVertexSgpr, indirect.startInstanceSgpr, indirect.drawIndexEnabled ? indirect.drawIndexSgpr : -1, indirect.indxOffset, drawParameters.indexed};
         }
     }
@@ -242,7 +254,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::uint64_t dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
     bool drawHit = false;
     bool verifyHit = false;
-    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates);
+    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, packetPatchKey);
     for (auto& variant : matched) {
         if (variant != nullptr) applyShaderDataPatches(*variant);
     }
@@ -342,26 +354,31 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
+            if (ShaderRecompiler::IndirectSgprRuntime() && !result.indirectSgprs) drawParameters.indirect->runtimeSgprs.reset();
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            if (indirectCpu && argumentRun != nullptr && !argumentRun->empty()) {
+                *argumentRun = {};
+                return draw(queue, packet, submission, rejected);
+            }
             if (indirectCpu) {
                 if (!deferredLabels().labels.empty()) {
                     if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
                     recordQueuedLabelsBeforeRead(submission.queue);
                     ++captureRetries;
-                    return draw(queue, packet, submission, rejected);
+                    return draw(queue, packet, submission, rejected, argumentRun);
                 }
                 const auto& indirect = *drawParameters.indirect;
                 if (pipelineIndirect) {
                     auto& pipeline = DrawPipeline::Queue0();
-                    if (pipeline.DrainIfOverlaps(memory, regionBounds, DrawPipeline::DrainReason::Capture)) return draw(queue, packet, submission, rejected);
+                    if (pipeline.DrainIfOverlaps(memory, regionBounds, DrawPipeline::DrainReason::Capture)) return draw(queue, packet, submission, rejected, argumentRun);
                     const auto readBounds = [](const Graphics::DecodeRead& read) { return DrawPipeline::Range{read.address, read.address + read.bytes.size()}; };
                     for (const auto& reads : decodeReads) {
-                        if (pipeline.DrainIfOverlaps(reads, readBounds, DrawPipeline::DrainReason::Capture)) return draw(queue, packet, submission, rejected);
+                        if (pipeline.DrainIfOverlaps(reads, readBounds, DrawPipeline::DrainReason::Capture)) return draw(queue, packet, submission, rejected, argumentRun);
                     }
                     const std::array<DrawPipeline::Range, 2> argumentRanges{DrawPipeline::Range{indirect.arguments, indirect.arguments + indirect.RangeBytes()}, indirect.countIndirect ? DrawPipeline::Range{indirect.countAddress, indirect.countAddress + 4} : DrawPipeline::Range{0, 0}};
                     if (pipeline.DrainIfOverlaps(std::span<const DrawPipeline::Range>(argumentRanges), DrawPipeline::DrainReason::Indirect)) {
                         pipeline.Note(DrawPipeline::Event::IndirectArgsDrain);
-                        return draw(queue, packet, submission, rejected);
+                        return draw(queue, packet, submission, rejected, argumentRun);
                     }
                 }
                 const auto readStart = std::chrono::steady_clock::now();
@@ -401,9 +418,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (const auto& read : reads) memory.push_back({read.address, std::as_bytes(std::span(read.bytes))});
     }
 
-    if (pipelineIndirect && DrawPipeline::Queue0().DrainIfOverlaps(memory, regionBounds, DrawPipeline::DrainReason::Capture)) return draw(queue, packet, submission, rejected);
+    if (pipelineIndirect && DrawPipeline::Queue0().DrainIfOverlaps(memory, regionBounds, DrawPipeline::DrainReason::Capture)) return draw(queue, packet, submission, rejected, argumentRun);
     if (pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
-    if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
+    if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected, argumentRun);
 
     bool rectListBuilt = false;
 
@@ -616,6 +633,33 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return drawn();
     }
 
+    if (argumentRun != nullptr && !argumentRun->empty()) {
+        using Role = ShaderRecompiler::DescriptorRole;
+        const auto writes = DrawWriteRanges(graphics, stages, true);
+        const auto overlaps = [&](std::span<const std::uint32_t> words) {
+            const auto address = static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffffu) << 32u);
+            const auto stride = (words[1] >> 16u) & 0x3fffu;
+            const auto bytes = static_cast<std::uint64_t>(words[2]) * std::max(stride, 1u);
+            return address != 0 && std::ranges::any_of(writes, [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+        };
+        const auto independent = [&](const Graphics::CompiledShader& stage) {
+            if (stage.program->bdaWrites || std::ranges::any_of(stage.program->vertexAttributes, [&](const auto& attribute) { return overlaps(attribute.resource.fields); })) return false;
+            return std::ranges::all_of(stage.program->bindings, [&](const auto& binding) {
+                if (binding.role == Role::Gds || binding.role == Role::GuestImages || binding.role == Role::ImageTable || binding.role == Role::BdaPagetable) return false;
+                if (binding.role != Role::GuestBuffers) return true;
+                if (!binding.readOnly && (binding.bufferWritten.size() < binding.count || std::ranges::any_of(binding.bufferWritten, [](bool written) { return written; }))) return false;
+                if (binding.guestDescriptor.size() < static_cast<std::size_t>(binding.count) * 4u) return false;
+                for (std::uint32_t element = 0; element < binding.count; ++element) if (overlaps(std::span(binding.guestDescriptor).subspan(element * 4u, 4u))) return false;
+                return true;
+            });
+        };
+        const bool writesArguments = std::ranges::any_of(writes, [&](const auto& range) { return drawParameters.indirect->ArgumentsOverlap(range.first, range.second); });
+        const bool readsOutput = std::ranges::any_of(memory, [&](const auto& region) { return std::ranges::any_of(writes, [&](const auto& range) { return region.guestAddress < range.second && range.first < region.guestAddress + region.bytes.size(); }); });
+        if (!drawParameters.indirect->runtimeSgprs || !std::ranges::all_of(stages, independent) || writesArguments || readsOutput) {
+            *argumentRun = {};
+            return draw(queue, packet, submission, rejected);
+        }
+    }
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
     if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());

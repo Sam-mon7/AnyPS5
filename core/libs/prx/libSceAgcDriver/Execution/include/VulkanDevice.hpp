@@ -305,6 +305,7 @@ public:
         bool multi;
         bool count;
         bool parameters;
+        std::uint32_t maxCount;
     };
     IndirectDrawSupport DrawIndirectSupport() const;
     void EnqueueDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});

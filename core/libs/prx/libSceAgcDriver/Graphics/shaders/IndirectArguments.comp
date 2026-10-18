@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint words[]; };
+layout(push_constant) uniform Parameters {
+    Words table;
+    Words commands;
+    uint count;
+    uint tableStride;
+    uint recordBytes;
+    uint vertexField;
+    uint vertexBias;
+    uint instanceField;
+    uint instanceBias;
+    uint indexCount;
+} p;
+uint source(Words record, uint field, uint bias, uint ordinal) {
+    if (field == 0xffffffffu) return bias;
+    if (field == 0xfffffffeu) return ordinal + bias;
+    return record.words[field] + bias;
+}
+void main() {
+    uint draw = gl_GlobalInvocationID.x;
+    if (draw >= p.count) return;
+    Words meta = Words(uint64_t(p.table) + uint64_t(draw) * p.tableStride);
+    Words record = Words((uint64_t(meta.words[1]) << 32) + meta.words[0] + uint64_t(meta.words[3] + draw) * meta.words[2]);
+    uint ordinal = meta.words[4] + draw * meta.words[5];
+    uint base = draw * (p.recordBytes / 4);
+    uint vertex = p.recordBytes == 20 ? 3 : 2;
+    for (uint word = 0; word < p.recordBytes / 4; ++word) p.commands.words[base + word] = record.words[word];
+    p.commands.words[base + vertex] = source(record, p.vertexField, p.vertexBias, ordinal);
+    p.commands.words[base + vertex + 1] = source(record, p.instanceField, p.instanceBias, ordinal);
+    if (p.recordBytes == 20) {
+        uint first = record.words[2];
+        p.commands.words[base] = first >= p.indexCount ? 0 : min(record.words[0], p.indexCount - first);
+        if (first >= p.indexCount) p.commands.words[base + 2] = 0;
+    }
+}

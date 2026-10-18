@@ -350,6 +350,7 @@ struct VulkanDevice::State {
     bool contextReady = false;
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     std::unique_ptr<Graphics::Recorder> recorder;
+    std::shared_ptr<Graphics::IndirectArgumentPipeline> indirectArgumentPipeline;
     // Device-local buffers of a repeated 16-byte fill pattern (FillBuffer), most recently used
     // last; each is filled once by a doubling chain in device memory.
     std::vector<std::pair<std::array<std::uint32_t, 4>, std::shared_ptr<Graphics::DeviceBuffer>>> patternBuffers;
@@ -692,6 +693,7 @@ struct VulkanDevice::State {
             }
             Graphics::DestroyShadows(device);
             recorder.reset();
+            indirectArgumentPipeline.reset();
             // Cached graphics pipelines (with their framebuffers, modules, render passes and layouts)
             // belong to this device and must be destroyed while it lives.
             Graphics::ClearCachedPipelines(device);
@@ -3301,6 +3303,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.addressBindings = state->addressBindingsEnabled ? state->addressBindings : nullptr;
     context.copyCheckpoints = state->copyCheckpoints;
     context.recorder = state->recorder.get();
+    context.indirectArgumentPipeline = &state->indirectArgumentPipeline;
     context.descriptorCache = state->descriptorCache.get();
     context.samplerCache = state->samplerCache.get();
     context.drawIndirectFirstInstance = state->drawIndirectFirstInstance;
@@ -3349,7 +3352,7 @@ Graphics::Context VulkanDevice::buildContext() const {
 }
 
 VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
-    return {state->drawIndirectFirstInstance, state->multiDrawIndirect, state->drawIndirectCount, state->shaderDrawParameters};
+    return {state->drawIndirectFirstInstance, state->multiDrawIndirect, state->drawIndirectCount, state->shaderDrawParameters, static_cast<std::uint32_t>(std::min<std::uint64_t>(state->properties.limits.maxDrawIndirectCount, static_cast<std::uint64_t>(state->properties.limits.maxComputeWorkGroupCount[0]) * 64u))};
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/shaders/IndirectArgumentsSpv.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -36,6 +37,68 @@
 #include <utility>
 
 namespace AgcDriver::Graphics {
+namespace {
+std::atomic<std::uint64_t> runtimeIndirectCalls{0}, runtimeIndirectRecords{0}, runtimeIndirectScattered{0};
+}
+
+IndirectSgprDrawCounts RuntimeIndirectDrawCounts() {
+    return {runtimeIndirectCalls.load(), runtimeIndirectRecords.load(), runtimeIndirectScattered.load()};
+}
+
+class IndirectArgumentPipeline {
+public:
+    explicit IndirectArgumentPipeline(const Context& context) : context(context) {
+        VkShaderModule module = VK_NULL_HANDLE;
+        try {
+            const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 48};
+            VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layoutInfo.pushConstantRangeCount = 1;
+            layoutInfo.pPushConstantRanges = &push;
+            Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout indirect arguments");
+            VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            moduleInfo.codeSize = sizeof(IndirectArgumentsSpv);
+            moduleInfo.pCode = IndirectArgumentsSpv;
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule indirect arguments");
+            VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            info.stage.module = module;
+            info.stage.pName = "main";
+            info.layout = layout;
+            auto cacheLock = context.LockPipelineCacheForUse();
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &info, nullptr, &pipeline), "vkCreateComputePipelines indirect arguments");
+            context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        } catch (...) {
+            if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            release();
+            throw;
+        }
+    }
+    ~IndirectArgumentPipeline() { release(); }
+    void Record(VkCommandBuffer commands, VkDeviceAddress table, VkDeviceAddress output, std::uint32_t count, std::uint32_t tableStride, const Pm4::DrawParameters& draw) const {
+        const auto& args = *draw.indirect;
+        using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+        const auto field = [](Rule rule, std::uint32_t source, std::uint32_t own) { return rule == Rule::Constant ? ShaderRecompiler::IndirectSgprConstant : rule == Rule::InPlace ? own / 4u : source; };
+        struct {
+            VkDeviceAddress table, output;
+            std::uint32_t count, tableStride, recordBytes, vertexField, vertexBias, instanceField, instanceBias, indexCount;
+        } parameters{table, output, count, tableStride, args.recordBytes, field(args.vertexRule, args.vertexField, args.VertexDwordOffset()), args.vertexRule == Rule::InPlace ? 0u : args.vertexConstant, field(args.instanceRule, args.instanceField, args.InstanceDwordOffset()), args.instanceRule == Rule::InPlace ? 0u : args.instanceConstant, draw.indexCount};
+        static_assert(sizeof(parameters) == 48u);
+        context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(parameters), &parameters);
+        context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, (count + 63u) / 64u, 1, 1);
+    }
+private:
+    void release() {
+        if (pipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+        if (layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+        pipeline = VK_NULL_HANDLE;
+        layout = VK_NULL_HANDLE;
+    }
+    Context context;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
 
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews) {
     std::uint64_t key = 14695981039346656037ull;
@@ -1338,32 +1401,63 @@ struct IndirectRecord {
     IndirectDrawPath path = IndirectDrawPath::Gpu;
     const HostImport* argumentImport = nullptr;
     const HostImport* countImport = nullptr;
+    std::vector<const HostImport*> argumentImports;
     std::span<const Pm4::DrawArguments> records;
     double readMs = 0;
 };
 
-std::shared_ptr<Buffer> runtimeFallbackArguments(const Context& context, VkCommandBuffer commands, const Pm4::DrawParameters& draw, const IndirectRecord& indirect) {
-    using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+struct RuntimeIndirectArguments {
+    std::shared_ptr<Buffer> table;
+    std::shared_ptr<Buffer> commands;
+    std::vector<std::shared_ptr<Buffer>> originals;
+    std::shared_ptr<IndirectArgumentPipeline> pipeline;
+};
+
+std::shared_ptr<RuntimeIndirectArguments> runtimeIndirectArguments(const Context& context, VkCommandBuffer commands, Recorder* recorder, bool recorded, const Pm4::DrawParameters& draw, const IndirectRecord& indirect) {
     const auto& args = *indirect.args;
-    const auto bytes = indirect.records.size() * args.recordBytes;
-    Require(bytes != 0, "runtime SGPR fallback without records");
-    auto buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
-    for (std::size_t index = 0; index < indirect.records.size(); ++index) {
-        const auto& record = indirect.records[index];
-        const auto instance = args.instanceRule == Rule::InPlace ? record.firstInstance : args.instanceConstant;
-        const auto vertex = args.vertexRule == Rule::InPlace ? (draw.indexed ? record.vertexOffset : record.firstVertexOrIndex) : args.vertexConstant;
-        const auto count = !draw.indexed ? record.count : record.firstVertexOrIndex >= draw.indexCount ? 0u : std::min(record.count, draw.indexCount - record.firstVertexOrIndex);
-        auto* destination = buffer->Bytes().data() + index * args.recordBytes;
-        if (draw.indexed) {
-            const VkDrawIndexedIndirectCommand command{count, record.instances, record.firstVertexOrIndex, static_cast<std::int32_t>(vertex), instance};
-            std::memcpy(destination, &command, sizeof(command));
+    const bool gpu = indirect.path == IndirectDrawPath::Gpu;
+    const auto count = gpu ? args.count : static_cast<std::uint32_t>(indirect.records.size());
+    Require(context.bufferDeviceAddress && count != 0, "runtime indirect arguments require BDA and records");
+    auto result = std::make_shared<RuntimeIndirectArguments>();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    const bool scattered = !args.argumentAddresses.empty();
+    const auto originalStride = scattered ? args.recordBytes : args.stride;
+    const auto originalBytes = static_cast<std::size_t>(count - 1u) * originalStride + args.recordBytes;
+    auto original = std::make_shared<Buffer>(context, originalBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, Buffer::Access::Scratch);
+    if (gpu && !scattered) CopyBuffer(context, commands, indirect.argumentImport->buffer, args.arguments - indirect.argumentImport->base, original->Handle(), 0, originalBytes);
+    else for (std::uint32_t record = 0; record < count; ++record) {
+        const auto offset = static_cast<VkDeviceSize>(record) * originalStride;
+        if (gpu) {
+            const auto* imported = indirect.argumentImports.at(record);
+            CopyBuffer(context, commands, imported->buffer, args.RecordAddress(record) - imported->base, original->Handle(), offset, args.recordBytes);
         } else {
-            const VkDrawIndirectCommand command{count, record.instances, vertex, instance};
-            std::memcpy(destination, &command, sizeof(command));
+            const auto& data = indirect.records[record];
+            const std::array<std::uint32_t, 5> words{data.count, data.instances, data.firstVertexOrIndex, draw.indexed ? data.vertexOffset : data.firstInstance, data.firstInstance};
+            std::memcpy(original->Bytes().data() + offset, words.data(), args.recordBytes);
         }
     }
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
-    return buffer;
+    const auto entries = scattered ? count : 1u;
+    result->table = std::make_shared<Buffer>(context, entries * sizeof(ShaderRecompiler::IndirectSgprArgument), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    for (std::uint32_t entry = 0; entry < entries; ++entry) {
+        const ShaderRecompiler::IndirectSgprArgument meta{original->DeviceAddress() + (scattered ? static_cast<VkDeviceAddress>(entry) * originalStride : 0u), scattered ? 0u : originalStride, 0, 0, scattered ? 0u : 1u};
+        std::memcpy(result->table->Bytes().data() + entry * sizeof(meta), &meta, sizeof(meta));
+    }
+    result->originals.push_back(std::move(original));
+    result->commands = std::make_shared<Buffer>(context, static_cast<std::size_t>(count) * args.recordBytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, Buffer::Access::Scratch);
+    if (context.indirectArgumentPipeline != nullptr) {
+        auto& pipeline = *context.indirectArgumentPipeline;
+        if (pipeline == nullptr) pipeline = std::make_shared<IndirectArgumentPipeline>(context);
+        result->pipeline = pipeline;
+    } else result->pipeline = std::make_shared<IndirectArgumentPipeline>(context);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    if (recorded) {
+        args.ArgumentRanges([&](auto address, auto bytes) { recorder->NotePendingRead(address, static_cast<std::size_t>(bytes), Recorder::ReadKind::Indirect); });
+        if (args.countIndirect) recorder->NotePendingRead(args.countAddress, 4, Recorder::ReadKind::Indirect);
+    }
+    result->pipeline->Record(commands, result->table->DeviceAddress(), result->commands->DeviceAddress(), count, scattered ? sizeof(ShaderRecompiler::IndirectSgprArgument) : 0u, draw);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+    Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+    return result;
 }
 
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
@@ -1385,17 +1479,18 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
     if (args == nullptr) {
         if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, draw.indexCount, draw.instanceCount, firstIndex, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
         else context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, draw.firstVertex, draw.firstInstance);
-    } else if (args->runtimeSgprs && indirect->path != IndirectDrawPath::Gpu) {
-        const auto count = static_cast<std::uint32_t>(indirect->records.size());
-        if (count <= 1 || context.multiDrawIndirect) {
+    } else if (args->runtimeSgprs) {
+        const auto count = indirect->path == IndirectDrawPath::Gpu ? args->count : static_cast<std::uint32_t>(indirect->records.size());
+        ++runtimeIndirectCalls;
+        runtimeIndirectRecords += count;
+        if (!args->argumentAddresses.empty()) ++runtimeIndirectScattered;
+        Require(count <= context.limits.maxDrawIndirectCount && (count <= 1 || context.multiDrawIndirect), "runtime indirect draw exceeds device draw count");
+        if (indirect->path == IndirectDrawPath::Gpu && args->countIndirect) {
+            if (draw.indexed) context.Function<PFN_vkCmdDrawIndexedIndirectCountKHR>("vkCmdDrawIndexedIndirectCountKHR")(commands, argumentBuffer, 0, indirect->countImport->buffer, args->countAddress - indirect->countImport->base, count, args->recordBytes);
+            else context.Function<PFN_vkCmdDrawIndirectCountKHR>("vkCmdDrawIndirectCountKHR")(commands, argumentBuffer, 0, indirect->countImport->buffer, args->countAddress - indirect->countImport->base, count, args->recordBytes);
+        } else {
             if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect")(commands, argumentBuffer, 0, count, args->recordBytes);
             else context.Resolved(&DeviceFunctions::cmdDrawIndirect, "vkCmdDrawIndirect")(commands, argumentBuffer, 0, count, args->recordBytes);
-        } else {
-            Require(args->runtimeSgprs->drawIndex < 0, "runtime draw index requires multi draw support");
-            for (std::uint32_t record = 0; record < count; ++record) {
-                if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect")(commands, argumentBuffer, static_cast<VkDeviceSize>(record) * args->recordBytes, 1, args->recordBytes);
-                else context.Resolved(&DeviceFunctions::cmdDrawIndirect, "vkCmdDrawIndirect")(commands, argumentBuffer, static_cast<VkDeviceSize>(record) * args->recordBytes, 1, args->recordBytes);
-            }
         }
     } else if (indirect->path == IndirectDrawPath::Gpu) {
         if (args->countIndirect) {
@@ -1649,11 +1744,17 @@ void recordStencilReplay(const Context& context, VkCommandBuffer commands, const
     }
 }
 
-void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false) {
+void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, VkDeviceAddress indirectTable = 0, std::uint32_t indirectTableStride = 0) {
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
         resources.PatchPushConstants(block);
         stages = PushConstantStages(shaders);
+    }
+    if (indirectTable != 0) {
+        for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::IndirectSgprPushOffset, "stage push constants overlap indirect arguments");
+        const std::array<std::uint32_t, 4> words{static_cast<std::uint32_t>(indirectTable), static_cast<std::uint32_t>(indirectTable >> 32u), indirectTableStride, 0u};
+        std::memcpy(block.data() + ShaderRecompiler::IndirectSgprPushOffset, words.data(), sizeof(words));
+        stages |= VK_SHADER_STAGE_VERTEX_BIT;
     }
     if (state.stages.tessellation) {
         for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::TessellationLevelPushOffsetBytes, "a stage's push constants overlap the tessellation levels");
@@ -1776,7 +1877,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         const auto bytes = static_cast<std::size_t>(end - begin);
         if (resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes)) return true;
         if (!gpuIndirect) return false;
-        return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
+        return args->ArgumentsOverlap(begin, end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
     };
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
@@ -1814,7 +1915,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
         if (gpuIndirect) {
-            reads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
+            args->ArgumentRanges([&](auto address, auto bytes) { reads.emplace_back(address, address + bytes); });
             if (args->countIndirect) reads.emplace_back(args->countAddress, args->countAddress + 4);
         }
         auto images = resources.StorageImages();
@@ -1824,7 +1925,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
     std::unique_ptr<DeviceBuffer> scratch;
-    std::shared_ptr<Buffer> runtimeArguments;
+    std::shared_ptr<RuntimeIndirectArguments> runtimeArguments;
     std::shared_ptr<Buffer> meshArguments;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
     VkDeviceSize argumentOffset = 0;
@@ -1846,12 +1947,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (meshIndirect) {
             meshArguments = recordMeshArguments(context, commands, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
             argumentBuffer = meshArguments->Handle();
+        } else if (args != nullptr && args->runtimeSgprs) {
+            runtimeArguments = runtimeIndirectArguments(context, commands, recorder, true, draw, *record.indirect);
+            argumentBuffer = runtimeArguments->commands->Handle();
+            rewritten = true;
         } else if (gpuIndirect) {
             rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
-        } else if (args != nullptr && args->runtimeSgprs) {
-            runtimeArguments = runtimeFallbackArguments(context, commands, draw, *record.indirect);
-            argumentBuffer = runtimeArguments->Handle();
-            countBarrier(1);
         }
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
@@ -1868,7 +1969,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), runtimeArguments != nullptr ? runtimeArguments->table->DeviceAddress() : 0, args != nullptr && !args->argumentAddresses.empty() ? sizeof(ShaderRecompiler::IndirectSgprArgument) : 0u);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     else {
@@ -2202,7 +2303,15 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         Require(rangeBytes <= std::numeric_limits<std::size_t>::max(), "indirect draw record range overflow");
         if (!gpuIndirectDraws) indirect.path = IndirectDrawPath::Disabled;
-        else indirect.path = decide(args->arguments, static_cast<std::size_t>(rangeBytes), indirect.argumentImport);
+        else if (args->argumentAddresses.empty()) indirect.path = decide(args->arguments, static_cast<std::size_t>(rangeBytes), indirect.argumentImport);
+        else {
+            for (const auto address : args->argumentAddresses) {
+                const HostImport* imported = nullptr;
+                const auto path = decide(address, args->recordBytes, imported);
+                if (path != IndirectDrawPath::Gpu) indirect.path = path;
+                indirect.argumentImports.push_back(imported);
+            }
+        }
         if (indirect.path == IndirectDrawPath::Gpu && args->countIndirect) {
             Require(context.drawIndirectCount, "indirect draw count without VK_KHR_draw_indirect_count must be resolved by the driver");
             indirect.path = decide(args->countAddress, 4, indirect.countImport);
@@ -2394,7 +2503,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto bytes = static_cast<std::size_t>(end - begin);
         if (resources->WritesOverlap(begin, bytes) || resources->ReadsOverlap(begin, bytes)) return true;
         if (!gpuIndirect) return false;
-        return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
+        return args->ArgumentsOverlap(begin, end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
     };
     if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
@@ -2410,7 +2519,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         auto reads = resources->InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
         if (gpuIndirect) {
-            reads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
+            args->ArgumentRanges([&](auto address, auto bytes) { reads.emplace_back(address, address + bytes); });
             if (args->countIndirect) reads.emplace_back(args->countAddress, args->countAddress + 4);
         }
         auto images = resources->StorageImages();
@@ -2433,19 +2542,19 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         countBarrier();
     }
     APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
-    std::shared_ptr<Buffer> runtimeArguments;
+    std::shared_ptr<RuntimeIndirectArguments> runtimeArguments;
     std::shared_ptr<Buffer> meshArguments;
     if (state.stages.mesh && args != nullptr) {
         meshArguments = recordMeshArguments(context, commands, recorder, recorded, state, draw, indirect, countBarrier, inputs.restartTable);
         argumentBuffer = meshArguments->Handle();
     } else if (!inputs.restartTable.empty()) {
         meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    } else if (args != nullptr && args->runtimeSgprs) {
+        runtimeArguments = runtimeIndirectArguments(context, commands, recorder, recorded, draw, indirect);
+        argumentBuffer = runtimeArguments->commands->Handle();
+        rewritten = true;
     } else if (gpuIndirect) {
         rewritten = recordIndirectArguments(context, commands, recorder, recorded, indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
-    } else if (args != nullptr && args->runtimeSgprs) {
-        runtimeArguments = runtimeFallbackArguments(context, commands, draw, indirect);
-        argumentBuffer = runtimeArguments->Handle();
-        countBarrier(1);
     }
     for (auto& binding : targets) {
         if (binding.proxied) {
@@ -2478,7 +2587,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), runtimeArguments != nullptr ? runtimeArguments->table->DeviceAddress() : 0, args != nullptr && !args->argumentAddresses.empty() ? sizeof(ShaderRecompiler::IndirectSgprArgument) : 0u);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     if (stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
     else {
