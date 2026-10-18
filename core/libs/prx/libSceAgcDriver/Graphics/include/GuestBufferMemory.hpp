@@ -250,6 +250,10 @@ struct VramWritableStats {
     std::uint64_t basePages = 0;
     std::uint64_t pendingPages = 0;
     std::uint64_t faults = 0;
+    std::uint64_t writerWaits = 0;
+    std::uint64_t writerWaitUs = 0;
+    std::uint64_t seals = 0;
+    std::uint64_t protectedBytes = 0;
 };
 VramWritableStats VramWritableCounters();
 bool HasVramMirrorWriters();

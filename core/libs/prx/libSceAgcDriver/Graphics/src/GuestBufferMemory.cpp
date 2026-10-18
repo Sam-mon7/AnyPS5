@@ -1368,10 +1368,14 @@ void countWritable(const VramWritableStats& added) {
     total.writeBackUs += added.writeBackUs;
     total.basePages += added.basePages;
     total.faults += added.faults;
+    total.writerWaits += added.writerWaits;
+    total.writerWaitUs += added.writerWaitUs;
+    total.seals += added.seals;
+    total.protectedBytes += added.protectedBytes;
     const auto now = std::chrono::steady_clock::now();
     if (now - state.lastReport < std::chrono::seconds(10)) return;
     state.lastReport = now;
-    AgcDriver::ProfilePrint_nid_no_patch("[vram-writable] pages %llu, merged %llu, overflow %llu, readback %llu bytes, publication %.3f ms, base pages %llu, pending %llu, faults %llu\n", static_cast<unsigned long long>(total.pagesWritten), static_cast<unsigned long long>(total.pagesMerged), static_cast<unsigned long long>(total.overflowFallbacks), static_cast<unsigned long long>(total.readbackBytes), total.writeBackUs / 1000.0, static_cast<unsigned long long>(total.basePages), static_cast<unsigned long long>(total.pendingPages), static_cast<unsigned long long>(total.faults));
+    AgcDriver::ProfilePrint_nid_no_patch("[vram-writable] pages %llu, merged %llu, overflow %llu, readback %llu bytes, publication %.3f ms, base pages %llu, pending %llu, faults %llu; writer waits %llu (%.3f ms), seals %llu protecting %.1f MiB (%.2f MiB per seal)\n", static_cast<unsigned long long>(total.pagesWritten), static_cast<unsigned long long>(total.pagesMerged), static_cast<unsigned long long>(total.overflowFallbacks), static_cast<unsigned long long>(total.readbackBytes), total.writeBackUs / 1000.0, static_cast<unsigned long long>(total.basePages), static_cast<unsigned long long>(total.pendingPages), static_cast<unsigned long long>(total.faults), static_cast<unsigned long long>(total.writerWaits), total.writerWaitUs / 1000.0, static_cast<unsigned long long>(total.seals), total.protectedBytes / 1048576.0, total.seals != 0 ? total.protectedBytes / 1048576.0 / static_cast<double>(total.seals) : 0.0);
 }
 
 bool intervalCovers(const MirrorWriteInterval& interval, std::uint64_t page) {
@@ -1482,9 +1486,11 @@ void finishMirrorWriter(ImageMirror& mirror, std::uint64_t begin, std::uint64_t 
         Require(!Recorder::InCompletion(), "a writable mirror writer cannot be waited during completion");
         auto* recorder = interval->recorder;
         Require(recorder != nullptr && interval->serial != 0, "a writable mirror writer has no recorded completion");
+        const auto waited = std::chrono::steady_clock::now();
         if (interval->serial > recorder->Submissions()) recorder->Submit();
         recorder->FinishUpTo(interval->serial);
         Require(interval->complete, "a writable mirror writer has no completion action");
+        countWritable({.writerWaits = 1, .writerWaitUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waited).count())});
     }
     publishMirrorPages(mirror, interval, begin, end);
     if (interval->written.empty()) {
@@ -1496,12 +1502,17 @@ void finishMirrorWriter(ImageMirror& mirror, std::uint64_t begin, std::uint64_t 
 void sealMirrorWriter(MirrorWriteInterval& interval) {
     if (interval.sealed || interval.complete) return;
     Require(interval.recorded && interval.ready, "a VRAM mirror writer was submitted before its completion was registered");
+    std::uint64_t protectedBytes = 0;
 #ifdef _WIN32
-    for (const auto& [begin, end] : interval.watched) Require(GuestArena::GuestArenaProtectGpuAccess_nid_no_patch(begin, static_cast<std::size_t>(end - begin)), "a VRAM mirror writer could not protect every guest alias before execution");
+    for (const auto& [begin, end] : interval.watched) {
+        Require(GuestArena::GuestArenaProtectGpuAccess_nid_no_patch(begin, static_cast<std::size_t>(end - begin)), "a VRAM mirror writer could not protect every guest alias before execution");
+        protectedBytes += end - begin;
+    }
 #else
     Require(false, "writable mirrors require Windows guest page tracking");
 #endif
     interval.sealed = true;
+    countWritable({.seals = 1, .protectedBytes = protectedBytes});
 }
 
 bool registeredGpuAliases(VkDevice device, std::uint64_t address, std::size_t bytes) {
