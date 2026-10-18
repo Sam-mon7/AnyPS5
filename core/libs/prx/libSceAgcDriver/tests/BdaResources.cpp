@@ -944,6 +944,11 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
     const auto made = MirrorCounters();
     Require(made.heapMirrors == before.heapMirrors + 1 && made.heapBytes == before.heapBytes + bytes, "a read-only heap range was not mirrored");
     Require(access.addressBytes(first)[65536 + 3] == std::byte{0x11}, "the heap mirror was not filled");
+    if (AddressSpaceCounters().enabled) {
+        const auto surfaces = AddressMirrorSurfaces(context);
+        const bool listed = std::any_of(surfaces.begin(), surfaces.end(), [&](const auto& surface) { return surface.first == address && surface.second == bytes; });
+        Require(listed == (std::getenv("APS5_ADDRESS_PRESYNC") != nullptr), "the address pre-sync surfaces do not follow APS5_ADDRESS_PRESYNC for a heap mirror");
+    }
     Require(build(0, {}) == first && MirrorCounters().blocksCopied == made.blocksCopied && MirrorCounters().heapRefills == made.heapRefills, "an unchanged heap range was read into its mirror again");
     guest[65536 + 3] = 0x22;
     Require(build(0, {}) == first && MirrorCounters().heapRefills == made.heapRefills + 1 && MirrorCounters().blocksCopied == made.blocksCopied + 1, "a written heap block was not read again alone");

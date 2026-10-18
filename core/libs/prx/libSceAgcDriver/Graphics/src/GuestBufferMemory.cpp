@@ -4091,6 +4091,18 @@ bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t
     return state.device == context.device && findImport(state, address, address + bytes) != nullptr;
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> AddressMirrorSurfaces(const Context& context) {
+    static const bool enabled = std::getenv("APS5_ADDRESS_PRESYNC") != nullptr;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> surfaces;
+    if (!enabled || !addressSpaceCacheEnabled()) return surfaces;
+    const auto space = Spaces().current.load();
+    if (space == nullptr || space->device != context.device) return surfaces;
+    for (const auto& region : space->base) {
+        if (region.mirror != nullptr && (region.mirror->heap || region.mirror->writable)) surfaces.emplace_back(region.begin, region.end - region.begin);
+    }
+    return surfaces;
+}
+
 GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) {
     ValidateVramOptions();
 #ifdef _WIN32

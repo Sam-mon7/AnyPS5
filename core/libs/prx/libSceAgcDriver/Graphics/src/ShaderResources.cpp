@@ -4658,6 +4658,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
         return surfaces;
     }
     // Stage A has not run (an address-based build, or the pass is off): decoded from the shader.
+    if (lockedBuild) surfaces = AddressMirrorSurfaces(context);
     if (deferredCompute.program == nullptr) return surfaces;
     forEachImageElement(*deferredCompute.program, [&](const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t, std::span<const std::uint32_t> words) {
         if (IsNullTextureResource(words)) return;
