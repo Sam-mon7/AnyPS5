@@ -14,6 +14,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -329,9 +330,8 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         }
         return prepared;
     };
-    const auto dispatch = [&](bool written, const std::function<void()>& beforeWriteBack = {}, std::shared_ptr<PreparedHeapRefresh> prepared = {}) {
+    const auto recordDispatch = [&](bool written, const std::function<void()>& beforeWriteBack, const std::shared_ptr<PreparedHeapRefresh>& prepared) {
         Memory::BumpCollectEpoch();
-        if (prepared == nullptr) prepared = prepare();
         auto memory = std::make_shared<GuestBufferMemory>(context);
         memory->SetAddressWrites(written);
         {
@@ -376,6 +376,10 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         } else recorder.OnComplete([memory] { memory->WriteBack(); });
         return output;
     };
+    const auto dispatch = [&](bool written, const std::function<void()>& beforeWriteBack = {}, std::shared_ptr<PreparedHeapRefresh> prepared = {}) {
+        if (prepared == nullptr) prepared = prepare();
+        return recordDispatch(written, beforeWriteBack, prepared);
+    };
     if (gpu != nullptr && ResidentHeapMirrors()) Require(prepare() == nullptr, "resident heap mirrors admitted dispatch staging");
     if (gpu != nullptr && !sparse && !ResidentHeapMirrors()) {
         const auto enabled = DispatchLockDietEnabled();
@@ -398,6 +402,13 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
             checkRead(dispatch(false, {}, prepared), expected);
             Require(DispatchHeapRefreshCounters().fallback == before.fallback + (enabled ? 1 : 0), "a stale dispatch heap plan did not fall back exactly once");
         };
+        const auto wait = [](const auto& ready) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!ready()) {
+                Require(std::chrono::steady_clock::now() < deadline, "dispatch heap fixture timed out");
+                std::this_thread::yield();
+            }
+        };
         words[0] = 0x10203040u;
         auto prepared = capture();
         const auto beforeApply = DispatchHeapRefreshCounters();
@@ -412,6 +423,123 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         auto second = capture();
         checkRead(dispatch(false, {}, prepared), words[0]);
         checkFallback(second, words[0]);
+        prepared.reset();
+        second.reset();
+        words[0] = 0x41516171u;
+        prepared = CaptureDispatchHeapRefresh(context, [](std::uint64_t, std::size_t) { return false; });
+        bool mutated = false;
+        gpu->unlock();
+        try {
+            if (prepared != nullptr) StageDispatchHeapRefresh(*prepared, [&](std::uint64_t begin, std::size_t bytes) {
+                Require(begin <= address && address < begin + bytes, "during-copy fixture staged the wrong block");
+                words[0] = 0x42526272u;
+                mutated = true;
+            });
+            else words[0] = 0x42526272u;
+        } catch (...) { gpu->lock(); throw; }
+        gpu->lock();
+        Require(mutated == enabled, "during-copy mutation hook did not follow the switch");
+        checkFallback(prepared, words[0]);
+        prepared.reset();
+        words[0] = 0x43536373u;
+        prepared = CaptureDispatchHeapRefresh(context, [](std::uint64_t, std::size_t) { return false; });
+        std::atomic<bool> copying{false}, refreshed{false};
+        std::exception_ptr queueError, stageError;
+        gpu->unlock();
+        {
+            std::jthread queue([&] {
+                try {
+                    Memory::TagGpuLockThread(1);
+                    wait([&] { return copying.load(std::memory_order_acquire); });
+                    auto other = PrepareDispatchHeapRefresh(context, [](std::uint64_t, std::size_t) { return false; }, {});
+                    std::lock_guard lock(Memory::GpuMutex());
+                    const auto output = recordDispatch(false, {}, other);
+                    recorder.Sync();
+                    std::uint32_t actual = 0;
+                    std::memcpy(&actual, output->Bytes().data(), sizeof(actual));
+                    Require(actual == 0x43536373u, "the competing queue consumed stale heap bytes");
+                } catch (...) { queueError = std::current_exception(); }
+                refreshed.store(true, std::memory_order_release);
+            });
+            try {
+                if (prepared != nullptr) StageDispatchHeapRefresh(*prepared, [&](std::uint64_t, std::size_t) {
+                    copying.store(true, std::memory_order_release);
+                    wait([&] { return refreshed.load(std::memory_order_acquire); });
+                });
+                else copying.store(true, std::memory_order_release);
+                wait([&] { return refreshed.load(std::memory_order_acquire); });
+            } catch (...) { copying.store(true, std::memory_order_release); stageError = std::current_exception(); }
+        }
+        gpu->lock();
+        if (stageError) std::rethrow_exception(stageError);
+        if (queueError) std::rethrow_exception(queueError);
+        checkFallback(prepared, words[0]);
+        prepared.reset();
+        const auto pending = [&](std::uint64_t begin, std::size_t bytes) {
+            return recorder.PendingWriteOverlaps(begin, bytes) || recorder.PendingLabelIn(begin, bytes);
+        };
+        const auto synchronize = [&](std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+            Require(!Memory::GpuMutex().HeldByThisThread() && !ranges.empty(), "heap pre-sync held the GPU mutex");
+            if (!recorder.HasTimeline()) return false;
+            std::uint64_t serial = 0;
+            {
+                std::lock_guard lock(Memory::GpuMutex());
+                for (const auto& [begin, bytes] : ranges) {
+                    const auto info = recorder.DescribePendingWrite(begin, bytes);
+                    if (info) serial = std::max(serial, info->serial);
+                }
+                if (serial != 0) recorder.Submit();
+            }
+            if (serial == 0) return false;
+            recorder.WaitSerial(serial);
+            std::lock_guard lock(Memory::GpuMutex());
+            recorder.FinishUpTo(serial);
+            return true;
+        };
+        recordDispatch(true, {}, {});
+        const auto beforePresync = DispatchHeapRefreshCounters();
+        gpu->unlock();
+        try { prepared = PrepareDispatchHeapRefresh(context, pending, synchronize); }
+        catch (...) { gpu->lock(); throw; }
+        gpu->lock();
+        const bool presynced = enabled && recorder.HasTimeline();
+        Require((prepared != nullptr) == presynced, "pending-writer heap staging admission differs");
+        Require(DispatchHeapRefreshCounters().presyncs == beforePresync.presyncs + (presynced ? 1 : 0), "pending heap writer did not pre-sync exactly once");
+        checkRead(dispatch(false, {}, prepared), values[0]);
+        prepared.reset();
+        recordDispatch(true, {}, {});
+        const auto beforeRestart = DispatchHeapRefreshCounters();
+        unsigned rounds = 0;
+        const std::uint32_t restarted = 0x456789abu;
+        gpu->unlock();
+        try {
+            prepared = PrepareDispatchHeapRefresh(context, pending, [&](auto ranges) {
+                if (!synchronize(ranges)) return false;
+                if (++rounds == 1) {
+                    std::lock_guard lock(Memory::GpuMutex());
+                    static_cast<void>(recorder.Commands());
+                    recorder.AfterCompletions(address, std::as_bytes(std::span(&restarted, 1)), 992, 1, false);
+                }
+                return true;
+            });
+        } catch (...) { gpu->lock(); throw; }
+        gpu->lock();
+        Require(rounds == (presynced ? 2u : 0u), "a writer arriving during pre-sync did not restart heap capture");
+        Require(DispatchHeapRefreshCounters().presyncs == beforeRestart.presyncs + rounds, "restarted heap pre-sync rounds were not counted");
+        checkRead(dispatch(false, {}, prepared), presynced ? restarted : values[0]);
+        prepared.reset();
+        const auto beforeRetries = DispatchHeapRefreshCounters();
+        unsigned retries = 0;
+        gpu->unlock();
+        try {
+            prepared = PrepareDispatchHeapRefresh(context, [](std::uint64_t, std::size_t) { return true; }, [&](auto) {
+                ++retries;
+                return true;
+            });
+        } catch (...) { gpu->lock(); throw; }
+        gpu->lock();
+        Require(prepared == nullptr && retries == (enabled ? 2u : 0u), "new heap writers did not take the bounded fallback");
+        Require(DispatchHeapRefreshCounters().presyncFallbacks == beforeRetries.presyncFallbacks + (enabled ? 1 : 0), "bounded heap pre-sync fallback was not counted");
         prepared = capture();
         dispatch(true);
         checkFallback(prepared, values[0]);
@@ -434,10 +562,70 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         checkFallback(prepared, label);
         prepared.reset();
         second.reset();
+        for (const bool remap : {false, true}) {
+            checkRead(dispatch(false), label);
+            prepared = capture();
+            recorder.FlushDeferredReleases();
+            std::atomic<bool> applied{false}, finished{false};
+            std::exception_ptr mutationError, waitError;
+            gpu->unlock();
+            {
+                std::jthread mutation([&] {
+                    try {
+                        if (remap) {
+                            {
+                                GuestAllocations::Mutation change;
+                                change.Unmap(raw, 2 * block, [&](const void*, std::size_t, const void*, bool) {
+                                    GuestArena::GuestArenaReset_nid_postfix(raw, 2 * block);
+                                    applied.store(true, std::memory_order_release);
+                                });
+                            }
+                            GuestArena::GuestArenaCommit_nid_postfix(raw, 2 * block, PAGE_READWRITE, block);
+                            words[0] = label;
+                            GuestAllocations::Mutation().Add(raw, 2 * block, true, true, true);
+                        } else {
+                            GuestAllocations::Mutation().Protect(raw, 2 * block, true, false, true, [&] {
+                                DWORD previous = 0;
+                                Require(VirtualProtect(raw, 2 * block, PAGE_READONLY, &previous) != 0, "cannot protect the staged heap");
+                                applied.store(true, std::memory_order_release);
+                            });
+                        }
+                    } catch (...) { mutationError = std::current_exception(); }
+                    finished.store(true, std::memory_order_release);
+                });
+                try {
+                    if (enabled) {
+                        wait([&] {
+                            const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+                            return std::none_of(lease.begin(), lease.end(), [&](const auto& range) { return range->address == address; });
+                        });
+                        Require(!applied.load(std::memory_order_acquire), "mapping mutation passed a staged heap lease");
+                    }
+                    gpu->lock();
+                    prepared.reset();
+                    gpu->unlock();
+                    wait([&] { return finished.load(std::memory_order_acquire); });
+                } catch (...) {
+                    waitError = std::current_exception();
+                    std::lock_guard lock(Memory::GpuMutex());
+                    prepared.reset();
+                }
+            }
+            gpu->lock();
+            if (waitError) std::rethrow_exception(waitError);
+            if (mutationError) std::rethrow_exception(mutationError);
+            Require(applied.load(std::memory_order_acquire), "mapping mutation never applied");
+            if (!remap) GuestAllocations::Mutation().Protect(raw, 2 * block, true, true, true, [&] {
+                DWORD previous = 0;
+                Require(VirtualProtect(raw, 2 * block, PAGE_READWRITE, &previous) != 0, "cannot restore the staged heap protection");
+            });
+            checkRead(dispatch(false), label);
+        }
         const auto after = DispatchHeapRefreshCounters();
         Require(enabled ? after.stagedBytes > initial.stagedBytes :
             after.captured == initial.captured && after.unavailable == initial.unavailable && after.stagedBytes == initial.stagedBytes &&
-            after.stageUs == initial.stageUs && after.applied == initial.applied && after.fallback == initial.fallback,
+            after.stageUs == initial.stageUs && after.applied == initial.applied && after.fallback == initial.fallback &&
+            after.presyncs == initial.presyncs && after.presyncFallbacks == initial.presyncFallbacks,
             "dispatch heap staging counters did not follow the switch");
         std::memset(raw, 0x11, block);
     }

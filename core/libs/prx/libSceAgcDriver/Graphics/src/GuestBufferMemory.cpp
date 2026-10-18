@@ -189,7 +189,7 @@ namespace {
 thread_local PreparedHeapRefresh* dispatchHeapRefresh = nullptr;
 
 struct HeapRefreshCounters {
-    std::atomic<std::uint64_t> captured{0}, unavailable{0}, stagedBytes{0}, stageUs{0}, applied{0}, fallback{0};
+    std::atomic<std::uint64_t> captured{0}, unavailable{0}, stagedBytes{0}, stageUs{0}, applied{0}, fallback{0}, presyncs{0}, presyncFallbacks{0};
 };
 
 HeapRefreshCounters& HeapRefreshes() {
@@ -4257,9 +4257,10 @@ bool DispatchLockDietEnabled() {
     return enabled;
 }
 
-std::shared_ptr<PreparedHeapRefresh> CaptureDispatchHeapRefresh(const Context& context, std::function<bool(std::uint64_t, std::size_t)> pending) {
+std::shared_ptr<PreparedHeapRefresh> CaptureDispatchHeapRefresh(const Context& context, std::function<bool(std::uint64_t, std::size_t)> pending, DispatchHeapRanges* writers) {
     if (!DispatchLockDietEnabled()) return nullptr;
     Require(GuestMemory::GpuMutex().HeldByThisThread(), "dispatch heap capture requires the GPU mutex");
+    if (writers != nullptr) writers->clear();
     const auto unavailable = [] {
         HeapRefreshes().unavailable.fetch_add(1, std::memory_order_relaxed);
         return std::shared_ptr<PreparedHeapRefresh>{};
@@ -4274,7 +4275,6 @@ std::shared_ptr<PreparedHeapRefresh> CaptureDispatchHeapRefresh(const Context& c
         std::lock_guard lock(imports.mutex);
         if (imports.epoch != space->importsEpoch) return unavailable();
     }
-    for (const auto& run : space->heapRuns) if (pending(run.begin, static_cast<std::size_t>(run.bytes))) return unavailable();
     auto prepared = std::make_shared<PreparedHeapRefresh>();
     prepared->space = std::move(space);
     prepared->pending = std::move(pending);
@@ -4287,11 +4287,41 @@ std::shared_ptr<PreparedHeapRefresh> CaptureDispatchHeapRefresh(const Context& c
             mirror->writer != nullptr || mirror->lazyAddressWriter != nullptr || !mirror->pendingWrites.empty()) return unavailable();
         prepared->mirrors.push_back({mirror, mirror->generations, mirror->gpuRevision});
     }
+    bool blocked = false;
+    for (const auto& run : prepared->space->heapRuns) {
+        if (!prepared->pending(run.begin, static_cast<std::size_t>(run.bytes))) continue;
+        blocked = true;
+        if (writers != nullptr) writers->emplace_back(run.begin, run.bytes);
+    }
+    if (blocked) return unavailable();
     HeapRefreshes().captured.fetch_add(1, std::memory_order_relaxed);
     return prepared;
 }
 
-void StageDispatchHeapRefresh(PreparedHeapRefresh& prepared) {
+std::shared_ptr<PreparedHeapRefresh> PrepareDispatchHeapRefresh(const Context& context, std::function<bool(std::uint64_t, std::size_t)> pending, const std::function<bool(std::span<const std::pair<std::uint64_t, std::uint64_t>>)>& synchronize) {
+    if (!DispatchLockDietEnabled()) return nullptr;
+    Require(!GuestMemory::GpuMutex().HeldByThisThread(), "dispatch heap preparation requires an unlocked GPU mutex");
+    for (unsigned attempt = 0; ; ++attempt) {
+        DispatchHeapRanges writers;
+        std::shared_ptr<PreparedHeapRefresh> prepared;
+        {
+            std::lock_guard gpu(GuestMemory::GpuMutex());
+            prepared = CaptureDispatchHeapRefresh(context, pending, &writers);
+        }
+        if (prepared != nullptr) {
+            StageDispatchHeapRefresh(*prepared);
+            return prepared;
+        }
+        if (writers.empty()) return nullptr;
+        if (attempt == 2 || !synchronize || !synchronize(writers)) {
+            HeapRefreshes().presyncFallbacks.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        HeapRefreshes().presyncs.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void StageDispatchHeapRefresh(PreparedHeapRefresh& prepared, const std::function<void(std::uint64_t, std::size_t)>& duringCopy) {
     Require(!GuestMemory::GpuMutex().HeldByThisThread(), "dispatch heap staging requires an unlocked GPU mutex");
     const auto started = std::chrono::steady_clock::now();
     const auto finish = [&] {
@@ -4322,7 +4352,12 @@ void StageDispatchHeapRefresh(PreparedHeapRefresh& prepared) {
                     const auto bytes = static_cast<std::size_t>(end - begin);
                     if (bytes > maxBytes - stagedBytes) return false;
                     PreparedHeapRefresh::Block block{saved.mirror, begin, generation, std::vector<std::byte>(bytes)};
-                    if (GuestMemory::CopyMapped(begin, block.bytes) != GuestMemory::Compare::Equal) return false;
+                    if (duringCopy) {
+                        const auto split = bytes / 2;
+                        if (GuestMemory::CopyMapped(begin, std::span(block.bytes).first(split)) != GuestMemory::Compare::Equal) return false;
+                        duringCopy(begin, bytes);
+                        if (GuestMemory::CopyMapped(begin + split, std::span(block.bytes).subspan(split)) != GuestMemory::Compare::Equal) return false;
+                    } else if (GuestMemory::CopyMapped(begin, block.bytes) != GuestMemory::Compare::Equal) return false;
                     stagedBytes += bytes;
                     prepared.blocks.push_back(std::move(block));
                 }
@@ -4359,7 +4394,8 @@ DispatchHeapRefreshStats DispatchHeapRefreshCounters() {
     const auto& counters = HeapRefreshes();
     return {counters.captured.load(std::memory_order_relaxed), counters.unavailable.load(std::memory_order_relaxed),
         counters.stagedBytes.load(std::memory_order_relaxed), counters.stageUs.load(std::memory_order_relaxed),
-        counters.applied.load(std::memory_order_relaxed), counters.fallback.load(std::memory_order_relaxed)};
+        counters.applied.load(std::memory_order_relaxed), counters.fallback.load(std::memory_order_relaxed),
+        counters.presyncs.load(std::memory_order_relaxed), counters.presyncFallbacks.load(std::memory_order_relaxed)};
 }
 
 void GuestBufferMemory::AcquireRegistered() {
