@@ -780,7 +780,8 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     context.memoryProperties2(context.physical, &properties);
     const auto sampled = SampledTextureMemory();
     const auto storage = storageCacheBytes();
-    const auto budget = SampledTextureBudget(context.memory, &reported, sampled, storage, sampled > cache.bytes ? sampled - cache.bytes : 0u);
+    const auto slack = ImageSuballocation() ? ImageBlockSlack(context) : std::uint64_t{0};
+    const auto budget = SampledTextureBudget(context.memory, &reported, sampled + slack, storage, sampled > cache.bytes ? sampled - cache.bytes : 0u);
     const bool fresh = cache.budgetDevice != context.physical;
     if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(cache.reportedBudget, budget, now - cache.reportedAt))) {
         char was[48] = "";

@@ -2,10 +2,13 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BUFFERPOOL_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -99,6 +102,12 @@ public:
     std::size_t SlabBlocks();
     BufferPoolStats Stats();
     VramBudget& Vram() { return vram; }
+    static ImageBlockPolicy ImagePolicyFromEnvironment();
+    void SetImagePolicy(const ImageBlockPolicy& policy);
+    ImageMemoryBinding BindOptimalImage(const Context& context, const std::shared_ptr<BufferPool>& self, VkImage image, const VkMemoryRequirements& requirements, const char* what, VkDeviceMemory& dedicated, ImageRange& range);
+    void PutImageRange(VkDeviceMemory block, VkDeviceSize offset, VkDeviceSize size) noexcept;
+    ImageBlockStats ImageStats();
+    VkDeviceSize ImageSlack() const;
 
 private:
     struct SlabBlock {
@@ -116,6 +125,22 @@ private:
     };
     static std::uint64_t SlabKey(std::uint32_t memoryType, std::size_t capacity, bool addressable);
     void freeBlock(SlabBlock& block) noexcept;
+    struct ImageBlock {
+        ImageBlock(VkDeviceMemory memory, std::uint32_t type, VkDeviceSize bytes) : memory(memory), type(type), ranges(bytes) {}
+        VkDeviceMemory memory;
+        std::uint32_t type;
+        RangeAllocator ranges;
+    };
+    struct ImageGrant {
+        VkDeviceMemory memory;
+        VkDeviceSize offset;
+    };
+    std::optional<ImageGrant> takeImageRange(const Context& context, std::uint32_t type, const VkMemoryRequirements& requirements);
+    std::optional<ImageGrant> grantFromImageBlocks(std::uint32_t type, const VkMemoryRequirements& requirements);
+    std::size_t emptyImageBlocks(std::uint32_t type) const;
+    bool deviceHeapHasRoom(const Context& context, std::uint32_t type, VkDeviceSize bytes) const;
+    VkDeviceSize releaseEmptyImageBlocks() noexcept;
+    void reportImageBlocks();
     struct Slot {
         BufferAllocation allocation;
         std::uint64_t lastUse;
@@ -188,6 +213,16 @@ private:
     std::mutex slabMutex;
     std::unordered_map<std::uint64_t, Slab> slabs;
     std::unordered_map<VkDeviceMemory, std::unique_ptr<SlabBlock>> slabBlocks;
+    std::mutex imageMutex;
+    std::unordered_map<VkDeviceMemory, std::unique_ptr<ImageBlock>> imageBlocks;
+    std::map<std::uint32_t, std::vector<ImageBlock*>> imageTypes;
+    ImageBlockPolicy imagePolicy;
+    ImageBlockStats imageTotals;
+    ImageBlockStats imageReported;
+    std::chrono::steady_clock::time_point imageReportedAt = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point imageRetryAt{};
+    std::atomic<VkDeviceSize> imageReserved{0};
+    std::atomic<VkDeviceSize> imageUsed{0};
     VramBudget vram;
     std::uint64_t vramDropped = 0;
     VkDeviceSize vramDroppedBytes = 0;
