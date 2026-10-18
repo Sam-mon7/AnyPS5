@@ -315,10 +315,15 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
-        allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "texture");
-        setupPhase(2);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
-        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+        if (ImageSuballocation()) {
+            setupPhase(2);
+            allocation.memoryTypeIndex = BindOptimalImageMemory(context, image, requirements, "texture", owned->memory, owned->range).memoryType;
+        } else {
+            allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "texture");
+            setupPhase(2);
+            Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
+            Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+        }
         setupPhase(3);
 
         {
@@ -1035,9 +1040,13 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         memoryBytes = requirements.size;
-        allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "storage texture");
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
-        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
+        if (ImageSuballocation()) {
+            BindOptimalImageMemory(context, image, requirements, "storage texture", memory, memoryRange);
+        } else {
+            allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "storage texture");
+            Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
+            Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
+        }
     } catch (...) {
         release();
         throw;
@@ -4651,6 +4660,7 @@ void StorageTexture::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    memoryRange.Release();
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

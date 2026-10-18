@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -55,6 +56,7 @@ struct OwnedImage {
     Context context;
     VkImage image;
     VkDeviceMemory memory;
+    ImageRange range;
 };
 
 class Texture {
@@ -540,6 +542,7 @@ private:
     bool lent = false;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    ImageRange memoryRange;
     VkDeviceSize memoryBytes = 0;
     VkImageView view = VK_NULL_HANDLE;
     std::uint32_t defaultMip = 0;
