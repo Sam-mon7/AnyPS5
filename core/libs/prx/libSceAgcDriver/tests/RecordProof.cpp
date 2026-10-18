@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordProof.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/PreparationProof.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include <barrier>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -91,6 +93,182 @@ void coverage() {
     require(check(tracker, RecordProof::Capture(tracker, invalid, Forget).get(), invalid) != RecordProofResult::Accepted, "invalid range accepted");
 }
 
+void pinnedProofs(bool enabled) {
+    using namespace Lanes;
+    Tracker tracker;
+    const Runs runs{{Base, Base + 4}};
+    tracker.RegisterRange({Base, PageBytes}, Kind::Section, Bit(Reason::Immutable));
+    auto resource = std::make_shared<const std::uint64_t>(37);
+    std::weak_ptr<const std::uint64_t> retired = resource;
+    auto contents = RecordProof::Capture(tracker, runs, Forget);
+    auto pin = RecordProof::Pin(tracker, contents, runs, Forget, resource, 7);
+    if (!enabled) {
+        require(pin == nullptr, "disabled lane proof pinned a cache object");
+        WorkerPool pool(1);
+        bool prepared = false, committed = false;
+        auto work = pool.Enqueue(WithProofs({0, 1, [&](std::size_t) -> Commit { prepared = true; return {}; }}, tracker, {}, [] { return Forget; }, [&] { committed = true; }));
+        work.get();
+        require(!prepared && committed, "disabled proof preparation did not resolve serially");
+        return;
+    }
+    require(pin != nullptr && pin->Generation() == 7 && pin->WriterChunk() == 0 && pin->Resource().get() == resource.get(), "parse-time resource version was not pinned");
+    require(pin->Runs().size() == 1 && pin->Runs()[0] == runs[0], "pin did not own its range snapshot");
+    resource.reset();
+    require(!retired.expired() && pin->Check(tracker, Forget) == RecordProofResult::Accepted, "cache eviction retired a pinned resource version");
+    require(pin->Check(tracker, Forget + 2) == RecordProofResult::Forget, "pin survived a mapping forget");
+    Tracker foreign;
+    foreign.RegisterRange({Base, PageBytes}, Kind::Section, Bit(Reason::Immutable));
+    require(pin->Check(foreign, Forget) == RecordProofResult::Coverage, "pin crossed tracker identity");
+    require(RecordProof::Pin(tracker, contents, runs, Forget, pin->Resource(), 8, 4) == nullptr, "pending writer chunk was admitted without a dependency");
+    require(RecordProof::Pin(tracker, contents, runs, Forget, pin->Resource(), 0) == nullptr, "unversioned cache object was admitted");
+    require(RecordProof::Pin(tracker, contents, runs, Forget, {}, 8) == nullptr, "cache object without a lifetime pin was admitted");
+    require(RecordProof::Pin(tracker, nullptr, runs, Forget, pin->Resource(), 8) == nullptr, "cache object without a content proof was admitted");
+    require(RecordProof::Pin(tracker, contents, {}, Forget, pin->Resource(), 8) == nullptr, "empty dependency list was admitted");
+    tracker.MarkCpuWritten({Base, 4}, Source::DriverStore);
+    require(pin->Check(tracker, Forget) == RecordProofResult::Cpu, "worker ignored a CPU write after parsing");
+    require(RecordProof::Pin(tracker, contents, runs, Forget, pin->Resource(), 8) == nullptr, "fresh parser token validated stale cache bytes");
+    contents = RecordProof::Capture(tracker, runs, Forget);
+    auto next = RecordProof::Pin(tracker, contents, runs, Forget, pin->Resource(), 8);
+    require(next != nullptr && next->Generation() == 8 && pin->Generation() == 7, "cache publication changed an existing pinned generation");
+    tracker.MarkGpuWritten({Base, 4}, Source::GpuDeclaration);
+    require(next->Check(tracker, Forget) == RecordProofResult::Gpu, "worker ignored a GPU declaration after parsing");
+    require(RecordProof::Pin(tracker, RecordProof::Capture(tracker, runs, Forget), runs, Forget, next->Resource(), 9) == nullptr, "pending GPU bytes acquired a clean parser proof");
+    tracker.RegisterRange({Base, PageBytes}, Kind::Section, Bit(Reason::Immutable));
+    contents = RecordProof::Capture(tracker, runs, Forget);
+    auto mapped = RecordProof::Pin(tracker, contents, runs, Forget, next->Resource(), 9);
+    require(mapped != nullptr, "new mapping could not be pinned");
+    tracker.InvalidateRange({Base, PageBytes}, true);
+    tracker.RegisterRange({Base, PageBytes}, Kind::Section, Bit(Reason::Immutable));
+    require(mapped->Check(tracker, Forget) == RecordProofResult::Mapping, "worker accepted a remapped resource");
+    pin.reset();
+    next.reset();
+    mapped.reset();
+    require(retired.expired(), "pinned cache resource leaked after all users retired");
+}
+
+void pinnedPreparation(bool enabled) {
+    if (!enabled) return;
+    using namespace Lanes;
+    Tracker tracker;
+    const Runs runs{{Base, Base + 4}};
+    tracker.RegisterRange({Base, PageBytes}, Kind::Section, Bit(Reason::Immutable));
+    const auto resource = std::make_shared<const std::uint32_t>(41);
+    const auto pin = RecordProof::Pin(tracker, RecordProof::Capture(tracker, runs, Forget), runs, Forget, resource, 1);
+    require(pin != nullptr, "lane fixture did not capture a proof");
+    constexpr std::size_t count = 512;
+    std::array<std::uint32_t, count> parallel{}, serial{};
+    std::barrier firstWave(4);
+    std::vector<std::future<void>> work;
+    {
+        WorkerPool pool(4, count);
+        {
+            std::lock_guard spy(AgcDriver::GuestMemory::GpuMutex());
+            for (std::size_t index = 0; index < count; ++index) {
+                serial[index] = *resource * static_cast<std::uint32_t>(index + 1);
+                work.push_back(pool.Enqueue(WithProofs({0, index, [&, index, pin](std::size_t) -> Commit {
+                    require(!AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "proof worker holds GpuMutex");
+                    if (index < 4) firstWave.arrive_and_wait();
+                    const auto pinned = std::static_pointer_cast<const std::uint32_t>(pin->Resource());
+                    const auto value = *pinned * static_cast<std::uint32_t>(index + 1);
+                    return [&, index, value] { parallel[index] = value; };
+                }}, tracker, {pin}, [] { return Forget; }, [] { throw std::runtime_error("unchanged proof fell back"); })));
+            }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            bool ready = true;
+            for (auto& result : work) ready &= result.wait_until(deadline) == std::future_status::ready;
+            require(ready, "proof preparation acquired GpuMutex while another thread held it");
+        }
+        for (auto& result : work) result.get();
+    }
+    require(parallel == serial, "many parallel pinned preparations differed from serial buffers");
+    {
+        WorkerPool pool(1);
+        bool committed = false;
+        int fallback = 0;
+        auto result = pool.Enqueue(WithProofs({0, 1, [&](std::size_t) -> Commit {
+            tracker.MarkCpuWritten({Base, 4}, Source::DriverStore);
+            return [&] { committed = true; };
+        }}, tracker, {pin}, [] { return Forget; }, [&] { ++fallback; }));
+        result.get();
+        require(!committed && fallback == 1, "proof changed during preparation was published");
+        bool prepared = false;
+        result = pool.Enqueue(WithProofs({0, 2, [&](std::size_t) -> Commit { prepared = true; return {}; }}, tracker, {pin}, [] { return Forget; }, [&] { ++fallback; }));
+        result.get();
+        require(!prepared && fallback == 2, "invalid parser token reached preparation");
+    }
+    {
+        const auto current = RecordProof::Pin(tracker, RecordProof::Capture(tracker, runs, Forget), runs, Forget, resource, 2);
+        WorkerPool pool(2);
+        std::promise<void> release, prepared;
+        auto gate = release.get_future().share();
+        auto ready = prepared.get_future();
+        auto predecessor = pool.Enqueue({0, 1, [gate](std::size_t) -> Commit { return [gate] { gate.wait(); }; }});
+        int checks = 0, fallback = 0;
+        bool committed = false;
+        auto chunk = WithProofs({0, 2, [&](std::size_t) -> Commit { return [&] { committed = true; }; }}, tracker, {current}, [] { return Forget; }, [&] { ++fallback; });
+        const auto validate = std::move(chunk.validate);
+        chunk.validate = [&, validate] {
+            const bool valid = validate();
+            if (++checks == 2) prepared.set_value();
+            return valid;
+        };
+        auto result = pool.Enqueue(std::move(chunk));
+        const auto status = ready.wait_for(std::chrono::seconds(5));
+        tracker.MarkCpuWritten({Base, 4}, Source::DriverStore);
+        release.set_value();
+        predecessor.get();
+        result.get();
+        require(status == std::future_status::ready && checks == 3 && !committed && fallback == 1, "proof changed before ordered publication was committed");
+    }
+}
+
+void pinnedPublication(bool enabled) {
+    if (!enabled) return;
+    struct Version {
+        std::uint64_t generation;
+        std::array<std::uint64_t, 64> words;
+    };
+    Tracker tracker;
+    const Runs runs{{Base, Base + 4}};
+    tracker.RegisterRange({Base, PageBytes}, Kind::Section, Bit(Reason::Immutable));
+    std::atomic<std::shared_ptr<const PinnedRecordProof>> published;
+    std::vector<std::weak_ptr<const Version>> retired;
+    const auto publish = [&](std::uint64_t generation) {
+        auto version = std::make_shared<Version>();
+        version->generation = generation;
+        for (std::size_t i = 0; i < version->words.size(); ++i) version->words[i] = generation * (i + 1);
+        retired.emplace_back(version);
+        const auto contents = RecordProof::Capture(tracker, runs, Forget);
+        auto pin = RecordProof::Pin(tracker, contents, runs, Forget, std::move(version), generation);
+        require(pin != nullptr, "writer could not publish a proved resource version");
+        published.store(std::move(pin), std::memory_order_release);
+    };
+    publish(1);
+    std::barrier start(5);
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> readers;
+    for (std::size_t reader = 0; reader < 4; ++reader) readers.emplace_back([&] {
+        start.arrive_and_wait();
+        for (std::size_t iteration = 0; iteration < 4096; ++iteration) {
+            const auto pin = published.load(std::memory_order_acquire);
+            if (pin == nullptr) { failed.store(true); continue; }
+            const auto version = std::static_pointer_cast<const Version>(pin->Resource());
+            if (pin->Generation() != version->generation) failed.store(true);
+            for (std::size_t i = 0; i < version->words.size(); ++i) if (version->words[i] != pin->Generation() * (i + 1)) failed.store(true);
+            const auto result = pin->Check(tracker, Forget);
+            if (result != RecordProofResult::Accepted && result != RecordProofResult::Cpu) failed.store(true);
+        }
+    });
+    start.arrive_and_wait();
+    for (std::uint64_t generation = 2; generation <= 512; ++generation) {
+        tracker.MarkCpuWritten({Base, 4}, Source::DriverStore);
+        publish(generation);
+    }
+    for (auto& reader : readers) reader.join();
+    published.store(nullptr, std::memory_order_release);
+    require(!failed.load() && std::all_of(retired.begin(), retired.end(), [](const auto& version) { return version.expired(); }), "concurrent version publication mixed or leaked resource generations");
+}
+
 #ifdef _WIN32
 void privateMemory() {
     Initialize();
@@ -107,6 +285,7 @@ void privateMemory() {
     require(tracker->Current(range, &first) && tracker->Counts().pollCalls == before.pollCalls + 1 && tracker->Counts().polledPages == before.polledPages + 1, "private boundary did not make one resetting poll for overlapping pages");
     auto proof = RecordProof::Capture(*tracker, runs, Forget, &first);
     require(check(*tracker, proof.get(), runs, Forget, &first) == RecordProofResult::Accepted, "fresh private proof rejected");
+    require(RecordProof::Pin(*tracker, proof, runs, Forget, std::make_shared<const int>(1), 1) == nullptr, "thread-bound private observation was transferred to a lane");
     require(check(*tracker, nullptr, runs, Forget, &first) == RecordProofResult::Missing, "fresh private cold lookup did not fall back");
     require(check(*tracker, proof.get(), runs) == RecordProofResult::Coverage, "private proof without boundary accepted");
     Observation empty;
@@ -239,6 +418,10 @@ int main() {
         const bool enabled = exact("APS5_EPOCH_PROOFS") && exact("APS5_PAGE_TRACKER");
         require(RecordProof::Enabled() == enabled, "switch semantics changed");
         require(RecordProof::Counts() == RecordProofCounts{}, "counters changed before use");
+        const bool lanes = Lanes::Enabled();
+        pinnedProofs(enabled && lanes);
+        pinnedPreparation(enabled && lanes);
+        pinnedPublication(enabled && lanes);
         if (enabled) {
             epochs();
             coverage();

@@ -262,6 +262,86 @@ filtered. H2 only ran syntax/conventions checks in its isolated worktree. The
 integrator must run the registered Vulkan tests with validation enabled and
 confirm routing on hardware exposing a dedicated compute family.
 
+## W4g proof handoff slice
+
+`RecordProof::Pin` is the first part of remaining step 1. It accepts the
+original content proof of an immutable cache-object generation, its exact
+ranges, the owning shared pointer, and a nonzero generation. At the parser
+boundary it captures an additional token and validates both proofs. A newer
+parse token cannot validate an older object's changed contents. The returned
+`PinnedRecordProof` owns both proofs, the ranges and the object; workers check
+those tokens without reading fields from the live cache object or guest bytes.
+The tracker identity is checked as well as mapping, CPU/GPU epochs and the
+mapping-forget serial.
+
+Admission requires all three exact switches `APS5_GPU_LANES=1`,
+`APS5_EPOCH_PROOFS=1` and `APS5_PAGE_TRACKER=1`. Empty dependencies, missing
+content proofs, missing object pins, generation zero, uncovered/changed ranges
+and pending writer-chunk identities are rejected. Private write-watch proofs
+are also rejected because their observations cannot cross threads; this slice
+does not weaken that tracker contract or turn a metadata epoch into a byte
+snapshot.
+
+`Lanes::WithProofs` attaches a pinned dependency list and an ordered serial
+fallback to a `Chunk`. The pool validates before preparation, after preparation
+and immediately before ordered publication. A failed check discards prepared
+work and executes the fallback once in its original submit position. Exceptions
+retain the existing cancellation of later publications. The fallback must not
+publish the discarded work. The caller must keep the tracker alive and must
+transfer object pins into recorder completion ownership before GPU submission.
+
+This is an API and worker-handoff slice. Live `SubmissionCursor` still supplies
+legacy resource-free preparation callbacks. It does not yet decode operation
+dependencies or attach these pins. No draw/dispatch cache, resource cache,
+pipeline cache, texture lookup, recorder or submission format is changed.
+Remaining step 1 still needs real shader/SRT, buffer, indirect, texture and
+target range extraction, logical GPU-write declarations and producer-version
+edges. Steps 2 and 3 remain required before moving those live operations to
+workers or removing their `GpuMutex` holds.
+
+With lanes and `APS5_PROFILE_DRAW` enabled, a cumulative `[gpu-lanes]` line adds
+`prepared`, `prepared-parallel`, `proof-fallbacks`, `worker-busy-ns` and
+`worker-idle-ns`. Parallel preparations are jobs whose preparation intervals
+overlap another worker's interval, including both participants. Busy time
+covers proof validation and preparation; idle time covers waiting for work.
+These counters currently describe the compatibility slice-copy jobs as well.
+GPU-mutex acquisition counts and driver-cache contention counts still require
+hooks in the future live preparation/cache paths; zero values are not invented
+for those unavailable counters.
+
+`agc_gpu_lanes_proof_{off,on,nonexact,unset,epoch_off,tracker_off}` reuse the
+record-proof executable. They cover pin lifetime across replacement, original
+content proof rejection, mapping identity, pending producers, 512 chunks with
+serial-buffer equivalence, four simultaneous workers, invalidation during
+preparation and before ordered publication, and four readers racing publication
+and retirement of 512 immutable versions. A blocking mutex spy holds the actual
+`GpuMutex` on another thread while every admitted chunk completes. This verifies
+only the proof handoff and pure fixture preparation, not the existing draw or
+dispatch paths. `agc_gpu_lanes_profile_{off,on}` cover profile gating and overlap
+counters. The original lane tests additionally cover a failing proof validator
+and a missing serial fallback. Existing H2 pixel regressions are unchanged and
+must still run in the integrator's build. No new `.cpp` or production CMake
+source registration is required; reconfigure for the added test registrations.
+
+The mutex-removal handoff for this slice is unchanged at these live call sites:
+
+| Site | Work retained inside `GpuMutex` |
+| --- | --- |
+| `Driver::draw`, `Driver::precheckDraw`, `Driver::commitDraw` | Lazy device creation, optional locked preparation, queued-label recording, guest writer declarations and `VulkanDevice::Draw`/`DrawFromRecipe`; the `lockForDraw` closure still covers the final recording path and indirect CPU replay. |
+| `Driver::dispatch` | Lazy device creation and the final direct/indirect `Dispatch`/`DispatchRecipe` recording loop, including label and writer publication; its draw-pipeline commit closure retains the same hold when that separate mode is used. |
+| `Driver::fillBuffer`, `Driver::copyBuffer` | Their existing HLE buffer recording, synchronization and publication paths. |
+| `Driver::execute`, `Driver::flushBetweenPackets`, `Driver::preparePacketMemory`, `Driver::recordQueuedLabelsBeforeRead` | Suspension/chunk-end submits, packet flush boundaries, GPU stores/labels/copies, memory-read synchronization and deferred labels. These remain on the ordered worker. |
+| `ShaderResources::Complete`/`buildComplete`, `Revalidate`, `RefreshData`, `MarkGpuWrites` | Binding completion, mutable buffer/image freshness checks, descriptor/data refresh and recorder write declarations reached from the final draw/dispatch holds. `cachedTexture`, `cachedStorageTexture`, `fastTexture` and `StorageImageCached` also retain their own cache locks and mutable image-generation/layout dependencies. |
+| `Pipeline::AcquireFramebuffer`, `Recorder::ensureOpen`, `Recorder::Submit` | Shared framebuffer LRU, active batch/command buffer and command-pool state, resource hazards/layouts, fence retention and submission. `Recorder::EndComputeChain`, sample queries/dumps, `KeepThroughHold` and `NoteWrittenBack` explicitly retain the GPU-lock contract as well. |
+
+No worker-mutex claim applies to any of those functions. Only
+`PinnedRecordProof::Check`, the `WithProofs` guard and the pure CPU fixture's
+preparation are covered by this slice's blocking mutex spy. Before moving a
+live draw or dispatch, replace each inherited mutable resource/recorder
+dependency above with pinned versions and worker-owned state, then add a real
+per-worker mutex-acquisition hook and contention counters to the migrated
+cache lookup/publication paths.
+
 ## Shared caches and migration
 
 | Shared state | Requirement before parallel resource preparation/recording |

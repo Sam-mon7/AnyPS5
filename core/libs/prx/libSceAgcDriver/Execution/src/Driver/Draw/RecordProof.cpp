@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordProof.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/WorkerPool.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -60,6 +61,30 @@ RecordProofResult RecordProof::Check(const PageTracker::Tracker& tracker, const 
     }
     for (const auto& epoch : proof->epochs) if (epoch.observationTracker != nullptr && !tracker.Current(epoch.range, observation)) return RecordProofResult::Coverage;
     return RecordProofResult::Accepted;
+}
+
+std::shared_ptr<const PinnedRecordProof> RecordProof::Pin(const PageTracker::Tracker& tracker, std::shared_ptr<const RecordProof> contents, RecordProofRuns runs, std::uint64_t forget, std::shared_ptr<const void> resource, std::uint64_t generation, std::uint64_t writerChunk) {
+    if (!Lanes::Enabled() || !Enabled() || contents == nullptr || resource == nullptr || generation == 0 || writerChunk != 0 || runs.empty()) return nullptr;
+    // ponytail: private observations stay serial until the tracker exposes transferable write-watch boundaries.
+    if (std::any_of(contents->epochs.begin(), contents->epochs.end(), [](const auto& epoch) { return epoch.observationTracker != nullptr; })) return nullptr;
+    const auto parsed = Capture(tracker, runs, forget);
+    if (Check(tracker, contents.get(), runs, forget) != RecordProofResult::Accepted || Check(tracker, parsed.get(), runs, forget) != RecordProofResult::Accepted) return nullptr;
+    auto pin = std::shared_ptr<PinnedRecordProof>(new PinnedRecordProof());
+    pin->tracker = &tracker;
+    pin->contents = std::move(contents);
+    pin->parsed = parsed;
+    pin->runs.assign(runs.begin(), runs.end());
+    pin->resource = std::move(resource);
+    pin->generation = generation;
+    pin->writerChunk = writerChunk;
+    return pin;
+}
+
+RecordProofResult PinnedRecordProof::Check(const PageTracker::Tracker& currentTracker, std::uint64_t forget) const {
+    if (tracker != &currentTracker) return RecordProofResult::Coverage;
+    const auto result = RecordProof::Check(currentTracker, parsed.get(), runs, forget);
+    if (result != RecordProofResult::Accepted) return result;
+    return RecordProof::Check(currentTracker, contents.get(), runs, forget);
 }
 
 void RecordProof::Account(RecordProofResult result) {
