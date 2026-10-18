@@ -645,6 +645,9 @@ public:
 #ifdef _WIN32
         const auto protection = !readable ? PAGE_NOACCESS : writable ? PAGE_READWRITE : PAGE_READONLY;
         GuestArena::GuestArenaSetProtection_nid_postfix(Address(block), Block, protection);
+        // SetProtection updates shared-view/GPU bookkeeping; private pages need the OS change too.
+        DWORD previous;
+        Require(VirtualProtect(memory + block * Block, Block, protection, &previous) != 0, "cannot protect a committed test block");
 #else
         const auto protection = !readable ? PROT_NONE : writable ? PROT_READ | PROT_WRITE : PROT_READ;
         Require(mprotect(memory + block * Block, Block, protection) == 0, "cannot protect a committed test block");

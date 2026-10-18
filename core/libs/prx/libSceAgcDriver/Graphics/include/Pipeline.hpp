@@ -116,6 +116,9 @@ bool SplitsSets(const Context& context, std::span<const CompiledShader> shaders)
 // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.
 void ClearCachedPipelines(VkDevice device);
+// Drops the device's prepared-object budget pins without erasing pipeline lookup entries.
+// Call through the driver so callers linked to their own static recompiler clear the owning cache.
+void ClearPreparedPipelineObjects(VkDevice device);
 struct PipelineExpiryCounters {
     std::uint64_t lookups = 0;
     std::uint64_t scans = 0;

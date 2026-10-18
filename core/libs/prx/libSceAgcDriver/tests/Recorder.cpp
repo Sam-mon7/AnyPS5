@@ -7763,13 +7763,13 @@ void pipelineCacheTests(const Device& device, bool benchmark) {
         std::weak_ptr<Pipeline> expired = lookup(input);
         state.cullMode = 0;
         Require(lookup(input) == first, "another key displaced a retained pipeline");
-        ShaderRecompiler::ClearPreparedObjects(reinterpret_cast<std::uintptr_t>(context.device));
+        ClearPreparedPipelineObjects(context.device);
         Require(expired.expired(), "the expiry test pipeline is still retained");
         for (unsigned i = 0; i < 512; ++i) Require(lookup(input) == first, "an expiry scan invalidated a live identity entry");
         Require(PipelineExpiryCountersOf().removed > beforeExpiry.removed, "expiry scans did not remove an unused pipeline");
         state.cullMode = VK_CULL_MODE_FRONT_BIT;
         expired = lookup(input);
-        ShaderRecompiler::ClearPreparedObjects(reinterpret_cast<std::uintptr_t>(context.device));
+        ClearPreparedPipelineObjects(context.device);
         Require(expired.expired(), "the identity expiry test pipeline is still retained");
         const auto replaced = lookup(input);
         Require(replaced != nullptr && lookup(input) == replaced, "an expired identity entry was not replaced");

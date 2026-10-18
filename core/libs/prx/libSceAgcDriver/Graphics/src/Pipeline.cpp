@@ -1045,6 +1045,10 @@ PipelineExpiryCounters PipelineExpiryCountersOf() {
     return store.expiry;
 }
 
+void ClearPreparedPipelineObjects(VkDevice device) {
+    ShaderRecompiler::ClearPreparedObjects(reinterpret_cast<std::uintptr_t>(device));
+}
+
 void ClearCachedPipelines(VkDevice device) {
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
