@@ -2041,6 +2041,10 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         recorder.AfterCompletions(address, bytes, stamp, queue, false);
         return 5;
     }
+    if (Graphics::Recorder::ParseTimeLabels() && recorder.HasCompletions()) {
+        recorder.AfterCompletions(address, bytes, stamp, queue, false);
+        return 5;
+    }
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
@@ -4182,6 +4186,15 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         timer.add(which, std::chrono::duration<double, std::milli>(now - recordFrom).count());
         recordFrom = now;
     };
+    if (Graphics::Recorder::RecordWorkerEnabled() && state->checkpointMarker == nullptr && record.shader->program->workgroupMemoryDwords == 0 &&
+        (record.dataRefresh == RecordedDispatch::DataRefresh::None || (record.dataRefresh == RecordedDispatch::DataRefresh::Hash && resources.DataWordsHash() == record.dataWordsHash)) &&
+        (argumentImport != nullptr || (record.x <= state->properties.limits.maxComputeWorkGroupCount[0] && record.y <= state->properties.limits.maxComputeWorkGroupCount[1] && record.z <= state->properties.limits.maxComputeWorkGroupCount[2])) &&
+        recorder.TryRecordDispatch(record.objects->pipeline, record.objects->layout, record.objects, record.resources,
+            record.pushStages != 0 ? std::span<const std::byte>(*record.pushBytes).first(Graphics::ComputePushConstantBytes) : std::span<const std::byte>{},
+            record.x, record.y, record.z, argumentImport != nullptr ? argumentImport->buffer : VK_NULL_HANDLE, argumentImport != nullptr ? arguments - argumentImport->base : 0, arguments)) {
+        recordStep(PhaseRecordBind);
+        return;
+    }
     // Whether the last command recorded into the batch left every earlier write visible to this
     // dispatch's reads and writes (a closed label-store run, the previous dispatch's own trailing
     // barrier, a fill's or copy's): the pre-dispatch barrier below then adds nothing and is

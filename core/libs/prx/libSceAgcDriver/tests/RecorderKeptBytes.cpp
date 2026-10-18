@@ -1,10 +1,13 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <future>
 #include <map>
@@ -45,10 +48,19 @@ struct MockDevice {
     bool endLocked = false, submitLocked = false, waitedBeforeSubmit = false;
     VkResult endResult = VK_SUCCESS, submitResult = VK_SUCCESS;
     std::uint64_t failAt = 1;
+    std::vector<std::uint32_t> dispatches, pushes;
+    std::vector<char> recording;
+    std::thread::id recordThread;
+    bool recordLocked = false;
+    std::vector<std::thread::id> recordThreads;
+    std::vector<bool> recordLocks;
 };
 
 MockDevice mock;
 std::mutex mockMutex;
+std::promise<void>* recordEntered = nullptr;
+std::shared_future<void> recordAllowed;
+std::atomic<bool> recordBlocked{false};
 
 std::uint64_t SubmitCount() {
     std::lock_guard lock(mockMutex);
@@ -178,14 +190,41 @@ VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t count, con
 }
 
 VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, const void*) {}
-VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
+    std::lock_guard lock(mockMutex);
+    mock.recording.push_back('B');
+}
 VKAPI_ATTR void VKAPI_CALL mockCmdBeginQuery(VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdEndQuery(VkCommandBuffer, VkQueryPool, std::uint32_t) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdResetQueryPool(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdCopyQueryPoolResults(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize, VkDeviceSize, VkQueryResultFlags) {}
-VKAPI_ATTR void VKAPI_CALL mockCmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline) {}
-VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t, const void*) {}
-VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline) {
+    std::lock_guard lock(mockMutex);
+    mock.recording.push_back('P');
+}
+VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t bytes, const void* data) {
+    std::lock_guard lock(mockMutex);
+    std::uint32_t value = 0;
+    if (bytes >= sizeof(value)) std::memcpy(&value, data, sizeof(value));
+    mock.pushes.push_back(value);
+    mock.recording.push_back('C');
+}
+VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t x, std::uint32_t, std::uint32_t) {
+    if (recordEntered != nullptr && !recordBlocked.exchange(true)) {
+        recordEntered->set_value();
+        recordAllowed.wait();
+    }
+    std::lock_guard lock(mockMutex);
+    mock.dispatches.push_back(x);
+    mock.recording.push_back('D');
+    mock.recordThread = std::this_thread::get_id();
+    mock.recordLocked = AgcDriver::GuestMemory::GpuMutex().HeldByThisThread();
+    mock.recordThreads.push_back(mock.recordThread);
+    mock.recordLocks.push_back(mock.recordLocked);
+}
+VKAPI_ATTR void VKAPI_CALL mockCmdDispatchIndirect(VkCommandBuffer commands, VkBuffer, VkDeviceSize offset) {
+    mockCmdDispatch(commands, static_cast<std::uint32_t>(offset), 1, 1);
+}
 
 PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
     static const std::map<std::string_view, PFN_vkVoidFunction> table{
@@ -210,6 +249,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
+        {"vkCmdDispatchIndirect", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatchIndirect)},
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -587,6 +627,142 @@ void SubmitWorkerFailure(bool endFailure, std::uint64_t failAt = 1, bool deviceL
     Expect(mock.signaled.empty() && mock.pools.empty() && mock.commandPools.empty(), "failed submit teardown leaked mock Vulkan objects");
 }
 
+void RecordWorkerOrderAndSync() {
+    mock = MockDevice{};
+    const bool enabled = Recorder::RecordWorkerEnabled();
+    std::promise<void> entered, allow, appended, finished;
+    auto enteredFuture = entered.get_future();
+    auto appendedFuture = appended.get_future();
+    auto finishedFuture = finished.get_future();
+    recordBlocked = false;
+    recordEntered = enabled ? &entered : nullptr;
+    recordAllowed = allow.get_future().share();
+    std::weak_ptr<int> kept;
+    std::thread::id producer;
+    bool aliveAtCompletion = false;
+    std::exception_ptr failure;
+    const auto before = Recorder::RecordCounts();
+    std::thread caller([&] {
+        try {
+            producer = std::this_thread::get_id();
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(mockContext());
+            auto object = std::make_shared<int>(1);
+            kept = object;
+            recorder.Keep(std::move(object));
+            for (std::uint32_t i = 0; i < 260; ++i) {
+                Recorder::DispatchCommand command;
+                command.pipeline = reinterpret_cast<VkPipeline>(1);
+                command.layout = reinterpret_cast<VkPipelineLayout>(2);
+                command.x = i;
+                command.pushBytes = sizeof(i);
+                std::memcpy(command.push.data(), &i, sizeof(i));
+                if (i % 2 != 0) {
+                    command.indirect = reinterpret_cast<VkBuffer>(3);
+                    command.offset = i;
+                }
+                recorder.RecordDispatch(command);
+                command.push.fill(std::byte{0xff});
+            }
+            recorder.OnComplete([&] { aliveAtCompletion = !kept.expired(); });
+            appended.set_value();
+            if (enabled) {
+                const auto commands = recorder.Commands();
+                mockCmdDispatch(commands, 260, 1, 1);
+            } else {
+                mockCmdDispatch(recorder.Commands(), 260, 1, 1);
+            }
+            recorder.Sync();
+        } catch (...) {
+            failure = std::current_exception();
+            try { appended.set_value(); } catch (...) {}
+        }
+        finished.set_value();
+    });
+    const bool queued = appendedFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    Expect(queued, "producer waited for dispatch replay before a recording sync");
+    if (enabled && queued) {
+        Expect(enteredFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready, "128 commands did not publish a chunk");
+        Expect(finishedFuture.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout, "direct recording overtook the blocked worker");
+        Expect(!kept.expired(), "unreplayed dispatches lost kept objects");
+        Expect(Recorder::RecordCounts().queueDepth >= 2, "worker queue depth did not include the blocked chunks");
+        std::lock_guard lock(mockMutex);
+        Expect(mock.submits == 0 && mock.ended.empty(), "unfinished recording reached the submitter");
+    }
+    allow.set_value();
+    caller.join();
+    recordEntered = nullptr;
+    recordAllowed = {};
+    if (failure) std::rethrow_exception(failure);
+    Expect(aliveAtCompletion && kept.expired(), "dispatch resource lifetime missed replay or batch completion");
+    Expect(mock.dispatches.size() == 261 && mock.pushes.size() == 260, "dispatch records were lost or replayed twice");
+    for (std::uint32_t i = 0; i < mock.dispatches.size(); ++i) Expect(mock.dispatches[i] == i, "dispatch replay changed batch order");
+    for (std::uint32_t i = 0; i < mock.pushes.size(); ++i) Expect(mock.pushes[i] == i, "push constants were not copied into the chunk");
+    for (std::size_t i = 0; i < 260 && i < mock.recordThreads.size(); ++i) Expect((mock.recordThreads[i] == producer) == !enabled && mock.recordLocks[i] == !enabled, "dispatch recording used the wrong thread or the GPU mutex");
+    std::size_t event = 0;
+    for (unsigned i = 0; i < 260; ++i) {
+        const std::string expected = i % 2 != 0 ? "BBPCDB" : "BPCDB";
+        Expect(event + expected.size() <= mock.recording.size() && std::equal(expected.begin(), expected.end(), mock.recording.begin() + event), "dispatch barriers or binds were reordered");
+        event += expected.size();
+    }
+    const auto counts = Recorder::RecordCounts();
+    Expect(!enabled || (counts.commands - before.commands == 260 && counts.chunks - before.chunks == 3 && counts.queueDepth == 0), "record worker counters missed chunks or queued work");
+    Expect(!mock.waitedBeforeSubmit && mock.submits == 1, "recording sync changed GPU submission order");
+    Expect(mock.signaled.empty() && mock.pools.empty() && mock.commandPools.empty(), "record worker teardown leaked mock Vulkan objects");
+}
+
+void ParseTimeLabelTests() {
+    using namespace AgcDriver;
+    mock = MockDevice{};
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    recorder.Activate();
+    alignas(64) std::array<std::uint32_t, 16> memory{};
+    const auto address = reinterpret_cast<std::uint64_t>(memory.data());
+    const bool enabled = Recorder::ParseTimeLabels();
+    const auto labelsBefore = Recorder::ParseLabelCounts();
+    std::array<std::uint32_t, 5> write{0xc0033700u, 0x500u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 7};
+    const std::array<std::uint32_t, 7> wait{0xc0053c00u, 0x13u, write[2], write[3], 7, UINT32_MAX, 0};
+    Expect(DriverDetail::TryParseTimeLabelPacket(write) == enabled, "WRITE_DATA parse-time switch selected the wrong path");
+    Expect(Pm4::WaitSatisfiedUnchecked(wait) == enabled && SubmitCount() == 0 && mock.fenceWaits == 0, "constant label wait required a GPU round trip");
+    std::array<std::uint32_t, 7> eop{0xc0054900u, 0, 1u << 29u, write[2], write[3], 9, 0};
+    Expect(DriverDetail::TryParseTimeLabelPacket(eop) == enabled && memory[0] == (enabled ? 9u : 0u), "constant end-of-pipe label did not publish at parse time");
+    eop[2] = 3u << 29u;
+    Expect(!DriverDetail::TryParseTimeLabelPacket(eop), "a GPU timestamp label published early");
+    eop[2] = (1u << 29u) | (1u << 24u);
+    Expect(!DriverDetail::TryParseTimeLabelPacket(eop), "an interrupt label published early");
+    memory[0] = 0;
+    recorder.NotePendingRead(address, 4, Recorder::ReadKind::DispatchElement);
+    Expect(!DriverDetail::TryParseTimeLabelPacket(write) && memory[0] == 0, "an early label overwrote an in-place GPU reader");
+    recorder.Sync();
+    recorder.NotePendingRead(address + 16, 4, Recorder::ReadKind::DispatchElement);
+    const auto submitsBefore = SubmitCount();
+    Expect(!DriverDetail::TryParseTimeLabelPacket(write), "an early label permitted reuse of a pending reader's guest input");
+    Expect(SubmitCount() == submitsBefore, "a disjoint GPU reader forced a label submit");
+    recorder.Sync();
+    recorder.Commands();
+    Expect(DriverDetail::TryParseTimeLabelPacket(write) == enabled, "a batch without pending guest accesses refused a constant label");
+    recorder.Sync();
+    memory[0] = 0;
+    recorder.NotePendingWrite(address + 16, 4);
+    Expect(!DriverDetail::TryParseTimeLabelPacket(write) && memory[0] == 0, "an early label bypassed a pending GPU write");
+    recorder.Sync();
+    recorder.NotePendingWrite(address + 16, 4);
+    recorder.OnComplete([&] { memory[4] = 91; });
+    Expect(!DriverDetail::TryParseTimeLabelPacket(write) && !Pm4::WaitSatisfiedUnchecked(wait), "a label ordering a copied write-back published early");
+    const std::uint32_t value = 7;
+    recorder.AfterCompletions(address, std::as_bytes(std::span(&value, 1)), 1, 0, false);
+    Recorder::LabelRefusal refusal{};
+    Expect(Recorder::LookupLabel(address, 4, 0, &refusal).has_value() == !enabled, "a newly received wait bypassed a pending copied write-back");
+    Expect(!enabled || refusal == Recorder::LabelRefusal::BehindCompletion, "a copied write-back wait lost its completion refusal");
+    Expect(!Recorder::LookupLabel(address, 4, 2, &refusal).has_value() && refusal == Recorder::LabelRefusal::BehindCompletion, "a completion label was trusted before its copied write-back");
+    Expect(memory[0] == 0 && memory[4] == 0, "copied write-back or label ran before completion");
+    recorder.Sync();
+    Expect(memory[4] == 91 && Pm4::WaitSatisfiedUnchecked(wait), "label wait did not converge after its copied write-back");
+    const auto counts = Recorder::ParseLabelCounts();
+    Expect(counts.parsed - labelsBefore.parsed == (enabled ? 3u : 0u), "parse-time label counter included a refused label");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -596,7 +772,11 @@ int main(int argc, char** argv) {
         std::puts("Aftermath capture precedes failed recorder batch release");
         return 0;
 #endif
-        if (argc == 2 && std::string_view(argv[1]) == "submit-worker") {
+        if (argc == 2 && std::string_view(argv[1]) == "record-worker") {
+            RecordWorkerOrderAndSync();
+        } else if (argc == 2 && std::string_view(argv[1]) == "parse-time-labels") {
+            ParseTimeLabelTests();
+        } else if (argc == 2 && std::string_view(argv[1]) == "submit-worker") {
             SubmitWorkerOrderAndSync();
             SubmitWorkerDirectBatch();
             SubmitWorkerFailure(true);

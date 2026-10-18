@@ -180,7 +180,7 @@ void Driver::execute(const Submission& submission) {
             cursor = nextCursor;
             continue;
         }
-        if (pipelined && !predicated && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && orderedWaits && DrawPipeline::Queue0().Busy()) {
+        if (!Graphics::Recorder::ParseTimeLabels() && pipelined && !predicated && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && orderedWaits && DrawPipeline::Queue0().Busy()) {
             const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
             if (const auto value = DrawPipeline::Queue0().PendingLabel(awaited, Pm4::WaitAwaitedBytes(packet)); value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
                 ++waitOutcomes().fromRecorderSameQueue;

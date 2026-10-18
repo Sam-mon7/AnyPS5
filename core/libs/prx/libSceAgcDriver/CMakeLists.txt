@@ -1308,6 +1308,35 @@ set_target_properties(agc_recorder_kept_bytes_tests PROPERTIES CXX_EXTENSIONS OF
 configure_windows_unwind(agc_recorder_kept_bytes_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_recorder_kept_bytes_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    foreach(recordMode IN ITEMS off on)
+        add_test(NAME agc_recorder_parse_time_labels_${recordMode} COMMAND agc_recorder_kept_bytes_tests parse-time-labels)
+        add_test(NAME agc_recorder_record_worker_${recordMode} COMMAND agc_recorder_kept_bytes_tests record-worker)
+        add_test(NAME agc_recorder_record_worker_submit_${recordMode} COMMAND agc_recorder_kept_bytes_tests record-worker)
+        add_test(NAME agc_recorder_record_worker_device_${recordMode} COMMAND agc_driver_recorder_tests --record-worker-only)
+        set_tests_properties(agc_recorder_parse_time_labels_${recordMode} PROPERTIES TIMEOUT 15 ENVIRONMENT "APS5_COPY_READ_TRACKING=1")
+        set_tests_properties(agc_recorder_record_worker_${recordMode} agc_recorder_record_worker_submit_${recordMode} agc_recorder_record_worker_device_${recordMode}
+            PROPERTIES TIMEOUT 60 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1")
+        set_property(TEST agc_recorder_parse_time_labels_${recordMode} agc_recorder_record_worker_${recordMode} agc_recorder_record_worker_submit_${recordMode} agc_recorder_record_worker_device_${recordMode}
+            PROPERTY ENVIRONMENT_MODIFICATION "APS5_SUBMIT_WORKER=unset:;APS5_BACKGROUND_RELEASE=unset:;APS5_PROFILE_GPU=unset:;APS5_PROFILE_DRAW=unset:;APS5_PROFILE_PRESENT=unset:;APS5_TRACE_DIR=unset:;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_LAZY_WRITES=unset:;APS5_RESIDENT_HEAP_MIRRORS=unset:;APS5_RESIDENT_STORAGE_IMAGES=unset:;APS5_BARRIER_VALIDATE=unset:")
+        set_property(TEST agc_recorder_parse_time_labels_${recordMode} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RECORD_WORKER=unset:")
+        set_property(TEST agc_recorder_record_worker_${recordMode} agc_recorder_record_worker_submit_${recordMode} agc_recorder_record_worker_device_${recordMode}
+            APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PARSE_TIME_LABELS=unset:")
+        if(recordMode STREQUAL "on")
+            set_property(TEST agc_recorder_parse_time_labels_${recordMode} APPEND PROPERTY ENVIRONMENT "APS5_PARSE_TIME_LABELS=1")
+            set_property(TEST agc_recorder_record_worker_${recordMode} agc_recorder_record_worker_submit_${recordMode} agc_recorder_record_worker_device_${recordMode}
+                APPEND PROPERTY ENVIRONMENT "APS5_RECORD_WORKER=1")
+        else()
+            set_property(TEST agc_recorder_parse_time_labels_${recordMode} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PARSE_TIME_LABELS=unset:")
+            set_property(TEST agc_recorder_record_worker_${recordMode} agc_recorder_record_worker_submit_${recordMode} agc_recorder_record_worker_device_${recordMode}
+                APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RECORD_WORKER=unset:")
+        endif()
+        set_property(TEST agc_recorder_record_worker_submit_${recordMode} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_SUBMIT_WORKER=set:1")
+        set_tests_properties(agc_recorder_record_worker_device_${recordMode} PROPERTIES SKIP_RETURN_CODE 77)
+        if(WIN32)
+            set_property(TEST agc_recorder_parse_time_labels_${recordMode} agc_recorder_record_worker_${recordMode} agc_recorder_record_worker_submit_${recordMode} agc_recorder_record_worker_device_${recordMode}
+                APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     foreach(submitWorkerMode IN ITEMS off on)
         add_test(NAME agc_recorder_submit_worker_${submitWorkerMode} COMMAND agc_recorder_kept_bytes_tests submit-worker)
         add_test(NAME agc_recorder_submit_worker_device_${submitWorkerMode} COMMAND agc_driver_recorder_tests --submit-worker-only)
