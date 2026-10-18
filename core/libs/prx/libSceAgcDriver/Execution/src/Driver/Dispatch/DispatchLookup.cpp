@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordProof.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
 
@@ -31,7 +32,8 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
 
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
-            if (!stampValidate()) {
+            const bool stamps = stampValidate() && !RecordProof::Enabled();
+            if (!stamps) {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
 
                 std::optional<SampledReadScope> sampling;
@@ -133,7 +135,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     counters.dataWordsRefreshed += liveData.size();
                     ++counters.dataHitsByRank[rank];
                 }
-                if (stampValidate()) {
+                if (stamps) {
                     captured = variant->captured;
                 } else {
 
