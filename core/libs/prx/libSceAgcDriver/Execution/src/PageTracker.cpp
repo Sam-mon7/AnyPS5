@@ -224,14 +224,18 @@ void Tracker::InvalidateRange(Range range, bool unmapped) {
 void Tracker::SetCoverage(Range range, Reasons reasons) {
     Visit(range, false, [&](auto, auto offset, auto bytes, auto* region) {
         if (region == nullptr) return;
-        Advance(region->mapEpoch);
+        const bool privatePoll = ProofsEnabled() && (reasons & Bit(Reason::PrivateWatch)) != 0;
+        bool changed = false;
         for (std::size_t i = 0; i < region->reasons.size(); ++i) {
             if (i == static_cast<std::size_t>(Reason::ExcludedImport)) continue;
             if (i == static_cast<std::size_t>(Reason::PendingGpu) && (reasons & Bit(Reason::PendingGpu)) == 0) continue;
-            Assign(region->reasons[i], offset, bytes, (reasons & (1u << i)) != 0);
+            const bool set = (reasons & (1u << i)) != 0;
+            if (privatePoll) Words(offset, bytes, [&](auto word, auto mask) { changed |= (region->reasons[i][word] & mask) != (set ? mask : 0); });
+            Assign(region->reasons[i], offset, bytes, set);
         }
         if (offset % PageBytes != 0) Assign(region->reasons[static_cast<std::size_t>(Reason::Unsupported)], offset, 1, true);
         if ((offset + bytes) % PageBytes != 0) Assign(region->reasons[static_cast<std::size_t>(Reason::Unsupported)], offset + bytes - 1, 1, true);
+        if (!privatePoll || changed) Advance(region->mapEpoch);
     });
 }
 
@@ -287,20 +291,81 @@ bool Tracker::Covered(Reasons reasons, bool proof) {
     return (reasons & mechanisms) != 0 && (reasons & blockers) == 0 && (!proof || (reasons & Bit(Reason::PrivateWatch)) == 0);
 }
 
-Epoch Tracker::CaptureEpoch(Range range) const {
+Observation Tracker::Observe(std::span<const Range> ranges, Poll poll) {
+    if (!ProofsEnabled() || Poisoned()) return {};
+    const auto serial = observationSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (serial == 0) { Poison(); return {}; }
+    Observation observation;
+    observation.thread = std::this_thread::get_id();
+    observation.ranges.assign(ranges.begin(), ranges.end());
+    std::vector<Range> privateRanges;
+    for (const auto range : ranges) {
+        if (!range.Valid()) return {};
+        Visit(range, false, [&](auto id, auto offset, auto bytes, auto* region) {
+            observation.regions.push_back({id, region != nullptr ? region->mapEpoch : 0});
+            if (region == nullptr) return;
+            for (auto page = offset / PageBytes; page < (offset + bytes + PageBytes - 1) / PageBytes; ++page) {
+                if ((PageReasons(*region, page) & Bit(Reason::PrivateWatch)) == 0) continue;
+                const auto address = id * RegionBytes + page * PageBytes;
+                if (!privateRanges.empty() && privateRanges.back().address + privateRanges.back().bytes == address) privateRanges.back().bytes += PageBytes;
+                else privateRanges.push_back({address, PageBytes});
+            }
+        });
+    }
+    std::sort(observation.regions.begin(), observation.regions.end());
+    for (std::size_t i = 1; i < observation.regions.size(); ++i) {
+        if (observation.regions[i - 1].regionId == observation.regions[i].regionId && observation.regions[i - 1].mapEpoch != observation.regions[i].mapEpoch) return {};
+    }
+    observation.regions.erase(std::unique(observation.regions.begin(), observation.regions.end()), observation.regions.end());
+    std::sort(privateRanges.begin(), privateRanges.end());
+    std::vector<Range> polls;
+    for (const auto range : privateRanges) {
+        if (!polls.empty() && range.address <= polls.back().address + polls.back().bytes) {
+            polls.back().bytes = std::max(polls.back().address + polls.back().bytes, range.address + range.bytes) - polls.back().address;
+        } else polls.push_back(range);
+    }
+    try {
+        for (const auto range : polls) if (poll == nullptr || !poll(range)) return {};
+    } catch (...) { return {}; }
+    if (Poisoned() || observationSerial.load(std::memory_order_acquire) != serial) return {};
+    observation.tracker = this;
+    observation.serial = serial;
+    return observation;
+}
+
+bool Tracker::Current(Range range, const Observation* observation) const {
+    if (observation == nullptr || observation->tracker != this || observation->serial == 0 || observation->thread != std::this_thread::get_id() || observationSerial.load(std::memory_order_acquire) != observation->serial || !range.Valid() || Poisoned()) return false;
+    return std::any_of(observation->ranges.begin(), observation->ranges.end(), [&](const auto observed) {
+        return observed.address <= range.address && range.address + range.bytes <= observed.address + observed.bytes;
+    });
+}
+
+Epoch Tracker::CaptureEpoch(Range range, const Observation* observation) const {
     Epoch token{range, {}, range.Valid() && !poisoned.load(std::memory_order_acquire)};
+    const bool observed = Current(range, observation);
     Visit(range, false, [&](auto id, auto offset, auto bytes, auto* region) {
         if (region == nullptr) { token.covered = false; token.regions.push_back({id}); return; }
         token.regions.push_back({id, region->mapEpoch, region->cpuEpoch, region->gpuEpoch});
         if (region->mapEpoch == 0 || region->cpuEpoch == 0 || region->gpuEpoch == 0) token.covered = false;
-        for (auto page = offset / PageBytes; page < (offset + bytes + PageBytes - 1) / PageBytes; ++page) if (!Covered(PageReasons(*region, page), true)) token.covered = false;
+        bool privatePages = false;
+        for (auto page = offset / PageBytes; page < (offset + bytes + PageBytes - 1) / PageBytes; ++page) {
+            const auto reasons = PageReasons(*region, page);
+            privatePages |= (reasons & Bit(Reason::PrivateWatch)) != 0;
+            if (!Covered(reasons, !observed)) token.covered = false;
+        }
+        if (privatePages) {
+            token.observationTracker = this;
+            if (!observed || std::none_of(observation->regions.begin(), observation->regions.end(), [&](const auto& before) { return before.regionId == id && before.mapEpoch == region->mapEpoch; })) token.covered = false;
+        }
     });
+    if (token.observationTracker != nullptr && !Current(range, observation)) token.covered = false;
     return token;
 }
 
-bool Tracker::DirtySince(Range range, const Epoch& token) const {
+bool Tracker::DirtySince(Range range, const Epoch& token, const Observation* observation) const {
     if (token.range != range || !token.covered) return true;
-    const auto current = CaptureEpoch(range);
+    if (token.observationTracker != nullptr && (token.observationTracker != this || !Current(range, observation))) return true;
+    const auto current = CaptureEpoch(range, observation);
     return !current.covered || current.regions != token.regions;
 }
 
@@ -370,6 +435,7 @@ Statistics Tracker::Counts() const {
     std::shared_lock lock(directoryMutex);
     result.regions = directory.size();
     result.metadataBytes = sizeof(*this) + directory.size() * (sizeof(Region) + sizeof(decltype(directory)::value_type) + 4 * sizeof(void*));
+    if (!ProofsEnabled()) result.metadataBytes -= sizeof(observationSerial);
     if (!ArmEnabled()) {
         constexpr auto armCountBytes = 3 * sizeof(std::uint64_t) + sizeof(ReadBytes) * static_cast<std::size_t>(GuestMemory::ReadSite::Count);
         constexpr auto armRegionBytes = 2 * sizeof(Bitmap);
@@ -414,6 +480,11 @@ std::string Tracker::ProfileLine() const {
 
 bool Enabled() {
     static const bool enabled = [] { const auto* text = std::getenv("APS5_PAGE_TRACKER"); return text != nullptr && std::string_view(text) == "1"; }();
+    return enabled;
+}
+
+bool ProofsEnabled() {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_EPOCH_PROOFS"); return Enabled() && value != nullptr && std::string_view(value) == "1"; }();
     return enabled;
 }
 

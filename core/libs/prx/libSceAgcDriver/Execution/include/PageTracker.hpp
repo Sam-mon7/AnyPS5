@@ -13,7 +13,9 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <string>
+#include <thread>
 
 namespace AgcDriver::PageTracker {
 
@@ -52,10 +54,24 @@ struct RegionToken {
     std::uint64_t regionId = 0, mapEpoch = 0, cpuEpoch = 0, gpuEpoch = 0;
     auto operator<=>(const RegionToken&) const = default;
 };
+class Tracker;
+class Observation {
+public:
+    Observation() = default;
+private:
+    friend class Tracker;
+    const Tracker* tracker = nullptr;
+    std::uint64_t serial = 0;
+    std::thread::id thread;
+    std::vector<Range> ranges;
+    std::vector<RegionToken> regions;
+};
+using Poll = bool (*)(Range);
 struct Epoch {
     Range range;
     std::vector<RegionToken> regions;
     bool covered = false;
+    const Tracker* observationTracker = nullptr;
 };
 struct ReadBytes { std::uint64_t covered = 0, total = 0; };
 struct Statistics {
@@ -76,8 +92,9 @@ public:
     void MarkCpuWritten(Range range, Source source);
     void MarkGpuWritten(Range range, Source source);
     void PublishGpuWrites(Range range);
-    Epoch CaptureEpoch(Range range) const;
-    bool DirtySince(Range range, const Epoch& token) const;
+    bool Current(Range range, const Observation* observation) const;
+    Epoch CaptureEpoch(Range range, const Observation* observation = nullptr) const;
+    bool DirtySince(Range range, const Epoch& token, const Observation* observation = nullptr) const;
     void ObserveRead(Range range, GuestMemory::ReadSite site);
     void NotePoll(std::uint64_t pages, std::uint64_t ns, bool complete);
     void ObservePolledPage(Range range);
@@ -88,6 +105,8 @@ public:
     bool Poisoned() const noexcept { return poisoned.load(std::memory_order_acquire); }
 
 private:
+    friend Observation PollCpuWrites(std::span<const Range> ranges);
+    Observation Observe(std::span<const Range> ranges, Poll poll);
     struct Region {
         mutable std::mutex mutex;
         Bitmap cpuDirty{}, gpuDirty{}, observedPrivate{};
@@ -112,9 +131,12 @@ private:
     mutable std::mutex countsMutex;
     Statistics counts;
     std::atomic<bool> poisoned{false};
+    std::atomic<std::uint64_t> observationSerial{0};
 };
 
 bool Enabled();
+bool ProofsEnabled();
+Observation PollCpuWrites(std::span<const Range> ranges);
 bool ArmEnabled();
 void CompletedFrame();
 Tracker* Get();

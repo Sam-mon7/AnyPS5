@@ -1139,7 +1139,7 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 }
 
 #ifdef _WIN32
-bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t stop, bool armedOnly) {
+bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t stop, bool armedOnly, bool resetting = false) {
     auto& tracker = runs.tracker;
     auto* pageTracker = PageTracker::Get();
     const auto pollStarted = pageTracker != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1171,9 +1171,9 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
         return complete;
     };
     try {
-        if (!walk(singlePass || fresh)) return finish(false);
+        if (!walk(singlePass || fresh || resetting)) return finish(false);
         if (runs.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
-        return finish(fresh || singlePass || runs.stamped == 0 || walk(true));
+        return finish(resetting || fresh || singlePass || runs.stamped == 0 || walk(true));
     } catch (...) {
         finish(false);
         throw;
@@ -1274,6 +1274,23 @@ std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, false);
+}
+
+bool pollProofWrites(PageTracker::Range range) {
+    if (!PageTracker::ProofsEnabled() || !range.Valid() || range.address + range.bytes > std::numeric_limits<std::uint64_t>::max() - (WritePageBytes - 1)) return false;
+#ifdef _WIN32
+    const auto first = range.address & ~(std::uint64_t{WritePageBytes} - 1);
+    const auto stop = (range.address + range.bytes + WritePageBytes - 1) & ~(std::uint64_t{WritePageBytes} - 1);
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || !tracker.covers(first, stop - first)) return false;
+    ++tracker.generation;
+    StampRuns runs{tracker, StampKind::Cpu};
+    return collectWindowsWrites(runs, first, stop, false, true);
+#else
+    return false;
+#endif
 }
 
 void BumpCollectEpoch() {
@@ -2234,4 +2251,10 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
 
 extern "C" void AgcDriverCheckGuestMemory_nid_postfix(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable) {
     AgcDriver::GuestMemory::CheckRange(pointer, bytes, alignment, writable);
+}
+
+AgcDriver::PageTracker::Observation AgcDriver::PageTracker::PollCpuWrites(std::span<const Range> ranges) {
+    if (!ProofsEnabled()) return {};
+    auto* tracker = Get();
+    return tracker != nullptr ? tracker->Observe(ranges, &GuestMemory::pollProofWrites) : Observation{};
 }

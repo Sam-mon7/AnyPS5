@@ -20,8 +20,9 @@ struct RecordProof {
     std::uint64_t forgetSerial = 0;
 
     static bool Enabled();
-    static std::shared_ptr<const RecordProof> Capture(const PageTracker::Tracker& tracker, RecordProofRuns runs, std::uint64_t forget);
-    static RecordProofResult Check(const PageTracker::Tracker& tracker, const RecordProof* proof, RecordProofRuns runs, std::uint64_t forget);
+    static PageTracker::Observation Observe(RecordProofRuns runs);
+    static std::shared_ptr<const RecordProof> Capture(const PageTracker::Tracker& tracker, RecordProofRuns runs, std::uint64_t forget, const PageTracker::Observation* observation = nullptr);
+    static RecordProofResult Check(const PageTracker::Tracker& tracker, const RecordProof* proof, RecordProofRuns runs, std::uint64_t forget, const PageTracker::Observation* observation = nullptr);
     static void Account(RecordProofResult result);
     static void Recorded(bool stable);
     static RecordProofCounts Counts();

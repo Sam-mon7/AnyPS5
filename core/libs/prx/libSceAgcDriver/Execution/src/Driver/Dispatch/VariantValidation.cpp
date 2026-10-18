@@ -93,7 +93,10 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
         pending.Load();
         const auto proof = variant.recordProof.load(std::memory_order_acquire);
         auto result = proofGate();
-        if (result == RecordProofResult::Accepted) result = RecordProof::Check(*tracker, proof.get(), variant.runs, forget);
+        if (result == RecordProofResult::Accepted) {
+            const auto observation = RecordProof::Observe(variant.runs);
+            result = RecordProof::Check(*tracker, proof.get(), variant.runs, forget, &observation);
+        }
         if (result == RecordProofResult::Accepted && Graphics::Recorder::PublishGeneration() != publish) result = RecordProofResult::Publish;
         if (result == RecordProofResult::Accepted && Graphics::StorageTexture::PendingSerial() != pendingSerial) result = RecordProofResult::Pending;
         if (result == RecordProofResult::Accepted && GuestMemory::ForgetSerial() != forget) result = RecordProofResult::Forget;
@@ -131,11 +134,13 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
 
     pending.Load();
     std::shared_ptr<const RecordProof> proof;
+    PageTracker::Observation observation;
     if (tracker != nullptr) {
         for (const auto& [begin, end] : variant.runs) {
             if (end > begin) GuestMemory::CollectWritesUncached(begin, end - begin);
         }
-        proof = RecordProof::Capture(*tracker, variant.runs, forget);
+        observation = RecordProof::Observe(variant.runs);
+        proof = RecordProof::Capture(*tracker, variant.runs, forget, &observation);
     }
     bool unmapped = false;
     if (!validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked ? &mask : nullptr)) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
@@ -144,7 +149,8 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     if (GuestMemory::ForgetSerial() != forget) return EntryOutcome::ForgetMoved;
     if (proof != nullptr && (!masked || live->empty())) {
         pending.Load();
-        const bool stable = proofGate() == RecordProofResult::Accepted && RecordProof::Check(*tracker, proof.get(), variant.runs, forget) == RecordProofResult::Accepted;
+        observation = RecordProof::Observe(variant.runs);
+        const bool stable = proofGate() == RecordProofResult::Accepted && RecordProof::Check(*tracker, proof.get(), variant.runs, forget, &observation) == RecordProofResult::Accepted;
         if (stable) variant.recordProof.store(std::move(proof), std::memory_order_release);
         RecordProof::Recorded(stable);
     }
