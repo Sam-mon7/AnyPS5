@@ -3,7 +3,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
-#include <string_view>
 
 namespace AgcDriver::DriverDetail {
 namespace {
@@ -12,24 +11,31 @@ std::atomic<std::uint64_t> recorded{0}, unstable{0};
 }
 
 bool RecordProof::Enabled() {
-    static const bool enabled = [] { const auto* value = std::getenv("APS5_EPOCH_PROOFS"); return value != nullptr && std::string_view(value) == "1" && PageTracker::Enabled(); }();
-    return enabled;
+    return PageTracker::ProofsEnabled();
 }
 
-std::shared_ptr<const RecordProof> RecordProof::Capture(const PageTracker::Tracker& tracker, RecordProofRuns runs, std::uint64_t forget) {
+PageTracker::Observation RecordProof::Observe(RecordProofRuns runs) {
+    if (!Enabled()) return {};
+    std::vector<PageTracker::Range> ranges;
+    ranges.reserve(runs.size());
+    for (const auto& [begin, end] : runs) ranges.push_back({begin, end > begin ? end - begin : 0});
+    return PageTracker::PollCpuWrites(ranges);
+}
+
+std::shared_ptr<const RecordProof> RecordProof::Capture(const PageTracker::Tracker& tracker, RecordProofRuns runs, std::uint64_t forget, const PageTracker::Observation* observation) {
     if (!Enabled()) return nullptr;
     auto proof = std::make_shared<RecordProof>();
     proof->forgetSerial = forget;
     proof->epochs.reserve(runs.size());
-    for (const auto& [begin, end] : runs) proof->epochs.push_back(tracker.CaptureEpoch({begin, end > begin ? end - begin : 0}));
+    for (const auto& [begin, end] : runs) proof->epochs.push_back(tracker.CaptureEpoch({begin, end > begin ? end - begin : 0}, observation));
     return proof;
 }
 
-RecordProofResult RecordProof::Check(const PageTracker::Tracker& tracker, const RecordProof* proof, RecordProofRuns runs, std::uint64_t forget) {
+RecordProofResult RecordProof::Check(const PageTracker::Tracker& tracker, const RecordProof* proof, RecordProofRuns runs, std::uint64_t forget, const PageTracker::Observation* observation) {
     if ((forget & 1) != 0 || (proof != nullptr && proof->forgetSerial != forget)) return RecordProofResult::Forget;
     if (proof == nullptr) {
         for (const auto& [begin, end] : runs) {
-            if (end <= begin || !tracker.CaptureEpoch({begin, end - begin}).covered) return RecordProofResult::Coverage;
+            if (end <= begin || !tracker.CaptureEpoch({begin, end - begin}, observation).covered) return RecordProofResult::Coverage;
         }
         return RecordProofResult::Missing;
     }
@@ -39,8 +45,9 @@ RecordProofResult RecordProof::Check(const PageTracker::Tracker& tracker, const 
         const PageTracker::Range range{begin, end > begin ? end - begin : 0};
         const auto& epoch = proof->epochs[i];
         if (epoch.range != range) return RecordProofResult::Ranges;
-        if (!tracker.DirtySince(range, epoch)) continue;
-        const auto current = tracker.CaptureEpoch(range);
+        if (epoch.observationTracker != nullptr && (epoch.observationTracker != &tracker || !tracker.Current(range, observation))) return RecordProofResult::Coverage;
+        if (!tracker.DirtySince(range, epoch, observation)) continue;
+        const auto current = tracker.CaptureEpoch(range, observation);
         if (current.regions.size() != epoch.regions.size()) return RecordProofResult::Coverage;
         for (std::size_t r = 0; r < epoch.regions.size(); ++r) {
             const auto& before = epoch.regions[r];
@@ -51,6 +58,7 @@ RecordProofResult RecordProof::Check(const PageTracker::Tracker& tracker, const 
         }
         return RecordProofResult::Coverage;
     }
+    for (const auto& epoch : proof->epochs) if (epoch.observationTracker != nullptr && !tracker.Current(epoch.range, observation)) return RecordProofResult::Coverage;
     return RecordProofResult::Accepted;
 }
 

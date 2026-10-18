@@ -5,6 +5,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -19,8 +20,8 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-RecordProofResult check(const Tracker& tracker, const RecordProof* proof, const Runs& runs, std::uint64_t forget = Forget) {
-    const auto result = RecordProof::Check(tracker, proof, runs, forget);
+RecordProofResult check(const Tracker& tracker, const RecordProof* proof, const Runs& runs, std::uint64_t forget = Forget, const Observation* observation = nullptr) {
+    const auto result = RecordProof::Check(tracker, proof, runs, forget, observation);
     RecordProof::Account(result);
     return result;
 }
@@ -91,6 +92,82 @@ void coverage() {
 }
 
 #ifdef _WIN32
+void privateMemory() {
+    Initialize();
+    constexpr std::size_t bytes = RegionBytes + 0x10000;
+    auto* memory = GuestArena::GuestArenaAllocate_nid_postfix(bytes, RegionBytes);
+    GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    const Range range{address, 4};
+    const Runs runs{{address, address + 4}, {address + 32, address + 36}};
+    auto* tracker = Get();
+    *static_cast<volatile std::uint32_t*>(memory) = 7;
+    const auto before = tracker->Counts();
+    auto first = RecordProof::Observe(runs);
+    require(tracker->Current(range, &first) && tracker->Counts().pollCalls == before.pollCalls + 1 && tracker->Counts().polledPages == before.polledPages + 1, "private boundary did not make one resetting poll for overlapping pages");
+    auto proof = RecordProof::Capture(*tracker, runs, Forget, &first);
+    require(check(*tracker, proof.get(), runs, Forget, &first) == RecordProofResult::Accepted, "fresh private proof rejected");
+    require(check(*tracker, nullptr, runs, Forget, &first) == RecordProofResult::Missing, "fresh private cold lookup did not fall back");
+    require(check(*tracker, proof.get(), runs) == RecordProofResult::Coverage, "private proof without boundary accepted");
+    Observation empty;
+    require(check(*tracker, proof.get(), runs, Forget, &empty) == RecordProofResult::Coverage, "default boundary accepted");
+    Tracker other;
+    other.RegisterRange({address, bytes}, Kind::Private, Bit(Reason::PrivateWatch));
+    require(check(other, proof.get(), runs, Forget, &first) == RecordProofResult::Coverage, "foreign tracker boundary accepted");
+    auto current = RecordProof::Observe(runs);
+    require(tracker->Counts().polledPages == before.polledPages + 1, "private boundary did not reset the previous write watch");
+    require(!tracker->Current(range, &first) && check(*tracker, proof.get(), runs, Forget, &first) == RecordProofResult::Coverage, "old boundary survived the next poll");
+    const auto polls = tracker->Counts().pollCalls;
+    DWORD previous = 0;
+    require(VirtualProtect(memory, bytes, PAGE_NOACCESS, &previous), "private proof noaccess protection failed");
+    const auto accepted = check(*tracker, proof.get(), runs, Forget, &current);
+    MEMORY_BASIC_INFORMATION state{};
+    const auto queried = VirtualQuery(memory, &state, sizeof(state));
+    require(VirtualProtect(memory, bytes, previous, &previous), "private proof protection restore failed");
+    require(accepted == RecordProofResult::Accepted && queried == sizeof(state) && state.Protect == PAGE_NOACCESS && tracker->Counts().pollCalls == polls, "unchanged private proof read guest bytes, changed protection, or polled in the query");
+    RecordProofResult crossThread = RecordProofResult::Accepted;
+    std::thread worker([&] { crossThread = check(*tracker, proof.get(), runs, Forget, &current); });
+    worker.join();
+    require(crossThread == RecordProofResult::Coverage, "boundary crossed its caller thread");
+    auto narrow = RecordProof::Observe(RecordProofRuns(runs).first(1));
+    require(check(*tracker, proof.get(), runs, Forget, &narrow) == RecordProofResult::Coverage, "partial boundary covered another run");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto legacy = AgcDriver::GuestMemory::CollectWrites(address, bytes);
+    require(legacy != 0, "legacy private baseline failed");
+    *static_cast<volatile std::uint32_t*>(memory) = 11;
+    current = RecordProof::Observe(runs);
+    require(check(*tracker, proof.get(), runs, Forget, &current) == RecordProofResult::Cpu, "private write between boundaries accepted");
+    require(!AgcDriver::GuestMemory::UnchangedSince(address, 4, legacy), "private proof poll consumed a write without updating legacy stamps");
+    proof = RecordProof::Capture(*tracker, runs, Forget, &current);
+    require(check(*tracker, proof.get(), runs, Forget, &current) == RecordProofResult::Accepted, "private re-record did not recover");
+    const auto copied = *static_cast<volatile std::uint32_t*>(memory);
+    require(copied == 11, "private capture fixture read failed");
+    *static_cast<volatile std::uint32_t*>(memory) = 13;
+    current = RecordProof::Observe(runs);
+    require(check(*tracker, proof.get(), runs, Forget, &current) == RecordProofResult::Cpu, "private capture/read/capture race recorded clean");
+    const Runs invalid{{address, address}};
+    auto invalidBoundary = RecordProof::Observe(invalid);
+    require(!tracker->Current(range, &invalidBoundary) && check(*tracker, proof.get(), runs, Forget, &current) == RecordProofResult::Coverage, "invalid boundary did not expire the previous boundary");
+    current = RecordProof::Observe(runs);
+    const auto beforeRemap = RecordProof::Capture(*tracker, runs, Forget, &current);
+    tracker->RegisterRange({address, bytes}, Kind::Private, Bit(Reason::PrivateWatch));
+    require(!tracker->CaptureEpoch(range, &current).covered && check(*tracker, beforeRemap.get(), runs, Forget, &current) != RecordProofResult::Accepted, "boundary crossed a mapping incarnation");
+    const Runs crossing{{address + RegionBytes - 4, address + RegionBytes + 4}};
+    current = RecordProof::Observe(crossing);
+    const auto multi = RecordProof::Capture(*tracker, crossing, Forget, &current);
+    require(multi->epochs[0].regions.size() == 2 && check(*tracker, multi.get(), crossing, Forget, &current) == RecordProofResult::Accepted, "multi-region private boundary rejected");
+    reinterpret_cast<volatile std::uint32_t*>(memory)[RegionBytes / sizeof(std::uint32_t)] = 19;
+    current = RecordProof::Observe(crossing);
+    require(check(*tracker, multi.get(), crossing, Forget, &current) == RecordProofResult::Cpu, "private write in the second region accepted");
+    current = RecordProof::Observe(runs);
+    proof = RecordProof::Capture(*tracker, runs, Forget, &current);
+    AgcDriver::GuestMemory::Unwatch(address, bytes);
+    auto excluded = RecordProof::Observe(runs);
+    require(!tracker->Current(range, &excluded) && check(*tracker, proof.get(), runs, Forget, &excluded) == RecordProofResult::Coverage, "excluded private import acquired a boundary");
+    GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+}
+
 void inaccessible() {
     auto* memory = VirtualAlloc(nullptr, 2 * PageBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     require(memory != nullptr, "test allocation failed");
@@ -168,6 +245,7 @@ int main() {
 #ifdef _WIN32
             inaccessible();
             observedCpuWrite();
+            privateMemory();
 #endif
             const auto counts = RecordProof::Counts();
             require(counts.results[static_cast<std::size_t>(RecordProofResult::Accepted)] != 0 && counts.results[static_cast<std::size_t>(RecordProofResult::Coverage)] != 0 && counts.unstable == 1, "proof counters missing");
@@ -177,6 +255,11 @@ int main() {
             Tracker tracker;
             const Runs runs{{Base, Base + PageBytes}};
             require(RecordProof::Capture(tracker, runs, Forget) == nullptr, "disabled proof allocated metadata");
+            const auto observation = RecordProof::Observe(runs);
+            const std::array ranges{Range{Base, PageBytes}};
+            const auto direct = PollCpuWrites(ranges);
+            require(!tracker.Current(ranges[0], &observation) && !tracker.Current(ranges[0], &direct), "disabled proof issued a boundary");
+            if (auto* global = Get()) require(global->Counts().pollCalls == 0 && global->Counts().regions == 0, "disabled proof polled or created region metadata");
             for (std::size_t i = 0; i < static_cast<std::size_t>(RecordProofResult::Count); ++i) RecordProof::Account(static_cast<RecordProofResult>(i));
             RecordProof::Recorded(true);
             RecordProof::Recorded(false);
