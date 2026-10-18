@@ -185,8 +185,14 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::span<const 
     auto& first = artifacts[reinterpret_cast<std::uintptr_t>(code.data())];
     if (first.variantId == 0u) first = result;
     else Require(result.cacheHit && result.variantId == first.variantId, "runtime storage image changed the compiled artifact");
+    const auto recorded = AgcDriver::Graphics::Recorder::RecordCounts().commands;
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
+    static bool checkedRecording = false;
+    if (!checkedRecording && std::getenv("APS5_TEST_RECORD_COVERAGE") != nullptr) {
+        Require((AgcDriver::Graphics::Recorder::RecordCounts().commands > recorded) == AgcDriver::Graphics::Recorder::RecordWorkerEnabled(), "storage-image dispatch selected the wrong worker path");
+        checkedRecording = true;
+    }
     AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(texels), TexelBytes, nullptr, "test");
     device.WaitIdle();
 }

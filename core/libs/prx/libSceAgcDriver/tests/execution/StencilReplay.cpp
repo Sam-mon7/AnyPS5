@@ -159,8 +159,10 @@ void Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelC
     AgcDriver::Pm4::DrawParameters draw{0, vertices, 0, instances, 0, false};
     if (alterDraw) alterDraw(draw);
     const auto bindsBefore = GraphicsBinds.load();
+    const auto recorded = AgcDriver::Graphics::Recorder::RecordCounts().commands;
     device.Draw(state, draw, shaders);
     device.WaitIdle();
+    if (std::getenv("APS5_TEST_RECORD_COVERAGE") != nullptr) Require((AgcDriver::Graphics::Recorder::RecordCounts().commands > recorded) == AgcDriver::Graphics::Recorder::RecordWorkerEnabled(), "stencil draw selected the wrong worker path");
     if (!pixelResult.stencilReferences.empty()) Require(GraphicsBinds.load() - bindsBefore == 1u, "stencil replay rebound its shader pipeline within an original draw");
 }
 

@@ -4235,14 +4235,26 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             return;
         }
     }
-    if (Graphics::Recorder::RecordWorkerEnabled() && state->checkpointMarker == nullptr && record.shader->program->workgroupMemoryDwords == 0 &&
+    static const bool recordResidentHeapMirrors = Graphics::VramOption("APS5_RESIDENT_HEAP_MIRRORS");
+    if (Graphics::Recorder::RecordWorkerEnabled() && state->checkpointMarker == nullptr && (!recordResidentHeapMirrors || record.shader->program->workgroupMemoryDwords == 0) &&
         (record.dataRefresh == RecordedDispatch::DataRefresh::None || (record.dataRefresh == RecordedDispatch::DataRefresh::Hash && resources.DataWordsHash() == record.dataWordsHash)) &&
-        (argumentImport != nullptr || (record.x <= state->properties.limits.maxComputeWorkGroupCount[0] && record.y <= state->properties.limits.maxComputeWorkGroupCount[1] && record.z <= state->properties.limits.maxComputeWorkGroupCount[2])) &&
-        recorder.TryRecordDispatch(record.objects->pipeline, record.objects->layout, record.objects, record.resources,
+        (argumentImport != nullptr || (record.x <= state->properties.limits.maxComputeWorkGroupCount[0] && record.y <= state->properties.limits.maxComputeWorkGroupCount[1] && record.z <= state->properties.limits.maxComputeWorkGroupCount[2]))) {
+        auto memory = record.shader->program->workgroupMemoryDwords != 0 ? state->WorkgroupMemoryFor(context, record.x, record.y, record.z, record.shader->program->workgroupMemoryDwords) : nullptr;
+        std::function<void()> completion;
+        if (resources.NeedsCompletion() && resources.Reusable()) completion = [kept = record.resources] { kept->CheckFaults(); };
+        else if (resources.NeedsCompletion()) {
+            completion = [kept = record.resources, writers = state->copiedWriters] {
+                writers->erase(std::remove(writers->begin(), writers->end(), kept), writers->end());
+                kept->WriteBackBuffers();
+            };
+        }
+        if (recorder.TryRecordDispatch(record.objects->pipeline, record.objects->layout, record.objects, record.resources,
             record.pushStages != 0 ? std::span<const std::byte>(*record.pushBytes).first(Graphics::ComputePushConstantBytes) : std::span<const std::byte>{},
-            record.x, record.y, record.z, argumentImport != nullptr ? argumentImport->buffer : VK_NULL_HANDLE, argumentImport != nullptr ? arguments - argumentImport->base : 0, arguments)) {
-        recordStep(PhaseRecordBind);
-        return;
+            record.x, record.y, record.z, argumentImport != nullptr ? argumentImport->buffer : VK_NULL_HANDLE, argumentImport != nullptr ? arguments - argumentImport->base : 0, arguments, memory != nullptr ? memory->set : VK_NULL_HANDLE, memory, std::move(completion))) {
+            if (resources.NeedsCompletion() && !resources.Reusable() && resources.HasCopiedWrites()) state->copiedWriters->push_back(record.resources);
+            recordStep(PhaseRecordBind);
+            return;
+        }
     }
     // Whether the last command recorded into the batch left every earlier write visible to this
     // dispatch's reads and writes (a closed label-store run, the previous dispatch's own trailing

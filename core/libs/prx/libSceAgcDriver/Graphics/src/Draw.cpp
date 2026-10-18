@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1706,16 +1707,8 @@ struct RecordedDraw {
     std::vector<std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> stencilReplay;
 };
 
-void recordStencilReplay(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, std::span<const std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> replay, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes = nullptr, VkShaderStageFlags stages = 0) {
+void recordStencilReplayCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, std::span<const std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> replay, std::array<std::byte, PipelinePushConstantBytes> block, VkShaderStageFlags stages, std::uint32_t referenceOffset) {
     State selected = state;
-    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
-    if (bytes == nullptr) {
-        resources.PatchPushConstants(block);
-        stages = PushConstantStages(shaders);
-    }
-    const auto fragment = std::ranges::find_if(shaders, [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Fragment && !shader.program->stencilReferences.empty(); });
-    Require(fragment != shaders.end(), "stencil replay fragment stage is missing");
-    const auto referenceOffset = fragment->pushConstantOffset + fragment->program->stencilReferenceDword * sizeof(std::uint32_t);
     Require(referenceOffset <= block.size() - sizeof(std::uint32_t), "stencil replay reference exceeds the push block");
     const auto run = [&](const Pm4::DrawParameters& piece, std::uint32_t firstIndex) {
         for (const auto& [reference, pipeline] : replay) {
@@ -1744,7 +1737,22 @@ void recordStencilReplay(const Context& context, VkCommandBuffer commands, const
     }
 }
 
-void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, VkDeviceAddress indirectTable = 0, std::uint32_t indirectTableStride = 0) {
+std::uint32_t stencilReferenceOffset(std::span<const CompiledShader> shaders) {
+    const auto fragment = std::ranges::find_if(shaders, [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Fragment && !shader.program->stencilReferences.empty(); });
+    Require(fragment != shaders.end(), "stencil replay fragment stage is missing");
+    return fragment->pushConstantOffset + fragment->program->stencilReferenceDword * sizeof(std::uint32_t);
+}
+
+void recordStencilReplay(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, std::span<const std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> replay, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes = nullptr, VkShaderStageFlags stages = 0) {
+    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
+    if (bytes == nullptr) {
+        resources.PatchPushConstants(block);
+        stages = PushConstantStages(shaders);
+    }
+    recordStencilReplayCommands(context, commands, state, draw, inputs, replay, block, stages, stencilReferenceOffset(shaders));
+}
+
+std::pair<std::array<std::byte, PipelinePushConstantBytes>, VkShaderStageFlags> drawPushConstants(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments, bool restartTable, VkDeviceAddress indirectTable, std::uint32_t indirectTableStride) {
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
         resources.PatchPushConstants(block);
@@ -1764,15 +1772,19 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
         std::memcpy(block.data() + ShaderRecompiler::TessellationLevelPushOffsetBytes, levels.data(), sizeof(levels));
     }
     if (!state.stages.mesh) {
-        pipeline.PushConstants(commands, stages, block);
-        return;
+        return {block, stages};
     }
     const auto firstVertex = draw.indirect ? draw.indirect->vertexConstant : draw.firstVertex;
     const auto firstInstance = draw.indirect ? draw.indirect->instanceConstant : draw.firstInstance;
     const std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4> words{draw.indexCount, firstVertex, firstInstance, draw.indexed ? draw.indexSize | (restartTable ? ShaderRecompiler::MeshIndexRestartTable : 0u) : 0u, static_cast<std::uint32_t>(meshArguments), static_cast<std::uint32_t>(meshArguments >> 32u)};
     static_assert(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes == PipelinePushSlotBytes);
     std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
-    pipeline.PushConstants(commands, stages | VK_SHADER_STAGE_MESH_BIT_EXT, block);
+    return {block, stages | VK_SHADER_STAGE_MESH_BIT_EXT};
+}
+
+void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, VkDeviceAddress indirectTable = 0, std::uint32_t indirectTableStride = 0) {
+    const auto [block, selectedStages] = drawPushConstants(state, draw, shaders, resources, bytes, stages, meshArguments, restartTable, indirectTable, indirectTableStride);
+    pipeline.PushConstants(commands, selectedStages, block);
 }
 
 // The record of a draw whose targets are all resident (`lean`: recorded into the device's open
@@ -1901,7 +1913,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory, inputs.inPlaceReads};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const bool deferred = recorder->CanRecordDraw() && !capture && args == nullptr && !state.stages.mesh && !state.stages.tessellation && record.stencilReplay.empty() && record.proxies.empty() && !record.waited && resources.Reusable() && !resources.NeedsCompletion();
+    static const bool residentHeapMirrors = VramOption("APS5_RESIDENT_HEAP_MIRRORS");
+    const bool deferred = recorder->CanRecordDraw() && !capture && args == nullptr &&
+        (!residentHeapMirrors || (!state.stages.mesh && !state.stages.tessellation && record.stencilReplay.empty() && record.proxies.empty() && !record.waited && resources.Reusable() && !resources.NeedsCompletion()));
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || (args != nullptr && args->runtimeSgprs), fenced, passAccess, deferred);
     resources.BeginGpuWrites(*recorder);
     const bool continued = start.continued;
@@ -1909,14 +1923,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     outcome.passBegun = !continued;
     const auto commands = start.commands;
     if (deferred) {
-        auto push = record.pushBytes != nullptr ? *record.pushBytes : AssemblePushConstants(shaders);
-        const auto stages = record.pushBytes != nullptr ? record.pushStages : PushConstantStages(shaders);
-        if (record.pushBytes == nullptr) resources.PatchPushConstants(push);
+        auto meshArguments = !inputs.restartTable.empty() ? directMeshArguments(context, draw, inputs.restartTable) : nullptr;
+        const auto [push, stages] = drawPushConstants(state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), 0, 0);
+        const auto referenceOffset = record.stencilReplay.empty() ? 0u : stencilReferenceOffset(shaders);
         auto replayContext = context;
         replayContext.recorder = nullptr;
-        recorder->RecordCommand([replayContext, state, draw, inputs, pipeline = record.pipeline, framebuffer = record.framebuffer, resources = record.resources, drawBindings, push, stages, start](VkCommandBuffer commands) {
+        recorder->RecordCommand([replayContext, state, draw, inputs, pipeline = record.pipeline, framebuffer = record.framebuffer, resources = record.resources, drawBindings, push, stages, start, replay = record.stencilReplay, proxies = record.proxies, referenceOffset](VkCommandBuffer commands) {
             if (start.continued) pipeline->Continue(commands, state);
             else {
+                for (const auto& proxy : proxies) proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
                 if (start.barrier) RecordMemoryBarrier(replayContext, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
                     VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -1929,7 +1944,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
                 if (fragmentSet != VK_NULL_HANDLE) replayContext.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
             } else resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
             pipeline->PushConstants(commands, stages, push);
-            recordDrawCommands(replayContext, commands, state, draw, inputs, nullptr, VK_NULL_HANDLE, 0);
+            if (replay.empty()) recordDrawCommands(replayContext, commands, state, draw, inputs, nullptr, VK_NULL_HANDLE, 0);
+            else recordStencilReplayCommands(replayContext, commands, state, draw, inputs, replay, push, stages, referenceOffset);
             if (pipeline->SplitsFaces()) {
                 pipeline->ContinueBackFaces(commands, state);
                 recordDrawCommands(replayContext, commands, state, draw, inputs, nullptr, VK_NULL_HANDLE, 0);
@@ -1940,10 +1956,29 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             }
         });
         if (!continued && start.barrier) countBarrier(1);
-        recorder->LeaveRenderPassOpen(passKey, Recorder::NoTiming, fenced, passAccess);
+        std::function<void(VkCommandBuffer)> storeProxies;
+        if (!continued && !record.proxies.empty()) {
+            countBarrier(static_cast<std::uint32_t>(record.proxies.size()) * 2u);
+            storeProxies = [proxies = record.proxies](VkCommandBuffer passCommands) {
+                for (const auto& proxy : proxies) {
+                    proxy->RecordAttachmentProxyStore(passCommands, VK_IMAGE_LAYOUT_GENERAL);
+                    Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+                }
+            };
+        }
+        if (meshArguments != nullptr) recorder->Keep(meshArguments);
+        for (const auto& [reference, pipeline] : record.stencilReplay) recorder->Keep(pipeline);
+        recorder->LeaveRenderPassOpen(passKey, Recorder::NoTiming, fenced, passAccess, std::move(storeProxies));
         timer.phase(PhaseRecord);
         keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), {}, {}, record.listed, record.completion, outcome);
         timer.phase(PhaseKeep);
+        if (record.waited) {
+            Recorder::CountSync(3);
+            const auto ownBefore = timer.profile ? Recorder::ThreadWaitedMs() : 0.0;
+            recorder->Sync();
+            if (timer.profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;
+            timer.phase(PhaseSync);
+        }
         return;
     }
     if (!continued) recorder->PrepareSampleSlot();
