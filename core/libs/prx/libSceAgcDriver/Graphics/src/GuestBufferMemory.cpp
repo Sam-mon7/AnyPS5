@@ -3953,6 +3953,23 @@ void FinishLazyMirrorFill(Recorder& recorder, const LazyMirrorFill& fill, std::u
     reportLazyWrites();
 }
 
+bool LazyPagesOverlap(std::uint64_t address, std::size_t bytes) {
+    if (!VramLazyWrites() || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    const auto end = address + bytes;
+    auto found = state.entries.upper_bound(address);
+    if (found != state.entries.begin()) --found;
+    for (; found != state.entries.end() && found->first < end; ++found) {
+        const auto& mirror = *found->second;
+        if (mirror.base + mirror.bytes <= address) continue;
+        const auto page = mirror.lazyPages.lower_bound(address & ~std::uint64_t{4095});
+        if (page != mirror.lazyPages.end() && page->first < end) return true;
+    }
+    return false;
+}
+
 void CountLazyImportFill(std::size_t bytes) {
     if (!VramLazyWrites()) return;
     GuestMemory::AssertGpuLockHeld("lazy import fill count");

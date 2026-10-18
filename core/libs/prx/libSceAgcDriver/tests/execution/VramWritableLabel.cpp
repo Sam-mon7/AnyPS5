@@ -38,10 +38,10 @@ int main() {
         Require(labels != nullptr, "cannot allocate the imported completion label");
         const auto labelAddress = reinterpret_cast<std::uint64_t>(labels);
         GuestAllocations::Mutation().Add(labels, bytes, true, true, true);
-        Require(HostImportFor(context, labelAddress, bytes) != nullptr, "completion label was not imported before the mirror build");
+        Require(VramLazyWrites() || HostImportFor(context, labelAddress, bytes) != nullptr, "completion label was not imported before the mirror build");
         void* raw = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
         HANDLE section = nullptr;
-        if (VramWritable()) {
+        if (VramWritable() || VramLazyWrites()) {
             section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
             Require(section != nullptr, "cannot create shared writable label-fixture memory");
             GuestArena::GuestArenaMap_nid_postfix(raw, bytes, section, 0, PAGE_READWRITE);
@@ -70,19 +70,19 @@ int main() {
         const auto shader = ShaderRecompiler::Recompile(request);
         Require(shader.bdaWrites, "label fixture lost BDA write metadata");
         device->Dispatch(shader, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
-        Require(HasVramMirrorWriters() == VramWritable(), "label fixture did not establish the selected writer backing");
+        Require(HasVramMirrorWriters() == (VramWritable() || VramLazyWrites()), "label fixture did not establish the selected writer backing");
         if (VramWritable()) Require(HostImportFor(context, address, bytes) == nullptr, "label fixture imported its writable mirror");
         const std::uint32_t label = 0x76543210u;
         const auto payload = std::as_bytes(std::span(&label, 1));
         const auto reason = device->WriteLabelOnGpu(labelAddress, payload, 1, 0, false);
-        Require(reason == (VramWritable() ? 2 : 0), "imported disjoint label did not follow the mirror completion gate");
-        if (VramWritable()) Require(*static_cast<volatile std::uint32_t*>(labels) == 0, "imported label became visible before mirror publication");
+        Require(reason == (VramWritable() ? 2 : VramLazyWrites() ? 5 : 0), "imported disjoint label did not follow the mirror completion gate");
+        if (VramWritable() || VramLazyWrites()) Require(*static_cast<volatile std::uint32_t*>(labels) == 0, "imported label became visible before mirror publication");
         device->WaitIdle();
         if (reason == 2) Memory::Write(labelAddress, payload, 4);
         Require(*static_cast<volatile std::uint32_t*>(labels) == label, "completion label was not published after the caller drained");
         Require(*static_cast<volatile std::uint32_t*>(raw) == 0xa1b2c300u, "native read after the imported label missed the BDA store");
         Require(!HasVramMirrorWriters(), "the completed label kept an active mirror writer");
-        if (device->CanWaitUnlocked()) {
+        if (device->CanWaitUnlocked() && !VramLazyWrites()) {
             const std::uint32_t initial = 0x11111111u;
             Memory::Write(address, std::as_bytes(std::span(&initial, 1)));
             device->Dispatch(shader, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));

@@ -1969,7 +1969,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
     if (Graphics::PendingStorageOverlaps(address, bytes.size(), nullptr)) return 3;
     auto& recorder = *state->recorder;
-    if (Graphics::VramMirrorWrites() && Graphics::HasVramMirrorWriters()) return 2;
+    if (Graphics::VramMirrorWrites() && !Graphics::VramLazyWrites() && Graphics::HasVramMirrorWriters()) return 2;
     // Batches that already finished are retired before the checks: their completions ran, so they
     // neither keep the recorder busy nor force this label behind a completion. Only for the
     // graphics worker: a reap runs completions (copied write-backs, whose guest stores can re-enter
@@ -1979,6 +1979,11 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
     if (recorder.Idle()) return 1;
+    if (Graphics::VramLazyWrites()) {
+        if (Graphics::LazyPagesOverlap(address, bytes.size())) return 2;
+        recorder.AfterCompletions(address, bytes, stamp, queue, false);
+        return 5;
+    }
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());

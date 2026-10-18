@@ -272,6 +272,7 @@ bool LazyMirrorFillCovers(const Context& context, std::uint64_t address, std::si
 LazyMirrorFill BeginLazyMirrorFill(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes);
 void FinishLazyMirrorFill(Recorder& recorder, const LazyMirrorFill& fill, std::uint64_t address, std::size_t bytes);
 const HostImport* HostImportForFill(const Context& context, std::uint64_t address, std::size_t bytes);
+bool LazyPagesOverlap(std::uint64_t address, std::size_t bytes);
 void CountLazyImportFill(std::size_t bytes);
 void CountLazyCpuFill(std::size_t bytes);
 struct VramCleanupStats {
