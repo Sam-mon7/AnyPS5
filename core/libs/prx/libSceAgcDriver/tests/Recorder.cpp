@@ -25,6 +25,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/Dispatch/PreparedHeapRefresh.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -324,10 +325,15 @@ private:
     }
 
     void release() noexcept {
+        std::lock_guard gpu(GpuMutex());
+        if (context.device != VK_NULL_HANDLE) {
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            DestroyShadows(context.device);
+        }
         if (context.pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, context.pool, nullptr);
         context.bufferPool.reset();
         if (context.device != VK_NULL_HANDLE) {
-            DestroyShadows(context.device);
             function<PFN_vkDestroyDevice>("vkDestroyDevice")(context.device, nullptr);
         }
         if (instance != VK_NULL_HANDLE) function<PFN_vkDestroyInstance>("vkDestroyInstance")(instance, nullptr);
@@ -8586,6 +8592,45 @@ void completionProbeTests(Device& device) {
     std::cout << "Completion probe tests passed\n";
 }
 
+void dispatchHeapTeardownTests(std::unique_ptr<Device>& device) {
+    constexpr std::size_t bytes = 2 * 65536;
+    auto* raw = AllocateWatched(bytes, 65536);
+    Require(raw != nullptr, "dispatch teardown fixture requires watched memory");
+    GuestAllocations::Mutation().Add(raw, bytes, true, true, true);
+    struct Cleanup {
+        void* raw;
+        ~Cleanup() {
+            GuestAllocations::Mutation().Remove(raw);
+            ReleaseWatched(raw, bytes);
+        }
+    } cleanup{raw};
+    std::weak_ptr<BufferPool> retained;
+    struct AbandonedPreparation {};
+    try {
+        std::unique_lock gpu(GpuMutex());
+        auto context = device->GetContext();
+        context.hostImportAlignment = 0;
+        retained = GetBufferPool(context);
+        std::memset(raw, 0x11, bytes);
+        GuestBufferMemory memory(context);
+        memory.AcquireRegistered();
+        memory.Upload(true);
+        auto prepared = CaptureDispatchHeapRefresh(context, [](std::uint64_t, std::size_t) { return false; });
+        Require((prepared != nullptr) == DispatchLockDietEnabled(), "abandoned heap preparation did not follow the switch");
+        gpu.unlock();
+        if (prepared != nullptr) StageDispatchHeapRefresh(*prepared);
+        gpu.lock();
+        throw AbandonedPreparation{};
+    } catch (const AbandonedPreparation&) {}
+    Require(!retained.expired(), "dispatch teardown fixture did not retain its cached heap buffer");
+    {
+        std::lock_guard gpu(GpuMutex());
+        device.reset();
+    }
+    Require(retained.expired(), "a cached heap buffer pool outlived its Vulkan device after abandoned preparation");
+    std::cout << "Abandoned dispatch heap preparation released its buffers before device teardown\n";
+}
+
 int main(int argc, char** argv) {
     struct ProfileStop {
         ~ProfileStop() { AgcDriver::ResourcePhase::Stop(); }
@@ -8638,6 +8683,11 @@ int main(int argc, char** argv) {
 
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-only") {
             descriptorPoolTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--dispatch-heap-teardown-only") {
+            if (!AgcDriver::GuestMemory::WriteWatched()) return 77;
+            dispatchHeapTeardownTests(created);
             return 0;
         }
         std::unique_lock gpu(GpuMutex());

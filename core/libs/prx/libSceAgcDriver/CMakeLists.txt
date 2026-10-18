@@ -1149,6 +1149,11 @@ if(BUILD_TESTING)
                 ENVIRONMENT "${dispatchDietEnvironment};APS5_NO_HOST_IMPORT=1;APS5_NO_RESOURCE_CACHE=1;APS5_LABEL_COMPLETION_FALLBACK=1"
                 ENVIRONMENT_MODIFICATION "${dispatchDietModifications};APS5_NO_TIMELINE=unset:;APS5_NO_PRESYNC=unset:;APS5_LOCKED_BUILD=unset:;APS5_SYNC_DISPATCH=unset:;APS5_SYNC_LEASE_DISPATCH=unset:")
             if(dispatchDietMode STREQUAL "off" OR dispatchDietMode STREQUAL "on")
+                set(dispatchTeardownTest agc_dispatch_heap_teardown_${dispatchDietMode})
+                add_test(NAME ${dispatchTeardownTest} COMMAND agc_driver_recorder_tests --dispatch-heap-teardown-only)
+                set_tests_properties(${dispatchTeardownTest} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+                    ENVIRONMENT "${dispatchDietEnvironment}"
+                    ENVIRONMENT_MODIFICATION "${dispatchDietModifications}")
                 set(dispatchResidentTest agc_dispatch_heap_refresh_resident_${dispatchDietMode})
                 add_test(NAME ${dispatchResidentTest} COMMAND agc_driver_recorder_tests --dispatch-heap-refresh-only)
                 get_test_property(${dispatchDietTest} ENVIRONMENT dispatchDietEnvironment)
