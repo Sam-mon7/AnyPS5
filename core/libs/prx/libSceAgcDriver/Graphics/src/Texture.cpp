@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
@@ -50,7 +51,20 @@ EpochTextureCounts& EpochCounts() {
     return counts;
 }
 bool EpochUploadSupported(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry) {
-    return descriptor.dccAddress == 0 && descriptor.baseAddress % 65536 == 0 && descriptor.tileMode != TextureTileMode::kLinear && !geometry.thick && !IsBlockCompressed(descriptor.format);
+    return descriptor.dccAddress == 0 && (descriptor.tileMode == TextureTileMode::kLinear || descriptor.baseAddress % 65536 == 0) && !geometry.thick && !IsBlockCompressed(descriptor.format);
+}
+std::uint32_t EpochPageOffset(const TextureSwizzleEquation* equation, const GuestTextureResource& descriptor, std::uint32_t elementBytes, std::uint32_t x, std::uint32_t y, std::uint32_t layer) {
+    if (equation != nullptr) {
+        const auto coordinate = (x & 0xfffu) | ((y & 0xfffu) << 12u) | (layer << 24u);
+        auto offset = descriptor.pipeBankXor;
+        for (unsigned bit = 12; bit < 16; ++bit) offset ^= (std::popcount(equation->bits[bit] & coordinate) & 1u) << bit;
+        return offset & 0xf000u;
+    }
+    if (elementBytes == 1) return ((x << 7u) & 0x2000u) ^ ((x << 8u) & 0x8000u) ^ ((y << 6u) & 0x1000u) ^ ((y << 7u) & 0x4000u);
+    if (elementBytes == 2) return ((x << 7u) & 0x2000u) ^ ((x << 8u) & 0x8000u) ^ ((y << 7u) & 0x1000u) ^ ((y << 8u) & 0x4000u);
+    if (elementBytes == 4) return ((x << 8u) & 0x2000u) ^ ((x << 9u) & 0x8000u) ^ ((y << 7u) & 0x1000u) ^ ((y << 8u) & 0x4000u);
+    if (elementBytes == 8) return ((x << 8u) & 0x2000u) ^ ((x << 9u) & 0x8000u) ^ ((y << 8u) & 0x1000u) ^ ((y << 9u) & 0x4000u);
+    return ((x << 9u) & 0x2000u) ^ ((x << 10u) & 0x8000u) ^ ((y << 8u) & 0x1000u) ^ ((y << 9u) & 0x4000u);
 }
 bool EpochRangeAvailable(const Context& context, const GuestTextureResource& descriptor, std::uint64_t bytes) {
     const std::pair<std::uint64_t, std::uint64_t> range{descriptor.baseAddress, descriptor.baseAddress + bytes};
@@ -67,7 +81,7 @@ bool TextureEpoch::Enabled() {
 
 void TextureEpoch::Capture(PageTracker::Range range) {
     token = {};
-    if (Enabled()) if (const auto* tracker = PageTracker::Get()) token = tracker->CaptureEpoch(range);
+    if (Enabled()) if (const auto* tracker = PageTracker::Get()) token = tracker->DirtyPagesSince(range, {}).token;
 }
 
 TextureEpoch::Update TextureEpoch::Check(PageTracker::Range range) const {
@@ -75,31 +89,28 @@ TextureEpoch::Update TextureEpoch::Check(PageTracker::Range range) const {
     if (!Enabled()) return result;
     const auto* tracker = PageTracker::Get();
     if (tracker == nullptr) return result;
-    if (!tracker->DirtySince(range, token)) {
-        result.action = Action::Reuse;
-        return result;
-    }
-    result.token = tracker->CaptureEpoch(range);
+    auto dirty = tracker->DirtyPagesSince(range, token);
+    result.token = std::move(dirty.token);
     if (!result.token.covered) return result;
     result.action = Action::Full;
-    if (!token.covered || token.range != range || token.regions.size() != result.token.regions.size()) return result;
+    if (!dirty.precise) return result;
     std::uint64_t changed = 0;
-    for (std::size_t i = 0; i < token.regions.size(); ++i) {
-        const auto& before = token.regions[i];
-        const auto& after = result.token.regions[i];
-        if (before.regionId != after.regionId || before.mapEpoch != after.mapEpoch || before.gpuEpoch != after.gpuEpoch) {
-            result.runs.clear();
-            return result;
+    for (std::size_t i = 0; i < dirty.regions.size(); ++i) {
+        for (std::size_t word = 0; word < PageTracker::BitmapWords; ++word) {
+            auto bits = dirty.regions[i][word];
+            while (bits != 0) {
+                const auto page = result.token.regions[i].regionId * PageTracker::RegionBytes + (word * 64 + std::countr_zero(bits)) * PageTracker::PageBytes;
+                const auto begin = std::max(range.address, page) - range.address;
+                const auto end = std::min(range.address + range.bytes, page + PageTracker::PageBytes) - range.address;
+                changed += end - begin;
+                if (!result.runs.empty() && result.runs.back().second == begin) result.runs.back().second = end;
+                else result.runs.emplace_back(begin, end);
+                bits &= bits - 1;
+            }
         }
-        if (before.cpuEpoch == after.cpuEpoch) continue;
-        const auto first = std::max(range.address, after.regionId * PageTracker::RegionBytes);
-        const auto begin = first - range.address;
-        const auto end = begin + std::min(PageTracker::RegionBytes - first % PageTracker::RegionBytes, range.bytes - begin);
-        changed += end - begin;
-        if (!result.runs.empty() && result.runs.back().second == begin) result.runs.back().second = end;
-        else result.runs.emplace_back(begin, end);
     }
-    if (changed != 0 && changed <= range.bytes / 2) result.action = Action::Partial;
+    if (changed == 0) result.action = Action::Reuse;
+    else if (changed < range.bytes) result.action = Action::Partial;
     return result;
 }
 
@@ -1792,17 +1803,10 @@ bool StorageTexture::Refresh() {
             if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
             return true;
         }
-        if (update.action == TextureEpoch::Action::Partial && blockUnits && EpochUploadSupported(descriptor, geometry)) {
+        if (update.action == TextureEpoch::Action::Partial && EpochUploadSupported(descriptor, geometry)) {
             for (const auto& [begin, end] : update.runs) {
                 const auto now = GuestMemory::CollectWritesUncached(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
                 for (auto unit = begin / trackedLayerBytes; unit < trackedLayers && unit * trackedLayerBytes < end; ++unit) layerGeneration[unit] = now;
-            }
-            auto nextToken = update.token;
-            const auto collected = PageTracker::Get()->CaptureEpoch(range);
-            nextToken.covered = collected.covered;
-            for (std::size_t i = 0; i < nextToken.regions.size(); ++i) {
-                const auto first = std::max(range.address, nextToken.regions[i].regionId * PageTracker::RegionBytes) - range.address;
-                for (const auto& [begin, end] : update.runs) if (begin <= first && first < end) nextToken.regions[i] = collected.regions[i];
             }
             std::span<const std::byte> snapshot;
             if (original.size() == guestBytes) {
@@ -1811,7 +1815,7 @@ bool StorageTexture::Refresh() {
                 snapshot = original;
             }
             const auto bytes = Texture::UploadEpoch(context, detiler, descriptor, geometry, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, shared_from_this(), update.runs, snapshot);
-            epoch.token = std::move(nextToken);
+            epoch.token = update.token;
             generationBaseline.clear();
             refreshGeneration();
             refreshProof = {};
@@ -2590,12 +2594,14 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<
     return sliceWindows(descriptor, geometry, runs);
 }
 
-std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) {
+std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool pages) {
     const auto& mips = geometry.mips;
     const auto arrayLayers = geometry.layers;
     std::vector<SliceWindow> windows;
     const auto elementBytes = BytesPerElement(descriptor.format);
-    const auto block = ThinBlockLayout(descriptor.tileMode, elementBytes);
+    const bool linear = descriptor.tileMode == TextureTileMode::kLinear;
+    const auto block = linear && pages ? std::array<std::uint32_t, 3>{} : ThinBlockLayout(descriptor.tileMode, elementBytes);
+    const auto* equation = pages && !linear ? FindTextureSwizzleEquation(EquationSwizzleMode(descriptor.tileMode), elementBytes) : nullptr;
     for (const auto& [runBegin, runEnd] : runs) {
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
@@ -2606,7 +2612,34 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(const Gues
                 if (runEnd <= sliceBegin || sliceEnd <= runBegin) continue;
                 SliceWindow window{layer, level, 0, 0, {}, 0, {}};
                 const auto pitch = static_cast<std::uint32_t>(mip.pitchBytes / elementBytes * BlockWidth(descriptor.format));
-                if (mip.tail) {
+                const auto low = std::max(runBegin, sliceBegin) - sliceBegin;
+                const auto high = std::min(runEnd, sliceEnd) - sliceBegin;
+                if (linear && pages) {
+                    const auto firstRow = static_cast<std::uint32_t>(low / mip.pitchBytes);
+                    const auto lastRow = std::min(mip.height, static_cast<std::uint32_t>((high + mip.pitchBytes - 1) / mip.pitchBytes));
+                    window.tiledBegin = sliceBegin + low;
+                    window.tiledEnd = sliceBegin + high;
+                    window.linearBytes = static_cast<std::uint64_t>(lastRow - firstRow) * mip.pitchBytes;
+                    window.window = {static_cast<std::uint32_t>(low), static_cast<std::uint32_t>(high), static_cast<std::uint32_t>(low), firstRow * mip.pitchBytes, window.linearBytes};
+                    window.window.rowBegin = firstRow;
+                    window.window.rowEnd = lastRow;
+                    for (auto row = firstRow; row < lastRow; ++row) {
+                        const auto rowOffset = static_cast<std::uint64_t>(row) * mip.pitchBytes;
+                        const auto x0 = static_cast<std::uint32_t>((std::max(low, rowOffset) - rowOffset) / elementBytes);
+                        const auto x1 = std::min(mip.width, static_cast<std::uint32_t>((std::min(high, rowOffset + mip.pitchBytes) - rowOffset) / elementBytes));
+                        if (x0 >= x1) continue;
+                        VkBufferImageCopy region{};
+                        region.bufferOffset = static_cast<std::uint64_t>(row - firstRow) * mip.pitchBytes + x0 * elementBytes;
+                        region.bufferRowLength = pitch;
+                        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1};
+                        region.imageOffset = {static_cast<std::int32_t>(x0), static_cast<std::int32_t>(row), geometry.CopyDepth(layer)};
+                        region.imageExtent = {x1 - x0, 1, 1};
+                        window.regions.push_back(region);
+                    }
+                    if (!window.regions.empty()) windows.push_back(std::move(window));
+                    continue;
+                }
+                if (mip.tail && (!pages || (low == 0 && high == mip.tiledSize))) {
                     // The tail block holds every tail level: each is moved whole.
                     window.tiledBegin = sliceBegin;
                     window.tiledEnd = sliceEnd;
@@ -2621,9 +2654,7 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(const Gues
                     windows.push_back(std::move(window));
                     continue;
                 }
-                const auto low = std::max(runBegin, sliceBegin) - sliceBegin;
-                const auto high = std::min(runEnd, sliceEnd) - sliceBegin;
-                Require(low % block[0] == 0 && high % block[0] == 0, "storage image window is not tile-block aligned");
+                Require(pages || (low % block[0] == 0 && high % block[0] == 0), "storage image window is not tile-block aligned");
                 const auto firstBlock = low / block[0];
                 const auto lastBlock = (high - 1) / block[0];
                 const auto firstRow = static_cast<std::uint32_t>(firstBlock / mip.blocksPerRow);
@@ -2640,6 +2671,31 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(const Gues
                 if (firstRow == lastRow) {
                     window.window.columnBegin = static_cast<std::uint32_t>(firstBlock - static_cast<std::uint64_t>(firstRow) * mip.blocksPerRow) * block[1];
                     window.window.columnEnd = std::min(mip.width, static_cast<std::uint32_t>(lastBlock - static_cast<std::uint64_t>(firstRow) * mip.blocksPerRow + 1u) * block[1]);
+                }
+                if (pages && (mip.tail || low % block[0] != 0 || high % block[0] != 0)) {
+                    const auto columnBegin = window.window.columnBegin;
+                    const auto columnEnd = window.window.columnEnd != 0 ? window.window.columnEnd : mip.width;
+                    for (auto y = rowBegin; y < rowEnd; ++y) {
+                        auto start = columnEnd;
+                        for (auto x = columnBegin; x <= columnEnd; ++x) {
+                            const auto blockIndex = mip.tail ? 0 : static_cast<std::uint64_t>(y / block[2]) * mip.blocksPerRow + x / block[1];
+                            const auto offset = blockIndex * block[0] + (EpochPageOffset(equation, descriptor, elementBytes, x + (mip.tail ? mip.tailX : 0), y + (mip.tail ? mip.tailY : 0), layer) & (block[0] - 1u));
+                            const bool selected = x < columnEnd && low <= offset && offset < high;
+                            if (selected && start == columnEnd) start = x;
+                            if (selected || start == columnEnd) continue;
+                            VkBufferImageCopy region{};
+                            region.bufferOffset = static_cast<std::uint64_t>(y - rowBegin) * mip.pitchBytes + start * elementBytes;
+                            region.bufferRowLength = pitch;
+                            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1};
+                            region.imageOffset = {static_cast<std::int32_t>(start), static_cast<std::int32_t>(y), geometry.CopyDepth(layer)};
+                            region.imageExtent = {x - start, 1, 1};
+                            if (!window.regions.empty() && window.regions.back().imageOffset.x == region.imageOffset.x && window.regions.back().imageExtent.width == region.imageExtent.width && window.regions.back().imageOffset.y + static_cast<std::int32_t>(window.regions.back().imageExtent.height) == region.imageOffset.y) ++window.regions.back().imageExtent.height;
+                            else window.regions.push_back(region);
+                            start = columnEnd;
+                        }
+                    }
+                    if (!window.regions.empty()) windows.push_back(std::move(window));
+                    continue;
                 }
                 // One region per block row; whole rows merge (a run's middle rows are whole).
                 for (auto row = firstRow; row <= lastRow; ++row) {
@@ -2684,7 +2740,7 @@ bool Texture::RefreshEpoch(const GuestTextureResource& descriptor, std::span<con
 }
 
 std::uint64_t Texture::UploadEpoch(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, const SurfaceGeometry& geometry, VkImage image, VkImageLayout layout, VkImageAspectFlags aspect, std::shared_ptr<void> lifetime, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::byte> snapshot) {
-    const auto windows = StorageTexture::sliceWindows(descriptor, geometry, runs);
+    const auto windows = StorageTexture::sliceWindows(descriptor, geometry, runs, true);
     if (windows.empty()) return 0;
     std::vector<std::uint64_t> tiledPositions, linearPositions;
     std::uint64_t tiledBytes = 0, linearBytes = 0;

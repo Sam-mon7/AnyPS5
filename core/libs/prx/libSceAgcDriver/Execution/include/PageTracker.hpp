@@ -73,6 +73,11 @@ struct Epoch {
     bool covered = false;
     const Tracker* observationTracker = nullptr;
 };
+struct DirtyPages {
+    Epoch token;
+    std::vector<Bitmap> regions;
+    bool precise = false;
+};
 struct ReadBytes { std::uint64_t covered = 0, total = 0; };
 struct Statistics {
     std::array<std::array<ReadBytes, static_cast<std::size_t>(Kind::Count)>, static_cast<std::size_t>(GuestMemory::ReadSite::Count)> reads{};
@@ -95,6 +100,7 @@ public:
     bool Current(Range range, const Observation* observation) const;
     Epoch CaptureEpoch(Range range, const Observation* observation = nullptr) const;
     bool DirtySince(Range range, const Epoch& token, const Observation* observation = nullptr) const;
+    DirtyPages DirtyPagesSince(Range range, const Epoch& token) const;
     void ObserveRead(Range range, GuestMemory::ReadSite site);
     void NotePoll(std::uint64_t pages, std::uint64_t ns, bool complete);
     void ObservePolledPage(Range range);
@@ -108,7 +114,12 @@ private:
     friend Observation PollCpuWrites(std::span<const Range> ranges);
     Observation Observe(std::span<const Range> ranges, Poll poll);
     struct Region {
+        struct PageHistory {
+            std::array<std::uint64_t, RegionPages> cpu{};
+            std::uint64_t invalidated = 0;
+        };
         mutable std::mutex mutex;
+        std::unique_ptr<PageHistory> pages;
         Bitmap cpuDirty{}, gpuDirty{}, observedPrivate{};
         std::array<Bitmap, static_cast<std::size_t>(Reason::Count)> reasons{};
         std::array<Bitmap, static_cast<std::size_t>(Kind::Count)> kinds{};

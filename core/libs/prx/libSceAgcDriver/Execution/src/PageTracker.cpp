@@ -201,6 +201,7 @@ Tracker::Region* Tracker::GetRegion(std::uint64_t id, bool create) const {
 void Tracker::RegisterRange(Range range, Kind kind, Reasons reasons) {
     Visit(range, true, [&](auto, auto offset, auto bytes, auto* region) {
         Advance(region->mapEpoch);
+        if (region->pages != nullptr) region->pages->invalidated = region->mapEpoch;
         Assign(region->cpuDirty, offset, bytes, true);
         Assign(region->gpuDirty, offset, bytes, false);
         for (std::size_t i = 0; i < region->kinds.size(); ++i) Assign(region->kinds[i], offset, bytes, i == static_cast<std::size_t>(kind));
@@ -214,6 +215,7 @@ void Tracker::InvalidateRange(Range range, bool unmapped) {
     Visit(range, true, [&](auto, auto offset, auto bytes, auto* region) {
         if (region == nullptr) return;
         Advance(region->mapEpoch);
+        if (region->pages != nullptr) region->pages->invalidated = region->mapEpoch;
         Assign(region->reasons[static_cast<std::size_t>(unmapped ? Reason::Unmapped : Reason::Unsupported)], offset, bytes, true);
         if (unmapped) {
             for (std::size_t i = 0; i < region->kinds.size(); ++i) Assign(region->kinds[i], offset, bytes, i == static_cast<std::size_t>(Kind::Unknown));
@@ -226,6 +228,14 @@ void Tracker::SetCoverage(Range range, Reasons reasons) {
         if (region == nullptr) return;
         const bool privatePoll = ProofsEnabled() && (reasons & Bit(Reason::PrivateWatch)) != 0;
         bool changed = false;
+        bool pageHistoryChanged = false;
+        if (region->pages != nullptr) {
+            for (auto page = offset / PageBytes; page < (offset + bytes + PageBytes - 1) / PageBytes; ++page) {
+                const auto before = PageReasons(*region, page);
+                const auto after = reasons | (before & (Bit(Reason::ExcludedImport) | Bit(Reason::PendingGpu)));
+                if ((before & ~Bit(Reason::OpenWriter)) != (after & ~Bit(Reason::OpenWriter)) || ((before & Bit(Reason::OpenWriter)) == 0 && (after & Bit(Reason::OpenWriter)) != 0)) pageHistoryChanged = true;
+            }
+        }
         for (std::size_t i = 0; i < region->reasons.size(); ++i) {
             if (i == static_cast<std::size_t>(Reason::ExcludedImport)) continue;
             if (i == static_cast<std::size_t>(Reason::PendingGpu) && (reasons & Bit(Reason::PendingGpu)) == 0) continue;
@@ -235,7 +245,8 @@ void Tracker::SetCoverage(Range range, Reasons reasons) {
         }
         if (offset % PageBytes != 0) Assign(region->reasons[static_cast<std::size_t>(Reason::Unsupported)], offset, 1, true);
         if ((offset + bytes) % PageBytes != 0) Assign(region->reasons[static_cast<std::size_t>(Reason::Unsupported)], offset + bytes - 1, 1, true);
-        if (!privatePoll || changed) Advance(region->mapEpoch);
+        if (!privatePoll || changed || pageHistoryChanged) Advance(region->mapEpoch);
+        if (pageHistoryChanged) region->pages->invalidated = region->mapEpoch;
     });
 }
 
@@ -243,6 +254,7 @@ void Tracker::ExcludeImport(Range range) {
     Visit(range, true, [&](auto, auto offset, auto bytes, auto* region) {
         if (region == nullptr) return;
         Advance(region->mapEpoch);
+        if (region->pages != nullptr) region->pages->invalidated = region->mapEpoch;
         Assign(region->reasons[static_cast<std::size_t>(Reason::ExcludedImport)], offset, bytes, true);
     });
 }
@@ -252,6 +264,9 @@ void Tracker::MarkCpuWritten(Range range, Source source) {
     Visit(range, source != Source::SectionFault && source != Source::HostWrite, [&](auto, auto offset, auto bytes, auto* region) {
         if (region == nullptr) return;
         Advance(region->cpuEpoch);
+        if (region->pages != nullptr) {
+            for (auto page = offset / PageBytes; page < (offset + bytes + PageBytes - 1) / PageBytes; ++page) region->pages->cpu[page] = region->cpuEpoch;
+        }
         Assign(region->cpuDirty, offset, bytes, true);
         if (ArmEnabled() && source == Source::PrivatePoll) Words(offset, bytes, [&](auto word, auto mask) {
             uniquePolled += std::popcount(mask & ~region->observedPrivate[word]);
@@ -369,6 +384,45 @@ bool Tracker::DirtySince(Range range, const Epoch& token, const Observation* obs
     return !current.covered || current.regions != token.regions;
 }
 
+DirtyPages Tracker::DirtyPagesSince(Range range, const Epoch& token) const {
+    DirtyPages result;
+    result.token = {range, {}, range.Valid() && !Poisoned()};
+    result.precise = token.covered && token.range == range;
+    std::size_t index = 0;
+    Visit(range, false, [&](auto id, auto offset, auto bytes, auto* region) {
+        auto& dirty = result.regions.emplace_back();
+        if (region == nullptr) {
+            result.token.regions.push_back({id});
+            result.token.covered = result.precise = false;
+            Assign(dirty, offset, bytes, true);
+            ++index;
+            return;
+        }
+        result.token.regions.push_back({id, region->mapEpoch, region->cpuEpoch, region->gpuEpoch});
+        if (region->mapEpoch == 0 || region->cpuEpoch == 0 || region->gpuEpoch == 0) result.token.covered = false;
+        const bool hasHistory = region->pages != nullptr;
+        if (!hasHistory) {
+            region->pages = std::make_unique<Region::PageHistory>();
+            region->pages->cpu.fill(region->cpuEpoch);
+            region->pages->invalidated = region->mapEpoch;
+        }
+        const auto before = index < token.regions.size() ? token.regions[index] : RegionToken{};
+        const bool known = token.covered && token.range == range && before.regionId == id && before.mapEpoch != 0 &&
+            before.mapEpoch >= region->pages->invalidated && before.mapEpoch <= region->mapEpoch &&
+            before.cpuEpoch != 0 && before.cpuEpoch <= region->cpuEpoch && before.gpuEpoch == region->gpuEpoch &&
+            (hasHistory || before.cpuEpoch == region->cpuEpoch);
+        if (!known) result.precise = false;
+        for (auto page = offset / PageBytes; page < (offset + bytes + PageBytes - 1) / PageBytes; ++page) {
+            const bool covered = Covered(PageReasons(*region, page), true);
+            if (!covered) result.token.covered = false;
+            if (!known || !covered || region->pages->cpu[page] > before.cpuEpoch) dirty[page / 64] |= 1ull << (page % 64);
+        }
+        ++index;
+    });
+    result.precise = result.precise && result.token.covered && token.regions.size() == index;
+    return result;
+}
+
 void Tracker::ObserveRead(Range range, GuestMemory::ReadSite site) {
     if (static_cast<std::size_t>(site) >= counts.reads.size()) site = GuestMemory::ReadSite::Unknown;
     std::array<ReadBytes, static_cast<std::size_t>(Kind::Count)> read{};
@@ -436,6 +490,11 @@ Statistics Tracker::Counts() const {
     result.regions = directory.size();
     result.metadataBytes = sizeof(*this) + directory.size() * (sizeof(Region) + sizeof(decltype(directory)::value_type) + 4 * sizeof(void*));
     if (!ProofsEnabled()) result.metadataBytes -= sizeof(observationSerial);
+    for (const auto& [id, region] : directory) {
+        std::lock_guard regionLock(region->mutex);
+        if (region->pages != nullptr) result.metadataBytes += sizeof(*region->pages);
+        else result.metadataBytes -= sizeof(region->pages);
+    }
     if (!ArmEnabled()) {
         constexpr auto armCountBytes = 3 * sizeof(std::uint64_t) + sizeof(ReadBytes) * static_cast<std::size_t>(GuestMemory::ReadSite::Count);
         constexpr auto armRegionBytes = 2 * sizeof(Bitmap);
