@@ -792,10 +792,23 @@ void vramDescriptorSparseGrowthTests(const Device& device, Recorder& recorder) {
         prepared->UploadPrepare(false);
         const auto beforeRefusal = VramDescriptorCounters();
         bool refused = false;
-        try { static_cast<void>(tail(heldTailAt)); }
+        std::shared_ptr<GuestBufferMemory> fallback;
+        try { fallback = tail(heldTailAt); }
         catch (const std::runtime_error& error) { refused = std::string_view(error.what()).find("prepared or uploaded build") != std::string_view::npos; }
-        Require(refused && VramDescriptorCounters().cpuCopies == beforeRefusal.cpuCopies,
-                "sparse mirror growth under a prepared owner silently used a CPU fallback");
+        if (VramWritable()) {
+            Require(refused && VramDescriptorCounters().cpuCopies == beforeRefusal.cpuCopies,
+                    "sparse mirror growth under a prepared owner silently used a CPU fallback");
+        } else {
+            const auto counted = VramDescriptorCounters();
+            Require(!refused && fallback != nullptr && counted.resizeFallbacks > beforeRefusal.resizeFallbacks && counted.mixedSpans > beforeRefusal.mixedSpans &&
+                    counted.backedCopies > beforeRefusal.backedCopies && counted.cpuCopies > beforeRefusal.cpuCopies,
+                    "sparse mirror growth under a prepared owner did not fall back to a counted CPU copy");
+            const auto fallbackTail = read(fallback, address + heldTailAt);
+            Require(std::all_of(fallbackTail.begin(), fallbackTail.end(), [](std::byte value) { return value == std::byte{}; }) &&
+                    read(fallback, address)[0] == std::byte{0x77} && read(fallback, address + grownAt)[0] == std::byte{0x66},
+                    "sparse mirror growth fallback copied stale or missing heap bytes");
+            fallback->WriteBack();
+        }
         prepared->UploadFinish(false);
         Require(read(prepared, address)[0] == std::byte{0x77}, "refused sparse growth invalidated its prepared owner");
         prepared->WriteBack();

@@ -238,7 +238,9 @@ struct VramDescriptorStats {
     std::uint64_t sparseResizes = 0;
     std::uint64_t recorderSyncs = 0;
     std::uint64_t resultSyncs = 0;
-    std::uint64_t mixedRefusals = 0;
+    std::uint64_t mixedSpans = 0;
+    std::uint64_t resizeFallbacks = 0;
+    std::uint64_t backedCopies = 0;
 };
 VramDescriptorStats VramDescriptorCounters();
 struct VramWritableStats {

@@ -275,12 +275,14 @@ void countDescriptors(const VramDescriptorStats& added) {
     total.sparseResizes += added.sparseResizes;
     total.recorderSyncs += added.recorderSyncs;
     total.resultSyncs += added.resultSyncs;
-    total.mixedRefusals += added.mixedRefusals;
+    total.mixedSpans += added.mixedSpans;
+    total.resizeFallbacks += added.resizeFallbacks;
+    total.backedCopies += added.backedCopies;
     const auto now = std::chrono::steady_clock::now();
     if (now - counts.lastReport < std::chrono::seconds(10)) return;
     const auto& seen = counts.seen;
     std::fprintf(stderr, "[vram-descriptors] (10 s): mirrors %llu, GPU copies %llu, imports %llu, CPU copies %llu; references %.1f MiB, results %.1f MiB, write-back %.1f MiB in %.3f ms\n", static_cast<unsigned long long>(total.mirrorRegions - seen.mirrorRegions), static_cast<unsigned long long>(total.gpuCopies - seen.gpuCopies), static_cast<unsigned long long>(total.importedRegions - seen.importedRegions), static_cast<unsigned long long>(total.cpuCopies - seen.cpuCopies), (total.referenceBytes - seen.referenceBytes) / 1048576.0, (total.resultBytes - seen.resultBytes) / 1048576.0, (total.writeBackBytes - seen.writeBackBytes) / 1048576.0, (total.writeBackUs - seen.writeBackUs) / 1000.0);
-    std::fprintf(stderr, "[vram-descriptors] refresh blocks %llu, sparse resizes %llu, recorder syncs %llu, result-copy waits %llu, mixed spans refused %llu\n", static_cast<unsigned long long>(total.refreshBlocks - seen.refreshBlocks), static_cast<unsigned long long>(total.sparseResizes - seen.sparseResizes), static_cast<unsigned long long>(total.recorderSyncs - seen.recorderSyncs), static_cast<unsigned long long>(total.resultSyncs - seen.resultSyncs), static_cast<unsigned long long>(total.mixedRefusals - seen.mixedRefusals));
+    std::fprintf(stderr, "[vram-descriptors] refresh blocks %llu, sparse resizes %llu, recorder syncs %llu, result-copy waits %llu, mixed spans %llu, resize fallbacks %llu, mirror-backed CPU copies %llu\n", static_cast<unsigned long long>(total.refreshBlocks - seen.refreshBlocks), static_cast<unsigned long long>(total.sparseResizes - seen.sparseResizes), static_cast<unsigned long long>(total.recorderSyncs - seen.recorderSyncs), static_cast<unsigned long long>(total.resultSyncs - seen.resultSyncs), static_cast<unsigned long long>(total.mixedSpans - seen.mixedSpans), static_cast<unsigned long long>(total.resizeFallbacks - seen.resizeFallbacks), static_cast<unsigned long long>(total.backedCopies - seen.backedCopies));
     counts.seen = total;
     counts.lastReport = now;
 }
@@ -2272,6 +2274,10 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             std::erase_if(blocks, [&](const auto& block) { return block.mirror == replaced.get(); });
             Spaces().current.store(nullptr);
             if (auto* recorder = Recorder::Active()) {
+                if (Recorder::InCompletion() && !VramWritable()) {
+                    countDescriptors({.resizeFallbacks = 1});
+                    return nullptr;
+                }
                 Require(!Recorder::InCompletion(), "cannot resize a sparse mirror during completion");
                 countDescriptors({.recorderSyncs = 1});
                 recorder->Sync();
@@ -2279,6 +2285,10 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             }
             FlushHeapMirrorWrites(replaced->base, static_cast<std::size_t>(replaced->bytes), true);
             std::lock_guard lock(state.mutex);
+            if (replaced->activeUsers.load(std::memory_order_acquire) != 0 && !VramWritable()) {
+                countDescriptors({.resizeFallbacks = 1});
+                return nullptr;
+            }
             Require(replaced->activeUsers.load(std::memory_order_acquire) == 0, "cannot resize a sparse mirror while a prepared or uploaded build still holds it");
         }
     }
@@ -4425,15 +4435,30 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     const auto refreshDescriptorMirror = [&](ImageMirror& mirror, std::uint64_t begin, std::uint64_t bytes) {
         if (VramDescriptors() && mirror.heap && mirror.sparse) {
             std::vector<RefreshBlock> blocks;
-            Require(refreshSparseMirror(mirror, blocks), "a descriptor sparse mirror grew during upload");
+            if (!refreshSparseMirror(mirror, blocks)) {
+                Require(!VramWritable(), "a descriptor sparse mirror grew during upload");
+                countDescriptors({.resizeFallbacks = 1});
+                return false;
+            }
             compareBlocks(blocks);
         } else refreshMirror(mirror, begin, bytes);
+        return true;
     };
     // One clock pair around the loop (an address-based build has ~1200 regions): the [buffers]
     // 'import lookup' is the loop less the mirror refreshes and the CPU copies, timed apart.
     const auto loopStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::uint64_t refreshUs = 0;
     std::uint64_t copyUs = 0;
+    const auto copyFallback = [&](Region& region) {
+        if (region.deviceLocal) {
+            region.buffer.reset();
+            region.deviceLocal = false;
+        }
+        region.direct = nullptr;
+        const auto copyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        copyRegion(region, addressable);
+        if (profile) copyUs += microsecondsSince(copyStart);
+    };
     for (auto& region : regions) {
         if (region.mirror == nullptr && mirrorBackingOverlaps(context.device, region.begin, region.end)) region.pending = true;
         if (!region.pending) continue;
@@ -4463,8 +4488,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // Read-only mirrors are never written back; a writable one is diffed for this sub-range
             // at write-back.
             const auto refreshStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            refreshDescriptorMirror(*region.mirror, region.begin, bytes);
-            if (VramDescriptors() && !bindableInPlace(region.begin - region.mirror->base, addressable)) {
+            const bool refreshed = refreshDescriptorMirror(*region.mirror, region.begin, bytes);
+            if (refreshed && VramDescriptors() && !bindableInPlace(region.begin - region.mirror->base, addressable)) {
                 region.copySource = region.mirror->buffer->Handle();
                 region.copySourceBase = region.mirror->base;
                 region.gpuCopy = true;
@@ -4472,6 +4497,11 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 gpuCopies.push_back(&region);
             }
             if (profile) refreshUs += microsecondsSince(refreshStart);
+            if (refreshed) continue;
+            region.mirror.reset();
+            region.mirrorLease.reset();
+            region.subrangeMirror = false;
+            copyFallback(region);
             continue;
         }
         if (sparseHeapCandidate(region)) {
@@ -4501,15 +4531,26 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             }
             if (!region.mirrorPieces.empty()) {
                 auto cursor = region.begin;
+                bool contiguous = true;
                 for (const auto& piece : region.mirrorPieces) {
-                    if (piece.begin != cursor) countDescriptors({.mixedRefusals = 1});
-                    Require(piece.begin == cursor, "a descriptor spans mirror-backed and non-mirror-backed memory");
-                    holdMirror(piece.mirror);
-                    refreshDescriptorMirror(*piece.mirror, piece.begin, piece.end - piece.begin);
+                    contiguous = contiguous && piece.begin == cursor;
                     cursor = piece.end;
                 }
-                if (cursor != region.end) countDescriptors({.mixedRefusals = 1});
-                Require(cursor == region.end, "a descriptor spans mirror-backed and non-mirror-backed memory");
+                bool served = contiguous && cursor == region.end;
+                if (!served) {
+                    countDescriptors({.mixedSpans = 1});
+                    Require(!VramWritable(), "a descriptor spans mirror-backed and non-mirror-backed memory");
+                }
+                for (const auto& piece : region.mirrorPieces) {
+                    if (!served) break;
+                    holdMirror(piece.mirror);
+                    served = refreshDescriptorMirror(*piece.mirror, piece.begin, piece.end - piece.begin);
+                }
+                if (!served) {
+                    region.mirrorPieces.clear();
+                    copyFallback(region);
+                    continue;
+                }
                 region.direct = nullptr;
                 region.buffer.reset();
                 region.deviceLocal = true;
@@ -4661,7 +4702,10 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
 }
 
 void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
-    Require(!mirrorBackingOverlaps(context.device, region.begin, region.end), "a mirror-backed descriptor could not be served; refusing a stale CPU copy");
+    if (mirrorBackingOverlaps(context.device, region.begin, region.end)) {
+        Require(!VramWritable(), "a mirror-backed descriptor could not be served; refusing a stale CPU copy");
+        countDescriptors({.backedCopies = 1});
+    }
     if (VramCleanup() && HostImportCovers(context, region.begin, static_cast<std::size_t>(region.end - region.begin))) countImportedCopy();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool noReuse = std::getenv("APS5_NO_READONLY_FALLBACK_REUSE") != nullptr;
