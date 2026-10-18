@@ -901,6 +901,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
+    bool epochFallbackCounted = false;
+    const auto countEpochFallback = [&] {
+        if (!std::exchange(epochFallbackCounted, true)) TextureEpoch::Count(TextureEpoch::Action::Fallback, 0, &resource);
+    };
     if (TextureEpoch::Enabled() && !disabled && resource.dccAddress == 0) {
         const std::pair<std::uint64_t, std::uint64_t> range{address, address + guestBytes};
         if (!MirrorSourceCovers(context, address, bytes) && !AnyShadowedOverlaps(address, bytes) && !Recorder::SnapshotWriteOverlaps(address, bytes) && !StorageTexture::AnyPendingOverlaps(std::span(&range, 1))) {
@@ -916,7 +920,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                         cache.snapshotBytes -= it->bytes.capacity();
                         if (!it->bytes.empty()) cache.omittedSnapshotBytes += it->surfaceBytes;
                         spareSnapshot(cache, std::exchange(it->bytes, {}));
-                    } else TextureEpoch::Count(TextureEpoch::Action::Reuse);
+                    } else TextureEpoch::Count(TextureEpoch::Action::Reuse, 0, &resource);
                     touchTexture(cache, it);
                     logLookup({it->texture.get(), resource, guestBytes, DccKeys::Uncompressed, it->generation, nullptr});
                     reportTextureCounters();
@@ -1001,6 +1005,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         keys.reset();
     }
     if (!keys.has_value()) keys = scanKeys();
+    if (TextureEpoch::Enabled() && source == nullptr && resource.dccAddress != 0) countEpochFallback();
     const auto mirror = source == nullptr && *keys == DccKeys::Uncompressed ? MirrorSourceFor(context, address, bytes) : std::nullopt;
     if (disabled) {
         if (source != nullptr && depthCompare) {
@@ -1070,7 +1075,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 const auto update = available ? it->epoch.Check({address, guestBytes}) : TextureEpoch::Update{};
                 if (update.action == TextureEpoch::Action::Reuse) {
                     epochReused = true;
-                    TextureEpoch::Count(TextureEpoch::Action::Reuse);
+                    TextureEpoch::Count(TextureEpoch::Action::Reuse, 0, &resource);
                 } else if (update.action == TextureEpoch::Action::Partial && it->texture->RefreshEpoch(resource, update.runs)) {
                     it->epoch.token = update.token;
                     cache.snapshotBytes -= it->bytes.capacity();
@@ -1078,9 +1083,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                     spareSnapshot(cache, std::exchange(it->bytes, {}));
                     epochReused = true;
                 } else if (update.action != TextureEpoch::Action::Fallback) {
+                    if (update.action == TextureEpoch::Action::Partial) countEpochFallback();
                     epochDirty = true;
                 } else {
-                    TextureEpoch::Count(TextureEpoch::Action::Fallback);
+                    countEpochFallback();
                 }
             }
             if (epochReused || (!epochDirty && ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || equalsCommitted()))) {
@@ -1142,9 +1148,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
     if (TextureEpoch::Enabled() && source == nullptr) {
-        TextureEpoch::Count(TextureEpoch::Action::Full, guestBytes);
+        TextureEpoch::Count(TextureEpoch::Action::Full, guestBytes, &resource);
         if (entry.epoch.token.covered && !PageTracker::Get()->DirtySince({address, guestBytes}, entry.epoch.token)) spareSnapshot(cache, std::exchange(entry.bytes, {}));
-        else if (!entry.epoch.token.covered) TextureEpoch::Count(TextureEpoch::Action::Fallback);
+        else if (!entry.epoch.token.covered) countEpochFallback();
     }
     if (TextureDedupe()) dropSupersededTextures(cache, key, address, entry.bytes);
     const auto budget = sampledBudget(context, cache);

@@ -43,6 +43,8 @@ namespace AgcDriver::Graphics {
 namespace {
 struct EpochTextureCounts {
     std::atomic<std::uint64_t> reuse{0}, partial{0}, full{0}, bytes{0}, fallback{0};
+    std::array<std::atomic<std::uint64_t>, 4> storage{};
+    std::atomic<std::uint64_t> linear{0}, tiled{0}, thick{0}, bc{0}, dcc{0}, alignment{0}, unavailable{0};
     std::mutex reportMutex;
     std::chrono::steady_clock::time_point reported{};
 };
@@ -50,8 +52,8 @@ EpochTextureCounts& EpochCounts() {
     static EpochTextureCounts counts;
     return counts;
 }
-bool EpochUploadSupported(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry) {
-    return descriptor.dccAddress == 0 && (descriptor.tileMode == TextureTileMode::kLinear || descriptor.baseAddress % 65536 == 0) && !geometry.thick && !IsBlockCompressed(descriptor.format);
+bool EpochUploadSupported(const GuestTextureResource& descriptor) {
+    return descriptor.dccAddress == 0 && (descriptor.tileMode == TextureTileMode::kLinear || descriptor.baseAddress % 65536 == 0);
 }
 std::uint32_t EpochPageOffset(const TextureSwizzleEquation* equation, const GuestTextureResource& descriptor, std::uint32_t elementBytes, std::uint32_t x, std::uint32_t y, std::uint32_t layer) {
     if (equation != nullptr) {
@@ -116,14 +118,27 @@ TextureEpoch::Update TextureEpoch::Check(PageTracker::Range range) const {
 
 std::string TextureEpoch::ProfileLine() {
     const auto& counts = EpochCounts();
-    return "[epoch-textures] cumulative: reuse-proof=" + std::to_string(counts.reuse.load(std::memory_order_relaxed)) +
+    auto line = "[epoch-textures] cumulative: reuse-proof=" + std::to_string(counts.reuse.load(std::memory_order_relaxed)) +
         " partial=" + std::to_string(counts.partial.load(std::memory_order_relaxed)) +
         " full=" + std::to_string(counts.full.load(std::memory_order_relaxed)) +
         " bytes-uploaded=" + std::to_string(counts.bytes.load(std::memory_order_relaxed)) +
         " fallbacks=" + std::to_string(counts.fallback.load(std::memory_order_relaxed));
+    if (!Enabled()) return line;
+    return line +
+        " storage-reuse=" + std::to_string(counts.storage[static_cast<std::size_t>(Action::Reuse)].load(std::memory_order_relaxed)) +
+        " storage-partial=" + std::to_string(counts.storage[static_cast<std::size_t>(Action::Partial)].load(std::memory_order_relaxed)) +
+        " storage-full=" + std::to_string(counts.storage[static_cast<std::size_t>(Action::Full)].load(std::memory_order_relaxed)) +
+        " storage-fallback=" + std::to_string(counts.storage[static_cast<std::size_t>(Action::Fallback)].load(std::memory_order_relaxed)) +
+        " partial-linear=" + std::to_string(counts.linear.load(std::memory_order_relaxed)) +
+        " partial-tiled=" + std::to_string(counts.tiled.load(std::memory_order_relaxed)) +
+        " partial-thick=" + std::to_string(counts.thick.load(std::memory_order_relaxed)) +
+        " partial-bc=" + std::to_string(counts.bc.load(std::memory_order_relaxed)) +
+        " fallback-dcc-metadata=" + std::to_string(counts.dcc.load(std::memory_order_relaxed)) +
+        " fallback-tiled-base-alignment=" + std::to_string(counts.alignment.load(std::memory_order_relaxed)) +
+        " fallback-unavailable=" + std::to_string(counts.unavailable.load(std::memory_order_relaxed));
 }
 
-void TextureEpoch::Count(Action action, std::uint64_t bytes) {
+void TextureEpoch::Count(Action action, std::uint64_t bytes, const GuestTextureResource* descriptor, bool storage) {
     if (!Enabled()) return;
     auto& counts = EpochCounts();
     switch (action) {
@@ -131,6 +146,18 @@ void TextureEpoch::Count(Action action, std::uint64_t bytes) {
         case Action::Partial: counts.partial.fetch_add(1, std::memory_order_relaxed); break;
         case Action::Full: counts.full.fetch_add(1, std::memory_order_relaxed); break;
         case Action::Fallback: counts.fallback.fetch_add(1, std::memory_order_relaxed); break;
+    }
+    if (storage) counts.storage[static_cast<std::size_t>(action)].fetch_add(1, std::memory_order_relaxed);
+    if (action == Action::Partial && descriptor != nullptr) {
+        if (descriptor->tileMode == TextureTileMode::kLinear) counts.linear.fetch_add(1, std::memory_order_relaxed);
+        else if (descriptor->dimension == TextureDimension::k3D && descriptor->tileMode != TextureTileMode::kZ64KBX && descriptor->tileMode != TextureTileMode::kR64KBX) counts.thick.fetch_add(1, std::memory_order_relaxed);
+        else counts.tiled.fetch_add(1, std::memory_order_relaxed);
+        if (IsBlockCompressed(descriptor->format)) counts.bc.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (action == Action::Fallback) {
+        auto& reason = descriptor != nullptr && descriptor->dccAddress != 0 ? counts.dcc :
+            descriptor != nullptr && !EpochUploadSupported(*descriptor) ? counts.alignment : counts.unavailable;
+        reason.fetch_add(1, std::memory_order_relaxed);
     }
     counts.bytes.fetch_add(bytes, std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
@@ -1799,11 +1826,11 @@ bool StorageTexture::Refresh() {
         const auto update = available ? epoch.Check(range) : TextureEpoch::Update{};
         if (update.action == TextureEpoch::Action::Reuse) {
             NoteProved();
-            TextureEpoch::Count(TextureEpoch::Action::Reuse);
+            TextureEpoch::Count(TextureEpoch::Action::Reuse, 0, &descriptor, true);
             if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
             return true;
         }
-        if (update.action == TextureEpoch::Action::Partial && EpochUploadSupported(descriptor, geometry)) {
+        if (update.action == TextureEpoch::Action::Partial && EpochUploadSupported(descriptor)) {
             for (const auto& [begin, end] : update.runs) {
                 const auto now = GuestMemory::CollectWritesUncached(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
                 for (auto unit = begin / trackedLayerBytes; unit < trackedLayers && unit * trackedLayerBytes < end; ++unit) layerGeneration[unit] = now;
@@ -1814,23 +1841,33 @@ bool StorageTexture::Refresh() {
                 for (const auto& [begin, end] : update.runs) GuestMemory::ReadCommitted(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
                 snapshot = original;
             }
+            if (generationBaseline.size() == guestBytes) {
+                const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
+                for (const auto& [begin, end] : update.runs) {
+                    const auto target = std::span(generationBaseline).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin));
+                    if (snapshot.empty()) GuestMemory::ReadCommitted(descriptor.baseAddress + begin, target);
+                    else std::memcpy(target.data(), snapshot.data() + begin, target.size());
+                }
+                if (snapshot.empty()) snapshot = generationBaseline;
+            }
             const auto bytes = Texture::UploadEpoch(context, detiler, descriptor, geometry, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, shared_from_this(), update.runs, snapshot);
             epoch.token = update.token;
-            generationBaseline.clear();
+            comparedGuestBytes = {};
             refreshGeneration();
             refreshProof = {};
             forgetBorrowed(0, trackedLayers);
             ++version;
             NoteProved();
-            TextureEpoch::Count(TextureEpoch::Action::Partial, bytes);
+            TextureEpoch::Count(TextureEpoch::Action::Partial, bytes, &descriptor, true);
             return false;
         }
         if (update.action == TextureEpoch::Action::Full || update.action == TextureEpoch::Action::Partial) {
+            if (update.action == TextureEpoch::Action::Partial) TextureEpoch::Count(TextureEpoch::Action::Fallback, 0, &descriptor, true);
             upload();
             NoteProved();
             return false;
         }
-        TextureEpoch::Count(TextureEpoch::Action::Fallback);
+        TextureEpoch::Count(TextureEpoch::Action::Fallback, 0, &descriptor, true);
     }
     if (MirrorSourceCovers(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && ProvedKeys() == DccKeys::Uncompressed) {
         if (anyLayerPending() && !otherPendingOverlaps() && MirrorSourceUnchanged(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), mirrorProof, generation)) {
@@ -2288,7 +2325,7 @@ void StorageTexture::upload(const std::vector<bool>* layers, const MirrorSource*
     const auto finishEpoch = [&](std::uint64_t bytes) {
         if (!TextureEpoch::Enabled()) return;
         epoch = std::move(nextEpoch);
-        TextureEpoch::Count(bytes != 0 && bytes < guestBytes ? TextureEpoch::Action::Partial : TextureEpoch::Action::Full, bytes);
+        TextureEpoch::Count(layers != nullptr && bytes != 0 ? TextureEpoch::Action::Partial : TextureEpoch::Action::Full, bytes, &descriptor, true);
     };
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
     const auto elementBytes = BytesPerElement(descriptor.format);
@@ -2600,8 +2637,14 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(const Gues
     std::vector<SliceWindow> windows;
     const auto elementBytes = BytesPerElement(descriptor.format);
     const bool linear = descriptor.tileMode == TextureTileMode::kLinear;
-    const auto block = linear && pages ? std::array<std::uint32_t, 3>{} : ThinBlockLayout(descriptor.tileMode, elementBytes);
-    const auto* equation = pages && !linear ? FindTextureSwizzleEquation(EquationSwizzleMode(descriptor.tileMode), elementBytes) : nullptr;
+    auto block = linear && pages ? std::array<std::uint32_t, 3>{} : ThinBlockLayout(descriptor.tileMode, elementBytes);
+    auto mode = EquationSwizzleMode(descriptor.tileMode);
+    if (pages && geometry.thick) {
+        const auto extent = ThickBlockExtent(descriptor.tileMode, elementBytes);
+        block = {descriptor.tileMode == TextureTileMode::kStandard4KB ? 4096u : 65536u, extent[0], extent[1]};
+        mode = descriptor.tileMode == TextureTileMode::kStandard4KB ? 0x105u : descriptor.tileMode == TextureTileMode::kStandard64KB ? 0x109u : descriptor.tileMode == TextureTileMode::kS64KBX ? 0x119u : 0x11au;
+    }
+    const auto* equation = pages && !linear ? FindTextureSwizzleEquation(mode, elementBytes) : nullptr;
     for (const auto& [runBegin, runEnd] : runs) {
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
@@ -2726,16 +2769,28 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(const Gues
             }
         }
     }
+    if (pages && IsBlockCompressed(descriptor.format)) {
+        for (auto& window : windows) {
+            const auto width = std::max(descriptor.width >> window.level, 1u);
+            const auto height = std::max(descriptor.height >> window.level, 1u);
+            for (auto& region : window.regions) {
+                region.imageOffset.x *= BlockWidth(descriptor.format);
+                region.imageOffset.y *= BlockHeight(descriptor.format);
+                region.imageExtent.width = std::min(region.imageExtent.width * BlockWidth(descriptor.format), width - static_cast<std::uint32_t>(region.imageOffset.x));
+                region.imageExtent.height = std::min(region.imageExtent.height * BlockHeight(descriptor.format), height - static_cast<std::uint32_t>(region.imageOffset.y));
+            }
+        }
+    }
     return windows;
 }
 
 bool Texture::RefreshEpoch(const GuestTextureResource& descriptor, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) {
     if (!TextureEpoch::Enabled() || owned == nullptr || context.detiler == nullptr || depthFormat != VK_FORMAT_UNDEFINED) return false;
     const auto geometry = DescribeSurface(descriptor);
-    if (!EpochUploadSupported(descriptor, geometry)) return false;
+    if (!EpochUploadSupported(descriptor)) return false;
     const auto aspect = viewFormat == VK_FORMAT_D32_SFLOAT || viewFormat == VK_FORMAT_D16_UNORM ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     const auto uploaded = UploadEpoch(context, *context.detiler, descriptor, geometry, image, layout, aspect, owned, runs);
-    TextureEpoch::Count(TextureEpoch::Action::Partial, uploaded);
+    TextureEpoch::Count(TextureEpoch::Action::Partial, uploaded, &descriptor);
     return true;
 }
 
@@ -2799,12 +2854,12 @@ std::uint64_t Texture::UploadEpoch(const Context& context, TextureDetiler& detil
             detile.tiledBase = 0;
             offset = descriptor.baseAddress - import->base + geometry.GuestLayerOffset(window.layer) + mip.tiledOffset;
         }
-        detiler.Dispatch(commands, descriptor.tileMode, BytesPerElement(descriptor.format), source, offset, linear->Handle(), linearPositions[i], mip, false, window.layer, false, detile);
+        detiler.Dispatch(commands, descriptor.tileMode, BytesPerElement(descriptor.format), source, offset, linear->Handle(), linearPositions[i], mip, false, window.layer, geometry.thick, detile);
         for (auto region : window.regions) {
             region.bufferOffset += linearPositions[i];
             region.imageSubresource.aspectMask = aspect;
             regions.push_back(region);
-            uploaded += static_cast<std::uint64_t>(region.imageExtent.width) * region.imageExtent.height * BytesPerElement(descriptor.format);
+            uploaded += static_cast<std::uint64_t>((region.imageExtent.width + BlockWidth(descriptor.format) - 1u) / BlockWidth(descriptor.format)) * ((region.imageExtent.height + BlockHeight(descriptor.format) - 1u) / BlockHeight(descriptor.format)) * BytesPerElement(descriptor.format);
         }
     }
     const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -3347,6 +3402,7 @@ void StorageTexture::refreshGeneration() {
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    if (TextureEpoch::Enabled()) epoch.token = {};
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (!eager && canRetainUnits() && pendingLease == nullptr) {
