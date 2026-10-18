@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PageTracker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -140,6 +141,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
 }
 
 void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
+    PageTracker::ReportIfDue([](const char* line) { AgcDriver::ProfilePrint_nid_no_patch("%s", line); });
     static std::vector<double> waits;
     static VulkanDevice::PresentStatistics previous{};
     static std::uint64_t previousFlips = 0, windowSerial = 0, previousUnsignaled = 0;

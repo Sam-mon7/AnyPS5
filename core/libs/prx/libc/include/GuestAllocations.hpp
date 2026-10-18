@@ -76,6 +76,8 @@ std::uint64_t GuestAllocationsGeneration_nid_postfix();
 // Precise invalidation for such caches: the callback runs, after the generation changed, for every
 // range whose mapping or protection changed (registry mutations and guest heap decommits).
 void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));
+void GuestAllocationsSetPageInvalidator_nid_no_patch(void (*callback)(std::uintptr_t address, std::size_t bytes) noexcept);
+bool GuestAllocationsHasPageInvalidator_nid_no_patch();
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes);
 // A mutation of a range that GPU work still leases waits for the lease (RequireUnpinned). The
 // waiter, set by the GPU driver, is called on the mutating thread with the registry lock released

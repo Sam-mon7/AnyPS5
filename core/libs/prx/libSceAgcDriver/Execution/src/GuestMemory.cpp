@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PageTracker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
@@ -1116,6 +1117,9 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 #ifdef _WIN32
 bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t stop, bool armedOnly) {
     auto& tracker = runs.tracker;
+    auto* pageTracker = PageTracker::Get();
+    const auto pollStarted = pageTracker != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::uint64_t polledPages = 0;
     const bool fresh = runs.kind == StampKind::Fresh;
     const auto collect = fresh ? &GuestArena::GuestArenaCollectFreshWrites_nid_postfix : armedOnly ? &GuestArena::GuestArenaCollectArmedWrites_nid_postfix : &GuestArena::GuestArenaCollectWrites_nid_postfix;
     static const bool singlePass = std::getenv("APS5_NO_SINGLE_PASS_COLLECT") == nullptr;
@@ -1124,18 +1128,32 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
         while (cursor < stop) {
             std::size_t count = tracker.pages.size();
             if (!collect(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, clear)) return false;
+            polledPages += count;
             for (std::size_t i = 0; i < count; ++i) {
                 const auto page = reinterpret_cast<std::uintptr_t>(tracker.pages[i]);
                 stampWrittenRun(&runs, page, page + WritePageBytes);
+                if (pageTracker != nullptr) pageTracker->ObservePolledPage({page, WritePageBytes});
             }
             if (count < tracker.pages.size()) break;
             cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + WritePageBytes;
         }
         return true;
     };
-    if (!walk(singlePass || fresh)) return false;
-    if (runs.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
-    return fresh || singlePass || runs.stamped == 0 || walk(true);
+    const auto finish = [&](bool complete) {
+        if (pageTracker != nullptr) {
+            pageTracker->NotePoll(polledPages, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pollStarted).count(), complete);
+            if (!complete) pageTracker->InvalidateRange({first, stop - first});
+        }
+        return complete;
+    };
+    try {
+        if (!walk(singlePass || fresh)) return finish(false);
+        if (runs.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
+        return finish(fresh || singlePass || runs.stamped == 0 || walk(true));
+    } catch (...) {
+        finish(false);
+        throw;
+    }
 }
 #endif
 
@@ -1258,6 +1276,7 @@ std::uint64_t CollectEpoch() {
 namespace {
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
+    if (auto* pageTracker = PageTracker::Get()) pageTracker->ExcludeImport({address, bytes});
     if (!tracker.watched) return;
 #ifdef _WIN32
     if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) unwatchSerial.fetch_add(1, std::memory_order_release);
@@ -1292,7 +1311,9 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     tracker.initialize();
     if (!tracker.watched) {
         lock.unlock();
-        return import();
+        const bool imported = import();
+        if (imported && !staysWatched) if (auto* pageTracker = PageTracker::Get()) pageTracker->ExcludeImport({address, bytes});
+        return imported;
     }
     constexpr std::uint64_t page = 4096;
     const auto first = address & ~(page - 1);
@@ -1395,6 +1416,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     }
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
+        PageTracker::CpuWrite({stored.first, stored.second - stored.first});
         ++tracker.generation;
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
             tracker.noteUnstampedStore(stored.first, stored.second);
@@ -1996,8 +2018,18 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
+namespace {
+void observePageRead(std::uint64_t address, std::size_t bytes) {
+    if (auto* tracker = PageTracker::Get()) {
+        tracker->ObserveRead({address, bytes}, CurrentReadSite());
+        PageTracker::ReportIfDue([](const char* line) { AgcDriver::ProfilePrint_nid_no_patch("%s", line); });
+    }
+}
+}
+
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
+    observePageRead(address, destination.size());
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
@@ -2028,6 +2060,7 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
+    observePageRead(address, destination.size());
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
@@ -2037,6 +2070,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
 
 bool ReadCommittedIfAny(std::uint64_t address, std::size_t bytes, std::vector<std::byte>& destination) {
     if (bytes == 0) return false;
+    observePageRead(address, bytes);
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
     FlushGpuWrites(address, bytes);
     const TimedAccess timed(CounterRead, bytes);
@@ -2051,6 +2085,7 @@ bool ReadCommittedIfAny(std::uint64_t address, std::size_t bytes, std::vector<st
 
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
+    observePageRead(address, destination.size());
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
@@ -2065,6 +2100,7 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
 
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
+    observePageRead(address, bytes.size());
     const TimedAccess timed(CounterCompare, bytes.size());
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
@@ -2075,6 +2111,7 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
 
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return Compare::Equal;
+    observePageRead(address, bytes.size());
     if (address == 0 || bytes.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
     auto outcome = Compare::Equal;
     // Each run's page state is consulted right before its bytes are compared.
@@ -2088,6 +2125,7 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
 
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     if (out.empty()) return Compare::Equal;
+    observePageRead(address, out.size());
     if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
     auto outcome = Compare::Equal;
     const bool queried = describePages(static_cast<std::uintptr_t>(address), out.size(), [&](const PageRun& run) {

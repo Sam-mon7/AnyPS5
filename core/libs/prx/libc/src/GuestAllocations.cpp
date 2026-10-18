@@ -93,6 +93,7 @@ void retractPublished(std::uintptr_t address, std::uintptr_t end) {
 
 std::atomic<std::uint64_t> generation{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> invalidator{nullptr};
+std::atomic<void (*)(std::uintptr_t, std::size_t) noexcept> pageInvalidator{nullptr};
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> pinWaiter{nullptr};
 std::atomic<void (*)(const Mapped&, std::uint64_t)> gpuMapObserver{nullptr};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> unmapObserver{nullptr};
@@ -120,6 +121,7 @@ struct MutationState {
 };
 
 void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
+    if (const auto callback = pageInvalidator.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
@@ -215,7 +217,16 @@ void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t,
     invalidator.store(callback, std::memory_order_release);
 }
 
+void GuestAllocationsSetPageInvalidator_nid_no_patch(void (*callback)(std::uintptr_t, std::size_t) noexcept) {
+    pageInvalidator.store(callback, std::memory_order_release);
+}
+
+bool GuestAllocationsHasPageInvalidator_nid_no_patch() {
+    return pageInvalidator.load(std::memory_order_acquire) != nullptr;
+}
+
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    if (const auto callback = pageInvalidator.load(std::memory_order_acquire)) callback(address, bytes);
     generation.fetch_add(1, std::memory_order_release);
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
 }

@@ -312,6 +312,22 @@ std::invalid_argument OutsideArena(const char* operation, const void* pointer, s
 }
 
 #ifdef _WIN32
+void GuestArenaSetPageObserver_nid_no_patch(PageObserver callback) {
+    WindowsMappings::Get().SetPageObserver(callback);
+}
+
+bool GuestArenaHasPageObserver_nid_no_patch() {
+    return WindowsMappings::Get().HasPageObserver();
+}
+
+std::size_t GuestArenaPageObserverMetadataBytes_nid_no_patch() {
+    return WindowsMappings::Get().PageObserverMetadataBytes();
+}
+
+void GuestArenaVisitPageAliases_nid_no_patch(std::uintptr_t address, std::size_t bytes, void (*visitor)(std::uintptr_t, std::size_t, void*), void* context) {
+    WindowsMappings::Get().VisitPageAliases(address, bytes, visitor, context);
+}
+
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
     WindowsMappings::Get().SetProtection(address, bytes, protection);
 }

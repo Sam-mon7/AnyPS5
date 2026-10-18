@@ -170,6 +170,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PageTracker.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -2896,4 +2897,22 @@ if(BUILD_TESTING AND WIN32)
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_TEXTURES=set:1")
     set_property(TEST agc_vram_options_textures_requires_cleanup APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_CLEANUP=set:0")
     set_property(TEST agc_vram_options_textures_requires_deferred APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DEFERRED=set:0")
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(agc_page_tracker_tests tests/PageTracker.cpp Execution/src/PageTracker.cpp)
+    target_include_directories(agc_page_tracker_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_page_tracker_tests PRIVATE libc)
+    configure_windows_unwind(agc_page_tracker_tests)
+    foreach(pageTrackerMode IN ITEMS off on nonexact unset)
+        add_test(NAME agc_page_tracker_${pageTrackerMode} COMMAND agc_page_tracker_tests)
+        set_tests_properties(agc_page_tracker_${pageTrackerMode} PROPERTIES TIMEOUT 30)
+        if(WIN32)
+            set_property(TEST agc_page_tracker_${pageTrackerMode} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_property(TEST agc_page_tracker_off PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=0")
+    set_property(TEST agc_page_tracker_on PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=1")
+    set_property(TEST agc_page_tracker_nonexact PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=01")
+    set_property(TEST agc_page_tracker_unset APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PAGE_TRACKER=unset:")
 endif()
