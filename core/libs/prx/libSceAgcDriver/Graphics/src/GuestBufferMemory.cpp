@@ -899,8 +899,11 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
 std::atomic<std::uint64_t> budgetOverride{0};
 
 std::uint64_t importBudget(const Context& context) {
-    constexpr std::uint64_t cleanupLimit = 1024ull << 20u;
-    const auto limited = [&](std::uint64_t value) { return VramCleanup() ? std::min(value, cleanupLimit) : value; };
+    static const std::uint64_t cleanupLimit = []() -> std::uint64_t {
+        const char* value = std::getenv("APS5_VRAM_CLEANUP_IMPORT_MIB");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0u;
+    }();
+    const auto limited = [&](std::uint64_t value) { return VramCleanup() && cleanupLimit != 0 ? std::min(value, cleanupLimit) : value; };
     if (const auto set = budgetOverride.load(std::memory_order_relaxed); set != 0) return limited(set);
     static const std::uint64_t configured = []() -> std::uint64_t {
         const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
@@ -1326,11 +1329,19 @@ ImageMirrors& Mirrors() {
 
 constexpr std::uint64_t CleanupCopyLimit = 64ull << 20u;
 
-void countCleanupCopy(std::uint64_t bytes, bool snapshot, bool refused) {
+void countCleanupCopy(std::uint64_t bytes, bool snapshot, bool overLimit) {
     auto& state = Mirrors();
     std::lock_guard lock(state.mutex);
-    if (refused) ++(snapshot ? state.cleanup.snapshotRefusals : state.cleanup.copyRefusals);
-    else (snapshot ? state.cleanup.snapshotBytes : state.cleanup.copyBytes) += bytes;
+    (snapshot ? state.cleanup.snapshotBytes : state.cleanup.copyBytes) += bytes;
+    if (!overLimit) return;
+    if ((snapshot ? state.cleanup.snapshotOverLimit : state.cleanup.copyOverLimit)++ == 0)
+        std::fprintf(stderr, "[vram-cleanup] a build's %s copies passed %llu MiB; later builds over the limit are counted\n", snapshot ? "snapshot" : "fallback", static_cast<unsigned long long>(CleanupCopyLimit >> 20u));
+}
+
+void countImportedCopy() {
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    ++state.cleanup.importedCopies;
 }
 
 struct WritableMirrors {
@@ -3186,7 +3197,7 @@ void CollectVramMirrors(const Context& context) {
     lastReport = now;
     const auto counts = VramCleanupCounters();
     const auto buffers = pool->Stats();
-    AgcDriver::ProfilePrint_nid_no_patch("[vram-cleanup] frame %llu, usage %.1f MiB / target %.1f MiB, age %llu; mirrors evicted %llu (%.1f MiB), heap shadows %.1f MiB; imports %.1f / %.1f MiB; CPU copies %.1f MiB (%llu refused), snapshots %.1f MiB (%llu refused)\n", static_cast<unsigned long long>(present), report.usage / 1048576.0, report.target / 1048576.0, static_cast<unsigned long long>(pressure.age), static_cast<unsigned long long>(counts.evictedMirrors), counts.evictedBytes / 1048576.0, counts.heapShadowBytes / 1048576.0, HostImportLiveBytes() / 1048576.0, importBudget(context) / 1048576.0, counts.copyBytes / 1048576.0, static_cast<unsigned long long>(counts.copyRefusals), counts.snapshotBytes / 1048576.0, static_cast<unsigned long long>(counts.snapshotRefusals));
+    AgcDriver::ProfilePrint_nid_no_patch("[vram-cleanup] frame %llu, usage %.1f MiB / target %.1f MiB, age %llu; mirrors evicted %llu (%.1f MiB), heap shadows %.1f MiB; imports %.1f / %.1f MiB; CPU copies %.1f MiB (%llu builds over limit, %llu of imported ranges), snapshots %.1f MiB (%llu builds over limit)\n", static_cast<unsigned long long>(present), report.usage / 1048576.0, report.target / 1048576.0, static_cast<unsigned long long>(pressure.age), static_cast<unsigned long long>(counts.evictedMirrors), counts.evictedBytes / 1048576.0, counts.heapShadowBytes / 1048576.0, HostImportLiveBytes() / 1048576.0, importBudget(context) / 1048576.0, counts.copyBytes / 1048576.0, static_cast<unsigned long long>(counts.copyOverLimit), static_cast<unsigned long long>(counts.importedCopies), counts.snapshotBytes / 1048576.0, static_cast<unsigned long long>(counts.snapshotOverLimit));
     AgcDriver::ProfilePrint_nid_no_patch("[bufferpool-cleanup] physical retained small %.1f / %.1f MiB, large %.1f / %.1f MiB, staging %.1f / %.1f MiB; slab allocations %.1f MiB; logical cached slots %.1f MiB\n", buffers.smallPhysicalRetained / 1048576.0, buffers.smallLimit / 1048576.0, buffers.largePhysicalRetained / 1048576.0, buffers.largeLimit / 1048576.0, buffers.devicePhysicalRetained / 1048576.0, buffers.deviceLimit / 1048576.0, buffers.slabBytes / 1048576.0, (buffers.smallRetained + buffers.largeRetained + buffers.deviceRetained) / 1048576.0);
 }
 
@@ -3552,11 +3563,7 @@ void GuestBufferMemory::AcquireRegistered() {
             const char* value = std::getenv("APS5_ADDRESS_COPY_MAX_MIB");
             return (value ? std::strtoull(value, nullptr, 10) : 64ull) << 20u;
         }();
-        if (const auto overflow = AddressCopyOverflow(std::move(copies), VramCleanup() ? std::min(copyLimit, CleanupCopyLimit) : copyLimit); !overflow.empty()) {
-            if (VramCleanup()) {
-                countCleanupCopy(0, false, true);
-                Require(false, overflow);
-            }
+        if (const auto overflow = AddressCopyOverflow(std::move(copies), copyLimit); !overflow.empty()) {
             std::fprintf(stderr, "FATAL: %s\n", overflow.c_str());
             std::fflush(stderr);
             std::abort();
@@ -3873,9 +3880,7 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
             regionsSorted = false;
             return;
         }
-        const bool refused = snapshot.bytes.size() > CleanupCopyLimit - snapshotCopyBytes;
-        countCleanupCopy(snapshot.bytes.size(), true, refused);
-        Require(!refused, "VRAM cleanup per-build snapshot copy limit of 64 MiB exceeded");
+        countCleanupCopy(snapshot.bytes.size(), true, snapshotCopyBytes <= CleanupCopyLimit && snapshot.bytes.size() > CleanupCopyLimit - snapshotCopyBytes);
         snapshotCopyBytes += snapshot.bytes.size();
     }
     regions.push_back({snapshot.address, end, false, {snapshot.bytes.begin(), snapshot.bytes.end()}, nullptr});
@@ -4646,10 +4651,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
 
 void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     Require(!mirrorBackingOverlaps(context.device, region.begin, region.end), "a mirror-backed descriptor could not be served; refusing a stale CPU copy");
-    if (VramCleanup() && HostImportCovers(context, region.begin, static_cast<std::size_t>(region.end - region.begin))) {
-        countCleanupCopy(0, false, true);
-        Require(false, "VRAM cleanup refuses a CPU copy of an imported range; a GPU copy or direct binding is required");
-    }
+    if (VramCleanup() && HostImportCovers(context, region.begin, static_cast<std::size_t>(region.end - region.begin))) countImportedCopy();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool noReuse = std::getenv("APS5_NO_READONLY_FALLBACK_REUSE") != nullptr;
     const auto bytes = region.end - region.begin;
@@ -4696,9 +4698,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     }
     const auto allocated = region.bufferEnd != 0 ? region.bufferEnd - region.begin : bytes;
     if (VramCleanup()) {
-        const bool refused = allocated > CleanupCopyLimit - fallbackCopyBytes;
-        countCleanupCopy(allocated, false, refused);
-        Require(!refused, "VRAM cleanup per-build fallback copy limit of 64 MiB exceeded");
+        countCleanupCopy(allocated, false, fallbackCopyBytes <= CleanupCopyLimit && allocated > CleanupCopyLimit - fallbackCopyBytes);
         fallbackCopyBytes += allocated;
     }
     // A buffer made by UploadPrepare for a GPU copy that fell back here (its import went) is kept.

@@ -2531,6 +2531,13 @@ if(BUILD_TESTING AND WIN32)
         set_property(TEST agc_vram_cleanup_age_${vramCleanupMode} APPEND PROPERTY ENVIRONMENT "APS5_RELEASE_ON_UNLOCK=1")
     endforeach()
     set_property(TEST agc_vram_cleanup_pool_on agc_vram_cleanup_staging_zero_on agc_vram_cleanup_age_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_CLEANUP=set:1")
+    add_test(NAME agc_vram_cleanup_pool_import_cap COMMAND agc_buffer_pool_tests)
+    add_test(NAME agc_vram_cleanup_pool_without_writable COMMAND agc_buffer_pool_tests)
+    set_tests_properties(agc_vram_cleanup_pool_import_cap agc_vram_cleanup_pool_without_writable PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+        ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_WRITABLE=1;APS5_VRAM_DEFERRED=1;APS5_VRAM_CLEANUP=1;APS5_RESIDENT_HEAP_MIRRORS=0"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_REBAR_MIB=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
+    set_property(TEST agc_vram_cleanup_pool_import_cap APPEND PROPERTY ENVIRONMENT "APS5_VRAM_CLEANUP_IMPORT_MIB=1024")
+    set_property(TEST agc_vram_cleanup_pool_without_writable APPEND PROPERTY ENVIRONMENT "APS5_VRAM_WRITABLE=0;APS5_VRAM_DEFERRED=0")
     add_test(NAME agc_vram_cleanup_recorder COMMAND agc_driver_recorder_tests --vram-writable-recorder-only)
     add_test(NAME agc_vram_cleanup_descriptors COMMAND agc_driver_recorder_tests --vram-descriptors-only)
     add_test(NAME agc_vram_cleanup_heap COMMAND agc_driver_recorder_tests --resident-heap-only)

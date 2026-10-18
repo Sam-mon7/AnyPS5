@@ -217,9 +217,10 @@ struct VramCleanupStats {
     std::uint64_t evictedMirrors = 0;
     std::uint64_t evictedBytes = 0;
     std::uint64_t copyBytes = 0;
-    std::uint64_t copyRefusals = 0;
+    std::uint64_t copyOverLimit = 0;
+    std::uint64_t importedCopies = 0;
     std::uint64_t snapshotBytes = 0;
-    std::uint64_t snapshotRefusals = 0;
+    std::uint64_t snapshotOverLimit = 0;
     std::uint64_t heapShadowBytes = 0;
 };
 VramCleanupStats VramCleanupCounters();

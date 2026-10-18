@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <memory>
@@ -852,12 +853,10 @@ void CleanupCopyLimits() {
     GuestBufferMemory memory(context);
     memory.AddSnapshot({0x10000000, source});
     memory.AddSnapshot({0x20000000, source});
-    bool refused = false;
-    try { memory.AddSnapshot({0x30000000, std::span<const std::byte>(source).first(1)}); }
-    catch (const std::runtime_error&) { refused = true; }
-    Expect(refused == VramCleanup(), "snapshot copies did not enforce the per-build cleanup boundary");
+    memory.AddSnapshot({0x30000000, std::span<const std::byte>(source).first(1)});
+    memory.AddSnapshot({0x40000000, std::span<const std::byte>(source).first(1)});
     const auto after = VramCleanupCounters();
-    Expect(!VramCleanup() || (after.snapshotBytes - before.snapshotBytes == 64 * MiB && after.snapshotRefusals == before.snapshotRefusals + 1), "snapshot cleanup counters did not report accepted and refused bytes");
+    Expect(!VramCleanup() || (after.snapshotBytes - before.snapshotBytes == 64 * MiB + 2 && after.snapshotOverLimit == before.snapshotOverLimit + 1), "snapshot cleanup counters did not count the build over its limit once");
     Expect(mock.allocations == 0, "snapshot-cap validation allocated GPU memory");
     const std::vector<std::byte> first(33 * MiB, std::byte{0x11});
     const std::vector<std::byte> second(33 * MiB, std::byte{0x22});
@@ -865,14 +864,14 @@ void CleanupCopyLimits() {
     copied.AddReadable(reinterpret_cast<std::uint64_t>(first.data()), first.size());
     copied.AddReadable(reinterpret_cast<std::uint64_t>(second.data()), second.size());
     const auto copiesBefore = VramCleanupCounters();
-    refused = false;
-    try { copied.Upload(false); }
-    catch (const std::runtime_error& error) { refused = std::string(error.what()).find("per-build fallback copy limit") != std::string::npos; }
-    Expect(refused == VramCleanup(), "CPU fallback copies did not enforce their aggregate per-build cleanup boundary");
+    copied.Upload(false);
     const auto copiesAfter = VramCleanupCounters();
-    Expect(!VramCleanup() || (copiesAfter.copyBytes - copiesBefore.copyBytes == first.size() && copiesAfter.copyRefusals == copiesBefore.copyRefusals + 1 && mock.allocations == 1), "fallback copy limit allocated or copied the refused range");
+    Expect(!VramCleanup() || (copiesAfter.copyBytes - copiesBefore.copyBytes == first.size() + second.size() && copiesAfter.copyOverLimit == copiesBefore.copyOverLimit + 1), "fallback copies over the per-build limit were not counted");
+    Expect(mock.allocations == 2, "fallback copies over the per-build limit were not both made");
+    const auto* importCap = std::getenv("APS5_VRAM_CLEANUP_IMPORT_MIB");
+    const std::uint64_t cappedImports = VramCleanup() && importCap != nullptr ? std::min<std::uint64_t>(std::strtoull(importCap, nullptr, 10), 2048u) : 2048u;
     SetHostImportBudget(2 * 1024 * MiB);
-    Expect(EffectiveHostImportBudget(context) == (VramCleanup() ? 1024u : 2048u) * MiB, "cleanup did not cap host imports at 1 GiB");
+    Expect(EffectiveHostImportBudget(context) == cappedImports * MiB, "cleanup host import cap did not follow APS5_VRAM_CLEANUP_IMPORT_MIB");
     SetHostImportBudget(128 * MiB);
     Expect(EffectiveHostImportBudget(context) == 128 * MiB, "cleanup enlarged a smaller configured host import budget");
     SetHostImportBudget(0);
