@@ -196,6 +196,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderValidation.cpp
@@ -2987,4 +2988,31 @@ if(BUILD_TESTING)
     set_property(TEST agc_page_tracker_on PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=1")
     set_property(TEST agc_page_tracker_nonexact PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=01")
     set_property(TEST agc_page_tracker_unset APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PAGE_TRACKER=unset:")
+endif()
+
+if(BUILD_TESTING)
+    foreach(bufferCacheMode IN ITEMS off on tracker_off nonexact unset)
+        add_test(NAME agc_buffer_cache_${bufferCacheMode} COMMAND agc_driver_buffer_cache_tests)
+        set_tests_properties(agc_buffer_cache_${bufferCacheMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_RESIDENT_HEAP_MIRRORS=0;APS5_VRAM_MIRRORS=0;APS5_VRAM_DESCRIPTORS=0;APS5_VRAM_WRITABLE=0;APS5_VRAM_WRITABLE_STRICT=0;APS5_VRAM_DEVICE_LOCAL_MIRRORS=0;APS5_VRAM_LAZY_WRITES=0;APS5_VRAM_DEFERRED=0;APS5_VRAM_CLEANUP=0;APS5_VRAM_TEXTURES=0;APS5_TEXTURE_AGE_EVICTION=0")
+        if(WIN32)
+            set_property(TEST agc_buffer_cache_${bufferCacheMode} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_property(TEST agc_buffer_cache_off APPEND PROPERTY ENVIRONMENT "APS5_BUFFER_CACHE=0;APS5_PAGE_TRACKER=1")
+    set_property(TEST agc_buffer_cache_on APPEND PROPERTY ENVIRONMENT "APS5_BUFFER_CACHE=1;APS5_PAGE_TRACKER=1")
+    set_property(TEST agc_buffer_cache_tracker_off APPEND PROPERTY ENVIRONMENT "APS5_BUFFER_CACHE=1;APS5_PAGE_TRACKER=0")
+    set_property(TEST agc_buffer_cache_nonexact APPEND PROPERTY ENVIRONMENT "APS5_BUFFER_CACHE=01;APS5_PAGE_TRACKER=1")
+    set_property(TEST agc_buffer_cache_unset APPEND PROPERTY ENVIRONMENT "APS5_PAGE_TRACKER=1")
+    set_property(TEST agc_buffer_cache_unset APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_BUFFER_CACHE=unset:")
+    foreach(bufferCacheMode IN ITEMS off on)
+        add_test(NAME agc_buffer_cache_label_${bufferCacheMode} COMMAND agc_driver_vram_writable_label_tests)
+        set_tests_properties(agc_buffer_cache_label_${bufferCacheMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_PAGE_TRACKER=1;APS5_VRAM_MIRRORS=0;APS5_VRAM_DESCRIPTORS=0;APS5_VRAM_DEVICE_LOCAL_MIRRORS=0;APS5_VRAM_LAZY_WRITES=0;APS5_VRAM_WRITABLE=0;APS5_VRAM_WRITABLE_STRICT=0;APS5_VRAM_DEFERRED=0;APS5_VRAM_CLEANUP=0;APS5_VRAM_TEXTURES=0;APS5_TEXTURE_AGE_EVICTION=0;APS5_RESIDENT_HEAP_MIRRORS=0")
+        if(WIN32)
+            set_property(TEST agc_buffer_cache_label_${bufferCacheMode} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_property(TEST agc_buffer_cache_label_off APPEND PROPERTY ENVIRONMENT "APS5_BUFFER_CACHE=0")
+    set_property(TEST agc_buffer_cache_label_on APPEND PROPERTY ENVIRONMENT "APS5_BUFFER_CACHE=1")
 endif()

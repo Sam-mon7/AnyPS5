@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ResourcePhase.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -3462,6 +3463,7 @@ void ClearImageMirrors(VkDevice device) {
 }
 
 void ClearHostImports(VkDevice device) {
+    BufferCache::Clear(device);
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     state.parked.erase(device);
@@ -4835,6 +4837,7 @@ void ShutdownGuestBufferWorkers() {
 }
 
 GuestBufferMemory::~GuestBufferMemory() {
+    BufferCache::Release(this);
     if (VramLazyWrites() && !mirrorWrites.empty()) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
         for (const auto& [mirror, interval] : mirrorWrites) {
@@ -4985,6 +4988,24 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         }
     }
     regions = std::move(merged);
+    if (!addressable && BufferCache::BindingsPermitted(this)) std::erase_if(regions, [&](const Region& region) {
+        if (!(region.writable || region.hostBacked) || region.sparse) return false;
+        const auto begin = region.begin / PageTracker::PageBytes * PageTracker::PageBytes;
+        const auto end = ((region.end - 1) / PageTracker::PageBytes + 1) * PageTracker::PageBytes;
+        if (WritesOverlap(begin, static_cast<std::size_t>(end - begin))) {
+            BufferCache::CountFallback(BufferCache::Fallback::Written);
+            return false;
+        }
+        if (region.direct != nullptr || region.mirror != nullptr || mirrorBackingOverlaps(context.device, region.begin, region.end)) {
+            BufferCache::CountFallback(BufferCache::Fallback::Alias);
+            return false;
+        }
+        if (!bindableInPlace(region.begin, addressable)) {
+            BufferCache::CountFallback(BufferCache::Fallback::Alignment);
+            return false;
+        }
+        return BufferCache::BindReadOnly(context, this, region.begin, static_cast<std::size_t>(region.end - region.begin));
+    });
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
     for (auto& region : regions) {
@@ -5781,6 +5802,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
 VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {
     Require(uploaded && !committed, "guest GPU memory is not available");
     Require(bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest buffer view");
+    if (auto cached = BufferCache::Descriptor(this, address, bytes, adjustment)) return *cached;
     const auto* found = owner(address);
     Require(found != nullptr, "guest buffer has no GPU owner");
     const auto& region = *found;
