@@ -639,6 +639,7 @@ public:
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
+        std::optional<MEMORY_BASIC_INFORMATION> cachedQuery;
         if (collection == Collection::Fresh) {
             const auto fresh = freshRanges.upper_bound(address);
             if ((fresh == freshRanges.begin() || std::prev(fresh)->second <= address) && (fresh == freshRanges.end() || fresh->first >= end)) return true;
@@ -648,7 +649,7 @@ public:
                     if ((it->second.collected & (1u << ((at - it->first) / 4096))) == 0) return false;
                 }
             }
-        } else if (clear && !collectable(address, end)) return false;
+        } else if (clear && !collectable(address, end, cachedQuery)) return false;
         for (auto cursor = address; cursor < end;) {
             const auto nextClean = cleanRanges.upper_bound(cursor);
             if (nextClean != cleanRanges.begin()) {
@@ -747,7 +748,7 @@ public:
                     cursor = next == views.end() ? end : std::min(end, next->first);
                     continue;
                 }
-                const auto memory = query(cursor);
+                const auto memory = query(cursor, cachedQuery);
                 if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
                 if (capacity == *count) return true;
@@ -764,7 +765,7 @@ public:
     }
 
 private:
-    bool collectable(std::uintptr_t address, std::uintptr_t end) {
+    bool collectable(std::uintptr_t address, std::uintptr_t end, std::optional<MEMORY_BASIC_INFORMATION>& cachedQuery) {
         for (auto cursor = address; cursor < end;) {
             const auto clean = cleanRanges.upper_bound(cursor);
             if (clean != cleanRanges.begin()) {
@@ -780,7 +781,7 @@ private:
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
-            const auto memory = query(cursor);
+            const auto memory = query(cursor, cachedQuery);
             if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
             cursor = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
         }
@@ -1138,6 +1139,14 @@ private:
     static MEMORY_BASIC_INFORMATION query(std::uintptr_t address) {
         MEMORY_BASIC_INFORMATION memory{};
         if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) != sizeof(memory)) fail("query guest memory");
+        return memory;
+    }
+
+    static MEMORY_BASIC_INFORMATION query(std::uintptr_t address, std::optional<MEMORY_BASIC_INFORMATION>& cached) {
+        static const bool enabled = std::getenv("APS5_CACHE_MAPPING_QUERIES") != nullptr;
+        if (enabled && cached.has_value() && address >= reinterpret_cast<std::uintptr_t>(cached->BaseAddress) && address - reinterpret_cast<std::uintptr_t>(cached->BaseAddress) < cached->RegionSize) return *cached;
+        const auto memory = query(address);
+        if (enabled) cached = memory;
         return memory;
     }
 

@@ -101,8 +101,8 @@ std::size_t ImagePagesSize();
 // folded at report time; a finished thread's totals move to `retired`. Nothing is counted without
 // the profile switch (the counters are only ever printed under it).
 // Debug aid: APS5_SHARED_MEMORY_COUNTERS=1 accumulates into one shared set with atomic RMWs as before.
-enum MemoryCounterKind { CounterRead, CounterCompare, CounterWrite, CounterChangedWrite, CounterCollect, CounterVerify, CounterQuery, MemoryCounterCount };
-constexpr const char* MemoryCounterNames[MemoryCounterCount] = {"read", "compare", "write", "write-changed", "collect", "verify", "query"};
+enum MemoryCounterKind { CounterRead, CounterCompare, CounterWrite, CounterChangedWrite, CounterCollect, CounterVerify, CounterQuery, CounterQueryCached, MemoryCounterCount };
+constexpr const char* MemoryCounterNames[MemoryCounterCount] = {"read", "compare", "write", "write-changed", "collect", "verify", "query", "query-cached"};
 
 struct MemoryCounter {
     std::atomic<std::uint64_t> calls{0};
@@ -289,6 +289,11 @@ void CountWriteCaller(const void* returnAddress) {
     CountCaller(Profile().writeCallers, sampled, 16, returnAddress);
 }
 
+bool CacheMappingQueries() {
+    static const bool enabled = std::getenv("APS5_CACHE_MAPPING_QUERIES") != nullptr;
+    return enabled;
+}
+
 bool MemoryProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
@@ -308,6 +313,7 @@ public:
         const auto totals = FoldMemoryCounters();
         AgcDriver::ProfilePrint_nid_no_patch("[guestmem]");
         for (std::size_t i = 0; i < MemoryCounterCount; ++i) {
+            if (i == CounterQueryCached && !CacheMappingQueries()) continue;
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
@@ -511,6 +517,12 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
     pages.initialize();
     const auto end = address + bytes;
     auto cursor = address;
+#ifdef _WIN32
+    std::optional<MEMORY_BASIC_INFORMATION> cachedQuery;
+    std::uint64_t cachedGeneration = 0;
+    std::uint64_t cachedForget = 0;
+    std::uint64_t cachedCommit = 0;
+#endif
     while (cursor < end) {
         if (const auto* span = pages.spanOf(cursor)) {
             const auto value = span->load(cursor);
@@ -522,17 +534,29 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             }
         }
 #ifdef _WIN32
-        const TimedAccess timed(CounterQuery, 0);
         MEMORY_BASIC_INFORMATION memory{};
         const auto queryStart = std::chrono::steady_clock::now();
         // A mutation that changes these pages while they are being queried bumps the generation
         // before it invalidates, so a generation change across the query and the store below means
         // the stored pages may describe the old state and are forgotten again.
         const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
+        const auto forgotten = CacheMappingQueries() ? forgetSerial.load(std::memory_order_acquire) : 0;
+        const auto committedGeneration = CacheMappingQueries() ? GuestArena::GuestArenaCommitGeneration_nid_postfix() : 0;
+        const bool queryHit = CacheMappingQueries() && cachedQuery.has_value() && cachedGeneration == generation && cachedForget == forgotten && cachedCommit == committedGeneration && cursor >= reinterpret_cast<std::uintptr_t>(cachedQuery->BaseAddress) && cursor - reinterpret_cast<std::uintptr_t>(cachedQuery->BaseAddress) < cachedQuery->RegionSize;
+        const TimedAccess timed(queryHit ? CounterQueryCached : CounterQuery, 0);
+        if (queryHit) memory = *cachedQuery;
+        else {
+            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
+            if (CacheMappingQueries()) {
+                cachedQuery = memory;
+                cachedGeneration = generation;
+                cachedForget = forgotten;
+                cachedCommit = committedGeneration;
+            }
+        }
         // Debug aid: APS5_TRACE_QUERY prints every 16th page query with its cost.
         static const bool traceQuery = std::getenv("APS5_TRACE_QUERY") != nullptr;
-        if (traceQuery) {
+        if (traceQuery && !queryHit) {
             static std::atomic<std::uint32_t> queries{0};
             if (queries.fetch_add(1) % 16 == 0) {
                 const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - queryStart).count();
@@ -1959,6 +1983,11 @@ void NoteLockedGpuWait(double ms) {
 std::uint64_t ThreadCollectedBytes() {
     if (!MemoryProfiled()) return 0;
     return CounterFor(CounterCollect).bytes.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ThreadCachedPageQueries() {
+    if (!MemoryProfiled()) return 0;
+    return CounterFor(CounterQueryCached).calls.load(std::memory_order_relaxed);
 }
 
 std::uint32_t GpuLockThreadTag() {

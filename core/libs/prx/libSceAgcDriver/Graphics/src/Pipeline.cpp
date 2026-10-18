@@ -875,8 +875,15 @@ struct PipelineStore {
     std::uint64_t evicted = 0;
     std::uint64_t generation = 1;
     std::uint64_t identityHits = 0;
+    std::uint32_t expiryCountdown = 0;
+    PipelineExpiryCounters expiry;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
+
+bool lazyPipelineExpiry() {
+    static const bool enabled = std::getenv("APS5_LAZY_PIPELINE_EXPIRY") != nullptr;
+    return enabled;
+}
 
 bool pipelineIdentity() {
     static const bool enabled = [] { const char* text = std::getenv("APS5_PIPELINE_IDENTITY"); return text == nullptr || std::strcmp(text, "0") != 0; }();
@@ -930,6 +937,7 @@ void reportPipelines(PipelineStore& store) {
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
     AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%; %llu repeats of the thread's previous key), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.identityHits), static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
+    if (lazyPipelineExpiry()) AgcDriver::ProfilePrint_nid_no_patch("[pipecache] expiry cumulative: %llu lookups, %llu scans, %llu entries checked, %llu expired, %.3f ms\n", static_cast<unsigned long long>(store.expiry.lookups), static_cast<unsigned long long>(store.expiry.scans), static_cast<unsigned long long>(store.expiry.checked), static_cast<unsigned long long>(store.expiry.removed), store.expiry.ms);
     store.hits = store.misses = store.uncached = store.evicted = store.identityHits = 0;
 }
 
@@ -944,11 +952,23 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
-    for (auto entry = store.entries.begin(); entry != store.entries.end();) {
-        if (!entry->pipeline.Expired()) { ++entry; continue; }
-        store.index.erase(entry->hash);
-        entry = store.entries.erase(entry);
-        ++store.generation;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) ++store.expiry.lookups;
+    if (!lazyPipelineExpiry() || store.expiryCountdown-- == 0) {
+        const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (lazyPipelineExpiry()) store.expiryCountdown = 255;
+        if (profile) {
+            ++store.expiry.scans;
+            store.expiry.checked += store.entries.size();
+        }
+        for (auto entry = store.entries.begin(); entry != store.entries.end();) {
+            if (!entry->pipeline.Expired()) { ++entry; continue; }
+            store.index.erase(entry->hash);
+            entry = store.entries.erase(entry);
+            ++store.generation;
+            if (profile) ++store.expiry.removed;
+        }
+        if (profile) store.expiry.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
     reportPipelines(store);
     const bool identity = pipelineIdentity();
@@ -1017,6 +1037,12 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     if (const auto found = store.index.find(hash); found != store.index.end() && found->second->pipeline.Pin() == pipeline) remember(found->second);
     static_cast<void>(ShaderRecompiler::MaintainPreparedShaderCache());
     return pipeline;
+}
+
+PipelineExpiryCounters PipelineExpiryCountersOf() {
+    auto& store = Pipelines();
+    std::lock_guard lock(store.mutex);
+    return store.expiry;
 }
 
 void ClearCachedPipelines(VkDevice device) {

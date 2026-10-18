@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ResourcePhase.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DispatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -58,6 +59,7 @@ void ReportDispatchItems(bool profile) {
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
+    ResourcePhase prologue("dispatch-prologue-program");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) registeredShader = ReadRawShader(address);
@@ -73,6 +75,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
     if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
 
+    prologue.End();
+    ResourcePhase devicePhase("dispatch-prologue-device");
     static const bool unlockedDevice = std::getenv("APS5_NO_UNLOCKED_DEVICE") == nullptr;
     std::shared_ptr<VulkanDevice> localDevice = unlockedDevice ? device.Load() : nullptr;
     if (localDevice == nullptr) {
@@ -81,6 +85,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         localDevice = device;
     }
+    devicePhase.End();
+    ResourcePhase decision("dispatch-prologue-decision");
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
@@ -149,6 +155,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
         {0, 0, 0, 128}
     };
+    decision.End();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static double captureMs = 0, keyMs = 0, recompileMs = 0, deviceMs = 0;
     static std::uint64_t cacheHits = 0;

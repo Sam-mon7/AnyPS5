@@ -4952,9 +4952,12 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
 }
 
 std::size_t ShaderResources::MaxDrawSnapshotBytes() {
-    const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
-    const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
-    return static_cast<std::size_t>(mib * 1024ull * 1024ull);
+    static const auto bytes = [] {
+        const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
+        const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
+        return static_cast<std::size_t>(mib * 1024ull * 1024ull);
+    }();
+    return bytes;
 }
 
 constexpr std::size_t FreshCopyLimit = 4096;
@@ -4962,6 +4965,7 @@ constexpr std::size_t PatchedSnapshotBytes = 65536;
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    ResourcePhase phase("draw-snapshot-bindings");
     const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = MaxDrawSnapshotBytes();
     std::size_t totalSnapshotBytes = 0;
@@ -4974,7 +4978,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             Recorder::SnapshotSlice slice{};
-            static const bool movedRing = std::getenv("APS5_MOVED_RING") == nullptr || std::strcmp(std::getenv("APS5_MOVED_RING"), "0") != 0;
+            static const bool movedRing = [] { const char* text = std::getenv("APS5_MOVED_RING"); return text == nullptr || std::strcmp(text, "0") != 0; }();
             if (movedRing && Recorder::SnapshotRingEnabled()) slice = recorder.AllocateDrawSnapshot(override->size);
             auto buffer = slice.buffer != nullptr ? std::move(slice.buffer) : std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             const VkDeviceSize offset = buffer != nullptr && slice.offset != 0 ? slice.offset : 0;
