@@ -448,6 +448,38 @@ void deviceMirrorUploadTests(const Device& device, Recorder& recorder) {
         unchanged.WriteBack();
         recorder.Sync();
         Require(VramUploadCounters().bytes == after.bytes, "unchanged device mirror was uploaded again");
+        std::memset(block, 0x73, 4 * blockBytes);
+        Memory::BumpCollectEpoch();
+        GuestBufferMemory grouped(context);
+        grouped.AddReadable(address, 4 * blockBytes);
+        grouped.Upload(false);
+        const auto batched = VramUploadCounters();
+        Require(batched.blocks == after.blocks + 4 && batched.uploadBatches == after.uploadBatches + 1,
+            "device mirror refresh did not batch four dirty blocks together");
+        Require(batched.syncUploads == after.syncUploads, "recorded mirror upload waited synchronously");
+        recorder.OnComplete([&] {
+            std::memset(block, 0x74, 2 * blockBytes);
+            Memory::BumpCollectEpoch();
+            GuestBufferMemory completed(context);
+            completed.AddReadable(address, 2 * blockBytes);
+            completed.Upload(false);
+            completed.WriteBack();
+        });
+        recorder.Sync();
+        const auto synchronous = VramUploadCounters();
+        Require(synchronous.syncUploads == batched.syncUploads + 1 && synchronous.syncBytes == batched.syncBytes + 2 * blockBytes,
+            "completion mirror uploads did not count one synchronous batch");
+        std::uint32_t adjustment = 0;
+        const auto view = grouped.Descriptor(address, 4 * blockBytes, adjustment);
+        Buffer result(context, 4 * blockBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CopyBuffer(context, recorder.Commands(), view.buffer, view.offset, result.Handle(), 0, 4 * blockBytes);
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        const auto actual = result.ReadBytes(0, 4 * blockBytes);
+        for (std::size_t index = 0; index < actual.size(); ++index)
+            Require(actual[index] == static_cast<std::byte>(index < 2 * blockBytes ? 0x74 : 0x73), "batched device mirror upload corrupted a dirty block");
+        grouped.WriteBack();
     } else Require(VramUploadCounters().bytes == before.bytes, "disabled device mirrors recorded uploads");
 }
 

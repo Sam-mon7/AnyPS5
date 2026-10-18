@@ -220,6 +220,10 @@ struct VramUploadStats {
     std::uint64_t fallbackSlices = 0;
     std::uint64_t initialWaits = 0;
     std::uint64_t deviceMirrors = 0;
+    std::uint64_t uploadBatches = 0;
+    std::uint64_t syncUploads = 0;
+    std::uint64_t syncBytes = 0;
+    std::uint64_t syncUs = 0;
 };
 VramUploadStats VramUploadCounters();
 struct VramCleanupStats {

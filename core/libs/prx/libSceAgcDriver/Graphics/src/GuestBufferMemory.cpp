@@ -1754,9 +1754,10 @@ void reportVramMirrors() {
     std::fprintf(stderr, "[vram-mirrors] (10 s): %llu read-only ranges mapped mirror first; %llu heap mirrors made in VRAM (%llu MiB), %llu refused for the VRAM budget (%llu MiB), %llu placed in host memory; ReBAR %llu of %llu MiB live, peak %llu MiB\n", readOnly, created, createdMiB, refused, refusedMiB, fallbacks, static_cast<unsigned long long>(rebar.live.load() >> 20u), static_cast<unsigned long long>(rebar.limit >> 20u), static_cast<unsigned long long>(rebar.peak.load() >> 20u));
     if (VramDeviceLocalMirrors()) {
         const auto& uploads = UploadCounts();
-        std::fprintf(stderr, "[vram-mirrors] device-local uploads cumulative: %llu mirrors, %llu blocks, %.1f MiB; arena slices %llu, fallback slices %llu, initial chunk waits %llu\n",
+        std::fprintf(stderr, "[vram-mirrors] device-local uploads cumulative: %llu mirrors, %llu blocks, %.1f MiB; arena slices %llu, fallback slices %llu, initial chunk waits %llu; upload batches %llu, sync uploads %llu (%.1f MiB, %.3f ms)\n",
             static_cast<unsigned long long>(uploads.deviceMirrors), static_cast<unsigned long long>(uploads.blocks), static_cast<double>(uploads.bytes) / (1u << 20u),
-            static_cast<unsigned long long>(uploads.ringSlices), static_cast<unsigned long long>(uploads.fallbackSlices), static_cast<unsigned long long>(uploads.initialWaits));
+            static_cast<unsigned long long>(uploads.ringSlices), static_cast<unsigned long long>(uploads.fallbackSlices), static_cast<unsigned long long>(uploads.initialWaits),
+            static_cast<unsigned long long>(uploads.uploadBatches), static_cast<unsigned long long>(uploads.syncUploads), static_cast<double>(uploads.syncBytes) / (1u << 20u), uploads.syncUs / 1000.0);
     }
 }
 
@@ -1806,7 +1807,44 @@ bool refreshWritableHeap(ImageMirror& mirror, std::vector<RefreshBlock>& blocks,
 constexpr std::uint8_t SparseCopy = 1;
 constexpr std::uint8_t SparseZero = 2;
 
-void stageMirrorBlock(const RefreshBlock& block) {
+struct MirrorUpload {
+    Recorder::SnapshotSlice source;
+    std::shared_ptr<Buffer> target;
+    VkDeviceSize offset;
+    std::size_t bytes;
+    const Context* context;
+};
+
+void recordMirrorUploads(std::vector<MirrorUpload>& uploads) {
+    if (uploads.empty()) return;
+    const auto& context = *uploads.front().context;
+    const auto record = [&](VkCommandBuffer commands) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        for (const auto& upload : uploads) CopyBuffer(context, commands, upload.source.buffer->Handle(), upload.source.offset, upload.target->Handle(), upload.offset, upload.bytes);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    };
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion()) {
+        record(recorder->Commands());
+        for (const auto& upload : uploads) {
+            recorder->Keep(upload.source.buffer, upload.bytes);
+            recorder->Keep(upload.target);
+        }
+    } else {
+        const auto started = std::chrono::steady_clock::now();
+        CommandBatch batch(context, CommandBatch::Mode::Independent);
+        record(batch.Handle());
+        batch.SubmitAndWait();
+        ++UploadCounts().syncUploads;
+        for (const auto& upload : uploads) UploadCounts().syncBytes += upload.bytes;
+        UploadCounts().syncUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+    }
+    ++UploadCounts().uploadBatches;
+    uploads.clear();
+}
+
+void stageMirrorBlock(const RefreshBlock& block, std::vector<MirrorUpload>& uploads) {
     auto& mirror = *block.mirror;
     const auto& context = mirror.uploadContext;
     const auto offset = block.address - mirror.base;
@@ -1822,22 +1860,7 @@ void stageMirrorBlock(const RefreshBlock& block) {
     auto target = slice.buffer->WriteBytes().subspan(static_cast<std::size_t>(slice.offset), block.length);
     if (block.fill == SparseZero) std::memset(target.data(), 0, target.size());
     else std::memcpy(target.data(), reinterpret_cast<const void*>(block.address), target.size());
-    const auto record = [&](VkCommandBuffer commands) {
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        CopyBuffer(context, commands, slice.buffer->Handle(), slice.offset, mirror.buffer->Handle(), offset, block.length);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-    };
-    if (recorder != nullptr && !Recorder::InCompletion()) {
-        record(recorder->Commands());
-        recorder->Keep(slice.buffer, block.length);
-        recorder->Keep(mirror.buffer);
-    } else {
-        CommandBatch batch(context, CommandBatch::Mode::Independent);
-        record(batch.Handle());
-        batch.SubmitAndWait();
-    }
+    uploads.push_back({slice, mirror.buffer, offset, block.length, &context});
     UploadCounts().bytes += block.length;
     ++UploadCounts().blocks;
     if (mirror.heap && block.fill == 0) mirror.generations[static_cast<std::size_t>(block.address / 65536 - mirror.base / 65536)] = block.generation;
@@ -1872,12 +1895,13 @@ void initializeDeviceMirror(ImageMirror& mirror, std::span<const std::pair<std::
 }
 
 // Compares a block's guest bytes with the mirror's shadow and copies a changed block into the device
-bool compareBlock(const RefreshBlock& block) {
+bool compareBlock(const RefreshBlock& block, std::vector<MirrorUpload>* uploads = nullptr) {
     const auto offset = static_cast<std::size_t>(block.address - block.mirror->base);
     const auto* guest = reinterpret_cast<const std::byte*>(block.address);
     if (!block.mirror->buffer->Mapped()) {
         if (block.fill == 0 && !block.mirror->heap && std::memcmp(block.mirror->shadow.data() + offset, guest, block.length) == 0) return false;
-        stageMirrorBlock(block);
+        Require(uploads != nullptr, "device mirror refresh has no upload batch");
+        stageMirrorBlock(block, *uploads);
         return true;
     }
     if (block.fill != 0) {
@@ -1913,7 +1937,18 @@ public:
     std::uint64_t Run(std::span<const RefreshBlock> blocks) {
         if (VramDeviceLocalMirrors()) {
             std::uint64_t copied = 0;
-            for (const auto& block : blocks) copied += compareBlock(block) ? 1 : 0;
+            std::vector<MirrorUpload> uploads;
+            std::size_t stagedBytes = 0;
+            const bool synchronous = Recorder::Active() == nullptr || Recorder::InCompletion();
+            for (const auto& block : blocks) {
+                copied += compareBlock(block, &uploads) ? 1 : 0;
+                stagedBytes += block.length;
+                if (synchronous && stagedBytes >= (4u << 20u)) {
+                    recordMirrorUploads(uploads);
+                    stagedBytes = 0;
+                }
+            }
+            recordMirrorUploads(uploads);
             return copied;
         }
         // Small jobs are not worth waking the helpers (a sub-range refresh at Upload is a few blocks).
