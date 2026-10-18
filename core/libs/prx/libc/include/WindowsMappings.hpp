@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <cstdio>
 #include <cstddef>
@@ -45,10 +46,91 @@ public:
 
     bool HasPageObserver() const { return pageObserver.load(std::memory_order_acquire) != nullptr; }
 
+    static bool ObservationRequested() {
+        static const bool enabled = [] {
+            const auto* tracker = std::getenv("APS5_PAGE_TRACKER");
+            const auto* arm = std::getenv("APS5_PAGE_TRACKER_ARM");
+            return tracker != nullptr && std::string_view(tracker) == "1" && arm != nullptr && std::string_view(arm) == "1";
+        }();
+        return enabled;
+    }
+
+    void EnablePageObservation(bool (*ready)() noexcept) {
+        if (!ObservationRequested()) return;
+        MemoryLockProbe::Lock lock(mutex, "page-observation-enable", 0);
+        if (!HasPageObserver()) return;
+        observationReady = ready;
+        observationEnabled.store(true, std::memory_order_release);
+        lastObservationCheckpoint = MemoryLockProbe::Now();
+        for (auto& [key, page] : cpuObservations) armObservation(key, page.touched);
+    }
+
+    bool ArmPageObservation(std::uintptr_t address, std::size_t bytes) {
+        if (!observationEnabled.load(std::memory_order_acquire)) return false;
+        MemoryLockProbe::Lock lock(mutex, "page-observation-arm", bytes);
+        if (!wholeGpuPages(address, bytes)) return refuseObservation(PageArmRefusal::InvalidRange);
+        bool result = true;
+        for (auto cursor = address; cursor < address + bytes;) {
+            const auto base = cursor & ~(pageBytes - 1);
+            const auto stop = std::min(address + bytes, base + pageBytes);
+            const auto found = observationViews.find(base);
+            if (found == observationViews.end()) result = refuseObservation(PageArmRefusal::UnknownMapping);
+            else result = armObservation(found->second, subpagesOf(base, cursor, stop)) && result;
+            cursor = stop;
+        }
+        return result;
+    }
+
+    bool PageObservationCheckpoint(bool frame) {
+        if (!observationEnabled.load(std::memory_order_acquire)) return false;
+        const auto start = MemoryLockProbe::Now();
+        MemoryLockProbe::Lock lock(mutex, "page-observation-checkpoint", 0);
+        if (!frame && start - lastObservationCheckpoint < 1000000000ull) return false;
+        lastObservationCheckpoint = start;
+        std::uint64_t written = observationRetiredPages;
+        observationRetiredPages = 0;
+        for (auto& [key, page] : cpuObservations) {
+            written += std::popcount(page.written);
+            page.written = 0;
+            if (page.touched != 0) armObservation(key, page.touched);
+        }
+        const auto faults = observationFaultSerial.load(std::memory_order_relaxed);
+        const auto faultDelta = faults - lastObservationFaultSerial;
+        lastObservationFaultSerial = faults;
+        if (frame) {
+            ++observationCounts.frames;
+            observationCounts.framePages += written;
+            observationCounts.maxFramePages = std::max(observationCounts.maxFramePages, written);
+            observationCounts.frameFaults += faultDelta;
+            observationCounts.maxFrameFaults = std::max(observationCounts.maxFrameFaults, faultDelta);
+            ++observationCounts.frameFaultHistogram[timingBucket(faultDelta)];
+        } else {
+            ++observationCounts.fallbackWindows;
+            observationCounts.fallbackPages += written;
+            observationCounts.fallbackFaults += faultDelta;
+        }
+        noteTiming(observationCounts.checkpoint, MemoryLockProbe::Now() - start);
+        return true;
+    }
+
+    PageObservationStatistics PageObservationCounts() {
+        if (!ObservationRequested()) return {};
+        MemoryLockProbe::Lock lock(mutex, "page-observation-counts", 0);
+        auto result = observationCounts;
+        for (const auto& [key, page] : cpuObservations) result.outstanding += std::popcount(page.armed);
+        std::lock_guard faultLock(observationFaultMutex);
+        result.faults = observationFaultCounts;
+        result.mappingWait = observationMappingWait;
+        return result;
+    }
+
+    void SetPageObservationFaultHook(void (*hook)() noexcept) { observationFaultHook.store(hook, std::memory_order_release); }
+
     std::size_t PageObserverMetadataBytes() {
         MemoryLockProbe::Lock lock(mutex, "page-observer-size", 0);
         const auto nodes = [](const auto& map) { return map.size() * (sizeof(typename std::decay_t<decltype(map)>::value_type) + 4 * sizeof(void*)); };
         auto bytes = nodes(observationViews) + nodes(observationPhysical) + nodes(observationAliases) + nodes(observationHostAliases) + observationSections.capacity() * sizeof(std::shared_ptr<Section>);
+        if (ObservationRequested()) bytes += nodes(cpuObservations);
         for (const auto& [key, aliases] : observationPhysical) bytes += aliases.capacity() * sizeof(std::uintptr_t);
         for (const auto& [key, aliases] : observationAliases) bytes += aliases.capacity() * sizeof(ObservationKey);
         return bytes;
@@ -56,6 +138,15 @@ public:
 
     void SetPageObserver(PageObserver callback) {
         MemoryLockProbe::Lock lock(mutex, "page-observer", 0);
+        if (observationEnabled.exchange(false)) {
+            for (auto& [key, page] : cpuObservations) {
+                const auto armed = page.armed;
+                page.armed = 0;
+                applyObservation(key, armed);
+            }
+        }
+        for (auto& [address, view] : views) view.cpuObservation = nullptr;
+        cpuObservations.clear();
         pageObserver.store(callback, std::memory_order_release);
         observationViews.clear();
         observationPhysical.clear();
@@ -119,10 +210,10 @@ public:
                     mapped->second.armed = 0;
                     invalidate(*mapped->second.page);
                 }
-                if (gpuFault.load(std::memory_order_acquire) != nullptr) applyGpuProtection(cursor, stop - cursor, protection);
+                if (gpuFault.load(std::memory_order_acquire) != nullptr || observationEnabled.load(std::memory_order_relaxed)) applyGpuProtection(cursor, stop - cursor, protection);
                 else {
                     DWORD previous;
-                    if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                    if (!protectMemory(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
                 }
                 cursor = stop;
             }
@@ -174,7 +265,7 @@ public:
             }
             timer.Step(MemoryLockProbe::MapStep::Protect);
             DWORD previous;
-            if (!VirtualProtect(address, bytes, protection, &previous)) fail("protect a run of shared guest pages");
+            if (!protectMemory(address, bytes, protection, &previous)) fail("protect a run of shared guest pages");
             timer.Step(MemoryLockProbe::MapStep::Bookkeeping);
             for (std::size_t done = 0; done < bytes; done += pageBytes) {
                 const auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done);
@@ -215,7 +306,7 @@ public:
             }
             DWORD previous;
             timer.Step(MemoryLockProbe::MapStep::Protect);
-            if (!VirtualProtect(page, pageBytes, protection, &previous)) fail("protect shared guest page");
+            if (!protectMemory(page, pageBytes, protection, &previous)) fail("protect shared guest page");
             timer.Step(MemoryLockProbe::MapStep::Bookkeeping);
             if (!lean) shared = physical[key].lock();
             if (!shared) {
@@ -240,6 +331,7 @@ public:
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
             it->second.armed = 0;
+            if (observationEnabled.load(std::memory_order_relaxed)) openObservation(it->first, allSubpages);
             invalidate(*it->second.page);
             if (HasPageObserver()) {
                 const auto found = observationViews.find(it->first);
@@ -263,6 +355,7 @@ public:
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
             ++page.pins;
+            if (observationEnabled.load(std::memory_order_relaxed)) openObservation(it->first, allSubpages);
             for (const auto alias : page.aliases) {
                 auto& view = views.at(alias);
                 if (view.armed == 0) continue;
@@ -289,27 +382,40 @@ public:
     }
 
     bool HandleWrite(std::uintptr_t address) {
-        if (const auto handled = handleGpuFault(address, true)) return *handled;
+        FaultTimer timer(*this, PageFaultKind::Legacy);
+        if (timer.active) {
+            if (timer.nested) return false;
+            if (const auto handled = handleObservationFault(address, timer)) return *handled;
+        }
+        if (const auto handled = handleGpuFault(address, true, timer.publishedCpu)) return *handled;
         MemoryLockProbe::Lock lock(mutex, "write-fault", 1);
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
-        if (found == views.end() || !writable(found->second.protection)) return false;
+        if (found == views.end() || !writable(found->second.protection)) { timer.kind = PageFaultKind::Rejected; return false; }
         auto& view = found->second;
         const auto written = subpagesOf(base, address, address + 1);
         if (HasPageObserver()) observeWrite(base, written, PageEvent::WriteFault);
         invalidate(*view.page, written);
-        protectSubpages(base, written, view.protection, "resume shared memory write");
-        view.armed &= static_cast<std::uint8_t>(~written);
+        if (timer.active) {
+            view.armed &= static_cast<std::uint8_t>(~written);
+            applyGpuView(base, written);
+        } else {
+            protectSubpages(base, written, view.protection, "resume shared memory write");
+            view.armed &= static_cast<std::uint8_t>(~written);
+        }
         if (HasPageObserver()) observeAliasesState(base);
         return true;
     }
 
     bool HandleTransition(std::uintptr_t address) {
+        FaultTimer timer(*this, PageFaultKind::GpuRead);
+        if (timer.nested) return false;
         if (gpuAccessProtected.load(std::memory_order_acquire)) if (const auto handled = handleGpuFault(address, false)) return *handled;
+        timer.kind = PageFaultKind::Stale;
         if (transitionOwner.load() == GetCurrentThreadId()) return false;
         bool recent = false;
         for (std::size_t slot = 0; slot < transitionSlots && !recent; ++slot) recent = transitionFrom[slot].load() <= address && address < transitionTo[slot].load();
-        if (!recent) return false;
+        if (!recent) { timer.kind = PageFaultKind::Rejected; return false; }
         thread_local std::uintptr_t lastAddress = 0;
         thread_local int repeats = 0;
         if (address != lastAddress) {
@@ -357,6 +463,10 @@ public:
             if (!reserved) ++view.hostWrites;
             const auto written = subpagesOf(it->first, address, end);
             if (HasPageObserver()) observeWrite(it->first, written, PageEvent::HostWrite);
+            if (observationEnabled.load(std::memory_order_relaxed)) {
+                noteObservationWrite(it->first, written);
+                openObservation(it->first, written);
+            }
             invalidate(*view.page, written);
             const auto opened = static_cast<std::uint8_t>(view.armed & written);
             if (opened == 0) continue;
@@ -446,6 +556,12 @@ public:
         GetSystemInfo(&system);
         const auto base = reinterpret_cast<std::uintptr_t>(alias) & ~(static_cast<std::uintptr_t>(system.dwAllocationGranularity) - 1);
         if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(base), 0)) fail("unmap shared guest alias");
+        if (observationEnabled.load(std::memory_order_acquire)) {
+            MemoryLockProbe::Lock lock(mutex, "unmap-observation-alias", 0);
+            if (HasPageObserver()) forgetObservationAlias(alias);
+            untrackedAliases.fetch_sub(1, std::memory_order_relaxed);
+            return;
+        }
         if (HasPageObserver()) forgetObservationAlias(alias);
         untrackedAliases.fetch_sub(1, std::memory_order_relaxed);
     }
@@ -636,6 +752,7 @@ public:
             base = untouched.data();
         }
         const auto protection = found->second.protection;
+        if (!pending && observationEnabled.load(std::memory_order_relaxed)) openObservation(address & ~(pageBytes - 1), static_cast<std::uint8_t>(1u << ((address % pageBytes) / subpageBytes)));
         if (!pending) removeGpuPage(address);
         if (shared != nullptr) {
             auto& view = views.at(address & ~(pageBytes - 1));
@@ -645,7 +762,7 @@ public:
         if (!pending) {
             observe(PageEvent::Invalidate, address, subpageBytes);
             DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(address), subpageBytes, protection, &previous)) fail("open GPU publication page");
+            if (!protectMemory(reinterpret_cast<void*>(address), subpageBytes, protection, &previous)) fail("open GPU publication page");
             gpuProtectionSerial.fetch_add(1, std::memory_order_release);
         }
         const auto* source = static_cast<const unsigned char*>(gpu);
@@ -674,9 +791,12 @@ public:
     }
 
     bool ApplyGpuProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
-        if (gpuFault.load(std::memory_order_acquire) == nullptr) return false;
+        if (gpuFault.load(std::memory_order_acquire) == nullptr && !observationEnabled.load(std::memory_order_acquire)) return false;
         MemoryLockProbe::Lock lock(mutex, "gpu-protect", bytes);
         applyGpuProtection(address, bytes, protection);
+        if (observationEnabled.load(std::memory_order_relaxed)) {
+            for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) observeAliasesState(it->first);
+        }
         return true;
     }
 
@@ -841,6 +961,178 @@ public:
     }
 
 private:
+    static std::size_t timingBucket(std::uint64_t value) { return std::min<std::size_t>(31, std::bit_width(value)); }
+
+    static void noteTiming(PageTiming& timing, std::uint64_t ns) {
+        ++timing.calls;
+        timing.ns += ns;
+        timing.maxNs = std::max(timing.maxNs, ns);
+        ++timing.histogram[timingBucket(ns)];
+    }
+
+    struct FaultTimer {
+        WindowsMappings& owner;
+        PageFaultKind kind;
+        bool active, nested = false, publishedCpu = false;
+        std::uint64_t start = 0;
+        inline static thread_local unsigned depth = 0;
+        FaultTimer(WindowsMappings& owner, PageFaultKind kind) : owner(owner), kind(kind), active(owner.observationEnabled.load(std::memory_order_acquire)) {
+            if (!active) return;
+            nested = depth++ != 0;
+            if (nested) this->kind = PageFaultKind::Nested;
+            start = MemoryLockProbe::Now();
+        }
+        ~FaultTimer() {
+            if (!active) return;
+            const auto elapsed = MemoryLockProbe::Now() - start;
+            --depth;
+            std::lock_guard lock(owner.observationFaultMutex);
+            noteTiming(owner.observationFaultCounts[static_cast<std::size_t>(kind)], elapsed);
+            owner.observationFaultSerial.fetch_add(1, std::memory_order_relaxed);
+        }
+        void Locked(std::uint64_t since) {
+            if (!active) return;
+            const auto elapsed = MemoryLockProbe::Now() - since;
+            std::lock_guard lock(owner.observationFaultMutex);
+            noteTiming(owner.observationMappingWait, elapsed);
+        }
+    };
+
+    bool refuseObservation(PageArmRefusal reason) {
+        ++observationCounts.refusals[static_cast<std::size_t>(reason)];
+        return false;
+    }
+
+    BOOL protectMemory(void* address, std::size_t bytes, DWORD protection, DWORD* previous) {
+        if (!observationEnabled.load(std::memory_order_relaxed)) return VirtualProtect(address, bytes, protection, previous);
+        const auto start = MemoryLockProbe::Now();
+        const auto result = VirtualProtect(address, bytes, protection, previous);
+        noteTiming(observationCounts.protection, MemoryLockProbe::Now() - start);
+        observationCounts.protectionPages += bytes / subpageBytes;
+        return result;
+    }
+
+    bool protectObservation(std::uintptr_t address, std::size_t bytes, DWORD protection) {
+        const auto start = MemoryLockProbe::Now();
+        DWORD previous;
+        const bool result = VirtualProtect(reinterpret_cast<void*>(address), bytes, protection, &previous) != 0;
+        noteTiming(observationCounts.protection, MemoryLockProbe::Now() - start);
+        observationCounts.protectionPages += bytes / subpageBytes;
+        return result;
+    }
+
+    bool applyObservation(const ObservationKey& key, std::uint8_t mask) {
+        bool result = true;
+        for (const auto alias : observationPhysical.at(key)) {
+            const auto& view = views.at(alias);
+            for (std::size_t sub = 0; sub < subpages;) {
+                if ((mask & (1u << sub)) == 0) { ++sub; continue; }
+                const auto from = sub++;
+                const auto protection = effectiveGpuProtection(alias + from * subpageBytes, view.protection);
+                while (sub < subpages && (mask & (1u << sub)) != 0 && effectiveGpuProtection(alias + sub * subpageBytes, view.protection) == protection) ++sub;
+                result = protectObservation(alias + from * subpageBytes, (sub - from) * subpageBytes, protection) && result;
+            }
+        }
+        return result;
+    }
+
+    bool armObservation(const ObservationKey& key, std::uint8_t mask) {
+        auto& page = cpuObservations.at(key);
+        if (observationReady == nullptr || !observationReady()) return refuseObservation(PageArmRefusal::Metadata);
+        if (compare == nullptr) return refuseObservation(PageArmRefusal::Identity);
+        bool anyWritable = false;
+        if (observationOldAliases || observationHostAliases.contains(key)) return refuseObservation(PageArmRefusal::HostAlias);
+        for (const auto alias : observationPhysical.at(key)) {
+            const auto& view = views.at(alias);
+            anyWritable |= writable(view.protection);
+            if (view.page->pins != 0) return refuseObservation(PageArmRefusal::Pinned);
+            if (view.hostWrites != 0) return refuseObservation(PageArmRefusal::HostWriter);
+            if (view.page->hostAliases != 0) return refuseObservation(PageArmRefusal::HostAlias);
+        }
+        if (!anyWritable) return refuseObservation(PageArmRefusal::Permission);
+        mask &= static_cast<std::uint8_t>(~page.armed);
+        if (mask == 0) return true;
+        page.armed |= mask;
+        if (!applyObservation(key, mask)) {
+            page.armed &= static_cast<std::uint8_t>(~mask);
+            page.touched |= mask;
+            applyObservation(key, mask);
+            for (const auto alias : observationPhysical.at(key)) observe(PageEvent::SectionState, alias, pageBytes, PageUnsupported);
+            return refuseObservation(PageArmRefusal::Protection);
+        }
+        observationCounts.armedPages += std::popcount(mask);
+        observationCounts.rearmedPages += std::popcount(static_cast<std::uint8_t>(mask & page.everArmed));
+        page.everArmed |= mask;
+        page.touched &= static_cast<std::uint8_t>(~mask);
+        observeState(key);
+        return true;
+    }
+
+    void openObservation(std::uintptr_t base, std::uint8_t mask) {
+        const auto found = observationViews.find(base);
+        if (found == observationViews.end()) return;
+        auto& page = cpuObservations.at(found->second);
+        const auto opened = static_cast<std::uint8_t>(page.armed & mask);
+        page.armed &= static_cast<std::uint8_t>(~mask);
+        page.touched |= mask;
+        if (opened != 0 && !applyObservation(found->second, opened)) fail("open CPU observation page");
+        observeState(found->second);
+    }
+
+    void noteObservationWrite(std::uintptr_t base, std::uint8_t mask) {
+        auto* page = views.at(base).cpuObservation;
+        if (page == nullptr) return;
+        observationCounts.physicalPages += std::popcount(static_cast<std::uint8_t>(mask & ~page->written));
+        observationCounts.aliasPages += observationPhysical.at(observationViews.at(base)).size() * std::popcount(mask);
+        page->written |= mask;
+        page->touched |= mask;
+    }
+
+    std::optional<bool> handleObservationFault(std::uintptr_t address, FaultTimer& timer) {
+        const auto start = MemoryLockProbe::Now();
+        MemoryLockProbe::Lock lock(mutex, "page-observation-fault", 1);
+        timer.Locked(start);
+        const auto base = address & ~(pageBytes - 1);
+        const auto found = views.find(base);
+        if (found == views.end()) {
+            const auto owner = gpuOwner(address);
+            timer.kind = owner != 0 ? PageFaultKind::GpuWrite : PageFaultKind::Rejected;
+            return std::nullopt;
+        }
+        auto& view = found->second;
+        if (!writable(view.protection)) { timer.kind = PageFaultKind::Rejected; return false; }
+        const auto mask = subpagesOf(base, address, address + 1);
+        const auto owner = gpuOwner(address);
+        const bool gpu = owner != 0 && (gpuPages.at(owner).pending || gpuPages.at(owner).armed);
+        const bool legacy = (view.armed & mask) != 0;
+        auto* page = view.cpuObservation;
+        const bool observed = page != nullptr && (page->armed & mask) != 0;
+        timer.kind = gpu ? PageFaultKind::GpuWrite : legacy ? PageFaultKind::Legacy : observed ? PageFaultKind::Observation : PageFaultKind::Stale;
+        if (observed) {
+            observeWrite(base, mask, PageEvent::ObservationFault);
+            timer.publishedCpu = true;
+            if (const auto hook = observationFaultHook.load(std::memory_order_acquire)) hook();
+            page->armed &= static_cast<std::uint8_t>(~mask);
+            page->touched |= mask;
+        }
+        if (observed || legacy) noteObservationWrite(base, mask);
+        if (gpu) return std::nullopt;
+        if (legacy) {
+            if (!observed) observeWrite(base, mask, PageEvent::WriteFault);
+            invalidate(*view.page, mask);
+            view.armed &= static_cast<std::uint8_t>(~mask);
+        }
+        if (observed || legacy) {
+            if (!applyObservation(observationViews.at(base), mask)) { timer.kind = PageFaultKind::Rejected; return false; }
+            observeAliasesState(base);
+            return true;
+        }
+        const auto memory = query(address);
+        if (memory.State == MEM_COMMIT && writable(memory.Protect)) return true;
+        timer.kind = PageFaultKind::Rejected;
+        return false;
+    }
+
     void observe(PageEvent event, std::uintptr_t address, std::size_t bytes, std::uint32_t reasons = 0) const {
         if (const auto callback = pageObserver.load(std::memory_order_acquire)) callback(event, address, bytes, reasons);
     }
@@ -855,7 +1147,17 @@ private:
         const ObservationKey key{reinterpret_cast<std::uintptr_t>(section->handle), view.offset};
         observationViews.emplace(address, key);
         observationPhysical[key].push_back(address);
+        if (ObservationRequested()) views.at(address).cpuObservation = &cpuObservations[key];
         observe(PageEvent::SectionMap, address, pageBytes, PageUnsupported);
+        if (observationEnabled.load(std::memory_order_relaxed)) {
+            if (observationReady != nullptr && observationReady()) {
+                if (!applyObservation(key, views.at(address).cpuObservation->armed)) fail("protect a new CPU observation alias");
+                armObservation(key, allSubpages);
+            } else {
+                openObservation(address, allSubpages);
+                refuseObservation(PageArmRefusal::Metadata);
+            }
+        }
         observeState(key);
     }
 
@@ -875,7 +1177,8 @@ private:
                 const auto owner = gpuOwner(alias + sub * subpageBytes);
                 pending |= owner != 0 && gpuPages.at(owner).pending;
                 anyWritable |= writable(view.protection);
-                open |= view.page->pins != 0 || view.hostWrites != 0 || (writable(view.protection) && (view.armed & (1u << sub)) == 0);
+                const bool watched = (view.armed & (1u << sub)) != 0 || (view.cpuObservation != nullptr && (view.cpuObservation->armed & (1u << sub)) != 0);
+                open |= view.page->pins != 0 || view.hostWrites != 0 || (writable(view.protection) && !watched);
             }
             for (const auto alias : aliases) {
                 const auto& view = views.at(alias);
@@ -911,6 +1214,7 @@ private:
         if (host != observationHostAliases.end() && host->second == 0) observationHostAliases.erase(host);
         if (!observationPhysical.at(key).empty() || observationHostAliases.contains(key)) return;
         observationPhysical.erase(key);
+        cpuObservations.erase(key);
         const auto next = observationPhysical.lower_bound({key.first, 0});
         if (next == observationPhysical.end() || next->first.first != key.first) std::erase_if(observationSections, [&](const auto& section) { return reinterpret_cast<std::uintptr_t>(section->handle) == key.first; });
     }
@@ -943,6 +1247,9 @@ private:
     static_assert(subpageBytes == 4096, "Collect reports one page per subpage");
     static constexpr std::size_t subpages = pageBytes / subpageBytes;
     static constexpr std::uint8_t allSubpages = (1u << subpages) - 1;
+    struct CpuObservation {
+        std::uint8_t armed = 0, touched = allSubpages, written = 0, everArmed = 0;
+    };
     struct Section;
     struct SharedPage {
         std::array<std::uint64_t, subpages> generation = [] {
@@ -972,6 +1279,7 @@ private:
         std::uint64_t offset;
         std::uint32_t hostWrites;
         std::uint8_t collected = 0;
+        CpuObservation* cpuObservation = nullptr;
     };
     struct GpuPage {
         std::shared_ptr<SharedPage> shared;
@@ -998,7 +1306,7 @@ private:
         if (owner != 0 && gpuPages.at(owner).pending) return PAGE_NOACCESS;
         const auto view = views.find(page & ~(pageBytes - 1));
         const auto bit = static_cast<std::uint8_t>(1u << ((page % pageBytes) / subpageBytes));
-        const bool watched = (owner != 0 && gpuPages.at(owner).armed) || (view != views.end() && (view->second.armed & bit) != 0);
+        const bool watched = (owner != 0 && gpuPages.at(owner).armed) || (view != views.end() && ((view->second.armed & bit) != 0 || (view->second.cpuObservation != nullptr && (view->second.cpuObservation->armed & bit) != 0)));
         if (watched && writable(protection)) return protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
         return protection;
     }
@@ -1006,7 +1314,7 @@ private:
     void protectGpuPage(std::uintptr_t page, DWORD protection) {
         observe(PageEvent::Invalidate, page, subpageBytes);
         DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(page), subpageBytes, protection, &previous)) fail("protect GPU watched page");
+        if (!protectMemory(reinterpret_cast<void*>(page), subpageBytes, protection, &previous)) fail("protect GPU watched page");
         gpuProtectionSerial.fetch_add(1, std::memory_order_release);
     }
 
@@ -1060,7 +1368,7 @@ private:
             }
             DWORD previous;
             observe(PageEvent::Invalidate, page, end - page);
-            if (!VirtualProtect(reinterpret_cast<void*>(page), end - page, protection, &previous)) fail("protect private GPU watched pages");
+            if (!protectMemory(reinterpret_cast<void*>(page), end - page, protection, &previous)) fail("protect private GPU watched pages");
             gpuProtectionSerial.fetch_add(1, std::memory_order_release);
         }
         for (const auto& [page, mask] : shared) applyGpuShared(*page, mask);
@@ -1102,7 +1410,7 @@ private:
         return true;
     }
 
-    std::optional<bool> handleGpuFault(std::uintptr_t address, bool write) {
+    std::optional<bool> handleGpuFault(std::uintptr_t address, bool write, bool publishedCpu = false) {
         const auto callback = gpuFault.load(std::memory_order_acquire);
         if (callback == nullptr) return std::nullopt;
         std::uintptr_t owner = 0;
@@ -1116,7 +1424,7 @@ private:
                 const auto view = views.find(address & ~(pageBytes - 1));
                 const auto logical = view == views.end() ? page.protection : view->second.protection;
                 if (write ? !writable(logical) : !readable(logical)) return false;
-                if (write && HasPageObserver()) {
+                if (write && HasPageObserver() && !publishedCpu) {
                     const auto base = address & ~(pageBytes - 1);
                     if (view != views.end()) observeWrite(base, subpagesOf(base, address, address + 1), PageEvent::WriteFault);
                     else observe(PageEvent::WriteFault, address & ~(subpageBytes - 1), subpageBytes);
@@ -1177,6 +1485,7 @@ private:
                 const auto key = observationViews.at(cursor);
                 keys.push_back(key);
                 ++observationHostAliases[key];
+                if (observationEnabled.load(std::memory_order_relaxed)) openObservation(cursor, allSubpages);
                 observeState(key);
             }
         }
@@ -1266,7 +1575,7 @@ private:
             while (stop < subpages && (mask & (1u << stop)) != 0) ++stop;
             observe(PageEvent::Invalidate, base + sub * subpageBytes, (stop - sub) * subpageBytes);
             DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
+            if (!protectMemory(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
             sub = stop;
         }
     }
@@ -1411,6 +1720,11 @@ private:
             if (observed != observationViews.end()) {
                 const auto key = observed->second;
                 std::erase(observationPhysical.at(key), page);
+                if (ObservationRequested() && observationPhysical.at(key).empty()) {
+                    auto& watched = cpuObservations.at(key);
+                    observationRetiredPages += std::popcount(watched.written);
+                    watched = {};
+                }
                 observationViews.erase(observed);
                 observeState(key);
                 pruneObservationKey(key);
@@ -1460,10 +1774,11 @@ private:
             auto stop = page + pageBytes;
             while (stop < to && views.at(stop).protection == protection) stop += pageBytes;
             DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(page), stop - page, protection, &previous)) fail("restore kept shared guest pages");
+            if (!protectMemory(reinterpret_cast<void*>(page), stop - page, protection, &previous)) fail("restore kept shared guest pages");
             for (auto armed = page; armed < stop; armed += pageBytes) {
                 const auto& view = views.at(armed);
                 if (view.armed != 0) protectSubpages(armed, view.armed, protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY, "re-arm a kept shared guest page");
+                if (view.cpuObservation != nullptr && !applyObservation(observationViews.at(armed), view.cpuObservation->armed)) fail("restore CPU observation protection");
                 for (std::size_t sub = 0; sub < subpages; ++sub) if (view.page->gpuOwners[sub] != 0) applyGpuPage(armed + sub * subpageBytes);
                 if (HasPageObserver()) observeAliasesState(armed);
             }
@@ -1524,6 +1839,16 @@ private:
     std::vector<std::shared_ptr<Section>> observationSections;
     std::map<std::uintptr_t, std::vector<ObservationKey>> observationAliases;
     std::map<ObservationKey, std::size_t> observationHostAliases;
+    std::map<ObservationKey, CpuObservation> cpuObservations;
+    std::atomic<bool> observationEnabled{false};
+    bool (*observationReady)() noexcept = nullptr;
+    std::atomic<void (*)() noexcept> observationFaultHook{nullptr};
+    PageObservationStatistics observationCounts;
+    std::mutex observationFaultMutex;
+    std::array<PageTiming, static_cast<std::size_t>(PageFaultKind::Count)> observationFaultCounts{};
+    PageTiming observationMappingWait;
+    std::atomic<std::uint64_t> observationFaultSerial{0};
+    std::uint64_t lastObservationCheckpoint = 0, lastObservationFaultSerial = 0, observationRetiredPages = 0;
     bool observationOldAliases = false;
     std::atomic<std::size_t> untrackedAliases{0};
     std::atomic<bool (*)(std::uintptr_t, bool)> gpuFault{nullptr};

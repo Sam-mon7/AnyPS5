@@ -320,6 +320,12 @@ bool GuestArenaHasPageObserver_nid_no_patch() {
     return WindowsMappings::Get().HasPageObserver();
 }
 
+void GuestArenaEnablePageObservation_nid_no_patch(bool (*ready)() noexcept) { WindowsMappings::Get().EnablePageObservation(ready); }
+bool GuestArenaArmPageObservation_nid_no_patch(std::uintptr_t address, std::size_t bytes) { return WindowsMappings::Get().ArmPageObservation(address, bytes); }
+bool GuestArenaPageObservationCheckpoint_nid_no_patch(bool frame) { return WindowsMappings::Get().PageObservationCheckpoint(frame); }
+PageObservationStatistics GuestArenaPageObservationCounts_nid_no_patch() { return WindowsMappings::Get().PageObservationCounts(); }
+void GuestArenaSetPageObservationFaultHook_nid_no_patch(void (*hook)() noexcept) { WindowsMappings::Get().SetPageObservationFaultHook(hook); }
+
 std::size_t GuestArenaPageObserverMetadataBytes_nid_no_patch() {
     return WindowsMappings::Get().PageObserverMetadataBytes();
 }
