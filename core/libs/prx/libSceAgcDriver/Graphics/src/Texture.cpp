@@ -254,7 +254,32 @@ std::uint64_t SampledTextureMemory() {
     return SampledMemoryCounter().load(std::memory_order_relaxed);
 }
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, const MirrorSource* mirror) : context(context) {
+bool Texture::ImportDetileEnabled() {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_TEXTURE_IMPORT_DETILE"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    return enabled;
+}
+
+Texture::ImportRefusal Texture::ImportDetileRefusal(const Context& context, const GuestTextureResource& descriptor, std::uint64_t guestBytes) {
+    if (guestBytes < ImportDetileMinBytes) return ImportRefusal::TooSmall;
+    if (!HostImportCovers(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return ImportRefusal::NotImported;
+    return ImportRefusal::None;
+}
+
+namespace {
+
+const HostImport* ImportToDetile(const Context& context, const GuestTextureResource& descriptor, std::uint64_t guestBytes, Recorder* recorder) {
+    const auto address = descriptor.baseAddress;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    CompletePendingTextureWrites(context, address, bytes);
+    if (recorder != nullptr) recorder->FlushStoresOverlapping(address, bytes);
+    PublishShadow(address, bytes, PublishScope::Whole, PublishReason::Upload);
+    const auto* found = HostImportFor(context, address, bytes);
+    return found != nullptr && (address - found->base) % 4u == 0 ? found : nullptr;
+}
+
+}
+
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, const MirrorSource* mirror, bool detileFromImport) : context(context) {
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool verbose = [] { const auto* value = std::getenv("APS5_VERBOSE_TEXTURE_SETUP"); return value != nullptr && std::strcmp(value, "1") == 0; }();
@@ -288,7 +313,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         }
 
         const auto guestBytes = geometry.guestBytes;
-        Require(mirror != nullptr || snapshot.size() == guestBytes, "texture snapshot size mismatch");
+        const bool fromImport = detileFromImport && mirror == nullptr;
+        Require(mirror != nullptr || fromImport || snapshot.size() == guestBytes, "texture snapshot size mismatch");
 
         const auto sliceLinearBytes = geometry.sliceLinearBytes;
         Require(arrayLayers == 0 || sliceLinearBytes <= UINT64_MAX / arrayLayers, "detiled texture buffer size overflows");
@@ -337,11 +363,12 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 dumpWanted = dumpList.find(address) != std::string::npos || dumpList.find(extent) != std::string::npos;
             }
             static const bool scratch = BufferPool::ScratchEnabled();
-            auto staging = mirror != nullptr ? nullptr : std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, scratch ? Buffer::Access::Scratch : Buffer::Access::UploadOnly);
+            auto staging = mirror != nullptr || fromImport ? nullptr : std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, scratch ? Buffer::Access::Scratch : Buffer::Access::UploadOnly);
             setupPhase(4);
             if (staging != nullptr) std::memcpy(staging->WriteBytes().data(), snapshot.data(), snapshot.size());
             setupPhase(5);
-            auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, scratch);
+            std::shared_ptr<DeviceBuffer> tiled;
+            if (!fromImport) tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, scratch);
             setupPhase(6);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, scratch);
             setupPhase(7);
@@ -377,13 +404,25 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             // recorder (tests). APS5_SYNC_TEXTURE_UPLOAD=1 restores the waiting batch for every upload.
             static const bool syncUploads = std::getenv("APS5_SYNC_TEXTURE_UPLOAD") != nullptr;
             auto* recorder = dumpWanted || syncUploads ? nullptr : Recorder::Active();
+            const HostImport* guestImport = nullptr;
+            if (fromImport) {
+                guestImport = ImportToDetile(context, descriptor, guestBytes, recorder);
+                if (guestImport == nullptr) {
+                    std::vector<std::byte> current(static_cast<std::size_t>(guestBytes));
+                    ReadTextureSurface(descriptor, DccKeys::Uncompressed, current);
+                    staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, scratch ? Buffer::Access::Scratch : Buffer::Access::UploadOnly);
+                    std::memcpy(staging->WriteBytes().data(), current.data(), current.size());
+                    tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, scratch);
+                }
+                detiledFromImport = guestImport != nullptr;
+            }
             std::unique_ptr<CommandBatch> batch;
             VkCommandBuffer commands = VK_NULL_HANDLE;
             if (recorder != nullptr) {
                 commands = recorder->Commands();
                 if (staging != nullptr) recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
                 if (mirror != nullptr) recorder->Keep(mirror->lifetime);
-                recorder->Keep(tiled, static_cast<std::size_t>(guestBytes));
+                if (tiled != nullptr) recorder->Keep(tiled, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
                 recorder->Keep(owned);
             } else {
@@ -405,17 +444,24 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 std::fprintf(stderr, "[texture-upload] id=%llu device=0x%llx bindingSerial=%llu guest=0x%llx extent=%ux%ux%u layers=%u slices=%u mips=%u image=0x%llx recorder=0x%llx anticipatedBatch=%llu commands=0x%llx mode=%s staging=0x%llx stagingRequested=%llu tiled=0x%llx tiledRequested=%llu linear=0x%llx linearRequested=%llu (CPU recording: staging->tiled, detile tiled->linear, linear->image; pooled handles may have multiple uses)\n",
                     static_cast<unsigned long long>(trace->id), handleBits(context.device), static_cast<unsigned long long>(trace->bindings->LatestSerial()), static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, geometry.imageDepth, geometry.imageLayers, arrayLayers, descriptor.mipCount,
                     handleBits(image), handleBits(recorder), static_cast<unsigned long long>(recorder != nullptr ? recorder->Submissions() + 1u : 0u), handleBits(commands), recorder != nullptr ? "recorded" : "standalone",
-                    handleBits(staging != nullptr ? staging->Handle() : mirror->buffer), static_cast<unsigned long long>(guestBytes), handleBits(tiled->Handle()), static_cast<unsigned long long>(guestBytes), handleBits(linear->Handle()), static_cast<unsigned long long>(linearBytes));
+                    handleBits(staging != nullptr ? staging->Handle() : mirror != nullptr ? mirror->buffer : guestImport->buffer), static_cast<unsigned long long>(guestBytes), handleBits(tiled != nullptr ? tiled->Handle() : VkBuffer{}), static_cast<unsigned long long>(guestBytes), handleBits(linear->Handle()), static_cast<unsigned long long>(linearBytes));
             }
 
-            if (mirror != nullptr) {
-                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-                CopyBuffer(context, commands, mirror->buffer, mirror->offset, tiled->Handle(), 0, guestBytes);
+            if (guestImport != nullptr) {
+                if (recorder != nullptr) recorder->NotePendingRead(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), Recorder::ReadKind::StorageUpload);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
             } else {
-                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-                CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, guestBytes);
+                if (mirror != nullptr) {
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                    CopyBuffer(context, commands, mirror->buffer, mirror->offset, tiled->Handle(), 0, guestBytes);
+                } else {
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                    CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, guestBytes);
+                }
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             }
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            const VkBuffer detileSource = guestImport != nullptr ? guestImport->buffer : tiled->Handle();
+            const std::uint64_t detileBase = guestImport != nullptr ? descriptor.baseAddress - guestImport->base : 0;
 
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 const auto guestLayerOffset = geometry.GuestLayerOffset(layer);
@@ -423,7 +469,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 for (std::uint32_t level = 0; level < mips.size(); ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
-                    detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled->Handle(), guestLayerOffset + mip.tiledOffset, linear->Handle(), linearLayerOffset + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
+                    detiler.Dispatch(commands, descriptor.tileMode, elementBytes, detileSource, detileBase + guestLayerOffset + mip.tiledOffset, linear->Handle(), linearLayerOffset + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
                 }
             }
 

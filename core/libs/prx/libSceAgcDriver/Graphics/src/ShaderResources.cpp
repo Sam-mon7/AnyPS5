@@ -18,6 +18,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -159,6 +160,9 @@ struct TextureCache {
         std::uint64_t snapshotsMade = 0;
         std::uint64_t snapshotBytesMade = 0;
         std::uint64_t snapshotsReused = 0;
+        std::uint64_t importTextures = 0;
+        std::uint64_t importBytes = 0;
+        std::array<std::uint64_t, 5> importFallbacks{};
     } counts;
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
     VkPhysicalDevice budgetDevice = VK_NULL_HANDLE;
@@ -520,6 +524,7 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
     reportPrint("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu; %llu over-budget admissions under VRAM pressure\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(counts.pressured));
+    if (Texture::ImportDetileEnabled()) reportPrint("[texture-import] (10 s): %llu textures (%llu MiB) detiled straight from imported guest pages, no snapshot or staging copy; %llu kept the snapshot path: %llu DCC surfaces, %llu without write stamps or partly resident, %llu under 64 KiB, %llu not imported, %llu lost their import\n", static_cast<unsigned long long>(counts.importTextures), static_cast<unsigned long long>(counts.importBytes >> 20u), static_cast<unsigned long long>(std::accumulate(counts.importFallbacks.begin(), counts.importFallbacks.end(), std::uint64_t{0})), static_cast<unsigned long long>(counts.importFallbacks[0]), static_cast<unsigned long long>(counts.importFallbacks[1]), static_cast<unsigned long long>(counts.importFallbacks[2]), static_cast<unsigned long long>(counts.importFallbacks[3]), static_cast<unsigned long long>(counts.importFallbacks[4]));
     reportPrint("[texture-snapshots] cache CPU bytes: %llu retained, %llu omitted; %llu resnapshots after failed proof; %llu snapshots made (%llu MiB), %llu of them in reused buffers, %llu MiB spare (10 s)\n", static_cast<unsigned long long>(cache.snapshotBytes), static_cast<unsigned long long>(cache.omittedSnapshotBytes), static_cast<unsigned long long>(counts.resnapshots), static_cast<unsigned long long>(counts.snapshotsMade), static_cast<unsigned long long>(counts.snapshotBytesMade >> 20u), static_cast<unsigned long long>(counts.snapshotsReused), static_cast<unsigned long long>(cache.spareBytes >> 20u));
     if (VramTextures()) reportPrint("[texture-mirrors] cumulative: %llu GPU snapshots, %llu storage detiles, %llu CPU snapshots\n", static_cast<unsigned long long>(cache.mirrorSnapshotsMade), static_cast<unsigned long long>(StorageTexture::MirrorUploads()), static_cast<unsigned long long>(cache.snapshotsMade));
 }
@@ -790,6 +795,24 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     return budget;
 }
 
+enum class ImportFallback : std::size_t { Dcc, Unstamped, TooSmall, NotImported, Lost };
+
+bool useImportDetile(const Context& context, TextureCache& cache, const GuestTextureResource& resource, DccKeys keys, std::uint64_t guestBytes, std::uint64_t generation, bool partial) {
+    if (!Texture::ImportDetileEnabled() || context.detiler == nullptr) return false;
+    const auto refuse = [&](ImportFallback reason) {
+        ++cache.counts.importFallbacks[static_cast<std::size_t>(reason)];
+        return false;
+    };
+    if (keys != DccKeys::Uncompressed || resource.dccAddress != 0) return refuse(ImportFallback::Dcc);
+    if (generation == 0 || partial) return refuse(ImportFallback::Unstamped);
+    switch (Texture::ImportDetileRefusal(context, resource, guestBytes)) {
+        case Texture::ImportRefusal::TooSmall: return refuse(ImportFallback::TooSmall);
+        case Texture::ImportRefusal::NotImported: return refuse(ImportFallback::NotImported);
+        case Texture::ImportRefusal::None: break;
+    }
+    return true;
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
     std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
@@ -979,7 +1002,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, bytes, source != nullptr || mirror ? std::vector<std::byte>() : takeSnapshot(cache, bytes), nullptr, *keys, snapshotGeneration};
+    const bool importDetile = source == nullptr && !mirror && useImportDetile(context, cache, resource, *keys, guestBytes, snapshotGeneration, committed.has_value());
+    CachedTexture entry{key, address, bytes, source != nullptr || mirror || importDetile ? std::vector<std::byte>() : takeSnapshot(cache, bytes), nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
     if (source != nullptr) {
         entry.source = source;
@@ -997,6 +1021,15 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, std::span<const std::byte>{}, depthCompare, &*mirror);
         entry.accounted = entry.texture->AllocationBytes();
         ++cache.mirrorSnapshotsMade;
+    } else if (importDetile) {
+        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, std::span<const std::byte>{}, depthCompare, nullptr, true);
+        entry.accounted = entry.texture->AllocationBytes();
+        if (entry.texture->DetiledFromImport()) {
+            ++cache.counts.importTextures;
+            cache.counts.importBytes += bytes;
+        } else {
+            ++cache.counts.importFallbacks[static_cast<std::size_t>(ImportFallback::Lost)];
+        }
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         if (*keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);

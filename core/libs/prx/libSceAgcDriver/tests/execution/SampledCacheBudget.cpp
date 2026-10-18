@@ -1046,6 +1046,131 @@ void mirrorTextureTests(const Context& context, bool compressed) {
     }
     recorder.Sync();
 }
+
+class WatchedBlock {
+public:
+    WatchedBlock(const Context& context, Recorder& recorder, std::size_t bytes) : context(context), recorder(recorder), bytes(bytes) {
+        memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
+        Require(memory != nullptr, "cannot reserve import detile texture memory");
+        GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+        GuestAllocations::Mutation().Add(memory, bytes, true, true, true);
+    }
+    ~WatchedBlock() {
+        recorder.Sync();
+        ClearCachedTextures(context.device);
+        recorder.FlushDeferredReleases();
+        ClearHostImports(context.device);
+        GuestAllocations::Mutation().Remove(memory);
+        GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+    }
+    WatchedBlock(const WatchedBlock&) = delete;
+    WatchedBlock& operator=(const WatchedBlock&) = delete;
+    std::uint8_t* Data(std::size_t offset = 0) const { return memory + offset; }
+    std::uint64_t Address(std::size_t offset = 0) const { return reinterpret_cast<std::uint64_t>(memory) + offset; }
+    std::size_t Bytes() const { return bytes; }
+    void Fill(std::size_t offset, std::size_t count, std::uint32_t seed) const {
+        std::uint32_t state = seed;
+        for (std::size_t index = 0; index < count; ++index) {
+            state = state * 1664525u + 1013904223u;
+            memory[offset + index] = static_cast<std::uint8_t>(state >> 24u);
+        }
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    }
+
+private:
+    const Context& context;
+    Recorder& recorder;
+    std::size_t bytes;
+    std::uint8_t* memory = nullptr;
+};
+
+std::array<std::uint32_t, 8> CompressedWords(std::uint64_t address, std::uint32_t side) {
+    constexpr std::uint32_t lastLevel = 2;
+    return {
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (169u << 20u) | (((side - 1u) & 3u) << 30u),
+        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+        0xfacu | (lastLevel << 16u) | (TileR64KBX << 20u) | (Type2D << 28u),
+        0u,
+        0u,
+        0u,
+        0u,
+    };
+}
+
+bool importDetileTests(const Context& context) {
+    constexpr std::uint32_t side = 512;
+    constexpr std::uint32_t levels = 3;
+    constexpr VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    const bool on = Texture::ImportDetileEnabled();
+    const auto guestBytes = static_cast<std::size_t>(DescribeSurface(DecodeTextureResource(CompressedWords(65536, side))).guestBytes);
+    const auto stride = (guestBytes + 65535) / 65536 * 65536;
+    Recorder recorder(context);
+    recorder.Activate();
+    WatchedBlock block(context, recorder, 4 * stride);
+    if (context.hostImportAlignment == 0 || HostImportFor(context, block.Address(), block.Bytes()) == nullptr) {
+        std::puts("skipped, import detile tests require host imports");
+        return false;
+    }
+    if (AgcDriver::GuestMemory::CollectWrites(block.Address(), block.Bytes()) == 0) {
+        std::puts("skipped, import detile tests require write-watched guest memory");
+        return false;
+    }
+    MirrorSampleProgram sampler(context, recorder);
+    const auto samples = [&](const Texture& texture) {
+        std::array<float, levels> result{};
+        for (std::uint32_t level = 0; level < levels; ++level) result[level] = sampler.Red(texture.View(), texture.Layout(), static_cast<float>(level));
+        return result;
+    };
+    for (std::size_t surface = 0; surface < 4; ++surface) block.Fill(surface * stride, guestBytes, 0x1000u + static_cast<std::uint32_t>(surface));
+    ClearCachedTextures(context.device);
+
+    for (std::size_t surface = 1; surface < 3; ++surface) {
+        const auto words = CompressedWords(block.Address(surface * stride), side);
+        const auto resource = DecodeTextureResource(words);
+        Require(DescribeSurface(resource).guestBytes == guestBytes, "the import detile fixture changed size");
+        std::vector<std::byte> snapshot(guestBytes);
+        std::memcpy(snapshot.data(), block.Data(surface * stride), guestBytes);
+        const Texture reference(context, *context.detiler, resource, identity, snapshot);
+        const Texture direct(context, *context.detiler, resource, identity, std::span<const std::byte>{}, false, nullptr, true);
+        Require(!reference.DetiledFromImport() && direct.DetiledFromImport(), "a texture over imported guest pages was not detiled from the import");
+        const auto expected = samples(reference);
+        Require(samples(direct) == expected, "the texture detiled from the import differs from the one detiled from a snapshot (surface " + std::to_string(surface) + ")");
+        Require(std::any_of(expected.begin(), expected.end(), [](float value) { return value != 0.0f; }), "the import detile fixture samples black at every level");
+    }
+
+    const auto words = CompressedWords(block.Address(stride), side);
+    const auto resource = DecodeTextureResource(words);
+    std::vector<std::byte> snapshot(guestBytes);
+    std::memcpy(snapshot.data(), block.Data(stride), guestBytes);
+    const auto firstExpected = samples(Texture(context, *context.detiler, resource, identity, snapshot));
+    const auto before = TextureCacheUsage().snapshotsMade;
+    auto cached = CachedSampledTexture(context, words);
+    Require(!cached->ViewsStorageImage(), "a compressed texture viewed a storage image");
+    Require(cached->DetiledFromImport() == on, on ? "the lookup of a texture over imported guest pages kept the snapshot path" : "the lookup detiled from the import with the switch off");
+    Require((TextureCacheUsage().snapshotsMade == before) == on, on ? "the lookup took a CPU snapshot although it detiles from the import" : "the lookup took no CPU snapshot with the switch off");
+    Require(samples(*cached) == firstExpected, "the cached texture sampled other texels than a snapshot of the same guest pages");
+    Require(CachedSampledTexture(context, words) == cached, "the second lookup of an unchanged texture did not hit the cache");
+
+    block.Fill(stride, guestBytes, 0x2000u);
+    std::memcpy(snapshot.data(), block.Data(stride), guestBytes);
+    const auto secondExpected = samples(Texture(context, *context.detiler, resource, identity, snapshot));
+    Require(secondExpected != firstExpected, "the import detile fixture did not change its texels");
+    auto written = CachedSampledTexture(context, words);
+    Require(written != cached, "a CPU write over the texture kept the cached texture");
+    Require(samples(*written) == secondExpected, "the texture looked up after a CPU write sampled the old texels");
+
+    RecordMirrorFill(context, recorder, resource.baseAddress, guestBytes, 0u);
+    auto filled = CachedSampledTexture(context, words);
+    Require(filled != written, "a recorded GPU write over the texture kept the cached texture");
+    for (const auto value : samples(*filled)) Require(value == 0.0f, on ? "the texture detiled from the import ran before the recorded GPU write over its pages" : "the snapshot texture missed the recorded GPU write over its pages");
+    cached.reset();
+    written.reset();
+    filled.reset();
+    recorder.Sync();
+    return true;
+}
 #endif
 
 void VKAPI_PTR ReportPressure(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
@@ -1175,6 +1300,7 @@ int main(int argc, char** argv) {
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool resources = mode == "resource-admission" || mode == "resource-oversized" || mode == "resource-clear";
         const bool mirrors = mode == "mirror-storage" || mode == "mirror-snapshot" || mode == "mirror-readonly";
+        const bool importDetile = mode == "import-detile";
 #ifdef _WIN32
         if (!memory) _putenv_s("APS5_TEXTURE_CACHE_MIB", "1");
 #else
@@ -1182,7 +1308,7 @@ int main(int argc, char** argv) {
 #endif
         std::unique_ptr<Device> device;
         try {
-            device = std::make_unique<Device>(resources, mirrors);
+            device = std::make_unique<Device>(resources, mirrors || importDetile);
         } catch (const std::exception& error) {
             if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
             std::printf("skipped, no usable Vulkan device: %s\n", error.what());
@@ -1197,6 +1323,16 @@ int main(int argc, char** argv) {
             if (mode == "mirror-readonly") readOnlyMirrorTextureTests(context);
             else mirrorTextureTests(context, mode == "mirror-snapshot");
             std::puts("mirror texture tests passed");
+            return 0;
+#else
+            return VulkanTestSkipped;
+#endif
+        }
+        if (importDetile) {
+#ifdef _WIN32
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            if (!importDetileTests(context)) return VulkanTestSkipped;
+            std::puts("texture import detile tests passed");
             return 0;
 #else
             return VulkanTestSkipped;
