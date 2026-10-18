@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <limits>
 #include <iterator>
@@ -39,6 +40,7 @@ struct Registry {
     std::weak_ptr<const Lease::Ranges> readableLease;
     std::weak_ptr<const Lease::Ranges> allLease;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> retiring;
+    std::atomic<std::shared_ptr<const Lease::Ranges>> published;
 };
 
 Registry& registry() {
@@ -51,6 +53,38 @@ bool isRetiring(const Range& range) {
         if (range.address < end && begin < range.address + range.bytes) return true;
     }
     return false;
+}
+
+bool publishedLeases() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_REGISTRY_PUBLISHED_LEASE");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
+}
+
+std::shared_ptr<const Lease::Ranges> readableRanges() {
+    auto ranges = std::make_shared<Lease::Ranges>();
+    for (const auto& [address, range] : registry().ranges) {
+        if (range->readable && range->bytes != 0 && !isRetiring(*range)) ranges->push_back(range);
+    }
+    return ranges;
+}
+
+void retractPublished(std::uintptr_t address, std::uintptr_t end) {
+    if (!publishedLeases()) return;
+    const auto current = registry().published.load();
+    if (current == nullptr) return;
+    const auto& list = *current;
+    const auto from = std::partition_point(list.begin(), list.end(), [&](const auto& range) { return range->address + range->bytes <= address; });
+    auto to = from;
+    while (to != list.end() && ((*to)->address < end || (*to)->address == address)) ++to;
+    if (from == to) return;
+    auto kept = std::make_shared<Lease::Ranges>();
+    kept->reserve(list.size() - static_cast<std::size_t>(to - from));
+    kept->insert(kept->end(), list.begin(), from);
+    kept->insert(kept->end(), to, list.end());
+    registry().published.store(std::move(kept));
 }
 
 std::atomic<std::uint64_t> generation{1};
@@ -140,6 +174,13 @@ void* GuestAllocationsBegin_nid_postfix() {
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
+    if (publishedLeases()) {
+        try {
+            registry().published.store(readableRanges());
+        } catch (...) {
+            registry().published.store(nullptr);
+        }
+    }
     const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
@@ -390,6 +431,7 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     for (;;) {
         registry().readableLease.reset();
         registry().allLease.reset();
+        retractPublished(address, end);
         bool pinned = false;
         auto it = ranges.upper_bound(address);
         if (it != ranges.begin()) --it;
@@ -638,15 +680,25 @@ void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_
     unmapObserver.store(callback, std::memory_order_release);
 }
 
-Lease GuestAllocationsAcquire_nid_postfix() {
-    std::lock_guard lock(registry().mutex);
+namespace {
+
+Lease acquireReadable() {
     if (auto shared = registry().readableLease.lock()) return Lease(std::move(shared));
-    auto ranges = std::make_shared<Lease::Ranges>();
-    for (const auto& [address, range] : registry().ranges) {
-        if (range->readable && range->bytes != 0 && !isRetiring(*range)) ranges->push_back(range);
-    }
+    auto ranges = readableRanges();
     if (registry().retiring.empty()) registry().readableLease = ranges;
     return Lease(std::move(ranges));
+}
+
+}
+
+Lease GuestAllocationsAcquire_nid_postfix() {
+    if (publishedLeases()) {
+        std::unique_lock attempt(registry().mutex, std::try_to_lock);
+        if (attempt.owns_lock()) return acquireReadable();
+        if (auto shared = registry().published.load()) return Lease(std::move(shared));
+    }
+    std::lock_guard lock(registry().mutex);
+    return acquireReadable();
 }
 
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next) {

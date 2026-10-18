@@ -1390,9 +1390,11 @@ if(BUILD_TESTING)
         target_compile_definitions(guest_memory_tests PRIVATE GUEST_MEMORY_ELF0_MODULE="$<TARGET_FILE:guest_memory_elf0_module>")
     endif()
     add_test(NAME guest_memory COMMAND guest_memory_tests)
+    add_test(NAME guest_memory_published_lease COMMAND guest_memory_tests)
+    set_tests_properties(guest_memory_published_lease PROPERTIES ENVIRONMENT "APS5_REGISTRY_PUBLISHED_LEASE=1" TIMEOUT 30)
     add_test(NAME guest_mmap_fixed_anonymous COMMAND guest_memory_tests fixed-anonymous)
     if(WIN32)
-        set_tests_properties(guest_memory guest_mmap_fixed_anonymous PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(guest_memory guest_memory_published_lease guest_mmap_fixed_anonymous PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_mprotect_unmapped_tests ${LIBS_INCLUDE_DIR}/tests/GuestMprotectUnmapped.cpp)

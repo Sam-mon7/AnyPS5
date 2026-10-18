@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2768,6 +2769,88 @@ static void CheckPinnedRangeIsLeftOutOfNewLeases() {
     Require(munmap_nid_postfix(again, page) == 0);
 }
 
+static bool PublishedLeases() {
+    const char* text = std::getenv("APS5_REGISTRY_PUBLISHED_LEASE");
+    return text != nullptr && std::string_view(text) == "1";
+}
+
+static bool LeaseHolds(const GuestAllocations::Lease& lease, const void* pointer) {
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    return std::any_of(lease.begin(), lease.end(), [&](const auto& range) { return range->address == address; });
+}
+
+static unsigned char* UnregisteredPage(void* storage, std::size_t page) {
+    return reinterpret_cast<unsigned char*>((reinterpret_cast<std::uintptr_t>(storage) + page - 1) & ~(page - 1));
+}
+
+static void CheckAcquireDuringMutation() {
+    constexpr std::size_t page = 0x4000;
+    void* storage = ::operator new(page * 2);
+    auto* target = UnregisteredPage(storage, page);
+    {
+        GuestAllocations::Mutation settle;
+    }
+    std::atomic<bool> acquired{false};
+    GuestAllocations::Lease seen;
+    std::thread reader;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(target, page, true, true, true);
+        reader = std::thread([&] {
+            seen = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+            acquired = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        Require(acquired == PublishedLeases());
+    }
+    reader.join();
+    Require(acquired);
+    Require(LeaseHolds(seen, target) != PublishedLeases());
+    seen.clear();
+    {
+        const auto after = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        Require(LeaseHolds(after, target));
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(target);
+    }
+    {
+        const auto after = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        Require(!LeaseHolds(after, target));
+    }
+    ::operator delete(storage);
+}
+
+static void CheckLeaseDuringPinWaitLeavesOutTheRange() {
+    constexpr std::size_t page = 0x4000;
+    void* storage = ::operator new(page * 2);
+    auto* target = UnregisteredPage(storage, page);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(target, page, true, true, false);
+    }
+    auto held = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    Require(LeaseHolds(held, target));
+    std::atomic<bool> removed{false};
+    std::thread remover([&] {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(target);
+        removed = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    Require(!removed);
+    if (PublishedLeases()) {
+        const auto during = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        Require(!LeaseHolds(during, target));
+        Require(!removed);
+    }
+    held.clear();
+    remover.join();
+    Require(removed);
+    ::operator delete(storage);
+}
+
 static void CheckMunmapOverUnmappedPages() {
     constexpr std::size_t page = 0x4000;
     const auto failed = reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));
@@ -2872,6 +2955,8 @@ int main(int argc, char** argv) {
     CheckReadsIntoSharedWriteTracking();
     CheckPinnedSharedPages();
     CheckPinnedRangeIsLeftOutOfNewLeases();
+    CheckAcquireDuringMutation();
+    CheckLeaseDuringPinWaitLeavesOutTheRange();
     CheckFailedCollectKeepsWrites();
     CheckSingleDirectMappingTracksWritesWithoutFaults();
     CheckSecondDirectMappingWaitsForLeases();

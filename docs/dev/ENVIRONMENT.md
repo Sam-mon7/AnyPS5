@@ -508,6 +508,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_SSE4A_EMULATION` | presence | `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp` |  | disables emulation of AMD-only SSE4a instructions, making such a fault fatal |
 | `APS5_NO_WRITE_WATCH` | presence | `core/libs/prx/libc/src/GuestArena.cpp` |  | disables write watching so guest buffers are fully re-read on every use |
 | `APS5_PIN_WAIT_MS` | integer | `core/libs/prx/libc/src/GuestAllocations.cpp` | 60000 | milliseconds to wait for a pinned allocation lease before failing |
+| `APS5_REGISTRY_PUBLISHED_LEASE` | string | `core/libs/prx/libc/src/GuestAllocations.cpp` |  | 1 permits allocation leases from the last committed snapshot while a mutation holds the registry mutex |
 | `APS5_TRACE_AFFINITY` | presence | `core/libs/prx/libc/include/CpuTopology.hpp` |  | prints a line naming the role, tid and mask of every thread pinning |
 | `APS5_TRACE_CALLS` | string | `core/libs/prx/libc/src/specifics/windows/CallTrace.cpp` |  | comma-separated libraries (or all) whose guest calls are traced |
 | `APS5_TRACE_EXIT` | presence | `core/libs/prx/libc/src/Process.cpp` |  | prints a backtrace of the caller of exit, _Exit and the process-exit path |
