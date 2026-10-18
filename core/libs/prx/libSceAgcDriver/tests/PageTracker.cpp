@@ -569,9 +569,21 @@ void declarationSkips() {
     require(tracker->CaptureEpoch(c).regions.front().gpuEpoch > newAlias.regions.front().gpuEpoch, "new alias missed the GPU declaration");
     GpuWrite(a);
     require(skipped() == mapped + 1, "declaration after the alias visit was not skipped");
+    const Range pair{a.address, 2 * PageBytes};
+    GpuWrite(pair);
+    const auto paired = skipped();
+    GpuWrite(pair);
+    require(skipped() == paired + 2, "repeated two-page declaration was not skipped");
+    tracker->SetCoverage({a.address + PageBytes, PageBytes}, Bit(Reason::ProtectedSection));
+    const auto partial = skipped();
+    const auto secondAlias = tracker->CaptureEpoch({b.address + PageBytes, PageBytes});
+    GpuWrite(pair);
+    require(skipped() == partial + 1, "partial declaration revisited still-declared pages");
+    require(tracker->CaptureEpoch({b.address + PageBytes, PageBytes}).regions.front().gpuEpoch > secondAlias.regions.front().gpuEpoch, "partial declaration missed the changed page's alias");
     tracker->ReadbackGpuWrites(a);
+    const auto readback = skipped();
     GpuWrite(a);
-    require(skipped() == mapped + 1, "declaration skipped after a readback cleared pending work");
+    require(skipped() == readback, "declaration skipped after a readback cleared pending work");
     for (auto* view : views) GuestArena::GuestArenaReset_nid_postfix(view, bytes);
     for (auto* view : views) GuestArena::GuestArenaRelease_nid_postfix(view, bytes);
 }

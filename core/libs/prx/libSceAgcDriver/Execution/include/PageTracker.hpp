@@ -16,6 +16,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace AgcDriver::PageTracker {
 
@@ -97,8 +98,8 @@ public:
     void MarkCpuWritten(Range range, Source source);
     void MarkGpuWritten(Range range, Source source);
     void MarkGpuDeclared(Range range, Source source, std::uint64_t generation);
-    bool DeclaredPending(Range range) const;
-    void NoteSkippedDeclaration(Range range);
+    std::vector<Range> UndeclaredRuns(Range range) const;
+    void NoteSkippedDeclaration(std::uint64_t pages);
     std::uint64_t MappingGeneration() const { return mappingGeneration.load(std::memory_order_acquire); }
     void PublishGpuWrites(Range range);
     void ReadbackGpuWrites(Range range);

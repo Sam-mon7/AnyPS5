@@ -355,21 +355,32 @@ void Tracker::MarkGpuDeclared(Range range, Source source, std::uint64_t generati
     if (source == Source::GpuDeclaration) counts.gpuPages += Pages(range);
 }
 
-bool Tracker::DeclaredPending(Range range) const {
-    if (!range.Valid() || Poisoned()) return false;
-    bool pending = true;
-    Visit(range, false, [&](auto, auto offset, auto bytes, auto* region) {
-        if (!pending) return;
-        if (region == nullptr) { pending = false; return; }
+std::vector<Range> Tracker::UndeclaredRuns(Range range) const {
+    std::vector<Range> runs;
+    if (!range.Valid()) return runs;
+    if (Poisoned()) return {range};
+    const auto end = range.address + range.bytes;
+    const auto add = [&](std::uint64_t first, std::uint64_t last) {
+        first = std::max(first, range.address);
+        last = std::min(last, end);
+        if (first >= last) return;
+        if (!runs.empty() && runs.back().address + runs.back().bytes == first) runs.back().bytes += last - first;
+        else runs.push_back({first, last - first});
+    };
+    Visit(range, false, [&](auto id, auto offset, auto bytes, auto* region) {
+        const auto base = id * RegionBytes;
+        if (region == nullptr) { add(base + offset, base + offset + bytes); return; }
         const auto& gpu = region->reasons[static_cast<std::size_t>(Reason::PendingGpu)];
-        Words(offset, bytes, [&](auto word, auto mask) { if ((region->declared[word] & gpu[word] & mask) != mask) pending = false; });
+        for (auto page = offset / PageBytes; page < (offset + bytes + PageBytes - 1) / PageBytes; ++page) {
+            if ((region->declared[page / 64] & gpu[page / 64] & (1ull << (page % 64))) == 0) add(base + page * PageBytes, base + (page + 1) * PageBytes);
+        }
     });
-    return pending;
+    return runs;
 }
 
-void Tracker::NoteSkippedDeclaration(Range range) {
+void Tracker::NoteSkippedDeclaration(std::uint64_t pages) {
     std::lock_guard lock(countsMutex);
-    counts.skippedGpuPages += Pages(range);
+    counts.skippedGpuPages += pages;
 }
 
 void Tracker::PublishGpuWrites(Range range) { MarkGpuWritten(range, Source::Copyback); }
@@ -740,10 +751,11 @@ bool ObserversRegistered() { return registered.load(std::memory_order_acquire); 
 namespace {
 void declareGpuAliases(Tracker& tracker, Range range, Source source) {
     const auto generation = tracker.MappingGeneration();
-    if (tracker.DeclaredPending(range)) {
-        tracker.NoteSkippedDeclaration(range);
-        return;
-    }
+    const auto runs = tracker.UndeclaredRuns(range);
+    std::uint64_t undeclared = 0;
+    for (const auto run : runs) undeclared += Pages(run);
+    if (Pages(range) > undeclared) tracker.NoteSkippedDeclaration(Pages(range) - undeclared);
+    if (runs.empty()) return;
     std::vector<Range> aliases;
 #ifdef _WIN32
     const auto collect = [](std::uintptr_t address, std::size_t bytes, void* context) {
@@ -751,7 +763,7 @@ void declareGpuAliases(Tracker& tracker, Range range, Source source) {
         if (!ranges.empty() && ranges.back().address + ranges.back().bytes == address) ranges.back().bytes += bytes;
         else ranges.push_back({address, bytes});
     };
-    GuestArena::GuestArenaVisitPageAliases_nid_no_patch(range.address, range.bytes, collect, &aliases);
+    for (const auto run : runs) GuestArena::GuestArenaVisitPageAliases_nid_no_patch(run.address, run.bytes, collect, &aliases);
     std::sort(aliases.begin(), aliases.end());
     std::vector<Range> merged;
     for (const auto alias : aliases) {
@@ -760,7 +772,7 @@ void declareGpuAliases(Tracker& tracker, Range range, Source source) {
     }
     aliases = std::move(merged);
 #else
-    aliases.push_back(range);
+    aliases = runs;
 #endif
     for (const auto alias : aliases) tracker.MarkGpuDeclared(alias, source, generation);
 }
