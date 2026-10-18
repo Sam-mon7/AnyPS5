@@ -12,6 +12,7 @@ public:
     ResourcePhase(const ResourcePhase&) = delete;
     ResourcePhase& operator=(const ResourcePhase&) = delete;
     void End();
+    static void Stop();
 
 private:
     const char* name;

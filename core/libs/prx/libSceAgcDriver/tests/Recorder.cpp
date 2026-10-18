@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ResourcePhase.hpp"
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -8360,6 +8361,9 @@ void completionProbeTests(Device& device) {
 }
 
 int main(int argc, char** argv) {
+    struct ProfileStop {
+        ~ProfileStop() { AgcDriver::ResourcePhase::Stop(); }
+    } profileStop;
     try {
         const bool completionProbe = argc == 2 && std::string_view(argv[1]) == "--completion-probe-only";
         std::unique_ptr<Device> created;

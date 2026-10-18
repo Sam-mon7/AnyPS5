@@ -35,6 +35,10 @@ ResourcePhase::~ResourcePhase() {
     End();
 }
 
+void ResourcePhase::Stop() {
+    StopProfileOutput_nid_no_patch();
+}
+
 void ResourcePhase::End() {
     if (start == 0) return;
     const auto end = timestamp();
