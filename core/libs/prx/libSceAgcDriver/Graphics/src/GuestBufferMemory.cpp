@@ -3226,6 +3226,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                 drained = true;
             }
             if (recorder != nullptr) recorder->FlushDeferredReleases();
+            if (BufferCache::WritesEnabled()) synced = BufferCache::FlushForMapping(address, bytes) || synced;
             FlushHeapMirrorWrites(address, bytes, true);
             publishImages();
             const auto end = static_cast<std::uint64_t>(address) + bytes;
@@ -3280,6 +3281,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                 std::this_thread::yield();
             }
             if (recorder != nullptr) recorder->FlushDeferredReleases();
+            if (BufferCache::WritesEnabled()) synced = BufferCache::FlushForMapping(address, bytes) || synced;
             FlushHeapMirrorWrites(address, bytes, true);
             publishImages();
 
@@ -3369,6 +3371,7 @@ std::shared_ptr<const GuestAllocations::Range> LeaseRegisteredRange(std::uint64_
 bool HeapMirrorExportInProgress() { return exportingHeapMirrors; }
 
 void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force) {
+    if (BufferCache::WritesEnabled() && GuestMemory::CurrentReadSite() != GuestMemory::ReadSite::BufferUpload) BufferCache::Flush(address, bytes);
     ResourcePhase phase("mirror-writeback");
     if (VramLazyWrites() && bytes != 0) {
         if (!force && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::MirrorRefresh) return;
@@ -5231,7 +5234,8 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         if (!(region.writable || region.hostBacked) || region.sparse) return false;
         const auto begin = region.begin / PageTracker::PageBytes * PageTracker::PageBytes;
         const auto end = ((region.end - 1) / PageTracker::PageBytes + 1) * PageTracker::PageBytes;
-        if (WritesOverlap(begin, static_cast<std::size_t>(end - begin))) {
+        const bool written = WritesOverlap(begin, static_cast<std::size_t>(end - begin));
+        if (written && !BufferCache::WritesEnabled()) {
             BufferCache::CountFallback(BufferCache::Fallback::Written);
             return false;
         }
@@ -5243,7 +5247,10 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             BufferCache::CountFallback(BufferCache::Fallback::Alignment);
             return false;
         }
-        return BufferCache::BindReadOnly(context, this, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+        const bool cached = written ? BufferCache::BindWritable(context, this, region.begin, bytes) : BufferCache::BindReadOnly(context, this, region.begin, bytes);
+        if (!cached) BufferCache::Flush(begin, static_cast<std::size_t>(end - begin));
+        return cached;
     });
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
@@ -6103,6 +6110,8 @@ void GuestBufferMemory::AddressRanges(std::vector<ShaderRecompiler::BdaAbi::Rang
     auto& merged = HostThreadLocal<std::vector<ShaderRecompiler::BdaAbi::Range>, MergedRangesStorage>();
     own.clear();
     for (const auto& region : regions) own.push_back(addressRange(region));
+    BufferCache::AddressRanges(this, own);
+    if (BufferCache::WritesEnabled()) std::sort(own.begin(), own.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
     result.clear();
     if (space != nullptr) {
         result.reserve(own.size() + space->ranges.size());
@@ -6136,7 +6145,7 @@ void GuestBufferMemory::AddressRanges(std::vector<ShaderRecompiler::BdaAbi::Rang
             part.deviceAddress += cursor - range.begin;
             if (written) {
                 const auto* region = owner(cursor);
-                Require(region != nullptr && region->writable && (region->mirror == nullptr || region->mirror->writable), "runtime buffer write has no writable GPU owner");
+                Require(BufferCache::Contains(this, cursor, static_cast<std::size_t>(end - cursor)) || (region != nullptr && region->writable && (region->mirror == nullptr || region->mirror->writable)), "runtime buffer write has no writable GPU owner");
                 part.permissions |= ShaderRecompiler::BdaAbi::Write;
             }
             merged.push_back(part);
@@ -6193,6 +6202,7 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
 bool GuestBufferMemory::HasCopiedWrites() const {
     if (VramMirrorWrites() && !mirrorWrites.empty()) return true;
     for (const auto& [begin, end] : writes) {
+        if (BufferCache::WritesEnabled() && BufferCache::Contains(this, begin, static_cast<std::size_t>(end - begin))) continue;
         const auto* found = owner(begin);
         if (found == nullptr) continue;
         const auto& region = *found;
@@ -6215,6 +6225,7 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
         if (std::any_of(interval->watched.begin(), interval->watched.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; })) return true;
     }
     for (const auto& [begin, end] : writes) {
+        if (BufferCache::WritesEnabled() && BufferCache::Contains(this, begin, static_cast<std::size_t>(end - begin))) continue;
         if (!(address < end && begin < address + bytes)) continue;
         const auto* found = owner(begin);
         if (found == nullptr) continue;
@@ -6230,6 +6241,7 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
 void GuestBufferMemory::MarkDirectWrites() const {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     for (const auto& [begin, end] : writes) {
+        if (BufferCache::WritesEnabled() && BufferCache::Contains(this, begin, static_cast<std::size_t>(end - begin))) continue;
         const auto* found = owner(begin);
         if (found == nullptr) continue;
         const auto& region = *found;
@@ -6502,7 +6514,7 @@ void GuestBufferMemory::prepareMirrorWrites(bool addressable) {
 
 void GuestBufferMemory::declarePageWrites() const {
     if (!PageTracker::Enabled()) return;
-    for (const auto& [begin, end] : writes) PageTracker::GpuWrite({begin, end - begin});
+    for (const auto& [begin, end] : writes) if (!BufferCache::WritesEnabled() || !BufferCache::Contains(this, begin, static_cast<std::size_t>(end - begin))) PageTracker::GpuWrite({begin, end - begin});
     const auto mark = [](const auto& list) {
         for (const auto& region : list) if (region.direct != nullptr && region.writable) PageTracker::GpuWrite({region.begin, region.end - region.begin});
     };
@@ -6512,6 +6524,7 @@ void GuestBufferMemory::declarePageWrites() const {
 
 void GuestBufferMemory::BeginGpuWrites(Recorder& recorder) {
     declarePageWrites();
+    BufferCache::BeginWrites(this, recorder, writes);
     if (VramLazyWrites()) { beginLazyWrites(&recorder); return; }
     if (!VramWritable()) return;
     GuestMemory::AssertGpuLockHeld("VRAM mirror command recording");
@@ -6805,7 +6818,7 @@ void GuestBufferMemory::recordMirrorResults(Recorder* recorder) {
 
 void GuestBufferMemory::WriteBack() {
     Require(uploaded && !committed, "guest memory cannot be committed twice or before upload");
-    if (PageTracker::Enabled()) for (const auto& [begin, end] : writes) PageTracker::Publish({begin, end - begin});
+    if (PageTracker::Enabled()) for (const auto& [begin, end] : writes) if (!BufferCache::Contains(this, begin, static_cast<std::size_t>(end - begin))) PageTracker::Publish({begin, end - begin});
     recordMirrorResults(nullptr);
     completeMirrorWrites();
     for (const auto& readback : mirrorReadbacks) {
@@ -6827,6 +6840,7 @@ void GuestBufferMemory::WriteBack() {
     // The CPU keeps running while the GPU works, so storing whole ranges would roll back its writes to
     // bytes the shader never touched. Only runs that differ from the uploaded copy are stored.
     for (const auto& [begin, end] : merged) {
+        if (BufferCache::Contains(this, begin, static_cast<std::size_t>(end - begin))) continue;
         const auto* found = owner(begin);
         Require(found != nullptr, "write-back range has no GPU owner");
         const auto& region = *found;
