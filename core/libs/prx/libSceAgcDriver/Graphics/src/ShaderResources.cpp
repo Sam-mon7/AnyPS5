@@ -117,6 +117,7 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
+    std::chrono::steady_clock::time_point used{};
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     MirrorSourceProof mirrorProof;
 };
@@ -136,6 +137,8 @@ struct TextureCache {
     std::uint64_t mirrorSnapshotsMade = 0;
     std::uint64_t collectedPresent = ~0ull;
     std::uint64_t evictedPresent = ~0ull;
+    std::chrono::steady_clock::time_point collectedAt{};
+    std::chrono::steady_clock::time_point evictedAt{};
     std::size_t ageVictims = 0;
     std::size_t passed = 0;
     std::chrono::steady_clock::time_point passedSince{};
@@ -149,6 +152,7 @@ struct TextureCache {
         std::uint64_t uncached = 0;
         std::uint64_t evicted = 0;
         std::uint64_t passed = 0;
+        std::uint64_t pressured = 0;
         std::uint64_t stale = 0;
         std::uint64_t resnapshots = 0;
         std::uint64_t snapshotsMade = 0;
@@ -397,13 +401,24 @@ void dropUncachedViews(TextureCache& cache) {
 void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     it->present = Recorder::Presents();
+    it->used = std::chrono::steady_clock::now();
+}
+
+constexpr auto AgeTick = std::chrono::milliseconds(500);
+
+std::uint64_t textureAge(const CachedTexture& entry, std::uint64_t present, std::chrono::steady_clock::time_point now) {
+    if (entry.present >= present) return 0;
+    const auto idle = static_cast<std::uint64_t>((now - entry.used) / AgeTick);
+    return std::max(present - entry.present, idle);
 }
 
 void collectAgedTextures(const Context& context, TextureCache& cache) {
     if (!TextureAgeEviction()) return;
     const auto present = Recorder::Presents();
-    if (cache.collectedPresent == present) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (cache.collectedPresent == present && now - cache.collectedAt < AgeTick) return;
     cache.collectedPresent = present;
+    cache.collectedAt = now;
     if (context.bufferPool == nullptr) return;
     auto& vram = context.bufferPool->Vram();
     const auto pressure = VramBudget::PressureFor(vram.Current());
@@ -411,7 +426,7 @@ void collectAgedTextures(const Context& context, TextureCache& cache) {
     std::size_t victims = 0;
     for (auto it = cache.entries.end(); it != cache.entries.begin() && victims < pressure.victims;) {
         --it;
-        if (it->key.device != context.device || it->accounted == 0 || it->present > present || present - it->present < pressure.age) continue;
+        if (it->key.device != context.device || it->accounted == 0 || textureAge(*it, present, now) < pressure.age) continue;
         const auto victim = it++;
         const auto bytes = victim->accounted;
         const bool released = victim->texture.use_count() == 1;
@@ -422,22 +437,25 @@ void collectAgedTextures(const Context& context, TextureCache& cache) {
     }
 }
 
-bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t incoming, std::uint64_t budget) {
+bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t incoming, std::uint64_t budget, bool pressured) {
     if (TextureAgeEviction()) {
         const auto present = Recorder::Presents();
-        if (cache.evictedPresent != present) {
+        const auto now = std::chrono::steady_clock::now();
+        if (cache.evictedPresent != present || now - cache.evictedAt >= AgeTick) {
             cache.evictedPresent = present;
+            cache.evictedAt = now;
             cache.ageVictims = 0;
         }
         for (auto it = cache.entries.end(); it != cache.entries.begin() && cache.ageVictims < 16 && cache.bytes + incoming > budget;) {
             --it;
-            if (it->accounted == 0 || it->present > present || present - it->present <= 3) continue;
+            if (it->accounted == 0 || textureAge(*it, present, now) <= 3) continue;
             const auto victim = it++;
             eraseTexture(cache, victim);
             ++cache.ageVictims;
             ++cache.counts.evicted;
         }
-        return true;
+        if (cache.bytes + incoming <= budget || !pressured) return true;
+        ++cache.counts.pressured;
     }
     if (cache.bytes + incoming <= budget) return true;
     if (const auto now = std::chrono::steady_clock::now(); now - cache.passedSince >= std::chrono::seconds(1)) {
@@ -500,7 +518,7 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     if (now - cache.countsReported < std::chrono::seconds(10)) return;
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
-    reportPrint("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
+    reportPrint("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu; %llu over-budget admissions under VRAM pressure\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(counts.pressured));
     reportPrint("[texture-snapshots] cache CPU bytes: %llu retained, %llu omitted; %llu resnapshots after failed proof; %llu snapshots made (%llu MiB), %llu of them in reused buffers, %llu MiB spare (10 s)\n", static_cast<unsigned long long>(cache.snapshotBytes), static_cast<unsigned long long>(cache.omittedSnapshotBytes), static_cast<unsigned long long>(counts.resnapshots), static_cast<unsigned long long>(counts.snapshotsMade), static_cast<unsigned long long>(counts.snapshotBytesMade >> 20u), static_cast<unsigned long long>(counts.snapshotsReused), static_cast<unsigned long long>(cache.spareBytes >> 20u));
     if (VramTextures()) reportPrint("[texture-mirrors] cumulative: %llu GPU snapshots, %llu storage detiles, %llu CPU snapshots\n", static_cast<unsigned long long>(cache.mirrorSnapshotsMade), static_cast<unsigned long long>(StorageTexture::MirrorUploads()), static_cast<unsigned long long>(cache.snapshotsMade));
 }
@@ -995,7 +1013,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
-    if (!admitTexture(cache, key, entry.accounted, budget)) {
+    const bool pressured = TextureAgeEviction() && context.bufferPool != nullptr && VramBudget::PressureFor(context.bufferPool->Vram().Current()).victims != 0;
+    if (!admitTexture(cache, key, entry.accounted, budget, pressured)) {
         noteReleased(texture);
         spareSnapshot(cache, std::move(entry.bytes));
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
@@ -1008,6 +1027,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     cache.snapshotBytes += entry.bytes.capacity();
     if (entry.source == nullptr && entry.bytes.empty()) cache.omittedSnapshotBytes += entry.surfaceBytes;
     entry.present = Recorder::Presents();
+    entry.used = std::chrono::steady_clock::now();
     ++cache.counts.inserted;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
     cache.entries.push_front(std::move(entry));

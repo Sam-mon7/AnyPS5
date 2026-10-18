@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -1047,6 +1048,14 @@ void mirrorTextureTests(const Context& context, bool compressed) {
 }
 #endif
 
+void VKAPI_PTR ReportPressure(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
+    auto* reported = static_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(properties->pNext);
+    for (std::uint32_t heap = 0; heap < VK_MAX_MEMORY_HEAPS; ++heap) {
+        reported->heapBudget[heap] = 4ull << 30u;
+        reported->heapUsage[heap] = 4ull << 30u;
+    }
+}
+
 void ageTextureTests(const Context& context) {
     if (!TextureAgeEviction()) {
         frameTests(context);
@@ -1073,6 +1082,22 @@ void ageTextureTests(const Context& context) {
     Require(std::count_if(recent.begin(), recent.end(), [](const auto& texture) { return texture.expired(); }) == victims,
             "age policy ran another eviction pass in the same present");
     Require(Sampled(context, block.Surface(1), 32) == second, "age policy failed to cache a current-present admission");
+    ClearCachedTextures(context.device);
+    Recorder::CountPresent();
+    std::vector<std::weak_ptr<Texture>> idle;
+    for (std::size_t surface = 0; surface < 32; ++surface) idle.push_back(Sampled(context, block.Surface(0) + surface * 65536, 128));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    Recorder::CountPresent();
+    Sampled(context, block.Surface(1), 32);
+    Require(std::any_of(idle.begin(), idle.end(), [](const auto& texture) { return texture.expired(); }),
+            "age policy kept textures idle for two seconds because only one present passed");
+    ClearCachedTextures(context.device);
+    Context pressured = context;
+    pressured.memoryProperties2 = &ReportPressure;
+    pressured.bufferPool = std::make_shared<BufferPool>(pressured);
+    Recorder::CountPresent();
+    for (std::size_t surface = 0; surface < 32; ++surface) Sampled(pressured, block.Surface(0) + surface * 65536, 128);
+    Require(TextureCacheUsage().sampledBytes <= Ceiling, "age policy overcommitted the sampled cache under VRAM pressure");
     ClearCachedTextures(context.device);
 }
 
