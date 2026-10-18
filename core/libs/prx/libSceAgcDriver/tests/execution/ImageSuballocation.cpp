@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageMemory.hpp"
@@ -191,7 +192,11 @@ std::uint64_t Dedicated(const ImageBlockStats& stats, ImageDedicatedReason reaso
     return stats.dedicated[static_cast<std::size_t>(reason)];
 }
 
-void Textures(const Context& context) {
+void Textures(const Context& context, AgcDriver::VulkanDevice& device) {
+    const auto drain = [&] {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        device.WaitIdle();
+    };
     auto pool = context.bufferPool;
     constexpr std::size_t Count = 12;
     const auto before = pool->ImageStats();
@@ -221,10 +226,12 @@ void Textures(const Context& context) {
         static_cast<unsigned long long>(Dedicated(during, ImageDedicatedReason::NoBlock) - Dedicated(before, ImageDedicatedReason::NoBlock)),
         static_cast<unsigned long long>(during.blocks), static_cast<unsigned long long>(ImageBlockSlack(context) / MiB));
     textures.erase(textures.begin(), textures.begin() + static_cast<std::ptrdiff_t>(Count / 2));
+    drain();
     for (std::size_t i = 0; i < Count / 2; ++i) textures.push_back(MakeTexture(context, 0x500000000ull + i * 0x1000000ull, 256, std::byte{0x33}));
     const auto reused = pool->ImageStats();
     if (ImageSuballocation()) Require(reused.blocksMade == during.blocksMade, "textures made after others were destroyed made new blocks instead of reusing the freed ranges");
     textures.clear();
+    drain();
     Require(SampledTextureMemory() == memoryBefore, "the sampled texture memory counter did not return to its start");
     const auto after = pool->ImageStats();
     Require(after.used == before.used && after.allocations - before.allocations == after.frees - before.frees, "destroying the textures left ranges in use");
@@ -239,7 +246,7 @@ int main() {
         const auto context = AgcDriver::VulkanDeviceTestAccess::Context(*device);
         Require(context.detiler != nullptr, "the device's context has no texture detiler");
         RawImages(context);
-        Textures(context);
+        Textures(context, *device);
         std::puts("image suballocation tests passed");
         return 0;
     } catch (const std::exception& error) {

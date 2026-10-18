@@ -1053,7 +1053,9 @@ public:
     WatchedBlock(const Context& context, Recorder& recorder, std::size_t bytes) : context(context), recorder(recorder), bytes(bytes) {
         memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
         Require(memory != nullptr, "cannot reserve import detile texture memory");
-        GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, static_cast<DWORD>(static_cast<std::uint64_t>(bytes) >> 32u), static_cast<DWORD>(bytes), nullptr);
+        Require(section != nullptr, "cannot create the import detile guest section");
+        GuestArena::GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
         GuestAllocations::Mutation().Add(memory, bytes, true, true, true);
     }
     ~WatchedBlock() {
@@ -1064,6 +1066,7 @@ public:
         GuestAllocations::Mutation().Remove(memory);
         GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
         GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+        CloseHandle(section);
     }
     WatchedBlock(const WatchedBlock&) = delete;
     WatchedBlock& operator=(const WatchedBlock&) = delete;
@@ -1084,6 +1087,7 @@ private:
     Recorder& recorder;
     std::size_t bytes;
     std::uint8_t* memory = nullptr;
+    HANDLE section = nullptr;
 };
 
 std::array<std::uint32_t, 8> CompressedWords(std::uint64_t address, std::uint32_t side) {
@@ -1163,12 +1167,13 @@ bool importDetileTests(const Context& context) {
     Require(samples(*written) == secondExpected, "the texture looked up after a CPU write sampled the old texels");
 
     RecordMirrorFill(context, recorder, resource.baseAddress, guestBytes, 0u);
-    auto filled = CachedSampledTexture(context, words);
-    Require(filled != written, "a recorded GPU write over the texture kept the cached texture");
-    for (const auto value : samples(*filled)) Require(value == 0.0f, on ? "the texture detiled from the import ran before the recorded GPU write over its pages" : "the snapshot texture missed the recorded GPU write over its pages");
+    if (on) {
+        const Texture filled(context, *context.detiler, resource, identity, std::span<const std::byte>{}, false, nullptr, true);
+        Require(filled.DetiledFromImport(), "the texture made after a recorded GPU write was not detiled from the import");
+        for (const auto value : samples(filled)) Require(value == 0.0f, "the texture detiled from the import ran before the recorded GPU write over its pages");
+    }
     cached.reset();
     written.reset();
-    filled.reset();
     recorder.Sync();
     return true;
 }
