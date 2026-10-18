@@ -2566,6 +2566,14 @@ if(BUILD_TESTING)
         "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_DEFERRED=set:1;APS5_RESIDENT_HEAP_MIRRORS=unset:")
     set_tests_properties(agc_vram_options_writable_requires_descriptors PROPERTIES ENVIRONMENT_MODIFICATION
         "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=unset:;APS5_VRAM_WRITABLE=set:1;APS5_VRAM_DEFERRED=unset:;APS5_RESIDENT_HEAP_MIRRORS=unset:")
+    add_test(NAME agc_vram_options_cleanup_without_deferred COMMAND agc_vram_options_tests)
+    add_test(NAME agc_vram_options_cleanup_requires_descriptors COMMAND agc_vram_options_tests "APS5_VRAM_CLEANUP requires APS5_VRAM_DESCRIPTORS=1")
+    add_test(NAME agc_vram_options_age_alone COMMAND agc_vram_options_tests)
+    set_tests_properties(agc_vram_options_cleanup_without_deferred agc_vram_options_cleanup_requires_descriptors agc_vram_options_age_alone PROPERTIES ENVIRONMENT_MODIFICATION
+        "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_MIRRORS=unset:;APS5_VRAM_DESCRIPTORS=unset:;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:;APS5_RESIDENT_HEAP_MIRRORS=unset:")
+    set_property(TEST agc_vram_options_cleanup_without_deferred APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_VRAM_CLEANUP=set:1")
+    set_property(TEST agc_vram_options_cleanup_requires_descriptors APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_MIRRORS=set:1;APS5_VRAM_CLEANUP=set:1")
+    set_property(TEST agc_vram_options_age_alone APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_TEXTURE_AGE_EVICTION=set:1")
     if(WIN32)
         add_test(NAME agc_vram_options_writable COMMAND agc_vram_options_tests)
         add_test(NAME agc_vram_options_writable_resident_conflict COMMAND agc_vram_options_tests "APS5_RESIDENT_HEAP_MIRRORS to be off")
@@ -2573,11 +2581,9 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_VRAM_WRITABLE=set:1;APS5_VRAM_DEFERRED=unset:;APS5_RESIDENT_HEAP_MIRRORS=unset:")
         set_property(TEST agc_vram_options_writable_resident_conflict APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RESIDENT_HEAP_MIRRORS=set:1")
         add_test(NAME agc_vram_options_cleanup COMMAND agc_vram_options_tests)
-        add_test(NAME agc_vram_options_cleanup_requires_deferred COMMAND agc_vram_options_tests "APS5_VRAM_CLEANUP requires APS5_VRAM_DEFERRED=1")
         add_test(NAME agc_vram_options_cleanup_resident_conflict COMMAND agc_vram_options_tests "APS5_RESIDENT_HEAP_MIRRORS to be off")
-        set_tests_properties(agc_vram_options_cleanup agc_vram_options_cleanup_requires_deferred agc_vram_options_cleanup_resident_conflict PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_vram_options_cleanup agc_vram_options_cleanup_resident_conflict PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_VRAM_WRITABLE=set:1;APS5_VRAM_DEFERRED=set:1;APS5_VRAM_CLEANUP=set:1;APS5_RESIDENT_HEAP_MIRRORS=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
-        set_property(TEST agc_vram_options_cleanup_requires_deferred APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DEFERRED=unset:")
         set_property(TEST agc_vram_options_cleanup_resident_conflict APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RESIDENT_HEAP_MIRRORS=set:1")
     else()
         add_test(NAME agc_vram_options_writable_unsupported COMMAND agc_vram_options_tests "APS5_VRAM_WRITABLE requires Windows guest page protection support")
@@ -2685,12 +2691,17 @@ if(BUILD_TESTING AND WIN32)
             set(vramTextureVariable APS5_TEXTURE_AGE_EVICTION)
         endif()
         add_test(NAME agc_vram_options_${vramTextureSwitch} COMMAND agc_vram_options_tests)
-        add_test(NAME agc_vram_options_${vramTextureSwitch}_requires_cleanup COMMAND agc_vram_options_tests "${vramTextureVariable} requires APS5_VRAM_CLEANUP=1")
         add_test(NAME agc_vram_options_${vramTextureSwitch}_resident_conflict COMMAND agc_vram_options_tests "APS5_RESIDENT_HEAP_MIRRORS to be off")
-        set_tests_properties(agc_vram_options_${vramTextureSwitch} agc_vram_options_${vramTextureSwitch}_requires_cleanup agc_vram_options_${vramTextureSwitch}_resident_conflict
+        set_tests_properties(agc_vram_options_${vramTextureSwitch} agc_vram_options_${vramTextureSwitch}_resident_conflict
             PROPERTIES ENVIRONMENT "${vramTextureTestEnvironment}"
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;${vramTextureVariable}=set:1")
-        set_property(TEST agc_vram_options_${vramTextureSwitch}_requires_cleanup APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_CLEANUP=set:0")
         set_property(TEST agc_vram_options_${vramTextureSwitch}_resident_conflict APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RESIDENT_HEAP_MIRRORS=set:1")
     endforeach()
+    add_test(NAME agc_vram_options_textures_requires_cleanup COMMAND agc_vram_options_tests "APS5_VRAM_TEXTURES requires APS5_VRAM_CLEANUP=1")
+    add_test(NAME agc_vram_options_textures_requires_deferred COMMAND agc_vram_options_tests "APS5_VRAM_TEXTURES requires APS5_VRAM_DEFERRED=1")
+    set_tests_properties(agc_vram_options_textures_requires_cleanup agc_vram_options_textures_requires_deferred
+        PROPERTIES ENVIRONMENT "${vramTextureTestEnvironment}"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_TEXTURES=set:1")
+    set_property(TEST agc_vram_options_textures_requires_cleanup APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_CLEANUP=set:0")
+    set_property(TEST agc_vram_options_textures_requires_deferred APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DEFERRED=set:0")
 endif()

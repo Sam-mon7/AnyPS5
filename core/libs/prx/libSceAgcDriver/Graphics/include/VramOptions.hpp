@@ -49,12 +49,12 @@ inline void ValidateVramOptions() {
         throw std::runtime_error("APS5_VRAM_WRITABLE requires APS5_VRAM_DESCRIPTORS=1");
     if (VramDeferred() && !VramWritable())
         throw std::runtime_error("APS5_VRAM_DEFERRED requires APS5_VRAM_WRITABLE=1");
-    if (VramCleanup() && !VramDeferred())
-        throw std::runtime_error("APS5_VRAM_CLEANUP requires APS5_VRAM_DEFERRED=1");
+    if (VramCleanup() && !VramDescriptors())
+        throw std::runtime_error("APS5_VRAM_CLEANUP requires APS5_VRAM_DESCRIPTORS=1");
     if (VramTextures() && !VramCleanup())
         throw std::runtime_error("APS5_VRAM_TEXTURES requires APS5_VRAM_CLEANUP=1");
-    if (TextureAgeEviction() && !VramCleanup())
-        throw std::runtime_error("APS5_TEXTURE_AGE_EVICTION requires APS5_VRAM_CLEANUP=1");
+    if (VramTextures() && !VramDeferred())
+        throw std::runtime_error("APS5_VRAM_TEXTURES requires APS5_VRAM_DEFERRED=1");
 #ifndef _WIN32
     if (VramWritable())
         throw std::runtime_error("APS5_VRAM_WRITABLE requires Windows guest page protection support");
