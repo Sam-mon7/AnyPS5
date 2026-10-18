@@ -293,6 +293,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     };
     const auto regionBounds = [](const ShaderRecompiler::MemoryRegion& region) { return DrawPipeline::Range{region.guestAddress, region.guestAddress + region.bytes.size()}; };
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
+    IndirectFoldDiagnostic foldDiagnostic;
+    IndirectFoldDiagnostic* foldReasons = nullptr;
     std::vector<Pm4::DrawArguments> records;
     double indirectReadMs = 0;
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
@@ -334,7 +336,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
-            indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            if (IndirectFoldReasonsEnabled()) foldReasons = &foldDiagnostic;
+            indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect, foldReasons);
+            if (foldReasons != nullptr && indirectCpu) {
+                foldReasons->role = roles.front();
+                SetIndirectFoldSrt(*foldReasons, result.variantId, recompiled.front() ? &stageCaptures.front().userDataUse : nullptr);
+            }
             if (indirectCpu) {
                 if (!deferredLabels().labels.empty()) {
                     if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
@@ -368,6 +375,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
                 if (std::none_of(records.begin(), records.end(), [](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0; })) {
                     Graphics::CountIndirectDraw(*indirectCpu, indirectReadMs);
+                    if (foldReasons != nullptr) { foldReasons->records = static_cast<std::uint32_t>(records.size()); CountIndirectFold(*foldReasons); }
                     return drawn();
                 }
             }
@@ -452,6 +460,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto indirect = *drawParameters.indirect;
         auto& pipeline = DrawPipeline::Queue0();
         Graphics::CountIndirectDraw(*indirectCpu, indirectReadMs);
+        if (foldReasons != nullptr) { foldReasons->records = static_cast<std::uint32_t>(records.size()); CountIndirectFold(*foldReasons); }
         const auto baseVertexWord = locate(indirect.baseVertexLocation);
         const auto startInstanceWord = locate(indirect.startInstanceLocation);
         const auto drawIndexWord = indirect.drawIndexEnabled ? locate(indirect.drawIndexLocation) : std::nullopt;
@@ -553,6 +562,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
         Graphics::CountIndirectDraw(*indirectCpu, indirectReadMs);
+        if (foldReasons != nullptr) { foldReasons->records = static_cast<std::uint32_t>(records.size()); CountIndirectFold(*foldReasons); }
         const auto baseVertexWord = locate(indirect.baseVertexLocation);
         const auto startInstanceWord = locate(indirect.startInstanceLocation);
         const auto drawIndexWord = indirect.drawIndexEnabled ? locate(indirect.drawIndexLocation) : std::nullopt;

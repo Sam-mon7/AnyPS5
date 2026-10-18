@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/IndirectDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
@@ -64,11 +65,13 @@ public:
     void ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive);
     void ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType);
     static void FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters);
-    static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
+    static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect, IndirectFoldDiagnostic* diagnostic = nullptr);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
     DrawEntryCounters DrawCacheCounters();
 
 private:
+    template<bool Diagnose>
+    static std::optional<Graphics::IndirectDrawPath> classifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect, IndirectFoldDiagnostic* diagnostic);
     friend class SampledReadScope;
     friend struct PendingView;
     friend struct PacketTimer;

@@ -253,14 +253,74 @@ void Run(const std::shared_ptr<AgcDriver::VulkanDevice>& device) {
     ::operator delete(records, std::align_val_t{65536});
 }
 
+void FoldReasons(const std::shared_ptr<AgcDriver::VulkanDevice>& device) {
+    using namespace AgcDriver::DriverDetail;
+    using Reason = IndirectFoldReason;
+    const bool enabled = IndirectFoldReasonsEnabled();
+    const auto userData = UserData(81);
+    auto program = Program(userData);
+    program.binary.codeHash = 0xabc;
+    auto vertex = Vertex(device, userData);
+    AgcDriver::Pm4::DrawParameters packet{};
+    packet.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{};
+    packet.indirect->opcode = 0x24;
+    packet.indirect->count = 1;
+    packet.indirect->baseVertexSgpr = -1;
+    packet.indirect->baseVertexLocation = 0x280;
+    packet.indirect->startInstanceSgpr = 10;
+    packet.indirect->startInstanceLocation = 0x8e;
+    packet.indirect->drawIndexLocation = 0x280;
+    auto shared = vertex;
+    shared.instanceOffsetSgpr = 10;
+    shared.instanceOffsetShared = true;
+    for (const auto* result : {&vertex, &shared}) {
+        auto probe = packet;
+        const auto plain = Driver::ClassifyIndirectDraw(*result, State(), program, device, probe, false);
+        IndirectFoldDiagnostic diagnostic{};
+        auto draw = packet;
+        const auto path = Driver::ClassifyIndirectDraw(*result, State(), program, device, draw, false, enabled ? &diagnostic : nullptr);
+        Require(path == plain && draw.indirect->instanceRule == probe.indirect->instanceRule && draw.indirect->vertexConstant == probe.indirect->vertexConstant, "instance fold diagnostic changed classification");
+        if (!path) continue;
+        if (enabled && path == AgcDriver::Graphics::IndirectDrawPath::NotFolded) {
+            const auto expected = result == &shared ? Reason::InstanceShared : Reason::InstanceMissing;
+            Require(diagnostic.first == expected && diagnostic.notFoldedMask == (result == &shared ? 32 : 8), "ordinary instance fold reason differs");
+            Require(diagnostic.dimensions[1].p == 10 && diagnostic.patched[1] == 10 && diagnostic.userBase == 8, "instance sample lost its absolute SGPR");
+        }
+        CountIndirectFold(diagnostic);
+    }
+    const auto counters = IndirectFoldReasonCounters();
+    if (enabled) {
+        const auto& sharedBucket = counters.reasons[static_cast<std::size_t>(Reason::InstanceShared)];
+        Require(sharedBucket.packets == 1 && sharedBucket.first == 1 && sharedBucket.shaders.size() == 1 && sharedBucket.samples.size() == 1, "shared instance fold was not counted");
+        const auto& missing = counters.reasons[static_cast<std::size_t>(Reason::InstanceMissing)];
+        Require(missing.packets == (Enabled() ? 0 : 1), "missing ordinary instance fold count differs");
+    } else Require(counters.packets == 0, "disabled instance fold reasons counted a packet");
+    const std::unique_ptr<std::FILE, decltype(&std::fclose)> log(std::tmpfile(), &std::fclose);
+    Require(log != nullptr, "cannot capture instance fold reasons");
+    const auto now = std::chrono::steady_clock::now();
+    Require(!ReportIndirectFoldReasons(log.get(), now), "instance fold reasons reported early");
+    Require(ReportIndirectFoldReasons(log.get(), now + std::chrono::seconds(11)) == enabled, "instance fold reporting switch differs");
+    std::fflush(log.get());
+    Require((std::ftell(log.get()) > 0) == enabled, "disabled instance fold reasons printed output");
+    std::rewind(log.get());
+    std::array<char, 8192> output{};
+    const auto size = std::fread(output.data(), 1, output.size() - 1, log.get());
+    if (enabled) {
+        Require(std::strstr(output.data(), "reason=instance.shared-or-index-observed") != nullptr && std::strstr(output.data(), "hash-or-variant=0xabc") != nullptr, "instance fold report lost its reason/sample");
+        std::fwrite(output.data(), 1, size, stderr);
+    }
+    Require(IndirectFoldReasonCounters().packets == 0, "instance fold reporting did not reset the window");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
         Analysis();
         std::shared_ptr<AgcDriver::VulkanDevice> device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Run(device);
+        if (argc == 2 && std::strcmp(argv[1], "--indirect-fold-reasons") == 0) FoldReasons(device);
         std::cout << "different-destination instance offset tests passed\n";
         return 0;
     } catch (const std::exception& error) {
