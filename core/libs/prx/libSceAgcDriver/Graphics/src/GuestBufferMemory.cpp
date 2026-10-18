@@ -269,10 +269,16 @@ void countDescriptors(const VramDescriptorStats& added) {
     total.resultBytes += added.resultBytes;
     total.writeBackBytes += added.writeBackBytes;
     total.writeBackUs += added.writeBackUs;
+    total.refreshBlocks += added.refreshBlocks;
+    total.sparseResizes += added.sparseResizes;
+    total.recorderSyncs += added.recorderSyncs;
+    total.resultSyncs += added.resultSyncs;
+    total.mixedRefusals += added.mixedRefusals;
     const auto now = std::chrono::steady_clock::now();
     if (now - counts.lastReport < std::chrono::seconds(10)) return;
     const auto& seen = counts.seen;
     std::fprintf(stderr, "[vram-descriptors] (10 s): mirrors %llu, GPU copies %llu, imports %llu, CPU copies %llu; references %.1f MiB, results %.1f MiB, write-back %.1f MiB in %.3f ms\n", static_cast<unsigned long long>(total.mirrorRegions - seen.mirrorRegions), static_cast<unsigned long long>(total.gpuCopies - seen.gpuCopies), static_cast<unsigned long long>(total.importedRegions - seen.importedRegions), static_cast<unsigned long long>(total.cpuCopies - seen.cpuCopies), (total.referenceBytes - seen.referenceBytes) / 1048576.0, (total.resultBytes - seen.resultBytes) / 1048576.0, (total.writeBackBytes - seen.writeBackBytes) / 1048576.0, (total.writeBackUs - seen.writeBackUs) / 1000.0);
+    std::fprintf(stderr, "[vram-descriptors] refresh blocks %llu, sparse resizes %llu, recorder syncs %llu, result-copy waits %llu, mixed spans refused %llu\n", static_cast<unsigned long long>(total.refreshBlocks - seen.refreshBlocks), static_cast<unsigned long long>(total.sparseResizes - seen.sparseResizes), static_cast<unsigned long long>(total.recorderSyncs - seen.recorderSyncs), static_cast<unsigned long long>(total.resultSyncs - seen.resultSyncs), static_cast<unsigned long long>(total.mixedRefusals - seen.mixedRefusals));
     counts.seen = total;
     counts.lastReport = now;
 }
@@ -1875,6 +1881,7 @@ void syncRange(std::uint64_t address, std::uint64_t bytes) {
     if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes))) {
         Recorder::CountSync(4);
         ++state.syncs;
+        countDescriptors({.recorderSyncs = 1});
         recorder->Sync();
     }
     ++state.refreshes;
@@ -1912,32 +1919,51 @@ void compareBlocks(std::span<const RefreshBlock> blocks) {
 }
 
 // Brings [address, address + bytes) of a writable mirror up to date with guest memory.
-void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes) {
-    if (VramWritable() && mirror.heap) {
+void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes, bool uncached = false) {
+    if (VramWritable() && mirror.heap && mirror.sparse) {
         std::vector<RefreshBlock> blocks;
-        Require(refreshWritableHeap(mirror, blocks), "a writable mirror grew during refresh");
+        Require(refreshWritableHeap(mirror, blocks, uncached), "a writable mirror grew during refresh");
         compareBlocks(blocks);
         return;
     }
-    if (!prepareRefresh(mirror, address, bytes)) return;
     std::vector<RefreshBlock> blocks;
     if (VramDescriptors() && mirror.heap && !mirror.sparse) {
+        if (bytes == 0) return;
         constexpr std::uint64_t block = 65536;
         const auto begin = std::max(mirror.base, address / block * block);
         const auto end = std::min(mirror.base + mirror.bytes, (address + bytes + block - 1) / block * block);
-        prepareRange(begin, end - begin);
-        const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin));
+        if (VramWritable()) {
+            validateMirrorAliases(mirror);
+            Require(GuestMemory::Accessible(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin)), "image mirror range became inaccessible");
+        } else prepareRange(begin, end - begin);
+        const auto collect = [&] { return uncached ? GuestMemory::CollectWritesUncached(begin, static_cast<std::size_t>(end - begin)) : GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)); };
+        auto generation = collect();
         Require(generation != 0, "a descriptor heap mirror is no longer write-watched");
-        std::vector<std::uint8_t> changed(mirror.generations.size());
-        GuestMemory::ChangedBlocks(mirror.base, static_cast<std::size_t>(mirror.bytes), mirror.generations, changed);
+        const auto first = static_cast<std::size_t>(begin / block - mirror.base / block);
+        const auto count = static_cast<std::size_t>((end - 1) / block - begin / block + 1);
+        const auto generations = std::span(mirror.generations).subspan(first, count);
+        std::vector<std::uint8_t> changed(count);
+        const auto scan = [&] {
+            GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), generations, changed);
+            countDescriptors({.refreshBlocks = count});
+        };
+        scan();
+        if (VramWritable() && std::any_of(changed.begin(), changed.end(), [](auto value) { return value != 0; })) {
+            if (mirror.writer != nullptr) finishMirrorWriter(mirror);
+            prepareRange(begin, end - begin);
+            generation = collect();
+            Require(generation != 0, "a descriptor heap refill is no longer write-watched");
+            scan();
+        }
         for (auto at = begin; at < end;) {
             const auto next = std::min(end, (at / block + 1) * block);
-            if (changed[static_cast<std::size_t>(at / block - mirror.base / block)] != 0) blocks.push_back({&mirror, at, static_cast<std::size_t>(next - at), generation});
+            if (changed[static_cast<std::size_t>(at / block - begin / block)] != 0) blocks.push_back({&mirror, at, static_cast<std::size_t>(next - at), generation});
             at = next;
         }
         compareBlocks(blocks);
         return;
     }
+    if (!prepareRefresh(mirror, address, bytes)) return;
     appendBlocks(blocks, mirror, address, bytes);
     compareBlocks(blocks);
 }
@@ -2208,6 +2234,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             Spaces().current.store(nullptr);
             if (auto* recorder = Recorder::Active()) {
                 Require(!Recorder::InCompletion(), "cannot resize a sparse mirror during completion");
+                countDescriptors({.recorderSyncs = 1});
                 recorder->Sync();
                 recorder->FlushDeferredReleases();
             }
@@ -2321,6 +2348,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     std::lock_guard lock(state.mutex);
     if (replaced != nullptr) Require(replaced->activeUsers.load(std::memory_order_acquire) == 0 && state.entries.find(range->address) != state.entries.end() && state.entries.at(range->address) == replaced, "sparse mirror acquired another owner during resize");
     if (!claimRangeBackings(context.device, std::span(&range, 1), RangeBacking::Mirror, mirror, replaced)) return nullptr;
+    if (replaced != nullptr) countDescriptors({.sparseResizes = 1});
     if (replaced != nullptr) replaced->retired.store(true, std::memory_order_release);
     ++state.rebuilds;
     mirror->serial = (1ull << 63u) | ++state.serials;
@@ -4339,11 +4367,13 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (!region.mirrorPieces.empty()) {
                 auto cursor = region.begin;
                 for (const auto& piece : region.mirrorPieces) {
+                    if (piece.begin != cursor) countDescriptors({.mixedRefusals = 1});
                     Require(piece.begin == cursor, "a descriptor spans mirror-backed and non-mirror-backed memory");
                     holdMirror(piece.mirror);
                     refreshDescriptorMirror(*piece.mirror, piece.begin, piece.end - piece.begin);
                     cursor = piece.end;
                 }
+                if (cursor != region.end) countDescriptors({.mixedRefusals = 1});
                 Require(cursor == region.end, "a descriptor spans mirror-backed and non-mirror-backed memory");
                 region.direct = nullptr;
                 region.buffer.reset();
@@ -5129,9 +5159,11 @@ void GuestBufferMemory::prepareMirrorWrites(bool addressable) {
 #else
             Require(false, "writable mirrors require Windows guest page tracking");
 #endif
-            std::vector<RefreshBlock> blocks;
-            Require(refreshWritableHeap(*mirror, blocks, true), "a writable mirror grew while its write watch was armed");
-            compareBlocks(blocks);
+            if (mirror->sparse) {
+                std::vector<RefreshBlock> blocks;
+                Require(refreshWritableHeap(*mirror, blocks, true), "a writable mirror grew while its write watch was armed");
+                compareBlocks(blocks);
+            } else for (const auto& [begin, end] : interval->watched) refreshMirror(*mirror, begin, end - begin, true);
             interval->active = true;
             mirror->writer = interval;
         } catch (...) {
@@ -5358,6 +5390,7 @@ void GuestBufferMemory::recordMirrorResults(Recorder* recorder) {
     } else {
         CommandBatch batch(context, VramWritable() ? CommandBatch::Mode::Independent : CommandBatch::Mode::Default);
         record(batch.Handle());
+        countDescriptors({.resultSyncs = 1});
         batch.SubmitAndWait();
     }
 }
