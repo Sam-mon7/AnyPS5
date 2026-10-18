@@ -79,10 +79,12 @@ BufferPool::BufferPool(const Context& context) : device(context.device), unmap(c
     smallTier.budget = VramCleanup() ? 16ull << 20u : smallBudget;
     largeTier.budget = VramCleanup() ? 128ull << 20u : budget;
     deviceTier.budget = DeviceTierEnabled() ? DeviceBudget(context.memory) : 0;
+    scratchDeviceTier.budget = ScratchBudget(true);
+    scratchHostTier.budget = ScratchBudget(false);
 }
 
 BufferPool::~BufferPool() {
-    for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
+    for (auto* tier : {&smallTier, &largeTier, &deviceTier, &scratchDeviceTier, &scratchHostTier}) {
         for (const auto& [key, slots] : tier->free) {
             for (const auto& slot : slots) destroy(slot.allocation);
         }
@@ -226,6 +228,10 @@ BufferPoolStats BufferPool::Stats() {
         result.smallPhysicalRetained = smallTier.physicalRetained;
         result.largePhysicalRetained = largeTier.physicalRetained;
         result.devicePhysicalRetained = deviceTier.physicalRetained;
+        result.scratchDeviceRetained = scratchDeviceTier.retainedBytes;
+        result.scratchDeviceLimit = scratchDeviceTier.budget;
+        result.scratchHostRetained = scratchHostTier.retainedBytes;
+        result.scratchHostLimit = scratchHostTier.budget;
     }
     {
         std::lock_guard lock(slabMutex);
@@ -283,6 +289,64 @@ std::size_t BufferPool::NextCapacity(std::size_t capacity) {
     return capacity < classLimit ? capacity * 2 : capacity + (std::bit_floor(capacity) >> deviceClassBits);
 }
 
+bool BufferPool::ScratchEnabled() {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_TEXTURE_SCRATCH_POOL"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    return enabled;
+}
+
+VkDeviceSize BufferPool::ScratchBudget(bool device) {
+    const auto* value = std::getenv(device ? "APS5_TEXTURE_SCRATCH_DEVICE_MIB" : "APS5_TEXTURE_SCRATCH_HOST_MIB");
+    const auto mib = value != nullptr ? std::strtoull(value, nullptr, 10) : (device ? 256ull : 128ull);
+    return std::min<VkDeviceSize>(mib, std::numeric_limits<VkDeviceSize>::max() >> 20u) << 20u;
+}
+
+std::size_t BufferPool::ScratchCapacity(std::size_t bytes) {
+    const auto step = std::max<std::size_t>(std::bit_floor(bytes) >> deviceClassBits, 1);
+    return (bytes + step - 1) / step * step;
+}
+
+namespace {
+
+std::size_t NextScratchCapacity(std::size_t capacity, unsigned classBits) {
+    return capacity + std::max<std::size_t>(std::bit_floor(capacity) >> classBits, 1);
+}
+
+bool deviceLocalOnly(VkMemoryPropertyFlags properties) {
+    return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0;
+}
+
+}
+
+BufferPool::Tier& BufferPool::scratchTier(VkMemoryPropertyFlags properties) {
+    return deviceLocalOnly(properties) ? scratchDeviceTier : scratchHostTier;
+}
+
+const BufferPool::Tier& BufferPool::scratchTier(VkMemoryPropertyFlags properties) const {
+    return deviceLocalOnly(properties) ? scratchDeviceTier : scratchHostTier;
+}
+
+bool BufferPool::ScratchEligible(std::size_t bytes, VkMemoryPropertyFlags properties) const {
+    return ScratchEnabled() && bytes >= scratchMinBytes && ScratchCapacity(bytes) <= scratchTier(properties).budget / 2u;
+}
+
+void BufferPool::NoteScratchFallback(std::size_t bytes) noexcept {
+    if (!ScratchEnabled()) return;
+    scratchFallbacks.fetch_add(1, std::memory_order_relaxed);
+    scratchFallbackBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+ScratchStats BufferPool::ScratchCounters(bool device) {
+    ScratchStats result;
+    {
+        std::lock_guard lock(mutex);
+        const auto& tier = device ? scratchDeviceTier : scratchHostTier;
+        result = {tier.hits, tier.misses, tier.evictions, tier.hitBytes, tier.missBytes, 0, 0, tier.slots, tier.retainedBytes, tier.budget};
+    }
+    result.fallbacks = scratchFallbacks.load(std::memory_order_relaxed);
+    result.fallbackBytes = scratchFallbackBytes.load(std::memory_order_relaxed);
+    return result;
+}
+
 VkBufferUsageFlags BufferPool::Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
     return DeviceTiered(properties) ? usage | deviceUsage : usage;
 }
@@ -292,9 +356,9 @@ BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlag
     return !sharedTiers() && capacity < classLimit ? smallTier : largeTier;
 }
 
-std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, std::uint32_t memoryType) {
+std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, std::uint32_t memoryType, bool scratch) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    const auto capacity = Capacity(bytes, properties);
+    const auto capacity = scratch ? ScratchCapacity(bytes) : Capacity(bytes, properties);
     std::lock_guard lock(mutex);
     ++clock;
     if (profile) {
@@ -308,7 +372,30 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
                 const auto report = vram.Report();
                 AgcDriver::ProfilePrint_nid_no_patch("[vram] heap %u: budget %llu MiB, usage %llu MiB, target %llu MiB; %llu released device buffers (%.0f MiB) not pooled over the target\n", report.heap, static_cast<unsigned long long>(report.budget >> 20u), static_cast<unsigned long long>(report.usage >> 20u), static_cast<unsigned long long>(report.target >> 20u), static_cast<unsigned long long>(vramDropped), vramDroppedBytes / 1048576.0);
             }
+            if (ScratchEnabled()) {
+                AgcDriver::ProfilePrint_nid_no_patch("[texture-scratch] cumulative, device: %llu hits (%.1f MiB), %llu misses (%.1f MiB), %llu evictions, %zu retained (%.0f MiB of %llu); host: %llu hits (%.1f MiB), %llu misses (%.1f MiB), %llu evictions, %zu retained (%.0f MiB of %llu); %llu requests not pooled (%.1f MiB)\n", static_cast<unsigned long long>(scratchDeviceTier.hits), scratchDeviceTier.hitBytes / 1048576.0, static_cast<unsigned long long>(scratchDeviceTier.misses), scratchDeviceTier.missBytes / 1048576.0, static_cast<unsigned long long>(scratchDeviceTier.evictions), scratchDeviceTier.slots, scratchDeviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(scratchDeviceTier.budget >> 20u), static_cast<unsigned long long>(scratchHostTier.hits), scratchHostTier.hitBytes / 1048576.0, static_cast<unsigned long long>(scratchHostTier.misses), scratchHostTier.missBytes / 1048576.0, static_cast<unsigned long long>(scratchHostTier.evictions), scratchHostTier.slots, scratchHostTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(scratchHostTier.budget >> 20u), static_cast<unsigned long long>(scratchFallbacks.load(std::memory_order_relaxed)), scratchFallbackBytes.load(std::memory_order_relaxed) / 1048576.0);
+            }
         }
+    }
+    if (scratch) {
+        auto& tier = scratchTier(properties);
+        const auto largest = bytes <= std::numeric_limits<std::size_t>::max() / 2 ? std::max(capacity, bytes * 2) : capacity;
+        for (auto size = capacity; size <= largest; size = NextScratchCapacity(size, deviceClassBits)) {
+            const auto found = tier.free.find({size, usage, properties, memoryType});
+            if (found == tier.free.end() || found->second.empty()) continue;
+            auto result = found->second.back().allocation;
+            found->second.pop_back();
+            if (found->second.empty()) tier.free.erase(found);
+            --tier.slots;
+            tier.retainedBytes -= result.allocationBytes;
+            removeRetained(tier, result);
+            ++tier.hits;
+            tier.hitBytes += bytes;
+            return result;
+        }
+        ++tier.misses;
+        tier.missBytes += bytes;
+        return std::nullopt;
     }
     auto& tier = tierFor(capacity, properties);
     const auto largest = &tier == &deviceTier && !exactSizes() && bytes <= std::numeric_limits<std::size_t>::max() / 2 ? std::max(capacity, bytes * 2) : capacity;
@@ -370,9 +457,11 @@ VkDeviceSize BufferPool::trim() {
     Tier retiredSmall;
     Tier retiredLarge;
     Tier retiredDevice;
+    Tier retiredScratchDevice;
+    Tier retiredScratchHost;
     {
         std::lock_guard lock(mutex);
-        for (const auto& [tier, retired] : {std::pair{&smallTier, &retiredSmall}, std::pair{&largeTier, &retiredLarge}, std::pair{&deviceTier, &retiredDevice}}) {
+        for (const auto& [tier, retired] : {std::pair{&smallTier, &retiredSmall}, std::pair{&largeTier, &retiredLarge}, std::pair{&deviceTier, &retiredDevice}, std::pair{&scratchDeviceTier, &retiredScratchDevice}, std::pair{&scratchHostTier, &retiredScratchHost}}) {
             tier->free.swap(retired->free);
             tier->evictions += tier->slots;
             tier->retainedBytes = 0;
@@ -382,7 +471,7 @@ VkDeviceSize BufferPool::trim() {
         }
     }
     VkDeviceSize bytes = 0;
-    for (const auto* tier : {&retiredSmall, &retiredLarge, &retiredDevice}) {
+    for (const auto* tier : {&retiredSmall, &retiredLarge, &retiredDevice, &retiredScratchDevice, &retiredScratchHost}) {
         for (const auto& [key, slots] : tier->free) {
             for (const auto& slot : slots) bytes += destroy(slot.allocation);
         }
@@ -405,7 +494,35 @@ VkDeviceSize BufferPool::trim() {
     return bytes;
 }
 
+void BufferPool::putScratch(const BufferAllocation& allocation) noexcept {
+    std::vector<BufferAllocation> evicted;
+    Tier* retained = nullptr;
+    try {
+        std::lock_guard lock(mutex);
+        auto& tier = scratchTier(allocation.properties);
+        retained = &tier;
+        if (allocation.allocationBytes > tier.budget) {
+            evicted.push_back(allocation);
+        } else {
+            while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);
+            tier.free[{allocation.bytes, allocation.usage, allocation.properties, allocation.memoryType}].push_back({allocation, ++clock});
+            ++tier.slots;
+            tier.retainedBytes += allocation.allocationBytes;
+            tier.physicalRetained += allocation.allocationBytes;
+        }
+    } catch (...) {
+        destroy(allocation);
+    }
+    VkDeviceSize freed = 0;
+    for (const auto& gone : evicted) freed += destroy(gone);
+    if (retained == &scratchDeviceTier && freed != 0) vram.Released(freed);
+}
+
 void BufferPool::Put(const BufferAllocation& allocation) noexcept {
+    if (allocation.scratch) {
+        putScratch(allocation);
+        return;
+    }
     if (VramCleanup() && allocation.residentMirror) {
         const auto freed = destroy(allocation);
         if (allocation.deviceLocal) vram.Released(freed);

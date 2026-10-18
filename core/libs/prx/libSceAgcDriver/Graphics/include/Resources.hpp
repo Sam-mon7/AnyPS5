@@ -8,7 +8,7 @@ namespace AgcDriver::Graphics {
 
 class Buffer {
 public:
-    enum class Access { Default, UploadOnly, ResidentMirror, DeviceMirror };
+    enum class Access { Default, UploadOnly, ResidentMirror, DeviceMirror, Scratch };
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, Access access = Access::Default);
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, Access access);
     ~Buffer();
@@ -46,6 +46,7 @@ private:
     bool slab = false;
     bool uploadOnly = false;
     bool residentMirror = false;
+    bool scratch = false;
     std::uint32_t memoryType = UINT32_MAX;
     VkDeviceSize rebarBytes = 0;
     VkBufferUsageFlags usage;
@@ -58,7 +59,7 @@ private:
 // copies and are only swizzled in video memory.
 class DeviceBuffer {
 public:
-    DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage);
+    DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, bool requestScratch = false);
     ~DeviceBuffer();
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
@@ -74,6 +75,7 @@ private:
     std::size_t capacity;
     VkDeviceSize allocationBytes = 0;
     VkBufferUsageFlags usage;
+    bool scratch = false;
     std::shared_ptr<BufferPool> cache;
 };
 
