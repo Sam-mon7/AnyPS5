@@ -165,6 +165,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ResourcePhase.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ResourcePhase.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
@@ -3609,6 +3610,7 @@ void GuestBufferMemory::AcquireRegistered() {
             // before any of them is dereferenced.
             served = true;
             mirrored = space->mirrored;
+            ResourcePhase mirrorPhase("mirrors");
             for (const auto index : space->writableMirrors) {
                 const auto& region = space->base[index];
                 if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
@@ -3649,6 +3651,7 @@ void GuestBufferMemory::AcquireRegistered() {
             }
             lap(timing.importsUs, at);
             if (entry == nullptr && mirrorsEnabled()) {
+                ResourcePhase mirrorPhase("mirrors");
                 region.mirror = acquireMirror(context, range, blocks, range->releasable, mirrorFirst);
                 lap(timing.mirrorsUs, at);
                 if (region.mirror != nullptr) {
@@ -3764,8 +3767,10 @@ void GuestBufferMemory::AcquireRegistered() {
         }
     }
     std::vector<std::pair<std::size_t, std::uint64_t>> checked;
+    ResourcePhase mirrorPhase("mirrors");
     if (served) checked = refreshHeapRuns(*space, blocks);
     else refreshHeapMirrors(heaps, blocks);
+    mirrorPhase.End();
     lap(timing.mirrorsUs, at);
     const auto copiedBefore = Mirrors().blocksCopied;
     compareBlocks(blocks);

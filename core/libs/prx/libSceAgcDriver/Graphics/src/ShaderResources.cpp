@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ResourcePhase.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderObjectMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -2291,6 +2292,7 @@ void ShaderResources::buildComplete() {
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
     try {
+        ResourcePhase imagePhase("images");
         // The lookups run in plan order: Revalidate walks the bindings the same way, and consecutive
         // storage elements of one mip chain share the previous element's image.
         previousSampled = {};
@@ -2307,6 +2309,7 @@ void ShaderResources::buildComplete() {
         nextImageRecord = 0;
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
         resolveImageTables();
+        imagePhase.End();
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
