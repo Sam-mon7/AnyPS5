@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -29,6 +30,7 @@ struct BufferAllocation {
     VkDeviceSize rebarBytes = 0;
     bool residentMirror = false;
     bool deviceLocal = false;
+    bool scratch = false;
 };
 
 struct BufferPoolStats {
@@ -37,6 +39,14 @@ struct BufferPoolStats {
     VkDeviceSize deviceRetained = 0, deviceLimit = 0;
     VkDeviceSize slabBytes = 0;
     VkDeviceSize smallPhysicalRetained = 0, largePhysicalRetained = 0, devicePhysicalRetained = 0;
+    VkDeviceSize scratchDeviceRetained = 0, scratchDeviceLimit = 0, scratchHostRetained = 0, scratchHostLimit = 0;
+};
+
+struct ScratchStats {
+    std::uint64_t hits = 0, misses = 0, evictions = 0, hitBytes = 0, missBytes = 0;
+    std::uint64_t fallbacks = 0, fallbackBytes = 0;
+    std::uint64_t slots = 0;
+    VkDeviceSize retained = 0, limit = 0;
 };
 
 struct SlabSlot {
@@ -75,8 +85,13 @@ public:
     static std::size_t Capacity(std::size_t bytes, VkMemoryPropertyFlags properties);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation);
-    std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, std::uint32_t memoryType = UINT32_MAX);
+    std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, std::uint32_t memoryType = UINT32_MAX, bool scratch = false);
     void Put(const BufferAllocation& allocation) noexcept;
+    static bool ScratchEnabled();
+    static std::size_t ScratchCapacity(std::size_t bytes);
+    bool ScratchEligible(std::size_t bytes, VkMemoryPropertyFlags properties) const;
+    void NoteScratchFallback(std::size_t bytes) noexcept;
+    ScratchStats ScratchCounters(bool device);
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
     static VkDeviceSize SlabBlockBytes(std::size_t capacity);
     SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, bool rebar = false);
@@ -130,6 +145,8 @@ private:
         std::uint64_t hits = 0;
         std::uint64_t misses = 0;
         std::uint64_t evictions = 0;
+        std::uint64_t hitBytes = 0;
+        std::uint64_t missBytes = 0;
     };
     // The tier a buffer of `capacity` and `properties` is retained in (the large one for everything
     // when shared; the device tier for device-local memory while it has a budget).
@@ -137,6 +154,10 @@ private:
     static bool DeviceTierEnabled();
     static bool DeviceTiered(VkMemoryPropertyFlags properties);
     static std::size_t NextCapacity(std::size_t capacity);
+    static VkDeviceSize ScratchBudget(bool device);
+    Tier& scratchTier(VkMemoryPropertyFlags properties);
+    const Tier& scratchTier(VkMemoryPropertyFlags properties) const;
+    void putScratch(const BufferAllocation& allocation) noexcept;
     VkDeviceSize destroy(const BufferAllocation& allocation) noexcept;
     VkDeviceSize trim();
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the
@@ -159,6 +180,10 @@ private:
     Tier smallTier;
     Tier largeTier;
     Tier deviceTier;
+    Tier scratchDeviceTier;
+    Tier scratchHostTier;
+    std::atomic<std::uint64_t> scratchFallbacks{0};
+    std::atomic<std::uint64_t> scratchFallbackBytes{0};
     std::uint64_t clock = 0;
     std::mutex slabMutex;
     std::unordered_map<std::uint64_t, Slab> slabs;
@@ -173,6 +198,7 @@ private:
     // Requests of this size and more keep their exact size and go to the large tier.
     static constexpr std::size_t classLimit = std::size_t{1} << 20u;
     static constexpr unsigned deviceClassBits = 3;
+    static constexpr std::size_t scratchMinBytes = std::size_t{64} << 10u;
     static constexpr std::size_t defaultSlots = 4096;
 };
 

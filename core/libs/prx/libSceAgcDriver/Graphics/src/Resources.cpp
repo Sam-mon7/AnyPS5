@@ -64,6 +64,11 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
+    if (access == Access::Scratch) {
+        scratch = cache->ScratchEligible(size, properties);
+        if (scratch) capacity = BufferPool::ScratchCapacity(size);
+        else cache->NoteScratchFallback(size);
+    }
     if (rebarRequested) RebarLimit(context);
     const auto reuse = [&](const BufferAllocation& entry) {
         const auto* allocation = &entry;
@@ -96,7 +101,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         }
         ready = true;
     };
-    if (!rebarRequested && access != Access::DeviceMirror) if (const auto allocation = cache->Take(size, this->usage, properties)) {
+    if (!rebarRequested && access != Access::DeviceMirror) if (const auto allocation = cache->Take(size, this->usage, properties, UINT32_MAX, scratch)) {
         reuse(*allocation);
         return;
     }
@@ -171,7 +176,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 return;
             }
         }
-        if (rebarBytes == 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && BufferPool::SlabEligible(capacity, requirements.alignment, requirements.size, context.limits.nonCoherentAtomSize)) {
+        if (rebarBytes == 0 && !scratch && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && BufferPool::SlabEligible(capacity, requirements.alignment, requirements.size, context.limits.nonCoherentAtomSize)) {
             const auto slot = cache->TakeSlot(context, allocation.memoryTypeIndex, capacity, addressable);
             memory = slot.memory;
             offset = slot.offset;
@@ -200,7 +205,7 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size, memoryType, rebarBytes, residentMirror, DeviceLocal() || (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size, memoryType, rebarBytes, residentMirror, DeviceLocal() || (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0, scratch});
         return;
     }
     if (slab) {
@@ -249,10 +254,15 @@ void Buffer::Invalidate() {
     Check(context.Function<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges")(context.device, 1, &range), "vkInvalidateMappedMemoryRanges");
 }
 
-DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, bool requestScratch) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
     Require(size != 0, "zero-sized device buffer");
     cache = GetBufferPool(context);
-    if (const auto allocation = cache->Take(size, this->usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+    if (requestScratch) {
+        scratch = cache->ScratchEligible(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (scratch) capacity = BufferPool::ScratchCapacity(size);
+        else cache->NoteScratchFallback(size);
+    }
+    if (const auto allocation = cache->Take(size, this->usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, UINT32_MAX, scratch)) {
         buffer = allocation->buffer;
         memory = allocation->memory;
         allocationBytes = allocation->allocationBytes;
@@ -294,7 +304,7 @@ DeviceBuffer::~DeviceBuffer() {
 
 void DeviceBuffer::release() noexcept {
     if (buffer && memory && cache) {
-        cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, size});
+        cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, size, UINT32_MAX, 0, false, false, scratch});
         return;
     }
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);

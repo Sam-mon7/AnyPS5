@@ -1120,6 +1120,53 @@ void memoryTests(Context context) {
     Require(SampledTextureMemory() == before, "a released texture still counts as sampled texture memory");
 }
 
+std::array<std::uint32_t, 8> RgbaWords(std::uint64_t address, std::uint32_t side) {
+    return {
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((side - 1u) & 3u) << 30u),
+        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+        0xfacu | (TileR64KBX << 20u) | (Type2D << 28u),
+        0u,
+        0u,
+        0u,
+        0u,
+    };
+}
+
+void scratchPoolTests(const Context& context) {
+    constexpr std::uint32_t side = 128;
+    const bool on = BufferPool::ScratchEnabled();
+    Recorder recorder(context);
+    recorder.Activate();
+    Block block(context);
+    ClearCachedTextures(context.device);
+    for (std::size_t surface = 0; surface < 3; ++surface) std::memset(reinterpret_cast<void*>(block.Surface(surface)), static_cast<int>(0x30 * (surface + 1)), SurfaceBytes);
+    MirrorSampleProgram sampler(context, recorder);
+    const auto lookup = [&](std::size_t surface) { return CachedSampledTexture(context, RgbaWords(block.Surface(surface), side)); };
+    const auto pool = GetBufferPool(context);
+    auto first = lookup(0);
+    auto second = lookup(1);
+    Require(!first->ViewsStorageImage() && !second->ViewsStorageImage(), "the scratch pool fixture sampled a storage image");
+    Require(pool->ScratchCounters(true).hits == 0 && pool->ScratchCounters(false).hits == 0, "a scratch buffer of an unfinished batch was handed out again");
+    expectRed(sampler.Red(first->View(), first->Layout(), 0), 48.0f / 255.0f, "the first texture of a batch");
+    recorder.FlushDeferredReleases();
+    auto third = lookup(2);
+    const auto device = pool->ScratchCounters(true);
+    const auto host = pool->ScratchCounters(false);
+    if (on) {
+        Require(device.misses == 4 && device.hits == 2 && host.misses == 2 && host.hits == 1, "the second upload after the batch completed did not reuse the first uploads' scratch buffers (device " + std::to_string(device.hits) + " hits, " + std::to_string(device.misses) + " misses; host " + std::to_string(host.hits) + " hits, " + std::to_string(host.misses) + " misses)");
+        Require(device.retained <= device.limit && host.retained <= host.limit, "the scratch pool kept more than its limits");
+    } else {
+        Require(device.hits == 0 && device.misses == 0 && host.hits == 0 && host.misses == 0 && device.fallbacks == 0, "the scratch pool counted uploads with the switch off");
+    }
+    expectRed(sampler.Red(second->View(), second->Layout(), 0), 96.0f / 255.0f, "the second texture of a batch");
+    expectRed(sampler.Red(third->View(), third->Layout(), 0), 144.0f / 255.0f, "the texture uploaded through reused scratch buffers");
+    first.reset();
+    second.reset();
+    third.reset();
+    recorder.Sync();
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1154,6 +1201,13 @@ int main(int argc, char** argv) {
 #else
             return VulkanTestSkipped;
 #endif
+        }
+        if (mode == "scratch-pool") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            scratchPoolTests(context);
+            ClearCachedTextures(context.device);
+            std::puts("texture scratch pool tests passed");
+            return 0;
         }
         if (mode == "age") {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());

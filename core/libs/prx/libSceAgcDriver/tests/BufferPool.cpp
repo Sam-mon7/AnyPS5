@@ -1011,6 +1011,114 @@ void MemoryLedgerAccounting() {
     Expect(AgcDriver::Graphics::MemoryLedgerReport().find("live Vulkan memory by type: top sites") != std::string::npos, "the memory ledger kept freed allocations live");
 }
 
+constexpr VkBufferUsageFlags ScratchTiledUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+constexpr VkBufferUsageFlags ScratchLinearUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+void ScratchOverTarget() {
+    mock = MockDevice{};
+    mock.heapBudget = HeapBytes;
+    mock.otherUsage = HeapTarget;
+    const bool on = BufferPool::ScratchEnabled();
+    {
+        auto context = budgetContext();
+        VkDeviceMemory first = VK_NULL_HANDLE;
+        VkDeviceMemory second = VK_NULL_HANDLE;
+        VkDeviceMemory third = VK_NULL_HANDLE;
+        {
+            std::vector<std::shared_ptr<DeviceBuffer>> batch;
+            batch.push_back(std::make_shared<DeviceBuffer>(context, 6 * MiB, ScratchTiledUsage, true));
+            batch.push_back(std::make_shared<DeviceBuffer>(context, 6 * MiB, ScratchTiledUsage, true));
+            first = MemoryOf(batch[0]->Handle());
+            second = MemoryOf(batch[1]->Handle());
+            Expect(first != second, "two scratch buffers of one unfinished batch share memory");
+            const auto during = std::make_shared<DeviceBuffer>(context, 6 * MiB, ScratchTiledUsage, true);
+            third = MemoryOf(during->Handle());
+            Expect(third != first && third != second, "a scratch buffer kept by an unfinished batch was handed out again");
+        }
+        const auto made = mock.allocations;
+        const auto freed = mock.frees;
+        auto again = std::make_shared<DeviceBuffer>(context, 6 * MiB, ScratchTiledUsage, true);
+        const auto stats = GetBufferPool(context)->ScratchCounters(true);
+        if (on) {
+            Expect(freed == 0 && mock.allocations == made, "scratch buffers released over the VRAM target were not retained for the next batch");
+            const auto memory = MemoryOf(again->Handle());
+            Expect(memory == first || memory == second || memory == third, "the scratch buffer of the second upload is not a retained one");
+            Expect(stats.hits == 1 && stats.misses == 3 && stats.hitBytes == 6 * MiB && stats.missBytes == 18 * MiB, "scratch hit and miss counters differ from the three batch buffers and the reuse (" + std::to_string(stats.hits) + " hits, " + std::to_string(stats.misses) + " misses)");
+            Expect(stats.retained == 12 * MiB && stats.limit == 256 * MiB, "the scratch pool retains " + std::to_string(stats.retained / MiB) + " MiB of a " + std::to_string(stats.limit / MiB) + " MiB limit");
+        } else {
+            Expect(freed == 3 && mock.allocations == made + 1, "a scratch request with the switch off was not served like any device buffer");
+            Expect(stats.hits == 0 && stats.misses == 0 && stats.fallbacks == 0 && stats.retained == 0, "the scratch pool counted a request with the switch off");
+        }
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "the scratch pool leaked a resource");
+}
+
+void ScratchBudgetAndFallbacks() {
+    if (!BufferPool::ScratchEnabled()) return;
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        auto pool = GetBufferPool(context);
+        {
+            std::vector<std::unique_ptr<DeviceBuffer>> live;
+            for (int i = 0; i < 6; ++i) live.push_back(std::make_unique<DeviceBuffer>(context, 60 * MiB, ScratchTiledUsage, true));
+            live.push_back(std::make_unique<DeviceBuffer>(context, 200 * MiB, ScratchLinearUsage, true));
+            live.push_back(std::make_unique<DeviceBuffer>(context, 4096, ScratchLinearUsage, true));
+        }
+        const auto device = pool->ScratchCounters(true);
+        Expect(device.retained == 4 * 60 * MiB && device.limit == 256 * MiB && device.evictions == 2 && device.slots == 4, "the scratch pool retained " + std::to_string(device.retained / MiB) + " MiB in " + std::to_string(device.slots) + " buffers after " + std::to_string(device.evictions) + " evictions, not four 60 MiB buffers under a 256 MiB limit");
+        Expect(device.fallbacks == 2 && device.fallbackBytes == 200 * MiB + 4096, "the oversized and the tiny scratch requests were not counted as not pooled");
+        DeviceBuffer reused(context, 60 * MiB, ScratchTiledUsage, true);
+        Expect(pool->ScratchCounters(true).hits == 1 && pool->ScratchCounters(true).slots == 3, "a retained 60 MiB scratch buffer did not serve the next request");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "the scratch budget case leaked a resource");
+}
+
+void ScratchHostStaging() {
+    mock = MockDevice{};
+    const bool on = BufferPool::ScratchEnabled();
+    {
+        auto context = mockContext();
+        VkDeviceMemory first = VK_NULL_HANDLE;
+        {
+            Buffer a(context, 5 * MiB + 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, Buffer::Access::Scratch);
+            first = MemoryOf(a.Handle());
+            Buffer b(context, 5 * MiB + 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, Buffer::Access::Scratch);
+            Expect(MemoryOf(b.Handle()) != first, "a host scratch buffer in use was handed out again");
+            Expect(a.Size() == 5 * MiB + 4096 && a.WriteBytes().size() == 5 * MiB + 4096, "a host scratch buffer does not map its requested size");
+            std::memset(a.WriteBytes().data(), 0x5a, a.Size());
+        }
+        const auto made = mock.allocations;
+        Buffer c(context, 5 * MiB + 8192, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, Buffer::Access::Scratch);
+        if (on) {
+            Expect(mock.allocations == made && MemoryOf(c.Handle()) == first, "a retained host scratch buffer did not serve another size of its class");
+            Expect(c.Size() == 5 * MiB + 8192 && mock.sizes.at(c.Handle()) == 5 * MiB + 8192, "a reused host scratch buffer kept the VkBuffer of the earlier size");
+            Expect(GetBufferPool(context)->ScratchCounters(false).hits == 1, "the host scratch hit was not counted");
+        } else {
+            Expect(mock.allocations == made + 1, "a host scratch request with the switch off was served from another exact size");
+        }
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "the host scratch case leaked a resource");
+}
+
+void ScratchReclaimedUnderPressure() {
+    if (!BufferPool::ScratchEnabled()) return;
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        { DeviceBuffer idle(context, 8 * MiB, ScratchTiledUsage, true); }
+        mock.limit = 12 * MiB;
+        const auto before = mock.attempts;
+        try {
+            DeviceBuffer other(context, 6 * MiB, ScratchTiledUsage);
+            Expect(mock.attempts == before + 2 && mock.frees == 1 && mock.liveBytes == 6 * MiB, "allocation pressure did not reclaim the retained scratch buffer");
+        } catch (const std::exception& error) {
+            Expect(false, std::string("retained scratch buffers did not permit recovery: ") + error.what());
+        }
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "scratch recovery leaked a resource");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--staging-zero-only") {
@@ -1052,6 +1160,10 @@ int main(int argc, char** argv) {
         CleanupPhysicalRetention();
         CleanupPressureAccounting();
         CleanupCopyLimits();
+        ScratchOverTarget();
+        ScratchBudgetAndFallbacks();
+        ScratchHostStaging();
+        ScratchReclaimedUnderPressure();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
