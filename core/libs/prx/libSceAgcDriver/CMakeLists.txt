@@ -1381,6 +1381,9 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     configure_windows_unwind(${agcExecutionTest})
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
+target_sources(agc_driver_sampled_cache_budget_tests PRIVATE ${agcSampleLodShaderHeader})
+target_include_directories(agc_driver_sampled_cache_budget_tests PRIVATE ${agcTestShaderGeneratedRoot})
+
 target_include_directories(agc_driver_draw_offset_indices_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler/RdnaDecoder/include
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler/Translation/include)
@@ -2626,5 +2629,68 @@ if(BUILD_TESTING)
             endif()
         endforeach()
         set_property(TEST ${drainTest}_narrow APPEND PROPERTY ENVIRONMENT "APS5_NARROW_PACKET_DRAINS=1")
+    endforeach()
+endif()
+
+
+if(BUILD_TESTING AND WIN32)
+    set(vramTextureTestEnvironment "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_WRITABLE=1;APS5_VRAM_DEFERRED=1;APS5_VRAM_CLEANUP=1;APS5_VRAM_TEXTURES=0;APS5_TEXTURE_AGE_EVICTION=0;APS5_RESIDENT_HEAP_MIRRORS=0")
+    foreach(vramTextureMode IN ITEMS off on)
+        add_test(NAME agc_vram_textures_storage_${vramTextureMode} COMMAND agc_driver_sampled_cache_budget_tests mirror-storage)
+        add_test(NAME agc_vram_textures_snapshot_${vramTextureMode} COMMAND agc_driver_sampled_cache_budget_tests mirror-snapshot)
+        add_test(NAME agc_vram_textures_readonly_${vramTextureMode} COMMAND agc_driver_sampled_cache_budget_tests mirror-readonly)
+        add_test(NAME agc_vram_textures_age_${vramTextureMode} COMMAND agc_driver_sampled_cache_budget_tests age)
+        set_tests_properties(agc_vram_textures_storage_${vramTextureMode} agc_vram_textures_snapshot_${vramTextureMode} agc_vram_textures_readonly_${vramTextureMode} agc_vram_textures_age_${vramTextureMode}
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT "${vramTextureTestEnvironment};APS5_NO_CLEARED_VIEW=1" ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endforeach()
+    set_property(TEST agc_vram_textures_storage_off agc_vram_textures_snapshot_off agc_vram_textures_readonly_off agc_vram_textures_storage_on agc_vram_textures_snapshot_on agc_vram_textures_readonly_on APPEND PROPERTY ENVIRONMENT "APS5_RELEASE_ON_UNLOCK=1")
+    set_property(TEST agc_vram_textures_storage_on agc_vram_textures_snapshot_on agc_vram_textures_readonly_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_TEXTURES=set:1")
+    set_property(TEST agc_vram_textures_age_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_TEXTURE_AGE_EVICTION=set:1")
+    foreach(vramCombinedMode IN ITEMS storage snapshot age)
+        if(vramCombinedMode STREQUAL "age")
+            set(vramCombinedArgument age)
+        else()
+            set(vramCombinedArgument mirror-${vramCombinedMode})
+        endif()
+        add_test(NAME agc_vram_textures_combined_${vramCombinedMode} COMMAND agc_driver_sampled_cache_budget_tests ${vramCombinedArgument})
+        set_tests_properties(agc_vram_textures_combined_${vramCombinedMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT "${vramTextureTestEnvironment};APS5_NO_CLEARED_VIEW=1;APS5_RELEASE_ON_UNLOCK=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_TEXTURES=set:1;APS5_TEXTURE_AGE_EVICTION=set:1")
+    endforeach()
+    add_test(NAME agc_vram_textures_sampled_cache_budget COMMAND agc_driver_sampled_cache_budget_tests)
+    add_test(NAME agc_vram_textures_partially_resident COMMAND agc_driver_partially_resident_snapshot_tests)
+    add_test(NAME agc_vram_textures_partially_resident_pool COMMAND agc_driver_partially_resident_snapshot_tests)
+    add_test(NAME agc_vram_textures_partially_resident_pending COMMAND agc_driver_partially_resident_snapshot_tests --pending-stores)
+    add_test(NAME agc_vram_textures_image_table COMMAND agc_driver_image_table_reuse_tests)
+    add_test(NAME agc_vram_textures_image_table_epochs COMMAND agc_driver_image_table_reuse_tests)
+    set_tests_properties(agc_vram_textures_sampled_cache_budget agc_vram_textures_partially_resident agc_vram_textures_partially_resident_pool agc_vram_textures_partially_resident_pending agc_vram_textures_image_table agc_vram_textures_image_table_epochs
+        PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        ENVIRONMENT "${vramTextureTestEnvironment}" ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_TEXTURES=set:1")
+    set_property(TEST agc_vram_textures_partially_resident_pool APPEND PROPERTY ENVIRONMENT "APS5_TEXTURE_SNAPSHOT_POOL_MIB=64")
+    set_property(TEST agc_vram_textures_image_table_epochs APPEND PROPERTY ENVIRONMENT "APS5_TABLE_REUSE_ACROSS_EPOCHS=1")
+    foreach(vramSnapshotRelease IN ITEMS 0 1)
+        foreach(vramSnapshotPool IN ITEMS 0 64)
+            add_test(NAME agc_vram_textures_snapshot_retention_${vramSnapshotRelease}_pool_${vramSnapshotPool} COMMAND agc_driver_image_table_reuse_tests --snapshot-retention)
+            set_tests_properties(agc_vram_textures_snapshot_retention_${vramSnapshotRelease}_pool_${vramSnapshotPool}
+                PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                ENVIRONMENT "${vramTextureTestEnvironment};APS5_RELEASE_TEXTURE_SNAPSHOTS=${vramSnapshotRelease};APS5_TEXTURE_SNAPSHOT_POOL_MIB=${vramSnapshotPool}"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_TEXTURES=set:1")
+        endforeach()
+    endforeach()
+    foreach(vramTextureSwitch IN ITEMS textures age)
+        if(vramTextureSwitch STREQUAL "textures")
+            set(vramTextureVariable APS5_VRAM_TEXTURES)
+        else()
+            set(vramTextureVariable APS5_TEXTURE_AGE_EVICTION)
+        endif()
+        add_test(NAME agc_vram_options_${vramTextureSwitch} COMMAND agc_vram_options_tests)
+        add_test(NAME agc_vram_options_${vramTextureSwitch}_requires_cleanup COMMAND agc_vram_options_tests "${vramTextureVariable} requires APS5_VRAM_CLEANUP=1")
+        add_test(NAME agc_vram_options_${vramTextureSwitch}_resident_conflict COMMAND agc_vram_options_tests "APS5_RESIDENT_HEAP_MIRRORS to be off")
+        set_tests_properties(agc_vram_options_${vramTextureSwitch} agc_vram_options_${vramTextureSwitch}_requires_cleanup agc_vram_options_${vramTextureSwitch}_resident_conflict
+            PROPERTIES ENVIRONMENT "${vramTextureTestEnvironment}"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;${vramTextureVariable}=set:1")
+        set_property(TEST agc_vram_options_${vramTextureSwitch}_requires_cleanup APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_CLEANUP=set:0")
+        set_property(TEST agc_vram_options_${vramTextureSwitch}_resident_conflict APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RESIDENT_HEAP_MIRRORS=set:1")
     endforeach()
 endif()
