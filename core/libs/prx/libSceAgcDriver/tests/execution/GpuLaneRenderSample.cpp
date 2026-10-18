@@ -2,10 +2,17 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/SubmissionCursor.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <cstring>
 #include <iostream>
+#include <span>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -18,8 +25,10 @@ alignas(256) constexpr std::array<std::uint32_t, 10> SampleCode{
     0x00610a1eu, 0x34060082u, 0xe0701000u, 0x80000a03u, 0xbf810000u,
 };
 alignas(256) constexpr std::array<std::array<float, 4>, 3> Triangle{{{-1, -1, 0.5f, 1}, {3, -1, 0.5f, 1}, {-1, 3, 0.5f, 1}}};
-alignas(256) std::array<std::byte, 65536> Color{};
-alignas(256) std::array<std::uint32_t, 64> Output{};
+constexpr std::size_t ColorBytes = 65536;
+constexpr std::size_t GuestBytes = 2 * ColorBytes;
+std::span<std::byte> Color;
+std::span<std::uint32_t> Output;
 
 struct Header { Shader shader{}; ShaderUserData userData{}; };
 alignas(8) Header VertexHeader{}, PixelHeader{};
@@ -98,9 +107,19 @@ int main() {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
         }
+#ifdef _WIN32
+        auto* guest = static_cast<std::byte*>(VirtualAlloc(nullptr, GuestBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+        auto* guest = static_cast<std::byte*>(std::aligned_alloc(ColorBytes, GuestBytes));
+#endif
+        Require(guest != nullptr, "cannot allocate render/sample guest memory");
+        std::memset(guest, 0, GuestBytes);
+        GuestAllocations::Mutation().Add(guest, GuestBytes, true, true, true);
+        Color = std::span(guest, ColorBytes);
+        Output = std::span(reinterpret_cast<std::uint32_t*>(guest + ColorBytes), 64);
         Register(VertexHeader, VertexCode, 2);
         Register(PixelHeader, PixelCode, 1);
-        Output.fill(0xdeadbeefu);
+        std::ranges::fill(Output, 0xdeadbeefu);
         auto words = Frame();
         AgcDriver::DriverDetail::Lanes::SubmissionCursor cursor;
         cursor.submission.commands = words;

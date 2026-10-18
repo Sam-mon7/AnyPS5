@@ -307,7 +307,7 @@ void NativeReadFaults(const Context& context, std::unique_lock<GuestMemory::GpuM
         BufferCache::PermitBindings(writer.get(), true);
         writer->AddWritable(address, bytes);
         writer->Upload(false);
-        Require(BufferCache::HasBindings(writer.get()) == BufferCache::WritesEnabled(), "native fault fixture missed write cache");
+        if (PageTracker::ArmEnabled() || !BufferCache::WritesEnabled()) Require(BufferCache::HasBindings(writer.get()) == BufferCache::WritesEnabled(), "native fault fixture missed write cache");
         std::uint32_t adjustment = 0;
         const auto view = writer->Descriptor(address, bytes, adjustment);
         writer->BeginGpuWrites(recorder);

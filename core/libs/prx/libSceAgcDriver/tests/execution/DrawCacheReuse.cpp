@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -166,7 +167,7 @@ alignas(8) Header IndirectPixelHeader{};
 alignas(8) Header PatchedIndirectVertexHeader{};
 alignas(4096) std::array<std::uint32_t, 1024> FragmentInput{};
 using IndirectRecord = std::array<std::uint32_t, 4>;
-alignas(16) std::array<IndirectRecord, 6> IndirectRecords{};
+alignas(4096) std::array<IndirectRecord, 256> IndirectRecords{};
 alignas(16) std::array<std::uint32_t, 2> IndirectCount{};
 std::array<std::atomic<unsigned>, 3> IndirectRecordReads{};
 std::atomic<unsigned> IndirectCountReads{0};
@@ -497,6 +498,7 @@ void RuntimeSgprRuns() {
 }
 
 void RuntimeSgprCache() {
+    GuestAllocations::Mutation().Add(IndirectRecords.data(), sizeof(IndirectRecords), true, true, true);
     ShaderRecompiler::RecompileResult emptyPush;
     emptyPush.indirectSgprs = ShaderRecompiler::IndirectSgprPatch{8, -1, -1, 0, false};
     const std::array<AgcDriver::Graphics::CompiledShader, 1> emptyStages{{{ShaderRecompiler::ShaderStage::Vertex, &emptyPush, 0}}};

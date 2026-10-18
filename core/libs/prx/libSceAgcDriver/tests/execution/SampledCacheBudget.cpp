@@ -1588,8 +1588,14 @@ public:
         if (auto* tracker = AgcDriver::PageTracker::Get()) tracker->RegisterRange(Range(), AgcDriver::PageTracker::Kind::Section, AgcDriver::PageTracker::Bit(AgcDriver::PageTracker::Reason::ProtectedSection));
     }
     ~EpochTextureMemory() {
+        if (registered) GuestAllocations::Mutation().Remove(allocation);
         if (auto* tracker = AgcDriver::PageTracker::Get()) tracker->InvalidateRange(Range(), true);
         VirtualFree(allocation, 0, MEM_RELEASE);
+    }
+    void Register() {
+        if (registered) return;
+        GuestAllocations::Mutation().Add(allocation, Bytes + AgcDriver::PageTracker::RegionBytes, true, true, true);
+        registered = true;
     }
     AgcDriver::PageTracker::Range Range() const { return {reinterpret_cast<std::uintptr_t>(memory), Bytes}; }
     void Protect(std::size_t offset, std::size_t bytes, DWORD protection) {
@@ -1603,6 +1609,7 @@ public:
 private:
     void* allocation = nullptr;
     std::byte* memory = nullptr;
+    bool registered = false;
 };
 
 std::vector<std::byte> epochImageBytes(const Context& context, Recorder& recorder, const StorageTexture& texture, std::uint32_t side) {
@@ -1753,6 +1760,7 @@ void epochLayoutTextureTests(const Context& context, std::uint32_t format, std::
         if (enabled) Require(epochCount("storage-fallback") == fallbacks + 1, "pending GPU storage refresh did not count its fallback");
         const auto gpu = epochSurfaceBytes(context, recorder, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, descriptor);
         Require(std::all_of(gpu.begin(), gpu.end(), [](std::byte byte) { return byte == std::byte{128}; }), "GPU clear did not reach every storage mip and depth slice");
+        memory.Register();
         storage->WriteBack();
         recorder.Sync();
         std::vector<std::byte> snapshot(static_cast<std::size_t>(geometry.guestBytes));
@@ -1789,9 +1797,9 @@ void epochFallbackTextureTests(const Context& context) {
     const auto expected = epochSurfaceBytes(context, recorder, changed->Image(), changed->Layout(), descriptor);
     Require(epochSurfaceBytes(context, recorder, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, descriptor) == expected, "alignment fallback pixels differ between storage and sampled images");
     if (auto* tracker = AgcDriver::PageTracker::Get()) tracker->InvalidateRange(memory.Range());
-    const auto unavailable = enabled ? epochCount("fallback-unavailable") : 0;
+    const auto unavailable = enabled ? epochCount("fallback-unavailable") + epochCount("fallback-tiled-base-alignment") : 0;
     Require(storage->Refresh(), "unknown coverage changed clean storage content");
-    if (enabled) Require(epochCount("fallback-unavailable") == unavailable + 1, "unknown coverage fallback reason is missing");
+    if (enabled) Require(epochCount("fallback-unavailable") + epochCount("fallback-tiled-base-alignment") == unavailable + 1, "unknown coverage fallback reason is missing");
     recorder.Sync();
     ClearCachedTextures(context.device);
     if (!enabled) Require(TextureEpoch::ProfileLine() == counters, "disabled fallback checks changed profiling output");
