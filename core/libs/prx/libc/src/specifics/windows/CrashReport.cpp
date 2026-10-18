@@ -576,9 +576,27 @@ struct ExitReporter {
     }
 } g_exitReporter;
 
+DWORD WINAPI FlushStderr(LPVOID) {
+    for (;;) {
+        Sleep(200);
+        std::fflush(stderr);
+    }
+}
+
+void BufferStderr() {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&FlushStderr), &module)) return;
+    static char buffer[1 << 16];
+    if (std::setvbuf(stderr, buffer, _IOFBF, sizeof(buffer)) != 0) return;
+    const auto thread = CreateThread(nullptr, 0, FlushStderr, nullptr, 0, nullptr);
+    if (thread != nullptr) CloseHandle(thread);
+    else std::setvbuf(stderr, nullptr, _IONBF, 0);
+}
+
 const bool g_crashReportInstalled = [] {
     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
+    if (IsEnvironmentSet("APS5_BUFFERED_STDERR")) BufferStderr();
     AddVectoredExceptionHandler(1, ReportCrash);
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);

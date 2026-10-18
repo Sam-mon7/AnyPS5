@@ -499,6 +499,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 
 | Name | Kind | Source | Default | Description |
 |------|------|--------|---------|-------------|
+| `APS5_BUFFERED_STDERR` | presence | `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp` |  | buffers stderr in 64 KiB and flushes every 200 ms on Windows; pins libc for process lifetime |
 | `APS5_CRASH_INDIRECT_MEMORY` | presence | `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp` |  | dumps the words the faulting registers point at in the Windows crash report |
 | `APS5_HANG_DUMP_SECS` | integer | `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp` |  | seconds after which a watchdog dumps all threads and aborts |
 | `APS5_HEAP_CACHE_MIB` | integer | `core/libs/prx/libc/src/GuestHeap.cpp` | 4096 | size in MiB of the cache of freed large blocks before the oldest are decommitted |
