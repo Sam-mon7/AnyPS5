@@ -332,6 +332,8 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 // the millisecond the old print rounded to), totalled over 10 s in the [draws] line.
 enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
 constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+enum PipelinePart : std::size_t { PartChecks, PartIndirect, PartInsert, PartRebuild, PartPipelines, PartFramebuffer, PartCount };
+constexpr std::array<const char*, PartCount> PipelinePartNames{"checks", "indirect", "cache insert", "rebuild", "pipelines", "framebuffer"};
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
@@ -397,6 +399,7 @@ struct DrawProfile {
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
     std::array<double, PhaseCount> totalsUs{};
+    std::array<double, PartCount> partsUs{};
     // The longest single draw's time per phase, and the longest draw: the [lock] line's 'draw'
     // hold max (tens of ms against an average well under a millisecond) needs a phase name.
     std::array<double, PhaseCount> maxUs{};
@@ -464,7 +467,7 @@ DrawProfile& Profile() {
 }
 
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
-void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
+void reportDraw(const std::array<double, PhaseCount>& us, const std::array<double, PartCount>& parts, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
     std::lock_guard lock(profile.mutex);
     double drawUs = 0;
@@ -473,6 +476,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         profile.maxUs[i] = std::max(profile.maxUs[i], us[i]);
         drawUs += us[i];
     }
+    for (std::size_t i = 0; i < PartCount; ++i) profile.partsUs[i] += parts[i];
     profile.maxDrawUs = std::max(profile.maxDrawUs, drawUs);
     profile.hookWaitUs += outcome.hookWaitUs;
     profile.maxHookWaitUs = std::max(profile.maxHookWaitUs, outcome.hookWaitUs);
@@ -512,7 +516,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.lastReport = now;
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
-    char line[2048];
+    char line[4096];
     int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
@@ -524,6 +528,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
+        if (i == PhasePipeline) {
+            for (std::size_t part = 0; part < PartCount && room(); ++part) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s%s %.1f%s", part == 0 ? " (" : ", ", PipelinePartNames[part], profile.partsUs[part] / 1000.0, part + 1 == PartCount ? ")" : "");
+        }
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
@@ -557,6 +564,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     std::fprintf(stderr, "%s\n", line);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
+    profile.partsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
     profile.bindingsUs = profile.uploadUs = profile.descriptorsUs = profile.otherUs = profile.addressOtherUs = 0;
@@ -856,12 +864,20 @@ struct DrawTimer {
     bool profile;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
+    std::chrono::steady_clock::time_point partStart{};
+    std::array<double, PartCount> parts{};
     explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
     void phase(DrawPhase which) {
         if (!profile) return;
         const auto now = std::chrono::steady_clock::now();
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         phaseStart = now;
+    }
+    void part(PipelinePart which) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        parts[which] += std::chrono::duration<double, std::micro>(now - std::max(phaseStart, partStart)).count();
+        partStart = now;
     }
 };
 
@@ -882,7 +898,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
         }
         std::fprintf(stderr, "%s\n", line);
     }
-    reportDraw(timer.us, built, outcome);
+    reportDraw(timer.us, timer.parts, built, outcome);
 }
 
 }
@@ -2089,6 +2105,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             }
         }
     }
+    timer.part(PartChecks);
     const auto& contentKey = resolved.contentKey;
     const bool cacheable = resolved.cacheable;
     built = resolved.built;
@@ -2149,6 +2166,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             }
         }
     }
+    timer.part(PartIndirect);
     // A draw whose only completion work is a BDA fault check (the rect-list stages carry a fault
     // buffer, so every rect-list draw needed one) is recorded too, with the check as a completion
     // action like a dispatch's write-back: its own batch would first wait for everything recorded
@@ -2192,6 +2210,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
     if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    timer.part(PartInsert);
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
@@ -2203,6 +2222,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
     }
+    timer.part(PartRebuild);
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
@@ -2231,6 +2251,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
     auto pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    timer.part(PartPipelines);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
@@ -2242,6 +2263,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         persistent.push_back(binding.multisampled ? 1u : 0u);
     }
     auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent);
+    timer.part(PartFramebuffer);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
