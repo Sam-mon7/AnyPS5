@@ -114,6 +114,7 @@ void CheckCopiedWriteRefusal(AgcDriver::Graphics::Context context) {
     memory.fill(std::byte{Fill});
     bool refused = false;
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto unprotected = VramWritableCounters().legacyWrites;
     try {
         GuestBufferMemory buffers(context);
         buffers.AddWritable(reinterpret_cast<std::uintptr_t>(memory.data()), memory.size());
@@ -123,7 +124,8 @@ void CheckCopiedWriteRefusal(AgcDriver::Graphics::Context context) {
         if (text.find("requires shared protection or a coherent host import") == std::string::npos) throw;
         refused = true;
     }
-    Require(refused == VramWritable(), "copied writer: unsafe copied descriptor did not follow the writable switch");
+    Require(refused == (VramWritable() && VramWritableStrict()), "copied writer: unsafe copied descriptor did not follow the writable and strict switches");
+    Require(VramWritableCounters().legacyWrites == unprotected + (VramWritable() && !VramWritableStrict() ? 1u : 0u), "copied writer: an unprotected copied descriptor was not counted");
     Require(std::all_of(memory.begin(), memory.end(), [](std::byte value) { return value == std::byte{Fill}; }), "copied writer: refused preparation changed guest bytes");
 }
 

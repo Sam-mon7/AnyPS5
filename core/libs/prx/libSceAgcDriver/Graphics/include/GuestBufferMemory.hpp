@@ -256,6 +256,8 @@ struct VramWritableStats {
     std::uint64_t writerWaitUs = 0;
     std::uint64_t seals = 0;
     std::uint64_t protectedBytes = 0;
+    std::uint64_t legacyWrites = 0;
+    std::uint64_t legacyRanges = 0;
 };
 VramWritableStats VramWritableCounters();
 bool HasVramMirrorWriters();

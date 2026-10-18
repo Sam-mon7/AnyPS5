@@ -1069,10 +1069,10 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
             access.bytes(view.buffer)[view.offset + adjustment + static_cast<std::size_t>(at - (page - 16))] = std::byte{0x77};
             leased.WriteBack();
         };
-        if (VramWritable()) {
+        if (VramWritableStrict()) {
             reject([&] { storeAt(page - 8); }, "requires shared protection or a coherent host import");
             Require(bytes8[65536 - 8] == 0x11 && bytes8[65536 + 4] == 0x11, "a refused writable range changed a read-only page or its neighbour");
-        } else {
+        } else if (!VramWritable()) {
             const auto made = MirrorCounters().heapMirrors;
             storeAt(page - 8);
             Require(MirrorCounters().heapMirrors == made + 1 && bytes8[65536 - 8] == 0x77, "a store next to a read-only page was not written back");
@@ -1542,20 +1542,31 @@ void RunVramWritableBdaResourceTests(const Context& context, const BdaTestAccess
         GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, privateRange, bytes, true, true, true);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     }
-    reject([&] {
+    const auto unprotected = VramWritableCounters();
+    const auto acquire = [&] {
         GuestBufferMemory memory(context);
         memory.AcquireRegistered();
-    }, "VRAM writable range requires shared protection or a coherent host import");
+    };
+    if (VramWritableStrict()) reject(acquire, "VRAM writable range requires shared protection or a coherent host import");
+    else {
+        acquire();
+        Require(VramWritableCounters().legacyRanges == unprotected.legacyRanges + 1, "an unprotected private writable range was not counted");
+    }
     {
         auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
         GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, privateRange);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     }
-    reject([&] {
+    const auto upload = [&] {
         GuestBufferMemory memory(context);
         memory.AddWritable(base, 16);
         memory.Upload(false);
-    }, "VRAM writable descriptor requires shared protection or a coherent host import");
+    };
+    if (VramWritableStrict()) reject(upload, "VRAM writable descriptor requires shared protection or a coherent host import");
+    else {
+        upload();
+        Require(VramWritableCounters().legacyWrites == unprotected.legacyWrites + 1, "an unprotected private writable descriptor was not counted");
+    }
     Require(MirrorCounters().heapMirrors == before.heapMirrors && std::all_of(static_cast<std::uint8_t*>(privateRange), static_cast<std::uint8_t*>(privateRange) + bytes, [](std::uint8_t value) { return value == 0x37; }), "an unsupported private writer acquired a mirror or changed guest bytes");
     GuestArena::GuestArenaReset_nid_postfix(privateRange, bytes);
     GuestArena::GuestArenaRelease_nid_postfix(privateRange, bytes);

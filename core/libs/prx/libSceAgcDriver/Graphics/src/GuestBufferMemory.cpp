@@ -1374,10 +1374,12 @@ void countWritable(const VramWritableStats& added) {
     total.writerWaitUs += added.writerWaitUs;
     total.seals += added.seals;
     total.protectedBytes += added.protectedBytes;
+    total.legacyWrites += added.legacyWrites;
+    total.legacyRanges += added.legacyRanges;
     const auto now = std::chrono::steady_clock::now();
     if (now - state.lastReport < std::chrono::seconds(10)) return;
     state.lastReport = now;
-    AgcDriver::ProfilePrint_nid_no_patch("[vram-writable] pages %llu, merged %llu, overflow %llu, readback %llu bytes, publication %.3f ms, base pages %llu, pending %llu, faults %llu; writer waits %llu (%.3f ms), seals %llu protecting %.1f MiB (%.2f MiB per seal)\n", static_cast<unsigned long long>(total.pagesWritten), static_cast<unsigned long long>(total.pagesMerged), static_cast<unsigned long long>(total.overflowFallbacks), static_cast<unsigned long long>(total.readbackBytes), total.writeBackUs / 1000.0, static_cast<unsigned long long>(total.basePages), static_cast<unsigned long long>(total.pendingPages), static_cast<unsigned long long>(total.faults), static_cast<unsigned long long>(total.writerWaits), total.writerWaitUs / 1000.0, static_cast<unsigned long long>(total.seals), total.protectedBytes / 1048576.0, total.seals != 0 ? total.protectedBytes / 1048576.0 / static_cast<double>(total.seals) : 0.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[vram-writable] pages %llu, merged %llu, overflow %llu, readback %llu bytes, publication %.3f ms, base pages %llu, pending %llu, faults %llu; writer waits %llu (%.3f ms), seals %llu protecting %.1f MiB (%.2f MiB per seal); unprotected writers on the copy path: %llu descriptors, %llu ranges\n", static_cast<unsigned long long>(total.pagesWritten), static_cast<unsigned long long>(total.pagesMerged), static_cast<unsigned long long>(total.overflowFallbacks), static_cast<unsigned long long>(total.readbackBytes), total.writeBackUs / 1000.0, static_cast<unsigned long long>(total.basePages), static_cast<unsigned long long>(total.pendingPages), static_cast<unsigned long long>(total.faults), static_cast<unsigned long long>(total.writerWaits), total.writerWaitUs / 1000.0, static_cast<unsigned long long>(total.seals), total.protectedBytes / 1048576.0, total.seals != 0 ? total.protectedBytes / 1048576.0 / static_cast<double>(total.seals) : 0.0, static_cast<unsigned long long>(total.legacyWrites), static_cast<unsigned long long>(total.legacyRanges));
 }
 
 bool intervalCovers(const MirrorWriteInterval& interval, std::uint64_t page) {
@@ -3567,7 +3569,10 @@ void GuestBufferMemory::AcquireRegistered() {
                 imported.push_back(range->address);
                 continue;
             }
-            Require(!VramWritable() || !range->writable || !range->releasable, "VRAM writable range requires shared protection or a coherent host import");
+            if (VramWritable() && range->writable && range->releasable) {
+                Require(!VramWritableStrict(), "VRAM writable range requires shared protection or a coherent host import");
+                countWritable({.legacyRanges = 1});
+            }
             addCopiedRange({range->address, range->address + range->bytes, range->writable});
             const auto& copied = regions.back();
             std::uint64_t committed = copied.end - copied.begin;
@@ -5302,7 +5307,9 @@ void GuestBufferMemory::prepareMirrorWrites(bool addressable) {
     }
     for (const auto& [begin, end] : writes) {
         const auto* region = owner(begin);
-        Require(region != nullptr && coherent(*region), "VRAM writable descriptor requires shared protection or a coherent host import");
+        const bool served = region != nullptr && coherent(*region);
+        Require(served || (region != nullptr && !VramWritableStrict()), "VRAM writable descriptor requires shared protection or a coherent host import");
+        if (!served) countWritable({.legacyWrites = 1});
     }
     using Target = std::pair<std::shared_ptr<ImageMirror>, std::vector<std::pair<std::uint64_t, std::uint64_t>>>;
     std::map<ImageMirror*, Target> targets;

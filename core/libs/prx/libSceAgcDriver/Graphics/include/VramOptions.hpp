@@ -22,6 +22,11 @@ inline bool VramWritable() {
     return enabled;
 }
 
+inline bool VramWritableStrict() {
+    static const bool enabled = VramOption("APS5_VRAM_WRITABLE_STRICT");
+    return enabled;
+}
+
 inline bool VramDeferred() {
     static const bool enabled = VramOption("APS5_VRAM_DEFERRED");
     return enabled;
@@ -47,6 +52,8 @@ inline void ValidateVramOptions() {
         throw std::runtime_error("APS5_VRAM_DESCRIPTORS requires APS5_VRAM_MIRRORS=1");
     if (VramWritable() && !VramDescriptors())
         throw std::runtime_error("APS5_VRAM_WRITABLE requires APS5_VRAM_DESCRIPTORS=1");
+    if (VramWritableStrict() && !VramWritable())
+        throw std::runtime_error("APS5_VRAM_WRITABLE_STRICT requires APS5_VRAM_WRITABLE=1");
     if (VramDeferred() && !VramWritable())
         throw std::runtime_error("APS5_VRAM_DEFERRED requires APS5_VRAM_WRITABLE=1");
     if (VramCleanup() && !VramDescriptors())
