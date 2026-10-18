@@ -46,6 +46,24 @@ void Failure() {
     Require(failed == 2 && !committed, "a failed predecessor did not cancel later commits");
 }
 
+void ProofFailure() {
+    WorkerPool pool(2);
+    std::promise<void> release;
+    auto gate = release.get_future().share();
+    auto first = pool.Enqueue({0, 1, [gate](std::size_t) -> Commit { gate.wait(); return {}; }});
+    Chunk missing{0, 2, [](std::size_t) -> Commit { return {}; }, [] { return false; }};
+    bool rejected = false;
+    try { pool.Enqueue(std::move(missing)); } catch (const std::invalid_argument&) { rejected = true; }
+    bool laterCommitted = false;
+    auto second = pool.Enqueue({0, 2, [](std::size_t) -> Commit { return {}; }, []() -> bool { throw std::runtime_error("proof failure"); }, [] {}});
+    auto third = pool.Enqueue({0, 3, [&](std::size_t) -> Commit { return [&] { laterCommitted = true; }; }});
+    release.set_value();
+    first.get();
+    int failures = 0;
+    for (auto* result : {&second, &third}) try { result->get(); } catch (const std::runtime_error&) { ++failures; }
+    Require(rejected && failures == 2 && !laterCommitted, "proof failure did not reject or cancel publication");
+}
+
 void Suspension() {
     Scheduler scheduler;
     std::atomic<int> label{0};
@@ -228,9 +246,16 @@ int main() {
         Require(AsyncComputeEnabled() == (Enabled() && async != nullptr && std::strcmp(async, "1") == 0), "async switch is not exact/default-off");
         Ordering();
         Failure();
+        ProofFailure();
         Suspension();
         Cancellation();
         Queues();
+        const auto counts = PreparationProfile::Counts();
+        const auto line = PreparationProfile::ProfileLine();
+        if (PreparationProfile::Enabled()) {
+            Require(counts.prepared != 0 && counts.parallel >= 2 && counts.busyNs != 0 && counts.idleNs != 0, "lane worker profile counters missing");
+            Require(line.starts_with("[gpu-lanes] cumulative prepared=") && line.find("prepared-parallel=") != std::string::npos && line.find("worker-idle-ns=") != std::string::npos, "lane worker profile fields missing");
+        } else Require(counts == PreparationCounts{} && line.empty(), "disabled lanes changed worker profiling output");
         std::cout << "GPU lanes tests passed\n";
         return 0;
     } catch (const std::exception& error) {
