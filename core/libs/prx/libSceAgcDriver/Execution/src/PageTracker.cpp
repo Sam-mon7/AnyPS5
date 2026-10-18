@@ -371,9 +371,15 @@ std::vector<Range> Tracker::UndeclaredRuns(Range range) const {
         const auto base = id * RegionBytes;
         if (region == nullptr) { add(base + offset, base + offset + bytes); return; }
         const auto& gpu = region->reasons[static_cast<std::size_t>(Reason::PendingGpu)];
-        for (auto page = offset / PageBytes; page < (offset + bytes + PageBytes - 1) / PageBytes; ++page) {
-            if ((region->declared[page / 64] & gpu[page / 64] & (1ull << (page % 64))) == 0) add(base + page * PageBytes, base + (page + 1) * PageBytes);
-        }
+        Words(offset, bytes, [&](auto word, auto mask) {
+            auto missing = mask & ~(region->declared[word] & gpu[word]);
+            while (missing != 0) {
+                const auto first = static_cast<std::uint64_t>(std::countr_zero(missing));
+                const auto count = static_cast<std::uint64_t>(std::countr_one(missing >> first));
+                add(base + (word * 64 + first) * PageBytes, base + (word * 64 + first + count) * PageBytes);
+                missing &= count == 64 ? 0 : ~(((1ull << count) - 1) << first);
+            }
+        });
     });
     return runs;
 }
