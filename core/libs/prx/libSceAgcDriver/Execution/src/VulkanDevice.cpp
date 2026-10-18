@@ -4416,9 +4416,11 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         objects->destroyLayout = state->DeviceFunction<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
         objects->destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
-        moduleInfo.pCode = shader.spirv.data();
+        const auto moduleWords = shader.spirv.ModuleWords();
+        moduleInfo.codeSize = moduleWords.size_bytes();
+        moduleInfo.pCode = moduleWords.data();
         check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, Graphics::ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module), &objects->module), "vkCreateShaderModule");
+        shader.spirv.ReleaseAfterModule();
         const std::array<VkDescriptorSetLayout, 2> setLayouts{setLayout, shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : VK_NULL_HANDLE};
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};

@@ -310,10 +310,12 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT meshSubgroup{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT, nullptr, 32u};
         for (std::uint32_t i = 0; i < shaders.size(); ++i) {
             const auto& shader = *shaders[i].program;
+            const auto words = shader.spirv.ModuleWords();
             VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
-            module.pCode = shader.spirv.data();
+            module.codeSize = words.size_bytes();
+            module.pCode = words.data();
             Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &module, ShaderObjectAllocator(ShaderRecompiler::PreparedObjectKind::Module), &_modules[i]), "vkCreateShaderModule graphics");
+            shader.spirv.ReleaseAfterModule();
             const auto stage = VulkanStage(shaders[i].stage);
             stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
             stages[i].stage = stage;

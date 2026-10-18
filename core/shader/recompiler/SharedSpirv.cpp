@@ -1,5 +1,8 @@
 #include "Recompiler.hpp"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
@@ -14,11 +17,46 @@
 
 namespace ShaderRecompiler {
 
+namespace {
+
+std::atomic<std::uint64_t> releasedBytes{0}, regenerations{0}, sourceReprepares{0};
+
+void ReportReleasedShaderData() {
+    static std::atomic<std::int64_t> reported{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = reported.load(std::memory_order_relaxed);
+    if (previous != 0 && now - previous < 10) return;
+    if (!reported.compare_exchange_strong(previous, now, std::memory_order_relaxed)) return;
+    const auto totals = ShaderDataReleaseTotals();
+    std::fprintf(stderr, "[shader-memory] released %llu private SPIR-V bytes; regenerations %llu (module reads from backing cache), source re-prepares %llu\n",
+        static_cast<unsigned long long>(totals.releasedBytes), static_cast<unsigned long long>(totals.regenerations), static_cast<unsigned long long>(totals.sourceReprepares));
+}
+
+}
+
+bool ReleaseShaderDataEnabled() {
+    static const bool enabled = [] {
+        const auto* text = std::getenv("APS5_RELEASE_SHADER_DATA");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
+}
+
+ShaderDataReleaseStats ShaderDataReleaseTotals() {
+    return {releasedBytes.load(std::memory_order_relaxed), regenerations.load(std::memory_order_relaxed), sourceReprepares.load(std::memory_order_relaxed)};
+}
+
+void NoteShaderDataReprepare() {
+    if (ReleaseShaderDataEnabled()) sourceReprepares.fetch_add(1, std::memory_order_relaxed);
+}
+
 struct SharedSpirv::Storage {
     mutable std::mutex mutex;
     mutable std::vector<std::uint32_t> values;
     const std::uint32_t* mapped = nullptr;
     std::size_t count = 0;
+    bool vectorBorrowed = false;
+    bool released = false;
 #ifdef _WIN32
     HANDLE file = INVALID_HANDLE_VALUE;
     HANDLE mapping = nullptr;
@@ -95,7 +133,16 @@ SharedSpirv::SharedSpirv(std::vector<std::uint32_t> source) {
         const auto* value = std::getenv("APS5_SPIRV_IN_MEMORY");
         return value != nullptr && std::string_view(value) == "1";
     }();
-    if (!inMemory && enabled != nullptr && std::string_view(enabled) == "1" && source.size() >= 16384u) storage->Back(source);
+    if (ReleaseShaderDataEnabled() && !source.empty()) {
+        try {
+            storage->Back(source);
+        } catch (const std::exception& error) {
+            storage = std::make_shared<Storage>();
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) std::fprintf(stderr, "[shader-memory] keeping SPIR-V in memory: %s\n", error.what());
+        }
+        storage->values = std::move(source);
+    } else if (!inMemory && enabled != nullptr && std::string_view(enabled) == "1" && source.size() >= 16384u) storage->Back(source);
     else storage->values = std::move(source);
     words = std::move(storage);
 }
@@ -109,6 +156,26 @@ std::span<const std::uint32_t> SharedSpirv::Read() const {
     return words != nullptr ? words->Read() : std::span<const std::uint32_t>();
 }
 
+std::span<const std::uint32_t> SharedSpirv::ModuleWords() const {
+    if (!ReleaseShaderDataEnabled() || words == nullptr) return Read();
+    std::lock_guard lock(words->mutex);
+    if (words->released) regenerations.fetch_add(1, std::memory_order_relaxed);
+    return words->Read();
+}
+
+void SharedSpirv::ReleaseAfterModule() const {
+    if (!ReleaseShaderDataEnabled() || words == nullptr) return;
+    {
+        std::lock_guard lock(words->mutex);
+        if (words->mapped == nullptr || words->vectorBorrowed) return;
+        const auto bytes = words->values.capacity() * sizeof(std::uint32_t);
+        std::vector<std::uint32_t>().swap(words->values);
+        words->released = true;
+        releasedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    ReportReleasedShaderData();
+}
+
 std::size_t SharedSpirv::MemoryBytes() const {
     if (words == nullptr) return 0;
     std::lock_guard lock(words->mutex);
@@ -120,7 +187,11 @@ const std::vector<std::uint32_t>& SharedSpirv::Words() const {
         static const std::vector<std::uint32_t> empty;
         return empty;
     }
-    if (words->mapped != nullptr) {
+    if (ReleaseShaderDataEnabled()) {
+        std::lock_guard lock(words->mutex);
+        if (words->values.empty() && words->mapped != nullptr) words->values.assign(words->mapped, words->mapped + words->count);
+        words->vectorBorrowed = true;
+    } else if (words->mapped != nullptr) {
         std::lock_guard lock(words->mutex);
         if (words->values.empty()) words->values.assign(words->mapped, words->mapped + words->count);
     }
@@ -132,6 +203,7 @@ std::vector<std::uint32_t>& SharedSpirv::Mutable() {
         const auto source = Read();
         auto storage = std::make_shared<Storage>();
         storage->values.assign(source.begin(), source.end());
+        storage->vectorBorrowed = true;
         words = std::move(storage);
     }
     return words->values;

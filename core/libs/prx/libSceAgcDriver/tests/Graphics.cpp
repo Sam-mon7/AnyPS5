@@ -4276,8 +4276,12 @@ void pipelineLibraryLifetimeTests() {
         const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
         const std::array<std::uint32_t, 1> mainKey{11}, fragmentKey{22};
         const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), makeHandle<VkDescriptorSetLayout>(), true, mainKey, fragmentKey};
+        const auto memoryBefore = ShaderRecompiler::ShaderDataReleaseTotals();
         auto first = std::make_unique<Pipeline>(context, State{}, VertexInputLayout{}, resources, shaders);
+        const auto released = ShaderRecompiler::ShaderDataReleaseTotals();
+        Require((released.releasedBytes > memoryBefore.releasedBytes) == ShaderRecompiler::ReleaseShaderDataEnabled(), "graphics module creation did not apply the shader release switch");
         auto second = std::make_unique<Pipeline>(context, State{}, VertexInputLayout{}, resources, shaders);
+        Require((ShaderRecompiler::ShaderDataReleaseTotals().regenerations > released.regenerations) == ShaderRecompiler::ReleaseShaderDataEnabled(), "later graphics pipeline did not regenerate its released module words");
         const auto live = mock.liveGraphicsPipelines;
         Require(live.size() == 6, "two linked pipelines did not share four libraries");
         ClearPipelineLibraries(context.device);

@@ -243,6 +243,7 @@ function(add_shader_recompiler target runtimeTarget)
             GetPreparedCode
             PreparedShaderInvocation::TryCreate
             PreparedShaderBudgetEnabled
+            ReleaseShaderDataEnabled
             CachePreparedObject
             MaintainPreparedShaderCache
             TouchPreparedShader
