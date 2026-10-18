@@ -141,12 +141,12 @@ private:
 inline std::atomic<ProfileOutput*> createdProfileOutput{nullptr};
 
 inline ProfileOutput& ProfileOutput_nid_no_patch() {
-    static ProfileOutput output([](std::string_view text) {
+    static auto* const output = new ProfileOutput([](std::string_view text) {
         if (std::fwrite(text.data(), 1, text.size(), stderr) != text.size() || std::fflush(stderr) != 0)
             throw std::runtime_error("profile output write failed");
     });
-    createdProfileOutput.store(&output, std::memory_order_release);
-    return output;
+    createdProfileOutput.store(output, std::memory_order_release);
+    return *output;
 }
 
 inline void StopProfileOutput_nid_no_patch() {
