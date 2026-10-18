@@ -3524,7 +3524,7 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             submit.commandBufferCount = 1;
             submit.pCommandBuffers = &buffer;
-            if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
+            if ((probe.result = OrderedQueueCall([&] { return context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence); })) != VK_SUCCESS) return "vkQueueSubmit";
             submitted = true;
             if ((probe.result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences";
             submitted = false;
@@ -3539,7 +3539,7 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         return nullptr;
     };
     probe.failure = run();
-    if (submitted) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    if (submitted) OrderedQueueCall([&] { return context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue); });
     if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (commands[0] != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 2, commands);
     if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);
@@ -3817,7 +3817,7 @@ void RetireVramMirrorRecorder(Recorder& recorder) noexcept {
             try {
                 if (addressWriter != nullptr && addressWriter->recorder == &recorder) {
                     const bool executed = addressWriter->serial <= recorder.Submissions();
-                    if (executed) Check(addressWriter->context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(addressWriter->context.queue), "vkQueueWaitIdle lazy BDA retirement");
+                    if (executed) Check(OrderedQueueCall([&] { return addressWriter->context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(addressWriter->context.queue); }), "vkQueueWaitIdle lazy BDA retirement");
                     completeAbandonedLazyWriter(*mirror, addressWriter, executed);
                 }
             } catch (const std::exception& error) { std::fprintf(stderr, "[gpu] lazy BDA retirement: %s\n", error.what()); }
@@ -3846,7 +3846,7 @@ void RetireVramMirrorRecorder(Recorder& recorder) noexcept {
         const auto interval = mirror->writer;
         try {
             if (interval->serial != 0 && interval->serial <= recorder.Submissions()) {
-                Check(interval->context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(interval->context.queue), "vkQueueWaitIdle VRAM mirror retirement");
+                Check(OrderedQueueCall([&] { return interval->context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(interval->context.queue); }), "vkQueueWaitIdle VRAM mirror retirement");
                 for (const auto& [begin, end] : interval->watched) for (auto page = begin; page < end; page += 4096) interval->written.insert(page);
                 interval->complete = true;
                 publishMirrorPages(*mirror, interval);
@@ -4834,7 +4834,7 @@ GuestBufferMemory::~GuestBufferMemory() {
                     });
                 } else {
                     if (synchronousSubmission != nullptr && *synchronousSubmission)
-                        Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle lazy mirror retirement");
+                        Check(OrderedQueueCall([&] { return context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue); }), "vkQueueWaitIdle lazy mirror retirement");
                     completeAbandonedLazyWriter(*mirror, interval, synchronousSubmission != nullptr && *synchronousSubmission);
                     publishLazyPages(*mirror, mirror->base, mirror->base + mirror->bytes);
                 }
@@ -4847,7 +4847,7 @@ GuestBufferMemory::~GuestBufferMemory() {
         std::lock_guard gpu(GuestMemory::GpuMutex());
         try {
             if (synchronousSubmission != nullptr && *synchronousSubmission) {
-                Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle synchronous VRAM mirror retirement");
+                Check(OrderedQueueCall([&] { return context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue); }), "vkQueueWaitIdle synchronous VRAM mirror retirement");
                 recordMirrorResults(nullptr);
                 for (const auto& [mirror, interval] : mirrorWrites) {
                     for (const auto& [begin, end] : interval->watched) for (auto page = begin; page < end; page += 4096) interval->written.insert(page);

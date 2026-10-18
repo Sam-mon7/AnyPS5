@@ -295,6 +295,7 @@ public:
             VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
             pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
             pool.queueFamilyIndex = family;
+            context.queueFamilyIndex = family;
             Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &pool, nullptr, &context.pool), "vkCreateCommandPool");
         } catch (...) {
             release();
@@ -311,7 +312,7 @@ public:
         function<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(context.physical, &properties);
         return properties;
     }
-    void WaitQueue() const { Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle"); }
+    void WaitQueue() const { Check(OrderedQueueCall([&] { return context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue); }), "vkQueueWaitIdle"); }
 
 private:
     template<typename TFunction>
@@ -8584,10 +8585,11 @@ int main(int argc, char** argv) {
         ~ProfileStop() { AgcDriver::ResourcePhase::Stop(); }
     } profileStop;
     try {
+        const bool submitWorkerTest = argc == 2 && std::string_view(argv[1]) == "--submit-worker-only";
         const bool completionProbe = argc == 2 && std::string_view(argv[1]) == "--completion-probe-only";
         std::unique_ptr<Device> created;
         try {
-            created = std::make_unique<Device>(completionProbe);
+            created = std::make_unique<Device>(completionProbe || submitWorkerTest);
         } catch (const std::exception& error) {
             if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
             std::cout << "skipped, no usable Vulkan device: " << error.what() << '\n';
@@ -8645,8 +8647,22 @@ int main(int argc, char** argv) {
         }
 #endif
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
-        Recorder recorder(device.GetContext());
+        Recorder recorder(device.GetContext(), submitWorkerTest);
         recorder.Activate();
+        if (submitWorkerTest) {
+            readTrackingTests(device, recorder);
+            directCompletionLabelTests(recorder);
+            afterRecordedWorkTests(device, recorder);
+            bool completed = false;
+            recorder.OnComplete([&] { completed = true; });
+            const auto serial = recorder.SubmitAndEpoch();
+            recorder.WaitSerial(serial);
+            Require(!completed, "timeline wait delivered a completion outside the GPU mutex");
+            recorder.FinishUpTo(serial);
+            Require(completed && recorder.Idle(), "timeline wait did not complete the handed-off batch");
+            std::cout << "Submit worker device tests passed\n";
+            return 0;
+        }
         if (argc == 2 && (std::string_view(argv[1]) == "--vram-lazy-only" || std::string_view(argv[1]) == "--vram-lazy-imports")) {
             RunVramLazyTests(device.GetContext(), recorder, std::string_view(argv[1]) == "--vram-lazy-imports");
             std::cout << "Lazy mirror coherence tests passed\n";

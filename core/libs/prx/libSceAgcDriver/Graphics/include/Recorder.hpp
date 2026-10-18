@@ -527,6 +527,7 @@ private:
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
+        VkCommandPool pool = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
@@ -720,6 +721,8 @@ private:
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);
     }
     VkResult fenceStatus(VkFence fence) const { return function(getFenceStatus, "vkGetFenceStatus")(context.device, fence); }
+    VkResult batchStatus(const Batch& batch) const;
+    void waitSubmitted(std::uint64_t serial) const;
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
@@ -773,6 +776,8 @@ private:
     bool unsignaled(std::uint64_t serial) const;
 
     Context context;
+    struct SubmitProgress;
+    std::shared_ptr<SubmitProgress> submitProgress;
     struct CompletionProbe;
     std::unique_ptr<CompletionProbe> completionProbe;
     void noteProbeCompletion(const Batch& batch);
@@ -806,6 +811,7 @@ private:
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
+    std::vector<VkCommandPool> spareCommandPools;
     std::vector<VkQueryPool> sparePools;
     mutable std::mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;

@@ -425,6 +425,7 @@ struct VulkanDevice::State {
     // The presentation present() submitted and QueuePresent has not handed to the swapchain.
     bool queuePending = false;
     std::uint32_t queueIndex = 0;
+    std::uint32_t queueFamilyIndex = 0;
     int nextDumpIndex = 0;
     FrameDumpWriter dumpWriter;
 
@@ -663,7 +664,7 @@ struct VulkanDevice::State {
             device = VK_NULL_HANDLE;
         }
         if (device != VK_NULL_HANDLE) {
-            const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            const auto idle = Graphics::OrderedQueueCall([&] { return reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device); });
             Graphics::Aftermath::Notify(idle);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
@@ -1755,7 +1756,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         const auto checkpointData = checkpoints ? state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV") : nullptr;
         Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, faultInfo, checkpointData, bindings = addressBindings ? state->addressBindings : nullptr, copies = state->copyCheckpoints] {
             std::vector<VkDeviceFaultAddressInfoEXT> addresses;
-            for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData, &addresses)) std::fprintf(stderr, "%s\n", line.c_str());
+            Graphics::OrderedQueueCall([&] {
+                for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData, &addresses)) std::fprintf(stderr, "%s\n", line.c_str());
+                return VK_SUCCESS;
+            });
             if (bindings != nullptr) for (const auto& address : addresses) bindings->Report(address, stderr);
             if (copies != nullptr) copies->Report(stderr);
         };
@@ -1765,6 +1769,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = family;
+    state->queueFamilyIndex = family;
     check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->pool), "vkCreateCommandPool");
     static const bool procTable = std::getenv("APS5_NO_PROC_TABLE") == nullptr;
     if (procTable) {
@@ -1887,7 +1892,7 @@ void VulkanDevice::WaitIdle() {
         if (!state->recorder->Idle()) Graphics::Recorder::CountSync(0, __builtin_return_address(0));
         state->recorder->Sync();
     }
-    check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    check(Graphics::OrderedQueueCall([&] { return state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device); }), "vkDeviceWaitIdle");
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
 
@@ -3010,7 +3015,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    check(Graphics::OrderedQueueCall([&] { return state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence); }), "vkQueueSubmit clear");
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -3131,7 +3136,7 @@ void VulkanDevice::QueuePresent() {
     present.swapchainCount = 1;
     present.pSwapchains = &state->swapchain;
     present.pImageIndices = &index;
-    const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
+    const auto presented = Graphics::OrderedQueueCall([&] { return state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present); });
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
     timing.Mark("queue_present");
@@ -3278,6 +3283,7 @@ Graphics::Context VulkanDevice::buildContext() const {
         state->depthClamp,
         state->hostImportAlignment
     };
+    context.queueFamilyIndex = state->queueFamilyIndex;
     context.pipelineCacheSynchronization = state->pipelineCache ? &state->pipelineCache->Synchronization() : nullptr;
     context.dmaBufImport = state->dmaBufImport;
     context.addressBindings = state->addressBindingsEnabled ? state->addressBindings : nullptr;
