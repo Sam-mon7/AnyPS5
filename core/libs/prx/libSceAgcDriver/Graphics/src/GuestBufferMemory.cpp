@@ -2353,6 +2353,10 @@ void prepareMirrorRange(ImageMirror& mirror, std::uint64_t address, std::uint64_
         prepareRange(address, bytes, flush);
         return;
     }
+    if (!flush) {
+        syncRange(address, bytes, false);
+        return;
+    }
     const auto end = address + bytes;
     auto cursor = address;
     for (auto it = mirror.lazyPages.lower_bound(address & ~std::uint64_t{4095}); it != mirror.lazyPages.end() && it->first < end; ++it) {
