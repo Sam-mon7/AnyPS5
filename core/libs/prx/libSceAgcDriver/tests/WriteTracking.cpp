@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -184,6 +185,29 @@ void CheckNewestStamp() {
 }
 
 #ifdef _WIN32
+std::size_t importFlushes = 0;
+
+void CountImportFlush(std::uint64_t, std::size_t) {
+    ++importFlushes;
+}
+
+void CheckImportWithoutOverlay() {
+    if (!AgcDriver::Graphics::VramWritable()) return;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Block, nullptr);
+    Require(section != nullptr, "cannot create overlay-free import backing");
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(Block, Block));
+    Require(memory != nullptr, "cannot allocate overlay-free import address");
+    GuestArena::GuestArenaMap_nid_postfix(memory, Block, section, 0, PAGE_READWRITE);
+    importFlushes = 0;
+    SetFlushHook(&CountImportFlush);
+    const bool imported = ImportWatched(reinterpret_cast<std::uintptr_t>(memory), Block, [] { return true; });
+    SetFlushHook(nullptr);
+    GuestArena::GuestArenaReset_nid_postfix(memory, Block);
+    GuestArena::GuestArenaRelease_nid_postfix(memory, Block);
+    CloseHandle(section);
+    Require(imported && importFlushes == 0, "an import of memory without a GPU overlay ran the GPU write flush under its caller's import lock");
+}
+
 void CheckDeferredSharedImports() {
     constexpr std::size_t bytes = 4 * Block;
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
@@ -715,6 +739,7 @@ int main() {
         CheckUnwatch();
         CheckNewestStamp();
 #ifdef _WIN32
+        CheckImportWithoutOverlay();
         CheckDeferredSharedImports();
         CheckPrivateMappingReuse();
         CheckHostHoleInChild();

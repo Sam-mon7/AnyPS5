@@ -1281,7 +1281,11 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     std::unique_lock gpuLock(GpuMutex(), std::defer_lock);
     if (Graphics::VramWritable()) {
         gpuLock.lock();
+#ifdef _WIN32
+        if (GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(address, bytes)) FlushGpuWrites(address, bytes);
+#else
         FlushGpuWrites(address, bytes);
+#endif
     }
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
