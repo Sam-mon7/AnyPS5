@@ -3798,11 +3798,12 @@ struct DispatchTimer {
         }
         if (Graphics::DispatchLockDietEnabled()) {
             const auto refresh = Graphics::DispatchHeapRefreshCounters();
-            char text[256];
-            std::snprintf(text, sizeof(text), " heap-refresh captured=%llu unavailable=%llu applied=%llu fallback=%llu staged=%.1fMiB/%.1fms",
+            char text[320];
+            std::snprintf(text, sizeof(text), " heap-refresh captured=%llu unavailable=%llu applied=%llu fallback=%llu staged=%.1fMiB/%.1fms presync=%llu presync-fallback=%llu",
                 static_cast<unsigned long long>(refresh.captured), static_cast<unsigned long long>(refresh.unavailable),
                 static_cast<unsigned long long>(refresh.applied), static_cast<unsigned long long>(refresh.fallback),
-                refresh.stagedBytes / 1048576.0, refresh.stageUs / 1000.0);
+                refresh.stagedBytes / 1048576.0, refresh.stageUs / 1000.0,
+                static_cast<unsigned long long>(refresh.presyncs), static_cast<unsigned long long>(refresh.presyncFallbacks));
             report += text;
         }
         AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %llu dispatches, phase totals:%s\n", static_cast<unsigned long long>(d.profiledDispatches), report.c_str());
@@ -4031,14 +4032,18 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     if (Graphics::DispatchLockDietEnabled() && cached == nullptr &&
         std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }) &&
         !GuestMemory::GpuMutex().HeldByThisThread()) {
-        {
-            std::lock_guard gpu(GuestMemory::GpuMutex());
-            prepared->heapRefresh = Graphics::CaptureDispatchHeapRefresh(context, [this](std::uint64_t address, std::size_t bytes) {
+        prepared->heapRefresh = Graphics::PrepareDispatchHeapRefresh(context,
+            [this](std::uint64_t address, std::size_t bytes) {
                 return StoresPendingOver(address, bytes) || (state->recorder != nullptr &&
                     (state->recorder->QueuedKeyStoreOverlaps(address, bytes) || state->recorder->QueuedStoreOverlaps(address, bytes)));
+            }, [this](std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+                if (NoPresync() || !CanWaitUnlocked()) return false;
+                const auto serial = presync(ranges);
+                if (serial == 0) return false;
+                std::lock_guard gpu(GuestMemory::GpuMutex());
+                ReapRecorded(serial);
+                return true;
             });
-        }
-        if (prepared->heapRefresh != nullptr) Graphics::StageDispatchHeapRefresh(*prepared->heapRefresh);
         phase(PreparedDispatch::PrepareStageA);
     }
     if (profile) prepared->prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
