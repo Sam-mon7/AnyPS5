@@ -97,7 +97,7 @@ public:
     void MarkCpuWritten(Range range, Source source);
     void MarkGpuWritten(Range range, Source source);
     void MarkGpuDeclared(Range range, Source source, std::uint64_t generation);
-    bool DeclaredPending(Range range, std::uint64_t generation) const;
+    bool DeclaredPending(Range range) const;
     void NoteSkippedDeclaration(Range range);
     std::uint64_t MappingGeneration() const { return mappingGeneration.load(std::memory_order_acquire); }
     void PublishGpuWrites(Range range);
@@ -128,7 +128,7 @@ private:
         Bitmap cpuDirty{}, gpuDirty{}, observedPrivate{}, declared{};
         std::array<Bitmap, static_cast<std::size_t>(Reason::Count)> reasons{};
         std::array<Bitmap, static_cast<std::size_t>(Kind::Count)> kinds{};
-        std::uint64_t mapEpoch = 1, cpuEpoch = 1, gpuEpoch = 1, declaredGeneration = 0;
+        std::uint64_t mapEpoch = 1, cpuEpoch = 1, gpuEpoch = 1;
     };
     Region* GetRegion(std::uint64_t id, bool create) const;
     template<class Function> void Visit(Range range, bool create, Function&& function) const {

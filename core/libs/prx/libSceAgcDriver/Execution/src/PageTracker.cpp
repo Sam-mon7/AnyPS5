@@ -247,6 +247,7 @@ void Tracker::RegisterRange(Range range, Kind kind, Reasons reasons) {
     Visit(range, true, [&](auto, auto offset, auto bytes, auto* region) {
         Advance(region->mapEpoch);
         if (region->pages != nullptr) region->pages->invalidated = region->mapEpoch;
+        Assign(region->declared, offset, bytes, false);
         Assign(region->cpuDirty, offset, bytes, true);
         Assign(region->gpuDirty, offset, bytes, false);
         for (std::size_t i = 0; i < region->kinds.size(); ++i) Assign(region->kinds[i], offset, bytes, i == static_cast<std::size_t>(kind));
@@ -262,6 +263,7 @@ void Tracker::InvalidateRange(Range range, bool unmapped) {
         if (region == nullptr) return;
         Advance(region->mapEpoch);
         if (region->pages != nullptr) region->pages->invalidated = region->mapEpoch;
+        Assign(region->declared, offset, bytes, false);
         Assign(region->reasons[static_cast<std::size_t>(unmapped ? Reason::Unmapped : Reason::Unsupported)], offset, bytes, true);
         if (unmapped) {
             for (std::size_t i = 0; i < region->kinds.size(); ++i) Assign(region->kinds[i], offset, bytes, i == static_cast<std::size_t>(Kind::Unknown));
@@ -270,8 +272,10 @@ void Tracker::InvalidateRange(Range range, bool unmapped) {
 }
 
 void Tracker::SetCoverage(Range range, Reasons reasons) {
+    mappingGeneration.fetch_add(1, std::memory_order_acq_rel);
     Visit(range, false, [&](auto, auto offset, auto bytes, auto* region) {
         if (region == nullptr) return;
+        Assign(region->declared, offset, bytes, false);
         const bool privatePoll = ProofsEnabled() && (reasons & Bit(Reason::PrivateWatch)) != 0;
         bool changed = false;
         bool pageHistoryChanged = false;
@@ -344,27 +348,23 @@ void Tracker::MarkGpuDeclared(Range range, Source source, std::uint64_t generati
         Advance(region->gpuEpoch);
         Assign(region->gpuDirty, offset, bytes, true);
         Assign(region->reasons[static_cast<std::size_t>(Reason::PendingGpu)], offset, bytes, true);
-        if (region->declaredGeneration != generation) {
-            region->declared.fill(0);
-            region->declaredGeneration = generation;
-        }
-        Assign(region->declared, offset, bytes, true);
+        if (MappingGeneration() == generation) Assign(region->declared, offset, bytes, true);
     });
     std::lock_guard lock(countsMutex);
     counts.sources[static_cast<std::size_t>(source)] += Pages(range);
     if (source == Source::GpuDeclaration) counts.gpuPages += Pages(range);
 }
 
-bool Tracker::DeclaredPending(Range range, std::uint64_t generation) const {
-    if (!range.Valid() || Poisoned() || MappingGeneration() != generation) return false;
+bool Tracker::DeclaredPending(Range range) const {
+    if (!range.Valid() || Poisoned()) return false;
     bool pending = true;
     Visit(range, false, [&](auto, auto offset, auto bytes, auto* region) {
         if (!pending) return;
-        if (region == nullptr || region->declaredGeneration != generation) { pending = false; return; }
+        if (region == nullptr) { pending = false; return; }
         const auto& gpu = region->reasons[static_cast<std::size_t>(Reason::PendingGpu)];
         Words(offset, bytes, [&](auto word, auto mask) { if ((region->declared[word] & gpu[word] & mask) != mask) pending = false; });
     });
-    return pending && MappingGeneration() == generation;
+    return pending;
 }
 
 void Tracker::NoteSkippedDeclaration(Range range) {
@@ -740,7 +740,7 @@ bool ObserversRegistered() { return registered.load(std::memory_order_acquire); 
 namespace {
 void declareGpuAliases(Tracker& tracker, Range range, Source source) {
     const auto generation = tracker.MappingGeneration();
-    if (tracker.DeclaredPending(range, generation)) {
+    if (tracker.DeclaredPending(range)) {
         tracker.NoteSkippedDeclaration(range);
         return;
     }
