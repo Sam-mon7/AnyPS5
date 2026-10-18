@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DispatchCoverage.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/Dispatch/PreparedHeapRefresh.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FragmentBarycentric.hpp"
@@ -3457,6 +3458,7 @@ struct PreparedDispatch {
     // cache held the key's object at prepare time: the dispatch revalidates `cached` instead.
     std::shared_ptr<Graphics::ShaderResources> resources;
     std::shared_ptr<Graphics::ShaderResources> cached;
+    std::shared_ptr<Graphics::PreparedHeapRefresh> heapRefresh;
     ResourceCache::Key key;
     // APS5_PROFILE_DRAW: stage A's time, added to the [dispatch] phase totals by the dispatch, and
     // the prepare's parts for the driver's 'prepare:' rows (PreparePhase order).
@@ -3737,6 +3739,15 @@ struct DispatchTimer {
         for (std::size_t row = 0; row < DispatchPhaseCount; ++row) {
             if (d.phaseTotals[row] != 0) report += " " + std::string(DispatchRowName(row)) + "=" + std::to_string(static_cast<long long>(d.phaseTotals[row] / 1000)) + "s";
         }
+        if (Graphics::DispatchLockDietEnabled()) {
+            const auto refresh = Graphics::DispatchHeapRefreshCounters();
+            char text[256];
+            std::snprintf(text, sizeof(text), " heap-refresh captured=%llu unavailable=%llu applied=%llu fallback=%llu staged=%.1fMiB/%.1fms",
+                static_cast<unsigned long long>(refresh.captured), static_cast<unsigned long long>(refresh.unavailable),
+                static_cast<unsigned long long>(refresh.applied), static_cast<unsigned long long>(refresh.fallback),
+                refresh.stagedBytes / 1048576.0, refresh.stageUs / 1000.0);
+            report += text;
+        }
         AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %llu dispatches, phase totals:%s\n", static_cast<unsigned long long>(d.profiledDispatches), report.c_str());
     }
     // The call's end: the proc lookups it made, the slow-call report, the [indirect] hold
@@ -3959,6 +3970,19 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         const auto surfaces = cached != nullptr ? cached->PresyncSurfaces() : prepared->resources->PresyncSurfaces();
         prepared->presyncSerial = presync(surfaces);
         phase(PreparedDispatch::PreparePresync);
+    }
+    if (Graphics::DispatchLockDietEnabled() && cached == nullptr &&
+        std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }) &&
+        !GuestMemory::GpuMutex().HeldByThisThread()) {
+        {
+            std::lock_guard gpu(GuestMemory::GpuMutex());
+            prepared->heapRefresh = Graphics::CaptureDispatchHeapRefresh(context, [this](std::uint64_t address, std::size_t bytes) {
+                return StoresPendingOver(address, bytes) || (state->recorder != nullptr &&
+                    (state->recorder->QueuedKeyStoreOverlaps(address, bytes) || state->recorder->QueuedStoreOverlaps(address, bytes)));
+            });
+        }
+        if (prepared->heapRefresh != nullptr) Graphics::StageDispatchHeapRefresh(*prepared->heapRefresh);
+        phase(PreparedDispatch::PrepareStageA);
     }
     if (profile) prepared->prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     const auto& built = cached != nullptr ? *cached : *prepared->resources;
@@ -4435,7 +4459,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // (an address-based build also runs its stage A here, under the mutex: 'A locked').
         const auto before = profile ? resources->Timing() : Graphics::ShaderResources::BuildTiming{};
         const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        resources->Complete();
+        {
+            const Graphics::DispatchHeapRefreshScope refresh(prepared->heapRefresh.get());
+            resources->Complete();
+        }
         require(prepared->describedLayoutKey.empty() || std::ranges::equal(resources->SetLayouts().mainKey, prepared->describedLayoutKey), "the set layout described for the dispatch's pipeline differs from its build");
         if (profile) {
             const auto completeWall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - completeStart).count();

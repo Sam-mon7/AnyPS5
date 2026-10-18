@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/PageTracker.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/Dispatch/PreparedHeapRefresh.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ResourcePhase.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -157,7 +158,44 @@ struct GuestBufferMemory::AddressSpace {
     mutable std::map<std::vector<std::uint64_t>, std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>>> tables;
 };
 
+struct PreparedHeapRefresh {
+    std::shared_ptr<const GuestBufferMemory::AddressSpace> space;
+    struct Mirror {
+        ImageMirror* mirror;
+        std::vector<std::uint64_t> generations;
+        std::uint64_t revision;
+    };
+    struct Block {
+        ImageMirror* mirror;
+        std::uint64_t address;
+        std::uint64_t generation;
+        std::vector<std::byte> bytes;
+    };
+    std::vector<Mirror> mirrors;
+    std::vector<Block> blocks;
+    std::vector<std::pair<std::size_t, std::uint64_t>> checked;
+    std::function<bool(std::uint64_t, std::size_t)> pending;
+    std::uint64_t mirrorVersion = 0;
+    std::uint64_t forgetSerial = 0;
+    std::uint64_t commitGeneration = 0;
+    std::uint64_t unwatchSerial = 0;
+    std::uint64_t refills = 0;
+    bool ready = false;
+    bool consumed = false;
+};
+
 namespace {
+
+thread_local PreparedHeapRefresh* dispatchHeapRefresh = nullptr;
+
+struct HeapRefreshCounters {
+    std::atomic<std::uint64_t> captured{0}, unavailable{0}, stagedBytes{0}, stageUs{0}, applied{0}, fallback{0};
+};
+
+HeapRefreshCounters& HeapRefreshes() {
+    static HeapRefreshCounters counters;
+    return counters;
+}
 
 struct RetiredImport;
 bool aliasesLiveMirror(VkDevice device, std::uint64_t address, std::size_t bytes);
@@ -2717,7 +2755,62 @@ void planSpaceMirrors(GuestBufferMemory::AddressSpace& space) {
     space.verified = std::make_unique<std::atomic<std::uint64_t>[]>(space.heapRuns.size());
 }
 
+bool applyDispatchHeapRefresh(const GuestBufferMemory::AddressSpace& space, std::vector<std::pair<std::size_t, std::uint64_t>>& checked) {
+    auto* const prepared = dispatchHeapRefresh;
+    if (prepared == nullptr || prepared->consumed) return false;
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "dispatch heap apply requires the GPU mutex");
+    prepared->consumed = true;
+    const auto valid = [&] {
+        if (!prepared->ready || prepared->space.get() != &space || Spaces().current.load().get() != &space ||
+            space.generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix() ||
+            prepared->forgetSerial != GuestMemory::ForgetSerial() ||
+            prepared->commitGeneration != GuestArena::GuestArenaCommitGeneration_nid_postfix() ||
+            prepared->unwatchSerial != GuestMemory::UnwatchSerial() ||
+            prepared->mirrorVersion != Mirrors().version) return false;
+        {
+            auto& imports = Imports();
+            std::lock_guard lock(imports.mutex);
+            if (imports.epoch != space.importsEpoch) return false;
+        }
+        for (const auto& saved : prepared->mirrors) {
+            const auto& mirror = *saved.mirror;
+            if (mirror.retired.load(std::memory_order_acquire) || mirror.device != space.device ||
+                mirror.generations != saved.generations || mirror.gpuRevision != saved.revision) return false;
+        }
+        for (const auto& [index, generation] : prepared->checked) {
+            const auto& run = space.heapRuns[index];
+            if (prepared->pending(run.begin, static_cast<std::size_t>(run.bytes)) ||
+                GuestMemory::CollectWritesUncached(run.begin, static_cast<std::size_t>(run.bytes)) == 0 ||
+                !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), generation)) return false;
+        }
+        return prepared->forgetSerial == GuestMemory::ForgetSerial() &&
+            prepared->unwatchSerial == GuestMemory::UnwatchSerial() &&
+            prepared->commitGeneration == GuestArena::GuestArenaCommitGeneration_nid_postfix() &&
+            space.generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    };
+    if (!valid()) {
+        HeapRefreshes().fallback.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    for (const auto& block : prepared->blocks) {
+        auto& mirror = *block.mirror;
+        std::memcpy(mirror.buffer->WriteBytes().data() + (block.address - mirror.base), block.bytes.data(), block.bytes.size());
+        mirror.generations[static_cast<std::size_t>(block.address / 65536 - mirror.base / 65536)] = block.generation;
+    }
+    Mirrors().heapChecks += prepared->mirrors.size();
+    Mirrors().blocksCompared += prepared->blocks.size();
+    Mirrors().blocksCopied += prepared->blocks.size();
+    Mirrors().heapRefills += prepared->refills;
+    checked = std::move(prepared->checked);
+    HeapRefreshes().applied.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
+    if (dispatchHeapRefresh != nullptr) {
+        std::vector<std::pair<std::size_t, std::uint64_t>> checked;
+        if (applyDispatchHeapRefresh(space, checked)) return checked;
+    }
     if (VramMirrorWrites()) {
         for (auto* mirror : space.heapMirrors) Require(refreshWritableHeap(*mirror, blocks), "a writable heap grew during refresh");
         return {};
@@ -4157,6 +4250,116 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     totals.builds = 0;
     totals.sums = {};
     totals.snapshotsUs = 0;
+}
+
+bool DispatchLockDietEnabled() {
+    static const bool enabled = VramOption("APS5_DISPATCH_LOCK_DIET");
+    return enabled;
+}
+
+std::shared_ptr<PreparedHeapRefresh> CaptureDispatchHeapRefresh(const Context& context, std::function<bool(std::uint64_t, std::size_t)> pending) {
+    if (!DispatchLockDietEnabled()) return nullptr;
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "dispatch heap capture requires the GPU mutex");
+    const auto unavailable = [] {
+        HeapRefreshes().unavailable.fetch_add(1, std::memory_order_relaxed);
+        return std::shared_ptr<PreparedHeapRefresh>{};
+    };
+    if (ResidentHeapMirrors() || VramMirrorWrites() || VramDeviceLocalMirrors() || !pending) return unavailable();
+    auto space = Spaces().current.load();
+    if (space == nullptr || space->device != context.device || space->heapRuns.empty() ||
+        !space->sparseMirrors.empty() || !space->writableMirrors.empty() ||
+        space->generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return unavailable();
+    {
+        auto& imports = Imports();
+        std::lock_guard lock(imports.mutex);
+        if (imports.epoch != space->importsEpoch) return unavailable();
+    }
+    for (const auto& run : space->heapRuns) if (pending(run.begin, static_cast<std::size_t>(run.bytes))) return unavailable();
+    auto prepared = std::make_shared<PreparedHeapRefresh>();
+    prepared->space = std::move(space);
+    prepared->pending = std::move(pending);
+    prepared->mirrorVersion = Mirrors().version;
+    prepared->forgetSerial = GuestMemory::ForgetSerial();
+    prepared->commitGeneration = GuestArena::GuestArenaCommitGeneration_nid_postfix();
+    prepared->unwatchSerial = GuestMemory::UnwatchSerial();
+    for (auto* mirror : prepared->space->heapMirrors) {
+        if (!mirror->buffer->Mapped() || mirror->sparse || mirror->retired.load(std::memory_order_acquire) ||
+            mirror->writer != nullptr || mirror->lazyAddressWriter != nullptr || !mirror->pendingWrites.empty()) return unavailable();
+        prepared->mirrors.push_back({mirror, mirror->generations, mirror->gpuRevision});
+    }
+    HeapRefreshes().captured.fetch_add(1, std::memory_order_relaxed);
+    return prepared;
+}
+
+void StageDispatchHeapRefresh(PreparedHeapRefresh& prepared) {
+    Require(!GuestMemory::GpuMutex().HeldByThisThread(), "dispatch heap staging requires an unlocked GPU mutex");
+    const auto started = std::chrono::steady_clock::now();
+    const auto finish = [&] {
+        HeapRefreshes().stageUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+    };
+    prepared.ready = false;
+    prepared.blocks.clear();
+    prepared.checked.clear();
+    prepared.refills = 0;
+    std::size_t stagedBytes = 0;
+    const auto stage = [&] {
+        constexpr std::uint64_t blockBytes = 65536;
+        constexpr std::size_t maxBytes = 64u << 20u;
+        for (std::size_t index = 0; index < prepared.space->heapRuns.size(); ++index) {
+            const auto& run = prepared.space->heapRuns[index];
+            const auto generation = GuestMemory::CollectWritesUncached(run.begin, static_cast<std::size_t>(run.bytes));
+            if (generation == 0) return false;
+            for (auto at = run.first; at < run.last; ++at) {
+                const auto& saved = prepared.mirrors[at];
+                const auto* mirror = saved.mirror;
+                std::vector<std::uint8_t> changed(saved.generations.size());
+                if (!GuestMemory::ChangedBlocks(mirror->base, static_cast<std::size_t>(mirror->bytes), saved.generations, changed)) return false;
+                if (std::any_of(changed.begin(), changed.end(), [](auto value) { return value != 0; })) ++prepared.refills;
+                for (std::size_t slot = 0; slot < changed.size(); ++slot) {
+                    if (changed[slot] == 0) continue;
+                    const auto begin = std::max(mirror->base, (mirror->base / blockBytes + slot) * blockBytes);
+                    const auto end = std::min(mirror->base + mirror->bytes, (mirror->base / blockBytes + slot + 1) * blockBytes);
+                    const auto bytes = static_cast<std::size_t>(end - begin);
+                    if (bytes > maxBytes - stagedBytes) return false;
+                    PreparedHeapRefresh::Block block{saved.mirror, begin, generation, std::vector<std::byte>(bytes)};
+                    if (GuestMemory::CopyMapped(begin, block.bytes) != GuestMemory::Compare::Equal) return false;
+                    stagedBytes += bytes;
+                    prepared.blocks.push_back(std::move(block));
+                }
+            }
+            if (GuestMemory::CollectWritesUncached(run.begin, static_cast<std::size_t>(run.bytes)) == 0 ||
+                !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), generation)) return false;
+            prepared.checked.emplace_back(index, generation);
+        }
+        return prepared.forgetSerial == GuestMemory::ForgetSerial() &&
+            prepared.unwatchSerial == GuestMemory::UnwatchSerial() &&
+            prepared.commitGeneration == GuestArena::GuestArenaCommitGeneration_nid_postfix() &&
+            prepared.space->generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    };
+    prepared.ready = stage();
+    HeapRefreshes().stagedBytes.fetch_add(stagedBytes, std::memory_order_relaxed);
+    if (!prepared.ready) {
+        prepared.blocks.clear();
+        prepared.checked.clear();
+    }
+    finish();
+}
+
+DispatchHeapRefreshScope::DispatchHeapRefreshScope(PreparedHeapRefresh* prepared) : previous(std::exchange(dispatchHeapRefresh, prepared)) {}
+
+DispatchHeapRefreshScope::~DispatchHeapRefreshScope() {
+    if (dispatchHeapRefresh != nullptr && !dispatchHeapRefresh->consumed) {
+        dispatchHeapRefresh->consumed = true;
+        HeapRefreshes().fallback.fetch_add(1, std::memory_order_relaxed);
+    }
+    dispatchHeapRefresh = previous;
+}
+
+DispatchHeapRefreshStats DispatchHeapRefreshCounters() {
+    const auto& counters = HeapRefreshes();
+    return {counters.captured.load(std::memory_order_relaxed), counters.unavailable.load(std::memory_order_relaxed),
+        counters.stagedBytes.load(std::memory_order_relaxed), counters.stageUs.load(std::memory_order_relaxed),
+        counters.applied.load(std::memory_order_relaxed), counters.fallback.load(std::memory_order_relaxed)};
 }
 
 void GuestBufferMemory::AcquireRegistered() {

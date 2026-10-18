@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/Dispatch/PreparedHeapRefresh.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
@@ -255,7 +256,7 @@ void RunVramCleanupTests(const AgcDriver::Graphics::Context& device, AgcDriver::
 #endif
 }
 
-void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcDriver::Graphics::Recorder& recorder, bool sparse) {
+void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcDriver::Graphics::Recorder& recorder, bool sparse, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>* gpu) {
 #ifndef _WIN32
     throw std::runtime_error("partially committed resident heap fixture is not implemented on this platform");
 #else
@@ -311,11 +312,32 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         return;
     }
     VkDeviceAddress serving = 0;
-    const auto dispatch = [&](bool written, const std::function<void()>& beforeWriteBack = {}) {
+    const auto prepare = [&] {
+        if (gpu == nullptr) return std::shared_ptr<PreparedHeapRefresh>{};
+        auto prepared = CaptureDispatchHeapRefresh(context, [&](std::uint64_t begin, std::size_t bytes) {
+            return recorder.PendingWriteOverlaps(begin, bytes) || recorder.PendingLabelIn(begin, bytes);
+        });
+        if (prepared != nullptr) {
+            gpu->unlock();
+            try {
+                StageDispatchHeapRefresh(*prepared);
+            } catch (...) {
+                gpu->lock();
+                throw;
+            }
+            gpu->lock();
+        }
+        return prepared;
+    };
+    const auto dispatch = [&](bool written, const std::function<void()>& beforeWriteBack = {}, std::shared_ptr<PreparedHeapRefresh> prepared = {}) {
         Memory::BumpCollectEpoch();
+        if (prepared == nullptr) prepared = prepare();
         auto memory = std::make_shared<GuestBufferMemory>(context);
         memory->SetAddressWrites(written);
-        memory->AcquireRegistered();
+        {
+            const DispatchHeapRefreshScope refresh(prepared.get());
+            memory->AcquireRegistered();
+        }
         if (written) memory->AddWritable(address, 16);
         memory->Upload(true);
         const auto ranges = memory->AddressRanges();
@@ -354,6 +376,71 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         } else recorder.OnComplete([memory] { memory->WriteBack(); });
         return output;
     };
+    if (gpu != nullptr && ResidentHeapMirrors()) Require(prepare() == nullptr, "resident heap mirrors admitted dispatch staging");
+    if (gpu != nullptr && !sparse && !ResidentHeapMirrors()) {
+        const auto enabled = DispatchLockDietEnabled();
+        const auto initial = DispatchHeapRefreshCounters();
+        const auto checkRead = [&](const std::shared_ptr<Buffer>& output, std::uint32_t expected) {
+            recorder.Sync();
+            std::uint32_t actual = 0;
+            std::memcpy(&actual, output->Bytes().data(), sizeof(actual));
+            Require(actual == expected, "staged heap refresh exposed stale bytes to a GPU consumer");
+        };
+        checkRead(dispatch(false), 0x11111111u);
+        auto* const words = static_cast<volatile std::uint32_t*>(raw);
+        const auto capture = [&] {
+            auto prepared = prepare();
+            Require((prepared != nullptr) == enabled, "dispatch heap staging did not follow its exact-value switch");
+            return prepared;
+        };
+        const auto checkFallback = [&](const std::shared_ptr<PreparedHeapRefresh>& prepared, std::uint32_t expected) {
+            const auto before = DispatchHeapRefreshCounters();
+            checkRead(dispatch(false, {}, prepared), expected);
+            Require(DispatchHeapRefreshCounters().fallback == before.fallback + (enabled ? 1 : 0), "a stale dispatch heap plan did not fall back exactly once");
+        };
+        words[0] = 0x10203040u;
+        auto prepared = capture();
+        const auto beforeApply = DispatchHeapRefreshCounters();
+        checkRead(dispatch(false, {}, prepared), words[0]);
+        Require(DispatchHeapRefreshCounters().applied == beforeApply.applied + (enabled ? 1 : 0), "a stable dispatch heap plan did not apply");
+        words[0] = 0x20304050u;
+        prepared = capture();
+        words[0] = 0x30405060u;
+        checkFallback(prepared, words[0]);
+        words[0] = 0x40506070u;
+        prepared = capture();
+        auto second = capture();
+        checkRead(dispatch(false, {}, prepared), words[0]);
+        checkFallback(second, words[0]);
+        prepared = capture();
+        dispatch(true);
+        checkFallback(prepared, values[0]);
+        prepared = capture();
+        const std::uint32_t label = 0x50607080u;
+        static_cast<void>(recorder.Commands());
+        recorder.AfterCompletions(address, std::as_bytes(std::span(&label, 1)), 991, 0, false);
+        checkFallback(prepared, label);
+        prepared = capture();
+        alignas(64) static std::array<std::byte, 64> metadata{};
+        GuestAllocations::Mutation().Add(metadata.data(), metadata.size(), true, true, false);
+        checkFallback(prepared, label);
+        GuestAllocations::Mutation().Remove(metadata.data());
+        checkRead(dispatch(false), label);
+        prepared = capture();
+        ClearHostImports(context.device);
+        checkFallback(prepared, label);
+        prepared = capture();
+        ClearImageMirrors(context.device);
+        checkFallback(prepared, label);
+        prepared.reset();
+        second.reset();
+        const auto after = DispatchHeapRefreshCounters();
+        Require(enabled ? after.stagedBytes > initial.stagedBytes :
+            after.captured == initial.captured && after.unavailable == initial.unavailable && after.stagedBytes == initial.stagedBytes &&
+            after.stageUs == initial.stageUs && after.applied == initial.applied && after.fallback == initial.fallback,
+            "dispatch heap staging counters did not follow the switch");
+        std::memset(raw, 0x11, block);
+    }
     dispatch(true, [&] { static_cast<volatile std::uint8_t*>(raw)[8] = 0x55; });
     const auto* vramValue = std::getenv("APS5_VRAM_MIRRORS");
     const bool vramMirrors = vramValue != nullptr && std::strcmp(vramValue, "1") == 0;
