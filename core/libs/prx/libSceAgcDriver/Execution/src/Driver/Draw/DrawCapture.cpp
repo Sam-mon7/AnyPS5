@@ -104,7 +104,8 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
 }
 
 void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey) {
-    if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && (verifyHit || admitDrawKey(drawKey, registerKey && drawRelocationEnabled() ? shapeKey : 0))) {
+    static const bool cacheCpuIndirect = [] { const char* text = std::getenv("APS5_DRAW_CACHE_CPU_INDIRECT"); return text != nullptr && std::strcmp(text, "1") == 0; }();
+    if (useDrawEntries && !drawHit && (!(drawParameters.indirect && indirectCpu) || cacheCpuIndirect) && (verifyHit || admitDrawKey(drawKey, registerKey && drawRelocationEnabled() ? shapeKey : 0))) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0, differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {
