@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PageTracker.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -31,6 +32,21 @@ class CommandBatch;
 class StorageTexture;
 struct HostImport;
 struct MirrorSource;
+
+struct TextureEpoch {
+    enum class Action { Fallback, Reuse, Partial, Full };
+    struct Update {
+        Action action = Action::Fallback;
+        PageTracker::Epoch token;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    };
+    static bool Enabled();
+    void Capture(PageTracker::Range range);
+    Update Check(PageTracker::Range range) const;
+    static void Count(Action action, std::uint64_t bytes = 0);
+    static std::string ProfileLine();
+    PageTracker::Epoch token;
+};
 
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
 // Throws when the format has no storage form; the query is cached per format (a lookup cost a
@@ -67,6 +83,7 @@ public:
     static bool ImportDetileEnabled();
     static ImportRefusal ImportDetileRefusal(const Context& context, const GuestTextureResource& descriptor, std::uint64_t guestBytes);
     bool DetiledFromImport() const { return detiledFromImport; }
+    bool RefreshEpoch(const GuestTextureResource& descriptor, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
@@ -118,6 +135,8 @@ public:
     void MarkReleased() { released.store(true, std::memory_order_release); }
 
 private:
+    friend class StorageTexture;
+    static std::uint64_t UploadEpoch(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, const SurfaceGeometry& geometry, VkImage image, VkImageLayout layout, VkImageAspectFlags aspect, std::shared_ptr<void> lifetime, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::byte> snapshot = {});
     void release() noexcept;
     void createFirstLayerView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
     void prepareBaseLevelView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
@@ -351,6 +370,7 @@ public:
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
 private:
+    friend class Texture;
     StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
     // The regions of every array layer, or of the tracked layers `layers` selects.
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
@@ -392,6 +412,7 @@ private:
     // The windows moving the surface-relative runs: whole tile blocks of thin tiled mips, a tail
     // mip whole (its block holds every tail level), in slice order.
     std::vector<SliceWindow> sliceWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const;
+    static std::vector<SliceWindow> sliceWindows(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
     // The bytes of the surface-relative runs no element of the surface holds (the padding of partly
     // covered tile blocks and of linear rows, tail blocks, the bytes between mips; every byte of a
     // thick surface), ascending: a write-back keeps the guest's bytes there.
@@ -503,6 +524,7 @@ private:
     std::uint64_t guestBytes = 0;
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
+    TextureEpoch epoch;
     std::vector<std::byte> original;
     mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
     std::vector<std::byte> generationBaseline;

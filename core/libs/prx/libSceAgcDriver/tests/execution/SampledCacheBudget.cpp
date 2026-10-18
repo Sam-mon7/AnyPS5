@@ -14,6 +14,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "SampleLod_spv.h"
+#include "SampleArray_spv.h"
 #include "VulkanTestDevice.hpp"
 #include <SDL_loadso.h>
 #ifdef _WIN32
@@ -1504,12 +1505,207 @@ void dedupeKeyTests() {
     Require(once == twice, "canonicalizing a descriptor twice changed it again");
 }
 
+
+std::uint64_t epochReadBytes() {
+    std::uint64_t bytes = 0;
+    for (const auto& site : AgcDriver::PageTracker::Get()->Counts().reads) for (const auto& kind : site) bytes += kind.total;
+    return bytes;
+}
+
+std::uint64_t epochCount(const char* name) {
+    const auto line = TextureEpoch::ProfileLine();
+    const auto start = line.find(std::string(name) + "=");
+    Require(start != std::string::npos, "epoch texture counter is missing");
+    return std::stoull(line.substr(start + std::strlen(name) + 1));
+}
+
+void epochMetadataTests() {
+    using namespace AgcDriver::PageTracker;
+    const auto exact = [](const char* name) { const auto* value = std::getenv(name); return value != nullptr && std::strcmp(value, "1") == 0; };
+    Require(TextureEpoch::Enabled() == (exact("APS5_EPOCH_TEXTURES") && exact("APS5_PAGE_TRACKER")), "epoch texture switch requires exact opt-in to both switches");
+    const Range range{0x300000000ull, 4 * RegionBytes};
+    auto* tracker = Get();
+    if (tracker != nullptr) tracker->RegisterRange(range, Kind::Section, Bit(Reason::ProtectedSection));
+    TextureEpoch proof;
+    proof.Capture(range);
+    if (!TextureEpoch::Enabled()) {
+        Require(!proof.token.covered && proof.Check(range).action == TextureEpoch::Action::Fallback, "disabled texture epochs produced a proof");
+        const auto before = TextureEpoch::ProfileLine();
+        TextureEpoch::Count(TextureEpoch::Action::Full, 123);
+        Require(before == TextureEpoch::ProfileLine(), "disabled texture epochs changed counters");
+        return;
+    }
+    Require(proof.Check(range).action == TextureEpoch::Action::Reuse, "unchanged texture did not reuse its epoch");
+    tracker->MarkCpuWritten({range.address + RegionBytes + PageBytes, 1}, Source::DriverStore);
+    auto update = proof.Check(range);
+    Require(update.action == TextureEpoch::Action::Partial && update.runs == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{RegionBytes, 2 * RegionBytes}}, "CPU write did not select its conservative dirty region");
+    tracker->MarkCpuWritten({range.address + 2 * RegionBytes, 1}, Source::DriverStore);
+    Require(proof.Check(range).action == TextureEpoch::Action::Partial, "half-dirty texture did not allow a partial upload");
+    tracker->MarkCpuWritten({range.address, 1}, Source::DriverStore);
+    Require(proof.Check(range).action == TextureEpoch::Action::Full, "majority-dirty texture did not require a full upload");
+    proof.Capture(range);
+    tracker->MarkGpuWritten({range.address, PageBytes}, Source::GpuDeclaration);
+    Require(proof.Check(range).action == TextureEpoch::Action::Fallback, "GPU-pending texture reused a proof");
+    tracker->RegisterRange(range, Kind::Section, Bit(Reason::ProtectedSection));
+    proof.Capture(range);
+    tracker->InvalidateRange({range.address, PageBytes}, true);
+    Require(proof.Check(range).action == TextureEpoch::Action::Fallback, "unknown texture coverage reused a proof");
+    tracker->RegisterRange(range, Kind::Section, Bit(Reason::ProtectedSection));
+    Require(proof.Check(range).action == TextureEpoch::Action::Full, "remapping resurrected a texture proof");
+    proof.Capture(range);
+    tracker->MarkCpuWritten({range.address, PageBytes}, Source::SectionFault);
+    Require(proof.Check(range).action == TextureEpoch::Action::Fallback, "an open CPU writer reused a texture proof");
+}
+
+#ifdef _WIN32
+class EpochTextureMemory {
+public:
+    static constexpr std::size_t Bytes = 4 * AgcDriver::PageTracker::RegionBytes;
+    EpochTextureMemory() {
+        allocation = VirtualAlloc(nullptr, Bytes + AgcDriver::PageTracker::RegionBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        Require(allocation != nullptr, "cannot allocate epoch texture fixture");
+        const auto aligned = (reinterpret_cast<std::uintptr_t>(allocation) + AgcDriver::PageTracker::RegionBytes - 1) & ~(AgcDriver::PageTracker::RegionBytes - 1);
+        memory = reinterpret_cast<std::byte*>(aligned);
+        std::memset(memory, 64, Bytes);
+        if (auto* tracker = AgcDriver::PageTracker::Get()) tracker->RegisterRange(Range(), AgcDriver::PageTracker::Kind::Section, AgcDriver::PageTracker::Bit(AgcDriver::PageTracker::Reason::ProtectedSection));
+    }
+    ~EpochTextureMemory() {
+        if (auto* tracker = AgcDriver::PageTracker::Get()) tracker->InvalidateRange(Range(), true);
+        VirtualFree(allocation, 0, MEM_RELEASE);
+    }
+    AgcDriver::PageTracker::Range Range() const { return {reinterpret_cast<std::uintptr_t>(memory), Bytes}; }
+    void Protect(std::size_t offset, std::size_t bytes, DWORD protection) {
+        DWORD previous = 0;
+        Require(VirtualProtect(memory + offset, bytes, protection, &previous), "cannot protect epoch texture fixture");
+    }
+    void Write(std::size_t offset, std::size_t bytes, int value) {
+        std::memset(memory + offset, value, bytes);
+        if (auto* tracker = AgcDriver::PageTracker::Get()) tracker->MarkCpuWritten({Range().address + offset, bytes}, AgcDriver::PageTracker::Source::DriverStore);
+    }
+private:
+    void* allocation = nullptr;
+    std::byte* memory = nullptr;
+};
+
+void epochTextureTests(const Context& context) {
+    using namespace AgcDriver::PageTracker;
+    const bool enabled = TextureEpoch::Enabled();
+    const auto countersBefore = TextureEpoch::ProfileLine();
+    EpochTextureMemory memory;
+    auto words = RgbaWords(memory.Range().address, 1024);
+    words[3] = (words[3] & 0x0fffffffu) | (13u << 28u);
+    words[4] = 3;
+    const auto descriptor = DecodeTextureResource(words);
+    Require(DescribeSurface(descriptor).guestBytes == EpochTextureMemory::Bytes, "epoch texture fixture geometry changed");
+    ClearCachedTextures(context.device);
+    Recorder recorder(context);
+    MirrorSampleProgram sampler(context, recorder, SAMPLE_ARRAY_SPV);
+    auto texture = CachedSampledTexture(context, words);
+    Require(!texture->ViewsStorageImage(), "epoch sampled fixture unexpectedly became a storage view");
+    expectRed(sampler.Red(texture->View(), texture->Layout(), 0, 0), 64.f / 255, "initial epoch sampled pixel");
+    if (enabled) {
+        Require(TextureCacheUsage().snapshotBytes == 0 && TextureCacheUsage().omittedSnapshotBytes >= EpochTextureMemory::Bytes, "covered sampled texture retained its snapshot");
+        const auto counts = epochReadBytes();
+        memory.Protect(0, EpochTextureMemory::Bytes, PAGE_NOACCESS);
+        Require(CachedSampledTexture(context, words) == texture, "unchanged no-access texture did not reuse its image");
+        Require(epochReadBytes() == counts, "epoch sampled reuse issued a guest read");
+        MEMORY_BASIC_INFORMATION state{};
+        VirtualQuery(reinterpret_cast<void*>(memory.Range().address), &state, sizeof(state));
+        Require(state.Protect == PAGE_NOACCESS, "epoch sampled reuse changed guest protection");
+        memory.Protect(0, EpochTextureMemory::Bytes, PAGE_READWRITE);
+    } else Require(CachedSampledTexture(context, words) == texture, "disabled epoch textures changed normal cache reuse");
+    memory.Write(0, RegionBytes, 192);
+    const auto partials = epochCount("partial");
+    const auto uploaded = epochCount("bytes-uploaded");
+    if (enabled) memory.Protect(RegionBytes, EpochTextureMemory::Bytes - RegionBytes, PAGE_NOACCESS);
+    const auto changed = CachedSampledTexture(context, words);
+    if (enabled) {
+        Require(changed == texture && epochCount("partial") == partials + 1 && epochCount("bytes-uploaded") == uploaded + RegionBytes, "sampled CPU write did not upload just its dirty region");
+        memory.Protect(RegionBytes, EpochTextureMemory::Bytes - RegionBytes, PAGE_READWRITE);
+    } else Require(changed != texture, "disabled epoch textures changed snapshot rebuilds");
+    texture = changed;
+    if (enabled) {
+        memory.Protect(0, EpochTextureMemory::Bytes, PAGE_NOACCESS);
+        Require(CachedSampledTexture(context, words) == texture, "partial sampled refresh did not advance its epoch");
+        memory.Protect(0, EpochTextureMemory::Bytes, PAGE_READWRITE);
+    }
+    expectRed(sampler.Red(texture->View(), texture->Layout(), 0, 0), 192.f / 255, "partially uploaded sampled pixel");
+    expectRed(sampler.Red(texture->View(), texture->Layout(), 0, 1), 64.f / 255, "unchanged sampled pixel");
+    if (auto* tracker = Get()) tracker->MarkGpuWritten({memory.Range().address, PageBytes}, Source::GpuDeclaration);
+    memory.Write(0, RegionBytes, 128);
+    const auto fallbacks = epochCount("fallbacks");
+    const auto afterGpu = CachedSampledTexture(context, words);
+    Require(afterGpu != texture, "GPU-invalidated sampled texture retained its stale image");
+    if (enabled) Require(epochCount("fallbacks") > fallbacks, "GPU-pending sampled texture did not count a fallback");
+    expectRed(sampler.Red(afterGpu->View(), afterGpu->Layout(), 0, 0), 128.f / 255, "GPU-invalidated sampled pixel");
+    if (auto* tracker = Get()) tracker->InvalidateRange(memory.Range());
+    memory.Write(RegionBytes, RegionBytes, 160);
+    const auto unknown = CachedSampledTexture(context, words);
+    Require(unknown != afterGpu, "unknown sampled texture did not use the legacy comparison");
+    expectRed(sampler.Red(unknown->View(), unknown->Layout(), 0, 1), 160.f / 255, "unknown coverage sampled pixel");
+    ClearCachedTextures(context.device);
+    if (auto* tracker = Get()) tracker->RegisterRange(memory.Range(), Kind::Section, Bit(Reason::ProtectedSection));
+    auto storage = StorageTexture::Create(context, *context.detiler, descriptor, 0);
+    if (enabled) {
+        const auto counts = epochReadBytes();
+        memory.Protect(0, EpochTextureMemory::Bytes, PAGE_NOACCESS);
+        Require(storage->Refresh(), "unchanged no-access storage texture was uploaded");
+        Require(epochReadBytes() == counts, "epoch storage reuse issued a guest read");
+        memory.Protect(0, EpochTextureMemory::Bytes, PAGE_READWRITE);
+    } else Require(storage->Refresh(), "disabled epoch textures changed storage reuse");
+    memory.Write(2 * RegionBytes, RegionBytes, 224);
+    const auto storagePartials = epochCount("partial");
+    if (enabled) {
+        memory.Protect(0, 2 * RegionBytes, PAGE_NOACCESS);
+        memory.Protect(3 * RegionBytes, RegionBytes, PAGE_NOACCESS);
+    }
+    Require(!storage->Refresh(), "storage CPU write was not uploaded");
+    if (enabled) {
+        Require(epochCount("partial") == storagePartials + 1, "storage CPU write did not use a partial upload");
+        memory.Protect(0, EpochTextureMemory::Bytes, PAGE_READWRITE);
+    }
+    expectRed(sampler.Red(storage->View(), VK_IMAGE_LAYOUT_GENERAL, 0, 2), 224.f / 255, "partially uploaded storage pixel");
+    expectRed(sampler.Red(storage->View(), VK_IMAGE_LAYOUT_GENERAL, 0, 1), 160.f / 255, "unchanged storage pixel");
+    if (enabled) {
+        memory.Protect(0, EpochTextureMemory::Bytes, PAGE_NOACCESS);
+        Require(storage->Refresh(), "partial storage refresh did not advance its epoch");
+        memory.Protect(0, EpochTextureMemory::Bytes, PAGE_READWRITE);
+    }
+    {
+        CommandBatch batch(context);
+        const auto commands = batch.Handle();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkClearColorValue clear{};
+        for (auto& channel : clear.float32) channel = 0.5f;
+        const VkImageSubresourceRange subresources{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 4};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &subresources);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        batch.SubmitAndWait();
+    }
+    storage->MarkDirty();
+    if (auto* tracker = Get()) tracker->MarkGpuWritten(memory.Range(), Source::GpuDeclaration);
+    const auto gpuFallbacks = epochCount("fallbacks");
+    Require(storage->Refresh(), "GPU-written storage image lost its pending results");
+    if (enabled) Require(epochCount("fallbacks") > gpuFallbacks, "GPU-written storage image reused an epoch proof");
+    expectRed(sampler.Red(storage->View(), VK_IMAGE_LAYOUT_GENERAL, 0, 0), 0.5f, "GPU-written storage pixel");
+    recorder.Sync();
+    ClearCachedTextures(context.device);
+    if (!enabled) Require(TextureEpoch::ProfileLine() == countersBefore, "disabled epoch textures changed profiling output");
+}
+#endif
+
 }
 
 int main(int argc, char** argv) {
     try {
         const bool memory = argc > 1 && std::string(argv[1]) == "memory";
         const std::string mode = argc > 1 ? argv[1] : "";
+        const bool epochTextures = mode == "epoch-textures";
+        if (mode == "epoch-metadata") {
+            epochMetadataTests();
+            std::puts("epoch texture metadata tests passed");
+            return 0;
+        }
         const bool resources = mode == "resource-admission" || mode == "resource-oversized" || mode == "resource-clear";
         const bool mirrors = mode == "mirror-storage" || mode == "mirror-snapshot" || mode == "mirror-readonly";
         const bool importDetile = mode == "import-detile";
@@ -1524,9 +1720,9 @@ int main(int argc, char** argv) {
             return 0;
         }
 #ifdef _WIN32
-        if (!memory) _putenv_s("APS5_TEXTURE_CACHE_MIB", "1");
+        if (!memory && !epochTextures) _putenv_s("APS5_TEXTURE_CACHE_MIB", "1");
 #else
-        if (!memory) setenv("APS5_TEXTURE_CACHE_MIB", "1", 1);
+        if (!memory && !epochTextures) setenv("APS5_TEXTURE_CACHE_MIB", "1", 1);
 #endif
         std::unique_ptr<Device> device;
         try {
@@ -1539,6 +1735,16 @@ int main(int argc, char** argv) {
         auto context = device->GetContext();
         TextureDetiler detiler(context);
         context.detiler = &detiler;
+        if (epochTextures) {
+#ifdef _WIN32
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            epochTextureTests(context);
+            std::puts("epoch texture upload tests passed");
+            return 0;
+#else
+            return VulkanTestSkipped;
+#endif
+        }
         if (mirrors) {
 #ifdef _WIN32
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());

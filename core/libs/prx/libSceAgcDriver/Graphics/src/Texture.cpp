@@ -40,6 +40,97 @@
 namespace AgcDriver::Graphics {
 
 namespace {
+struct EpochTextureCounts {
+    std::atomic<std::uint64_t> reuse{0}, partial{0}, full{0}, bytes{0}, fallback{0};
+    std::mutex reportMutex;
+    std::chrono::steady_clock::time_point reported{};
+};
+EpochTextureCounts& EpochCounts() {
+    static EpochTextureCounts counts;
+    return counts;
+}
+bool EpochUploadSupported(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry) {
+    return descriptor.dccAddress == 0 && descriptor.baseAddress % 65536 == 0 && descriptor.tileMode != TextureTileMode::kLinear && !geometry.thick && !IsBlockCompressed(descriptor.format);
+}
+bool EpochRangeAvailable(const Context& context, const GuestTextureResource& descriptor, std::uint64_t bytes) {
+    const std::pair<std::uint64_t, std::uint64_t> range{descriptor.baseAddress, descriptor.baseAddress + bytes};
+    return descriptor.dccAddress == 0 && !MirrorSourceCovers(context, descriptor.baseAddress, static_cast<std::size_t>(bytes)) &&
+        !AnyShadowedOverlaps(descriptor.baseAddress, static_cast<std::size_t>(bytes)) &&
+        !Recorder::SnapshotWriteOverlaps(descriptor.baseAddress, static_cast<std::size_t>(bytes)) && !StorageTexture::AnyPendingOverlaps(std::span(&range, 1));
+}
+}
+
+bool TextureEpoch::Enabled() {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_EPOCH_TEXTURES"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    return enabled && PageTracker::Enabled();
+}
+
+void TextureEpoch::Capture(PageTracker::Range range) {
+    token = {};
+    if (Enabled()) if (const auto* tracker = PageTracker::Get()) token = tracker->CaptureEpoch(range);
+}
+
+TextureEpoch::Update TextureEpoch::Check(PageTracker::Range range) const {
+    Update result;
+    if (!Enabled()) return result;
+    const auto* tracker = PageTracker::Get();
+    if (tracker == nullptr) return result;
+    if (!tracker->DirtySince(range, token)) {
+        result.action = Action::Reuse;
+        return result;
+    }
+    result.token = tracker->CaptureEpoch(range);
+    if (!result.token.covered) return result;
+    result.action = Action::Full;
+    if (!token.covered || token.range != range || token.regions.size() != result.token.regions.size()) return result;
+    std::uint64_t changed = 0;
+    for (std::size_t i = 0; i < token.regions.size(); ++i) {
+        const auto& before = token.regions[i];
+        const auto& after = result.token.regions[i];
+        if (before.regionId != after.regionId || before.mapEpoch != after.mapEpoch || before.gpuEpoch != after.gpuEpoch) {
+            result.runs.clear();
+            return result;
+        }
+        if (before.cpuEpoch == after.cpuEpoch) continue;
+        const auto first = std::max(range.address, after.regionId * PageTracker::RegionBytes);
+        const auto begin = first - range.address;
+        const auto end = begin + std::min(PageTracker::RegionBytes - first % PageTracker::RegionBytes, range.bytes - begin);
+        changed += end - begin;
+        if (!result.runs.empty() && result.runs.back().second == begin) result.runs.back().second = end;
+        else result.runs.emplace_back(begin, end);
+    }
+    if (changed != 0 && changed <= range.bytes / 2) result.action = Action::Partial;
+    return result;
+}
+
+std::string TextureEpoch::ProfileLine() {
+    const auto& counts = EpochCounts();
+    return "[epoch-textures] cumulative: reuse-proof=" + std::to_string(counts.reuse.load(std::memory_order_relaxed)) +
+        " partial=" + std::to_string(counts.partial.load(std::memory_order_relaxed)) +
+        " full=" + std::to_string(counts.full.load(std::memory_order_relaxed)) +
+        " bytes-uploaded=" + std::to_string(counts.bytes.load(std::memory_order_relaxed)) +
+        " fallbacks=" + std::to_string(counts.fallback.load(std::memory_order_relaxed));
+}
+
+void TextureEpoch::Count(Action action, std::uint64_t bytes) {
+    if (!Enabled()) return;
+    auto& counts = EpochCounts();
+    switch (action) {
+        case Action::Reuse: counts.reuse.fetch_add(1, std::memory_order_relaxed); break;
+        case Action::Partial: counts.partial.fetch_add(1, std::memory_order_relaxed); break;
+        case Action::Full: counts.full.fetch_add(1, std::memory_order_relaxed); break;
+        case Action::Fallback: counts.fallback.fetch_add(1, std::memory_order_relaxed); break;
+    }
+    counts.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now();
+    std::unique_lock lock(counts.reportMutex, std::try_to_lock);
+    if (lock && now - counts.reported >= std::chrono::seconds(10)) {
+        counts.reported = now;
+        AgcDriver::ProfilePrint_nid_no_patch("%s\n", ProfileLine().c_str());
+    }
+}
+
+namespace {
 
 struct TextureUploadTrace {
     std::shared_ptr<GpuAddressBindings> bindings;
@@ -1691,6 +1782,52 @@ bool StorageTexture::Refresh() {
     if (VramTextures()) gpu.lock();
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (TextureEpoch::Enabled()) {
+        const PageTracker::Range range{descriptor.baseAddress, guestBytes};
+        const bool available = EpochRangeAvailable(context, descriptor, guestBytes);
+        const auto update = available ? epoch.Check(range) : TextureEpoch::Update{};
+        if (update.action == TextureEpoch::Action::Reuse) {
+            NoteProved();
+            TextureEpoch::Count(TextureEpoch::Action::Reuse);
+            if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
+            return true;
+        }
+        if (update.action == TextureEpoch::Action::Partial && blockUnits && EpochUploadSupported(descriptor, geometry)) {
+            for (const auto& [begin, end] : update.runs) {
+                const auto now = GuestMemory::CollectWritesUncached(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
+                for (auto unit = begin / trackedLayerBytes; unit < trackedLayers && unit * trackedLayerBytes < end; ++unit) layerGeneration[unit] = now;
+            }
+            auto nextToken = update.token;
+            const auto collected = PageTracker::Get()->CaptureEpoch(range);
+            nextToken.covered = collected.covered;
+            for (std::size_t i = 0; i < nextToken.regions.size(); ++i) {
+                const auto first = std::max(range.address, nextToken.regions[i].regionId * PageTracker::RegionBytes) - range.address;
+                for (const auto& [begin, end] : update.runs) if (begin <= first && first < end) nextToken.regions[i] = collected.regions[i];
+            }
+            std::span<const std::byte> snapshot;
+            if (original.size() == guestBytes) {
+                const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
+                for (const auto& [begin, end] : update.runs) GuestMemory::ReadCommitted(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
+                snapshot = original;
+            }
+            const auto bytes = Texture::UploadEpoch(context, detiler, descriptor, geometry, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, shared_from_this(), update.runs, snapshot);
+            epoch.token = std::move(nextToken);
+            generationBaseline.clear();
+            refreshGeneration();
+            refreshProof = {};
+            forgetBorrowed(0, trackedLayers);
+            ++version;
+            NoteProved();
+            TextureEpoch::Count(TextureEpoch::Action::Partial, bytes);
+            return false;
+        }
+        if (update.action == TextureEpoch::Action::Full || update.action == TextureEpoch::Action::Partial) {
+            upload();
+            NoteProved();
+            return false;
+        }
+        TextureEpoch::Count(TextureEpoch::Action::Fallback);
+    }
     if (MirrorSourceCovers(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && ProvedKeys() == DccKeys::Uncompressed) {
         if (anyLayerPending() && !otherPendingOverlaps() && MirrorSourceUnchanged(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), mirrorProof, generation)) {
             NoteProved();
@@ -2143,6 +2280,12 @@ void StorageTexture::upload(const std::vector<bool>* layers, const MirrorSource*
     if (source == nullptr) CompletePendingTextureWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     else layers = nullptr;
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
+    TextureEpoch nextEpoch;
+    const auto finishEpoch = [&](std::uint64_t bytes) {
+        if (!TextureEpoch::Enabled()) return;
+        epoch = std::move(nextEpoch);
+        TextureEpoch::Count(bytes != 0 && bytes < guestBytes ? TextureEpoch::Action::Partial : TextureEpoch::Action::Full, bytes);
+    };
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
@@ -2150,6 +2293,7 @@ void StorageTexture::upload(const std::vector<bool>* layers, const MirrorSource*
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (TextureEpoch::Enabled() && EpochRangeAvailable(context, descriptor, guestBytes)) nextEpoch.Capture({descriptor.baseAddress, guestBytes});
     const auto stampLayers = [&](bool selectedOnly) {
         const bool whole = !selectedOnly || layers == nullptr;
         if (source != nullptr || guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
@@ -2220,6 +2364,7 @@ void StorageTexture::upload(const std::vector<bool>* layers, const MirrorSource*
         else recorder->EndGpuTiming(timing, guestBytes);
         countStorageUpload(0, guestBytes);
         ++version;
+        finishEpoch(0);
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
         return;
     }
@@ -2255,6 +2400,7 @@ void StorageTexture::upload(const std::vector<bool>* layers, const MirrorSource*
             }
             ++Profile().storageDirectUploads;
             ++version;
+            finishEpoch(uploadedBytes);
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
             return;
         }
@@ -2314,6 +2460,7 @@ void StorageTexture::upload(const std::vector<bool>* layers, const MirrorSource*
             countStorageUpload(1, uploadedBytes);
             ++Profile().storageDirectUploads;
             ++version;
+            finishEpoch(uploadedBytes);
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
             return;
         }
@@ -2351,6 +2498,7 @@ void StorageTexture::upload(const std::vector<bool>* layers, const MirrorSource*
         countStorageUpload(1, uploadedBytes);
         ++Profile().storageDirectUploads;
         ++version;
+        finishEpoch(uploadedBytes);
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
         return;
     }
@@ -2370,6 +2518,7 @@ void StorageTexture::upload(const std::vector<bool>* layers, const MirrorSource*
         partialUploads.fetch_add(1, std::memory_order_relaxed);
         partialUploadBytes.fetch_add(bytes, std::memory_order_relaxed);
         ++version;
+        finishEpoch(bytes);
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadCpu, start);
         return;
     }
@@ -2421,6 +2570,7 @@ void StorageTexture::upload(const std::vector<bool>* layers, const MirrorSource*
     }
     countStorageUpload(2, guestBytes);
     ++version;
+    finishEpoch(guestBytes);
     if (profile) LookupOutcomes::Add(LookupOutcomes::UploadCpu, start);
 }
 
@@ -2437,6 +2587,12 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::unitRuns(co
 }
 
 std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const {
+    return sliceWindows(descriptor, geometry, runs);
+}
+
+std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) {
+    const auto& mips = geometry.mips;
+    const auto arrayLayers = geometry.layers;
     std::vector<SliceWindow> windows;
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto block = ThinBlockLayout(descriptor.tileMode, elementBytes);
@@ -2515,6 +2671,106 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<
         }
     }
     return windows;
+}
+
+bool Texture::RefreshEpoch(const GuestTextureResource& descriptor, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) {
+    if (!TextureEpoch::Enabled() || owned == nullptr || context.detiler == nullptr || depthFormat != VK_FORMAT_UNDEFINED) return false;
+    const auto geometry = DescribeSurface(descriptor);
+    if (!EpochUploadSupported(descriptor, geometry)) return false;
+    const auto aspect = viewFormat == VK_FORMAT_D32_SFLOAT || viewFormat == VK_FORMAT_D16_UNORM ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    const auto uploaded = UploadEpoch(context, *context.detiler, descriptor, geometry, image, layout, aspect, owned, runs);
+    TextureEpoch::Count(TextureEpoch::Action::Partial, uploaded);
+    return true;
+}
+
+std::uint64_t Texture::UploadEpoch(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, const SurfaceGeometry& geometry, VkImage image, VkImageLayout layout, VkImageAspectFlags aspect, std::shared_ptr<void> lifetime, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::byte> snapshot) {
+    const auto windows = StorageTexture::sliceWindows(descriptor, geometry, runs);
+    if (windows.empty()) return 0;
+    std::vector<std::uint64_t> tiledPositions, linearPositions;
+    std::uint64_t tiledBytes = 0, linearBytes = 0;
+    for (const auto& window : windows) {
+        tiledPositions.push_back(tiledBytes);
+        linearPositions.push_back(linearBytes);
+        tiledBytes += (window.tiledEnd - window.tiledBegin + 255) & ~std::uint64_t{255};
+        linearBytes += (window.linearBytes + 255) & ~std::uint64_t{255};
+    }
+    auto* recorder = Recorder::Active();
+    const auto* import = ImportToDetile(context, descriptor, geometry.guestBytes, recorder);
+    const bool scratch = BufferPool::ScratchEnabled();
+    auto staging = import != nullptr ? nullptr : std::make_shared<Buffer>(context, static_cast<std::size_t>(tiledBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, scratch ? Buffer::Access::Scratch : Buffer::Access::UploadOnly);
+    auto tiled = import != nullptr ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(tiledBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, scratch);
+    auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, scratch);
+    if (staging != nullptr) {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
+        for (std::size_t i = 0; i < windows.size(); ++i) {
+            const auto& window = windows[i];
+            const auto target = staging->WriteBytes().subspan(static_cast<std::size_t>(tiledPositions[i]), static_cast<std::size_t>(window.tiledEnd - window.tiledBegin));
+            if (snapshot.empty()) GuestMemory::ReadCommitted(descriptor.baseAddress + window.tiledBegin, target);
+            else std::memcpy(target.data(), snapshot.data() + window.tiledBegin, target.size());
+        }
+    }
+    detiler.BeginBatch();
+    std::unique_ptr<CommandBatch> batch;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (recorder != nullptr) {
+        commands = recorder->Commands();
+        recorder->Keep(std::move(lifetime));
+        recorder->Keep(linear, linear->Size());
+        if (staging != nullptr) recorder->Keep(staging, staging->Size());
+        if (tiled != nullptr) recorder->Keep(tiled, tiled->Size());
+        if (import != nullptr) for (const auto& window : windows) recorder->NotePendingRead(descriptor.baseAddress + window.tiledBegin, static_cast<std::size_t>(window.tiledEnd - window.tiledBegin), Recorder::ReadKind::StorageUpload);
+    } else {
+        batch = std::make_unique<CommandBatch>(context);
+        commands = batch->Handle();
+    }
+    if (staging != nullptr) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, tiledBytes);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    } else {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    }
+    std::uint64_t uploaded = 0;
+    std::vector<VkBufferImageCopy> regions;
+    for (std::size_t i = 0; i < windows.size(); ++i) {
+        const auto& window = windows[i];
+        const auto& mip = geometry.mips[window.level];
+        auto detile = window.window;
+        detile.pipeBankXor = descriptor.pipeBankXor;
+        auto source = tiled != nullptr ? tiled->Handle() : import->buffer;
+        auto offset = tiledPositions[i];
+        if (import != nullptr) {
+            detile.tiledBase = 0;
+            offset = descriptor.baseAddress - import->base + geometry.GuestLayerOffset(window.layer) + mip.tiledOffset;
+        }
+        detiler.Dispatch(commands, descriptor.tileMode, BytesPerElement(descriptor.format), source, offset, linear->Handle(), linearPositions[i], mip, false, window.layer, false, detile);
+        for (auto region : window.regions) {
+            region.bufferOffset += linearPositions[i];
+            region.imageSubresource.aspectMask = aspect;
+            regions.push_back(region);
+            uploaded += static_cast<std::uint64_t>(region.imageExtent.width) * region.imageExtent.height * BytesPerElement(descriptor.format);
+        }
+    }
+    const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toTransfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toTransfer.oldLayout = layout;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = image;
+    toTransfer.subresourceRange = {aspect, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
+    CopyBufferToImage(context, commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    auto done = toTransfer;
+    done.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    done.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    done.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    done.newLayout = layout;
+    context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &done);
+    if (batch != nullptr) batch->SubmitAndWait();
+    return uploaded;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::uncoveredBytes(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const {
