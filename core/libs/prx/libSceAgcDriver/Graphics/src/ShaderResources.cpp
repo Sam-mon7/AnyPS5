@@ -129,6 +129,7 @@ struct CachedTexture {
     std::chrono::steady_clock::time_point used{};
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     MirrorSourceProof mirrorProof;
+    TextureEpoch epoch;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -848,7 +849,9 @@ bool useImportDetile(const Context& context, TextureCache& cache, const GuestTex
         return false;
     };
     if (keys != DccKeys::Uncompressed || resource.dccAddress != 0) return refuse(ImportFallback::Dcc);
-    if (generation == 0 || partial) return refuse(ImportFallback::Unstamped);
+    TextureEpoch epoch;
+    if (TextureEpoch::Enabled()) epoch.Capture({resource.baseAddress, guestBytes});
+    if (!epoch.token.covered && (generation == 0 || partial)) return refuse(ImportFallback::Unstamped);
     switch (Texture::ImportDetileRefusal(context, resource, guestBytes)) {
         case Texture::ImportRefusal::TooSmall: return refuse(ImportFallback::TooSmall);
         case Texture::ImportRefusal::NotImported: return refuse(ImportFallback::NotImported);
@@ -897,6 +900,31 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
+    if (TextureEpoch::Enabled() && !disabled && resource.dccAddress == 0) {
+        const std::pair<std::uint64_t, std::uint64_t> range{address, address + guestBytes};
+        if (!MirrorSourceCovers(context, address, bytes) && !AnyShadowedOverlaps(address, bytes) && !Recorder::SnapshotWriteOverlaps(address, bytes) && !StorageTexture::AnyPendingOverlaps(std::span(&range, 1))) {
+            auto& cache = Textures();
+            std::lock_guard lock(cache.mutex);
+            const auto key = MakeTextureKey(context.device, words, components, depthCompare);
+            if (auto it = findTexture(cache, key); it != cache.entries.end() && it->source == nullptr && it->surfaceBytes == guestBytes && it->mirrorProof.identity == 0 && it->keys == DccKeys::Uncompressed) {
+                const auto update = it->epoch.Check({address, guestBytes});
+                const bool partial = update.action == TextureEpoch::Action::Partial && it->texture->RefreshEpoch(resource, update.runs);
+                if (update.action == TextureEpoch::Action::Reuse || partial) {
+                    if (partial) {
+                        it->epoch.token = update.token;
+                        cache.snapshotBytes -= it->bytes.capacity();
+                        if (!it->bytes.empty()) cache.omittedSnapshotBytes += it->surfaceBytes;
+                        spareSnapshot(cache, std::exchange(it->bytes, {}));
+                    } else TextureEpoch::Count(TextureEpoch::Action::Reuse);
+                    touchTexture(cache, it);
+                    logLookup({it->texture.get(), resource, guestBytes, DccKeys::Uncompressed, it->generation, nullptr});
+                    reportTextureCounters();
+                    if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
+                    return it->texture;
+                }
+            }
+        }
+    }
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
@@ -1032,7 +1060,29 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (it->bytes.empty() && snapshotGeneration == 0) return false;
                 return committed.has_value() ? !Recorder::SnapshotWriteOverlaps(address, it->surfaceBytes) && GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->surfaceBytes, it->generation);
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || equalsCommitted()) {
+            bool epochReused = false;
+            bool epochDirty = false;
+            if (TextureEpoch::Enabled()) {
+                const std::pair<std::uint64_t, std::uint64_t> range{address, address + guestBytes};
+                const bool available = resource.dccAddress == 0 && !mirror && it->mirrorProof.identity == 0 && !AnyShadowedOverlaps(address, bytes) &&
+                    !Recorder::SnapshotWriteOverlaps(address, bytes) && !StorageTexture::AnyPendingOverlaps(std::span(&range, 1));
+                const auto update = available ? it->epoch.Check({address, guestBytes}) : TextureEpoch::Update{};
+                if (update.action == TextureEpoch::Action::Reuse) {
+                    epochReused = true;
+                    TextureEpoch::Count(TextureEpoch::Action::Reuse);
+                } else if (update.action == TextureEpoch::Action::Partial && it->texture->RefreshEpoch(resource, update.runs)) {
+                    it->epoch.token = update.token;
+                    cache.snapshotBytes -= it->bytes.capacity();
+                    if (!it->bytes.empty()) cache.omittedSnapshotBytes += it->surfaceBytes;
+                    spareSnapshot(cache, std::exchange(it->bytes, {}));
+                    epochReused = true;
+                } else if (update.action != TextureEpoch::Action::Fallback) {
+                    epochDirty = true;
+                } else {
+                    TextureEpoch::Count(TextureEpoch::Action::Fallback);
+                }
+            }
+            if (epochReused || (!epochDirty && ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || equalsCommitted()))) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 touchTexture(cache, it);
@@ -1049,6 +1099,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const bool importDetile = source == nullptr && !mirror && useImportDetile(context, cache, resource, *keys, guestBytes, snapshotGeneration, committed.has_value());
     CachedTexture entry{key, address, bytes, source != nullptr || mirror || importDetile ? std::vector<std::byte>() : takeSnapshot(cache, bytes), nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
+    if (TextureEpoch::Enabled() && source == nullptr && !mirror && resource.dccAddress == 0 && !AnyShadowedOverlaps(address, bytes) && !Recorder::SnapshotWriteOverlaps(address, bytes)) entry.epoch.Capture({address, guestBytes});
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
@@ -1088,6 +1139,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (releaseSnapshots && snapshotGeneration != 0 && resource.dccAddress == 0 && *keys == DccKeys::Uncompressed) spareSnapshot(cache, std::exchange(entry.bytes, {}));
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (TextureEpoch::Enabled() && source == nullptr) {
+        TextureEpoch::Count(TextureEpoch::Action::Full, guestBytes);
+        if (entry.epoch.token.covered && !PageTracker::Get()->DirtySince({address, guestBytes}, entry.epoch.token)) spareSnapshot(cache, std::exchange(entry.bytes, {}));
+        else if (!entry.epoch.token.covered) TextureEpoch::Count(TextureEpoch::Action::Fallback);
     }
     if (TextureDedupe()) dropSupersededTextures(cache, key, address, entry.bytes);
     const auto budget = sampledBudget(context, cache);
