@@ -91,13 +91,14 @@ struct State {
 
 static_assert(offsetof(State, Value) == 128 && offsetof(State, Flags) == 136 && offsetof(State, RspBefore) == 144 && offsetof(State, RspAfter) == 152);
 
-Bytes canaryFunction(const Bytes& instruction, const bool observeStack = true) {
+Bytes canaryFunction(const Bytes& instruction, const bool observeStack = true, std::size_t* instructionOffset = nullptr) {
     Bytes code;
     if (observeStack) emit(code, {0x68, 0x02, 0x02, 0, 0, 0x9d});
     emit(code, {0x48, 0xb8});
     Io::AppendU64(code, Canary);
     for (int index = 0; index < 16; ++index) emit(code, {0x48, 0x89, 0x44, 0x24, static_cast<std::uint8_t>(-128 + index * 8)});
     if (observeStack) emit(code, {0x48, 0x89, 0xa2, 0x90, 0, 0, 0});
+    if (instructionOffset != nullptr) *instructionOffset = code.size();
     code.insert(code.end(), instruction.begin(), instruction.end());
     emit(code, {0x48, 0x89, 0x82, 0x80, 0, 0, 0});
     if (observeStack) emit(code, {0x48, 0x89, 0xa2, 0x98, 0, 0, 0});
@@ -215,11 +216,8 @@ void structural() {
 }
 
 void ripRelative() {
-    auto code = canaryFunction({0x48, 0x8b, 0x05, 0, 0, 0, 0});
-    const std::array<std::uint8_t, 3> pattern{0x48, 0x8b, 0x05};
-    const auto site = std::search(code.begin(), code.end(), pattern.begin(), pattern.end());
-    require(site != code.end(), "RIP-relative fixture site is missing");
-    const auto offset = static_cast<std::size_t>(site - code.begin());
+    std::size_t offset = 0;
+    auto code = canaryFunction({0x48, 0x8b, 0x05, 0, 0, 0, 0}, true, &offset);
     Io::WriteU32(code, offset + 3, static_cast<std::uint32_t>(code.size() - offset - 7));
     Io::AppendU64(code, 0x1234);
     const Fixture fixture(code);
@@ -231,20 +229,26 @@ void ripRelative() {
 }
 
 void liveCall() {
-    auto code = canaryFunction({0xe8, 0, 0, 0, 0}, false);
-    const auto site = std::find(code.begin(), code.end(), 0xe8);
-    const auto offset = static_cast<std::size_t>(site - code.begin());
+    constexpr std::uint64_t returned = 0x12345678abcdef01ull;
+    std::size_t offset = 0;
+    auto code = canaryFunction({0xe8, 0, 0, 0, 0, 0x4c, 0x8d, 0x04, 0x24, 0x4c, 0x89, 0x82, 0x98, 0, 0, 0}, false, &offset);
+    require(code.at(offset) == 0xe8 && std::find(code.begin(), code.end(), 0xe8) < code.begin() + static_cast<std::ptrdiff_t>(offset), "Live-call fixture must retain an earlier E8 operand byte");
     Io::WriteU32(code, offset + 1, static_cast<std::uint32_t>(code.size() - offset - 5));
     const auto callee = CodeAddress + static_cast<std::uint32_t>(code.size());
+    emit(code, {0x48, 0x89, 0xa2, 0x90, 0, 0, 0, 0x48, 0xb8});
+    Io::AppendU64(code, returned);
     code.push_back(0xc3);
     const Fixture fixture(code, {CodeAddress, callee});
     const auto output = patch(fixture);
     const Executable executable(output.Sections);
     State state;
     executable.Run(nullptr, state);
-    if (WindowsRedZonePatcher::Enabled()) {
+    const bool enabled = WindowsRedZonePatcher::Enabled();
+    require(state.Value == returned, "Live call did not execute and return from its intended callee");
+    require(state.RspBefore == state.RspAfter - (enabled ? 136 : 8), "Live-call trampoline did not restore the caller stack");
+    if (enabled) {
         require(output.Result.LiveCallCount == 1 && intact(state), "Live direct call overwrote red-zone data");
-    } else require(!intact(state), "Unprotected call did not overwrite its return-address slot");
+    } else require(intact(state, 15) && state.RedZone.back() != Canary, "Unprotected call changed bytes outside its return-address slot");
 }
 
 void indirectCall() {
@@ -266,13 +270,13 @@ void indirectCall() {
 }
 
 void generatedStub() {
-    const Fixture fixture(canaryFunction({0x48, 0x8b, 0x81, 0, 0, 0, 0}));
+    std::size_t offset = 0;
+    const Fixture fixture(canaryFunction({0x48, 0x8b, 0x81, 0, 0, 0, 0}, true, &offset));
     WindowsLoadImage image(fixture.Source, fixture.Headers);
     auto sections = image.BuildSections();
     auto next = image.GetEndRva();
     const auto stub = next;
-    constexpr std::uint32_t offset = 103;
-    const auto site = LoadRva + offset;
+    const auto site = CheckedRva(LoadRva + offset);
     Bytes body{0x48, 0x8b, 0x81, 0, 0, 0, 0, 0xe9, 0, 0, 0, 0};
     Io::WriteU32(body, 8, site + 7 - (stub + 12));
     sections.front().Data[offset] = 0xe9;
