@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -23,7 +24,7 @@ constexpr std::uint32_t ImportedKey = 0x100u;
 struct Entry {
     VkDeviceSize bytes = 0;
     std::uint32_t key = 0;
-    std::uintptr_t caller = 0;
+    std::array<std::uintptr_t, 4> chain{};
 };
 
 struct Site {
@@ -43,7 +44,7 @@ struct Ledger {
     VkPhysicalDeviceMemoryProperties properties{};
     bool haveProperties = false;
     std::unordered_map<VkDeviceMemory, Entry> live;
-    std::map<std::pair<std::uintptr_t, std::uint32_t>, Site> sites;
+    std::map<std::pair<std::array<std::uintptr_t, 4>, std::uint32_t>, Site> sites;
     std::map<std::uintptr_t, std::string> names;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -78,6 +79,16 @@ const std::string& siteName(Ledger& ledger, std::uintptr_t address) {
     return name;
 }
 
+std::string chainName(Ledger& ledger, const std::array<std::uintptr_t, 4>& chain) {
+    std::string text;
+    for (const auto address : chain) {
+        if (address == 0) break;
+        if (!text.empty()) text += "<";
+        text += siteName(ledger, address);
+    }
+    return text;
+}
+
 std::string typeName(const Ledger& ledger, std::uint32_t key) {
     if ((key & ImportedKey) != 0) return "imported";
     const auto type = key & 0xffu;
@@ -105,19 +116,19 @@ std::string reportLocked(Ledger& ledger) {
         std::snprintf(part, sizeof(part), " %s %.0f MiB in %llu;", typeName(ledger, key).c_str(), mib(total.first), static_cast<unsigned long long>(total.second));
         text += part;
     }
-    std::vector<std::pair<std::pair<std::uintptr_t, std::uint32_t>, Site>> sites(ledger.sites.begin(), ledger.sites.end());
+    std::vector<std::pair<std::pair<std::array<std::uintptr_t, 4>, std::uint32_t>, Site>> sites(ledger.sites.begin(), ledger.sites.end());
     std::sort(sites.begin(), sites.end(), [](const auto& left, const auto& right) { return left.second.liveBytes > right.second.liveBytes; });
     text += " top sites by live bytes (live MiB/count, 10 s allocated MiB/count, freed MiB/count):";
     for (std::size_t index = 0; index < sites.size() && index < 25 && sites[index].second.liveBytes != 0; ++index) {
         const auto& [key, site] = sites[index];
-        std::snprintf(part, sizeof(part), " [%s %s %.0f/%llu, %.0f/%llu, %.0f/%llu]", siteName(ledger, key.first).c_str(), typeName(ledger, key.second).c_str(), mib(site.liveBytes), static_cast<unsigned long long>(site.live), mib(site.allocatedBytes), static_cast<unsigned long long>(site.allocated), mib(site.freedBytes), static_cast<unsigned long long>(site.freed));
+        std::snprintf(part, sizeof(part), " [%s %s %.0f/%llu, %.0f/%llu, %.0f/%llu]", chainName(ledger, key.first).c_str(), typeName(ledger, key.second).c_str(), mib(site.liveBytes), static_cast<unsigned long long>(site.live), mib(site.allocatedBytes), static_cast<unsigned long long>(site.allocated), mib(site.freedBytes), static_cast<unsigned long long>(site.freed));
         text += part;
     }
     std::sort(sites.begin(), sites.end(), [](const auto& left, const auto& right) { return left.second.allocatedBytes > right.second.allocatedBytes; });
     text += "; top sites by 10 s allocations:";
     for (std::size_t index = 0; index < sites.size() && index < 10 && sites[index].second.allocatedBytes != 0; ++index) {
         const auto& [key, site] = sites[index];
-        std::snprintf(part, sizeof(part), " [%s %s %.0f MiB/%llu]", siteName(ledger, key.first).c_str(), typeName(ledger, key.second).c_str(), mib(site.allocatedBytes), static_cast<unsigned long long>(site.allocated));
+        std::snprintf(part, sizeof(part), " [%s %s %.0f MiB/%llu]", chainName(ledger, key.first).c_str(), typeName(ledger, key.second).c_str(), mib(site.allocatedBytes), static_cast<unsigned long long>(site.allocated));
         text += part;
     }
     for (auto& [key, site] : ledger.sites) {
@@ -138,14 +149,19 @@ void maybeReport(Ledger& ledger) {
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL allocate(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
-    const auto caller = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
+    std::array<std::uintptr_t, 4> chain{reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)), 0, 0, 0};
+#ifdef _WIN32
+    std::array<void*, 4> frames{};
+    const auto captured = RtlCaptureStackBackTrace(1, static_cast<DWORD>(frames.size()), frames.data(), nullptr);
+    for (USHORT index = 0; index < captured; ++index) chain[index] = reinterpret_cast<std::uintptr_t>(frames[index]);
+#endif
     auto& ledger = State();
     const auto result = ledger.allocate(device, info, callbacks, memory);
     if (result != VK_SUCCESS) return result;
     const std::uint32_t key = info->memoryTypeIndex | (importsHost(info->pNext) ? ImportedKey : 0u);
     std::lock_guard lock(ledger.mutex);
-    ledger.live[*memory] = {info->allocationSize, key, caller};
-    auto& site = ledger.sites[{caller, key}];
+    ledger.live[*memory] = {info->allocationSize, key, chain};
+    auto& site = ledger.sites[{chain, key}];
     site.liveBytes += info->allocationSize;
     ++site.live;
     site.allocatedBytes += info->allocationSize;
@@ -159,7 +175,7 @@ VKAPI_ATTR void VKAPI_CALL release(VkDevice device, VkDeviceMemory memory, const
     if (memory != VK_NULL_HANDLE) {
         std::lock_guard lock(ledger.mutex);
         if (const auto found = ledger.live.find(memory); found != ledger.live.end()) {
-            auto& site = ledger.sites[{found->second.caller, found->second.key}];
+            auto& site = ledger.sites[{found->second.chain, found->second.key}];
             site.liveBytes -= found->second.bytes;
             --site.live;
             site.freedBytes += found->second.bytes;
