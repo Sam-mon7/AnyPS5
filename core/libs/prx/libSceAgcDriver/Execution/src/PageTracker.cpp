@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string_view>
 #include <thread>
+#include <vector>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -242,6 +243,7 @@ Tracker::Region* Tracker::GetRegion(std::uint64_t id, bool create) const {
 }
 
 void Tracker::RegisterRange(Range range, Kind kind, Reasons reasons) {
+    mappingGeneration.fetch_add(1, std::memory_order_acq_rel);
     Visit(range, true, [&](auto, auto offset, auto bytes, auto* region) {
         Advance(region->mapEpoch);
         if (region->pages != nullptr) region->pages->invalidated = region->mapEpoch;
@@ -255,6 +257,7 @@ void Tracker::RegisterRange(Range range, Kind kind, Reasons reasons) {
 }
 
 void Tracker::InvalidateRange(Range range, bool unmapped) {
+    mappingGeneration.fetch_add(1, std::memory_order_acq_rel);
     Visit(range, true, [&](auto, auto offset, auto bytes, auto* region) {
         if (region == nullptr) return;
         Advance(region->mapEpoch);
@@ -333,6 +336,40 @@ void Tracker::MarkGpuWritten(Range range, Source source) {
     std::lock_guard lock(countsMutex);
     counts.sources[static_cast<std::size_t>(source)] += Pages(range);
     if (source == Source::GpuDeclaration) counts.gpuPages += Pages(range);
+}
+
+void Tracker::MarkGpuDeclared(Range range, Source source, std::uint64_t generation) {
+    Visit(range, true, [&](auto, auto offset, auto bytes, auto* region) {
+        if (region == nullptr) return;
+        Advance(region->gpuEpoch);
+        Assign(region->gpuDirty, offset, bytes, true);
+        Assign(region->reasons[static_cast<std::size_t>(Reason::PendingGpu)], offset, bytes, true);
+        if (region->declaredGeneration != generation) {
+            region->declared.fill(0);
+            region->declaredGeneration = generation;
+        }
+        Assign(region->declared, offset, bytes, true);
+    });
+    std::lock_guard lock(countsMutex);
+    counts.sources[static_cast<std::size_t>(source)] += Pages(range);
+    if (source == Source::GpuDeclaration) counts.gpuPages += Pages(range);
+}
+
+bool Tracker::DeclaredPending(Range range, std::uint64_t generation) const {
+    if (!range.Valid() || Poisoned() || MappingGeneration() != generation) return false;
+    bool pending = true;
+    Visit(range, false, [&](auto, auto offset, auto bytes, auto* region) {
+        if (!pending) return;
+        if (region == nullptr || region->declaredGeneration != generation) { pending = false; return; }
+        const auto& gpu = region->reasons[static_cast<std::size_t>(Reason::PendingGpu)];
+        Words(offset, bytes, [&](auto word, auto mask) { if ((region->declared[word] & gpu[word] & mask) != mask) pending = false; });
+    });
+    return pending && MappingGeneration() == generation;
+}
+
+void Tracker::NoteSkippedDeclaration(Range range) {
+    std::lock_guard lock(countsMutex);
+    counts.skippedGpuPages += Pages(range);
 }
 
 void Tracker::PublishGpuWrites(Range range) { MarkGpuWritten(range, Source::Copyback); }
@@ -576,7 +613,7 @@ std::string Tracker::ProfileLine() const {
             line << kinds[kind] << ':' << read.covered << '/' << read.total;
         }
     }
-    line << " polled-pages=" << snapshot.polledPages << " fault-observed-pages=" << snapshot.faultPages << " gpu-declared-pages=" << snapshot.gpuPages
+    line << " polled-pages=" << snapshot.polledPages << " fault-observed-pages=" << snapshot.faultPages << " gpu-declared-pages=" << snapshot.gpuPages << " gpu-declaration-skipped-pages=" << snapshot.skippedGpuPages
          << " poll-calls=" << snapshot.pollCalls << " poll-ms=" << snapshot.pollNs / 1000000.0 << " poll-errors=" << snapshot.pollErrors
          << " regions=" << snapshot.regions << " metadata-bytes=" << snapshot.metadataBytes + observerMetadata << " observer-metadata-bytes=" << observerMetadata << " metadata-estimated=1 poisoned=" << snapshot.poisoned;
     line << " source-pages=";
@@ -701,14 +738,44 @@ void Initialize() {
 bool ObserversRegistered() { return registered.load(std::memory_order_acquire); }
 
 namespace {
+void declareGpuAliases(Tracker& tracker, Range range, Source source) {
+    const auto generation = tracker.MappingGeneration();
+    if (tracker.DeclaredPending(range, generation)) {
+        tracker.NoteSkippedDeclaration(range);
+        return;
+    }
+    std::vector<Range> aliases;
+#ifdef _WIN32
+    const auto collect = [](std::uintptr_t address, std::size_t bytes, void* context) {
+        auto& ranges = *static_cast<std::vector<Range>*>(context);
+        if (!ranges.empty() && ranges.back().address + ranges.back().bytes == address) ranges.back().bytes += bytes;
+        else ranges.push_back({address, bytes});
+    };
+    GuestArena::GuestArenaVisitPageAliases_nid_no_patch(range.address, range.bytes, collect, &aliases);
+    std::sort(aliases.begin(), aliases.end());
+    std::vector<Range> merged;
+    for (const auto alias : aliases) {
+        if (!merged.empty() && alias.address <= merged.back().address + merged.back().bytes) merged.back().bytes = std::max(merged.back().address + merged.back().bytes, alias.address + alias.bytes) - merged.back().address;
+        else merged.push_back(alias);
+    }
+    aliases = std::move(merged);
+#else
+    aliases.push_back(range);
+#endif
+    for (const auto alias : aliases) tracker.MarkGpuDeclared(alias, source, generation);
+}
+
 void writeAliases(Range range, Source source, bool gpu) {
     auto* tracker = Get();
     if (tracker == nullptr || !range.Valid()) return;
-    struct Event { Tracker* tracker; Source source; bool gpu; } event{tracker, source, gpu};
+    if (gpu) {
+        try { declareGpuAliases(*tracker, range, source); } catch (...) { tracker->Poison(); }
+        return;
+    }
+    struct Event { Tracker* tracker; Source source; } event{tracker, source};
     const auto visit = [](std::uintptr_t address, std::size_t bytes, void* context) {
         auto& event = *static_cast<Event*>(context);
-        if (event.gpu) event.tracker->MarkGpuWritten({address, bytes}, event.source);
-        else event.tracker->MarkCpuWritten({address, bytes}, event.source);
+        event.tracker->MarkCpuWritten({address, bytes}, event.source);
     };
     try {
 #ifdef _WIN32

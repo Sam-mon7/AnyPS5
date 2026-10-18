@@ -82,7 +82,7 @@ struct ReadBytes { std::uint64_t covered = 0, total = 0; };
 struct Statistics {
     std::array<std::array<ReadBytes, static_cast<std::size_t>(Kind::Count)>, static_cast<std::size_t>(GuestMemory::ReadSite::Count)> reads{};
     std::array<std::uint64_t, static_cast<std::size_t>(Source::Count)> sources{};
-    std::uint64_t polledPages = 0, faultPages = 0, gpuPages = 0, pollCalls = 0, pollNs = 0, pollErrors = 0;
+    std::uint64_t polledPages = 0, faultPages = 0, gpuPages = 0, skippedGpuPages = 0, pollCalls = 0, pollNs = 0, pollErrors = 0;
     std::uint64_t regions = 0, metadataBytes = 0;
     std::uint64_t uniquePolledPages = 0, framePolledPages = 0, fallbackPolledPages = 0;
     bool poisoned = false;
@@ -96,6 +96,10 @@ public:
     void ExcludeImport(Range range);
     void MarkCpuWritten(Range range, Source source);
     void MarkGpuWritten(Range range, Source source);
+    void MarkGpuDeclared(Range range, Source source, std::uint64_t generation);
+    bool DeclaredPending(Range range, std::uint64_t generation) const;
+    void NoteSkippedDeclaration(Range range);
+    std::uint64_t MappingGeneration() const { return mappingGeneration.load(std::memory_order_acquire); }
     void PublishGpuWrites(Range range);
     void ReadbackGpuWrites(Range range);
     bool Current(Range range, const Observation* observation) const;
@@ -121,10 +125,10 @@ private:
         };
         mutable std::mutex mutex;
         std::unique_ptr<PageHistory> pages;
-        Bitmap cpuDirty{}, gpuDirty{}, observedPrivate{};
+        Bitmap cpuDirty{}, gpuDirty{}, observedPrivate{}, declared{};
         std::array<Bitmap, static_cast<std::size_t>(Reason::Count)> reasons{};
         std::array<Bitmap, static_cast<std::size_t>(Kind::Count)> kinds{};
-        std::uint64_t mapEpoch = 1, cpuEpoch = 1, gpuEpoch = 1;
+        std::uint64_t mapEpoch = 1, cpuEpoch = 1, gpuEpoch = 1, declaredGeneration = 0;
     };
     Region* GetRegion(std::uint64_t id, bool create) const;
     template<class Function> void Visit(Range range, bool create, Function&& function) const {
@@ -144,6 +148,7 @@ private:
     Statistics counts;
     std::atomic<bool> poisoned{false};
     std::atomic<std::uint64_t> observationSerial{0};
+    std::atomic<std::uint64_t> mappingGeneration{1};
 };
 
 bool Enabled();

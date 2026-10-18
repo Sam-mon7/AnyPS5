@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PageTracker.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include <array>
 #include <cstdlib>
 #include <chrono>
 #include <iostream>
@@ -536,6 +537,44 @@ void aliases(bool enabled) {
     GuestArena::GuestArenaRelease_nid_postfix(first, bytes);
     GuestArena::GuestArenaRelease_nid_postfix(second, bytes);
 }
+
+void declarationSkips() {
+    constexpr std::size_t bytes = 0x4000;
+    std::array<void*, 3> views{};
+    for (auto& view : views) view = GuestArena::GuestArenaAllocate_nid_postfix(bytes, RegionBytes);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    require(section != nullptr, "declaration test section failed");
+    std::array<HANDLE, 2> duplicates{};
+    for (auto& duplicate : duplicates) require(DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS), "duplicate declaration section failed");
+    GuestArena::GuestArenaMap_nid_postfix(views[0], bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(views[1], bytes, duplicates[0], 0, PAGE_READWRITE);
+    CloseHandle(section);
+    CloseHandle(duplicates[0]);
+    const Range a{reinterpret_cast<std::uintptr_t>(views[0]), PageBytes}, b{reinterpret_cast<std::uintptr_t>(views[1]), PageBytes}, c{reinterpret_cast<std::uintptr_t>(views[2]), PageBytes};
+    auto* tracker = Get();
+    const auto skipped = [&] { return tracker->Counts().skippedGpuPages; };
+    const auto initial = skipped();
+    GpuWrite(a);
+    require(skipped() == initial, "first GPU declaration was skipped");
+    const auto aliasBefore = tracker->CaptureEpoch(b);
+    GpuWrite(a);
+    require(skipped() == initial + 1, "repeated pending GPU declaration was not skipped");
+    require(tracker->CaptureEpoch(b).regions.front().gpuEpoch == aliasBefore.regions.front().gpuEpoch, "skipped declaration advanced an alias epoch");
+    GuestArena::GuestArenaMap_nid_postfix(views[2], bytes, duplicates[1], 0, PAGE_READWRITE);
+    CloseHandle(duplicates[1]);
+    const auto mapped = skipped();
+    const auto newAlias = tracker->CaptureEpoch(c);
+    GpuWrite(a);
+    require(skipped() == mapped, "declaration skipped across a new alias mapping");
+    require(tracker->CaptureEpoch(c).regions.front().gpuEpoch > newAlias.regions.front().gpuEpoch, "new alias missed the GPU declaration");
+    GpuWrite(a);
+    require(skipped() == mapped + 1, "declaration after the alias visit was not skipped");
+    tracker->ReadbackGpuWrites(a);
+    GpuWrite(a);
+    require(skipped() == mapped + 1, "declaration skipped after a readback cleared pending work");
+    for (auto* view : views) GuestArena::GuestArenaReset_nid_postfix(view, bytes);
+    for (auto* view : views) GuestArena::GuestArenaRelease_nid_postfix(view, bytes);
+}
 #endif
 }
 
@@ -556,6 +595,7 @@ int main() {
         require(GuestArena::GuestArenaHasPageObserver_nid_no_patch() == enabled, "switch-off registered mapping observer");
         inaccessible();
         aliases(enabled);
+        if (enabled) declarationSkips();
         protectedObservation();
         armingRefusals();
         mixedProtections();
