@@ -13,6 +13,7 @@ add_library(relinker_core STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsLoadImage.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsTlsBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsTrampolineBuilder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsRedZonePatcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsTlsTemplateBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsRelocationBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsImportBuilder.cpp
@@ -110,6 +111,21 @@ target_include_directories(relinker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli/incl
 set_target_properties(relinker PROPERTIES CXX_EXTENSIONS OFF)
 
 if(BUILD_TESTING AND WIN32)
+    add_test_executable(redzone_windows_tests ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/RedZoneWindowsTests.cpp)
+    target_link_libraries(redzone_windows_tests PRIVATE relinker_core)
+    foreach(redzone_mode IN ITEMS on off)
+        if(redzone_mode STREQUAL "on")
+            set(redzone_environment "ANYPS5_RELINK_REDZONE=1")
+        else()
+            set(redzone_environment "ANYPS5_RELINK_REDZONE=0")
+        endif()
+        add_test(NAME relinker_redzone_${redzone_mode} COMMAND redzone_windows_tests unit)
+        set_tests_properties(relinker_redzone_${redzone_mode} PROPERTIES ENVIRONMENT "${redzone_environment}" TIMEOUT 20)
+        foreach(redzone_access IN ITEMS load store)
+            add_test(NAME relinker_redzone_fault_${redzone_access}_${redzone_mode} COMMAND redzone_windows_tests fault-${redzone_access})
+            set_tests_properties(relinker_redzone_fault_${redzone_access}_${redzone_mode} PROPERTIES ENVIRONMENT "${redzone_environment}" TIMEOUT 20 SKIP_RETURN_CODE 77)
+        endforeach()
+    endforeach()
     add_test_executable(windows_guest_export_alias_tests ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/WindowsExportAliasTests.cpp)
     target_link_libraries(windows_guest_export_alias_tests PRIVATE relinker_core)
     add_test(NAME windows_guest_export_aliases COMMAND windows_guest_export_alias_tests)
