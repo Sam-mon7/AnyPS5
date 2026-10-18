@@ -2723,6 +2723,12 @@ if(BUILD_TESTING AND WIN32)
             ENVIRONMENT "${vramTextureTestEnvironment};APS5_NO_CLEARED_VIEW=1;APS5_RELEASE_ON_UNLOCK=1"
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_TEXTURES=set:1;APS5_TEXTURE_AGE_EVICTION=set:1")
     endforeach()
+    foreach(vramLazyTextureMode IN ITEMS storage snapshot readonly)
+        add_test(NAME agc_vram_textures_lazy_${vramLazyTextureMode} COMMAND agc_driver_sampled_cache_budget_tests mirror-${vramLazyTextureMode})
+        set_tests_properties(agc_vram_textures_lazy_${vramLazyTextureMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_DEVICE_LOCAL_MIRRORS=1;APS5_VRAM_LAZY_WRITES=1;APS5_VRAM_CLEANUP=1;APS5_VRAM_TEXTURES=1;APS5_TEXTURE_AGE_EVICTION=0;APS5_RESIDENT_HEAP_MIRRORS=0;APS5_REBAR_MIB=0;APS5_NO_CLEARED_VIEW=1;APS5_RELEASE_ON_UNLOCK=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_WRITABLE_STRICT=unset:;APS5_VRAM_DEFERRED=unset:")
+    endforeach()
     add_test(NAME agc_vram_textures_sampled_cache_budget COMMAND agc_driver_sampled_cache_budget_tests)
     add_test(NAME agc_vram_textures_partially_resident COMMAND agc_driver_partially_resident_snapshot_tests)
     add_test(NAME agc_vram_textures_partially_resident_pool COMMAND agc_driver_partially_resident_snapshot_tests)

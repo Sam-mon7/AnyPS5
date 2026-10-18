@@ -80,7 +80,7 @@ inline void ValidateVramOptions() {
         throw std::runtime_error("APS5_VRAM_CLEANUP requires APS5_VRAM_DESCRIPTORS=1");
     if (VramTextures() && !VramCleanup())
         throw std::runtime_error("APS5_VRAM_TEXTURES requires APS5_VRAM_CLEANUP=1");
-    if (VramTextures() && !VramDeferred())
+    if (VramTextures() && !VramDeferred() && !VramLazyWrites())
         throw std::runtime_error("APS5_VRAM_TEXTURES requires APS5_VRAM_DEFERRED=1");
 #ifndef _WIN32
     if (VramMirrorWrites())
