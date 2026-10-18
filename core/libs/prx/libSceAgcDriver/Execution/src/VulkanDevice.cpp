@@ -1987,6 +1987,11 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
+    static const bool completionFallback = std::getenv("APS5_LABEL_COMPLETION_FALLBACK") != nullptr;
+    if (import == nullptr && completionFallback) {
+        recorder.AfterCompletions(address, bytes, stamp, queue, false);
+        return 5;
+    }
     if (import == nullptr) return 3;
     // A unit shadow's results in the label's unit reach the import before the store lands over
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no

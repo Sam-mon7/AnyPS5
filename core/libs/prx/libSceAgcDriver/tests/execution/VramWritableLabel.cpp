@@ -82,6 +82,22 @@ int main() {
         Require(*static_cast<volatile std::uint32_t*>(labels) == label, "completion label was not published after the caller drained");
         Require(*static_cast<volatile std::uint32_t*>(raw) == 0xa1b2c300u, "native read after the imported label missed the BDA store");
         Require(!HasVramMirrorWriters(), "the completed label kept an active mirror writer");
+        if (!VramWritable() && !VramLazyWrites()) {
+            auto* unimported = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            Require(unimported != nullptr, "cannot allocate the unimported label");
+            const auto unimportedAddress = reinterpret_cast<std::uint64_t>(unimported);
+            device->Dispatch(shader, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+            const std::uint32_t late = 0x13572468u;
+            const auto latePayload = std::as_bytes(std::span(&late, 1));
+            const bool fallback = std::getenv("APS5_LABEL_COMPLETION_FALLBACK") != nullptr;
+            const auto lateReason = device->WriteLabelOnGpu(unimportedAddress, latePayload, 2, 0, false);
+            Require(lateReason == (fallback ? 5 : 3), "an unimported label did not follow the completion fallback switch");
+            if (fallback) Require(*static_cast<volatile std::uint32_t*>(unimported) == 0, "a completion-fallback label became visible before its batch completed");
+            device->WaitIdle();
+            if (lateReason == 3) Memory::Write(unimportedAddress, latePayload, 4);
+            Require(*static_cast<volatile std::uint32_t*>(unimported) == late, "an unimported label was not stored after its batch");
+            VirtualFree(unimported, 0, MEM_RELEASE);
+        }
         if (device->CanWaitUnlocked() && !VramLazyWrites()) {
             const std::uint32_t initial = 0x11111111u;
             Memory::Write(address, std::as_bytes(std::span(&initial, 1)));
