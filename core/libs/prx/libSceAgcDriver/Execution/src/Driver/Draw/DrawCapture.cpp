@@ -13,7 +13,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
+ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
     PerformanceTimer timing("Shader.DrawStage");
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
@@ -27,7 +27,18 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
-    const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
+    if (i == 0 && drawParameters.indirect && ShaderRecompiler::IndirectSgprRuntime()) request.indirectSgprs = drawParameters.indirect->runtimeSgprs;
+    const auto invocation = [&] {
+        try {
+            return InvocationFor(*program.snapshot, program.codeOffset, request);
+        } catch (const ShaderRecompiler::IndirectSgprUnsupported& failure) {
+            if (!request.indirectSgprs) throw;
+            drawParameters.indirect->runtimeFailure = failure.reason;
+            drawParameters.indirect->runtimeSgprs.reset();
+            request.indirectSgprs.reset();
+            return InvocationFor(*program.snapshot, program.codeOffset, request);
+        }
+    }();
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
@@ -80,6 +91,13 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     stageCapture.compiled = invocation.Materialize(*capture);
     timing.Mark("materialize");
     ShaderRecompiler::RecompileResult result = *stageCapture.compiled;
+    if (result.indirectSgprs && drawParameters.indirect) {
+        auto probe = drawParameters;
+        if (ClassifyIndirectDraw(result, graphics, program, localDevice, probe, false)) {
+            drawParameters.indirect->runtimeSgprs.reset();
+            return materializeDrawStage(i, pushOffset, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
+        }
+    }
     static const bool dumpIndirect = std::getenv("APS5_DUMP_INDIRECT_FALLBACKS") != nullptr;
     if (dumpIndirect && i == 0 && drawParameters.indirect && program.binary.stage == Stage::Vertex) {
         static std::mutex dumpMutex;

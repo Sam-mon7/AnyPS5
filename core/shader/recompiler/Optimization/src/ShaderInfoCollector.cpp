@@ -151,6 +151,9 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                             break;
                         case StageInputKind::VertexIndex:
                         case StageInputKind::InstanceIndex:
+                        case StageInputKind::BaseVertex:
+                        case StageInputKind::BaseInstance:
+                        case StageInputKind::DrawIndex:
                         case StageInputKind::InvocationId:
                         case StageInputKind::PrimitiveId:
                         case StageInputKind::FrontFacing:
@@ -342,6 +345,15 @@ void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
                     break;
                 case StageInputKind::InstanceIndex:
                     AddInput(info, kind, 0, 1, "gl_InstanceIndex");
+                    break;
+                case StageInputKind::BaseVertex:
+                    AddInput(info, kind, 0, 1, "gl_BaseVertex");
+                    break;
+                case StageInputKind::BaseInstance:
+                    AddInput(info, kind, 0, 1, "gl_BaseInstance");
+                    break;
+                case StageInputKind::DrawIndex:
+                    AddInput(info, kind, 0, 1, "gl_DrawID");
                     break;
                 case StageInputKind::InvocationId:
                     AddInput(info, kind, 0, 1, "gl_InvocationID");

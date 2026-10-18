@@ -43,6 +43,7 @@ struct Counters {
 };
 
 [[nodiscard]] std::uint64_t SourceVersion();
+[[nodiscard]] std::uint64_t OutputVersion();
 [[nodiscard]] bool OutputKeyed();
 [[nodiscard]] bool VerifyHits();
 [[nodiscard]] bool SameOutput(const CompiledVariant& left, const CompiledVariant& right);

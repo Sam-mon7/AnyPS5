@@ -418,6 +418,17 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Values(std::span<const std::uint32_t>(result.stencilReferences));
     writer.Value(result.stencilReplaySafe);
     writer.Value(result.stencilReferenceDword);
+    if (IndirectSgprRuntime()) {
+        writer.Value(result.indirectSgprs.has_value());
+        if (result.indirectSgprs) {
+            const auto& patch = *result.indirectSgprs;
+            writer.Value(patch.baseVertex);
+            writer.Value(patch.firstInstance);
+            writer.Value(patch.drawIndex);
+            writer.Value(patch.indxOffset);
+            writer.Value(patch.indexed);
+        }
+    }
 }
 
 void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
@@ -465,6 +476,18 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Values(result.stencilReferences);
     reader.Value(result.stencilReplaySafe);
     reader.Value(result.stencilReferenceDword);
+    if (IndirectSgprRuntime()) {
+        bool active = false;
+        reader.Value(active);
+        if (active) {
+            auto& patch = result.indirectSgprs.emplace();
+            reader.Value(patch.baseVertex);
+            reader.Value(patch.firstInstance);
+            reader.Value(patch.drawIndex);
+            reader.Value(patch.indxOffset);
+            reader.Value(patch.indexed);
+        }
+    }
     result.variantId = 0;
 }
 
@@ -1180,7 +1203,7 @@ std::vector<std::byte> buildSwitchKey(bool vertex) {
         if (std::find(std::begin(NeutralSwitches), std::end(NeutralSwitches), name) != std::end(NeutralSwitches)) continue;
         if (!vertex && std::find(std::begin(VertexStageSwitches), std::end(VertexStageSwitches), name) != std::end(VertexStageSwitches)) continue;
         const char* value = std::getenv(std::string(name).c_str());
-        if (value == nullptr) continue;
+        if (value == nullptr || (name == "APS5_INDIRECT_SGPR_RUNTIME" && std::strcmp(value, "1") != 0)) continue;
         writer.Text(std::string(name));
         writer.Text(value);
     }
@@ -1467,8 +1490,13 @@ bool OutputKeyed() {
     return keyed;
 }
 
+std::uint64_t OutputVersion() {
+    return IndirectSgprRuntime() ? IndirectSgprVersion(Generated::OutputVersion) : Generated::OutputVersion;
+}
+
 std::uint64_t SourceVersion() {
-    return OutputKeyed() ? Generated::OutputVersion : Generated::SourceVersion;
+    const auto legacy = OutputKeyed() ? Generated::OutputVersion : Generated::SourceVersion;
+    return IndirectSgprRuntime() ? IndirectSgprVersion(legacy) : legacy;
 }
 
 bool VerifyHits() {

@@ -155,11 +155,13 @@ set(content "#ifndef CORE_SHADER_RECOMPILER_SHADERCACHEVERSION_HPP
 
 #include <cstdint>
 #include <string_view>
+#include \"IndirectSgpr.hpp\"
 
 namespace ShaderRecompiler::ShaderDiskCache::Generated {
 
 inline constexpr std::uint64_t SourceVersion = 0x${version}ull;
 inline constexpr std::uint64_t OutputVersion = 0x${outputVersion}ull;
+inline constexpr std::uint64_t IndirectSgprOutputVersion = IndirectSgprVersion(OutputVersion);
 
 inline constexpr std::string_view RecompilerSwitches[] = {
     ${switchList}

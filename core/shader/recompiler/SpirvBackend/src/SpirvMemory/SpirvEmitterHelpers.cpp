@@ -67,6 +67,9 @@ void RequireTableIndexing(SpirvEmitterState& state) {
 std::uint32_t BuiltInForInput(StageInputKind kind) {
     switch (kind) {
     case StageInputKind::VertexIndex: return spv::BuiltInVertexIndex;
+    case StageInputKind::BaseVertex: return spv::BuiltInBaseVertex;
+    case StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
+    case StageInputKind::DrawIndex: return spv::BuiltInDrawIndex;
     case StageInputKind::InvocationId: return spv::BuiltInInvocationId;
     case StageInputKind::PrimitiveId: return spv::BuiltInPrimitiveId;
     case StageInputKind::TessCoord: return spv::BuiltInTessCoord;
@@ -146,6 +149,10 @@ void CheckBindings(const IrProgram& program, const CompiledBindingLayout& bindin
 
 void EmitBaseHeader(SpirvModule& module, const IrProgram& program) {
     module.EmitCapability(spv::CapabilityShader);
+    if (std::ranges::any_of(program.Info().inputs, [](const auto& input) { return input.kind == StageInputKind::BaseVertex || input.kind == StageInputKind::BaseInstance || input.kind == StageInputKind::DrawIndex; })) {
+        module.EmitCapability(spv::CapabilityDrawParameters);
+        module.EmitExtension("SPV_KHR_shader_draw_parameters");
+    }
     const bool physical = program.Info().usesDma || program.Resources().stage == IrShaderStage::Mesh;
     if (physical) {
         module.EmitCapability(spv::CapabilityInt64);
@@ -215,6 +222,9 @@ void DefineInputs(SpirvEmitterState& state) {
         std::uint32_t type = TypeU32(state);
         switch (input.kind) {
         case StageInputKind::VertexIndex:
+        case StageInputKind::BaseVertex:
+        case StageInputKind::BaseInstance:
+        case StageInputKind::DrawIndex:
         case StageInputKind::InvocationId:
         case StageInputKind::PrimitiveId:
         case StageInputKind::InstanceIndex:

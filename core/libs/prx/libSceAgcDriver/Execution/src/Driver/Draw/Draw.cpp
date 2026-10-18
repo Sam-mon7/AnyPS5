@@ -69,7 +69,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
-    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
+    const bool useDrawEntries = !(ShaderRecompiler::IndirectSgprRuntime() && drawParameters.indirect) && drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
@@ -187,6 +187,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         indirect.baseVertexSgpr = sgprOf(indirect.baseVertexLocation);
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
+        if (ShaderRecompiler::IndirectSgprRuntime()) {
+            using Failure = ShaderRecompiler::IndirectSgprFailure;
+            const auto support = localDevice->DrawIndirectSupport();
+            const auto otherStage = [&](std::uint32_t location) { const auto word = locate(location); return word && word->first != 0; };
+            if (graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList || graphics.stages.mesh || graphics.stages.tessellation || otherStage(indirect.baseVertexLocation) || otherStage(indirect.startInstanceLocation) || (indirect.drawIndexEnabled && otherStage(indirect.drawIndexLocation))) indirect.runtimeFailure = Failure::Stage;
+            else if (!support.parameters || (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0 && indirect.count > 1 && !support.multi)) indirect.runtimeFailure = Failure::Feature;
+            else if (indirect.baseVertexSgpr >= 0 || indirect.startInstanceSgpr >= 0 || (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0)) indirect.runtimeSgprs = ShaderRecompiler::IndirectSgprPatch{indirect.baseVertexSgpr, indirect.startInstanceSgpr, indirect.drawIndexEnabled ? indirect.drawIndexSgpr : -1, indirect.indxOffset, drawParameters.indexed};
+        }
     }
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;

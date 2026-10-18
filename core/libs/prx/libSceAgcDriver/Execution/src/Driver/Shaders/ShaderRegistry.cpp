@@ -93,6 +93,8 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
     try {
         auto handle = ShaderRecompiler::PrepareShader(request, preparation);
         return handle;
+    } catch (const ShaderRecompiler::IndirectSgprUnsupported&) {
+        throw;
     } catch (...) {
         failure = std::current_exception();
         try {

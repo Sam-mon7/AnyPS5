@@ -7,6 +7,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "Translation/EmbeddedVertexFetch.hpp"
+#include "IndirectSgpr.hpp"
 #include <cstdint>
 #include <optional>
 
@@ -37,6 +38,7 @@ struct TranslateOptions {
     std::optional<ShaderFloatMode> floatMode;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;
+    const IndirectSgprPatch* indirectSgprs = nullptr;
 };
 
 class InstructionTranslator {

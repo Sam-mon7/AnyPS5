@@ -55,7 +55,20 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     const auto unused = indirectFold && graphics.stages.path == Graphics::ShaderPath::Vertex && !meshPath && !graphics.stages.tessellation ? UnusedSgprs(frontProgram.binary.code) : 0;
     const bool meshGpuSide = meshPath && drawParameters.indexed && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
     if ((graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList) && !meshGpuSide) fail(Path::NonVertexPath);
-    if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) fail(Path::DrawIndex);
+    const bool runtime = ShaderRecompiler::IndirectSgprRuntime() && result.indirectSgprs && indirect.runtimeSgprs == result.indirectSgprs;
+    if (ShaderRecompiler::IndirectSgprRuntime() && !runtime) {
+        using Failure = ShaderRecompiler::IndirectSgprFailure;
+        switch (indirect.runtimeFailure) {
+        case Failure::None: break;
+        case Failure::Feature: fail(Path::RuntimeFeature); break;
+        case Failure::Stage: fail(Path::RuntimeStage); break;
+        case Failure::OriginalArgument: fail(Path::RuntimeOriginalArgument); break;
+        case Failure::ResourceDependency: fail(Path::RuntimeResource); break;
+        case Failure::Fetch: fail(Path::RuntimeFetch); break;
+        }
+    }
+    if (runtime && (!support.parameters || (result.indirectSgprs->drawIndex >= 0 && indirect.count > 1 && !support.multi))) fail(Path::RuntimeFeature);
+    if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0 && !runtime) fail(Path::DrawIndex);
     if (indirect.countIndirect && !support.count) fail(Path::FeatureGap);
     if (indirect.countIndirect && indirect.count > 1 && !support.multi) fail(Path::FeatureGap);
     const auto dimension = [&](std::int32_t k, std::int32_t p, bool shared, bool conflict, std::uint32_t x, Rule& rule, std::uint32_t& constant) {
@@ -65,7 +78,7 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
             require(offset <= std::numeric_limits<std::uint32_t>::max() - x, "draw vertex offset overflow");
             constant = x + offset;
         } else if (conflict) fail(Path::FetchUnknown);
-        else if (k != p || shared) fail(Path::NotFolded);
+        else if (k != p || (shared && !runtime)) fail(Path::NotFolded);
         else if (x != 0) fail(Path::IndxOffset);
         else rule = Rule::InPlace;
     };

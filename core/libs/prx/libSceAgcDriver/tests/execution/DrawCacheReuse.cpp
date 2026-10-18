@@ -155,6 +155,12 @@ alignas(256) constexpr std::array<std::uint32_t, 21> PatchedIndirectVertexCode{
     0x06020208u, 0x0604040au, 0x7e060c09u, 0x100606f0u, 0x06040503u,
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
 };
+alignas(256) constexpr std::array<std::uint32_t, 19> RuntimeIndirectVertexCode{
+    0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
+    0x7e060c09u, 0x100606f0u, 0x06040503u,
+    0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
+};
+alignas(8) Header RuntimeIndirectVertexHeader{};
 alignas(8) Header IndirectVertexHeader{};
 alignas(8) Header IndirectPixelHeader{};
 alignas(8) Header PatchedIndirectVertexHeader{};
@@ -172,6 +178,7 @@ struct IndirectInputs {
     float color = 1.0f;
     bool patchedOffsets = false;
     bool direct = false;
+    bool runtimeIndex = false;
 };
 
 void ObserveIndirectCapture(std::uint64_t address, std::size_t bytes) {
@@ -204,7 +211,7 @@ std::array<std::byte, 1024> SubmitIndirect(std::span<const IndirectRecord> recor
     AgcDriver::GuestMemory::Write(countAddress, std::as_bytes(std::span(&initialCount, 1)));
 
     auto commands = DrawCommands();
-    const auto vertex = reinterpret_cast<std::uintptr_t>(inputs.patchedOffsets ? PatchedIndirectVertexCode.data() : IndirectVertexCode.data());
+    const auto vertex = reinterpret_cast<std::uintptr_t>(inputs.runtimeIndex ? RuntimeIndirectVertexCode.data() : inputs.patchedOffsets ? PatchedIndirectVertexCode.data() : IndirectVertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(IndirectPixelCode.data());
     Append(commands, 0x79, {0x24a, 0});
     Append(commands, 0x76, {0xc8, static_cast<std::uint32_t>(vertex >> 8u), static_cast<std::uint32_t>(vertex >> 40u)});
@@ -230,7 +237,7 @@ std::array<std::byte, 1024> SubmitIndirect(std::span<const IndirectRecord> recor
             Append(commands, 0x2d, {record[0], 2});
         }
     } else if (records.size() == 1 && !drawCount && !inputs.patchedOffsets) Append(commands, 0x24, {0, 0x280, instance, 2});
-    else Append(commands, 0x2c, {0, inputs.patchedOffsets ? 0x8cu : 0x280u, instance, (inputs.patchedOffsets ? 0x8000008du : 0x280u) | (drawCount ? 1u << 30u : 0u), static_cast<std::uint32_t>(records.size()), drawCount ? static_cast<std::uint32_t>(countAddress) : 0u, drawCount ? static_cast<std::uint32_t>(countAddress >> 32u) : 0u, sizeof(IndirectRecord), 2});
+    else Append(commands, 0x2c, {0, inputs.patchedOffsets ? 0x8cu : 0x280u, instance, (inputs.patchedOffsets || inputs.runtimeIndex ? 0x8000008du : 0x280u) | (drawCount ? 1u << 30u : 0u), static_cast<std::uint32_t>(records.size()), drawCount ? static_cast<std::uint32_t>(countAddress) : 0u, drawCount ? static_cast<std::uint32_t>(countAddress >> 32u) : 0u, sizeof(IndirectRecord), 2});
 
     for (auto& count : IndirectRecordReads) count = 0;
     IndirectCountReads = 0;
@@ -243,7 +250,7 @@ std::array<std::byte, 1024> SubmitIndirect(std::span<const IndirectRecord> recor
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "indirect capture regression submission failed");
     AgcDriverWaitIdle_nid_postfix();
-    if (cpuFallback && !inputs.direct) {
+    if (cpuFallback && !inputs.direct && !inputs.runtimeIndex) {
         const auto count = std::min(static_cast<std::uint32_t>(records.size()), drawCount.value_or(static_cast<std::uint32_t>(records.size())));
         for (std::size_t index = 0; index < IndirectRecordReads.size(); ++index) {
             Require(IndirectRecordReads[index] == (index < count ? 1u : 0u), "CPU indirect arguments were skipped or reread instead of reusing the ordered snapshot");
@@ -392,6 +399,36 @@ std::array<std::byte, 1024> SubmitSharedPageIndirect(float color, bool queuedCol
     return ColorMemory;
 }
 
+void RuntimeSgprPixels() {
+    Registered(RuntimeIndirectVertexHeader, RuntimeIndirectVertexCode.data(), sizeof(RuntimeIndirectVertexCode), 2);
+    Registered(IndirectPixelHeader, IndirectPixelCode.data(), sizeof(IndirectPixelCode), 1);
+    IndirectInputs inputs{&FragmentInput[512], false, 1.0f, false, false, true};
+    const std::array records{IndirectRecord{3, 1, 700, 40}, IndirectRecord{0, 1, 300, 7}, IndirectRecord{3, 2, 500, 12}};
+    const auto check = [&](std::span<const IndirectRecord> arguments, std::optional<std::uint32_t> count = std::nullopt, bool queued = false) {
+        auto control = inputs;
+        control.direct = true;
+        const auto expected = SubmitIndirect(arguments, false, false, false, count, control);
+        const auto actual = SubmitIndirect(arguments, false, queued, false, count, inputs);
+        Require(actual == expected, "runtime DrawIndex pixels differ from CPU expansion");
+        return actual;
+    };
+    const auto all = check(records);
+    Require(all != check(records, 1), "runtime DrawIndex fixture did not distinguish record ordinals");
+    for (const auto count : {0u, 1u, 2u, 99u}) check(records, count);
+    check(records, 99, true);
+    inputs.alternateArguments = true;
+    check(records, 99, true);
+    const std::array<IndirectRecord, 1> single{records[0]};
+    Require(check(single, 99) == check(single, 99), "separate packets did not reset DrawIndex");
+    Registered(PatchedIndirectVertexHeader, PatchedIndirectVertexCode.data(), sizeof(PatchedIndirectVertexCode), 2);
+    inputs.runtimeIndex = false;
+    inputs.patchedOffsets = true;
+    auto control = inputs;
+    control.direct = true;
+    const std::array fallback{IndirectRecord{3, 1, std::bit_cast<std::uint32_t>(-0.5f), std::bit_cast<std::uint32_t>(-0.25f)}, IndirectRecord{3, 2, 0, 0}};
+    Require(SubmitIndirect(fallback, true, true, false, std::nullopt, inputs) == SubmitIndirect(fallback, true, false, false, std::nullopt, control), "original-argument fallback pixels differ from CPU expansion");
+}
+
 void QueuedFragmentWordInvalidatesFrontPage() {
     using namespace AgcDriver::DriverDetail;
     Require(DeferLabels() && !QueuedLabelTable(), "shared-page regression requires deferred labels with the queued-label table disabled");
@@ -406,7 +443,7 @@ void QueuedFragmentWordInvalidatesFrontPage() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
         Require(_putenv_s("APS5_NO_QUEUED_LABELS", "1") == 0 && _putenv_s("APS5_LABEL_FLUSH_US", "60000000") == 0, "cannot configure deferred-label regression");
@@ -421,6 +458,11 @@ int main() {
             libraries = device->GraphicsPipelineLibraries();
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
+        if (argc == 2 && std::string(argv[1]) == "--runtime-sgprs") {
+            RuntimeSgprPixels();
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
         ThirdDrawHitsTheCache(libraries);
         RecentlyHitDrawSurvivesColdInsertions();
         EmptyCpuIndirectDrawsSkipFragmentCapture();
