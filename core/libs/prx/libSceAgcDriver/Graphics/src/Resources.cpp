@@ -106,8 +106,8 @@ bool SubmitWorkerEnabled() {
 }
 
 std::shared_future<void> EnqueueSubmitWork(std::function<void()> work) {
-    static SubmitWorker worker;
-    return worker.Enqueue(std::move(work));
+    static auto* const worker = new SubmitWorker();
+    return worker->Enqueue(std::move(work));
 }
 
 VkResult OrderedQueueCall(const std::function<VkResult()>& work) {
