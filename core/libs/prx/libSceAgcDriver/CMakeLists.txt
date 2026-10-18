@@ -187,6 +187,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineLibrary.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MemoryLedger.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
@@ -797,6 +798,12 @@ if(BUILD_TESTING)
     add_test(NAME agc_buffer_pool COMMAND agc_buffer_pool_tests)
     if(WIN32)
         set_tests_properties(agc_buffer_pool PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_memory_ledger COMMAND agc_buffer_pool_tests)
+    set_tests_properties(agc_memory_ledger PROPERTIES ENVIRONMENT "APS5_PROFILE_MEMORY=1")
+    if(WIN32)
+        set_tests_properties(agc_memory_ledger PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

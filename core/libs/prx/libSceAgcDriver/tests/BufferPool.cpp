@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MemoryLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
@@ -954,6 +955,60 @@ void RebarUploadReuse() {
     Expect(RebarMemory().live == 0 && mock.liveBytes == 0, "ReBAR allocations stayed charged after the pool was freed");
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL LedgerFakeAllocate(VkDevice, const VkMemoryAllocateInfo*, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
+    static std::uintptr_t next = 0x1000;
+    next += 0x10;
+    *memory = reinterpret_cast<VkDeviceMemory>(next);
+    return VK_SUCCESS;
+}
+
+int ledgerFrees = 0;
+
+VKAPI_ATTR void VKAPI_CALL LedgerFakeFree(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {
+    ++ledgerFrees;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL LedgerFakeResolver(VkDevice, const char* name) {
+    if (std::strcmp(name, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LedgerFakeAllocate);
+    if (std::strcmp(name, "vkFreeMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LedgerFakeFree);
+    return nullptr;
+}
+
+void MemoryLedgerAccounting() {
+    const auto resolver = AgcDriver::Graphics::MemoryLedgerResolver(&LedgerFakeResolver);
+    if (!AgcDriver::Graphics::MemoryLedgerEnabled()) {
+        Expect(resolver == &LedgerFakeResolver, "the memory ledger wrapped the resolver while APS5_PROFILE_MEMORY is unset");
+        return;
+    }
+    Expect(resolver != &LedgerFakeResolver, "the memory ledger did not wrap the resolver under APS5_PROFILE_MEMORY");
+    VkPhysicalDeviceMemoryProperties properties{};
+    properties.memoryTypeCount = 2;
+    properties.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    properties.memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    AgcDriver::Graphics::MemoryLedgerSetProperties(properties);
+    const auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(resolver(VK_NULL_HANDLE, "vkAllocateMemory"));
+    const auto release = reinterpret_cast<PFN_vkFreeMemory>(resolver(VK_NULL_HANDLE, "vkFreeMemory"));
+    Expect(allocate != nullptr && release != nullptr, "the memory ledger resolved no allocation entry points");
+    VkMemoryAllocateInfo device{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, 3u << 20u, 0};
+    VkMemoryAllocateInfo host{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, 5u << 20u, 1};
+    VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+    VkMemoryAllocateInfo imported{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, 7u << 20u, 1};
+    VkDeviceMemory first = VK_NULL_HANDLE, second = VK_NULL_HANDLE, third = VK_NULL_HANDLE;
+    allocate(VK_NULL_HANDLE, &device, nullptr, &first);
+    allocate(VK_NULL_HANDLE, &host, nullptr, &second);
+    allocate(VK_NULL_HANDLE, &imported, nullptr, &third);
+    release(VK_NULL_HANDLE, second, nullptr);
+    const auto report = AgcDriver::Graphics::MemoryLedgerReport();
+    Expect(report.find("device/0 3 MiB in 1;") != std::string::npos, "the memory ledger lost a live device allocation: " + report);
+    Expect(report.find("imported 7 MiB in 1;") != std::string::npos, "the memory ledger did not count a host import apart: " + report);
+    Expect(report.find("host-cached/1 5 MiB in") == std::string::npos, "the memory ledger kept a freed allocation live: " + report);
+    Expect(report.find("agc_buffer_pool_tests.exe+0x") != std::string::npos, "the memory ledger did not name call sites by module: " + report);
+    Expect(ledgerFrees == 1, "the memory ledger did not forward the free");
+    release(VK_NULL_HANDLE, first, nullptr);
+    release(VK_NULL_HANDLE, third, nullptr);
+    Expect(AgcDriver::Graphics::MemoryLedgerReport().find("live Vulkan memory by type: top sites") != std::string::npos, "the memory ledger kept freed allocations live");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--staging-zero-only") {
@@ -962,6 +1017,7 @@ int main(int argc, char** argv) {
             std::puts("zero staging retention tests passed");
             return 0;
         }
+        MemoryLedgerAccounting();
         RebarEligibilityAndBudget();
         RebarUploadReuse();
         CopyDiagnostics();
