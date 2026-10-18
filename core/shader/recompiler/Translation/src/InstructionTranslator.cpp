@@ -193,7 +193,10 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const auto reg = static_cast<ScalarReg>(options.userDataBaseRegister + index);
         const auto* patch = options.indirectSgprs;
         const auto sgpr = static_cast<std::int32_t>(options.userDataBaseRegister + index);
-        IrValue& value = patch != nullptr && sgpr == patch->baseVertex ? builtin(StageInputKind::BaseVertex) : patch != nullptr && sgpr == patch->firstInstance ? builtin(StageInputKind::BaseInstance) : patch != nullptr && sgpr == patch->drawIndex ? builtin(StageInputKind::DrawIndex) : entryIr.GetUserData(reg);
+        const auto* fetch = options.embeddedFetch;
+        const bool vertexBuiltin = patch != nullptr && fetch != nullptr && fetch->vertexOffsetSgpr == patch->baseVertex && (patch->indexed || patch->indxOffset == 0);
+        const bool instanceBuiltin = patch != nullptr && fetch != nullptr && fetch->instanceOffsetSgpr == patch->firstInstance;
+        IrValue& value = patch != nullptr && sgpr == patch->drawIndex ? builtin(StageInputKind::IndirectArgument, IndirectSgprDrawIndex) : patch != nullptr && sgpr == patch->firstInstance ? (instanceBuiltin ? builtin(StageInputKind::BaseInstance) : builtin(StageInputKind::IndirectArgument, patch->indexed ? 4u : 3u)) : patch != nullptr && sgpr == patch->baseVertex ? (vertexBuiltin ? builtin(StageInputKind::BaseVertex) : builtin(StageInputKind::IndirectArgument, patch->indexed ? 3u : 2u)) : entryIr.GetUserData(reg);
         entryIr.SetScalarReg(reg, value);
         entryIr.SetScalarMaskTag(reg, entryIr.ConstantBool(false));
     }

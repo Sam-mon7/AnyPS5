@@ -39,6 +39,31 @@ const ShaderWorkgroupInputInfo* ShaderWorkgroupInputFor(const SpirvEmitterState&
 }
 
 std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std::uint32_t component) {
+    if (kind == StageInputKind::IndirectArgument) {
+        const auto push = [&](std::uint32_t word) {
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, IndirectSgprPushOffset / 4u + word));
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+            return value;
+        };
+        const auto wide = [&](std::uint32_t value) { return Unary(state, spv::OpUConvert, TypeScalarU64(state), value); };
+        const auto load = [&](std::uint32_t address, std::uint32_t offset) {
+            const auto pointer = state.module.AllocateId();
+            const auto element = Binary(state, spv::OpIAdd, TypeScalarU64(state), address, BdaConstant(state, offset));
+            state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32(state)), pointer, element);
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, spv::MemoryAccessAlignedMask, 4u);
+            return value;
+        };
+        const auto pair = [&](std::uint32_t low, std::uint32_t high) { return Binary(state, spv::OpBitwiseOr, TypeScalarU64(state), wide(low), Binary(state, spv::OpShiftLeftLogical, TypeScalarU64(state), wide(high), ConstantU32(state, 32u))); };
+        const auto draw = EmitBinaryU32(state, spv::OpIAdd, EmitBuiltinU32(state, StageInputKind::DrawIndex, 0u), push(3u));
+        const auto table = Binary(state, spv::OpIAdd, TypeScalarU64(state), pair(push(0u), push(1u)), Binary(state, spv::OpIMul, TypeScalarU64(state), wide(draw), wide(push(2u))));
+        if (component == IndirectSgprDrawIndex) return EmitBinaryU32(state, spv::OpIAdd, load(table, 16u), EmitBinaryU32(state, spv::OpIMul, draw, load(table, 20u)));
+        const auto record = Binary(state, spv::OpIAdd, TypeScalarU64(state), wide(load(table, 12u)), wide(draw));
+        const auto address = Binary(state, spv::OpIAdd, TypeScalarU64(state), pair(load(table, 0u), load(table, 4u)), Binary(state, spv::OpIMul, TypeScalarU64(state), record, wide(load(table, 8u))));
+        return load(address, component * 4u);
+    }
     if (kind == StageInputKind::LocalInvocationIndex) {
         return EmitLocalInvocationIndex(state);
     }

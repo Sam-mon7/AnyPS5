@@ -153,7 +153,7 @@ void EmitBaseHeader(SpirvModule& module, const IrProgram& program) {
         module.EmitCapability(spv::CapabilityDrawParameters);
         module.EmitExtension("SPV_KHR_shader_draw_parameters");
     }
-    const bool physical = program.Info().usesDma || program.Resources().stage == IrShaderStage::Mesh;
+    const bool physical = program.Info().usesDma || program.Resources().stage == IrShaderStage::Mesh || std::ranges::any_of(program.Info().inputs, [](const auto& input) { return input.kind == StageInputKind::IndirectArgument; });
     if (physical) {
         module.EmitCapability(spv::CapabilityInt64);
         module.EmitCapability(spv::CapabilityPhysicalStorageBufferAddresses);
@@ -206,6 +206,7 @@ void DefineInputs(SpirvEmitterState& state) {
         emulation = LayoutBarycentricEmulation(parameters, {true, reads(StageInputKind::BaryCoordSmooth), reads(StageInputKind::BaryCoordNoPerspective)});
     }
     for (auto& input : state.inputs) {
+        if (input.kind == StageInputKind::IndirectArgument) continue;
         if (pixelStage && input.kind == StageInputKind::Parameter) {
             const auto location = PixelParameterLocation(state, input.location);
             const auto shared = std::find_if(state.inputs.begin(), state.inputs.end(), [&](const SpirvInputBinding& other) {
@@ -412,7 +413,7 @@ void DefineOutputs(SpirvEmitterState& state) {
 void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
-    if (layout.UsesPushData() || state.stencilReplay || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl) {
+    if (layout.UsesPushData() || state.stencilReplay || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl || std::ranges::any_of(state.program.Info().inputs, [](const auto& input) { return input.kind == StageInputKind::IndirectArgument; })) {
         const auto type = PushConstantBlockType(state);
         state.pushConstantVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
         state.module.AddName(type, "BufferResource");

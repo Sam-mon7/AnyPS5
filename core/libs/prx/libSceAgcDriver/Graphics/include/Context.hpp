@@ -136,6 +136,8 @@ inline std::uint64_t& DeviceProcLookups() {
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
+class IndirectArgumentPipeline;
+
 struct Context {
     VkDevice device;
     VkPhysicalDevice physical;
@@ -229,6 +231,8 @@ struct Context {
     std::shared_ptr<GpuCopyCheckpoints> copyCheckpoints;
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
     std::uint32_t queueFamilyIndex = 0;
+
+    std::shared_ptr<IndirectArgumentPipeline>* indirectArgumentPipeline = nullptr;
 
     PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
