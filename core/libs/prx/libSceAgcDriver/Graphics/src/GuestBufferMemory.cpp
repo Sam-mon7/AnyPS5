@@ -992,6 +992,15 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     return importRunAt(context, state, std::move(run), false, address, lease, end, evict);
 }
 
+const HostImport* importSingleRange(const Context& context, HostImports& state, const std::shared_ptr<const GuestAllocations::Range>& range, const GuestAllocations::Lease& lease) {
+    const auto end = range->address + range->bytes;
+    if (!importsStale(context, state)) {
+        if (const auto* current = findImport(state, range->address, end)) return current;
+    }
+    if (aliasesLiveMirror(context.device, range->address, static_cast<std::size_t>(range->bytes)) || mirrorBackingOverlaps(context.device, range->address, end)) return nullptr;
+    return importRunAt(context, state, ImportRun{range->address, range->bytes, {range}}, false, range->address, lease, 0, true);
+}
+
 const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
     if (const auto* low = findImport(state, begin, begin + 1); low != nullptr && low->joined) begin = low->base;
     if (const auto* high = findImport(state, end - 1, end); high != nullptr && high->joined) end = high->base + high->bytes;
@@ -3811,7 +3820,7 @@ void RetireVramMirrorRecorder(Recorder& recorder) noexcept {
 
 namespace {
 
-const HostImport* hostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
+const HostImport* hostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, bool create = true) {
     std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
     if (VramMirrorWrites()) gpu.lock();
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
@@ -3837,7 +3846,7 @@ const HostImport* hostImportFor(const Context& context, std::uint64_t address, s
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    if (!runCovers(lease, address, address + bytes)) return ready(findImport(state, address, address + bytes));
+    if (!create || !runCovers(lease, address, address + bytes)) return ready(findImport(state, address, address + bytes));
     return ready(importAccess(context, state, address, address + bytes, lease));
 }
 
@@ -3863,7 +3872,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 const HostImport* HostImportForFill(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (!VramLazyWrites()) return hostImportFor(context, address, bytes);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || aliasesLiveMirror(context.device, address, bytes)) return nullptr;
-    return hostImportFor(context, address, bytes);
+    return hostImportFor(context, address, bytes, false);
 }
 
 bool LazyMirrorFillCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
@@ -4165,7 +4174,7 @@ void GuestBufferMemory::AcquireRegistered() {
             const HostImport* entry = nullptr;
             const bool mirrorFirst = vramMirrors() && mirrorsEnabled() && (!range->writable || VramMirrorWrites());
             if (mirrorFirst) VramMirrorCounters().readOnlyRanges.fetch_add(1, std::memory_order_relaxed);
-            if (importable && !mirrorFirst && !(VramLazyWrites() && range->writable)) {
+            if (importable && !mirrorFirst && !VramLazyWrites()) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
                 entry = importAllocation(context, state, range->address, lease, 0, false);
@@ -4193,7 +4202,7 @@ void GuestBufferMemory::AcquireRegistered() {
             if (entry == nullptr && importable) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
-                entry = importAllocation(context, state, range->address, lease);
+                entry = VramLazyWrites() ? importSingleRange(context, state, range, lease) : importAllocation(context, state, range->address, lease);
                 lap(timing.importsUs, at);
             }
             if (entry != nullptr) {
@@ -5076,7 +5085,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         if (importsStale(context, state)) refreshImports(context, state, importRanges());
         importsRefreshed = true;
         for (const auto& region : regions) {
-            if (!region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region) || !lazyImportAllowed(region.writable, region.begin, region.end, addressable)) continue;
+            if (VramLazyWrites() || !region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region)) continue;
             if (findImport(state, region.begin, region.end) != nullptr || runCovers(importRanges(), region.begin, region.end)) continue;
             static_cast<void>(importJoined(context, state, region.begin, region.end, importRanges()));
         }
@@ -5243,11 +5252,11 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             const bool sparseRun = region.sparseHeap && region.sparse && sparseRunImportsEnabled();
-            if (entry == nullptr && !sparseRun) {
+            if (entry == nullptr && !sparseRun && !VramLazyWrites()) {
                 entry = importAccess(context, state, region.begin, region.end, importRanges());
             }
             bool runImport = false;
-            if (entry == nullptr && sparseRun && !region.backed.empty() && region.backed.front().first == region.begin && !WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) {
+            if (entry == nullptr && sparseRun && !VramLazyWrites() && !region.backed.empty() && region.backed.front().first == region.begin && !WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) {
                 const auto committedEnd = region.backed.back().second;
                 const auto neededEnd = std::min(region.end, std::max(committedEnd, std::max(region.lastView, region.begin) + 4u));
                 const auto covers = [&](const HostImport* candidate) { return candidate != nullptr && candidate->base <= region.begin && candidate->base + candidate->bytes >= neededEnd; };

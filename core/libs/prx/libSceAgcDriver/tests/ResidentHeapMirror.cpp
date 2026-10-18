@@ -1238,6 +1238,49 @@ void RunVramLazyTests(const AgcDriver::Graphics::Context& device, AgcDriver::Gra
             recorder.FlushDeferredReleases();
             GuestAllocations::Mutation().Remove(readOnly);
             VirtualFree(readOnly, 0, MEM_RELEASE);
+            {
+                auto* joined = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * block, block));
+                auto* twin = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(block, block));
+                const auto joinedSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, 2 * block, nullptr);
+                Require(joined != nullptr && twin != nullptr && joinedSection != nullptr, "cannot create contiguous lazy import ranges");
+                GuestArena::GuestArenaMap_nid_postfix(joined, 2 * block, joinedSection, 0, PAGE_READWRITE);
+                GuestArena::GuestArenaMap_nid_postfix(twin, block, joinedSection, 0, PAGE_READWRITE);
+                std::memset(joined, 0x22, 2 * block);
+                {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Add(joined, block, true, true, true);
+                    mutation.Add(joined + block, block, true, true, true);
+                    mutation.Add(twin, block, true, true, true);
+                }
+                const auto joinedAddress = reinterpret_cast<std::uint64_t>(joined);
+                const auto beforeJoined = VramLazyCounters();
+                {
+                    Memory::BumpCollectEpoch();
+                    GuestBufferMemory space(context);
+                    space.SetAddressWrites(false);
+                    space.AcquireRegistered();
+                    space.Upload(true);
+                    Require(HostImportCovers(context, joinedAddress, block) && !HostImportCovers(context, joinedAddress + block, 1), "an unordered import joined a mirrorable neighbour");
+                    Require(VramLazyCounters().unorderedImportRanges == beforeJoined.unorderedImportRanges + 2 && VramLazyCounters().unorderedImportBytes == beforeJoined.unorderedImportBytes + 2 * block,
+                        "only the aliased ranges of a contiguous pair were not counted as unordered");
+                    space.WriteBack();
+                }
+                recorder.Sync();
+                recorder.FlushDeferredReleases();
+                ClearImageMirrors(context.device);
+                ClearHostImports(context.device);
+                {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(joined);
+                    mutation.Remove(joined + block);
+                    mutation.Remove(twin);
+                }
+                GuestArena::GuestArenaReset_nid_postfix(joined, 2 * block);
+                GuestArena::GuestArenaRelease_nid_postfix(joined, 2 * block);
+                GuestArena::GuestArenaReset_nid_postfix(twin, block);
+                GuestArena::GuestArenaRelease_nid_postfix(twin, block);
+                CloseHandle(joinedSection);
+            }
             GuestAllocations::Mutation().Remove(flag);
             VirtualFree(flag, 0, MEM_RELEASE);
         }
