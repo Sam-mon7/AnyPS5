@@ -47,6 +47,61 @@ struct AprFile {
     std::uint64_t size;
 };
 
+struct AprProfile {
+    std::atomic<std::uint64_t> submits{0}, inlineSubmits{0}, inlineNs{0}, maxInlineNs{0}, queuedSubmits{0}, deferredSubmits{0}, maxPending{0};
+    std::atomic<std::uint64_t> reads{0}, workerReads{0}, bytes{0}, openNs{0}, readNs{0}, maxReadNs{0};
+    std::atomic<std::uint64_t> guestWaits{0}, guestWaitNs{0}, maxGuestWaitNs{0}, commandWaits{0}, commandWaitNs{0};
+    std::atomic<std::uint64_t> lastReport{0};
+    std::mutex threadsLock;
+    std::map<std::uint32_t, std::pair<std::uint64_t, std::uint64_t>> inlineByThread;
+};
+
+bool _aprProfiled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_APR") != nullptr;
+    return enabled;
+}
+
+AprProfile& _aprProfile() {
+    static auto& profile = *new AprProfile();
+    return profile;
+}
+
+std::uint64_t _aprNow() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void _aprMax(std::atomic<std::uint64_t>& into, std::uint64_t value) {
+    auto seen = into.load(std::memory_order_relaxed);
+    while (seen < value && !into.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {}
+}
+
+thread_local bool t_aprWorker = false;
+
+void _aprReport() {
+    auto& profile = _aprProfile();
+    const auto now = _aprNow();
+    auto last = profile.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        profile.lastReport.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10'000'000'000ull || !profile.lastReport.compare_exchange_strong(last, now)) return;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    const auto ms = [](unsigned long long ns) { return static_cast<double>(ns) / 1e6; };
+    const auto submits = take(profile.submits), inlineSubmits = take(profile.inlineSubmits), inlineNs = take(profile.inlineNs), maxInlineNs = take(profile.maxInlineNs);
+    const auto queued = take(profile.queuedSubmits), deferred = take(profile.deferredSubmits), maxPending = take(profile.maxPending);
+    const auto reads = take(profile.reads), workerReads = take(profile.workerReads), bytes = take(profile.bytes), openNs = take(profile.openNs), readNs = take(profile.readNs), maxReadNs = take(profile.maxReadNs);
+    const auto guestWaits = take(profile.guestWaits), guestWaitNs = take(profile.guestWaitNs), maxGuestWaitNs = take(profile.maxGuestWaitNs), commandWaits = take(profile.commandWaits), commandWaitNs = take(profile.commandWaitNs);
+    std::string threads;
+    {
+        std::lock_guard lock(profile.threadsLock);
+        for (const auto& [thread, entry] : profile.inlineByThread) threads += " " + std::to_string(thread) + ":" + std::to_string(entry.first) + "/" + std::to_string(entry.second / 1000000u) + "ms";
+        profile.inlineByThread.clear();
+    }
+    std::fprintf(stderr, "[apr] (10 s): submits %llu (inline %llu holding the caller %.0f ms, max %.1f ms; queued %llu; deferred at a wait %llu; max pending %llu); reads %llu (%llu on the workers), %.1f MiB, open %.0f ms, read %.0f ms, max %.1f ms; guest waits for submissions %llu, %.0f ms, max %.1f ms; worker wait commands %llu, %.0f ms; inline by thread (submits/ms):%s\n",
+        submits, inlineSubmits, ms(inlineNs), ms(maxInlineNs), queued, deferred, maxPending, reads, workerReads, static_cast<double>(bytes) / 1048576.0, ms(openNs), ms(readNs), ms(maxReadNs), guestWaits, ms(guestWaitNs), ms(maxGuestWaitNs), commandWaits, ms(commandWaitNs), threads.c_str());
+}
+
 std::mutex& g_filesLock = *new std::mutex();
 std::vector<AprFile>& g_files = *new std::vector<AprFile>();
 std::unordered_map<std::string, std::uint32_t>& g_idsByPath = *new std::unordered_map<std::string, std::uint32_t>();
@@ -160,12 +215,25 @@ void _readFile(const Apr::ReadFileCommand& command) {
     const auto file = _file(command.fileId);
     static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
     if (trace) std::fprintf(stderr, "[apr] read %s offset=0x%llx size=0x%llx -> 0x%llx\n", file.path.string().c_str(), static_cast<unsigned long long>(command.offset), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.destination));
+    const bool profiled = _aprProfiled();
+    const auto opening = profiled ? _aprNow() : 0;
     std::ifstream stream(file.path, std::ios::binary);
     if (!stream) throw std::runtime_error("APR: cannot open " + file.path.string());
     stream.seekg(static_cast<std::streamoff>(command.offset));
     const GuestArena::HostWrite destination(reinterpret_cast<void*>(command.destination), command.size);
     if (!destination.Open()) throw std::runtime_error("APR: the read destination of " + file.path.string() + " is not writable guest memory");
+    const auto reading = profiled ? _aprNow() : 0;
     stream.read(reinterpret_cast<char*>(command.destination), static_cast<std::streamsize>(command.size));
+    if (profiled) {
+        auto& profile = _aprProfile();
+        const auto done = _aprNow();
+        profile.reads.fetch_add(1, std::memory_order_relaxed);
+        if (t_aprWorker) profile.workerReads.fetch_add(1, std::memory_order_relaxed);
+        profile.bytes.fetch_add(command.size, std::memory_order_relaxed);
+        profile.openNs.fetch_add(reading - opening, std::memory_order_relaxed);
+        profile.readNs.fetch_add(done - reading, std::memory_order_relaxed);
+        _aprMax(profile.maxReadNs, done - opening);
+    }
     if (stream.bad()) throw std::runtime_error("APR: read failed for " + file.path.string());
     const auto read = static_cast<std::uint64_t>(stream.gcount());
     if (read != command.size) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
@@ -651,7 +719,12 @@ std::optional<Deferred> _execute(const Apr::CommandBufferObject& buffer, std::ui
             };
             const std::uint64_t reference = (command.reference & command.mask) << unused;
             if (defer && !_waitSatisfied(command.compare, (current() & command.mask) << unused, reference)) return Deferred{cursor, read};
+            const auto waiting = _aprProfiled() ? _aprNow() : 0;
             while (!_waitSatisfied(command.compare, (current() & command.mask) << unused, reference)) PreciseSleepUs(50);
+            if (waiting != 0) {
+                _aprProfile().commandWaits.fetch_add(1, std::memory_order_relaxed);
+                _aprProfile().commandWaitNs.fetch_add(_aprNow() - waiting, std::memory_order_relaxed);
+            }
             break;
         }
         case Apr::Opcode::WriteKernelEventQueue: {
@@ -725,6 +798,7 @@ struct AprQueue {
 AprQueue* _startQueue() {
     auto* created = new AprQueue();
     std::thread([created] {
+        t_aprWorker = true;
         for (;;) {
             AprQueue::Work work;
             {
@@ -758,7 +832,39 @@ AprQueue& _queue(bool amm) {
     return *queues[amm ? 1 : 0];
 }
 
+enum class SubmitPath { Inline, Queued, Deferred };
+
+std::uint32_t _submitTimed(const std::uint8_t* base, std::uint32_t bytes, bool amm, SubmitPath& path);
+
 std::uint32_t _submit(const std::uint8_t* base, std::uint32_t bytes, bool amm) {
+    SubmitPath path = SubmitPath::Inline;
+    if (!_aprProfiled()) return _submitTimed(base, bytes, amm, path);
+    auto& profile = _aprProfile();
+    const auto started = _aprNow();
+    const auto id = _submitTimed(base, bytes, amm, path);
+    const auto elapsed = _aprNow() - started;
+    profile.submits.fetch_add(1, std::memory_order_relaxed);
+    if (path == SubmitPath::Queued) profile.queuedSubmits.fetch_add(1, std::memory_order_relaxed);
+    else {
+        if (path == SubmitPath::Deferred) profile.deferredSubmits.fetch_add(1, std::memory_order_relaxed);
+        profile.inlineSubmits.fetch_add(1, std::memory_order_relaxed);
+        profile.inlineNs.fetch_add(elapsed, std::memory_order_relaxed);
+        _aprMax(profile.maxInlineNs, elapsed);
+        std::lock_guard lock(profile.threadsLock);
+#ifdef _WIN32
+        const auto thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+#else
+        const auto thread = static_cast<std::uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+        auto& entry = profile.inlineByThread[thread];
+        ++entry.first;
+        entry.second += elapsed;
+    }
+    _aprReport();
+    return id;
+}
+
+std::uint32_t _submitTimed(const std::uint8_t* base, std::uint32_t bytes, bool amm, SubmitPath& path) {
     auto& queue = _queue(amm);
     std::lock_guard submitLock(queue.submit);
     std::uint32_t id;
@@ -769,20 +875,26 @@ std::uint32_t _submit(const std::uint8_t* base, std::uint32_t bytes, bool amm) {
         queued = queue.running || !queue.pending.empty();
     }
     const auto enqueue = [&](Deferred resume) {
+        std::size_t pending = 0;
         {
             std::lock_guard lock(queue.mutex);
             queue.pending.push_back({std::vector<std::uint8_t>(base, base + bytes), resume, id});
+            pending = queue.pending.size();
         }
         queue.ready.notify_one();
+        if (_aprProfiled()) _aprMax(_aprProfile().maxPending, pending);
     };
     if (queued) {
+        path = SubmitPath::Queued;
         enqueue({});
         return id;
     }
     if (const auto deferred = _execute(Apr::CommandBufferObject{Apr::BufferType::Generic, 0, bytes, 0, bytes, const_cast<std::uint8_t*>(base)}, 0, {}, true)) {
+        path = SubmitPath::Deferred;
         enqueue(*deferred);
         return id;
     }
+    path = SubmitPath::Inline;
     {
         std::lock_guard lock(queue.mutex);
         queue.completed = std::max(queue.completed, id);
@@ -793,8 +905,19 @@ std::uint32_t _submit(const std::uint8_t* base, std::uint32_t bytes, bool amm) {
 
 void _waitSubmitted(std::uint32_t id, bool amm) {
     auto& queue = _queue(amm);
-    std::unique_lock lock(queue.mutex);
-    queue.done.wait(lock, [&] { return queue.completed >= id || id > queue.submitted; });
+    const auto waiting = _aprProfiled() ? _aprNow() : 0;
+    {
+        std::unique_lock lock(queue.mutex);
+        queue.done.wait(lock, [&] { return queue.completed >= id || id > queue.submitted; });
+    }
+    if (waiting != 0) {
+        auto& profile = _aprProfile();
+        const auto elapsed = _aprNow() - waiting;
+        profile.guestWaits.fetch_add(1, std::memory_order_relaxed);
+        profile.guestWaitNs.fetch_add(elapsed, std::memory_order_relaxed);
+        _aprMax(profile.maxGuestWaitNs, elapsed);
+        _aprReport();
+    }
 }
 
 std::uint32_t AmmSubmit_nid_no_patch(void* base, std::uint32_t bytes) {

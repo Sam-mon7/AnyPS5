@@ -33,6 +33,13 @@ if(BUILD_TESTING)
         set_tests_properties(guest_ampr_threads PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAmpr>")
     endif()
+    add_test(NAME guest_ampr_markers_profiled COMMAND guest_ampr_tests)
+    add_test(NAME guest_ampr_threads_profiled COMMAND guest_ampr_threads_tests)
+    set_tests_properties(guest_ampr_markers_profiled guest_ampr_threads_profiled PROPERTIES ENVIRONMENT "APS5_PROFILE_APR=1")
+    if(WIN32)
+        set_tests_properties(guest_ampr_markers_profiled guest_ampr_threads_profiled PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAmpr>")
+    endif()
 
     if(MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
         enable_language(ASM)
