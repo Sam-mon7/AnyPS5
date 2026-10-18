@@ -28,6 +28,7 @@ public:
     void Invalidate();
 
 private:
+    Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, Access access, const void* caller);
     void initializeAddress(VkBufferUsageFlags usage);
     void release() noexcept;
     Context context;

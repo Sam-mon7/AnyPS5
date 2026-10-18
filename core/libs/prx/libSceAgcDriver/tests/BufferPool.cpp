@@ -994,6 +994,7 @@ void MemoryLedgerAccounting() {
     VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
     VkMemoryAllocateInfo imported{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, 7u << 20u, 1};
     VkDeviceMemory first = VK_NULL_HANDLE, second = VK_NULL_HANDLE, third = VK_NULL_HANDLE;
+    const AgcDriver::Graphics::MemoryLedgerCaller tag(reinterpret_cast<const void*>(&MemoryLedgerAccounting));
     allocate(VK_NULL_HANDLE, &device, nullptr, &first);
     allocate(VK_NULL_HANDLE, &host, nullptr, &second);
     allocate(VK_NULL_HANDLE, &imported, nullptr, &third);
@@ -1003,6 +1004,7 @@ void MemoryLedgerAccounting() {
     Expect(report.find("imported 7 MiB in 1;") != std::string::npos, "the memory ledger did not count a host import apart: " + report);
     Expect(report.find("host-cached/1 5 MiB in") == std::string::npos, "the memory ledger kept a freed allocation live: " + report);
     Expect(report.find("agc_buffer_pool_tests.exe+0x") != std::string::npos, "the memory ledger did not name call sites by module: " + report);
+    Expect(report.find("<agc_buffer_pool_tests.exe+0x") != std::string::npos, "the memory ledger kept no caller chain: " + report);
     Expect(ledgerFrees == 1, "the memory ledger did not forward the free");
     release(VK_NULL_HANDLE, first, nullptr);
     release(VK_NULL_HANDLE, third, nullptr);

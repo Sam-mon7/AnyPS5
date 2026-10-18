@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MemoryLedger.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuCopyCheckpoints.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuAddressBindings.hpp"
@@ -52,10 +53,13 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
 
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, Access access) : Buffer(context, size, usage, access == Access::DeviceMirror ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, access) {}
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, Access access) : Buffer(context, size, usage, access == Access::DeviceMirror ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, access, __builtin_return_address(0)) {}
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, Access access) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties), uploadOnly(access == Access::UploadOnly && RebarUploads()), residentMirror(access == Access::ResidentMirror || access == Access::DeviceMirror) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, Access access) : Buffer(context, size, usage, properties, access, __builtin_return_address(0)) {}
+
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, Access access, const void* caller) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties), uploadOnly(access == Access::UploadOnly && RebarUploads()), residentMirror(access == Access::ResidentMirror || access == Access::DeviceMirror) {
     Require(size != 0, "zero-sized GPU buffer");
+    const MemoryLedgerCaller ledgerCaller(caller);
     const bool rebarRequested = uploadOnly || access == Access::ResidentMirror;
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");

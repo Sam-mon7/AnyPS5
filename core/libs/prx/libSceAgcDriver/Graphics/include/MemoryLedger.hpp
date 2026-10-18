@@ -12,6 +12,17 @@ void MemoryLedgerSetProperties(const VkPhysicalDeviceMemoryProperties& propertie
 bool MemoryLedgerEnabled();
 std::string MemoryLedgerReport();
 
+class MemoryLedgerCaller {
+public:
+    explicit MemoryLedgerCaller(const void* caller);
+    ~MemoryLedgerCaller();
+    MemoryLedgerCaller(const MemoryLedgerCaller&) = delete;
+    MemoryLedgerCaller& operator=(const MemoryLedgerCaller&) = delete;
+
+private:
+    const void* previous;
+};
+
 }
 
 #endif

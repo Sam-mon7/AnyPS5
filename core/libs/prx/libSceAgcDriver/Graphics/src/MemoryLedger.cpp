@@ -21,6 +21,8 @@ namespace {
 
 constexpr std::uint32_t ImportedKey = 0x100u;
 
+thread_local const void* callerTag = nullptr;
+
 struct Entry {
     VkDeviceSize bytes = 0;
     std::uint32_t key = 0;
@@ -149,12 +151,7 @@ void maybeReport(Ledger& ledger) {
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL allocate(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
-    std::array<std::uintptr_t, 4> chain{reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)), 0, 0, 0};
-#ifdef _WIN32
-    std::array<void*, 4> frames{};
-    const auto captured = RtlCaptureStackBackTrace(1, static_cast<DWORD>(frames.size()), frames.data(), nullptr);
-    for (USHORT index = 0; index < captured; ++index) chain[index] = reinterpret_cast<std::uintptr_t>(frames[index]);
-#endif
+    const std::array<std::uintptr_t, 4> chain{reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)), reinterpret_cast<std::uintptr_t>(callerTag), 0, 0};
     auto& ledger = State();
     const auto result = ledger.allocate(device, info, callbacks, memory);
     if (result != VK_SUCCESS) return result;
@@ -199,6 +196,14 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL resolve(VkDevice device, const char* na
     return ledger.resolver(device, name);
 }
 
+}
+
+MemoryLedgerCaller::MemoryLedgerCaller(const void* caller) : previous(callerTag) {
+    callerTag = caller;
+}
+
+MemoryLedgerCaller::~MemoryLedgerCaller() {
+    callerTag = previous;
 }
 
 bool MemoryLedgerEnabled() {
