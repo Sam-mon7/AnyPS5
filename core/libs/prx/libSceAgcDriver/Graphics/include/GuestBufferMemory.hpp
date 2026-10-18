@@ -82,6 +82,26 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
 // re-checks with HostImportFor when it binds the import.
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes);
+
+struct MirrorSourceProof {
+    std::uint64_t identity = 0;
+    std::uint64_t revision = 0;
+    std::vector<std::uint64_t> generations;
+    bool operator==(const MirrorSourceProof& other) const {
+        return identity != 0 && identity == other.identity && revision == other.revision && generations == other.generations && std::none_of(generations.begin(), generations.end(), [](auto value) { return value == 0; });
+    }
+};
+
+struct MirrorSource {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    std::shared_ptr<void> lifetime;
+    MirrorSourceProof proof;
+};
+
+bool MirrorSourceCovers(const Context& context, std::uint64_t address, std::size_t bytes);
+std::optional<MirrorSource> MirrorSourceFor(const Context& context, std::uint64_t address, std::size_t bytes);
+bool MirrorSourceUnchanged(const Context& context, std::uint64_t address, std::size_t bytes, const MirrorSourceProof& proof, std::uint64_t generation);
 // Whether a readable registered allocation contains [address, address + bytes) right now (one
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes);

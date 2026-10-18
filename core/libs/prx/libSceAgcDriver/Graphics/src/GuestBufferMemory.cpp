@@ -5745,6 +5745,61 @@ std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, s
     return mirror != nullptr && !mirror->writable ? mirror->serial : 0;
 }
 
+bool MirrorSourceCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (!VramTextures() || bytes == 0 || bytes > UINT64_MAX - address) return false;
+    const auto mirror = findMirror(context, address, address + bytes);
+    if (mirror == nullptr) return false;
+    if (!mirror->sparse) return true;
+    const auto pieces = GuestMemory::CommittedRanges(address, bytes);
+    return pieces.size() == 1 && pieces.front().first == address && pieces.front().second == address + bytes;
+}
+
+std::optional<MirrorSource> MirrorSourceFor(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (!VramTextures() || bytes == 0 || bytes > UINT64_MAX - address) return std::nullopt;
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "a mirror texture source requires the GPU lock");
+    const auto mirror = findMirror(context, address, address + bytes);
+    if (mirror == nullptr) return std::nullopt;
+    auto lease = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, false);
+    if (lease == nullptr || !lease->readable || !sameRange(mirror->range, lease) || mirror->retired.load(std::memory_order_acquire)) return std::nullopt;
+    ensurePinWaiter();
+    const auto pieces = GuestMemory::CommittedRanges(address, bytes);
+    if (pieces.size() != 1 || pieces.front().first != address || pieces.front().second != address + bytes) return std::nullopt;
+    validateMirrorAliases(*mirror);
+    const auto generation = mirror->writable && !mirror->heap ? GuestMemory::CollectWritesUncached(address, bytes) : 0;
+    if (mirror->heap && mirror->sparse) {
+        std::vector<RefreshBlock> blocks;
+        if (!refreshWritableHeap(*mirror, blocks, true)) return std::nullopt;
+        compareBlocks(blocks);
+    } else refreshMirror(*mirror, address, bytes, true);
+    struct Use {
+        std::shared_ptr<ImageMirror> mirror;
+        std::shared_ptr<const GuestAllocations::Range> lease;
+        Use(std::shared_ptr<ImageMirror> mirror, std::shared_ptr<const GuestAllocations::Range> lease) : mirror(std::move(mirror)), lease(std::move(lease)) {
+            this->mirror->activeUsers.fetch_add(1, std::memory_order_release);
+        }
+        ~Use() { mirror->activeUsers.fetch_sub(1, std::memory_order_release); }
+    };
+    MirrorSource source{mirror->buffer->Handle(), address - mirror->base, std::make_shared<Use>(mirror, std::move(lease)), {mirror->serial, mirror->gpuRevision, {}}};
+    if (mirror->heap) {
+        const auto first = static_cast<std::size_t>(address / 65536 - mirror->base / 65536);
+        const auto last = static_cast<std::size_t>((address + bytes - 1) / 65536 - mirror->base / 65536);
+        source.proof.generations.assign(mirror->generations.begin() + first, mirror->generations.begin() + last + 1);
+    } else if (mirror->writable) {
+        source.proof.generations.push_back(generation);
+    }
+    return source;
+}
+
+bool MirrorSourceUnchanged(const Context& context, std::uint64_t address, std::size_t bytes, const MirrorSourceProof& proof, std::uint64_t generation) {
+    if (!VramTextures() || proof.identity == 0 || generation == 0 || bytes == 0 || bytes > UINT64_MAX - address) return false;
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "a mirror texture proof requires the GPU lock");
+    const auto mirror = findMirror(context, address, address + bytes);
+    if (mirror == nullptr || mirror->serial != proof.identity || mirror->gpuRevision != proof.revision) return false;
+    const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, false);
+    if (range == nullptr || !range->readable || !sameRange(mirror->range, range)) return false;
+    return GuestMemory::CollectWritesUncached(address, bytes) != 0 && GuestMemory::UnchangedSince(address, bytes, generation);
+}
+
 std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, std::size_t bytes, bool reconcile) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& state = Imports();
