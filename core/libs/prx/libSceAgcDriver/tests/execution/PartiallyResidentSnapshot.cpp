@@ -266,6 +266,54 @@ void Run(const Context& context, ReservedSurface& surface) {
     AgcDriver::GuestMemory::SetFlushHook(nullptr);
 }
 
+void Superseded(const Context& context, ReservedSurface& surface) {
+    const bool dedupe = std::getenv("APS5_TEXTURE_DEDUPE") != nullptr;
+    const auto address = surface.Address();
+    surface.Commit(0, SurfaceBytes);
+    std::memset(surface.Data(), 0x5a, SurfaceBytes);
+    ClearCachedTextures(context.device);
+    const auto first = Descriptor(address);
+    auto second = first;
+    second[3] = (second[3] & ~0xfffu) | 5u | (4u << 3u) | (6u << 6u) | (7u << 9u);
+    auto third = first;
+    third[3] = (third[3] & ~0xfffu) | 4u | (6u << 3u) | (5u << 6u) | (7u << 9u);
+    const auto lookup = [&](const std::array<std::uint32_t, 8>& words) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto texture = CachedSampledTexture(context, words);
+        Require(texture != nullptr && !texture->ViewsStorageImage(), "the superseded-snapshot surface was not sampled through a snapshot");
+        return std::weak_ptr<Texture>(texture);
+    };
+    const auto entries = [] { return TextureCacheUsage().sampledEntries; };
+    {
+        auto unused = first;
+        unused[7] = 0x12345678u;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto plain = CachedSampledTexture(context, first);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto noisy = CachedSampledTexture(context, unused);
+        Require((plain == noisy) == dedupe && entries() == (dedupe ? 1u : 2u), dedupe ? "descriptors that differ in bits nothing decodes got separate textures" : "descriptors that differ in unused bits shared a texture without APS5_TEXTURE_DEDUPE");
+    }
+    ClearCachedTextures(context.device);
+    const auto firstView = lookup(first);
+    std::memset(surface.Data(), 0x77, SurfaceBytes);
+    const auto secondView = lookup(second);
+    Require(!firstView.expired() && !secondView.expired() && entries() == 2, "a snapshot rewritten in the frame it was used was dropped as superseded");
+    for (int frame = 0; frame < 3; ++frame) Recorder::CountPresent();
+    std::memset(surface.Data(), 0x33, SurfaceBytes);
+    const auto thirdView = lookup(third);
+    if (dedupe) Require(firstView.expired() && secondView.expired() && !thirdView.expired() && entries() == 1, "the snapshots of rewritten memory, unused for frames, were kept beside the snapshot that replaced them");
+    else Require(!firstView.expired() && !secondView.expired() && !thirdView.expired() && entries() == 3, "stale snapshots were dropped without APS5_TEXTURE_DEDUPE");
+    for (int frame = 0; frame < 3; ++frame) Recorder::CountPresent();
+    const auto fourthView = lookup(first);
+    Require(!thirdView.expired() && !fourthView.expired() && entries() == (dedupe ? 2u : 3u), "a snapshot of unchanged memory was dropped as superseded");
+    for (int frame = 0; frame < 3; ++frame) Recorder::CountPresent();
+    std::memset(surface.Data(), 0x33, SurfaceBytes);
+    const auto fifthView = lookup(second);
+    Require(!thirdView.expired() && !fourthView.expired() && !fifthView.expired() && entries() == 3, "snapshots of memory rewritten with the same bytes were dropped as superseded");
+    ClearCachedTextures(context.device);
+    Require(entries() == 0, "clearing the cache left entries behind");
+}
+
 void PendingStores(const Context& context, ReservedSurface& surface) {
     const auto address = surface.Address();
     const auto words = Descriptor(address);
@@ -330,6 +378,7 @@ int main(int argc, char** argv) {
             ReservedSurface surface;
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (argc == 2 && std::string_view(argv[1]) == "--pending-stores") PendingStores(context, surface);
+            else if (argc == 2 && std::string_view(argv[1]) == "--superseded") Superseded(context, surface);
             else Run(context, surface);
             ClearCachedTextures(context.device);
         }

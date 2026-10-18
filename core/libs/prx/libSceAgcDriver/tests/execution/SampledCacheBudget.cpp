@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureDuplicates.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -1120,6 +1121,212 @@ void memoryTests(Context context) {
     Require(SampledTextureMemory() == before, "a released texture still counts as sampled texture memory");
 }
 
+constexpr std::uint64_t Mib(std::uint64_t count) {
+    return count << 20u;
+}
+
+TextureCopy CopyAt(std::uint64_t address, TextureBacking backing = TextureBacking::Snapshot, std::uint64_t bytes = Mib(1)) {
+    TextureCopy copy;
+    copy.address = address;
+    copy.guestBytes = bytes;
+    copy.gpuBytes = bytes;
+    copy.counted = bytes;
+    copy.used = 1;
+    copy.width = 512;
+    copy.height = 512;
+    copy.mips = 1;
+    copy.dimension = 1;
+    copy.tile = 14;
+    copy.format = 20;
+    copy.elementBytes = 4;
+    copy.blockWidth = 1;
+    copy.components = {3, 4, 5, 6};
+    copy.backing = backing;
+    return copy;
+}
+
+const DuplicateTotals& KindTotals(const TextureDuplicateSummary& summary, DuplicateKind kind) {
+    return summary.kinds[static_cast<std::size_t>(kind)];
+}
+
+void duplicateSummaryTests() {
+    constexpr std::uint64_t base = 0x100000000ull;
+    {
+        const std::vector<TextureCopy> copies{CopyAt(base), CopyAt(base + Mib(4))};
+        const auto summary = SummarizeTextureDuplicates(copies);
+        Require(summary.entries == 2 && summary.images == 2 && summary.ranges == 2 && summary.duplicatedRanges == 0 && summary.extraBytes == 0 && summary.top.empty(), "textures at different addresses were counted as duplicates");
+        Require(summary.heldBytes == Mib(2) && summary.overlapping.copies == 0 && summary.nested.copies == 0, "disjoint textures were counted as overlapping");
+    }
+    {
+        auto swizzled = CopyAt(base);
+        swizzled.components = {4, 3, 5, 6};
+        auto levelled = CopyAt(base);
+        levelled.baseLevel = 1;
+        const std::vector<TextureCopy> copies{CopyAt(base), swizzled, levelled};
+        const auto summary = SummarizeTextureDuplicates(copies);
+        Require(summary.duplicatedRanges == 1 && summary.extraBytes == Mib(2) && summary.heldBytes == Mib(3), "two view variants of a texture were not counted as its extra copies");
+        Require(KindTotals(summary, DuplicateKind::ViewVariant).copies == 2 && KindTotals(summary, DuplicateKind::ViewVariant).bytes == Mib(2), "view variants were not classified as such");
+        Require(summary.viewFields[0].copies == 1 && summary.viewFields[1].copies == 1 && summary.viewFields[2].copies == 0 && summary.viewFields[3].copies == 0 && summary.viewFields[4].copies == 0, "view variants were not attributed to the fields they differ in");
+        Require(summary.top.size() == 1 && summary.top.front().address == base && summary.top.front().copies == 3 && summary.top.front().heldBytes == Mib(3) && summary.top.front().extraBytes == Mib(2), "the range of view variants was not reported");
+        Require(DescribeDuplicateKinds(summary.top.front()) == "view x2", "the kinds of a range of view variants were described as '" + DescribeDuplicateKinds(summary.top.front()) + "'");
+    }
+    {
+        const std::vector<TextureCopy> copies{CopyAt(base), CopyAt(base)};
+        const auto summary = SummarizeTextureDuplicates(copies);
+        Require(KindTotals(summary, DuplicateKind::SameDescriptor).copies == 1 && KindTotals(summary, DuplicateKind::ViewVariant).copies == 0, "two copies with the same shape and view parameters were not classified as the same descriptor");
+    }
+    {
+        auto image = CopyAt(base, TextureBacking::Storage, Mib(2));
+        image.guestBytes = Mib(1);
+        image.used = ~std::uint64_t{0};
+        const std::vector<TextureCopy> copies{CopyAt(base), image};
+        const auto summary = SummarizeTextureDuplicates(copies);
+        Require(KindTotals(summary, DuplicateKind::SampledStorage).copies == 1 && KindTotals(summary, DuplicateKind::SampledStorage).bytes == Mib(1) && summary.extraBytes == Mib(1), "a snapshot beside a storage image of its surface was not counted as the extra copy");
+        auto compressed = CopyAt(base);
+        compressed.compressed = true;
+        compressed.format = 61;
+        compressed.blockWidth = 4;
+        const std::vector<TextureCopy> blocked{compressed, image};
+        const auto blockedSummary = SummarizeTextureDuplicates(blocked);
+        Require(KindTotals(blockedSummary, DuplicateKind::SampledStorage).copies == 0 && KindTotals(blockedSummary, DuplicateKind::FormatVariant).copies == 1, "a block-compressed snapshot, which cannot view a storage image, was classified as sampled+storage");
+    }
+    {
+        auto stale = CopyAt(base);
+        stale.stale = true;
+        stale.used = 9;
+        const std::vector<TextureCopy> copies{stale, CopyAt(base)};
+        const auto summary = SummarizeTextureDuplicates(copies);
+        Require(KindTotals(summary, DuplicateKind::Superseded).copies == 1 && KindTotals(summary, DuplicateKind::Superseded).bytes == Mib(1) && summary.stale.copies == 1, "a stale snapshot beside a current one was not classified as superseded");
+    }
+    {
+        auto format = CopyAt(base);
+        format.format = 21;
+        auto shape = CopyAt(base);
+        shape.width = 256;
+        const std::vector<TextureCopy> copies{CopyAt(base), format, shape};
+        const auto summary = SummarizeTextureDuplicates(copies);
+        Require(KindTotals(summary, DuplicateKind::FormatVariant).copies == 1 && KindTotals(summary, DuplicateKind::ShapeVariant).copies == 1 && summary.extraBytes == Mib(2), "format and extent variants were not classified apart");
+    }
+    {
+        auto view = CopyAt(base, TextureBacking::StorageView, 0);
+        const std::vector<TextureCopy> copies{CopyAt(base), view};
+        const auto summary = SummarizeTextureDuplicates(copies);
+        Require(summary.entries == 2 && summary.images == 1 && summary.duplicatedRanges == 0 && summary.extraBytes == 0, "a view of a storage image, which owns no memory, was counted as a copy");
+    }
+    {
+        auto inner = CopyAt(base + Mib(1));
+        auto straddling = CopyAt(base + Mib(3), TextureBacking::Snapshot, Mib(2));
+        const std::vector<TextureCopy> copies{CopyAt(base, TextureBacking::Snapshot, Mib(4)), CopyAt(base, TextureBacking::Snapshot, Mib(4)), inner, straddling};
+        const auto summary = SummarizeTextureDuplicates(copies);
+        Require(summary.overlapping.copies == 2 && summary.overlapping.bytes == Mib(3) && summary.nested.copies == 1 && summary.nested.bytes == Mib(1), "overlapping textures at other base addresses were not counted (" + std::to_string(summary.overlapping.copies) + " overlapping, " + std::to_string(summary.nested.copies) + " nested)");
+    }
+    {
+        auto depth = CopyAt(base, TextureBacking::DepthCopy, Mib(8));
+        depth.counted = 0;
+        depth.depthCompare = true;
+        const std::vector<TextureCopy> copies{depth, CopyAt(base + Mib(16))};
+        const auto summary = SummarizeTextureDuplicates(copies);
+        Require(summary.depthCopies.copies == 1 && summary.depthCopies.bytes == Mib(8) && summary.uncounted.copies == 1 && summary.uncounted.bytes == Mib(8), "a depth copy outside the cache budget was not counted");
+    }
+    {
+        std::vector<TextureCopy> copies;
+        for (std::uint64_t range = 0; range < 12; ++range) {
+            auto swizzled = CopyAt(base + range * Mib(16), TextureBacking::Snapshot, Mib(1 + range));
+            swizzled.components = {4, 3, 5, 6};
+            copies.push_back(CopyAt(base + range * Mib(16), TextureBacking::Snapshot, Mib(1 + range)));
+            copies.push_back(swizzled);
+        }
+        const auto summary = SummarizeTextureDuplicates(copies);
+        Require(summary.duplicatedRanges == 12 && summary.top.size() == 10 && summary.top.front().address == base + 11 * Mib(16) && summary.top.front().extraBytes == Mib(12), "the top ranges were not the ten with the most extra bytes");
+        for (std::size_t rank = 1; rank < summary.top.size(); ++rank) Require(summary.top[rank - 1].extraBytes > summary.top[rank].extraBytes, "the top ranges are not in descending order");
+        Require(SummarizeTextureDuplicates(copies, 3).top.size() == 3, "the number of reported ranges does not follow the limit");
+    }
+}
+
+using Words = std::array<std::uint32_t, 8>;
+
+Words MippedDescriptor(std::uint64_t address) {
+    auto words = Descriptor(address);
+    words[3] |= 3u << 16u;
+    words[5] |= 3u << 4u;
+    return words;
+}
+
+Words WithBit(Words words, std::size_t word, unsigned bit) {
+    words[word] ^= 1u << bit;
+    return words;
+}
+
+Words WithMinLod(Words words, std::uint32_t raw) {
+    words[1] = (words[1] & ~(0xfffu << 8u)) | (raw << 8u);
+    return words;
+}
+
+bool SameTextureContent(const GuestTextureResource& first, const GuestTextureResource& second) {
+    return first.baseAddress == second.baseAddress && first.pipeBankXor == second.pipeBankXor && first.width == second.width && first.height == second.height && first.depthOrLastArray == second.depthOrLastArray && first.baseArray == second.baseArray && first.mipCount == second.mipCount && first.allocatedMipCount == second.allocatedMipCount && first.baseLevel == second.baseLevel && first.lastLevel == second.lastLevel && first.tileMode == second.tileMode && first.dimension == second.dimension && first.format == second.format && first.bcSwizzle == second.bcSwizzle && first.dccAddress == second.dccAddress && EffectiveMinLod(first) == EffectiveMinLod(second);
+}
+
+void dedupeKeyTests() {
+    const bool dedupe = std::getenv("APS5_TEXTURE_DEDUPE") != nullptr;
+    const Words plain = MippedDescriptor(0x10000000ull);
+    const auto where = [](std::size_t word, unsigned bit) { return "word " + std::to_string(word) + " bit " + std::to_string(bit); };
+    const auto shares = [](const Words& first, const Words& second) { return SampledTexturesShareEntry(first, second); };
+    Require(shares(plain, plain), "a descriptor does not share an entry with itself");
+    std::vector<std::pair<std::size_t, unsigned>> masked;
+    for (unsigned bit = 8; bit < 20; ++bit) masked.emplace_back(5, bit);
+    masked.emplace_back(5, 25);
+    for (unsigned bit = 0; bit < 8; ++bit) masked.emplace_back(6, bit);
+    for (const auto& [word, bit] : masked) Require(shares(plain, WithBit(plain, word, bit)), where(word, bit) + " is part of the key, as the statistics bits were not");
+    std::vector<std::pair<std::size_t, unsigned>> ignored{{1, 29}, {2, 30}, {2, 31}};
+    for (const unsigned bit : {13u, 14u, 15u, 29u, 30u, 31u}) ignored.emplace_back(4, bit);
+    for (const unsigned bit : {20u, 21u, 22u, 24u, 27u, 28u, 29u, 30u, 31u}) ignored.emplace_back(5, bit);
+    for (unsigned bit = 8; bit <= 9; ++bit) ignored.emplace_back(6, bit);
+    for (unsigned bit = 11; bit <= 20; ++bit) ignored.emplace_back(6, bit);
+    for (unsigned bit = 22; bit <= 31; ++bit) ignored.emplace_back(6, bit);
+    for (unsigned bit = 0; bit < 32; ++bit) ignored.emplace_back(7, bit);
+    const auto reference = DecodeTextureResource(plain);
+    for (const auto& [word, bit] : ignored) {
+        const auto changed = WithBit(plain, word, bit);
+        Require(SameTextureContent(reference, DecodeTextureResource(changed)), where(word, bit) + " changes what the descriptor decodes to, so the dedupe key may not ignore it");
+        Require(shares(plain, changed) == dedupe, where(word, bit) + (dedupe ? " is still part of the texture key" : " is not part of the key without APS5_TEXTURE_DEDUPE"));
+    }
+    auto reselected = plain;
+    reselected[3] = (reselected[3] & ~0xfffu) | 5u | (4u << 3u) | (6u << 6u) | (7u << 9u);
+    const auto reselectedResource = DecodeTextureResource(reselected);
+    Require(reselectedResource.dstSelX != reference.dstSelX && SameTextureContent(reference, reselectedResource), "the reselected descriptor differs in more than its channel selectors");
+    Require(shares(plain, reselected) == dedupe, "descriptors that differ in their channel selectors alone " + std::string(dedupe ? "do not share a key although the swizzle is part of it separately" : "share a key without APS5_TEXTURE_DEDUPE"));
+    const std::vector<std::pair<std::size_t, unsigned>> distinct{{0, 8}, {1, 20}, {1, 30}, {2, 0}, {2, 14}, {3, 12}, {3, 16}, {3, 20}, {3, 25}, {3, 28}, {4, 0}, {4, 16}, {5, 4}, {6, 21}};
+    for (const auto& [word, bit] : distinct) Require(!shares(plain, WithBit(plain, word, bit)), where(word, bit) + " does not distinguish textures");
+    auto metadata = plain;
+    metadata[6] |= 1u << 21u;
+    for (const auto& [word, bit] : std::vector<std::pair<std::size_t, unsigned>>{{6, 19}, {6, 22}, {6, 23}, {6, 24}, {6, 31}, {7, 0}, {7, 31}}) Require(!shares(metadata, WithBit(metadata, word, bit)), where(word, bit) + " of a surface with DCC metadata does not distinguish textures");
+    auto levelled = plain;
+    levelled[3] = (levelled[3] & ~(0xfu << 12u)) | (1u << 12u);
+    Require(shares(WithMinLod(levelled, 0), WithMinLod(levelled, 0x100)) == dedupe, "minimum LOD values below the base level, which clamp nothing, " + std::string(dedupe ? "do not share a key" : "share a key without APS5_TEXTURE_DEDUPE"));
+    Require(shares(WithMinLod(plain, 0x300), WithMinLod(plain, 0xa00)) == dedupe, "minimum LOD values past the last level, which clamp to it, " + std::string(dedupe ? "do not share a key" : "share a key without APS5_TEXTURE_DEDUPE"));
+    Require(!shares(WithMinLod(plain, 0x100), WithMinLod(plain, 0x180)) && !shares(WithMinLod(plain, 0), WithMinLod(plain, 0x100)), "minimum LOD values that clamp differently share a key");
+    constexpr std::array<std::uint32_t, 17> raws{0, 1, 100, 255, 256, 257, 300, 511, 512, 513, 700, 767, 768, 769, 1000, 2048, 4095};
+    for (const auto [baseLevel, lastLevel] : {std::pair{0u, 3u}, std::pair{1u, 3u}, std::pair{2u, 2u}, std::pair{3u, 3u}}) {
+        auto descriptor = plain;
+        descriptor[3] = (descriptor[3] & ~((0xfu << 12u) | (0xfu << 16u))) | (baseLevel << 12u) | (lastLevel << 16u);
+        for (const auto first : raws) {
+            for (const auto second : raws) {
+                auto left = WithMinLod(descriptor, first);
+                auto right = WithMinLod(descriptor, second);
+                const bool sameClamp = EffectiveMinLod(DecodeTextureResource(left)) == EffectiveMinLod(DecodeTextureResource(right));
+                CanonicalizeTextureWords(left);
+                CanonicalizeTextureWords(right);
+                Require((left[1] == right[1]) == sameClamp, "the canonical minimum LOD of " + std::to_string(first) + " and " + std::to_string(second) + " at levels " + std::to_string(baseLevel) + ".." + std::to_string(lastLevel) + " disagrees with the clamp the view applies");
+            }
+        }
+    }
+    auto once = plain;
+    CanonicalizeTextureWords(once);
+    auto twice = once;
+    CanonicalizeTextureWords(twice);
+    Require(once == twice, "canonicalizing a descriptor twice changed it again");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1128,6 +1335,16 @@ int main(int argc, char** argv) {
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool resources = mode == "resource-admission" || mode == "resource-oversized" || mode == "resource-clear";
         const bool mirrors = mode == "mirror-storage" || mode == "mirror-snapshot" || mode == "mirror-readonly";
+        if (mode == "duplicates") {
+            duplicateSummaryTests();
+            std::puts("texture duplicate summary tests passed");
+            return 0;
+        }
+        if (mode == "dedupe-keys") {
+            dedupeKeyTests();
+            std::puts("texture dedupe key tests passed");
+            return 0;
+        }
 #ifdef _WIN32
         if (!memory) _putenv_s("APS5_TEXTURE_CACHE_MIB", "1");
 #else
