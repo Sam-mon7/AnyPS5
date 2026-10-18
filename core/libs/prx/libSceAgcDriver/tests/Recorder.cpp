@@ -443,7 +443,12 @@ void vramDescriptorTests(const Device& device, Recorder& recorder) {
         };
         block[blockBytes] = 0x45;
         block[blockBytes + 4] = 0x76;
+        const auto refreshBefore = VramDescriptorCounters();
         const auto aligned = read(element);
+        if (VramDescriptors() && !imported) {
+            const auto scanned = VramDescriptorCounters().refreshBlocks - refreshBefore.refreshBlocks;
+            Require(scanned == (VramWritable() ? 2u : 1u), "descriptor refresh scanned outside its one touched block");
+        }
         if (VramDescriptors()) Require(aligned.buffer == backing.buffer, "descriptor read replaced its registered range backing");
         const auto copiesBefore = VramDescriptorCounters();
         const auto misaligned = read(element + 4);
