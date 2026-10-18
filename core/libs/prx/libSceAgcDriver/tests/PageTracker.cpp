@@ -366,6 +366,88 @@ void armingRefusals() {
     require(state.Protect == PAGE_EXECUTE_READ, "CPU observation removed execute permission");
 }
 
+void readWatches() {
+    ObservationViews views;
+    auto* handler = AddVectoredExceptionHandler(1, observationException);
+    require(handler != nullptr, "read watch VEH failed");
+    struct Readback {
+        std::uintptr_t address;
+        std::array<unsigned char, PageBytes> original{}, source{};
+        unsigned calls = 0, inlineCalls = 0;
+        bool pending = true;
+    } data{views.A().address};
+    data.source.fill(0x63);
+    auto owner = std::make_shared<int>(1);
+    const auto download = [](void* context) noexcept {
+        return ResolveReadback(context, [](void* context, bool held) noexcept {
+            auto& data = *static_cast<Readback*>(context);
+            if (!AgcDriver::GuestMemory::GpuMutex().HeldByThisThread()) std::abort();
+            if (!data.pending) return true;
+            ++data.calls;
+            if (held) ++data.inlineCalls;
+            const auto result = GuestArena::GuestArenaPublishPageRead_nid_no_patch(data.address, data.source.data());
+            if (result) data.pending = false;
+            return result;
+        });
+    };
+    const auto arm = [&] {
+        data.pending = true;
+        return GuestArena::GuestArenaArmPageRead_nid_no_patch(data.address, owner, data.original.data(), download, &data);
+    };
+    const auto* value = std::getenv("APS5_BUFFER_CACHE_READ_FAULTS");
+    const auto* cache = std::getenv("APS5_BUFFER_CACHE");
+    const auto* writes = std::getenv("APS5_BUFFER_CACHE_WRITES");
+    const bool enabled = ArmEnabled() && value != nullptr && std::string_view(value) == "1" && cache != nullptr && std::string_view(cache) == "1" && writes != nullptr && std::string_view(writes) == "1";
+    if (enabled) require(PrepareReadbacks(), "readback worker preparation failed");
+    if (enabled) {
+        Get()->MarkGpuWritten(views.A(), Source::GpuDeclaration);
+        Get()->MarkGpuWritten(views.B(), Source::GpuDeclaration);
+    }
+    const auto cpuEpoch = enabled ? Get()->CaptureEpoch(views.A()).regions.front().cpuEpoch : 0;
+    const auto locks = gpuLockCalls.load();
+    require((arm() == GuestArena::PageArmRefusal::Count) == enabled, "read watch switch ignored");
+    MEMORY_BASIC_INFORMATION state{};
+    VirtualQuery(views.b, &state, sizeof(state));
+    require((state.Protect == PAGE_NOACCESS) == enabled, "read watch did not cover physical aliases");
+    const auto expected = enabled ? 0x63636363u : 0u;
+    require(*static_cast<volatile unsigned*>(views.b) == expected && *static_cast<volatile unsigned*>(views.a) == expected, "read fault did not publish device bytes");
+    require(data.calls == (enabled ? 1u : 0u), "read fault downloaded twice");
+    if (enabled) require(Get()->CaptureEpoch(views.A()).covered && Get()->CaptureEpoch(views.B()).covered && Get()->CaptureEpoch(views.A()).regions.front().cpuEpoch == cpuEpoch, "readback did not clear GPU ownership without a CPU write");
+    if (enabled) {
+        data.original = data.source;
+        data.source.fill(0x71);
+        require(arm() == GuestArena::PageArmRefusal::Count, "write readback arm failed");
+        const auto token = Get()->CaptureEpoch(views.A());
+        *static_cast<volatile unsigned*>(views.b) = 0x12345678u;
+        require(data.calls == 2 && static_cast<volatile unsigned*>(views.a)[0] == 0x12345678u && static_cast<volatile unsigned*>(views.a)[1] == 0x71717171u, "CPU write lost GPU bytes");
+        require(Get()->DirtySince(views.A(), token), "CPU write after readback missed tracker");
+        std::copy_n(static_cast<const unsigned char*>(views.a), PageBytes, data.original.begin());
+        data.source.fill(0x81);
+        require(arm() == GuestArena::PageArmRefusal::Count, "mutex owner read arm failed");
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            const auto ownedLocks = gpuLockCalls.load();
+            require(*static_cast<volatile unsigned*>(views.a) == 0x81818181u && data.inlineCalls == 1, "mutex owner read did not use direct path");
+            require(gpuLockCalls.load() == ownedLocks, "mutex owner fault recursively took GpuMutex");
+        }
+        data.original = data.source;
+        data.source.fill(0x83);
+        require(arm() == GuestArena::PageArmRefusal::Count, "concurrent read arm failed");
+        std::atomic<bool> start{false};
+        std::thread first([&] { while (!start.load()) std::this_thread::yield(); require(*static_cast<volatile unsigned*>(views.a) == 0x83838383u, "first alias read failed"); });
+        std::thread second([&] { while (!start.load()) std::this_thread::yield(); require(*static_cast<volatile unsigned*>(views.b) == 0x83838383u, "second alias read failed"); });
+        start.store(true);
+        first.join();
+        second.join();
+        require(data.calls == 4, "competing alias reads downloaded twice");
+        GuestArena::GuestArenaPinWritable_nid_postfix(views.a, views.bytes);
+        require(arm() == GuestArena::PageArmRefusal::Pinned, "pinned read watch armed");
+        GuestArena::GuestArenaUnpinWritable_nid_postfix(views.a, views.bytes);
+    }
+    if (!enabled) require(gpuLockCalls.load() == locks, "disabled read watch took GpuMutex");
+    RemoveVectoredExceptionHandler(handler);
+}
+
 void mixedProtections() {
     if (!ArmEnabled()) return;
     ObservationViews views;
@@ -477,6 +559,7 @@ int main() {
         protectedObservation();
         armingRefusals();
         mixedProtections();
+        readWatches();
 #endif
         geometry();
         epochs();

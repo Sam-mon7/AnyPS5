@@ -261,6 +261,115 @@ void Writable(const Context& context, const Memory& memory, bool cpuRead) {
     BufferCache::Clear(context.device);
 }
 
+#ifdef _WIN32
+LONG CALLBACK readFaultException(EXCEPTION_POINTERS* exception) {
+    const auto& record = *exception->ExceptionRecord;
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 || record.ExceptionInformation[0] > 1) return EXCEPTION_CONTINUE_SEARCH;
+    const bool handled = record.ExceptionInformation[0] == 1 ? GuestArena::GuestArenaHandleWrite_nid_postfix(record.ExceptionInformation[1]) : GuestArena::GuestArenaHandleTransition_nid_postfix(record.ExceptionInformation[1]);
+    return handled ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void NativeReadFaults(const Context& context, std::unique_lock<GuestMemory::GpuMutexType>& gpu) {
+    const bool expected = VramOption("APS5_BUFFER_CACHE_READ_FAULTS") && BufferCache::WritesEnabled() && PageTracker::ArmEnabled();
+    Require(BufferCache::ReadFaultsEnabled() == expected, "read fault switch ignored prerequisites");
+    BufferCache::Clear(context.device);
+    struct SharedMemory {
+        enum : std::size_t { Bytes = 0x4000 };
+        void* pointer = GuestArena::GuestArenaAllocate_nid_postfix(Bytes, BufferCache::BlockBytes);
+        std::uint64_t address = reinterpret_cast<std::uintptr_t>(pointer);
+        SharedMemory() {
+            Require(pointer != nullptr, "read fault test arena allocation failed");
+            const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Bytes, nullptr);
+            Require(section != nullptr, "read fault test section failed");
+            GuestArena::GuestArenaMap_nid_postfix(pointer, Bytes, section, 0, PAGE_READWRITE);
+            CloseHandle(section);
+            GuestAllocations::Mutation().Add(pointer, Bytes, true, true, true);
+            PageTracker::Initialize();
+            {
+                GuestArena::HostWrite write(pointer, Bytes);
+                std::memset(pointer, 0x35, Bytes);
+            }
+            if (PageTracker::ArmEnabled()) Require(GuestArena::GuestArenaArmPageObservation_nid_no_patch(address, Bytes), "read fault CPU watch arm failed");
+            if (auto* tracker = PageTracker::Get()) tracker->RegisterRange({address, Bytes}, PageTracker::Kind::Section, PageTracker::Bit(PageTracker::Reason::ProtectedSection));
+        }
+        ~SharedMemory() {
+            GuestAllocations::Mutation().Remove(pointer);
+            GuestArena::GuestArenaReset_nid_postfix(pointer, Bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(pointer, Bytes);
+        }
+    } memory;
+    auto* handler = AddVectoredExceptionHandler(1, readFaultException);
+    Require(handler != nullptr, "read fault test VEH failed");
+    Recorder recorder(context);
+    recorder.Activate();
+    const auto write = [&](std::uint64_t address, std::size_t bytes) {
+        auto writer = std::make_shared<GuestBufferMemory>(context);
+        BufferCache::PermitBindings(writer.get(), true);
+        writer->AddWritable(address, bytes);
+        writer->Upload(false);
+        Require(BufferCache::HasBindings(writer.get()) == BufferCache::WritesEnabled(), "native fault fixture missed write cache");
+        std::uint32_t adjustment = 0;
+        const auto view = writer->Descriptor(address, bytes, adjustment);
+        writer->BeginGpuWrites(recorder);
+        context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(recorder.Commands(), view.buffer, view.offset, bytes, 0xababababu);
+        writer->RecordCopyBacks(recorder);
+        writer->NotePendingWrites(recorder);
+        writer->MarkDirectWrites();
+        if (writer->HasCopiedWrites()) recorder.OnComplete([writer] { writer->WriteBack(); });
+        recorder.Keep(writer);
+        return writer;
+    };
+    const bool lazy = expected && !SubmitWorkerEnabled();
+    const auto before = BufferCache::Counters();
+    auto writer = write(memory.address, 2 * PageBytes);
+    BufferCache::FlushAtSync();
+    recorder.Sync();
+    const auto signaled = BufferCache::Counters();
+    MEMORY_BASIC_INFORMATION state{};
+    VirtualQuery(memory.pointer, &state, sizeof(state));
+    Require((state.Protect == PAGE_NOACCESS) == lazy, "guest signal discarded read protection");
+    if (lazy) Require(signaled.copiedBack == before.copiedBack && signaled.armedReads == before.armedReads + 2, "sync eagerly copied armed pages");
+    if (expected && SubmitWorkerEnabled()) Require(signaled.submitWorkerRefusals == before.submitWorkerRefusals + 2 && signaled.syncFallbackPages == before.syncFallbackPages + 2, "submit worker refusal did not use the counted sync fallback");
+    gpu.unlock();
+    Require(*static_cast<volatile unsigned*>(memory.pointer) == 0xababababu, "native CPU read missed GPU bytes");
+    Require(*static_cast<volatile unsigned*>(memory.pointer) == 0xababababu, "repeated CPU read lost GPU bytes");
+    const auto read = BufferCache::Counters();
+    if (lazy) Require(read.readFaults == before.readFaults + 1 && read.lockedFaults == before.lockedFaults && read.copiedBack == before.copiedBack + PageBytes, "native read did not hand off exactly one page");
+    VirtualQuery(reinterpret_cast<void*>(memory.address + PageBytes), &state, sizeof(state));
+    Require((state.Protect == PAGE_NOACCESS) == lazy, "native read downloaded an unrelated page");
+    const auto token = PageTracker::Get() != nullptr ? PageTracker::Get()->CaptureEpoch({memory.address + PageBytes, PageBytes}) : PageTracker::Epoch{};
+    *reinterpret_cast<volatile unsigned*>(memory.address + PageBytes) = 0x12345678u;
+    Require(*reinterpret_cast<volatile unsigned*>(memory.address + PageBytes + 4) == 0xababababu, "CPU write after GPU write lost the remaining device bytes");
+    if (lazy) Require(PageTracker::Get()->CaptureEpoch({memory.address + PageBytes, PageBytes}).regions.front().cpuEpoch > token.regions.front().cpuEpoch, "CPU write fault did not mark CPU dirty");
+    gpu.lock();
+    const auto written = BufferCache::Counters();
+    if (lazy) Require(written.readFaults == before.readFaults + 2 && written.copiedBack == before.copiedBack + 2 * PageBytes, "CPU write fault downloaded the wrong pages");
+    writer.reset();
+    BufferCache::Clear(context.device);
+    auto lockedWriter = write(memory.address + 2 * PageBytes, PageBytes);
+    recorder.Sync();
+    BufferCache::FlushAtSync();
+    const auto locked = BufferCache::Counters();
+    Require(*reinterpret_cast<volatile unsigned*>(memory.address + 2 * PageBytes) == 0xababababu, "mutex owner fault deadlocked or lost GPU data");
+    if (lazy) Require(BufferCache::Counters().lockedFaults == locked.lockedFaults + 1, "mutex owner did not use synchronous preallocated copy");
+    lockedWriter.reset();
+    BufferCache::Clear(context.device);
+    auto refusedWriter = write(memory.address + 3 * PageBytes, PageBytes);
+    GuestArena::GuestArenaPinWritable_nid_postfix(reinterpret_cast<void*>(memory.address + 3 * PageBytes), PageBytes);
+    const auto refused = BufferCache::Counters();
+    BufferCache::FlushAtSync();
+    recorder.Sync();
+    const auto fallback = BufferCache::Counters();
+    Require(*reinterpret_cast<volatile unsigned*>(memory.address + 3 * PageBytes) == 0xababababu, "refused read watch missed synchronous copyback");
+    if (lazy) Require(fallback.readRefusals[static_cast<std::size_t>(GuestArena::PageArmRefusal::Pinned)] == refused.readRefusals[static_cast<std::size_t>(GuestArena::PageArmRefusal::Pinned)] + 1 && fallback.syncFallbackPages == refused.syncFallbackPages + 1, "refused page was not counted and flushed");
+    GuestArena::GuestArenaUnpinWritable_nid_postfix(reinterpret_cast<void*>(memory.address + 3 * PageBytes), PageBytes);
+    refusedWriter.reset();
+    BufferCache::Clear(context.device);
+    if (!expected) Require(fallback.readFaults == 0 && fallback.armedReads == 0 && fallback.refusedReads == 0 && fallback.syncFallbackPages == 0, "disabled read fault path changed counters");
+    RemoveVectoredExceptionHandler(handler);
+}
+#endif
+
 void AsyncRing(const Context& context, const Memory& memory) {
     BufferCache::Clear(context.device);
     memory.Track();
@@ -333,11 +442,15 @@ int main(int argc, char** argv) {
     try {
         const bool expected = VramOption("APS5_BUFFER_CACHE") && PageTracker::Enabled();
         Require(BufferCache::Enabled() == expected, "cache switch does not require both exact values");
-        std::lock_guard gpu(GuestMemory::GpuMutex());
+        std::unique_lock gpu(GuestMemory::GpuMutex());
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         auto context = VulkanDeviceTestAccess::ContextOf(*device);
         context.hostImportAlignment = 0;
+#ifdef _WIN32
+        if (argc > 1 && std::strcmp(argv[1], "read-faults") == 0) NativeReadFaults(context, gpu);
+        else
+#endif
         {
             Memory memory;
             if (argc > 1) {

@@ -14,6 +14,41 @@ namespace {
 
 using PageTracker::PageBytes;
 constexpr std::size_t BlockPages = BlockBytes / PageBytes;
+struct Block;
+#ifdef _WIN32
+struct FaultPage {
+    std::weak_ptr<Block> block;
+    std::uint64_t address = 0;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    bool armed = false;
+};
+struct FaultResources {
+    Context context;
+    Buffer staging;
+    const void* data;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    PFN_vkQueueSubmit submit;
+    PFN_vkWaitForFences wait;
+    PFN_vkResetFences reset;
+    std::array<std::shared_ptr<FaultPage>, BlockPages> pages{};
+    explicit FaultResources(const Context& context) : context(context), staging(context, PageBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT), data(staging.ReadBytes(0, PageBytes).data()),
+        submit(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")), wait(context.Function<PFN_vkWaitForFences>("vkWaitForFences")), reset(context.Function<PFN_vkResetFences>("vkResetFences")) {
+        try {
+            VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+            poolInfo.queueFamilyIndex = context.queueFamilyIndex;
+            Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateCommandPool read faults");
+            VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence), "vkCreateFence read faults");
+        } catch (...) { Release(); throw; }
+    }
+    void Release() {
+        if (pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, pool, nullptr);
+        if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+    }
+    ~FaultResources() { Release(); }
+};
+#endif
 struct Block {
     Context context;
     std::shared_ptr<Buffer> buffer;
@@ -24,6 +59,9 @@ struct Block {
     std::shared_ptr<const GuestAllocations::Range> writerMapping;
     std::size_t pending = 0, reservations = 0;
     std::uint64_t used = 0;
+#ifdef _WIN32
+    std::unique_ptr<FaultResources> faults;
+#endif
 };
 struct Binding {
     PageTracker::Range range;
@@ -63,6 +101,93 @@ bool Valid(const Block& block, std::size_t page) { return (block.valid[page / 64
 void Validate(Block& block, std::size_t page) { block.valid[page / 64] |= 1ull << (page % 64); }
 bool AnyDirty(const Block& block) { return std::any_of(block.dirty.begin(), block.dirty.end(), [](auto word) { return word != 0; }); }
 
+#ifdef _WIN32
+bool DownloadFault(FaultPage& page) noexcept {
+    const auto owner = page.block.lock();
+    if (owner == nullptr) return !page.armed;
+    auto& block = *owner;
+    if (!page.armed) return true;
+    auto& resources = *block.faults;
+    VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submission.commandBufferCount = 1;
+    submission.pCommandBuffers = &page.commands;
+    if (resources.reset(block.context.device, 1, &resources.fence) != VK_SUCCESS) return false;
+    if (resources.submit(block.context.queue, 1, &submission, resources.fence) != VK_SUCCESS) return false;
+    if (resources.wait(block.context.device, 1, &resources.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) std::terminate();
+    if (!GuestArena::GuestArenaPublishPageRead_nid_no_patch(page.address, resources.data)) return false;
+    const auto index = (page.address % BlockBytes) / PageBytes;
+    const auto mask = 1ull << (index % 64);
+    block.dirty[index / 64] &= ~mask;
+    block.valid[index / 64] &= ~mask;
+    block.owned[index / 64] &= ~mask;
+    page.armed = false;
+    Cache().counts.copiedBack += PageBytes;
+    if (!AnyDirty(block)) block.writerMapping.reset();
+    return true;
+}
+
+bool ReadFault(void* context) noexcept {
+    return PageTracker::ResolveReadback(context, [](void* context, bool held) noexcept {
+        ++Cache().counts.readFaults;
+        if (held) ++Cache().counts.lockedFaults;
+        return DownloadFault(*static_cast<FaultPage*>(context));
+    });
+}
+
+void PrepareFaults(const std::shared_ptr<Block>& owner, std::uint64_t base, std::size_t first, std::size_t last) {
+    auto& block = *owner;
+    if (!ReadFaultsEnabled() || SubmitWorkerEnabled()) return;
+    try {
+        if (!PageTracker::PrepareReadbacks()) return;
+        if (block.faults == nullptr) block.faults = std::make_unique<FaultResources>(block.context);
+        auto& resources = *block.faults;
+        for (auto page = first; page < last; ++page) {
+            auto& fault = resources.pages[page];
+            if (fault != nullptr) continue;
+            VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            allocation.commandPool = resources.pool;
+            allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocation.commandBufferCount = 1;
+            VkCommandBuffer commands = VK_NULL_HANDLE;
+            Check(block.context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(block.context.device, &allocation, &commands), "vkAllocateCommandBuffers read faults");
+            VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            Check(block.context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer read faults");
+            RecordMemoryBarrier(block.context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            CopyBuffer(block.context, commands, block.buffer->Handle(), page * PageBytes, resources.staging.Handle(), 0, PageBytes);
+            RecordMemoryBarrier(block.context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            Check(block.context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands), "vkEndCommandBuffer read faults");
+            fault = std::make_shared<FaultPage>(FaultPage{owner, base + page * PageBytes, commands, false});
+        }
+    } catch (const std::exception&) { return; }
+}
+
+void ArmReads(const std::shared_ptr<Block>& block, std::uint64_t base) {
+    if (!ReadFaultsEnabled() || block->pending != 0) return;
+    for (std::size_t page = 0; page < BlockPages; ++page) {
+        if ((block->dirty[page / 64] & (1ull << (page % 64))) == 0) continue;
+        if (block->faults == nullptr || block->faults->pages[page] == nullptr || SubmitWorkerEnabled()) {
+            ++Cache().counts.refusedReads;
+            if (SubmitWorkerEnabled()) ++Cache().counts.submitWorkerRefusals;
+            else ++Cache().counts.setupRefusals;
+            continue;
+        }
+        auto& fault = *block->faults->pages[page];
+        if (fault.armed) continue;
+        fault.armed = true;
+        auto refusal = GuestArena::PageArmRefusal::Protection;
+        try {
+            refusal = GuestArena::GuestArenaArmPageRead_nid_no_patch(base + page * PageBytes, block->faults->pages[page], block->original.data() + page * PageBytes, ReadFault, &fault);
+        } catch (const std::bad_alloc&) { ++Cache().counts.setupRefusals; }
+        if (refusal == GuestArena::PageArmRefusal::Count) ++Cache().counts.armedReads;
+        else {
+            fault.armed = false;
+            ++Cache().counts.refusedReads;
+            ++Cache().counts.readRefusals[static_cast<std::size_t>(refusal)];
+        }
+    }
+}
+#endif
+
 bool Proven(PageTracker::Tracker& tracker, const Block& block, std::size_t page) {
     if (!Valid(block, page) || tracker.Poisoned()) return false;
     const auto& proof = block.pages[page];
@@ -101,6 +226,11 @@ void Report() {
         static_cast<unsigned long long>(c.uploaded), static_cast<unsigned long long>(c.copiedBack), static_cast<unsigned long long>(c.hits), static_cast<unsigned long long>(c.misses), static_cast<unsigned long long>(c.uploads), static_cast<unsigned long long>(c.wraps),
         static_cast<unsigned long long>(c.fallbacks[0]), static_cast<unsigned long long>(c.fallbacks[1]), static_cast<unsigned long long>(c.fallbacks[2]), static_cast<unsigned long long>(c.fallbacks[3]), static_cast<unsigned long long>(c.fallbacks[4]), static_cast<unsigned long long>(c.fallbacks[5]), static_cast<unsigned long long>(c.fallbacks[6]), static_cast<unsigned long long>(c.fallbacks[7]), static_cast<unsigned long long>(c.fallbacks[8]), static_cast<unsigned long long>(c.fallbacks[9]), static_cast<unsigned long long>(c.fallbacks[10]));
     if (WritesEnabled()) AgcDriver::ProfilePrint_nid_no_patch("[buffer-cache-writes] cumulative gpu-written=%llu completed=%llu retired-uploads=%llu ring-spills=%llu\n", static_cast<unsigned long long>(c.gpuWritten), static_cast<unsigned long long>(c.completedWrites), static_cast<unsigned long long>(c.retired), static_cast<unsigned long long>(c.spills));
+    if (ReadFaultsEnabled()) {
+        AgcDriver::ProfilePrint_nid_no_patch("[buffer-cache-read-faults] cumulative faults=%llu locked=%llu armed=%llu refused=%llu setup-refusals=%llu submit-worker-refusals=%llu sync-fallback-pages=%llu refusals invalid=%llu mapping=%llu identity=%llu metadata=%llu permission=%llu pinned=%llu host-writer=%llu host-alias=%llu protection=%llu\n",
+            static_cast<unsigned long long>(c.readFaults), static_cast<unsigned long long>(c.lockedFaults), static_cast<unsigned long long>(c.armedReads), static_cast<unsigned long long>(c.refusedReads), static_cast<unsigned long long>(c.setupRefusals), static_cast<unsigned long long>(c.submitWorkerRefusals), static_cast<unsigned long long>(c.syncFallbackPages),
+            static_cast<unsigned long long>(c.readRefusals[0]), static_cast<unsigned long long>(c.readRefusals[1]), static_cast<unsigned long long>(c.readRefusals[2]), static_cast<unsigned long long>(c.readRefusals[3]), static_cast<unsigned long long>(c.readRefusals[4]), static_cast<unsigned long long>(c.readRefusals[5]), static_cast<unsigned long long>(c.readRefusals[6]), static_cast<unsigned long long>(c.readRefusals[7]), static_cast<unsigned long long>(c.readRefusals[8]));
+    }
 }
 
 bool Refuse(Fallback reason) {
@@ -229,6 +359,15 @@ bool WritesEnabled() {
     return enabled;
 }
 
+bool ReadFaultsEnabled() {
+#ifdef _WIN32
+    static const bool enabled = VramOption("APS5_BUFFER_CACHE_READ_FAULTS") && WritesEnabled() && PageTracker::ArmEnabled();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 void PermitBindings(const void* owner, bool permitted) {
     if (!Enabled()) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -277,6 +416,9 @@ bool Bind(const Context& context, const void* owner, std::uint64_t address, std:
         block->original.resize(BlockBytes);
         GuestMemory::Read(first, std::span(block->original).subspan(first - base, end - first));
         for (auto page = first; page < end; page += PageBytes) if (!Proven(*tracker, *block, static_cast<std::size_t>((page - base) / PageBytes))) return Refuse(Fallback::Changed);
+#ifdef _WIN32
+        PrepareFaults(block, base, static_cast<std::size_t>((first - base) / PageBytes), static_cast<std::size_t>((end - base) / PageBytes));
+#endif
         block->mapping = lease;
         ++block->reservations;
     }
@@ -360,12 +502,16 @@ void BeginWrites(const void* owner, Recorder& recorder, std::span<const std::pai
                 Publish(*block, range, true);
                 --block->pending;
                 Cache().counts.completedWrites += range.bytes;
+#ifdef _WIN32
+                ArmReads(block, range.address / BlockBytes * BlockBytes);
+#endif
             });
         }
     }
 }
 
-void Flush(std::uint64_t address, std::size_t bytes) {
+namespace {
+void FlushImpl(std::uint64_t address, std::size_t bytes, bool syncPoint) {
     if (!WritesEnabled() || bytes == 0 || Recorder::InCompletion()) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     auto& state = Cache();
@@ -391,6 +537,17 @@ void Flush(std::uint64_t address, std::size_t bytes) {
             recorder->SyncThrough(base + pages.front() * PageBytes, (pages.back() - pages.front() + 1) * PageBytes);
             Require(block->pending == 0, "cached buffer copyback precedes its writer completion");
         }
+#ifdef _WIN32
+        if (ReadFaultsEnabled()) {
+            std::erase_if(pages, [&](auto page) {
+                if (block->faults == nullptr || block->faults->pages[page] == nullptr || !block->faults->pages[page]->armed) return false;
+                if (!syncPoint) Require(GuestArena::GuestArenaResolvePageRead_nid_no_patch(base + page * PageBytes), "cached read fault flush failed");
+                return true;
+            });
+            if (syncPoint) state.counts.syncFallbackPages += pages.size();
+            if (pages.empty()) continue;
+        }
+#endif
         Require(block->writerMapping != nullptr, "cached buffer copyback lost its mapping lease");
         const auto& context = block->context;
         Buffer download(context, pages.size() * PageBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -408,6 +565,7 @@ void Flush(std::uint64_t address, std::size_t bytes) {
             const auto result = download.ReadBytes(index * PageBytes, PageBytes);
             GuestMemory::WriteChanged(guest, result, std::span<const std::byte>(block->original).subspan(page * PageBytes, PageBytes));
             Recorder::NoteWrittenBack(guest, PageBytes);
+            if (ReadFaultsEnabled()) PageTracker::Get()->ReadbackGpuWrites({guest, PageBytes});
             block->dirty[page / 64] &= ~(1ull << (page % 64));
             state.counts.copiedBack += PageBytes;
         }
@@ -419,6 +577,11 @@ void Flush(std::uint64_t address, std::size_t bytes) {
         if (!AnyDirty(*block)) block->writerMapping.reset();
     }
 }
+
+}
+
+void Flush(std::uint64_t address, std::size_t bytes) { FlushImpl(address, bytes, false); }
+void FlushAtSync() { FlushImpl(0, SIZE_MAX, ReadFaultsEnabled()); }
 
 void AddressRanges(const void* owner, std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
     if (!WritesEnabled()) return;

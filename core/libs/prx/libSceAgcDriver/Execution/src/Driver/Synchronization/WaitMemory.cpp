@@ -135,7 +135,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     } epochPoint;
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
-    if (Graphics::BufferCache::WritesEnabled()) Graphics::BufferCache::Flush();
+    if (Graphics::BufferCache::WritesEnabled()) Graphics::BufferCache::FlushAtSync();
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
         return;
