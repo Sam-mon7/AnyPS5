@@ -59,7 +59,12 @@ struct OwnedImage {
 
 class Texture {
 public:
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, const MirrorSource* mirror = nullptr);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, const MirrorSource* mirror = nullptr, bool detileFromImport = false);
+    enum class ImportRefusal : std::uint8_t { None, TooSmall, NotImported };
+    static constexpr std::uint64_t ImportDetileMinBytes = std::uint64_t{64} << 10u;
+    static bool ImportDetileEnabled();
+    static ImportRefusal ImportDetileRefusal(const Context& context, const GuestTextureResource& descriptor, std::uint64_t guestBytes);
+    bool DetiledFromImport() const { return detiledFromImport; }
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
@@ -138,6 +143,7 @@ private:
     PerUseCopy perUseCopy = PerUseCopy::None;
     std::atomic<bool> released{false};
     bool copiedOnce = false;
+    bool detiledFromImport = false;
     std::uint64_t copiedVersion = 0;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
     std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0, copyElementBytes = 0;
