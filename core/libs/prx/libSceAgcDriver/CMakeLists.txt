@@ -160,6 +160,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketHistory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketTiming.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lanes/RecordingQueue.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Presentation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/QueueWorker.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/Submission.cpp
@@ -3508,7 +3509,7 @@ if(BUILD_TESTING)
         set_property(TEST agc_epoch_texture_${epochLayout}_off APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_EPOCH_TEXTURES=set:0")
         set_property(TEST agc_epoch_texture_${epochLayout}_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_EPOCH_TEXTURES=set:1")
     endforeach()
-    add_test_executable(agc_gpu_lanes_tests tests/GpuLanes.cpp)
+    add_test_executable(agc_gpu_lanes_tests tests/GpuLanes.cpp Execution/src/Driver/Lanes/RecordingQueue.cpp)
     target_include_directories(agc_gpu_lanes_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
     target_link_libraries(agc_gpu_lanes_tests PRIVATE libc)
     set_target_properties(agc_gpu_lanes_tests PROPERTIES CXX_EXTENSIONS OFF)

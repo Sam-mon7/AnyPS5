@@ -82,10 +82,7 @@ struct Dependency {
     std::uint64_t value = 0;
 };
 
-inline std::uint32_t& RecordingQueue() {
-    struct RecordingQueueStorage {};
-    return HostThreadLocal<std::uint32_t, RecordingQueueStorage>();
-}
+std::uint32_t& RecordingQueue();
 
 struct QueueScope {
     explicit QueueScope(std::uint32_t queue) : previous(RecordingQueue()) { RecordingQueue() = queue; }

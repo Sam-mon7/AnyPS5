@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DispatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Lanes/VulkanQueues.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
@@ -489,6 +490,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots, dispatchThreads, address);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    std::optional<Lanes::QueueScope> laneQueue;
+                    if (Lanes::AsyncComputeEnabled()) laneQueue.emplace(queueId);
                     recordLabelsForPacket(localDevice.get(), queueId);
                     if (noteWrites && writerKeyedEvidence() && !writersNoted) {
                         noteWrittenBuffers(address, queueId, compiledCommit);
@@ -579,6 +582,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         phaseTiming.Phase(PhaseLockWait);
+        std::optional<Lanes::QueueScope> laneQueue;
+        if (Lanes::AsyncComputeEnabled()) laneQueue.emplace(submission.queue);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(PhaseLabels);
