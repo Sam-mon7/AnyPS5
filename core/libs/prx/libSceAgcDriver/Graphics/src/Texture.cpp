@@ -1896,6 +1896,7 @@ bool StorageTexture::Refresh() {
         const bool overlapped = pending && otherPendingOverlaps();
         const auto change = pending && !overlapped ? MirrorSourceChange(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), mirrorProof, generation) : MirrorChange::Count;
         if (profile) countMirrorRefresh(!pending ? MirrorRefreshNotPending : overlapped ? MirrorRefreshOverlap : static_cast<int>(change));
+        if (profile && overlapped) traceOverlaps();
         if (change == MirrorChange::None) {
             NoteProved();
             return true;
@@ -2200,6 +2201,24 @@ std::uint64_t StorageTexture::SinglePassMoves() {
 
 std::uint64_t StorageTexture::MirrorUploads() {
     return mirrorUploads.load(std::memory_order_relaxed);
+}
+
+void StorageTexture::traceOverlaps() const {
+    static std::atomic<int> traced{0};
+    if (traced.load(std::memory_order_relaxed) >= 24) return;
+    const auto describe = [](const StorageTexture& texture) {
+        const auto& d = texture.descriptor;
+        char text[224];
+        std::snprintf(text, sizeof(text), "0x%llx+0x%llx %ux%u fmt %u tile %u mips %u (levels %u-%u) arrays %u-%u dim %u sel %u%u%u%u", static_cast<unsigned long long>(d.baseAddress), static_cast<unsigned long long>(texture.guestBytes), d.width, d.height, d.format, static_cast<unsigned>(d.tileMode), d.mipCount, d.baseLevel, d.lastLevel, d.baseArray, d.depthOrLastArray, static_cast<unsigned>(d.dimension), d.dstSelX, d.dstSelY, d.dstSelZ, d.dstSelW);
+        return std::string(text);
+    };
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    for (const auto* texture : pending.textures) {
+        if (texture == this || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
+        if (traced.fetch_add(1, std::memory_order_relaxed) >= 24) return;
+        std::fprintf(stderr, "[storage-overlap] %s with pending %s\n", describe(*this).c_str(), describe(*texture).c_str());
+    }
 }
 
 bool StorageTexture::otherPendingOverlaps() const {
