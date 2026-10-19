@@ -83,6 +83,7 @@ struct Counts {
     std::atomic<std::uint64_t> hostWrites{0};
     std::atomic<std::uint64_t> readFaults{0};
     std::atomic<std::uint64_t> faultNs{0};
+    std::atomic<std::uint64_t> readFaultNs{0};
     std::atomic<std::uint64_t> backingOpens{0};
     std::atomic<std::uint64_t> backingNs{0};
 };
@@ -250,8 +251,13 @@ bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
     const auto started = std::chrono::steady_clock::now();
     struct Timer {
         std::chrono::steady_clock::time_point started;
-        ~Timer() { counts.faultNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed); }
-    } timer{started};
+        bool read;
+        ~Timer() {
+            const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+            counts.faultNs.fetch_add(elapsed, std::memory_order_relaxed);
+            if (read) counts.readFaultNs.fetch_add(elapsed, std::memory_order_relaxed);
+        }
+    } timer{started, access == PageFaultAccess::Read};
     if (access == PageFaultAccess::Read) counts.readFaults.fetch_add(1, std::memory_order_relaxed);
     noteHot(access == PageFaultAccess::Write, address);
     if (resources->HandleFault(access, address)) return true;
@@ -766,9 +772,9 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             const auto now = window->loop.presented_frames.load(std::memory_order_relaxed);
-            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu read-faults=%llu fault-ms=%llu backing-opens=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
+            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu read-faults=%llu fault-ms=%llu read-fault-ms=%llu backing-opens=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
                          static_cast<unsigned long long>(counts.dcbs.load()), static_cast<unsigned long long>(counts.acbs.load()), static_cast<unsigned long long>(counts.adds.load()), static_cast<unsigned long long>(counts.graphicsTriggers.load()),
-                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()), static_cast<unsigned long long>(counts.readFaults.load()), static_cast<unsigned long long>(counts.faultNs.load() / 1000000), static_cast<unsigned long long>(counts.backingOpens.load()));
+                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()), static_cast<unsigned long long>(counts.readFaults.load()), static_cast<unsigned long long>(counts.faultNs.load() / 1000000), static_cast<unsigned long long>(counts.readFaultNs.load() / 1000000), static_cast<unsigned long long>(counts.backingOpens.load()));
             previous = now;
             {
                 std::lock_guard lock(hotMutex);
