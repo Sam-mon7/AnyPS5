@@ -239,8 +239,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         struct Last { std::vector<std::uint32_t> userData; std::map<std::uint32_t, std::uint32_t> shader; std::uint64_t key; };
         static std::map<std::uint64_t, Last> last;
         static int reports = 0;
+        static const std::uint64_t reportFrom = [] { const char* text = std::getenv("APS5_TRACE_DISPATCH_CACHE_FROM"); return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull; }();
+        static std::uint64_t traced = 0;
         auto& previous = last[address];
-        if (previous.key != 0 && previous.key != key && reports < 200) {
+        if (previous.key != 0 && previous.key != key && ++traced > reportFrom && reports < 200) {
             std::string what;
             for (std::size_t i = 0; i < userData.size(); ++i) {
                 if (i >= previous.userData.size() || previous.userData[i] != userData[i]) {
