@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/TextureDetile_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/CmaskClear_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/MirrorMerge_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/TextureDetileImage_spv.h"
 #include <algorithm>
 #include <array>
@@ -106,7 +107,55 @@ TextureDetiler::~TextureDetiler() {
     release();
 }
 
+void TextureDetiler::DispatchMirrorMerge(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress reference, VkDeviceAddress target, std::uint64_t words) {
+    Require(commands != VK_NULL_HANDLE && result != 0 && reference != 0 && target != 0 && words != 0, "a mirror merge needs a command buffer, three device addresses and a word count");
+    if (mergePipeline == VK_NULL_HANDLE) {
+        const VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &pushRange;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &mergePipelineLayout), "vkCreatePipelineLayout mirror merge");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = sizeof(MIRROR_MERGE_SPV);
+        moduleInfo.pCode = MIRROR_MERGE_SPV;
+        VkShaderModule mergeModule = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &mergeModule), "vkCreateShaderModule mirror merge");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = mergeModule;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = mergePipelineLayout;
+        VkResult created;
+        {
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &mergePipeline);
+        }
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, mergeModule, nullptr);
+        Check(created, "vkCreateComputePipelines mirror merge");
+    }
+    context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, mergePipeline);
+    constexpr std::uint64_t chunk = 65535ull * 64ull;
+    for (std::uint64_t done = 0; done < words; done += chunk) {
+        const auto count = static_cast<std::uint32_t>(std::min(chunk, words - done));
+        struct {
+            VkDeviceAddress result;
+            VkDeviceAddress reference;
+            VkDeviceAddress target;
+            std::uint32_t count;
+            std::uint32_t padding;
+        } push{result + done * 4, reference + done * 4, target + done * 4, count, 0};
+        static_assert(sizeof(push) == 32);
+        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, (count + 63u) / 64u, 1, 1);
+    }
+}
+
 void TextureDetiler::release() noexcept {
+    if (mergePipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, mergePipeline, nullptr);
+    if (mergePipelineLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, mergePipelineLayout, nullptr);
+    mergePipeline = VK_NULL_HANDLE;
+    mergePipelineLayout = VK_NULL_HANDLE;
     for (const auto pool : cmaskDescriptorPools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     if (cmaskPipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, cmaskPipeline, nullptr);
     if (cmaskPipelineLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, cmaskPipelineLayout, nullptr);

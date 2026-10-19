@@ -48,6 +48,7 @@ struct DispatchHeapRefreshStats {
 DispatchHeapRefreshStats DispatchHeapRefreshCounters();
 
 bool HeapGpuRefreshEnabled();
+bool MirrorGpuWriteBackEnabled();
 void CountCompletionWait(int kind);
 
 struct HeapGpuRefreshStats {

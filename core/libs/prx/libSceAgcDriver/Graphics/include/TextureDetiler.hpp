@@ -54,6 +54,8 @@ namespace AgcDriver::Graphics {
         void BeginBatch();
         void DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask, std::uint64_t cmaskOffset, std::size_t cmaskBytes, VkImageView view, std::uint32_t width, std::uint32_t height, std::uint32_t elementBytes, const std::array<std::uint32_t, 2>& clearWords, bool write);
         std::uint32_t CmaskErrors();
+        // Stores into `target` the bytes of `result` that differ from `reference` (`words` dwords).
+        void DispatchMirrorMerge(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress reference, VkDeviceAddress target, std::uint64_t words);
 
     private:
         VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image = false);
@@ -74,6 +76,8 @@ namespace AgcDriver::Graphics {
         std::vector<VkDescriptorPool> cmaskDescriptorPools;
         std::size_t allocatedCmaskSets = 0;
         std::unique_ptr<Buffer> cmaskErrors;
+        VkPipelineLayout mergePipelineLayout = VK_NULL_HANDLE;
+        VkPipeline mergePipeline = VK_NULL_HANDLE;
         VkDescriptorSetLayout imageDescriptorLayout = VK_NULL_HANDLE;
         VkPipelineLayout imagePipelineLayout = VK_NULL_HANDLE;
         VkShaderModule imageModule = VK_NULL_HANDLE;

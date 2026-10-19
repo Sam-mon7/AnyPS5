@@ -9014,6 +9014,8 @@ int main(int argc, char** argv) {
             const auto* value = std::getenv("APS5_HEAP_GPU_REFRESH");
             const bool expected = value != nullptr && std::string_view(value) == "1";
             Require(AgcDriver::Graphics::HeapGpuRefreshEnabled() == expected, "APS5_HEAP_GPU_REFRESH did not follow its exact value");
+            const auto* merge = std::getenv("APS5_MIRROR_GPU_WRITEBACK");
+            Require(AgcDriver::Graphics::MirrorGpuWriteBackEnabled() == (expected && merge != nullptr && std::string_view(merge) == "1"), "APS5_MIRROR_GPU_WRITEBACK did not follow its exact value and APS5_HEAP_GPU_REFRESH");
             std::cout << "Heap GPU refresh switch " << (expected ? "on" : "off") << '\n';
             return 0;
         }
@@ -9026,6 +9028,35 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && std::string_view(argv[1]) == "--mirror-merge-only") {
+            const auto& context = device.GetContext();
+            if (!context.bufferDeviceAddress) return 77;
+            constexpr std::size_t words = 70000;
+            const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            Buffer result(context, words * 4, usage), reference(context, words * 4, usage), target(context, words * 4, usage);
+            std::vector<std::uint32_t> before(words), after(words), guest(words), expected(words);
+            for (std::size_t index = 0; index < words; ++index) {
+                before[index] = static_cast<std::uint32_t>(index * 2654435761u);
+                after[index] = index % 3 == 0 ? before[index] : index % 3 == 1 ? before[index] ^ 0x00ff0000u : ~before[index];
+                guest[index] = 0x5a5a5a5au ^ static_cast<std::uint32_t>(index);
+                std::uint32_t mask = 0;
+                for (std::uint32_t lane = 0; lane < 4; ++lane) if (((before[index] ^ after[index]) >> (lane * 8)) & 0xffu) mask |= 0xffu << (lane * 8);
+                expected[index] = (guest[index] & ~mask) | (after[index] & mask);
+            }
+            std::memcpy(result.Bytes().data(), after.data(), words * 4);
+            std::memcpy(reference.Bytes().data(), before.data(), words * 4);
+            std::memcpy(target.Bytes().data(), guest.data(), words * 4);
+            TextureDetiler detiler(context);
+            CommandBatch batch(context);
+            RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            detiler.DispatchMirrorMerge(batch.Handle(), result.DeviceAddress(), reference.DeviceAddress(), target.DeviceAddress(), words);
+            RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            batch.SubmitAndWait();
+            target.Invalidate();
+            Require(std::memcmp(target.Bytes().data(), expected.data(), words * 4) == 0, "the mirror merge did not store exactly the changed bytes");
+            std::cout << "Mirror merge tests passed\n";
+            return 0;
+        }
         if (completionProbe) {
             completionProbeTests(device);
             return 0;

@@ -210,6 +210,11 @@ HeapGpuRefreshCounts& HeapGpuRefreshes() {
     return counts;
 }
 
+std::atomic<std::uint64_t>& mirrorMerges() {
+    static std::atomic<std::uint64_t> merges{0};
+    return merges;
+}
+
 std::map<std::uint64_t, std::uint64_t>& NotInPlaceWriters() {
     static std::map<std::uint64_t, std::uint64_t> writers;
     return writers;
@@ -2484,6 +2489,18 @@ void excludeBlocks(std::vector<RefreshBlock>& blocks, std::size_t first, std::sp
     blocks.insert(blocks.end(), kept.begin(), kept.end());
 }
 
+bool mirrorGpuWriteBackRequested() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_MIRROR_GPU_WRITEBACK");
+        return value != nullptr && std::string_view(value) == "1" && heapGpuRefresh();
+    }();
+    return enabled;
+}
+
+bool mirrorGpuWriteBack(const Context& context) {
+    return mirrorGpuWriteBackRequested() && context.bufferDeviceAddress && context.detiler != nullptr;
+}
+
 bool gpuOrderedRun(const Context* context, std::span<ImageMirror* const> mirrors, std::uint64_t begin, std::uint64_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& excluded) {
     excluded.clear();
     if (context == nullptr || bytes == 0 || !heapGpuRefresh()) return false;
@@ -4588,6 +4605,10 @@ bool HeapGpuRefreshEnabled() {
     return heapGpuRefresh();
 }
 
+bool MirrorGpuWriteBackEnabled() {
+    return mirrorGpuWriteBackRequested();
+}
+
 void CountCompletionWait(int kind) {
     if (!heapGpuRefresh() || kind < 0 || kind > 2) return;
     auto& counts = HeapGpuRefreshes();
@@ -4621,7 +4642,7 @@ std::string HeapGpuRefreshWriters() {
     const auto& counts = HeapGpuRefreshes();
     const auto value = [](const std::atomic<std::uint64_t>& counter) { return std::to_string(counter.load(std::memory_order_relaxed)); };
     std::string text = "labels:" + value(counts.labels) + ",held-waits:" + value(counts.heldWaits) + ",waits-no-mirror:" + value(counts.waitNoMirror) + ",waits-direct:" + value(counts.waitDirect) +
-        ",waits-unnoted:" + value(counts.waitUnnoted) + ",waits-import:" + value(counts.waitImport) + ",waits-other-mirror:" + value(counts.waitOtherMirror) + ",completion-copied:" + value(counts.completionCopied) +
+        ",waits-unnoted:" + value(counts.waitUnnoted) + ",waits-import:" + value(counts.waitImport) + ",waits-other-mirror:" + value(counts.waitOtherMirror) + ",gpu-merges:" + value(mirrorMerges()) + ",completion-copied:" + value(counts.completionCopied) +
         ",completion-drawn:" + value(counts.completionDrawn) + ",completion-labels:" + value(counts.completionLabels) + ",";
     char entry[48];
     for (std::size_t index = 0; index < writers.size() && index < 6; ++index) {
@@ -6446,10 +6467,15 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     return CachedTable{tableSerial, tableRanges.get()};
 }
 
+bool GuestBufferMemory::mergedWrite(std::uint64_t begin, std::uint64_t end) const {
+    return std::any_of(mirrorReadbacks.begin(), mirrorReadbacks.end(), [&](const MirrorReadback& readback) { return readback.merged && readback.begin <= begin && end <= readback.begin + readback.bytes; });
+}
+
 bool GuestBufferMemory::HasCopiedWrites() const {
     if (VramMirrorWrites() && !mirrorWrites.empty()) return true;
     for (const auto& [begin, end] : writes) {
         if (BufferCache::WritesEnabled() && BufferCache::Contains(this, begin, static_cast<std::size_t>(end - begin))) continue;
+        if (mergedWrite(begin, end)) continue;
         const auto* found = owner(begin);
         if (found == nullptr) continue;
         const auto& region = *found;
@@ -6474,6 +6500,7 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
     for (const auto& [begin, end] : writes) {
         if (BufferCache::WritesEnabled() && BufferCache::Contains(this, begin, static_cast<std::size_t>(end - begin))) continue;
         if (!(address < end && begin < address + bytes)) continue;
+        if (mergedWrite(begin, end)) continue;
         const auto* found = owner(begin);
         if (found == nullptr) continue;
         const auto& region = *found;
@@ -6990,7 +7017,8 @@ void GuestBufferMemory::takeHeapReferences() {
         const auto copied = static_cast<std::size_t>(((end + 3) & ~std::uint64_t{3}) - (begin & ~std::uint64_t{3}));
         Require((begin & ~std::uint64_t{3}) >= mirror->base && (begin & ~std::uint64_t{3}) + copied <= mirror->base + mirror->bytes, "mirror readback alignment exceeds its backing");
         constexpr auto properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-        auto reference = std::make_shared<Buffer>(context, copied, VK_BUFFER_USAGE_TRANSFER_DST_BIT, properties);
+        const VkBufferUsageFlags merge = mirrorGpuWriteBack(context) ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u;
+        auto reference = std::make_shared<Buffer>(context, copied, VK_BUFFER_USAGE_TRANSFER_DST_BIT | merge, properties);
         auto result = std::make_shared<Buffer>(context, copied, VK_BUFFER_USAGE_TRANSFER_DST_BIT, properties);
         mirrorReadbacks.push_back({begin, static_cast<std::size_t>(end - begin), mirror, std::move(reference), std::move(result)});
     };
@@ -7059,6 +7087,25 @@ void GuestBufferMemory::recordMirrorResults(Recorder* recorder) {
             region.copiedBack = true;
         }
         if (copied) RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        bool merging = false;
+        for (auto& readback : mirrorReadbacks) {
+            if (readback.recorded || !mirrorGpuWriteBack(context) || readback.mirror->sparse) continue;
+            const auto aligned = readback.begin & ~std::uint64_t{3};
+            const auto* import = HostImportFor(context, aligned, static_cast<std::size_t>(readback.reference->Size()));
+            const auto mirrorAddress = readback.mirror->buffer->DeviceAddress();
+            const auto referenceAddress = readback.reference->DeviceAddress();
+            if (import == nullptr || import->address == 0 || mirrorAddress == 0 || referenceAddress == 0) continue;
+            if (!merging) {
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                merging = true;
+            }
+            context.detiler->DispatchMirrorMerge(commands, mirrorAddress + (aligned - readback.mirror->base), referenceAddress, import->address + (aligned - import->base), readback.reference->Size() / 4);
+            readback.recorded = true;
+            readback.merged = true;
+            mirrorMerges().fetch_add(1, std::memory_order_relaxed);
+        }
+        if (merging) RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT);
         for (auto& readback : mirrorReadbacks) {
             if (readback.recorded) continue;
             CopyBuffer(context, commands, readback.mirror->buffer->Handle(), (readback.begin & ~std::uint64_t{3}) - readback.mirror->base, readback.result->Handle(), 0, readback.result->Size());
@@ -7087,6 +7134,10 @@ void GuestBufferMemory::WriteBack() {
     recordMirrorResults(nullptr);
     completeMirrorWrites();
     for (const auto& readback : mirrorReadbacks) {
+        if (readback.merged) {
+            GuestMemory::MarkWritten(readback.begin, readback.bytes);
+            continue;
+        }
         const auto started = std::chrono::steady_clock::now();
         Require(readback.recorded, "mirror write-back has no GPU readback");
         const auto offset = static_cast<std::size_t>(readback.begin % 4);

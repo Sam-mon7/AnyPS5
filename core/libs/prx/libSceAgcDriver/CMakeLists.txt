@@ -83,6 +83,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcMirrorMergeShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MirrorMerge.comp)
+set(agcMirrorMergeShaderSpv ${agcTextureDetileGeneratedDir}/MirrorMerge.spv)
+set(agcMirrorMergeShaderHeader ${agcTextureDetileGeneratedDir}/MirrorMerge_spv.h)
+add_custom_command(
+        OUTPUT "${agcMirrorMergeShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcMirrorMergeShaderSpv}" "${agcMirrorMergeShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcMirrorMergeShaderSpv} -DOUTPUT=${agcMirrorMergeShaderHeader}
+        -DSYMBOL=MIRROR_MERGE_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcMirrorMergeShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcSampleCounterShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/SampleCounter.comp)
 set(agcSampleCounterShaderSpv ${agcTextureDetileGeneratedDir}/SampleCounter.spv)
 set(agcSampleCounterShaderHeader ${agcTextureDetileGeneratedDir}/SampleCounter_spv.h)
@@ -226,6 +239,7 @@ set(agcDriverSources
         ${agcTextureDetileImageShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
+        ${agcMirrorMergeShaderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
@@ -1170,6 +1184,19 @@ if(BUILD_TESTING)
             if(residentHeapMode STREQUAL "on")
                 set_property(TEST agc_resident_heap_${residentHeapMode} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RESIDENT_HEAP_MIRRORS=set:1")
             endif()
+        endforeach()
+        add_test(NAME agc_mirror_merge COMMAND agc_driver_recorder_tests --mirror-merge-only)
+        set_tests_properties(agc_mirror_merge PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        foreach(mirrorMergeMode IN ITEMS on nonexact without_refresh)
+            add_test(NAME agc_mirror_gpu_writeback_${mirrorMergeMode} COMMAND agc_driver_recorder_tests --heap-gpu-refresh-switch)
+            set(mirrorMergeEnvironment "APS5_HEAP_GPU_REFRESH=set:1;APS5_MIRROR_GPU_WRITEBACK=set:1")
+            if(mirrorMergeMode STREQUAL "nonexact")
+                set(mirrorMergeEnvironment "APS5_HEAP_GPU_REFRESH=set:1;APS5_MIRROR_GPU_WRITEBACK=set:01")
+            elseif(mirrorMergeMode STREQUAL "without_refresh")
+                set(mirrorMergeEnvironment "APS5_HEAP_GPU_REFRESH=unset:;APS5_MIRROR_GPU_WRITEBACK=set:1")
+            endif()
+            set_tests_properties(agc_mirror_gpu_writeback_${mirrorMergeMode} PROPERTIES TIMEOUT 60
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_RESIDENT_HEAP_MIRRORS=unset:;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_LAZY_WRITES=unset:;APS5_VRAM_DEVICE_LOCAL_MIRRORS=unset:;${mirrorMergeEnvironment}")
         endforeach()
         foreach(heapGpuRefreshMode IN ITEMS off on nonexact)
             add_test(NAME agc_heap_gpu_refresh_${heapGpuRefreshMode} COMMAND agc_driver_recorder_tests --heap-gpu-refresh-switch)

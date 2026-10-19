@@ -600,7 +600,9 @@ private:
         std::shared_ptr<Buffer> reference;
         std::shared_ptr<Buffer> result;
         bool recorded = false;
+        bool merged = false;
     };
+    bool mergedWrite(std::uint64_t begin, std::uint64_t end) const;
     std::vector<MirrorReadback> mirrorReadbacks;
     std::vector<std::shared_ptr<ImageMirror>> mirrorUses;
     std::vector<std::pair<std::shared_ptr<ImageMirror>, std::shared_ptr<MirrorWriteInterval>>> mirrorWrites;

@@ -1,0 +1,26 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint words[]; };
+layout(push_constant) uniform Parameters {
+    Words result;
+    Words reference;
+    Words target;
+    uint count;
+} parameters;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.count) return;
+    const uint now = parameters.result.words[index];
+    const uint changed = now ^ parameters.reference.words[index];
+    if (changed == 0u) return;
+    uint mask = 0u;
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        const uint bits = 0xffu << (lane * 8u);
+        if ((changed & bits) != 0u) mask |= bits;
+    }
+    if (mask == 0xffffffffu) parameters.target.words[index] = now;
+    else parameters.target.words[index] = (parameters.target.words[index] & ~mask) | (now & mask);
+}
