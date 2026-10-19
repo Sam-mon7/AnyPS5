@@ -14,6 +14,7 @@ namespace AgcDriver::Graphics {
 
 struct Context;
 struct PreparedHeapRefresh;
+class Recorder;
 
 bool DispatchLockDietEnabled();
 using DispatchHeapRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
@@ -61,5 +62,6 @@ struct HeapGpuRefreshStats {
 
 HeapGpuRefreshStats HeapGpuRefreshCounters();
 std::string HeapGpuRefreshWriters();
+std::uint64_t StoreLabelInHeapMirror(const Context& context, Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes);
 
 }

@@ -2054,7 +2054,9 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
     static const bool completionFallback = std::getenv("APS5_LABEL_COMPLETION_FALLBACK") != nullptr;
     if (import == nullptr && completionFallback) {
+        const auto mirrored = Graphics::HeapGpuRefreshEnabled() ? Graphics::StoreLabelInHeapMirror(context, recorder, address, bytes) : 0;
         recorder.AfterCompletions(address, bytes, stamp, queue, false);
+        if (mirrored != 0) recorder.NoteInMirrorWrite(address, address + bytes.size(), mirrored);
         return 5;
     }
     if (import == nullptr) return 3;

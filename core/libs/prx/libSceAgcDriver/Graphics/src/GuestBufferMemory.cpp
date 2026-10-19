@@ -200,7 +200,7 @@ HeapRefreshCounters& HeapRefreshes() {
 }
 
 struct HeapGpuRefreshCounts {
-    std::atomic<std::uint64_t> runs{0}, copies{0}, bytes{0}, notInPlace{0}, pendingResults{0}, unimported{0}, unmirrored{0}, mirrored{0};
+    std::atomic<std::uint64_t> runs{0}, copies{0}, bytes{0}, notInPlace{0}, pendingResults{0}, unimported{0}, unmirrored{0}, mirrored{0}, labels{0};
 };
 
 HeapGpuRefreshCounts& HeapGpuRefreshes() {
@@ -2521,6 +2521,7 @@ bool gpuOrderedRun(const Context* context, std::span<ImageMirror* const> mirrors
     }
     if (cursor < end) prepareRange(cursor, end - cursor);
     Require(GuestMemory::Accessible(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
+    if (!mirrored.empty()) recorder->FlushStoresOverlapping(begin, static_cast<std::size_t>(bytes));
     const auto commands = recorder->Commands();
     if (copies.empty()) {
         RecordMemoryBarrier(*context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -4563,6 +4564,16 @@ HeapGpuRefreshStats HeapGpuRefreshCounters() {
         counts.unmirrored.load(std::memory_order_relaxed), counts.mirrored.load(std::memory_order_relaxed)};
 }
 
+std::uint64_t StoreLabelInHeapMirror(const Context& context, Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes) {
+    if (!heapGpuRefresh() || bytes.empty()) return 0;
+    const auto mirror = findMirror(context, address, address + bytes.size());
+    if (mirror == nullptr || !mirror->heap || mirror->sparse || mirror->buffer == nullptr || !mirror->buffer->Mapped()) return 0;
+    recorder.RecordStore(mirror->buffer->Handle(), address - mirror->base, bytes, address);
+    recorder.Keep(mirror->buffer);
+    HeapGpuRefreshes().labels.fetch_add(1, std::memory_order_relaxed);
+    return reinterpret_cast<std::uintptr_t>(mirror->buffer.get());
+}
+
 std::string HeapGpuRefreshWriters() {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writers;
     {
@@ -4570,7 +4581,7 @@ std::string HeapGpuRefreshWriters() {
         for (const auto& [offset, count] : NotInPlaceWriters()) writers.emplace_back(count, offset);
     }
     std::sort(writers.rbegin(), writers.rend());
-    std::string text;
+    std::string text = "labels:" + std::to_string(HeapGpuRefreshes().labels.load(std::memory_order_relaxed)) + ",";
     char entry[48];
     for (std::size_t index = 0; index < writers.size() && index < 6; ++index) {
         std::snprintf(entry, sizeof(entry), "%s+0x%llx:%llu", index == 0 ? "" : ",", static_cast<unsigned long long>(writers[index].second), static_cast<unsigned long long>(writers[index].first));
