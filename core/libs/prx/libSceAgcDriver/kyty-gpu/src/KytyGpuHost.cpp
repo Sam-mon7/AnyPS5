@@ -89,6 +89,30 @@ struct Counts {
 
 Counts counts;
 
+std::mutex hotMutex;
+std::unordered_map<std::uint64_t, std::uint32_t> hotReads;
+std::unordered_map<std::uint64_t, std::uint32_t> hotWrites;
+
+void noteHot(bool write, std::uint64_t address) {
+    std::lock_guard lock(hotMutex);
+    ++(write ? hotWrites : hotReads)[address & ~std::uint64_t{0xfff}];
+}
+
+std::string takeHot(std::unordered_map<std::uint64_t, std::uint32_t>& pages) {
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> sorted;
+    sorted.reserve(pages.size());
+    for (const auto& [page, count] : pages) sorted.emplace_back(count, page);
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string text = std::to_string(pages.size()) + " pages;";
+    char item[48];
+    for (std::size_t index = 0; index < std::min<std::size_t>(sorted.size(), 6); ++index) {
+        std::snprintf(item, sizeof(item), " %llx:%u", static_cast<unsigned long long>(sorted[index].second), sorted[index].first);
+        text += item;
+    }
+    pages.clear();
+    return text;
+}
+
 struct Protection {
     DWORD original;
     Mode mode;
@@ -208,6 +232,7 @@ bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
         ~Timer() { counts.faultNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed); }
     } timer{started};
     if (access == PageFaultAccess::Read) counts.readFaults.fetch_add(1, std::memory_order_relaxed);
+    noteHot(access == PageFaultAccess::Write, address);
     if (resources->HandleFault(access, address)) return true;
     MEMORY_BASIC_INFORMATION region{};
     if (!committed(address, region)) return false;
@@ -616,12 +641,19 @@ bool SystemContentParamSfoGetInt(const char*, int32_t*) {
     return false;
 }
 
-bool SystemContentParamSfoGetString(const char*, std::string*) {
-    return false;
+bool SystemContentParamSfoGetString(const char* name, std::string* value) {
+    if (host == nullptr || value == nullptr || name == nullptr || std::string_view(name) != "TITLE_ID") return false;
+    char id[32] = {};
+    host->titleId(id, sizeof(id));
+    *value = id;
+    return !value->empty();
 }
 
-bool SystemContentParamSfoGetString(const char*, char*, size_t) {
-    return false;
+bool SystemContentParamSfoGetString(const char* name, char* value, size_t value_size) {
+    std::string text;
+    if (value == nullptr || value_size == 0 || !SystemContentParamSfoGetString(name, &text)) return false;
+    std::snprintf(value, value_size, "%s", text.c_str());
+    return true;
 }
 
 namespace Timer {
@@ -713,6 +745,12 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                          static_cast<unsigned long long>(counts.dcbs.load()), static_cast<unsigned long long>(counts.acbs.load()), static_cast<unsigned long long>(counts.adds.load()), static_cast<unsigned long long>(counts.graphicsTriggers.load()),
                          static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()), static_cast<unsigned long long>(counts.readFaults.load()), static_cast<unsigned long long>(counts.faultNs.load() / 1000000), static_cast<unsigned long long>(counts.backingOpens.load()));
             previous = now;
+            {
+                std::lock_guard lock(hotMutex);
+                const auto reads = takeHot(hotReads);
+                const auto writes = takeHot(hotWrites);
+                std::fprintf(stderr, "[kyty-gpu] read faults: %s\n[kyty-gpu] write faults: %s\n", reads.c_str(), writes.c_str());
+            }
         }
     }).detach();
     return 0;

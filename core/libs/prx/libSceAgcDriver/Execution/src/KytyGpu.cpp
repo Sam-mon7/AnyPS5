@@ -4,6 +4,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -161,9 +162,14 @@ std::uint64_t tscFrequency() {
     return sceKernelGetTscFrequency();
 }
 
+void titleId(char* value, std::size_t size) {
+    const auto id = GetAppTitleId_nid_postfix();
+    std::snprintf(value, size, "%.*s", static_cast<int>(sizeof(id.value)), id.value);
+}
+
 constexpr KytyGpuHostTable hostTable{
     &readEvent, &writeEvent, &pendingCount, &pendingAt, &setPending, &addEvent, &triggerEvent, &deleteEvent, &pinEqueue,
-    &processTime, &processTimeCounter, &readTsc, &tscFrequency,
+    &processTime, &processTimeCounter, &readTsc, &tscFrequency, &titleId,
 };
 
 template <typename Function>

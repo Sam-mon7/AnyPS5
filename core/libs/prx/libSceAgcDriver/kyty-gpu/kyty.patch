@@ -296,6 +296,19 @@ index edea24b..722f4bb 100644
  						write.pBufferInfo = &view;
  						break;
  					}
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index f93bef4..119845d 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -41,7 +41,7 @@ namespace Libs::Graphics {
+ 
+ namespace {
+ 
+-constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
++constexpr auto DriverCacheSaveInterval = std::chrono::seconds {30};
+ 
+ uint8_t RemapSourceAlphaFactor(uint8_t factor) {
+ 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
 index efb2a98..073ebe8 100644
 --- a/src/graphics/host_gpu/renderer/renderCompute.cpp
