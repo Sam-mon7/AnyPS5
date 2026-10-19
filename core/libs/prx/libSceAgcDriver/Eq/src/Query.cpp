@@ -7,6 +7,7 @@
 #include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libSceAgcDriver/Execution/include/KytyGpu.hpp"
 
 extern "C" {
 
@@ -17,6 +18,7 @@ uint32_t APS5_VABI sceAgcDriverGetEqContextId(const KernelEvent* ev) {
     if (ev->filter != -14) {
         throw std::runtime_error(std::string(__func__) + ": not a graphics event");
     }
+    if (AgcDriver::KytyGpu::Enabled()) return static_cast<uint32_t>(ev->data);
     if (ev->ident > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error(std::string(__func__) + ": context id overflow");
     }

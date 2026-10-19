@@ -134,6 +134,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/KytyGpu.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
@@ -278,10 +279,17 @@ set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.
         INCLUDE_DIRECTORIES ${agcZlibIncludeDir}
 )
 
+if(WIN32 AND EXISTS ${CMAKE_SOURCE_DIR}/3rdparty/KytyPS5/src)
+    add_subdirectory(kyty-gpu)
+endif()
+
 add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${agcDriverSources}
 )
 add_dependencies(libSceAgcDriver agc_trace_revision)
+if(TARGET kytygpu)
+    add_dependencies(libSceAgcDriver kytygpu)
+endif()
 set_source_files_properties(Graphics/shaders/IndirectArguments.comp PROPERTIES HEADER_FILE_ONLY TRUE)
 target_sources(libSceAgcDriver PRIVATE Graphics/shaders/IndirectArguments.comp Graphics/shaders/IndirectArgumentsSpv.hpp)
 
@@ -499,6 +507,27 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_wait_shutdown agc_driver_resolution_shutdown PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
+add_test_executable(agc_kyty_gpu_tests EXCLUDE_FROM_ALL tests/KytyGpu.cpp)
+target_include_directories(agc_kyty_gpu_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_kyty_gpu_tests PRIVATE libSceAgcDriver libkernel libc)
+set_target_properties(agc_kyty_gpu_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_kyty_gpu_tests)
+if(BUILD_TESTING AND TARGET kytygpu)
+    set_target_properties(agc_kyty_gpu_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_dependencies(agc_kyty_gpu_tests kytygpu)
+    foreach(kytyGpuMode IN ITEMS off on nonexact)
+        add_test(NAME agc_kyty_gpu_${kytyGpuMode} COMMAND agc_kyty_gpu_tests)
+        set(kytyGpuValue "unset:")
+        if(kytyGpuMode STREQUAL "on")
+            set(kytyGpuValue "set:1")
+        elseif(kytyGpuMode STREQUAL "nonexact")
+            set(kytyGpuValue "set:01")
+        endif()
+        set_tests_properties(agc_kyty_gpu_${kytyGpuMode} PROPERTIES TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_append:$<TARGET_FILE_DIR:kytygpu>;APS5_KYTY_GPU=${kytyGpuValue}")
+    endforeach()
 endif()
 
 add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL

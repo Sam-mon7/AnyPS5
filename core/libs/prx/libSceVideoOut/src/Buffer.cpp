@@ -7,6 +7,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libSceVideoOut/include/KytyVideoOut.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
 AgcDriver::DisplayBuffer DescribeVideoOutBuffer(const VideoOutBuffer& buffer, const BufferAttributeGroup& group) {
@@ -32,6 +33,7 @@ AgcDriver::DisplayBuffer DescribeVideoOutBuffer(const VideoOutBuffer& buffer, co
 extern "C" {
 
 void APS5_VABI sceVideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribute, uint64_t pixelFormat, uint32_t tilingMode, uint32_t width, uint32_t height, uint64_t option, uint32_t dccControl, uint64_t dccCbRegisterClearColor) {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutSetBufferAttribute2)>("SetBufferAttribute2")(attribute, pixelFormat, tilingMode, width, height, option, dccControl, dccCbRegisterClearColor);
     if (attribute == nullptr) {
         throw std::runtime_error("sceVideoOutSetBufferAttribute2: null attribute");
     }
@@ -48,6 +50,7 @@ void APS5_VABI sceVideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribut
 }
 
 void APS5_VABI sceVideoOutAddBufferAttributeOption(VideoOutBufferAttribute2* attribute, uint64_t option) {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutAddBufferAttributeOption)>("AddBufferAttributeOption")(attribute, option);
     if (attribute == nullptr) {
         throw std::runtime_error("sceVideoOutAddBufferAttributeOption: null attribute");
     }
@@ -55,6 +58,7 @@ void APS5_VABI sceVideoOutAddBufferAttributeOption(VideoOutBufferAttribute2* att
 }
 
 int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIndexStart, const VideoOutBuffers* buffers, int bufferNum, const VideoOutBufferAttribute2* attribute, int category, void* option) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutRegisterBuffers2)>("RegisterBuffers2")(handle, setIndex, bufferIndexStart, buffers, bufferNum, attribute, category, option);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -111,6 +115,7 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
 }
 
 int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, const VideoOutBufferAttribute2* attribute, void* option) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutSubmitChangeBufferAttribute2)>("SubmitChangeBufferAttribute2")(handle, setIndex, attribute, option);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -144,6 +149,7 @@ int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, 
 }
 
 int APS5_VABI sceVideoOutUnregisterBuffers(int handle, int setIndex) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutUnregisterBuffers)>("UnregisterBuffers")(handle, setIndex);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -174,6 +180,7 @@ int APS5_VABI sceVideoOutUnregisterBuffers(int handle, int setIndex) try {
 }
 
 int APS5_VABI sceVideoOutSubmitFlip(int handle, int index, int flipMode, int64_t flipArg) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutSubmitFlip)>("SubmitFlip")(handle, index, flipMode, flipArg);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");

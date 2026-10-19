@@ -10,6 +10,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
+#include "prx/libSceAgcDriver/Execution/include/KytyGpu.hpp"
 
 namespace {
 
@@ -41,6 +42,7 @@ void AgcDriverDeliverEopInterrupt(std::uint32_t queue) {
 extern "C" {
 
 int APS5_VABI sceAgcDriverAddEqEvent(KernelEqueue eq, int id, void* udata) {
+    if (AgcDriver::KytyGpu::Enabled()) return AgcDriver::KytyGpu::AddEqEvent(eq, id, udata);
     if (eq == 0 || !EqueuePin_nid_postfix(eq)) {
         throw std::runtime_error(std::string(__func__) + ": invalid event queue");
     }
@@ -69,6 +71,7 @@ int APS5_VABI sceAgcDriverAddEqEvent(KernelEqueue eq, int id, void* udata) {
 }
 
 int APS5_VABI sceAgcDriverDeleteEqEvent(KernelEqueue eq, int id) {
+    if (AgcDriver::KytyGpu::Enabled()) return AgcDriver::KytyGpu::DeleteEqEvent(eq, id);
     {
         std::lock_guard lock(g_mutex);
         std::erase_if(g_registrations, [&](const Registration& r) { return r.eq == eq && r.id == id; });

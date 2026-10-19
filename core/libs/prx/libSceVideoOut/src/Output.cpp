@@ -11,6 +11,7 @@
 #include "prx/libSceVideoOut/include/Output.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libSceVideoOut/include/KytyVideoOut.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 
 static constexpr std::uint32_t VIDEO_OUT_OUTPUT_OPTIONS_FIRST_WORD = 0x00FF0000;
@@ -69,6 +70,7 @@ static void validateOpenParam(const void* param) {
 extern "C" {
 
 int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* param) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutOpen)>("Open")(userId, busType, index, param);
     validateOpenParam(param);
     if (userId != 255 && userId != 0) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_VALUE");
@@ -89,12 +91,14 @@ int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* pa
 }
 
 int APS5_VABI sceVideoOutClose(int handle) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutClose)>("Close")(handle);
     return VideoOutDriver::Get().Close(handle) ? 0 : VIDEO_OUT_ERROR_INVALID_HANDLE;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 int APS5_VABI sceVideoOutAllowOutputResolutionWqhdDetection(int handle) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutAllowOutputResolutionWqhdDetection)>("AllowOutputResolutionWqhdDetection")(handle);
     if (!VideoOutDriver::Get().IsOpen(handle)) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
     }
@@ -104,6 +108,7 @@ int APS5_VABI sceVideoOutAllowOutputResolutionWqhdDetection(int handle) try {
 }
 
 int APS5_VABI sceVideoOutSetFlipRate(int handle, int rate) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutSetFlipRate)>("SetFlipRate")(handle, rate);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -120,6 +125,7 @@ int APS5_VABI sceVideoOutSetFlipRate(int handle, int rate) try {
 }
 
 int APS5_VABI sceVideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutGetFlipStatus)>("GetFlipStatus")(handle, status);
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
@@ -136,6 +142,7 @@ int APS5_VABI sceVideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) t
 }
 
 int APS5_VABI sceVideoOutGetVblankStatus(int handle, VideoOutVblankStatus* status) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutGetVblankStatus)>("GetVblankStatus")(handle, status);
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
@@ -152,6 +159,7 @@ int APS5_VABI sceVideoOutGetVblankStatus(int handle, VideoOutVblankStatus* statu
 }
 
 int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutGetOutputStatus)>("GetOutputStatus")(handle, status);
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
@@ -195,6 +203,7 @@ int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatu
 }
 
 int APS5_VABI sceVideoOutIsFlipPending(int handle) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutIsFlipPending)>("IsFlipPending")(handle);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -207,6 +216,7 @@ int APS5_VABI sceVideoOutIsFlipPending(int handle) try {
 }
 
 int APS5_VABI sceVideoOutWaitVblank(int handle) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutWaitVblank)>("WaitVblank")(handle);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -222,6 +232,7 @@ int APS5_VABI sceVideoOutWaitVblank(int handle) try {
 }
 
 int APS5_VABI sceVideoOutInitializeOutputOptions(VideoOutOutputOptions* options) {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutInitializeOutputOptions)>("InitializeOutputOptions")(options);
     if (options == nullptr) return VIDEO_OUT_ERROR_INVALID_ADDRESS;
     std::memset(options, 0, sizeof(VideoOutOutputOptions));
     options->internalData[0] = VIDEO_OUT_OUTPUT_OPTIONS_FIRST_WORD;
@@ -229,6 +240,7 @@ int APS5_VABI sceVideoOutInitializeOutputOptions(VideoOutOutputOptions* options)
 }
 
 int APS5_VABI sceVideoOutIsOutputSupported(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutIsOutputSupported)>("IsOutputSupported")(handle, mode, options, reservedPtr, reserved);
     const int result = validateOutputConfig(handle, mode, options, reservedPtr, reserved);
     if (result != 0) {
         return result;
@@ -239,6 +251,7 @@ int APS5_VABI sceVideoOutIsOutputSupported(int handle, uint64_t mode, const Vide
 }
 
 int APS5_VABI sceVideoOutConfigureOutput(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutConfigureOutput)>("ConfigureOutput")(handle, mode, options, reservedPtr, reserved);
     const int supported = sceVideoOutIsOutputSupported(handle, mode, options, reservedPtr, reserved);
     if (supported < 0) {
         return supported;
@@ -257,6 +270,7 @@ int APS5_VABI sceVideoOutConfigureOutput(int handle, uint64_t mode, const VideoO
 }
 
 int APS5_VABI sceVideoOutSetWindowModeMargins(int handle, int top, int bottom) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutSetWindowModeMargins)>("SetWindowModeMargins")(handle, top, bottom);
     (void)top;
     (void)bottom;
     if (!VideoOutDriver::Get().IsOpen(handle)) {
@@ -268,6 +282,7 @@ int APS5_VABI sceVideoOutSetWindowModeMargins(int handle, int top, int bottom) t
 }
 
 int APS5_VABI sceVideoOutLatencyControlWaitBeforeInput(int handle) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutLatencyControlWaitBeforeInput)>("LatencyControlWaitBeforeInput")(handle);
     if (!VideoOutDriver::Get().IsOpen(handle)) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
     }
@@ -277,6 +292,7 @@ int APS5_VABI sceVideoOutLatencyControlWaitBeforeInput(int handle) try {
 }
 
 int APS5_VABI sceVideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutLatencyMeasureSetStartPoint)>("LatencyMeasureSetStartPoint")(handle, point);
     (void)point;
     if (!VideoOutDriver::Get().IsOpen(handle)) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -287,6 +303,7 @@ int APS5_VABI sceVideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point)
 }
 
 int APS5_VABI sceVideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma) {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutColorSettingsSetGamma)>("ColorSettingsSetGamma")(settings, gamma);
     if (settings == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
@@ -298,6 +315,7 @@ int APS5_VABI sceVideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, 
 }
 
 int APS5_VABI sceVideoOutAdjustColor(int handle, const VideoOutColorSettings* settings) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutAdjustColor)>("AdjustColor")(handle, settings);
     if (settings == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
@@ -312,6 +330,7 @@ int APS5_VABI sceVideoOutAdjustColor(int handle, const VideoOutColorSettings* se
 }
 
 int APS5_VABI sceVideoOutVrrUnpegFromFixedRate(int handle) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutVrrUnpegFromFixedRate)>("VrrUnpegFromFixedRate")(handle);
     if (VideoOutDriver::Get().GetConfig(handle) == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
     }
@@ -321,6 +340,7 @@ int APS5_VABI sceVideoOutVrrUnpegFromFixedRate(int handle) try {
 }
 
 int APS5_VABI sceVideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t arg2) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutVrrPegToFixedRate)>("VrrPegToFixedRate")(handle, arg1, arg2);
     if (VideoOutDriver::Get().GetConfig(handle) == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
     }

@@ -7,6 +7,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libSceVideoOut/include/KytyVideoOut.hpp"
 
 static std::vector<EventRegistration>* getEventList(VideoOutConfig& cfg, int16_t eventKind) {
     if (eventKind == VIDEO_OUT_EVENT_FLIP) return &cfg.flipEvents;
@@ -110,24 +111,28 @@ static int deleteVideoOutEvent(int handle, KernelEqueue eq, int16_t eventKind) {
 extern "C" {
 
 int APS5_VABI sceVideoOutAddFlipEvent(KernelEqueue eq, int handle, void* udata) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutAddFlipEvent)>("AddFlipEvent")(eq, handle, udata);
     return registerVideoOutEvent(handle, eq, VIDEO_OUT_EVENT_FLIP, udata);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 int APS5_VABI sceVideoOutAddVblankEvent(KernelEqueue eq, int handle, void* udata) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutAddVblankEvent)>("AddVblankEvent")(eq, handle, udata);
     return registerVideoOutEvent(handle, eq, VIDEO_OUT_EVENT_VBLANK, udata);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 int APS5_VABI sceVideoOutAddPreVblankStartEvent(KernelEqueue eq, int handle, void* udata) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutAddPreVblankStartEvent)>("AddPreVblankStartEvent")(eq, handle, udata);
     return registerVideoOutEvent(handle, eq, VIDEO_OUT_EVENT_PRE_VBLANK_START, udata);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 int APS5_VABI sceVideoOutAddOutputModeEvent(KernelEqueue eq, int handle, void* udata) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutAddOutputModeEvent)>("AddOutputModeEvent")(eq, handle, udata);
     return registerVideoOutEvent(handle, eq, VIDEO_OUT_EVENT_SET_MODE, udata);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -140,6 +145,7 @@ int APS5_VABI sceVideoOutAddVrrActiveStatusEvent(KernelEqueue eq, int handle, vo
 }
 
 int APS5_VABI sceVideoOutDeleteFlipEvent(KernelEqueue eq, int handle) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutDeleteFlipEvent)>("DeleteFlipEvent")(eq, handle);
     return deleteVideoOutEvent(handle, eq, VIDEO_OUT_EVENT_FLIP);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -152,12 +158,14 @@ int APS5_VABI sceVideoOutDeleteOutputModeEvent(KernelEqueue eq, int handle) try 
 }
 
 int APS5_VABI sceVideoOutDeleteVblankEvent(KernelEqueue eq, int handle) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutDeleteVblankEvent)>("DeleteVblankEvent")(eq, handle);
     return deleteVideoOutEvent(handle, eq, VIDEO_OUT_EVENT_VBLANK);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 int APS5_VABI sceVideoOutDeletePreVblankStartEvent(KernelEqueue eq, int handle) try {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutDeletePreVblankStartEvent)>("DeletePreVblankStartEvent")(eq, handle);
     return deleteVideoOutEvent(handle, eq, VIDEO_OUT_EVENT_PRE_VBLANK_START);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -170,6 +178,7 @@ int APS5_VABI sceVideoOutDeleteVrrActiveStatusEvent(KernelEqueue eq, int handle)
 }
 
 int APS5_VABI sceVideoOutGetEventId(const KernelEvent* ev) {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutGetEventId)>("GetEventId")(ev);
     if (ev == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
@@ -184,6 +193,7 @@ int APS5_VABI sceVideoOutGetEventId(const KernelEvent* ev) {
 }
 
 int APS5_VABI sceVideoOutGetEventData(const KernelEvent* ev, int64_t* data) {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutGetEventData)>("GetEventData")(ev, data);
     if (ev == nullptr || data == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
@@ -199,6 +209,7 @@ int APS5_VABI sceVideoOutGetEventData(const KernelEvent* ev, int64_t* data) {
 }
 
 int APS5_VABI sceVideoOutGetEventCount(const KernelEvent* ev) {
+    if (KytyVideoOutEnabled()) return KytyVideoOut<decltype(&sceVideoOutGetEventCount)>("GetEventCount")(ev);
     if (ev == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }

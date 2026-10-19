@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/PageTracker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/KytyGpu.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -114,6 +115,7 @@ void Driver::stop() {
 }
 
 Driver::Driver() {
+    if (KytyGpu::Enabled()) throw std::runtime_error("AGC driver: the AnyPS5 GPU driver must not start while APS5_KYTY_GPU=1");
     PageTracker::Initialize();
     static_cast<void>(GuestMemory::TrackerGeneration());
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);

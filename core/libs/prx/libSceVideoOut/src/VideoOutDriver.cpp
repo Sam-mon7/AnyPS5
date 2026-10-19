@@ -10,6 +10,7 @@
 
 #include "SDL.h"
 #include "SDL_vulkan.h"
+#include "SDL_syswm.h"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
 #include "prx/libSceVideoOut/include/MouseInput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
@@ -22,6 +23,7 @@
 #include "prx/libSceVideoOut/include/FrameTimingLog.hpp"
 #endif
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/KytyGpu.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -575,8 +577,15 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
     try {
         window.Ensure(VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT);
         updateDisplayRefreshRate();
-        const auto extensions = windowExtensions(window.Handle());
-        AgcDriverAttachWindow_nid_postfix({window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr});
+        if (AgcDriverKytyGpuEnabled_nid_no_patch()) {
+            SDL_SysWMinfo info{};
+            SDL_VERSION(&info.version);
+            require(SDL_GetWindowWMInfo(window.Handle(), &info) == SDL_TRUE, "cannot read the window handle for the Kyty GPU");
+            AgcDriverKytyGpuStart_nid_no_patch(info.info.win.window, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT);
+        } else {
+            const auto extensions = windowExtensions(window.Handle());
+            AgcDriverAttachWindow_nid_postfix({window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr});
+        }
     } catch (...) {
         window.Destroy();
         started.set_exception(std::current_exception());

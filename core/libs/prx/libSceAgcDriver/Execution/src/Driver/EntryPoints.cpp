@@ -1,16 +1,25 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/KytyGpu.hpp"
 #include <mutex>
 
 namespace AgcDriver {
 
 void Submit(const Packet* packet, std::uint32_t queue) try {
+    if (KytyGpu::Enabled()) {
+        KytyGpu::Submit(packet, queue);
+        return;
+    }
     DriverDetail::Driver::Get().Submit(packet, queue);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 void WaitIdle() {
+    if (KytyGpu::Enabled()) {
+        KytyGpu::WaitIdle();
+        return;
+    }
     DriverDetail::Driver::Get().WaitIdle();
 }
 
@@ -19,10 +28,18 @@ void Shutdown() {
 }
 
 void RegisterShader(const Shader* shader) {
+    if (KytyGpu::Enabled()) {
+        KytyGpu::RegisterShader(shader);
+        return;
+    }
     DriverDetail::Driver::Get().RegisterShader(shader);
 }
 
 void SuspendPoint() {
+    if (KytyGpu::Enabled()) {
+        KytyGpu::SuspendPoint();
+        return;
+    }
     DriverDetail::Driver::Get().SuspendPoint();
 }
 
@@ -128,17 +145,20 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
 }
 
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
+    if (AgcDriver::KytyGpu::Enabled()) return;
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
+    if (AgcDriver::KytyGpu::Enabled()) return;
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
+    if (AgcDriver::KytyGpu::Enabled()) return;
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
