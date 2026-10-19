@@ -4607,6 +4607,7 @@ std::uint64_t StoreLabelInLazyMirror(const Context& context, Recorder& recorder,
     if (mirror == nullptr || !mirror->heap || mirror->buffer == nullptr) return 0;
     recorder.RecordStore(mirror->buffer->Handle(), address - mirror->base, bytes, address);
     recorder.Keep(mirror->buffer);
+    dropShadows(*mirror, address, address + bytes.size());
     ++LazyState().counts.mirrorLabels;
     return reinterpret_cast<std::uintptr_t>(mirror->buffer.get());
 }
