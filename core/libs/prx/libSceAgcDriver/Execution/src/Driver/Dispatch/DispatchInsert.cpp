@@ -120,6 +120,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::span<
             }
             if (relocating) {
                 if (const auto inserted = dispatchCache.find(key); inserted != dispatchCache.end()) learnDispatchRelocation(relocationIdentity, userData, inserted->second, *attachVariant);
+                if (traceDispatchRelocation()) classifyRelocationMiss(relocationIdentity, userData, attachVariant, *capture);
             }
             trimDispatchCache();
         } else {

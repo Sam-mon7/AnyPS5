@@ -116,6 +116,8 @@ private:
     void trimDispatchCache();
     static bool dispatchRelocationEnabled();
     static bool verifyDispatchRelocation();
+    static bool traceDispatchRelocation();
+    void classifyRelocationMiss(std::uint64_t identity, std::span<const std::uint32_t> userData, const std::shared_ptr<DispatchVariant>& variant, const ShaderRecompiler::ResourceCapture& capture);
     std::shared_ptr<DispatchEntry> relocateDispatchEntry(std::unique_lock<std::mutex>& cacheLock, std::uint64_t identity, std::span<const std::uint32_t> userData);
     void learnDispatchRelocation(std::uint64_t identity, std::span<const std::uint32_t> userData, const std::shared_ptr<DispatchEntry>& entry, const DispatchVariant& variant);
     void verifyRelocatedHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> words, const ShaderRecompiler::RecompileResult& reused);
@@ -361,6 +363,8 @@ private:
     std::unordered_map<std::uint64_t, std::shared_ptr<const DrawRelocation>> dispatchRelocations;
     std::unordered_map<std::uint64_t, DispatchAlias> dispatchAliases;
     DispatchRelocationCounters dispatchRelocationCounters;
+    std::unordered_map<std::uint64_t, DispatchRelocationLast> dispatchRelocationLast;
+    DispatchRelocationTrace dispatchRelocationTrace;
     std::mutex drawCacheMutex;
     std::uint64_t drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;

@@ -75,6 +75,81 @@ bool Driver::verifyDispatchRelocation() {
     return verify;
 }
 
+bool Driver::traceDispatchRelocation() {
+    static const bool trace = dispatchRelocationEnabled() && ExactSwitch("APS5_TRACE_DISPATCH_RELOCATION");
+    return trace;
+}
+
+void Driver::classifyRelocationMiss(std::uint64_t identity, std::span<const std::uint32_t> userData, const std::shared_ptr<DispatchVariant>& variant, const ShaderRecompiler::ResourceCapture& capture) {
+    auto& trace = dispatchRelocationTrace;
+    auto& last = dispatchRelocationLast[identity];
+    const auto previous = last;
+    last = DispatchRelocationLast{std::vector<std::uint32_t>(userData.begin(), userData.end()), variant};
+    if (previous.variant == nullptr || previous.userData.size() != userData.size()) {
+        ++trace.firstSight;
+        return;
+    }
+    const auto& use = capture.userDataUse;
+    bool base = false, value = false, free = false;
+    for (std::uint32_t index = 0; index < userData.size(); ++index) {
+        if (previous.userData[index] == userData[index]) continue;
+        const auto bit = index < 64 ? std::uint64_t {1} << index : 0;
+        if (bit == 0 || (use.asValue & bit) != 0) value = true;
+        else if ((variant->relocatableWords & bit) != 0) base = true;
+        else if ((use.asBase & bit) != 0) value = true;
+        else free = true;
+    }
+    if (!base && !value && !free) {
+        ++trace.sameUserData;
+        return;
+    }
+    if (value) {
+        ++trace.valueMoved;
+        return;
+    }
+    if (!base) {
+        ++trace.freeOnly;
+        return;
+    }
+    ++(free ? trace.baseAndFree : trace.baseOnly);
+    auto runs = previous.variant->runs;
+    if (previous.variant->runBases.size() != runs.size()) {
+        ++trace.walkChanged;
+        return;
+    }
+    for (std::size_t run = 0; run < runs.size(); ++run) {
+        const auto origin = previous.variant->runBases[run];
+        if (origin < 0 || static_cast<std::size_t>(origin) >= userData.size() || userData[origin] == previous.userData[origin]) continue;
+        const auto delta = AlignedWord(userData[origin]) - AlignedWord(previous.userData[origin]);
+        runs[run].first += delta;
+        runs[run].second += delta;
+    }
+    if (runs != variant->runs || previous.variant->words.size() != variant->words.size()) {
+        ++trace.walkChanged;
+        return;
+    }
+    const auto addressWord = [&](std::uint32_t word) {
+        const auto holds = [&](const std::vector<ShaderRecompiler::DescriptorValue>& values) {
+            return std::any_of(values.begin(), values.end(), [&](const ShaderRecompiler::DescriptorValue& descriptor) { return descriptor.dwordCount >= 2 && (descriptor.dwords[0] == word || descriptor.dwords[1] == word); });
+        };
+        return holds(capture.snapshot.buffers) || holds(capture.snapshot.images);
+    };
+    bool data = false, address = false, other = false;
+    for (std::size_t i = 0; i < variant->words.size(); ++i) {
+        const auto word = variant->words[i];
+        if (word == previous.variant->words[i]) continue;
+        if (std::binary_search(variant->dataPositions.begin(), variant->dataPositions.end(), static_cast<std::uint32_t>(i))) data = true;
+        else if (addressWord(word)) address = true;
+        else if (std::find(capture.snapshot.flattenedSrt.begin(), capture.snapshot.flattenedSrt.end(), word) != capture.snapshot.flattenedSrt.end()) data = true;
+        else other = true;
+    }
+    if (!data && !address && !other) ++trace.contentEqual;
+    else if (other) ++trace.structural;
+    else if (data && address) ++trace.dataAndAddress;
+    else if (data) ++trace.dataOnly;
+    else ++trace.addressOnly;
+}
+
 std::shared_ptr<DispatchEntry> Driver::relocateDispatchEntry(std::unique_lock<std::mutex>& cacheLock, std::uint64_t identity, std::span<const std::uint32_t> userData) {
     auto& counters = dispatchRelocationCounters;
     ++counters.lookups;
@@ -238,6 +313,11 @@ void Driver::reportDispatchRelocation() {
     auto& counters = dispatchRelocationCounters;
     AgcDriver::ProfilePrint_nid_no_patch("[dispatch-relocate] (10 s) %llu lookups without an entry: %llu with no learned shape, %llu with unreadable content; %llu donors with moved user words (%llu variants refused), %llu hits through a relocated entry (%llu kept under their own key), %llu relocated entries that did not validate; %zu shapes learned, %zu aliases held\n", static_cast<unsigned long long>(counters.lookups), static_cast<unsigned long long>(counters.unlearned), static_cast<unsigned long long>(counters.unreadable), static_cast<unsigned long long>(counters.donors), static_cast<unsigned long long>(counters.refused), static_cast<unsigned long long>(counters.hits), static_cast<unsigned long long>(counters.inserted), static_cast<unsigned long long>(counters.differing), dispatchRelocations.size(), dispatchAliases.size());
     counters = {};
+    if (!traceDispatchRelocation()) return;
+    const auto& trace = dispatchRelocationTrace;
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    AgcDriver::ProfilePrint_nid_no_patch("[dispatch-relocate] (10 s) inserts against their identity's previous insert: %llu first, %llu same user words, %llu with a value word changed, %llu with only unused words changed, %llu with only base words changed (%llu with unused words too); of those, walk changed %llu, contents equal %llu, data words only %llu, descriptor addresses only %llu, data and addresses %llu, other words %llu\n", count(trace.firstSight), count(trace.sameUserData), count(trace.valueMoved), count(trace.freeOnly), count(trace.baseOnly), count(trace.baseAndFree), count(trace.walkChanged), count(trace.contentEqual), count(trace.dataOnly), count(trace.addressOnly), count(trace.dataAndAddress), count(trace.structural));
+    dispatchRelocationTrace = {};
 }
 
 DispatchRelocationCounters Driver::DispatchRelocationCounts() {

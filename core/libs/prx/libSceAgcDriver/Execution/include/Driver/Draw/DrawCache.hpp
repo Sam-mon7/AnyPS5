@@ -144,6 +144,15 @@ struct DispatchRelocationCounters {
     std::uint64_t lookups = 0, unlearned = 0, unreadable = 0, donors = 0, refused = 0, hits = 0, differing = 0, inserted = 0;
 };
 
+struct DispatchRelocationTrace {
+    std::uint64_t firstSight = 0, sameUserData = 0, valueMoved = 0, freeOnly = 0, baseOnly = 0, baseAndFree = 0, walkChanged = 0, contentEqual = 0, dataOnly = 0, addressOnly = 0, dataAndAddress = 0, structural = 0;
+};
+
+struct DispatchRelocationLast {
+    std::vector<std::uint32_t> userData;
+    std::shared_ptr<const DispatchVariant> variant;
+};
+
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
 
 }
