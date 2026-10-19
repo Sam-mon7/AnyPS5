@@ -166,6 +166,7 @@ Observation PollCpuWrites(std::span<const Range> ranges);
 bool ArmEnabled();
 bool PreciseWrites();
 bool CompleteWrites();
+bool RearmOnDemand();
 std::pair<std::uint64_t, bool> BatchTicket(const void* recorder, std::uint64_t serial);
 void CompleteBatch(std::uint64_t ticket);
 bool PrepareReadbacks();

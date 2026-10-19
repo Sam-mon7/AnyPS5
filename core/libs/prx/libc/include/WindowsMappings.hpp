@@ -55,6 +55,14 @@ public:
         return enabled;
     }
 
+    static bool RearmOnDemand() {
+        static const bool enabled = [] {
+            const auto* value = std::getenv("APS5_PAGE_TRACKER_REARM_ON_DEMAND");
+            return ObservationRequested() && value != nullptr && std::string_view(value) == "1";
+        }();
+        return enabled;
+    }
+
     static bool RearmBackoff() {
         static const bool enabled = [] {
             const auto* value = std::getenv("APS5_PAGE_TRACKER_REARM_BACKOFF");
@@ -110,6 +118,10 @@ public:
             const bool wrote = page.written != 0;
             page.written = 0;
             if (page.touched == 0) continue;
+            if (RearmOnDemand()) {
+                ++observationCounts.deferredRearms;
+                continue;
+            }
             if (RearmBackoff()) {
                 if (page.delay != 0) {
                     --page.delay;

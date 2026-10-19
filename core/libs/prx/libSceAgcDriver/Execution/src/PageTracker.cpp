@@ -613,8 +613,9 @@ DirtyPages Tracker::DirtyPagesSince(Range range, const Epoch& token) const {
 void Tracker::ObserveRead(Range range, GuestMemory::ReadSite site) {
     if (static_cast<std::size_t>(site) >= counts.reads.size()) site = GuestMemory::ReadSite::Unknown;
     std::array<ReadBytes, static_cast<std::size_t>(Kind::Count)> read{};
+    std::vector<Range> open;
     if (!range.Valid()) read[static_cast<std::size_t>(Kind::Unknown)].total = range.bytes;
-    else Visit(range, false, [&](auto, auto offset, auto bytes, auto* region) {
+    else Visit(range, false, [&](auto id, auto offset, auto bytes, auto* region) {
         for (auto cursor = offset; cursor < offset + bytes;) {
             const auto stop = std::min(offset + bytes, (cursor / PageBytes + 1) * PageBytes);
             const auto page = cursor / PageBytes;
@@ -625,6 +626,11 @@ void Tracker::ObserveRead(Range range, GuestMemory::ReadSite site) {
                 for (std::size_t i = 0; i < region->kinds.size(); ++i) if ((region->kinds[i][page / 64] & (1ull << (page % 64))) != 0) kind = static_cast<Kind>(i);
                 if ((reasons & (Bit(Reason::ExcludedImport) | Bit(Reason::HostAlias))) != 0) kind = Kind::Import;
                 else if (ArmEnabled() && (reasons & Bit(Reason::Immutable)) != 0) kind = Kind::Immutable;
+                if (RearmOnDemand() && (reasons & Bit(Reason::OpenWriter)) != 0 && (region->kinds[static_cast<std::size_t>(Kind::Section)][page / 64] & (1ull << (page % 64))) != 0) {
+                    const auto address = id * RegionBytes + page * PageBytes;
+                    if (!open.empty() && open.back().address + open.back().bytes == address) open.back().bytes += PageBytes;
+                    else if (open.empty() || open.back().address != address) open.push_back({address, PageBytes});
+                }
             }
             auto& entry = read[static_cast<std::size_t>(kind)];
             entry.total += stop - cursor;
@@ -632,11 +638,16 @@ void Tracker::ObserveRead(Range range, GuestMemory::ReadSite site) {
             cursor = stop;
         }
     });
-    std::lock_guard lock(countsMutex);
-    for (std::size_t i = 0; i < read.size(); ++i) {
-        counts.reads[static_cast<std::size_t>(site)][i].covered += read[i].covered;
-        counts.reads[static_cast<std::size_t>(site)][i].total += read[i].total;
+    {
+        std::lock_guard lock(countsMutex);
+        for (std::size_t i = 0; i < read.size(); ++i) {
+            counts.reads[static_cast<std::size_t>(site)][i].covered += read[i].covered;
+            counts.reads[static_cast<std::size_t>(site)][i].total += read[i].total;
+        }
     }
+#ifdef _WIN32
+    for (const auto pages : open) GuestArena::GuestArenaArmPageObservation_nid_no_patch(pages.address, pages.bytes);
+#endif
 }
 
 void Tracker::NotePoll(std::uint64_t pages, std::uint64_t ns, bool complete) {
@@ -741,6 +752,11 @@ bool ArmEnabled() {
 
 bool PreciseWrites() {
     static const bool enabled = [] { const auto* text = std::getenv("APS5_PAGE_TRACKER_PRECISE_WRITES"); return Enabled() && text != nullptr && std::string_view(text) == "1"; }();
+    return enabled;
+}
+
+bool RearmOnDemand() {
+    static const bool enabled = [] { const auto* text = std::getenv("APS5_PAGE_TRACKER_REARM_ON_DEMAND"); return ArmEnabled() && text != nullptr && std::string_view(text) == "1"; }();
     return enabled;
 }
 

@@ -46,6 +46,11 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+bool onDemand() {
+    const auto* value = std::getenv("APS5_PAGE_TRACKER_REARM_ON_DEMAND");
+    return ArmEnabled() && value != nullptr && std::string_view(value) == "1";
+}
+
 bool trustedAliases() {
     const auto* value = std::getenv("APS5_PAGE_TRACKER_TRUST_GPU_ALIASES");
     return ArmEnabled() && value != nullptr && std::string_view(value) == "1";
@@ -323,6 +328,7 @@ void protectedObservation() {
         require(tracker->Counts().regions == regions, "G3 fault allocated region metadata");
     }
     CompletedFrame();
+    if (onDemand()) tracker->ObserveRead(views.A(), AgcDriver::GuestMemory::ReadSite::BufferUpload);
     const auto rearmed = tracker != nullptr ? tracker->CaptureEpoch(views.A()) : Epoch{};
     *static_cast<volatile unsigned*>(views.b) = 31;
     const auto after = GuestArena::GuestArenaPageObservationCounts_nid_no_patch();
@@ -345,6 +351,7 @@ void protectedObservation() {
         require(GuestArena::GuestArenaPageObservationCounts_nid_no_patch().fallbackWindows > fallback, "timed fallback did not checkpoint");
         const auto* backoff = std::getenv("APS5_PAGE_TRACKER_REARM_BACKOFF");
         if (backoff != nullptr && std::string_view(backoff) == "1") for (int checkpoint = 0; checkpoint < 64; ++checkpoint) GuestArena::GuestArenaPageObservationCheckpoint_nid_no_patch(true);
+        if (onDemand()) Get()->ObserveRead(views.A(), AgcDriver::GuestMemory::ReadSite::BufferUpload);
         const auto beforeFallbackWrite = protectedWriteFaults.load();
         *static_cast<volatile unsigned*>(views.a) = 41;
         require(protectedWriteFaults.load() > beforeFallbackWrite, "timed fallback did not rearm");
@@ -604,6 +611,30 @@ void trustedAliasCoverage() {
     GuestArena::GuestArenaRelease_nid_postfix(view, bytes);
 }
 
+void rearmOnDemand() {
+    constexpr std::size_t bytes = 0x4000;
+    auto* view = GuestArena::GuestArenaAllocate_nid_postfix(bytes, RegionBytes);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    require(section != nullptr, "on-demand test section failed");
+    GuestArena::GuestArenaMap_nid_postfix(view, bytes, section, 0, PAGE_READWRITE);
+    CloseHandle(section);
+    const Range page{reinterpret_cast<std::uintptr_t>(view), PageBytes};
+    const auto protection = [&] {
+        MEMORY_BASIC_INFORMATION state{};
+        VirtualQuery(view, &state, sizeof(state));
+        return state.Protect;
+    };
+    require(protection() == PAGE_READONLY, "on-demand fixture was not armed");
+    require(GuestArena::GuestArenaHandleWrite_nid_postfix(page.address), "on-demand fault rejected");
+    GuestArena::GuestArenaPageObservationCheckpoint_nid_no_patch(true);
+    require((protection() == PAGE_READONLY) != onDemand(), "checkpoint rearm ignored the on-demand switch");
+    Get()->ObserveRead(page, AgcDriver::GuestMemory::ReadSite::TextureRead);
+    require(protection() == PAGE_READONLY, "a GPU-side read did not rearm its open page");
+    require(!Get()->DirtySince(page, Get()->CaptureEpoch(page)), "an on-demand rearmed page is not provable");
+    GuestArena::GuestArenaReset_nid_postfix(view, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(view, bytes);
+}
+
 void rearmBackoff() {
     const auto* value = std::getenv("APS5_PAGE_TRACKER_REARM_BACKOFF");
     const bool backoff = value != nullptr && std::string_view(value) == "1";
@@ -706,7 +737,8 @@ int main() {
         aliases(enabled);
         if (enabled && !CompleteWrites()) declarationSkips();
         if (ArmEnabled()) trustedAliasCoverage();
-        if (ArmEnabled()) rearmBackoff();
+        if (ArmEnabled() && !onDemand()) rearmBackoff();
+        if (ArmEnabled()) rearmOnDemand();
         protectedObservation();
         armingRefusals();
         mixedProtections();
