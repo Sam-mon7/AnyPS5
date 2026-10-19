@@ -92,6 +92,7 @@ Counts counts;
 std::mutex hotMutex;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReads;
 std::unordered_map<std::uint64_t, std::uint32_t> hotWrites;
+std::unordered_map<std::uint64_t, std::uint32_t> hotReadSites;
 
 void noteHot(bool write, std::uint64_t address) {
     std::lock_guard lock(hotMutex);
@@ -278,6 +279,10 @@ LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
     }
     counts.faults.fetch_add(1, std::memory_order_relaxed);
     const auto access = record->ExceptionInformation[0] == 1 ? PageFaultAccess::Write : PageFaultAccess::Read;
+    if (access == PageFaultAccess::Read) {
+        std::lock_guard lock(hotMutex);
+        ++hotReadSites[reinterpret_cast<std::uint64_t>(record->ExceptionAddress)];
+    }
     return notifyAccess(access, address) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -769,6 +774,23 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                 std::lock_guard lock(hotMutex);
                 const auto reads = takeHot(hotReads);
                 const auto writes = takeHot(hotWrites);
+                std::vector<std::pair<std::uint32_t, std::uint64_t>> sites;
+                for (const auto& [site, count] : hotReadSites) sites.emplace_back(count, site);
+                std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                std::string text;
+                char item[64];
+                for (std::size_t index = 0; index < std::min<std::size_t>(sites.size(), 6); ++index) {
+                    HMODULE module = nullptr;
+                    char name[MAX_PATH] = "?";
+                    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(sites[index].second), &module)) {
+                        GetModuleFileNameA(module, name, sizeof(name));
+                    }
+                    const char* base = std::strrchr(name, '\\');
+                    std::snprintf(item, sizeof(item), " %s+%llx:%u", base != nullptr ? base + 1 : name, static_cast<unsigned long long>(sites[index].second - reinterpret_cast<std::uint64_t>(module)), sites[index].first);
+                    text += item;
+                }
+                hotReadSites.clear();
+                std::fprintf(stderr, "[kyty-gpu] read fault sites:%s\n", text.c_str());
                 std::fprintf(stderr, "[kyty-gpu] read faults: %s\n[kyty-gpu] write faults: %s\n", reads.c_str(), writes.c_str());
             }
         }
