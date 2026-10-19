@@ -1723,7 +1723,33 @@ void RunLazyStorageWriteBackTests(const AgcDriver::Graphics::Context& device, Ag
             Require(texels[i] == expected, "guest memory does not hold the flushed storage image results");
         }
     }
+    {
+        auto small = resource;
+        small.width = 128;
+        small.height = 128;
+        auto pendingImage = StorageTexture::Create(context, detiler, small, 0);
+        auto overlapping = StorageTexture::Create(context, detiler, resource, 0);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const auto commands = recorder.Commands();
+        recorder.Keep(pendingImage);
+        recorder.Keep(overlapping);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearColorValue value{{0.0f, 1.0f, 0.0f, 1.0f}};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, pendingImage->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        pendingImage->MarkDirty();
+        overlapping->Refresh();
+        const bool kept = StorageTexture::FindPending(address, block) == pendingImage;
+        Require(kept == StorageTexture::KeepOverlappingResults(), StorageTexture::KeepOverlappingResults() ? "refreshing an overlapping image flushed another image's pending results" : "refreshing an overlapping image left another image's results pending");
+        Require(StorageTexture::FlushPending(address, surfaceBytes, nullptr, "lazy storage overlap test") == kept, "the overlap test's final flush did not match the pending state");
+        recorder.Sync();
+        const auto* texels = static_cast<volatile const std::uint8_t*>(alias);
+        for (std::size_t i = 0; i < surfaceBytes; ++i) {
+            const std::uint8_t expected = i < block ? (i % 4 == 1 || i % 4 == 3 ? 255 : 0) : (i % 4 == 0 || i % 4 == 3 ? 255 : 0);
+            Require(texels[i] == expected, "guest memory does not hold the overlapped image's results");
+        }
+    }
     recorder.Sync();
-    std::cout << "lazy storage write-back " << (StorageTexture::LazyMirrorWriteBack() ? "on the GPU" : "on the CPU") << " passed\n";
+    std::cout << "lazy storage write-back " << (StorageTexture::LazyMirrorWriteBack() ? "on the GPU" : "on the CPU") << (StorageTexture::KeepOverlappingResults() ? ", overlapping results kept" : "") << " passed\n";
 #endif
 }

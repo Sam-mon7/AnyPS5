@@ -1893,15 +1893,16 @@ bool StorageTexture::Refresh() {
     }
     if (MirrorSourceCovers(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && ProvedKeys() == DccKeys::Uncompressed) {
         const bool pending = anyLayerPending();
+        const bool keepOthers = KeepOverlappingResults();
         const bool overlapped = pending && otherPendingOverlaps();
-        const auto change = pending && !overlapped ? MirrorSourceChange(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), mirrorProof, generation) : MirrorChange::Count;
-        if (profile) countMirrorRefresh(!pending ? MirrorRefreshNotPending : overlapped ? MirrorRefreshOverlap : static_cast<int>(change));
+        const auto change = pending && (!overlapped || keepOthers) ? MirrorSourceChange(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), mirrorProof, generation) : MirrorChange::Count;
+        if (profile) countMirrorRefresh(!pending ? MirrorRefreshNotPending : overlapped && !keepOthers ? MirrorRefreshOverlap : static_cast<int>(change));
         if (profile && overlapped) traceOverlaps();
         if (change == MirrorChange::None) {
             NoteProved();
             return true;
         }
-        FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "mirror storage refresh");
+        FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "mirror storage refresh", PublishScope::Whole, nullptr, keepOthers ? this : nullptr);
         if (const auto source = MirrorSourceFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             NoteProved();
             if (uploadedKeys == DccKeys::Uncompressed && mirrorProof == source->proof) return true;
@@ -2176,6 +2177,14 @@ bool StorageTexture::Refresh() {
         uploadedKeys = keys;
     }
     return false;
+}
+
+bool StorageTexture::KeepOverlappingResults() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_KEEP_OVERLAPPING_RESULTS");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
 }
 
 bool StorageTexture::LazyMirrorWriteBack() {
@@ -3556,7 +3565,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     return false;
 }
 
-bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
+bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, const StorageTexture* only) {
     if (published != nullptr) *published = false;
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
@@ -3568,7 +3577,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
             if (ResidentResultsEnabled() && std::strcmp(reason, "idle") == 0 && texture->pendingLease != nullptr) { ++it; continue; }
-            if (texture != except && texture != exempt && texture->overlaps(address, bytes)) {
+            if (texture != except && texture != exempt && (only == nullptr || texture == only) && texture->overlaps(address, bytes)) {
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;
