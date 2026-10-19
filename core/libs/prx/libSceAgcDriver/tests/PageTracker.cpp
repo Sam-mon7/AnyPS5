@@ -343,6 +343,8 @@ void protectedObservation() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         GuestArena::GuestArenaPageObservationCheckpoint_nid_no_patch(false);
         require(GuestArena::GuestArenaPageObservationCounts_nid_no_patch().fallbackWindows > fallback, "timed fallback did not checkpoint");
+        const auto* backoff = std::getenv("APS5_PAGE_TRACKER_REARM_BACKOFF");
+        if (backoff != nullptr && std::string_view(backoff) == "1") for (int checkpoint = 0; checkpoint < 64; ++checkpoint) GuestArena::GuestArenaPageObservationCheckpoint_nid_no_patch(true);
         const auto beforeFallbackWrite = protectedWriteFaults.load();
         *static_cast<volatile unsigned*>(views.a) = 41;
         require(protectedWriteFaults.load() > beforeFallbackWrite, "timed fallback did not rearm");
@@ -602,6 +604,37 @@ void trustedAliasCoverage() {
     GuestArena::GuestArenaRelease_nid_postfix(view, bytes);
 }
 
+void rearmBackoff() {
+    const auto* value = std::getenv("APS5_PAGE_TRACKER_REARM_BACKOFF");
+    const bool backoff = value != nullptr && std::string_view(value) == "1";
+    constexpr std::size_t bytes = 0x4000;
+    auto* view = GuestArena::GuestArenaAllocate_nid_postfix(bytes, RegionBytes);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    require(section != nullptr, "backoff test section failed");
+    GuestArena::GuestArenaMap_nid_postfix(view, bytes, section, 0, PAGE_READWRITE);
+    CloseHandle(section);
+    const auto address = reinterpret_cast<std::uintptr_t>(view);
+    const auto protection = [&] {
+        MEMORY_BASIC_INFORMATION state{};
+        VirtualQuery(view, &state, sizeof(state));
+        return state.Protect;
+    };
+    const auto deferred = [] { return GuestArena::GuestArenaPageObservationCounts_nid_no_patch().deferredRearms; };
+    require(protection() == PAGE_READONLY, "backoff fixture was not armed");
+    const auto before = deferred();
+    require(GuestArena::GuestArenaHandleWrite_nid_postfix(address), "first backoff fault rejected");
+    GuestArena::GuestArenaPageObservationCheckpoint_nid_no_patch(true);
+    require(protection() == PAGE_READONLY, "a single faulting window deferred the rearm");
+    require(GuestArena::GuestArenaHandleWrite_nid_postfix(address), "second backoff fault rejected");
+    GuestArena::GuestArenaPageObservationCheckpoint_nid_no_patch(true);
+    require((protection() == PAGE_READONLY) != backoff, "a repeatedly written page ignored the backoff switch");
+    require((deferred() > before) == backoff, "deferred rearms ignored the backoff switch");
+    for (int checkpoint = 0; checkpoint < 4; ++checkpoint) GuestArena::GuestArenaPageObservationCheckpoint_nid_no_patch(true);
+    require(protection() == PAGE_READONLY, "a quiet page was not rearmed after its backoff");
+    GuestArena::GuestArenaReset_nid_postfix(view, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(view, bytes);
+}
+
 void declarationSkips() {
     constexpr std::size_t bytes = 0x4000;
     std::array<void*, 3> views{};
@@ -673,6 +706,7 @@ int main() {
         aliases(enabled);
         if (enabled && !CompleteWrites()) declarationSkips();
         if (ArmEnabled()) trustedAliasCoverage();
+        if (ArmEnabled()) rearmBackoff();
         protectedObservation();
         armingRefusals();
         mixedProtections();

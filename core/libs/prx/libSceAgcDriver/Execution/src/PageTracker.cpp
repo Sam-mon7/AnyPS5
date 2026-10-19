@@ -147,7 +147,7 @@ std::string observationProfile(const Statistics& reads) {
     line << " protect-pages=" << counts.protectionPages - previous.protectionPages << '/' << counts.protectionPages
          << " physical-cpu-pages=" << counts.physicalPages - previous.physicalPages << '/' << counts.physicalPages
          << " alias-page-events=" << counts.aliasPages - previous.aliasPages << '/' << counts.aliasPages
-         << " armed=" << counts.armedPages - previous.armedPages << '/' << counts.armedPages << " rearmed=" << counts.rearmedPages - previous.rearmedPages << '/' << counts.rearmedPages << " outstanding=" << counts.outstanding
+         << " armed=" << counts.armedPages - previous.armedPages << '/' << counts.armedPages << " rearmed=" << counts.rearmedPages - previous.rearmedPages << '/' << counts.rearmedPages << " rearm-deferred=" << counts.deferredRearms - previous.deferredRearms << '/' << counts.deferredRearms << " outstanding=" << counts.outstanding
          << " fallback-pages=" << counts.fallbackPages - previous.fallbackPages << '/' << counts.fallbackPages << " fallback-faults=" << counts.fallbackFaults - previous.fallbackFaults << '/' << counts.fallbackFaults;
     line << " protect-pages/call=";
     if (counts.protection.calls == previous.protection.calls) line << "N/A";

@@ -28,7 +28,7 @@ struct PageObservationStatistics {
     std::array<PageTiming, static_cast<std::size_t>(PageFaultKind::Count)> faults{};
     std::array<std::uint64_t, static_cast<std::size_t>(PageArmRefusal::Count)> refusals{};
     PageTiming protection, checkpoint, mappingWait;
-    std::uint64_t physicalPages = 0, aliasPages = 0, protectionPages = 0, armedPages = 0, rearmedPages = 0, outstanding = 0;
+    std::uint64_t physicalPages = 0, aliasPages = 0, protectionPages = 0, armedPages = 0, rearmedPages = 0, outstanding = 0, deferredRearms = 0;
     std::uint64_t frames = 0, fallbackWindows = 0, framePages = 0, maxFramePages = 0, fallbackPages = 0;
     std::uint64_t frameFaults = 0, maxFrameFaults = 0, fallbackFaults = 0;
     std::array<std::uint64_t, 32> frameFaultHistogram{};

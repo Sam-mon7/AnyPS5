@@ -55,6 +55,14 @@ public:
         return enabled;
     }
 
+    static bool RearmBackoff() {
+        static const bool enabled = [] {
+            const auto* value = std::getenv("APS5_PAGE_TRACKER_REARM_BACKOFF");
+            return ObservationRequested() && value != nullptr && std::string_view(value) == "1";
+        }();
+        return enabled;
+    }
+
     static bool TrustGpuAliases() {
         static const bool enabled = [] {
             const auto* value = std::getenv("APS5_PAGE_TRACKER_TRUST_GPU_ALIASES");
@@ -99,8 +107,23 @@ public:
         observationRetiredPages = 0;
         for (auto& [key, page] : cpuObservations) {
             written += std::popcount(page.written);
+            const bool wrote = page.written != 0;
             page.written = 0;
-            if (page.touched != 0) armObservation(key, page.touched);
+            if (page.touched == 0) continue;
+            if (RearmBackoff()) {
+                if (page.delay != 0) {
+                    --page.delay;
+                    ++observationCounts.deferredRearms;
+                    continue;
+                }
+                page.streak = wrote ? static_cast<std::uint8_t>(std::min(page.streak + 1, 6)) : 0;
+                if (page.streak >= 2) {
+                    page.delay = static_cast<std::uint8_t>((1u << (page.streak - 1)) - 1);
+                    ++observationCounts.deferredRearms;
+                    continue;
+                }
+            }
+            armObservation(key, page.touched);
         }
         const auto faults = observationFaultSerial.load(std::memory_order_relaxed);
         const auto faultDelta = faults - lastObservationFaultSerial;
@@ -1381,7 +1404,7 @@ private:
     };
     using PageReads = std::array<std::shared_ptr<PageRead>, subpages>;
     struct CpuObservation {
-        std::uint8_t armed = 0, touched = allSubpages, written = 0, everArmed = 0;
+        std::uint8_t armed = 0, touched = allSubpages, written = 0, everArmed = 0, streak = 0, delay = 0;
     };
     struct Section;
     struct SharedPage {
