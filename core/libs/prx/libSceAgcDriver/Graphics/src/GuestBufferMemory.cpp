@@ -201,6 +201,7 @@ HeapRefreshCounters& HeapRefreshes() {
 
 struct HeapGpuRefreshCounts {
     std::atomic<std::uint64_t> runs{0}, copies{0}, bytes{0}, notInPlace{0}, pendingResults{0}, unimported{0}, unmirrored{0}, mirrored{0}, labels{0}, heldWaits{0};
+    std::atomic<std::uint64_t> waitNoMirror{0}, waitDirect{0}, waitUnnoted{0}, waitImport{0}, waitOtherMirror{0};
 };
 
 HeapGpuRefreshCounts& HeapGpuRefreshes() {
@@ -2433,15 +2434,31 @@ void prepareRange(std::uint64_t address, std::uint64_t bytes, bool flush = true)
     syncRange(address, bytes, flush);
 }
 
-bool mirrorHoldsPendingWrites(const ImageMirror* mirror, std::uint64_t begin, std::uint64_t end) {
-    if (!heapGpuRefresh() || mirror == nullptr || !mirror->heap || end <= begin) return false;
+bool mirrorHoldsPendingWrites(const ImageMirror* mirror, std::uint64_t begin, std::uint64_t end, bool direct = false) {
+    if (!heapGpuRefresh() || end <= begin) return false;
     auto* recorder = Recorder::Active();
-    if (recorder == nullptr || Recorder::InCompletion()) return false;
+    if (recorder == nullptr || Recorder::InCompletion() || !recorder->PendingWriteOverlaps(begin, static_cast<std::size_t>(end - begin))) return false;
+    auto& counts = HeapGpuRefreshes();
+    if (mirror == nullptr || !mirror->heap) {
+        (direct ? counts.waitDirect : counts.waitNoMirror).fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::vector<Recorder::MirrorWrite> mirrored;
-    if (!recorder->InPlaceWritesOver(begin, static_cast<std::size_t>(end - begin), ranges, &mirrored) || !ranges.empty()) return false;
+    if (!recorder->InPlaceWritesOver(begin, static_cast<std::size_t>(end - begin), ranges, &mirrored)) {
+        counts.waitUnnoted.fetch_add(1, std::memory_order_relaxed);
+        countNotInPlaceWriter(recorder->NotInPlaceWriter(begin, static_cast<std::size_t>(end - begin)));
+        return false;
+    }
+    if (!ranges.empty()) {
+        counts.waitImport.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     const auto tag = reinterpret_cast<std::uintptr_t>(mirror->buffer.get());
-    if (!std::all_of(mirrored.begin(), mirrored.end(), [&](const auto& write) { return write.mirror == tag; })) return false;
+    if (!std::all_of(mirrored.begin(), mirrored.end(), [&](const auto& write) { return write.mirror == tag; })) {
+        counts.waitOtherMirror.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     HeapGpuRefreshes().heldWaits.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -4594,7 +4611,10 @@ std::string HeapGpuRefreshWriters() {
         for (const auto& [offset, count] : NotInPlaceWriters()) writers.emplace_back(count, offset);
     }
     std::sort(writers.rbegin(), writers.rend());
-    std::string text = "labels:" + std::to_string(HeapGpuRefreshes().labels.load(std::memory_order_relaxed)) + ",held-waits:" + std::to_string(HeapGpuRefreshes().heldWaits.load(std::memory_order_relaxed)) + ",";
+    const auto& counts = HeapGpuRefreshes();
+    const auto value = [](const std::atomic<std::uint64_t>& counter) { return std::to_string(counter.load(std::memory_order_relaxed)); };
+    std::string text = "labels:" + value(counts.labels) + ",held-waits:" + value(counts.heldWaits) + ",waits-no-mirror:" + value(counts.waitNoMirror) + ",waits-direct:" + value(counts.waitDirect) +
+        ",waits-unnoted:" + value(counts.waitUnnoted) + ",waits-import:" + value(counts.waitImport) + ",waits-other-mirror:" + value(counts.waitOtherMirror) + ",";
     char entry[48];
     for (std::size_t index = 0; index < writers.size() && index < 6; ++index) {
         std::snprintf(entry, sizeof(entry), "%s+0x%llx:%llu", index == 0 ? "" : ",", static_cast<unsigned long long>(writers[index].second), static_cast<unsigned long long>(writers[index].first));
@@ -5589,7 +5609,7 @@ void GuestBufferMemory::completeSpaceWrites() const {
         next = base.size();
         for (const auto index : candidates) {
             if (VramMirrorWrites() && base[index].mirror != nullptr && base[index].mirror->heap) continue;
-            if (mirrorHoldsPendingWrites(base[index].mirror.get(), base[index].begin, base[index].end)) continue;
+            if (mirrorHoldsPendingWrites(base[index].mirror.get(), base[index].begin, base[index].end, base[index].direct != nullptr)) continue;
             if (!CompletePendingCpuWrites(context, base[index].begin, static_cast<std::size_t>(base[index].end - base[index].begin))) continue;
             next = index + 1;
             break;
