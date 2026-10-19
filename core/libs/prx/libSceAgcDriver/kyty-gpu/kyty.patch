@@ -197,10 +197,24 @@ index df13100..4ae1566 100644
  			for (uint32_t slice = 0; slice < active.depth; ++slice) {
  				copy.bufferOffset                    = Add(Add(buffer_offset, mip.linear_offset),
 diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
-index edea24b..43e7be0 100644
+index edea24b..722f4bb 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
-@@ -574,7 +574,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+@@ -47,6 +47,13 @@
+ 
+ namespace Libs::Graphics {
+ 
++static void WarnScalarReadOverlap(const char* what) {
++	static std::atomic<uint32_t> warnings {0};
++	if (warnings.fetch_add(1, std::memory_order_relaxed) < 8) {
++		std::fprintf(stderr, "[kyty-gpu] %s; continuing with the specialised pipeline\n", what);
++	}
++}
++
+ namespace {
+ 
+ using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+@@ -574,7 +581,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
  	desc.info.pixel_format = pixel_format;
  	desc.info.guest_format = format;
  	desc.info.type         = TextureBaseType(type);
@@ -209,7 +223,7 @@ index edea24b..43e7be0 100644
  	desc.info.resources    = {levels, image_layers};
  	desc.info.bytes_per_block =
  	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
-@@ -695,10 +695,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
+@@ -695,10 +702,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
  	const auto& program  = *runtime.program;
  	const auto& snapshot = *runtime.resources;
  	prepared.runtime = &runtime;
@@ -224,7 +238,43 @@ index edea24b..43e7be0 100644
  	prepared.images.resize(program.info.images.size());
  	prepared.samplers.clear();
  	prepared.shader_data.clear();
-@@ -1051,7 +1051,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+@@ -757,7 +764,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
+ 							if (read_address > address) {
+ 								size = std::min(size, read_address - address);
+ 							} else if (address - read_address < read_size) {
+-								EXIT("scalar resource reads overlap a shader buffer write\n");
++								WarnScalarReadOverlap("scalar resource reads overlap a shader buffer write");
+ 							}
+ 						}
+ 					}
+@@ -929,7 +936,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+ 		if (reads.empty()) continue;
+ 		for (const auto* writer: prepared_bindings) {
+ 			if (writer->runtime->program->has_address_writes) {
+-				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
++				WarnScalarReadOverlap("scalar resource reads cannot be proven disjoint from shader address writes");
+ 			}
+ 		}
+ 		for (const auto [address, size]: reads) {
+@@ -941,7 +948,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+ 				                          image->info.metadata.range}) {
+ 					if (written.size != 0 && ImageRangeOverlaps(address, size,
+ 					                                          written.address, written.size)) {
+-						EXIT("scalar resource reads overlap an image or attachment write\n");
++						WarnScalarReadOverlap("scalar resource reads overlap an image or attachment write");
+ 					}
+ 				}
+ 			}
+@@ -952,7 +959,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+ 					const auto& written = writer->buffer_sources[resource.descriptor_index];
+ 					if (written.size != 0 && ImageRangeOverlaps(address, size,
+ 					                                          written.address, written.size)) {
+-						EXIT("scalar resource reads overlap a shader buffer write\n");
++						WarnScalarReadOverlap("scalar resource reads overlap a shader buffer write");
+ 					}
+ 				}
+ 			}
+@@ -1051,7 +1058,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
  						                             ? cache.GetBdaPageTableBuffer()
  						                             : cache.GetFaultBuffer();
  						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
