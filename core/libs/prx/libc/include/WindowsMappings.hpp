@@ -79,6 +79,16 @@ public:
         return enabled;
     }
 
+    static bool HotPagesEnabled() {
+        static const bool enabled = [] {
+            const auto* value = std::getenv("APS5_HOT_PAGES");
+            return value != nullptr && std::string_view(value) == "1";
+        }();
+        return enabled;
+    }
+
+    static constexpr std::uint64_t HotPageMilliseconds = 1000;
+
     void EnablePageObservation(bool (*ready)() noexcept) {
         if (!ObservationRequested()) return;
         MemoryLockProbe::Lock lock(mutex, "page-observation-enable", 0);
@@ -546,6 +556,12 @@ public:
         const auto written = subpagesOf(base, address, address + 1);
         if (HasPageObserver()) observeWrite(base, written, PageEvent::WriteFault);
         invalidate(*view.page, written);
+        if (HotPagesEnabled()) {
+            const auto until = GetTickCount64() + HotPageMilliseconds;
+            for (std::size_t sub = 0; sub < subpages; ++sub) {
+                if ((written & (1u << sub)) != 0) view.page->hotUntil[sub] = until;
+            }
+        }
         if (timer.active) {
             view.armed &= static_cast<std::uint8_t>(~written);
             applyGpuView(base, written);
@@ -1030,6 +1046,13 @@ public:
                 }
                 if (view.protection == PAGE_NOACCESS) return false;
                 const bool pinned = view.page->pins != 0;
+                std::uint8_t hot = 0;
+                if (HotPagesEnabled()) {
+                    const auto now = GetTickCount64();
+                    for (std::size_t sub = 0; sub < subpages; ++sub) {
+                        if (view.page->hotUntil[sub] > now) hot |= static_cast<std::uint8_t>(1u << sub);
+                    }
+                }
                 std::uint8_t settled = 0;
                 auto settledEnd = cursor;
                 bool full = false;
@@ -1037,7 +1060,7 @@ public:
                     const auto from = std::max(cursor, base + sub * subpageBytes);
                     const auto to = std::min(stop, base + (sub + 1) * subpageBytes);
                     if (from >= to) continue;
-                    if (collection == Collection::Fresh || pinned || view.seen[sub] != view.page->generation[sub]) {
+                    if (collection == Collection::Fresh || pinned || view.seen[sub] != view.page->generation[sub] || (hot & (1u << sub)) != 0) {
                         if (*count == capacity) {
                             full = true;
                             break;
@@ -1059,7 +1082,7 @@ public:
                     std::uint8_t untracked = 0;
                     for (const auto alias : view.page->aliases) {
                         auto& other = views.at(alias);
-                        const auto arming = static_cast<std::uint8_t>(settled & ~other.armed);
+                        const auto arming = static_cast<std::uint8_t>(settled & ~hot & ~other.armed);
                         if (!writable(other.protection) || arming == 0) continue;
                         if (other.hostWrites != 0) {
                             untracked |= arming;
@@ -1074,7 +1097,7 @@ public:
                             other.armed |= arming;
                         }
                     }
-                    const auto tracked = static_cast<std::uint8_t>(settled & ~untracked);
+                    const auto tracked = static_cast<std::uint8_t>(settled & ~untracked & ~hot);
                     auto cleanFrom = cursor;
                     auto cleanTo = cursor;
                     for (std::size_t sub = 0; sub < subpages; ++sub) {
@@ -1430,6 +1453,7 @@ private:
         std::array<std::uintptr_t, subpages> gpuOwners{};
         std::uint32_t hostAliases = 0;
         std::shared_ptr<Section> section;
+        std::array<std::uint64_t, subpages> hotUntil{};
     };
     struct Section {
         HANDLE handle;

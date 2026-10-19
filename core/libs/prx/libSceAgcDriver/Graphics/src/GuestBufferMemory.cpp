@@ -111,6 +111,7 @@ struct ImageMirror {
     std::shared_ptr<MirrorWriteInterval> writer;
     std::map<std::uint64_t, std::shared_ptr<MirrorWriteInterval>> lazyPages;
     std::shared_ptr<MirrorWriteInterval> lazyAddressWriter;
+    std::atomic<bool> lazyAny{false};
     std::uint64_t gpuRevision = 0;
     std::vector<std::uint64_t> gpuStamps;
     std::uint64_t aliasesGeneration = 0;
@@ -1736,6 +1737,7 @@ std::vector<std::uint64_t> protectLazyRange(ImageMirror& mirror, const std::shar
                 mirror.lazyPages.emplace(at, interval);
                 added.push_back(at);
             }
+            mirror.lazyAny.store(true, std::memory_order_release);
 #ifdef _WIN32
             Require(GuestArena::GuestArenaProtectGpuWrites_nid_no_patch(page, static_cast<std::size_t>(stop - page), &calls), "a lazy mirror range cannot protect CPU access");
 #endif
@@ -3580,13 +3582,21 @@ void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force)
     if (VramLazyWrites() && bytes != 0) {
         if (!force && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::MirrorRefresh) return;
         const auto end = address + std::min<std::uint64_t>(bytes, std::numeric_limits<std::uint64_t>::max() - address);
+        {
+            auto& state = Mirrors();
+            std::lock_guard lock(state.mutex);
+            if (std::none_of(state.entries.begin(), state.entries.end(), [&](const auto& entry) { return entry.second->lazyAny.load(std::memory_order_acquire) && address < entry.first + entry.second->bytes && entry.first < end; })) return;
+        }
         std::lock_guard gpu(GuestMemory::GpuMutex());
         std::vector<std::shared_ptr<ImageMirror>> mirrors;
         {
             auto& state = Mirrors();
             std::lock_guard lock(state.mutex);
-            for (const auto& [base, mirror] : state.entries)
-                if ((!mirror->lazyPages.empty() || mirror->lazyAddressWriter != nullptr) && address < base + mirror->bytes && base < end) mirrors.push_back(mirror);
+            for (const auto& [base, mirror] : state.entries) {
+                if (!(address < base + mirror->bytes && base < end)) continue;
+                if (!mirror->lazyPages.empty() || mirror->lazyAddressWriter != nullptr) mirrors.push_back(mirror);
+                else mirror->lazyAny.store(false, std::memory_order_release);
+            }
         }
         for (const auto& mirror : mirrors) publishLazyPages(*mirror, address, end);
         return;
@@ -6662,7 +6672,10 @@ void GuestBufferMemory::beginLazyWrites(Recorder* recorder) {
         interval->serial = recorder != nullptr ? recorder->Submissions() + 1 : 0;
         interval->order = ++LazyState().order;
         interval->generation = GuestMemory::TrackerGeneration();
-        if (interval->addressable) mirror->lazyAddressWriter = interval;
+        if (interval->addressable) {
+            mirror->lazyAddressWriter = interval;
+            mirror->lazyAny.store(true, std::memory_order_release);
+        }
         for (const auto& [begin, end] : interval->watched) {
             for (const auto page : protectLazyRange(*mirror, interval, begin, end, false)) {
                 const auto generation = mirror->generations[static_cast<std::size_t>(page / 65536 - mirror->base / 65536)];

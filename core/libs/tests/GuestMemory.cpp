@@ -1430,6 +1430,51 @@ static void CheckSharedWriteTracking() {
 #endif
 }
 
+static void CheckHotSharedPages() {
+#ifdef _WIN32
+    const auto* setting = std::getenv("APS5_HOT_PAGES");
+    const bool hot = setting != nullptr && std::string_view(setting) == "1";
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &phys) == 0);
+    void* first = nullptr;
+    void* second = nullptr;
+    Require(sceKernelMapDirectMemory(&first, page * 2, 3, 0, phys, 0) == 0);
+    Require(sceKernelMapDirectMemory(&second, page * 2, 3, 0, phys, 0) == 0);
+    const auto collect = [](void* address, std::size_t bytes) {
+        std::array<void*, 32> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(address), bytes, pages.data(), &count, true));
+        return count;
+    };
+    const auto armed = [](const void* address) {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(address, &info, sizeof(info)) == sizeof(info));
+        return (info.Protect & 0xffu) == PAGE_READONLY;
+    };
+    collect(first, page * 2);
+    collect(second, page * 2);
+    Require(collect(first, page * 2) == 0 && armed(first));
+    auto* left = static_cast<volatile unsigned char*>(first);
+    left[5] = 1;
+    Require(collect(first, page * 2) == 1);
+    if (hot) {
+        Require(!armed(first));
+        left[6] = 2;
+        Require(collect(first, page * 2) == 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        Require(collect(first, page * 2) == 1);
+        Require(collect(first, page * 2) == 0 && armed(first));
+    } else {
+        Require(armed(first));
+        Require(collect(first, page * 2) == 0);
+    }
+    Require(sceKernelMunmap(first, page * 2) == 0);
+    Require(sceKernelMunmap(second, page * 2) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page * 2) == 0);
+#endif
+}
+
 static void CheckSharedWritePages() {
 #ifdef _WIN32
     constexpr std::size_t page = 0x4000;
@@ -2345,12 +2390,17 @@ static void CheckMunmapOverUnmappedPages() {
     Require(sceKernelMunmap(memory, 0) == SCE_KERNEL_ERROR_EINVAL);
 }
 
-int main() {
+int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "1000");
 #else
     setenv("APS5_PIN_WAIT_MS", "1000", 1);
 #endif
+    if (argc == 2 && std::string_view(argv[1]) == "--hot-pages") {
+        CheckHotSharedPages();
+        std::puts("hot shared page tests passed");
+        return 0;
+    }
     CheckAvailableDirectMemoryIsLargestFreeBlock();
     CheckVirtualQuerySplitFlexibleRanges();
     CheckVirtualQueryForNonReadableGuestRange();
