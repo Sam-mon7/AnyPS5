@@ -48,6 +48,9 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <array>
+#include <map>
+#include <shared_mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -84,11 +87,22 @@ struct Counts {
     std::atomic<std::uint64_t> readFaults{0};
     std::atomic<std::uint64_t> faultNs{0};
     std::atomic<std::uint64_t> readFaultNs{0};
+    std::atomic<std::uint64_t> protectNs{0};
+    std::atomic<std::uint64_t> protectCalls{0};
+    std::atomic<std::uint64_t> protectSyscalls{0};
     std::atomic<std::uint64_t> backingOpens{0};
     std::atomic<std::uint64_t> backingNs{0};
 };
 
 Counts counts;
+
+bool statsEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_KYTY_GPU_STATS");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
+}
 
 std::mutex hotMutex;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReads;
@@ -96,6 +110,7 @@ std::unordered_map<std::uint64_t, std::uint32_t> hotWrites;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReadSites;
 
 void noteHot(bool write, std::uint64_t address) {
+    if (!statsEnabled()) return;
     std::lock_guard lock(hotMutex);
     ++(write ? hotWrites : hotReads)[address & ~std::uint64_t{0xfff}];
 }
@@ -115,19 +130,6 @@ std::string takeHot(std::unordered_map<std::uint64_t, std::uint32_t>& pages) {
     return text;
 }
 
-struct Protection {
-    DWORD original;
-    Mode mode;
-};
-
-std::mutex protectionMutex;
-std::unordered_map<std::uint64_t, Protection> protections;
-std::vector<std::pair<std::uint64_t, std::uint64_t>> hostWrites;
-
-bool inHostWrite(std::uint64_t page) {
-    return std::any_of(hostWrites.begin(), hostWrites.end(), [page](const auto& range) { return page < range.second && range.first < page + PageBytes; });
-}
-
 bool committed(std::uint64_t address, MEMORY_BASIC_INFORMATION& info) {
     return VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT;
 }
@@ -145,95 +147,238 @@ DWORD hostProtection(Mode mode, DWORD original) {
     }
 }
 
-bool protectPages(std::uint64_t address, std::uint64_t bytes, Mode mode) {
-    const auto begin = address & ~(PageBytes - 1);
-    const auto end = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
-    std::lock_guard lock(protectionMutex);
-    for (auto page = begin; page < end;) {
+constexpr std::uint64_t RegionBytes = 4ull << 20u;
+constexpr std::size_t RegionPages = RegionBytes / PageBytes;
+constexpr std::uint64_t LowerLimit = 1ull << 40u;
+constexpr std::uint64_t ExtendedBase = 0x080000000000ull;
+constexpr std::uint64_t ExtendedBytes = 512ull << 30u;
+constexpr std::uint8_t StateOpen = 0;
+constexpr std::uint8_t StateRead = 1;
+constexpr std::uint8_t StateNoAccess = 2;
+
+struct Region {
+    std::mutex mutex;
+    std::array<std::atomic<std::uint8_t>, RegionPages> state{};
+    std::array<std::uint8_t, RegionPages> hostWrites{};
+    std::array<DWORD, RegionPages> original{};
+};
+
+std::unique_ptr<std::atomic<Region*>[]> lowerRegions{new std::atomic<Region*>[LowerLimit / RegionBytes]{}};
+std::unique_ptr<std::atomic<Region*>[]> extendedRegions{new std::atomic<Region*>[ExtendedBytes / RegionBytes]{}};
+
+std::atomic<Region*>* regionSlot(std::uint64_t address) {
+    if (address < LowerLimit) return &lowerRegions[address / RegionBytes];
+    if (address >= ExtendedBase && address - ExtendedBase < ExtendedBytes) return &extendedRegions[(address - ExtendedBase) / RegionBytes];
+    return nullptr;
+}
+
+Region* findRegion(std::uint64_t address) {
+    auto* slot = regionSlot(address);
+    return slot != nullptr ? slot->load(std::memory_order_acquire) : nullptr;
+}
+
+void readOriginals(Region& region, std::uint64_t base, std::size_t first, std::size_t last) {
+    auto index = first;
+    while (index < last) {
         MEMORY_BASIC_INFORMATION info{};
-        if (!committed(page, info)) {
-            page = VirtualQuery(reinterpret_cast<const void*>(page), &info, sizeof(info)) == sizeof(info) ? std::max(page + PageBytes, regionEnd(info)) : page + PageBytes;
+        const auto at = base + index * PageBytes;
+        if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info) || regionEnd(info) <= at) {
+            region.original[index++] = 0;
             continue;
         }
-        const auto stop = std::min(end, regionEnd(info));
-        std::uint64_t runBegin = page;
-        std::uint64_t runEnd = page;
+        const auto stop = std::min<std::size_t>(last, (regionEnd(info) - base) / PageBytes);
+        const DWORD protection = info.State == MEM_COMMIT ? info.Protect : 0;
+        do {
+            region.original[index++] = protection;
+        } while (index < stop);
+    }
+}
+
+Region* ensureRegion(std::uint64_t address) {
+    auto* slot = regionSlot(address);
+    if (slot == nullptr) return nullptr;
+    if (auto* existing = slot->load(std::memory_order_acquire); existing != nullptr) return existing;
+    auto* created = new Region();
+    readOriginals(*created, address & ~(RegionBytes - 1), 0, RegionPages);
+    Region* expected = nullptr;
+    if (!slot->compare_exchange_strong(expected, created, std::memory_order_acq_rel)) {
+        delete created;
+        return expected;
+    }
+    return created;
+}
+
+std::uint8_t pageState(std::uint64_t address) {
+    const auto* region = findRegion(address);
+    return region != nullptr ? region->state[(address % RegionBytes) / PageBytes].load(std::memory_order_acquire) : StateOpen;
+}
+
+bool protectPages(std::uint64_t address, std::uint64_t bytes, Mode mode) {
+    const bool open = mode == Mode::ReadWrite || mode == Mode::ExecuteReadWrite;
+    const std::uint8_t desired = open ? StateOpen : (mode == Mode::NoAccess ? StateNoAccess : StateRead);
+    const auto begin = address & ~(PageBytes - 1);
+    const auto end = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
+    counts.protectCalls.fetch_add(1, std::memory_order_relaxed);
+    for (auto chunk = begin; chunk < end;) {
+        const auto base = chunk & ~(RegionBytes - 1);
+        const auto stop = std::min(end, base + RegionBytes);
+        auto* region = open ? findRegion(chunk) : ensureRegion(chunk);
+        if (region == nullptr) {
+            if (!open) return false;
+            chunk = stop;
+            continue;
+        }
+        std::lock_guard lock(region->mutex);
+        std::size_t runFirst = 0;
+        std::size_t runLast = 0;
         DWORD runProtection = 0;
         const auto flush = [&] {
+            if (runLast == runFirst) return true;
             DWORD previous = 0;
-            const bool applied = runEnd == runBegin || runProtection == info.Protect || VirtualProtect(reinterpret_cast<void*>(runBegin), runEnd - runBegin, runProtection, &previous);
-            runBegin = runEnd;
-            return applied;
-        };
-        for (auto at = page; at < stop; at += PageBytes) {
-            const auto found = protections.find(at);
-            const DWORD original = found != protections.end() ? found->second.original : info.Protect;
-            const bool open = mode == Mode::ReadWrite || mode == Mode::ExecuteReadWrite;
-            const DWORD wanted = open ? original : hostProtection(mode, original);
-            const bool apply = open || !inHostWrite(at);
-            if (!apply || wanted != runProtection || at != runEnd) {
-                if (!flush()) return false;
-                runBegin = at;
-                runEnd = at;
+            counts.protectSyscalls.fetch_add(1, std::memory_order_relaxed);
+            if (!open) {
+                for (auto index = runFirst; index < runLast; ++index) region->state[index].store(desired, std::memory_order_release);
             }
-            if (apply) {
-                runProtection = wanted;
-                runEnd = at + PageBytes;
-            } else {
-                runBegin = runEnd = at + PageBytes;
+            bool applied = VirtualProtect(reinterpret_cast<void*>(base + runFirst * PageBytes), (runLast - runFirst) * PageBytes, runProtection, &previous) != 0;
+            if (!applied) {
+                applied = true;
+                for (auto index = runFirst; index < runLast; ++index) {
+                    MEMORY_BASIC_INFORMATION page{};
+                    if (!committed(base + index * PageBytes, page)) {
+                        region->original[index] = 0;
+                        region->state[index].store(StateOpen, std::memory_order_release);
+                    } else if (!VirtualProtect(reinterpret_cast<void*>(base + index * PageBytes), PageBytes, runProtection, &previous)) {
+                        applied = false;
+                    }
+                }
             }
             if (open) {
-                if (found != protections.end()) protections.erase(found);
-            } else if (found != protections.end()) {
-                found->second.mode = mode;
-            } else {
-                protections.emplace(at, Protection{original, mode});
+                for (auto index = runFirst; index < runLast; ++index) region->state[index].store(StateOpen, std::memory_order_release);
             }
+            runFirst = runLast;
+            return applied;
+        };
+        for (auto index = (chunk - base) / PageBytes; index < (stop - base) / PageBytes; ++index) {
+            const auto current = region->state[index].load(std::memory_order_relaxed);
+            if (current == desired) {
+                if (!flush()) return false;
+                runFirst = runLast = index + 1;
+                continue;
+            }
+            if (!open && region->original[index] == 0) readOriginals(*region, base, index, index + 1);
+            const DWORD original = region->original[index];
+            if (original == 0 || (!open && region->hostWrites[index] != 0)) {
+                if (!flush()) return false;
+                region->state[index].store(original == 0 ? StateOpen : desired, std::memory_order_release);
+                runFirst = runLast = index + 1;
+                continue;
+            }
+            const DWORD wanted = open ? original : hostProtection(mode, original);
+            if (runLast != runFirst && (wanted != runProtection || index != runLast)) {
+                if (!flush()) return false;
+            }
+            if (runLast == runFirst) {
+                runFirst = index;
+                runProtection = wanted;
+            }
+            runLast = index + 1;
         }
         if (!flush()) return false;
-        page = stop;
+        chunk = stop;
     }
     return true;
+}
+
+std::shared_mutex mappingMutex;
+std::map<std::uint64_t, std::uint64_t> mappings;
+
+void addMapping(std::uint64_t begin, std::uint64_t end) {
+    std::unique_lock lock(mappingMutex);
+    auto it = mappings.upper_bound(begin);
+    if (it != mappings.begin() && std::prev(it)->second >= begin) {
+        --it;
+        begin = it->first;
+        end = std::max(end, it->second);
+        it = mappings.erase(it);
+    }
+    while (it != mappings.end() && it->first <= end) {
+        end = std::max(end, it->second);
+        it = mappings.erase(it);
+    }
+    mappings.emplace(begin, end);
+}
+
+void removeMapping(std::uint64_t begin, std::uint64_t end) {
+    std::unique_lock lock(mappingMutex);
+    auto it = mappings.upper_bound(begin);
+    if (it != mappings.begin()) --it;
+    while (it != mappings.end() && it->first < end) {
+        const auto first = it->first;
+        const auto last = it->second;
+        if (last <= begin) {
+            ++it;
+            continue;
+        }
+        it = mappings.erase(it);
+        if (first < begin) mappings.emplace(first, begin);
+        if (end < last) it = mappings.emplace(end, last).first;
+    }
+}
+
+std::uint64_t mappedRun(std::uint64_t address, std::uint64_t size) {
+    std::shared_lock lock(mappingMutex);
+    auto it = mappings.upper_bound(address);
+    if (it == mappings.begin()) return 0;
+    --it;
+    return address < it->second ? std::min(size, it->second - address) : 0;
+}
+
+void mapLate(std::uint64_t address) {
+    MEMORY_BASIC_INFORMATION region{};
+    if (resources == nullptr || !committed(address, region)) return;
+    const auto begin = std::max(address & ~(RegionBytes - 1), reinterpret_cast<std::uint64_t>(region.BaseAddress));
+    const auto end = std::min((address & ~(RegionBytes - 1)) + RegionBytes, regionEnd(region));
+    counts.lateMaps.fetch_add(1, std::memory_order_relaxed);
+    addMapping(begin, end);
+    resources->MapMemory(begin, end - begin);
 }
 
 template <typename Copy>
 bool backing(std::uint64_t address, std::uint64_t bytes, bool sparse, bool write, Copy&& copy) {
     for (auto at = address; at < address + bytes;) {
-        MEMORY_BASIC_INFORMATION info{};
-        const bool live = committed(at, info);
-        const auto stop = std::min(address + bytes, regionEnd(info) > at ? regionEnd(info) : at + PageBytes);
-        if (!live) {
-            if (!sparse) return false;
-            copy(at, stop - at, false);
-            at = stop;
+        auto run = at;
+        while (run < address + bytes) {
+            const auto state = pageState(run);
+            if (state != StateOpen && (write || state == StateNoAccess)) break;
+            run = std::min(address + bytes, (run & ~(PageBytes - 1)) + PageBytes);
+        }
+        if (run > at) {
+            if (mappedRun(at, run - at) < run - at) {
+                for (auto piece = at; piece < run;) {
+                    MEMORY_BASIC_INFORMATION info{};
+                    const bool live = committed(piece, info);
+                    const auto stop = std::min(run, regionEnd(info) > piece ? regionEnd(info) : piece + PageBytes);
+                    if (!live && !sparse) return false;
+                    copy(piece, stop - piece, live);
+                    piece = stop;
+                }
+            } else {
+                copy(at, run - at, true);
+            }
+            at = run;
             continue;
         }
-        for (auto page = at; page < stop;) {
-            std::unique_lock lock(protectionMutex);
-            auto run = page;
-            while (run < stop) {
-                const auto blocked = protections.find(run & ~(PageBytes - 1));
-                if (blocked != protections.end() && (write || blocked->second.mode == Mode::NoAccess)) break;
-                run = std::min(stop, (run & ~(PageBytes - 1)) + PageBytes);
-            }
-            if (run > page) {
-                lock.unlock();
-                copy(page, run - page, true);
-                page = run;
-                continue;
-            }
-            const auto next = std::min(stop, (page & ~(PageBytes - 1)) + PageBytes);
-            const auto found = protections.find(page & ~(PageBytes - 1));
-            {
-                counts.backingOpens.fetch_add(1, std::memory_order_relaxed);
-                DWORD previous = 0;
-                VirtualProtect(reinterpret_cast<void*>(page & ~(PageBytes - 1)), PageBytes, found->second.original, &previous);
-                copy(page, next - page, true);
-                VirtualProtect(reinterpret_cast<void*>(page & ~(PageBytes - 1)), PageBytes, previous, &previous);
-            }
-            page = next;
-        }
-        at = stop;
+        const auto page = at & ~(PageBytes - 1);
+        const auto next = std::min(address + bytes, page + PageBytes);
+        auto* region = findRegion(page);
+        std::lock_guard lock(region->mutex);
+        const auto index = (page % RegionBytes) / PageBytes;
+        counts.backingOpens.fetch_add(1, std::memory_order_relaxed);
+        DWORD previous = 0;
+        VirtualProtect(reinterpret_cast<void*>(page), PageBytes, region->original[index], &previous);
+        copy(at, next - at, true);
+        VirtualProtect(reinterpret_cast<void*>(page), PageBytes, previous, &previous);
+        at = next;
     }
     return true;
 }
@@ -248,44 +393,37 @@ bool permits(std::uint64_t address, bool write) {
 
 bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
     if (resources == nullptr) return false;
-    const auto started = std::chrono::steady_clock::now();
-    struct Timer {
-        std::chrono::steady_clock::time_point started;
-        bool read;
-        ~Timer() {
-            const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-            counts.faultNs.fetch_add(elapsed, std::memory_order_relaxed);
-            if (read) counts.readFaultNs.fetch_add(elapsed, std::memory_order_relaxed);
-        }
-    } timer{started, access == PageFaultAccess::Read};
     if (access == PageFaultAccess::Read) counts.readFaults.fetch_add(1, std::memory_order_relaxed);
+    if (!statsEnabled()) {
+        if (resources->HandleFault(access, address)) return true;
+        mapLate(address);
+        return resources->HandleFault(access, address);
+    }
+    const auto started = std::chrono::steady_clock::now();
     noteHot(access == PageFaultAccess::Write, address);
-    if (resources->HandleFault(access, address)) return true;
-    MEMORY_BASIC_INFORMATION region{};
-    if (!committed(address, region)) return false;
-    constexpr std::uint64_t block = 4ull << 20u;
-    const auto begin = std::max(address & ~(block - 1), reinterpret_cast<std::uint64_t>(region.BaseAddress));
-    const auto end = std::min((address & ~(block - 1)) + block, regionEnd(region));
-    counts.lateMaps.fetch_add(1, std::memory_order_relaxed);
-    resources->MapMemory(begin, end - begin);
-    return resources->HandleFault(access, address);
+    bool handled = resources->HandleFault(access, address);
+    if (!handled) {
+        mapLate(address);
+        handled = resources->HandleFault(access, address);
+    }
+    const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+    counts.faultNs.fetch_add(elapsed, std::memory_order_relaxed);
+    if (access == PageFaultAccess::Read) counts.readFaultNs.fetch_add(elapsed, std::memory_order_relaxed);
+    return handled;
 }
 
 LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
     const auto* record = info->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     const auto address = static_cast<std::uint64_t>(record->ExceptionInformation[1]);
-    {
-        std::lock_guard lock(protectionMutex);
-        if (!protections.contains(address & ~(PageBytes - 1))) {
-            if (record->ExceptionInformation[0] == 8 || !permits(address, record->ExceptionInformation[0] == 1)) return EXCEPTION_CONTINUE_SEARCH;
-            counts.raceRetries.fetch_add(1, std::memory_order_relaxed);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
+    if (pageState(address) == StateOpen) {
+        if (record->ExceptionInformation[0] == 8 || !permits(address, record->ExceptionInformation[0] == 1)) return EXCEPTION_CONTINUE_SEARCH;
+        counts.raceRetries.fetch_add(1, std::memory_order_relaxed);
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
     counts.faults.fetch_add(1, std::memory_order_relaxed);
     const auto access = record->ExceptionInformation[0] == 1 ? PageFaultAccess::Write : PageFaultAccess::Read;
-    if (access == PageFaultAccess::Read) {
+    if (access == PageFaultAccess::Read && statsEnabled()) {
         std::lock_guard lock(hotMutex);
         ++hotReadSites[reinterpret_cast<std::uint64_t>(record->ExceptionAddress)];
     }
@@ -383,7 +521,7 @@ void configure(std::uint32_t width, std::uint32_t height) {
         options.screen_height = height;
         const char* log = std::getenv("APS5_KYTY_GPU_LOG");
         options.printf_direction = log != nullptr && std::string_view(log) == "1" ? Config::LogDirection::Console : Config::LogDirection::Silent;
-        options.present_mode = Config::PresentMode::Fifo;
+        options.present_mode = Config::PresentMode::Mailbox;
         Config::Load(options);
         Log::Initialize();
     });
@@ -634,6 +772,7 @@ bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+    if (const auto known = mappedRun(vaddr, size); known != 0) return known;
     std::uint64_t covered = 0;
     while (covered < size) {
         MEMORY_BASIC_INFORMATION info{};
@@ -643,6 +782,7 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
     if (covered == 0) {
         EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
     }
+    addMapping(vaddr, vaddr + covered);
     return covered;
 }
 
@@ -772,11 +912,11 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             const auto now = window->loop.presented_frames.load(std::memory_order_relaxed);
-            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu read-faults=%llu fault-ms=%llu read-fault-ms=%llu backing-opens=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
+            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu read-faults=%llu fault-ms=%llu read-fault-ms=%llu protect-ms=%llu protect-calls=%llu protect-syscalls=%llu backing-opens=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
                          static_cast<unsigned long long>(counts.dcbs.load()), static_cast<unsigned long long>(counts.acbs.load()), static_cast<unsigned long long>(counts.adds.load()), static_cast<unsigned long long>(counts.graphicsTriggers.load()),
-                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()), static_cast<unsigned long long>(counts.readFaults.load()), static_cast<unsigned long long>(counts.faultNs.load() / 1000000), static_cast<unsigned long long>(counts.readFaultNs.load() / 1000000), static_cast<unsigned long long>(counts.backingOpens.load()));
+                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()), static_cast<unsigned long long>(counts.readFaults.load()), static_cast<unsigned long long>(counts.faultNs.load() / 1000000), static_cast<unsigned long long>(counts.readFaultNs.load() / 1000000), static_cast<unsigned long long>(counts.protectNs.load() / 1000000), static_cast<unsigned long long>(counts.protectCalls.load()), static_cast<unsigned long long>(counts.protectSyscalls.load()), static_cast<unsigned long long>(counts.backingOpens.load()));
             previous = now;
-            {
+            if (statsEnabled()) {
                 std::lock_guard lock(hotMutex);
                 const auto reads = takeHot(hotReads);
                 const auto writes = takeHot(hotWrites);
@@ -823,11 +963,15 @@ __declspec(dllexport) int KytyGpuDeleteEqEvent(std::int64_t eq, int id, void*) {
 }
 
 __declspec(dllexport) void KytyGpuMapMemory(std::uint64_t address, std::uint64_t bytes) {
-    if (resources != nullptr && Libs::Graphics::GuestRange{address, bytes}.Valid()) resources->MapMemory(address, bytes);
+    if (resources == nullptr || bytes == 0) return;
+    addMapping(address, address + bytes);
+    if (Libs::Graphics::GuestRange{address, bytes}.Valid()) resources->MapMemory(address, bytes);
 }
 
 __declspec(dllexport) void KytyGpuUnmapMemory(std::uint64_t address, std::uint64_t bytes) {
-    if (resources != nullptr && Libs::Graphics::GuestRange{address, bytes}.Valid()) resources->UnmapMemory(address, bytes);
+    if (resources == nullptr || bytes == 0) return;
+    removeMapping(address, address + bytes);
+    if (Libs::Graphics::GuestRange{address, bytes}.Valid()) resources->UnmapMemory(address, bytes);
 }
 
 __declspec(dllexport) void KytyGpuMapShader(const KytyGpuShader* shader) {
@@ -848,21 +992,21 @@ __declspec(dllexport) void* KytyGpuVideoOut(const char* name) {
 
 __declspec(dllexport) void KytyGpuHostWrite(std::uint64_t address, std::uint64_t bytes, bool begin) {
     if (resources == nullptr || bytes == 0) return;
-    {
-        std::lock_guard lock(protectionMutex);
-        if (begin) {
-            hostWrites.emplace_back(address, address + bytes);
-        } else if (const auto found = std::find(hostWrites.begin(), hostWrites.end(), std::make_pair(address, address + bytes)); found != hostWrites.end()) {
-            hostWrites.erase(found);
-        }
-    }
-    counts.hostWrites.fetch_add(begin ? 1 : 0, std::memory_order_relaxed);
+    if (begin) counts.hostWrites.fetch_add(1, std::memory_order_relaxed);
     const auto end = address + bytes;
     for (auto page = address & ~(PageBytes - 1); page < end; page += PageBytes) {
+        auto* region = begin ? ensureRegion(page) : findRegion(page);
+        if (region == nullptr) continue;
+        const auto index = (page % RegionBytes) / PageBytes;
         bool tracked = false;
         {
-            std::lock_guard lock(protectionMutex);
-            tracked = protections.contains(page);
+            std::lock_guard lock(region->mutex);
+            if (begin) {
+                ++region->hostWrites[index];
+            } else if (region->hostWrites[index] != 0) {
+                --region->hostWrites[index];
+            }
+            tracked = region->state[index].load(std::memory_order_relaxed) != StateOpen;
         }
         if (tracked) notifyAccess(PageFaultAccess::Write, std::max(page, address));
     }

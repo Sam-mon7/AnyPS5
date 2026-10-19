@@ -245,7 +245,7 @@ void Start(void* window, std::uint32_t width, std::uint32_t height) {
     std::size_t mapped = 0;
     std::uint64_t bytes = 0;
     for (const auto& range : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
-        if (range == nullptr || !range->gpu) continue;
+        if (range == nullptr || range->bytes == 0) continue;
         loaded.mapMemory(range->address, range->bytes);
         ++mapped;
         bytes += range->bytes;
@@ -256,7 +256,7 @@ void Start(void* window, std::uint32_t width, std::uint32_t height) {
     started.store(true, std::memory_order_release);
     for (const auto& pending : pendingEqEvents) loaded.addEqEvent(pending.eq, pending.id, pending.udata);
     pendingEqEvents.clear();
-    std::fprintf(stderr, "[kyty-gpu] started on %ux%u; %zu GPU ranges (%llu MiB) mapped\n", width, height, mapped, static_cast<unsigned long long>(bytes >> 20));
+    std::fprintf(stderr, "[kyty-gpu] started on %ux%u; %zu guest ranges (%llu MiB) mapped\n", width, height, mapped, static_cast<unsigned long long>(bytes >> 20));
 }
 
 void Submit(const Packet* packet, std::uint32_t queue) {
