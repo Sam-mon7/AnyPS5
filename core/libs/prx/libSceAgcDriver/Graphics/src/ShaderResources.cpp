@@ -3329,7 +3329,7 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); });
     };
     if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
-        Recorder::CountSync(4);
+        Recorder::CountSync(4, __builtin_return_address(0));
         recorder->SyncThrough(address, bytes);
         return true;
     }
