@@ -3401,7 +3401,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (heapMirrorsBeside(*range) + mirror->bytes > heapMirrorBudget()) {
             sweepMirrors();
             if (const auto held = heapMirrorsBeside(*range); held + mirror->bytes > heapMirrorBudget()) {
-                if (VramWritable()) return refuseMirror("heap mirror budget");
+                if (VramMirrorWrites()) return refuseMirror("heap mirror budget");
                 throw std::runtime_error(heapMirrorError(*range, held, "past the budget"));
             }
         }
