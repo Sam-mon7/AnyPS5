@@ -163,6 +163,9 @@ void Run(std::shared_ptr<AgcDriver::VulkanDevice>& device, GuestBlock& guest) {
         after.stagedBytes == initial.stagedBytes && after.stageUs == initial.stageUs && after.applied == initial.applied &&
         after.fallback == initial.fallback && after.presyncs == initial.presyncs && after.presyncFallbacks == initial.presyncFallbacks,
         "disabled production heap preparation changed counters");
+    std::uint64_t reasons = 0;
+    for (const auto count : after.unavailableBy) reasons += count;
+    Require(reasons == after.unavailable, "heap refresh refusal reasons do not add up to the refusals");
 }
 #endif
 
