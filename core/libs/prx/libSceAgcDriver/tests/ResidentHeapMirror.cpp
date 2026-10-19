@@ -1753,3 +1753,105 @@ void RunLazyStorageWriteBackTests(const AgcDriver::Graphics::Context& device, Ag
     std::cout << "lazy storage write-back " << (StorageTexture::LazyMirrorWriteBack() ? "on the GPU" : "on the CPU") << (StorageTexture::KeepOverlappingResults() ? ", overlapping results kept" : "") << " passed\n";
 #endif
 }
+
+void RunLazyMirrorLabelTests(const AgcDriver::Graphics::Context& device, AgcDriver::Graphics::Recorder& recorder) {
+#ifndef _WIN32
+    throw std::runtime_error("lazy mirror label fixture requires Windows guest page protection");
+#else
+    using namespace AgcDriver::Graphics;
+    namespace Memory = AgcDriver::GuestMemory;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 2 * block;
+    constexpr std::size_t labelOffset = 256;
+    constexpr std::size_t window = 128;
+    auto context = device;
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    auto* raw = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    auto* alias = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    Require(raw != nullptr && alias != nullptr && section != nullptr, "cannot create the lazy mirror label fixture");
+    GuestArena::GuestArenaMap_nid_postfix(raw, bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(alias, bytes, section, 0, PAGE_READWRITE);
+    std::memset(raw, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(raw);
+    GuestAllocations::Mutation().Add(raw, bytes, true, true, true);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        std::uint8_t* raw;
+        std::uint8_t* alias;
+        HANDLE section;
+        ~Release() {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            GuestAllocations::Mutation().Remove(raw);
+            for (auto* mapping : {raw, alias}) {
+                GuestArena::GuestArenaReset_nid_postfix(mapping, bytes);
+                GuestArena::GuestArenaRelease_nid_postfix(mapping, bytes);
+            }
+            CloseHandle(section);
+        }
+    } release{context, recorder, raw, alias, section};
+    {
+        GuestBufferMemory seed(context);
+        seed.SetAddressWrites(false);
+        seed.AcquireRegistered();
+        seed.Upload(true);
+        seed.WriteBack();
+    }
+    if (!MirrorSourceCovers(context, address, bytes)) {
+        std::cout << "no device-local heap mirror: lazy mirror labels not tested\n";
+        return;
+    }
+    const auto labelAddress = address + labelOffset;
+    const auto source = MirrorSourceFor(context, labelAddress, window);
+    Require(source.has_value(), "the label fixture has no device-local source");
+    static_cast<void>(recorder.Commands());
+    const std::uint32_t label = 0x600dcafeu;
+    const auto labelBytes = std::as_bytes(std::span(&label, 1));
+    const auto before = VramLazyCounters();
+    const auto mirrored = StoreLabelInLazyMirror(context, recorder, labelAddress, labelBytes);
+    Require((mirrored != 0) == LazyMirrorLabels(), "the label was stored in the heap mirror with the switch in the other state");
+    recorder.AfterCompletions(labelAddress, labelBytes, 1, 0, false);
+    if (mirrored != 0) recorder.NoteInMirrorWrite(labelAddress, labelAddress + sizeof(label), mirrored);
+    alias[labelOffset + 64] = 0x5a;
+    Memory::BumpCollectEpoch();
+    {
+        GuestBufferMemory heap(context);
+        heap.SetAddressWrites(false);
+        heap.AcquireRegistered();
+        heap.Upload(true);
+        heap.WriteBack();
+    }
+    const auto after = VramLazyCounters();
+    if (LazyMirrorLabels()) {
+        Require(after.mirrorLabels == before.mirrorLabels + 1 && after.labelRefreshesHeld > before.labelRefreshesHeld && after.labelRefreshesSynced == before.labelRefreshesSynced,
+            "a whole-heap refresh over a label held in the mirror synced");
+    } else {
+        Require(after.mirrorLabels == before.mirrorLabels && after.labelRefreshesHeld == before.labelRefreshesHeld && after.labelRefreshesSynced == before.labelRefreshesSynced,
+            "lazy mirror label counters moved with the switch off");
+        std::uint32_t landed = 0;
+        std::memcpy(&landed, const_cast<const std::uint8_t*>(alias) + labelOffset, sizeof(landed));
+        Require(landed == label, "a whole-heap refresh over a pending label did not land it first");
+    }
+    auto copy = std::make_shared<Buffer>(context, window, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, recorder.Commands(), source->buffer, source->offset, copy->Handle(), 0, window);
+    RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(copy);
+    recorder.Keep(source->lifetime);
+    recorder.Sync();
+    const auto held = copy->ReadBytes(0, window);
+    std::uint32_t mirrorLabel = 0;
+    std::memcpy(&mirrorLabel, held.data(), sizeof(mirrorLabel));
+    Require(mirrorLabel == label, "the heap mirror lost the label to the refresh");
+    Require(held[64] == std::byte{0x5a} && held[sizeof(label)] == std::byte{0x11}, "the heap mirror lost the CPU store beside the label");
+    std::uint32_t guest = 0;
+    std::memcpy(&guest, const_cast<const std::uint8_t*>(alias) + labelOffset, sizeof(guest));
+    Require(guest == label, "the label did not land in guest memory at completion");
+    std::cout << "lazy mirror labels " << (LazyMirrorLabels() ? "stored on the GPU" : "landed before the refresh") << " passed\n";
+#endif
+}

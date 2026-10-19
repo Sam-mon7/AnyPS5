@@ -1523,6 +1523,7 @@ struct LazyMirrors {
     };
     VramLazyStats counts;
     std::array<SiteDownloads, static_cast<std::size_t>(GuestMemory::ReadSite::Count) + 1> sites{};
+    VramLazyStats reportedLabels;
     std::uint64_t order = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -1634,6 +1635,12 @@ void reportLazyWrites() {
         entry = {};
     }
     AgcDriver::ProfilePrint_nid_no_patch("[vram-lazy] downloads by read site (10 s, calls/pages/ms):%s\n", sites.empty() ? " none" : sites.c_str());
+    if (LazyMirrorLabels()) {
+        AgcDriver::ProfilePrint_nid_no_patch("[vram-lazy] labels (10 s): %llu stored in heap mirrors on the GPU; heap refreshes over pending writes: %llu held only those labels (no sync), %llu synced\n",
+            static_cast<unsigned long long>(c.mirrorLabels - state.reportedLabels.mirrorLabels), static_cast<unsigned long long>(c.labelRefreshesHeld - state.reportedLabels.labelRefreshesHeld),
+            static_cast<unsigned long long>(c.labelRefreshesSynced - state.reportedLabels.labelRefreshesSynced));
+        state.reportedLabels = c;
+    }
 }
 
 void stampGpuBlocks(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end) {
@@ -2436,7 +2443,7 @@ struct WholeHeapRefresh {
     ~WholeHeapRefresh() { wholeHeapRefresh = previous; }
 };
 
-void syncRange(std::uint64_t address, std::uint64_t bytes, bool flush = true) {
+void syncRange(std::uint64_t address, std::uint64_t bytes, bool flush = true, bool labelsHeld = false) {
     // Named for the [hooksync] attribution: the flush goes through the hook, which waits when
     // recorded work notes a write inside the range (a descriptor written inside a writable exe
     // range; the lease itself maps the range read-only). The access is the whole range.
@@ -2446,7 +2453,7 @@ void syncRange(std::uint64_t address, std::uint64_t bytes, bool flush = true) {
         GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
     }
     auto& state = Mirrors();
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes))) {
+    if (auto* recorder = Recorder::Active(); !labelsHeld && recorder != nullptr && recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes))) {
         Recorder::CountSync(4);
         ++state.syncs;
         countDescriptors({.recorderSyncs = 1});
@@ -2456,11 +2463,11 @@ void syncRange(std::uint64_t address, std::uint64_t bytes, bool flush = true) {
     ++state.refreshes;
 }
 
-void prepareRange(std::uint64_t address, std::uint64_t bytes, bool flush = true) {
+void prepareRange(std::uint64_t address, std::uint64_t bytes, bool flush = true, bool labelsHeld = false) {
     ResourcePhase access("mirror-access");
     Require(GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
     access.End();
-    syncRange(address, bytes, flush);
+    syncRange(address, bytes, flush, labelsHeld);
 }
 
 bool mirrorHoldsPendingWrites(const ImageMirror* mirror, std::uint64_t begin, std::uint64_t end, bool direct = false) {
@@ -2616,24 +2623,24 @@ bool gpuOrderedRun(const Context* context, std::span<ImageMirror* const> mirrors
     return true;
 }
 
-void prepareMirrorRange(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes) {
+void prepareMirrorRange(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes, bool labelsHeld = false) {
     const bool flush = !(wholeHeapRefresh && mirror.heap);
     if (!VramLazyWrites() || mirror.lazyPages.empty()) {
-        prepareRange(address, bytes, flush);
+        prepareRange(address, bytes, flush, labelsHeld);
         return;
     }
     if (!flush) {
-        syncRange(address, bytes, false);
+        syncRange(address, bytes, false, labelsHeld);
         return;
     }
     const auto end = address + bytes;
     auto cursor = address;
     for (auto it = mirror.lazyPages.lower_bound(address & ~std::uint64_t{4095}); it != mirror.lazyPages.end() && it->first < end; ++it) {
-        if (cursor < it->first) prepareRange(cursor, it->first - cursor, flush);
+        if (cursor < it->first) prepareRange(cursor, it->first - cursor, flush, labelsHeld);
         cursor = std::max(cursor, std::min(end, it->first + 4096));
         ++LazyState().counts.hookRangesSkipped;
     }
-    if (cursor < end) prepareRange(cursor, end - cursor, flush);
+    if (cursor < end) prepareRange(cursor, end - cursor, flush, labelsHeld);
 }
 
 void filterLazyChanges(ImageMirror& mirror, std::uint64_t address, std::span<std::uint8_t> changed, std::uint64_t collected) {
@@ -2912,6 +2919,32 @@ Pieces clipPieces(const Pieces& pieces, std::uint64_t begin, std::uint64_t end) 
     return result;
 }
 
+bool lazyLabelsHeld(ImageMirror& mirror, std::vector<std::pair<std::uint64_t, std::uint64_t>>& labels) {
+    labels.clear();
+    if (!LazyMirrorLabels()) return false;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || Recorder::InCompletion() || !recorder->PendingWriteOverlaps(mirror.base, static_cast<std::size_t>(mirror.bytes))) return false;
+    auto& counts = LazyState().counts;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::vector<Recorder::MirrorWrite> mirrored;
+    const auto tag = reinterpret_cast<std::uintptr_t>(mirror.buffer.get());
+    if (!recorder->InPlaceWritesOver(mirror.base, static_cast<std::size_t>(mirror.bytes), ranges, &mirrored) || !ranges.empty() ||
+        !std::all_of(mirrored.begin(), mirrored.end(), [&](const auto& write) { return write.mirror == tag; })) {
+        ++counts.labelRefreshesSynced;
+        return false;
+    }
+    for (const auto& write : mirrored) labels.emplace_back(write.begin, write.end);
+    std::sort(labels.begin(), labels.end());
+    if (StorageTexture::AnyPendingOverlaps(labels)) {
+        labels.clear();
+        ++counts.labelRefreshesSynced;
+        return false;
+    }
+    recorder->FlushStoresOverlapping(mirror.base, static_cast<std::size_t>(mirror.bytes));
+    ++counts.labelRefreshesHeld;
+    return true;
+}
+
 bool refreshWritableHeap(ImageMirror& mirror, std::vector<RefreshBlock>& blocks, bool uncached) {
     validateMirrorAliases(mirror);
     if (!mirror.sparse) Require(GuestMemory::Accessible(reinterpret_cast<const void*>(mirror.base), static_cast<std::size_t>(mirror.bytes)), "image mirror range became inaccessible");
@@ -2935,14 +2968,18 @@ bool refreshWritableHeap(ImageMirror& mirror, std::vector<RefreshBlock>& blocks,
     if (!dirty) return true;
     if (VramLazyWrites()) finishLazyAddressWriter(mirror);
     if (mirror.writer != nullptr) finishMirrorWriter(mirror);
-    for (const auto& [begin, end] : pieces) prepareMirrorRange(mirror, begin, end - begin);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> labels;
+    const bool labelsHeld = lazyLabelsHeld(mirror, labels);
+    for (const auto& [begin, end] : pieces) prepareMirrorRange(mirror, begin, end - begin, labelsHeld);
     generation = collect();
     Require(generation != 0, "a writable heap refill is no longer write-watched");
+    const auto appended = blocks.size();
     if (mirror.sparse) appendSparseBlocks(mirror, std::move(pieces), generation, blocks);
     else {
         ImageMirror* pointer = &mirror;
         appendChangedBlocks(std::span<ImageMirror* const>(&pointer, 1), generation, blocks);
     }
+    excludeBlocks(blocks, appended, labels);
     return true;
 }
 
@@ -4343,6 +4380,25 @@ bool LazyPagesOverlap(std::uint64_t address, std::size_t bytes) {
         if (page != mirror.lazyPages.end() && page->first < end) return true;
     }
     return false;
+}
+
+bool LazyMirrorLabels() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_LAZY_MIRROR_LABELS");
+        return value != nullptr && std::string_view(value) == "1" && VramLazyWrites();
+    }();
+    return enabled;
+}
+
+std::uint64_t StoreLabelInLazyMirror(const Context& context, Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes) {
+    if (!LazyMirrorLabels() || bytes.empty() || bytes.size() > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    GuestMemory::AssertGpuLockHeld("lazy mirror label");
+    const auto mirror = findMirror(context, address, address + bytes.size());
+    if (mirror == nullptr || !mirror->heap || mirror->buffer == nullptr) return 0;
+    recorder.RecordStore(mirror->buffer->Handle(), address - mirror->base, bytes, address);
+    recorder.Keep(mirror->buffer);
+    ++LazyState().counts.mirrorLabels;
+    return reinterpret_cast<std::uintptr_t>(mirror->buffer.get());
 }
 
 void CountLazyImportFill(std::size_t bytes) {

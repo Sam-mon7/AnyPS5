@@ -77,6 +77,7 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& context, Agc
 void RunVramWritableTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu);
 void RunVramLazyTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, bool imports);
 void RunLazyStorageWriteBackTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
+void RunLazyMirrorLabelTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 void RunVramDeferredTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 void RunVramCleanupTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 
@@ -9166,6 +9167,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--record-worker-only") {
             copiedDirectOrderingTests(device, recorder, true);
             std::cout << "Record worker device tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--lazy-mirror-labels-only") {
+            RunLazyMirrorLabelTests(device.GetContext(), recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--lazy-storage-writeback-only") {

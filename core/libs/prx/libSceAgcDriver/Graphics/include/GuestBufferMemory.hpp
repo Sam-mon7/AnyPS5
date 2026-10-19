@@ -264,6 +264,9 @@ struct VramLazyStats {
     std::uint64_t unorderedImportBytes = 0;
     std::uint64_t unorderedImportBuilds = 0;
     std::uint64_t readOnlyImportBuilds = 0;
+    std::uint64_t mirrorLabels = 0;
+    std::uint64_t labelRefreshesHeld = 0;
+    std::uint64_t labelRefreshesSynced = 0;
 };
 VramLazyStats VramLazyCounters();
 struct LazyMirrorFill {
@@ -276,6 +279,8 @@ LazyMirrorFill BeginLazyMirrorFill(const Context& context, Recorder& recorder, s
 void FinishLazyMirrorFill(Recorder& recorder, const LazyMirrorFill& fill, std::uint64_t address, std::size_t bytes);
 const HostImport* HostImportForFill(const Context& context, std::uint64_t address, std::size_t bytes);
 bool LazyPagesOverlap(std::uint64_t address, std::size_t bytes);
+bool LazyMirrorLabels();
+std::uint64_t StoreLabelInLazyMirror(const Context& context, Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes);
 void CountLazyImportFill(std::size_t bytes);
 void CountLazyCpuFill(std::size_t bytes);
 struct VramCleanupStats {

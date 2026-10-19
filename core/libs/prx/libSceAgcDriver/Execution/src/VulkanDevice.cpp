@@ -2042,7 +2042,9 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     if (recorder.Idle()) return 1;
     if (Graphics::VramLazyWrites()) {
         if (Graphics::LazyPagesOverlap(address, bytes.size())) return 2;
+        const auto mirrored = Graphics::LazyMirrorLabels() ? Graphics::StoreLabelInLazyMirror(graphicsContext(), recorder, address, bytes) : 0;
         recorder.AfterCompletions(address, bytes, stamp, queue, false);
+        if (mirrored != 0) recorder.NoteInMirrorWrite(address, address + bytes.size(), mirrored);
         return 5;
     }
     if (Graphics::Recorder::ParseTimeLabels() && recorder.HasCompletions()) {
