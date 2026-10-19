@@ -57,6 +57,8 @@ public:
     // records is assumed uncovered until it marks); a new batch starts uncovered.
     VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
     static bool ComputeChainsEnabled();
+    static bool FencePollWait();
+    static bool SlowFenceTrace();
     enum class ComputeChainReason : std::uint8_t { Raw, Waw, War, Image, Indirect, Unknown, Refresh, Copied, Mirror, Worker, Lanes, FullBarriers, Profiling, Queue, Limit, Pm4, Command, Batch, Label, Count };
     static constexpr std::size_t ComputeChainReasons = static_cast<std::size_t>(ComputeChainReason::Count);
     struct ComputeChainStatistics {

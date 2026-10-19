@@ -9010,6 +9010,16 @@ int main(int argc, char** argv) {
         const bool submitWorkerTest = argc == 2 && std::string_view(argv[1]) == "--submit-worker-only";
         const bool completionProbe = argc == 2 && std::string_view(argv[1]) == "--completion-probe-only";
         const bool dispatchHeapTest = argc == 2 && std::string_view(argv[1]) == "--dispatch-heap-refresh-only";
+        if (argc == 2 && std::string_view(argv[1]) == "--fence-wait-switches") {
+            const auto exact = [](const char* name) {
+                const auto* value = std::getenv(name);
+                return value != nullptr && std::string_view(value) == "1";
+            };
+            Require(AgcDriver::Graphics::Recorder::FencePollWait() == exact("APS5_FENCE_POLL_WAIT"), "APS5_FENCE_POLL_WAIT did not follow its exact value");
+            Require(AgcDriver::Graphics::Recorder::SlowFenceTrace() == exact("APS5_TRACE_SLOW_FENCES"), "APS5_TRACE_SLOW_FENCES did not follow its exact value");
+            std::cout << "Fence wait switches: poll " << (exact("APS5_FENCE_POLL_WAIT") ? "on" : "off") << ", trace " << (exact("APS5_TRACE_SLOW_FENCES") ? "on" : "off") << '\n';
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--heap-gpu-refresh-switch") {
             const auto* value = std::getenv("APS5_HEAP_GPU_REFRESH");
             const bool expected = value != nullptr && std::string_view(value) == "1";

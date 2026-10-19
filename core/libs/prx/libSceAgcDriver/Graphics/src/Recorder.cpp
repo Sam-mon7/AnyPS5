@@ -1945,6 +1945,16 @@ bool Recorder::ComputeChainsEnabled() {
     return enabled;
 }
 
+bool Recorder::FencePollWait() {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_FENCE_POLL_WAIT"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    return enabled;
+}
+
+bool Recorder::SlowFenceTrace() {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_TRACE_SLOW_FENCES"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    return enabled;
+}
+
 Recorder::ComputeChainStatistics Recorder::ComputeChainCounts() {
     ComputeChainStatistics counts{computeChained.load(), computeDeferred.load(), computeBarriers.load(), 0, {}};
     counts.saved = counts.chained;
@@ -4763,11 +4773,38 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
-        auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
-        for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
-            // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
-            std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+        const bool traceSlow = SlowFenceTrace();
+        std::uint64_t timelineAtStart = 0;
+        if (traceSlow && timeline != VK_NULL_HANDLE) context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR")(context.device, timeline, &timelineAtStart);
+        const bool fenceAtStart = traceSlow && context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
+        const auto fenceWaitStart = std::chrono::steady_clock::now();
+        VkResult result = VK_TIMEOUT;
+        if (FencePollWait()) {
+            int reported = 0;
+            for (;;) {
+                result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 1'000'000ull);
+                if (result != VK_TIMEOUT) break;
+                if (std::chrono::steady_clock::now() - fenceWaitStart >= std::chrono::seconds(5 * (reported + 1))) {
+                    ++reported;
+                    std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", reported * 5);
+                }
+            }
+        } else {
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+            for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
+                // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
+                std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+                result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+            }
+        }
+        if (traceSlow) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto ms = std::chrono::duration<double, std::milli>(now - fenceWaitStart).count();
+            if (ms >= 100) {
+                std::uint64_t timelineAfter = 0;
+                if (timeline != VK_NULL_HANDLE) context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR")(context.device, timeline, &timelineAfter);
+                std::fprintf(stderr, "[slow-fence] batch %llu (source %d) waited %.1f ms, %.1f ms after its submission; fence signaled at the start %d; timeline at the start %llu, after %llu; newest submitted %llu\n", static_cast<unsigned long long>(batch->serial), source, ms, std::chrono::duration<double, std::milli>(now - batch->submittedAt).count(), fenceAtStart ? 1 : 0, static_cast<unsigned long long>(timelineAtStart), static_cast<unsigned long long>(timelineAfter), static_cast<unsigned long long>(submissions));
+            }
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = OrderedQueueCall([&] { return context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device); });
