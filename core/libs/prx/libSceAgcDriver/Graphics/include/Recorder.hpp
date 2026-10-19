@@ -172,6 +172,8 @@ public:
     // Whether every unfinished write over the range was noted in place and no queued label overlaps
     // it; `ranges` gets those writes clipped to the range, sorted and merged.
     bool InPlaceWritesOver(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
+    // The code address that noted the first unfinished write over the range without an in-place note.
+    const void* NotInPlaceWriter(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
@@ -591,6 +593,7 @@ private:
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceWrites;
+        std::vector<const void*> writeCallers;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {
             std::uint64_t begin;

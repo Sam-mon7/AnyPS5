@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -58,5 +59,6 @@ struct HeapGpuRefreshStats {
 };
 
 HeapGpuRefreshStats HeapGpuRefreshCounters();
+std::string HeapGpuRefreshWriters();
 
 }

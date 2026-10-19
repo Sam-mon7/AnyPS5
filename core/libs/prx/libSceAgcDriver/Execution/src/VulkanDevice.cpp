@@ -2130,6 +2130,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     recorder.FlushKeyStoresOverlapping(address, bytes);
     if (!recorder.DumpSamples(import->address + (address - import->base), address)) return false;
     recorder.NotePendingWrite(address, bytes);
+    if (Graphics::HeapGpuRefreshEnabled()) recorder.NoteInPlaceWrites(std::array{std::pair{address, address + bytes}});
     GuestMemory::MarkWritten(address, bytes);
     return true;
 }
@@ -2317,6 +2318,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     Graphics::CountLazyImportFill(bytes);
     if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) recorder.NotePendingFill(address, bytes, static_cast<std::uint8_t>(pattern[0]));
     else recorder.NotePendingWrite(address, bytes);
+    if (Graphics::HeapGpuRefreshEnabled()) recorder.NoteInPlaceWrites(std::array{std::pair{address, address + bytes}});
     GuestMemory::MarkWritten(address, bytes);
     phase(notesMs);
     return true;
@@ -2563,6 +2565,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     const bool sourceCurrent = bytes <= knownMax && generation != 0 && !recorder.PendingWriteOverlaps(source, bytes) && !recorder.PendingLabelIn(source, bytes) && !completionStoreOverlaps(source) && !Graphics::StorageTexture::AnyPendingOverlaps(sourceRange) && !Graphics::AnyShadowedOverlaps(sourceRange);
     noteWriter(sourceCurrent ? std::span(reinterpret_cast<const std::byte*>(source), bytes) : std::span<const std::byte>{}, sourceCurrent ? generation : 0);
     recorder.NotePendingWrite(destination, bytes);
+    if (Graphics::HeapGpuRefreshEnabled()) recorder.NoteInPlaceWrites(std::array{std::pair{destination, destination + bytes}});
     outcome.path = 1;
     return outcome;
 }
@@ -3823,6 +3826,7 @@ struct DispatchTimer {
                 static_cast<unsigned long long>(refresh.notInPlace), static_cast<unsigned long long>(refresh.pendingResults),
                 static_cast<unsigned long long>(refresh.unimported), static_cast<unsigned long long>(refresh.unmirrored));
             report += text;
+            report += " writers=" + Graphics::HeapGpuRefreshWriters();
         }
         AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %llu dispatches, phase totals:%s\n", static_cast<unsigned long long>(d.profiledDispatches), report.c_str());
     }

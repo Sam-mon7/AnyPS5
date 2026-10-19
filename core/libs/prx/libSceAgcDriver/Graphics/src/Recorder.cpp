@@ -3541,12 +3541,15 @@ void Recorder::OnComplete(std::function<void()> action) {
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
+thread_local const void* noteCaller = nullptr;
+
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
+    open->writeCallers.push_back(noteCaller);
     open->writeNotes.push_back(++writeNoteCount);
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     if (!ownLabel) markOverwritten(address, end);
@@ -3563,6 +3566,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
 
 void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel) {
     if (bytes == 0) return;
+    noteCaller = __builtin_return_address(0);
     if (&batch == open.get()) {
         if (!noteWrite(address, bytes, ownLabel)) return;
         const std::array ranges{std::pair{address, address + bytes}};
@@ -3574,6 +3578,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
+    batch.writeCallers.push_back(noteCaller);
     batch.writeNotes.push_back(++writeNoteCount);
     batch.writeValues.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
@@ -3593,6 +3598,7 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
 }
 
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
+    noteCaller = __builtin_return_address(0);
     if (!noteWrite(address, bytes)) return;
     const std::array ranges{std::pair{address, address + bytes}};
     publishPendingWrites(ranges);
@@ -3602,6 +3608,7 @@ void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
 }
 
 void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value) {
+    noteCaller = __builtin_return_address(0);
     if (!noteWrite(address, bytes, false, value)) return;
     const std::array ranges{std::pair{address, address + bytes}};
     publishPendingWrites(ranges);
@@ -3609,6 +3616,7 @@ void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::ui
 }
 
 void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    noteCaller = __builtin_return_address(0);
     bool publish = false;
     for (const auto& [begin, end] : ranges) {
         if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin))) publish = true;
@@ -3716,6 +3724,23 @@ bool Recorder::InPlaceWritesOver(std::uint64_t address, std::size_t bytes, std::
     }
     ranges.resize(out);
     return !ranges.empty();
+}
+
+const void* Recorder::NotInPlaceWriter(std::uint64_t address, std::size_t bytes) const {
+    const auto end = address + bytes;
+    const auto find = [&](const Batch& batch) -> const void* {
+        for (std::size_t index = 0; index < batch.writes.size(); ++index) {
+            const auto [begin, finish] = batch.writes[index];
+            if (finish <= address || end <= begin) continue;
+            if (std::none_of(batch.inPlaceWrites.begin(), batch.inPlaceWrites.end(), [&](const auto& range) { return range.first <= begin && finish <= range.second; })) return index < batch.writeCallers.size() ? batch.writeCallers[index] : nullptr;
+        }
+        return nullptr;
+    };
+    if (open != nullptr) if (const auto* caller = find(*open)) return caller;
+    for (const auto& batch : inFlight) {
+        if (const auto* caller = find(*batch)) return caller;
+    }
+    return nullptr;
 }
 
 bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {

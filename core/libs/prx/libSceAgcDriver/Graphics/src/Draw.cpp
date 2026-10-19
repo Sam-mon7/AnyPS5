@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/Dispatch/PreparedHeapRefresh.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -322,6 +323,7 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     recorder.Keep(resident);
     context.detiler->DispatchCmaskClear(commands, import.buffer, address - import.base, bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0);
     recorder.NotePendingWrite(address, bytes);
+    if (HeapGpuRefreshEnabled()) recorder.NoteInPlaceWrites(std::array{std::pair{address, address + bytes}});
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
 }
 

@@ -208,6 +208,26 @@ HeapGpuRefreshCounts& HeapGpuRefreshes() {
     return counts;
 }
 
+std::map<std::uint64_t, std::uint64_t>& NotInPlaceWriters() {
+    static std::map<std::uint64_t, std::uint64_t> writers;
+    return writers;
+}
+
+std::mutex& NotInPlaceWritersMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+void countNotInPlaceWriter(const void* caller) {
+    std::uint64_t offset = reinterpret_cast<std::uintptr_t>(caller);
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    if (caller != nullptr && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(caller), &module)) offset -= reinterpret_cast<std::uintptr_t>(module);
+#endif
+    std::lock_guard lock(NotInPlaceWritersMutex());
+    ++NotInPlaceWriters()[offset];
+}
+
 bool heapGpuRefresh() {
     static const bool enabled = [] {
         const auto* value = std::getenv("APS5_HEAP_GPU_REFRESH");
@@ -2421,6 +2441,7 @@ bool gpuOrderedRun(const Context* context, std::span<ImageMirror* const> mirrors
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     if (!recorder->InPlaceWritesOver(begin, static_cast<std::size_t>(bytes), ranges)) {
         counts.notInPlace.fetch_add(1, std::memory_order_relaxed);
+        countNotInPlaceWriter(recorder->NotInPlaceWriter(begin, static_cast<std::size_t>(bytes)));
         return false;
     }
     if (StorageTexture::AnyPendingOverlaps(ranges) || AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>>(ranges))) {
@@ -4490,6 +4511,22 @@ HeapGpuRefreshStats HeapGpuRefreshCounters() {
     return {counts.runs.load(std::memory_order_relaxed), counts.copies.load(std::memory_order_relaxed), counts.bytes.load(std::memory_order_relaxed),
         counts.notInPlace.load(std::memory_order_relaxed), counts.pendingResults.load(std::memory_order_relaxed), counts.unimported.load(std::memory_order_relaxed),
         counts.unmirrored.load(std::memory_order_relaxed)};
+}
+
+std::string HeapGpuRefreshWriters() {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writers;
+    {
+        std::lock_guard lock(NotInPlaceWritersMutex());
+        for (const auto& [offset, count] : NotInPlaceWriters()) writers.emplace_back(count, offset);
+    }
+    std::sort(writers.rbegin(), writers.rend());
+    std::string text;
+    char entry[48];
+    for (std::size_t index = 0; index < writers.size() && index < 6; ++index) {
+        std::snprintf(entry, sizeof(entry), "%s+0x%llx:%llu", index == 0 ? "" : ",", static_cast<unsigned long long>(writers[index].second), static_cast<unsigned long long>(writers[index].first));
+        text += entry;
+    }
+    return text;
 }
 
 DispatchHeapRefreshStats DispatchHeapRefreshCounters() {
