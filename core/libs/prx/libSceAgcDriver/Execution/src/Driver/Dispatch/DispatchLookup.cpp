@@ -5,7 +5,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, std::span<const std::uint32_t> userData, std::uint64_t relocationIdentity, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, bool& relocatedHit, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
@@ -13,6 +13,11 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
         ++entryCounters.lookups;
         const auto found = dispatchCache.find(key);
         std::shared_ptr<DispatchEntry> entry = found != dispatchCache.end() ? found->second : nullptr;
+        bool relocated = false;
+        if (entry == nullptr && relocationIdentity != 0) {
+            entry = relocateDispatchEntry(cacheLock, relocationIdentity, userData);
+            relocated = entry != nullptr;
+        }
         if (entry == nullptr) ++entryCounters.absent;
         if (validateUnlocked) cacheLock.unlock();
         phaseTiming.Phase(PhaseLookup);
@@ -118,6 +123,24 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             }
             if (current) {
                 ++counters.variantHitsByRank[rank];
+                if (relocated) {
+                    relocatedHit = true;
+                    ++dispatchRelocationCounters.hits;
+                    if (again == dispatchCache.end()) {
+                        auto kept = std::make_shared<DispatchEntry>();
+                        kept->variants.push_back(variant);
+                        for (const auto& other : variants) {
+                            if (other != variant) kept->variants.push_back(other);
+                        }
+                        for (const auto& held : kept->variants) accountVariant(*held, true);
+                        kept->touched = dispatchCacheHits;
+                        dispatchOrder.push_front(key);
+                        kept->order = dispatchOrder.begin();
+                        dispatchCache.emplace(key, std::move(kept));
+                        ++dispatchRelocationCounters.inserted;
+                        trimDispatchCache();
+                    }
+                }
                 compiledResult = variant->compiled;
                 if (dataHit) {
 
@@ -171,13 +194,18 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             } else {
                 if (traceCache) std::fprintf(stderr, "[dispatch-cache] 0x%llx captured memory changed\n", static_cast<unsigned long long>(address));
 
-                missedEntry = entry;
-                missedDiffering = outcome == EntryOutcome::Differing;
-                if (!untouched) ++counters.replaced;
+                if (relocated) {
+                    ++dispatchRelocationCounters.differing;
+                } else {
+                    missedEntry = entry;
+                    missedDiffering = outcome == EntryOutcome::Differing;
+                    if (!untouched) ++counters.replaced;
+                }
             }
             if (profile && std::chrono::steady_clock::now() - counters.lastReport > std::chrono::seconds(10)) {
                 counters.lastReport = std::chrono::steady_clock::now();
                 reportDispatchCache(counters);
+                if (dispatchRelocationEnabled()) reportDispatchRelocation();
             }
             phaseTiming.Phase(PhaseRelock);
         }

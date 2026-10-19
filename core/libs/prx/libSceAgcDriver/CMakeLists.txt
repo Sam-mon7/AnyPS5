@@ -142,6 +142,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchCacheStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchInsert.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchRelocate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchLookup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/IndirectDispatch.cpp
@@ -2038,6 +2039,22 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_gated_dispatch_capture_short_timeout PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    foreach(dispatchRelocationMode IN ITEMS on verify nonexact)
+        set(dispatchRelocationEnvironment "APS5_DISPATCH_RELOCATION=1")
+        if(dispatchRelocationMode STREQUAL "verify")
+            set(dispatchRelocationEnvironment "APS5_DISPATCH_RELOCATION=1;APS5_VERIFY_DISPATCH_RELOCATION=1")
+        elseif(dispatchRelocationMode STREQUAL "nonexact")
+            set(dispatchRelocationEnvironment "APS5_DISPATCH_RELOCATION=01")
+        endif()
+        add_test(NAME agc_driver_dispatch_relocation_${dispatchRelocationMode} COMMAND agc_driver_dispatch_relocation_tests)
+        set_tests_properties(agc_driver_dispatch_relocation_${dispatchRelocationMode} PROPERTIES
+                ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${dispatchRelocationEnvironment}"
+                SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(agc_driver_dispatch_relocation_${dispatchRelocationMode} PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     set_tests_properties(agc_driver_provoking_vertex PROPERTIES TIMEOUT 30)
     add_test(NAME agc_driver_uint8x4_color_target_no_resident COMMAND agc_driver_uint8x4_color_target_tests)
     set_tests_properties(agc_driver_uint8x4_color_target_no_resident PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_RESIDENT_TARGETS=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)

@@ -65,4 +65,19 @@ void Driver::eraseDispatchEntry(std::unordered_map<std::uint64_t, std::shared_pt
     dispatchCache.erase(it);
 }
 
+void Driver::trimDispatchCache() {
+    static const bool lru = std::getenv("APS5_NO_DISPATCH_LRU") == nullptr;
+    if (dispatchCache.size() <= dispatchCacheEntries()) return;
+    if (lru) {
+        eraseDispatchEntry(dispatchCache.find(dispatchOrder.back()));
+        ++dispatchCacheEvictions;
+    } else {
+        dispatchCacheEvictions += dispatchCache.size();
+        dispatchCache.clear();
+        dispatchOrder.clear();
+        dispatchCacheVariants = 0;
+        dispatchCacheVariantBytes = 0;
+    }
+}
+
 }

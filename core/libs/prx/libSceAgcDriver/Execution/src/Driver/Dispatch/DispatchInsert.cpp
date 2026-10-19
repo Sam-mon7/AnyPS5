@@ -14,24 +14,27 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     });
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::span<const std::uint32_t> userData, std::uint64_t relocationIdentity, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
         fresh->shader = registeredShader;
         fresh->forgetSerial = forgetAtCapture;
 
+        const bool relocating = relocationIdentity != 0 && capture != nullptr;
         std::vector<ShaderRecompiler::MemoryRegion> srtRegions;
         for (const auto& region : captured) {
             const bool registered = std::any_of(memory.begin(), memory.end(), [&](const auto& known) { return region.guestAddress >= known.guestAddress && region.guestAddress < known.guestAddress + known.bytes.size(); });
             if (registered) continue;
             srtRegions.push_back(region);
+            if (relocating) continue;
             fresh->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
             const auto count = region.bytes.size() / sizeof(std::uint32_t);
             const auto offset = fresh->words.size();
             fresh->words.resize(offset + count);
             std::memcpy(fresh->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
         }
+        if (relocating) tagVariantRuns(*fresh, srtRegions, capture->userDataUse, true, 0);
 
         DataWordPositionCounts dataCounts;
         if (dataHits() && !stampValidate() && capture != nullptr && !capture->readTrace.leaves.empty()) {
@@ -115,20 +118,10 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 dispatchOrder.splice(dispatchOrder.begin(), dispatchOrder, replacement->order);
                 found->second = std::move(replacement);
             }
-
-            static const bool lru = std::getenv("APS5_NO_DISPATCH_LRU") == nullptr;
-            if (dispatchCache.size() > dispatchCacheEntries()) {
-                if (lru) {
-                    eraseDispatchEntry(dispatchCache.find(dispatchOrder.back()));
-                    ++dispatchCacheEvictions;
-                } else {
-                    dispatchCacheEvictions += dispatchCache.size();
-                    dispatchCache.clear();
-                    dispatchOrder.clear();
-                    dispatchCacheVariants = 0;
-                    dispatchCacheVariantBytes = 0;
-                }
+            if (relocating) {
+                if (const auto inserted = dispatchCache.find(key); inserted != dispatchCache.end()) learnDispatchRelocation(relocationIdentity, userData, inserted->second, *attachVariant);
             }
+            trimDispatchCache();
         } else {
             ++entryCounters.unstable;
         }

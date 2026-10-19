@@ -135,6 +135,15 @@ struct DrawRelocationCounters {
     std::uint64_t lookups = 0, donors = 0, refused = 0, hits = 0;
 };
 
+struct DispatchAlias {
+    std::shared_ptr<DispatchEntry> entry;
+    std::vector<std::uint32_t> userData;
+};
+
+struct DispatchRelocationCounters {
+    std::uint64_t lookups = 0, unlearned = 0, unreadable = 0, donors = 0, refused = 0, hits = 0, differing = 0, inserted = 0;
+};
+
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
 
 }

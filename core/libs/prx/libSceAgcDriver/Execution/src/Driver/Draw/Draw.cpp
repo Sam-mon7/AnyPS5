@@ -300,7 +300,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
         std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
         DispatchVariant captured;
-        tagVariantRuns(captured, regions, stageCaptures[i].userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
+        tagVariantRuns(captured, regions, stageCaptures[i].userDataUse, drawRelocationEnabled() && decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
         const auto& runs = captured.runs;
         const auto& words = captured.words;
         const auto& compiled = *stageCaptures[i].compiled;

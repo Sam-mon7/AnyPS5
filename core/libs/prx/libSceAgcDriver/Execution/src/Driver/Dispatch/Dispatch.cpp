@@ -268,6 +268,25 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    std::uint64_t relocationIdentity = 0;
+    if (dispatchRelocationEnabled() && keyHygiene && !noDispatchCache && !stampValidate()) {
+        relocationIdentity = 0x6c62272e07bb0142ull;
+        const auto mixIdentity = [&](std::uint64_t value) {
+            relocationIdentity ^= value;
+            relocationIdentity *= 0x100000001b3ull;
+        };
+        mixIdentity(address);
+        mixIdentity(packet[4] & 0x8000u);
+        for (const auto threads : compute.partialThreads) mixIdentity(threads);
+        mixIdentity(userData.size());
+        for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+            const auto found = queue.shader.find(offset);
+            mixIdentity(found == queue.shader.end() ? (1ull << 32u) : found->second);
+        }
+        mixIdentity(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+        if (relocationIdentity == 0) relocationIdentity = 1;
+    }
+    bool relocatedHit = false;
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
@@ -319,7 +338,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, key, userData, relocationIdentity, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, relocatedHit, missedEntry, missedDiffering);
     }
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
@@ -400,8 +419,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        insertDispatch(address, key, userData, relocationIdentity, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
     }
+    if (relocatedHit && verifyDispatchRelocation()) verifyRelocatedHit(snapshot, codeOffset, request, memory, address, *keepVariant, dataHit ? std::span<const std::uint32_t>(liveWords) : std::span<const std::uint32_t>(keepVariant->words), *compiledResult);
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
         parked = ResolvedDispatch{};

@@ -53,7 +53,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
 }
 
 void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords) {
-    std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~use.asValue : 0;
+    std::uint64_t relocatable = eligible ? use.asBase & ~use.asValue : 0;
     if (hiddenWords != 0) relocatable &= hiddenWords >= 64 ? 0 : ~((std::uint64_t {1} << hiddenWords) - 1);
     std::vector<std::pair<std::uint64_t, std::int32_t>> reads;
     const auto covered = [&](std::uint64_t address) {
