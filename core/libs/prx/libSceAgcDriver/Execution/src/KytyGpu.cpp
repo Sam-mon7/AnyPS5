@@ -177,6 +177,14 @@ void unmapAlias(void* alias) {
     }
 }
 
+bool uniqueBacking(std::uintptr_t address, std::size_t bytes) {
+    try {
+        return GuestArena::GuestArenaUniqueBacking_nid_no_patch(address, bytes);
+    } catch (...) {
+        return false;
+    }
+}
+
 void titleId(char* value, std::size_t size) {
     const auto id = GetAppTitleId_nid_postfix();
     std::snprintf(value, size, "%.*s", static_cast<int>(sizeof(id.value)), id.value);
@@ -184,7 +192,7 @@ void titleId(char* value, std::size_t size) {
 
 constexpr KytyGpuHostTable hostTable{
     &readEvent, &writeEvent, &pendingCount, &pendingAt, &setPending, &addEvent, &triggerEvent, &deleteEvent, &pinEqueue,
-    &processTime, &processTimeCounter, &readTsc, &tscFrequency, &titleId, &mapAlias, &unmapAlias,
+    &processTime, &processTimeCounter, &readTsc, &tscFrequency, &titleId, &mapAlias, &unmapAlias, &uniqueBacking,
 };
 
 template <typename Function>

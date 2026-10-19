@@ -1,8 +1,6 @@
 #include "KytyGpuApi.hpp"
 
-#include "common/archive.h"
 #include "common/assert.h"
-#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -14,9 +12,9 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
-#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -28,10 +26,12 @@
 #include "kernel/pthread.h"
 #include "libs/agc.h"
 #include "loader/systemContent.h"
+#include "loader/demonsSoulsWarp.h"
 #include "loader/timer.h"
+#include "live-counters.h"
 
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_vulkan.h>
+#include "SDL.h"
+#include "SDL_vulkan.h"
 
 #include <windows.h>
 #include <vulkan/vulkan_win32.h>
@@ -68,6 +68,7 @@ constexpr std::uint64_t PageBytes = 4096;
 
 const KytyGpuHostTable* host = nullptr;
 RenderContext* resources = nullptr;
+Libs::Graphics::GpuResourceManager* gpuResources = nullptr;
 Libs::Graphics::WindowContext* window = nullptr;
 SDL_Window hostWindow;
 std::atomic<bool> started{false};
@@ -93,6 +94,7 @@ struct Counts {
     std::atomic<std::uint64_t> protectCalls{0};
     std::atomic<std::uint64_t> protectSyscalls{0};
     std::atomic<std::uint64_t> backingOpens{0};
+    std::atomic<std::uint64_t> flips{0};
     std::atomic<std::uint64_t> aliasCopies{0};
     std::atomic<std::uint64_t> backingNs{0};
 };
@@ -346,12 +348,12 @@ std::uint64_t mappedRun(std::uint64_t address, std::uint64_t size) {
 
 void mapLate(std::uint64_t address) {
     MEMORY_BASIC_INFORMATION region{};
-    if (resources == nullptr || !committed(address, region)) return;
+    if (gpuResources == nullptr || !committed(address, region)) return;
     const auto begin = std::max(address & ~(RegionBytes - 1), reinterpret_cast<std::uint64_t>(region.BaseAddress));
     const auto end = std::min((address & ~(RegionBytes - 1)) + RegionBytes, regionEnd(region));
     counts.lateMaps.fetch_add(1, std::memory_order_relaxed);
     addMapping(begin, end);
-    resources->MapMemory(begin, end - begin);
+    gpuResources->MapMemory(begin, end - begin);
 }
 
 std::uint8_t* regionAlias(Region& region, std::uint64_t base) {
@@ -433,19 +435,19 @@ bool permits(std::uint64_t address, bool write) {
 }
 
 bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
-    if (resources == nullptr) return false;
+    if (gpuResources == nullptr) return false;
     if (access == PageFaultAccess::Read) counts.readFaults.fetch_add(1, std::memory_order_relaxed);
     if (!statsEnabled()) {
-        if (resources->HandleFault(access, address)) return true;
+        if (gpuResources->HandleFault(access, address)) return true;
         mapLate(address);
-        return resources->HandleFault(access, address);
+        return gpuResources->HandleFault(access, address);
     }
     const auto started = std::chrono::steady_clock::now();
     noteHot(access == PageFaultAccess::Write, address);
-    bool handled = resources->HandleFault(access, address);
+    bool handled = gpuResources->HandleFault(access, address);
     if (!handled) {
         mapLate(address);
-        handled = resources->HandleFault(access, address);
+        handled = gpuResources->HandleFault(access, address);
     }
     const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
     counts.faultNs.fetch_add(elapsed, std::memory_order_relaxed);
@@ -554,6 +556,34 @@ std::chrono::steady_clock::time_point startTime() {
     return start;
 }
 
+constexpr std::array<std::pair<const char*, const char*>, 47> recommendedSwitches{{
+    {"KYTY_SRT_NATIVE", "1"}, {"KYTY_SRT_PREDICATES", "1"}, {"KYTY_PREPARATION_SCRATCH", "1"}, {"KYTY_PREPARATION_LOOKUP", "1"},
+    {"KYTY_PREPARATION_TRIM", "1"}, {"KYTY_SPECIALIZATION_GUARD", "1"}, {"KYTY_PIPELINE_INDEX", "1"}, {"KYTY_BINDING_SCRATCH", "1"},
+    {"KYTY_DRAW_RUN_RANGES", "1"}, {"KYTY_BUFFER_RESIDENCY", "1"}, {"KYTY_COPY_FEEDBACK", "1"}, {"KYTY_ASYNC_LOD_STATS", "1"},
+    {"KYTY_BACKING_READ", "1"}, {"KYTY_STREAM_UPLOAD", "1"}, {"KYTY_FRAME_PIPELINE", "1"}, {"KYTY_WRITE_WINDOW_HANDOFF", "1"},
+    {"KYTY_READBACK_DETACH", "1"}, {"KYTY_ASYNC_WRITE_READBACK", "1"}, {"KYTY_READBACK_SLOTS", "1"}, {"KYTY_ASYNC_UPLOAD", "2"},
+    {"KYTY_BUFFER_RECLAIM", "1"}, {"KYTY_UNMAP_PROTECT_SKIP", "1"}, {"KYTY_BDA_DIRTY_REGIONS", "1"},
+    {"KYTY_GLOBAL_BARRIER_DEDUPE", "1"}, {"KYTY_RANGE_SET_FAST", "1"}, {"KYTY_IMAGE_GRANULES", "2"},
+    {"KYTY_TEXTURE_RESOLVE_PAGES", "1"}, {"KYTY_PARTIAL_IMAGE_DIRTY", "1"}, {"KYTY_PARTIAL_ROW_BANDS", "1"},
+    {"KYTY_ASYNC_REPROTECT", "1"}, {"KYTY_READBACK_NARROW", "1"}, {"KYTY_READBACK_QUEUE", "1"}, {"KYTY_IMAGE_BARRIER_DEDUPE", "1"},
+    {"KYTY_IMAGE_POOL", "1"}, {"KYTY_PENDING_DRAIN", "1"}, {"KYTY_VULKAN_RECORDING", "1"}, {"KYTY_DEFERRED_SUBMIT", "1"},
+    {"KYTY_NATIVE_XPR", "1"}, {"KYTY_DRAW_PACKETS", "1"}, {"KYTY_NATIVE_XPR_PREDICT", "1"}, {"KYTY_NATIVE_IMAGE_PROOF", "1"},
+    {"KYTY_ASYNC_XPR_PIPELINES", "1"}, {"KYTY_NATIVE_XPR_RELOCATE", "1"}, {"KYTY_NATIVE_XPR_STORE_BUDGET", "256"},
+    {"KYTY_NATIVE_XPR_KEEP_FRAMES", "600"}, {"KYTY_NATIVE_XPR_INSTANCES", "1"}, {"KYTY_DISPATCH_BATCH", "128"},
+}};
+
+const std::string& renderCpus() {
+    static const std::string cpus = [] {
+        std::string list;
+        const auto processors = std::thread::hardware_concurrency();
+        if (processors >= 4) {
+            for (unsigned index = 1; index < processors / 2; ++index) list += (list.empty() ? "" : ",") + std::to_string(index * 2);
+        }
+        return list;
+    }();
+    return cpus;
+}
+
 void configure(std::uint32_t width, std::uint32_t height) {
     std::call_once(configured, [&] {
         Config::Initialize();
@@ -561,11 +591,10 @@ void configure(std::uint32_t width, std::uint32_t height) {
         options.screen_width = width;
         options.screen_height = height;
         const char* log = std::getenv("APS5_KYTY_GPU_LOG");
-        options.printf_direction = log != nullptr && std::string_view(log) == "1" ? Config::LogDirection::Console : Config::LogDirection::Silent;
+        options.printf_direction = log != nullptr && std::string_view(log) == "1" ? Config::OutputDirection::Console : Config::OutputDirection::Silent;
         options.present_mode = Config::PresentMode::Mailbox;
         Config::Load(options);
         Log::Initialize();
-        if (statsEnabled()) Common::DebugCounters::SetEnabled(true);
     });
 }
 
@@ -573,13 +602,42 @@ void ensureShaders() {
     std::call_once(shaders, [] { Libs::Graphics::ShaderInit(); });
 }
 
+KYTY_SYSV_ABI int videoOutSetFlipMaster(int, int) {
+    return 0;
+}
+
+KYTY_SYSV_ABI void videoOutAddBufferAttributeOption(void* attribute, std::uint64_t option) {
+    constexpr std::size_t optionOffset = 24;
+    std::uint64_t value = 0;
+    std::memcpy(&value, static_cast<std::uint8_t*>(attribute) + optionOffset, sizeof(value));
+    value |= option;
+    std::memcpy(static_cast<std::uint8_t*>(attribute) + optionOffset, &value, sizeof(value));
+}
+
+KYTY_SYSV_ABI int videoOutAllowOutputResolutionWqhdDetection(int) {
+    return 0;
+}
+
+KYTY_SYSV_ABI int videoOutVrrPegToFixedRate(int, std::uint64_t, std::uint64_t) {
+    return 0;
+}
+
+KYTY_SYSV_ABI int videoOutVrrUnpegFromFixedRate(int) {
+    return 0;
+}
+
+KYTY_SYSV_ABI int videoOutSubmitFlip(int handle, int index, int flipMode, std::int64_t flipArg) {
+    counts.flips.fetch_add(1, std::memory_order_relaxed);
+    return Libs::VideoOut::VideoOutSubmitFlip(handle, index, flipMode, flipArg);
+}
+
 void* videoOutFunction(std::string_view name) {
     namespace V = Libs::VideoOut;
     static const std::unordered_map<std::string_view, void*> functions{
         {"Open", reinterpret_cast<void*>(&V::VideoOutOpen)},
         {"Close", reinterpret_cast<void*>(&V::VideoOutClose)},
-        {"SetFlipMaster", reinterpret_cast<void*>(&V::VideoOutSetFlipMaster)},
-        {"AddBufferAttributeOption", reinterpret_cast<void*>(&V::VideoOutAddBufferAttributeOption)},
+        {"SetFlipMaster", reinterpret_cast<void*>(&videoOutSetFlipMaster)},
+        {"AddBufferAttributeOption", reinterpret_cast<void*>(&videoOutAddBufferAttributeOption)},
         {"SetBufferAttribute2", reinterpret_cast<void*>(&V::VideoOutSetBufferAttribute2)},
         {"SetFlipRate", reinterpret_cast<void*>(&V::VideoOutSetFlipRate)},
         {"AddFlipEvent", reinterpret_cast<void*>(&V::VideoOutAddFlipEvent)},
@@ -592,7 +650,7 @@ void* videoOutFunction(std::string_view name) {
         {"RegisterBuffers2", reinterpret_cast<void*>(&V::VideoOutRegisterBuffers2)},
         {"SubmitChangeBufferAttribute2", reinterpret_cast<void*>(&V::VideoOutSubmitChangeBufferAttribute2)},
         {"UnregisterBuffers", reinterpret_cast<void*>(&V::VideoOutUnregisterBuffers)},
-        {"SubmitFlip", reinterpret_cast<void*>(&V::VideoOutSubmitFlip)},
+        {"SubmitFlip", reinterpret_cast<void*>(&videoOutSubmitFlip)},
         {"GetFlipStatus", reinterpret_cast<void*>(&V::VideoOutGetFlipStatus)},
         {"IsFlipPending", reinterpret_cast<void*>(&V::VideoOutIsFlipPending)},
         {"GetVblankStatus", reinterpret_cast<void*>(&V::VideoOutGetVblankStatus)},
@@ -601,9 +659,9 @@ void* videoOutFunction(std::string_view name) {
         {"GetEventCount", reinterpret_cast<void*>(&V::VideoOutGetEventCount)},
         {"WaitVblank", reinterpret_cast<void*>(&V::VideoOutWaitVblank)},
         {"GetOutputStatus", reinterpret_cast<void*>(&V::VideoOutGetOutputStatus)},
-        {"AllowOutputResolutionWqhdDetection", reinterpret_cast<void*>(&V::VideoOutAllowOutputResolutionWqhdDetection)},
-        {"VrrPegToFixedRate", reinterpret_cast<void*>(&V::VideoOutVrrPegToFixedRate)},
-        {"VrrUnpegFromFixedRate", reinterpret_cast<void*>(&V::VideoOutVrrUnpegFromFixedRate)},
+        {"AllowOutputResolutionWqhdDetection", reinterpret_cast<void*>(&videoOutAllowOutputResolutionWqhdDetection)},
+        {"VrrPegToFixedRate", reinterpret_cast<void*>(&videoOutVrrPegToFixedRate)},
+        {"VrrUnpegFromFixedRate", reinterpret_cast<void*>(&videoOutVrrUnpegFromFixedRate)},
         {"InitializeOutputOptions", reinterpret_cast<void*>(&V::VideoOutInitializeOutputOptions)},
         {"IsOutputSupported", reinterpret_cast<void*>(&V::VideoOutIsOutputSupported)},
         {"ConfigureOutput", reinterpret_cast<void*>(&V::VideoOutConfigureOutput)},
@@ -615,50 +673,6 @@ void* videoOutFunction(std::string_view name) {
     };
     const auto found = functions.find(name);
     return found != functions.end() ? found->second : nullptr;
-}
-
-}
-
-namespace Common {
-
-struct ArchiveFile::Private {};
-
-ArchiveFile::~ArchiveFile() = default;
-
-uint64_t ArchiveFile::Size() const {
-    return 0;
-}
-
-uint64_t ArchiveFile::Tell() const {
-    return 0;
-}
-
-bool ArchiveFile::Seek(uint64_t) {
-    return false;
-}
-
-void ArchiveFile::Read(void*, uint32_t, uint32_t* bytes_read) {
-    if (bytes_read != nullptr) *bytes_read = 0;
-}
-
-bool IsArchivePath(const std::filesystem::path&) {
-    return false;
-}
-
-std::optional<File::Info> GetArchiveInfo(const std::filesystem::path&) {
-    return std::nullopt;
-}
-
-std::vector<File::DirEntry> GetArchiveDirEntries(const std::filesystem::path&) {
-    return {};
-}
-
-std::filesystem::path GetArchiveHostPath(const std::filesystem::path& path) {
-    return path;
-}
-
-std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path&) {
-    return nullptr;
 }
 
 }
@@ -711,19 +725,13 @@ SystemOverlay::SystemOverlay(GraphicContext&) {}
 
 SystemOverlay::~SystemOverlay() = default;
 
-bool SystemOverlay::PrepareFrame(vk::Extent2D, vk::Format, uint32_t) {
+bool SystemOverlay::PrepareFrame(vk::Extent2D, vk::Format, uint32_t, SystemOverlayHud*) {
     return false;
 }
 
 void SystemOverlay::Record(vk::CommandBuffer, vk::ImageView) {}
 
 void SystemOverlay::ReleaseVulkan() {}
-
-bool PerformanceOverlayEnabled() noexcept {
-    return false;
-}
-
-void PerformanceOverlayRecordFlip(uint32_t, uint32_t) noexcept {}
 
 void RenderDocOnGuestFlip(RenderContext&) {}
 
@@ -780,7 +788,23 @@ int KYTY_SYSV_ABI KernelDeleteEvent(KernelEqueue eq, uintptr_t ident, int16_t fi
 
 }
 
+std::uint8_t* backingPointer(std::uint64_t address, std::uint64_t bytes) {
+    const auto base = address & ~(RegionBytes - 1);
+    if (bytes == 0 || bytes > base + RegionBytes - address || mappedRun(address, bytes) != bytes) return nullptr;
+    auto* region = ensureRegion(base);
+    if (region == nullptr) return nullptr;
+    std::lock_guard lock(region->mutex);
+    auto* alias = regionAlias(*region, base);
+    return alias != nullptr ? alias + (address - base) : nullptr;
+}
+
+bool guestRange(std::uint64_t address, std::uint64_t bytes) {
+    return Libs::Graphics::GuestRange{address, bytes}.Valid();
+}
+
 namespace Libs::LibKernel::Memory {
+
+thread_local uint64_t g_srt_shader_hash = 0;
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
     auto* bytes = static_cast<std::uint8_t*>(data);
@@ -790,9 +814,9 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
-    if (resources != nullptr && Graphics::GuestRange{vaddr, size}.Valid()) {
+    if (gpuResources != nullptr && Graphics::GuestRange{vaddr, size}.Valid()) {
         if (!Graphics::GuestGpu::IsGpuThread()) return false;
-        auto& buffers = resources->GetBufferCache();
+        auto& buffers = gpuResources->GetBufferCache();
         if (buffers.HasGpuDirtyBytes(vaddr, size)) buffers.ReadMemory(vaddr, size);
     }
     return TryReadBacking(vaddr, data, size);
@@ -813,6 +837,134 @@ bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
     return CopySparseMemory(vaddr, data, size);
 }
 
+bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+    return TryReadBacking(vaddr, data, size);
+}
+
+bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    return backing(vaddr, size, false, true, [&](std::uint64_t at, std::uint64_t length, std::uint8_t* where) {
+        std::memcpy(where, bytes + (at - vaddr), static_cast<std::size_t>(length));
+    });
+}
+
+const uint8_t* TryGetBackingPointer(uint64_t vaddr, uint64_t size) {
+    return backingPointer(vaddr, size);
+}
+
+bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+    pieces.clear();
+    for (auto at = vaddr; at < vaddr + size;) {
+        const auto next = std::min(vaddr + size, (at & ~(RegionBytes - 1)) + RegionBytes);
+        const auto* pointer = backingPointer(at, next - at);
+        if (pointer == nullptr) return false;
+        if (!pieces.empty() && pieces.back().first + pieces.back().second == pointer) {
+            pieces.back().second += next - at;
+        } else {
+            pieces.emplace_back(pointer, next - at);
+        }
+        at = next;
+    }
+    return true;
+}
+
+bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+    if (gpuResources != nullptr && guestRange(vaddr, size)) {
+        if (!Graphics::GuestGpu::IsGpuThread() || gpuResources->GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+            gpuResources->GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+            return false;
+        }
+    }
+    return TryReadBackingToHost(vaddr, data, size);
+}
+
+bool IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size) {
+    return host->uniqueBacking != nullptr && host->uniqueBacking(vaddr, size);
+}
+
+bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size) {
+    return gpuResources != nullptr && Graphics::GuestGpu::IsGpuThread() && guestRange(vaddr, size) &&
+           gpuResources->HasReadWatchers(vaddr, size) && TryReadGpuCleanBackingToHost(vaddr, data, size);
+}
+
+bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean) {
+    if (data == nullptr || size < 8 || size > (clean ? 4096u : 64u) || size % 4 != 0 || gpuResources == nullptr ||
+        !Graphics::GuestGpu::IsGpuThread() || !guestRange(vaddr, size)) {
+        return false;
+    }
+    if (!clean && !gpuResources->HasReadWatchers(vaddr, size)) {
+        auto* out = static_cast<std::uint8_t*>(data);
+        const auto* in = reinterpret_cast<const std::uint8_t*>(vaddr);
+        std::uint64_t at = 0;
+        for (; at + 8 <= size; at += 8) std::memcpy(out + at, in + at, 8);
+        if (at < size) std::memcpy(out + at, in + at, 4);
+        return true;
+    }
+    return TryReadGpuCleanBackingToHost(vaddr, data, size);
+}
+
+bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
+    if (gpuResources == nullptr || !guestRange(vaddr, size)) return true;
+    if (!Graphics::GuestGpu::IsGpuThread() || gpuResources->GetTextureCache().IsRegionGpuModified(vaddr, size)) return false;
+    if (gpuResources->GetBufferCache().HasGpuDirtyBytes(vaddr, size)) gpuResources->GetBufferCache().ReadMemory(vaddr, size);
+    return true;
+}
+
+bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
+    return ClampRangeSize(vaddr, size) == size;
+}
+
+void MappedParts(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* parts) {
+    parts->clear();
+    const auto add = [&](std::uint64_t begin, std::uint64_t end) {
+        if (!parts->empty() && parts->back().first + parts->back().second == begin) {
+            parts->back().second += end - begin;
+        } else {
+            parts->emplace_back(begin, end - begin);
+        }
+    };
+    for (auto at = vaddr; at < vaddr + size;) {
+        if (const auto known = mappedRun(at, vaddr + size - at); known != 0) {
+            add(at, at + known);
+            at += known;
+            continue;
+        }
+        MEMORY_BASIC_INFORMATION info{};
+        const bool live = committed(at, info);
+        const auto stop = std::min(vaddr + size, regionEnd(info) > at ? regionEnd(info) : (at & ~(PageBytes - 1)) + PageBytes);
+        if (live) add(at, stop);
+        at = stop;
+    }
+}
+
+bool TryReadMappedOrZero(uint64_t vaddr, void* data, uint64_t size) {
+    return CopySparseMemory(vaddr, data, size);
+}
+
+bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size, const char** failure_reason) {
+    const bool read = CopySparseMemory(vaddr, data, size);
+    if (failure_reason != nullptr) *failure_reason = read ? nullptr : "sparse-backing-copy-failed";
+    return read;
+}
+
+bool RestoreGuestWritable(uint64_t vaddr, uint64_t size) {
+    for (auto page = vaddr & ~(PageBytes - 1); page < vaddr + size; page += PageBytes) {
+        auto* region = findRegion(page);
+        if (region == nullptr) return false;
+        const auto original = region->original[(page % RegionBytes) / PageBytes] & 0xffu;
+        if (original != PAGE_READWRITE && original != PAGE_EXECUTE_READWRITE) return false;
+    }
+    return protectPages(vaddr, size, Common::VirtualMemory::Mode::ReadWrite);
+}
+
+bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
+    return gpuResources != nullptr && guestRange(vaddr, size) && gpuResources->InvalidateMemory(vaddr, size);
+}
+
+bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+    return gpuResources != nullptr && gpuResources->HandleFault(access, fault_vaddr);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
     if (const auto known = mappedRun(vaddr, size); known != 0) return known;
     std::uint64_t covered = 0;
@@ -822,7 +974,11 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
         covered = std::min(size, regionEnd(info) - vaddr);
     }
     if (covered == 0) {
-        EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
+        static std::atomic<std::uint32_t> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            std::fprintf(stderr, "[kyty-gpu] buffer range at an unmapped address ignored, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
+        }
+        return 0;
     }
     addMapping(vaddr, vaddr + covered);
     return covered;
@@ -838,8 +994,8 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
     }
 }
 
-void InstallGpuResources(Graphics::RenderContext* renderer) noexcept {
-    resources = renderer;
+void InstallGpuResources(Graphics::GpuResourceManager* manager) noexcept {
+    gpuResources = manager;
 }
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
@@ -875,8 +1031,46 @@ double GetTimeMs() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startTime()).count();
 }
 
+Common::Time GetTime() {
+    return Common::Time(static_cast<int>(GetTimeMs()));
 }
 
+}
+
+}
+
+namespace Loader::DemonsSoulsWarp {
+
+const std::vector<Spawn>& Spawns() {
+    static const std::vector<Spawn> none;
+    return none;
+}
+
+bool Arm(std::string_view, std::string_view) {
+    return false;
+}
+
+void Disarm() {}
+
+std::string HudText() {
+    return {};
+}
+
+}
+
+void Libs::Graphics::WindowContext::UpdateTitle() {}
+
+extern "C" [[gnu::used]] volatile std::atomic_uint32_t kyty_local_backing_read_mode{0};
+
+extern "C" __declspec(dllexport) const char* KytyHostSwitch(const char* name) {
+    if (const char* value = std::getenv(name); value != nullptr) return value;
+    const char* safe = std::getenv("APS5_KYTY_GPU_SAFE");
+    if (safe != nullptr && std::string_view(safe) == "1") return nullptr;
+    if (std::string_view(name) == "KYTY_RENDER_CPUS") return renderCpus().empty() ? nullptr : renderCpus().c_str();
+    for (const auto& [key, value] : recommendedSwitches) {
+        if (std::string_view(name) == key) return value;
+    }
+    return nullptr;
 }
 
 const char* SDL_GetError() {
@@ -885,25 +1079,35 @@ const char* SDL_GetError() {
 
 void SDL_DestroyWindow(SDL_Window*) {}
 
-void SDL_QuitSubSystem(std::uint32_t) {}
+void SDL_QuitSubSystem(Uint32) {}
 
-bool SDL_RunOnMainThread(SDL_MainThreadCallback callback, void* userdata, bool) {
-    callback(userdata);
-    return true;
+void SDL_SetWindowTitle(SDL_Window*, const char*) {}
+
+const char* SDL_GetWindowTitle(SDL_Window*) {
+    return nullptr;
 }
 
-bool SDL_GetWindowSizeInPixels(SDL_Window* target, int* width, int* height) {
-    RECT rect{};
-    if (target == nullptr || !GetClientRect(static_cast<HWND>(target->hwnd), &rect)) return false;
-    *width = rect.right - rect.left;
-    *height = rect.bottom - rect.top;
-    return true;
+SDL_bool SDL_GetWindowWMInfo(SDL_Window*, SDL_SysWMinfo*) {
+    return SDL_FALSE;
 }
 
-const char* const* SDL_Vulkan_GetInstanceExtensions(std::uint32_t* count) {
+void SDL_PumpEvents() {}
+
+int SDL_GetWindowDisplayIndex(SDL_Window*) {
+    return -1;
+}
+
+int SDL_GetCurrentDisplayMode(int, SDL_DisplayMode*) {
+    return -1;
+}
+
+SDL_bool SDL_Vulkan_GetInstanceExtensions(SDL_Window*, unsigned int* count, const char** names) {
     static const char* const extensions[] = {"VK_KHR_surface", "VK_KHR_win32_surface"};
+    if (names != nullptr) {
+        for (unsigned int index = 0; index < std::min<unsigned int>(*count, 2); ++index) names[index] = extensions[index];
+    }
     *count = 2;
-    return extensions;
+    return SDL_TRUE;
 }
 
 void* SDL_Vulkan_GetVkGetInstanceProcAddr() {
@@ -911,16 +1115,16 @@ void* SDL_Vulkan_GetVkGetInstanceProcAddr() {
     return loader != nullptr ? reinterpret_cast<void*>(GetProcAddress(loader, "vkGetInstanceProcAddr")) : nullptr;
 }
 
-bool SDL_Vulkan_CreateSurface(SDL_Window* target, VkInstance instance, const VkAllocationCallbacks* allocator, VkSurfaceKHR* surface) {
+SDL_bool SDL_Vulkan_CreateSurface(SDL_Window* target, VkInstance instance, VkSurfaceKHR* surface) {
     const auto getProc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
-    if (getProc == nullptr || target == nullptr) return false;
+    if (getProc == nullptr || target == nullptr) return SDL_FALSE;
     const auto create = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(getProc(instance, "vkCreateWin32SurfaceKHR"));
-    if (create == nullptr) return false;
+    if (create == nullptr) return SDL_FALSE;
     VkWin32SurfaceCreateInfoKHR info{};
     info.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
     info.hinstance = GetModuleHandleW(nullptr);
     info.hwnd = static_cast<HWND>(target->hwnd);
-    return create(instance, &info, allocator, surface) == VK_SUCCESS;
+    return create(instance, &info, nullptr, surface) == VK_SUCCESS ? SDL_TRUE : SDL_FALSE;
 }
 
 extern "C" {
@@ -946,31 +1150,28 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
     auto& presenter = *window->presenter;
     auto& videoOut = Libs::VideoOut::VideoOutInit(width, height, presenter);
     auto& renderer = presenter.Renderer();
+    resources = &renderer;
     renderer.InitializeGpu(&videoOut);
     ensureShaders();
     started.store(true, std::memory_order_release);
     std::thread([] {
-        auto previous = window->loop.presented_frames.load(std::memory_order_relaxed);
+        auto previous = counts.flips.load(std::memory_order_relaxed);
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
-            const auto now = window->loop.presented_frames.load(std::memory_order_relaxed);
-            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu read-faults=%llu fault-ms=%llu read-fault-ms=%llu protect-ms=%llu protect-calls=%llu protect-syscalls=%llu backing-opens=%llu alias-copies=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
+            const auto now = counts.flips.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "[kyty-gpu] %llu flips over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu read-faults=%llu fault-ms=%llu read-fault-ms=%llu protect-ms=%llu protect-calls=%llu protect-syscalls=%llu backing-opens=%llu alias-copies=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
                          static_cast<unsigned long long>(counts.dcbs.load()), static_cast<unsigned long long>(counts.acbs.load()), static_cast<unsigned long long>(counts.adds.load()), static_cast<unsigned long long>(counts.graphicsTriggers.load()),
                          static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()), static_cast<unsigned long long>(counts.readFaults.load()), static_cast<unsigned long long>(counts.faultNs.load() / 1000000), static_cast<unsigned long long>(counts.readFaultNs.load() / 1000000), static_cast<unsigned long long>(counts.protectNs.load() / 1000000), static_cast<unsigned long long>(counts.protectCalls.load()), static_cast<unsigned long long>(counts.protectSyscalls.load()), static_cast<unsigned long long>(counts.backingOpens.load()), static_cast<unsigned long long>(counts.aliasCopies.load()));
             previous = now;
             if (statsEnabled()) {
-                using Common::DebugCounters::Counter;
-                static std::array<std::uint64_t, static_cast<std::size_t>(Counter::Count)> last{};
-                const auto delta = [](Counter counter) {
-                    const auto index = static_cast<std::size_t>(counter);
-                    const auto value = Common::DebugCounters::Detail::g_counters[index].load(std::memory_order_relaxed);
-                    const auto result = value - last[index];
+                static std::array<std::uint64_t, LiveCounters::Count> last{};
+                std::string text;
+                for (std::size_t index = 0; index < LiveCounters::Count; ++index) {
+                    const auto value = LiveCounters::Value(index);
+                    if (value != last[index]) text += std::string(" ") + LiveCounters::Names[index] + "=" + std::to_string(value - last[index]);
                     last[index] = value;
-                    return static_cast<unsigned long long>(result);
-                };
-                std::fprintf(stderr, "[kyty-gpu] 10 s: draws=%llu dispatches=%llu submits=%llu gpu-waits=%llu gpu-wait-ms=%llu buffer-up-mib=%llu buffer-down-mib=%llu texture-up-mib=%llu texture-down-mib=%llu buffer-evictions=%llu texture-evictions=%llu pipelines=%llu\n",
-                             delta(Counter::Draws), delta(Counter::Dispatches), delta(Counter::QueueSubmits), delta(Counter::GpuWaits), delta(Counter::GpuWaitNs) / 1000000, delta(Counter::BufferUploadBytes) >> 20, delta(Counter::BufferDownloadBytes) >> 20,
-                             delta(Counter::TextureUploadBytes) >> 20, delta(Counter::TextureDownloadBytes) >> 20, delta(Counter::BufferEvictions), delta(Counter::TextureEvictions), delta(Counter::PipelinesCreated));
+                }
+                std::fprintf(stderr, "[kyty-gpu] 10 s counters:%s\n", text.c_str());
             }
             if (statsEnabled()) {
                 std::lock_guard lock(hotMutex);
@@ -1072,15 +1273,15 @@ __declspec(dllexport) int KytyGpuDeleteEqEvent(std::int64_t eq, int id, void*) {
 }
 
 __declspec(dllexport) void KytyGpuMapMemory(std::uint64_t address, std::uint64_t bytes) {
-    if (resources == nullptr || bytes == 0) return;
+    if (gpuResources == nullptr || bytes == 0) return;
     addMapping(address, address + bytes);
-    if (Libs::Graphics::GuestRange{address, bytes}.Valid()) resources->MapMemory(address, bytes);
+    if (Libs::Graphics::GuestRange{address, bytes}.Valid()) gpuResources->MapMemory(address, bytes);
 }
 
 __declspec(dllexport) void KytyGpuUnmapMemory(std::uint64_t address, std::uint64_t bytes) {
-    if (resources == nullptr || bytes == 0) return;
+    if (gpuResources == nullptr || bytes == 0) return;
     removeMapping(address, address + bytes);
-    if (Libs::Graphics::GuestRange{address, bytes}.Valid()) resources->UnmapMemory(address, bytes);
+    if (Libs::Graphics::GuestRange{address, bytes}.Valid()) gpuResources->UnmapMemory(address, bytes, true);
     dropAliases(address, address + bytes);
 }
 
@@ -1101,7 +1302,7 @@ __declspec(dllexport) void* KytyGpuVideoOut(const char* name) {
 }
 
 __declspec(dllexport) void KytyGpuHostWrite(std::uint64_t address, std::uint64_t bytes, bool begin) {
-    if (resources == nullptr || bytes == 0) return;
+    if (gpuResources == nullptr || bytes == 0) return;
     if (begin) counts.hostWrites.fetch_add(1, std::memory_order_relaxed);
     const auto end = address + bytes;
     for (auto page = address & ~(PageBytes - 1); page < end; page += PageBytes) {
@@ -1135,7 +1336,7 @@ void KytyHostNoteWrittenBinding(std::uint64_t address, std::uint64_t size, bool 
 }
 
 __declspec(dllexport) void KytyGpuSuspendPoint() {
-    resources->GetGpu().SuspendPoint();
+    resources->GetGpu().Done();
 }
 
 __declspec(dllexport) void KytyGpuWaitIdle() {

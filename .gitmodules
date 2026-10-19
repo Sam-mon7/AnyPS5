@@ -39,6 +39,6 @@
 	url = https://github.com/libusb/libusb-cmake.git
 [submodule "3rdparty/KytyPS5"]
 	path = 3rdparty/KytyPS5
-	url = https://github.com/KytyPS5/KytyPS5.git
+	url = https://github.com/Supermedo/KytyPS5-SuperMedo.git
 	ignore = dirty
 	shallow = true

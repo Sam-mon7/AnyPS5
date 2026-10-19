@@ -1,8 +1,8 @@
 diff --git a/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp b/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp
-index 12a7a605..8c086f70 100644
+index 8001f93d..39100155 100644
 --- a/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp
 +++ b/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp
-@@ -201,6 +201,7 @@ constexpr auto MakeOpcodeDispatchTable() {
+@@ -199,6 +199,7 @@ constexpr auto MakeOpcodeDispatchTable() {
  	g_cp_op_func[Pm4::IT_COPY_DATA]                 = CpOpCopyData;
  	g_cp_op_func[Pm4::IT_EVENT_WRITE]               = CpOpEventWrite;
  	g_cp_op_func[Pm4::IT_EVENT_WRITE_EOP]           = CpOpEventWriteEop;
@@ -23,10 +23,10 @@ index 419c7490..3be02ce6 100644
  } // namespace Libs::Graphics
  
 diff --git a/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp b/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
-index 83147cdd..3564680c 100644
+index 31df5b9a..d75a8056 100644
 --- a/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
 +++ b/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
-@@ -2221,6 +2221,11 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
+@@ -2255,6 +2255,11 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
  	return dw_num + 1;
  }
  
@@ -38,7 +38,7 @@ index 83147cdd..3564680c 100644
  KYTY_CP_OP_PARSER(CpOpReleaseMem) {
  	KYTY_PROFILER_FUNCTION();
  
-@@ -2490,14 +2495,14 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
+@@ -2526,14 +2531,14 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
  KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
  	KYTY_PROFILER_FUNCTION();
  
@@ -55,21 +55,58 @@ index 83147cdd..3564680c 100644
  }
  
  template <typename T>
+diff --git a/src/graphics/guest_gpu/graphicsRun.h b/src/graphics/guest_gpu/graphicsRun.h
+index 134f551a..2e143bff 100644
+--- a/src/graphics/guest_gpu/graphicsRun.h
++++ b/src/graphics/guest_gpu/graphicsRun.h
+@@ -37,6 +37,7 @@ public:
+ 	void              SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
+ 	void              SubmitFlipPreparation(uint64_t request_id);
+ 	void              Done();
++	void              WaitForIdle();
+ 	[[nodiscard]] int GetFrameNum() const;
+ 
+ 	[[nodiscard]] static bool IsGpuThread() noexcept;
+@@ -70,7 +71,6 @@ private:
+ 	};
+ 
+ 	void              Enqueue(Submission submission);
+-	void              WaitForIdle();
+ 	bool              CanProcessSubmission(const Submission& submission) const;
+ 	void              ProcessCommands();
+ 	bool              Process(Submission& submission);
+diff --git a/src/graphics/host_gpu/memoryTracker.cpp b/src/graphics/host_gpu/memoryTracker.cpp
+index 934d1cca..55259413 100644
+--- a/src/graphics/host_gpu/memoryTracker.cpp
++++ b/src/graphics/host_gpu/memoryTracker.cpp
+@@ -5,6 +5,8 @@
+ 
+ namespace Libs::Graphics {
+ 
++thread_local std::vector<MemoryTracker::DeferredProtect> MemoryTracker::s_deferred;
++
+ static_assert(std::atomic<void*>::is_always_lock_free);
+ 
+ MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
+diff --git a/src/graphics/host_gpu/memoryTracker.h b/src/graphics/host_gpu/memoryTracker.h
+index 189782c6..8c971670 100644
+--- a/src/graphics/host_gpu/memoryTracker.h
++++ b/src/graphics/host_gpu/memoryTracker.h
+@@ -176,7 +176,7 @@ public:
+ private:
+ 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+ 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+-	inline static thread_local std::vector<DeferredProtect> s_deferred;
++	static thread_local std::vector<DeferredProtect> s_deferred;
+ 
+ 	void CheckNotInUploadCallback() const noexcept {
+ 		if (s_upload_owner == this) {
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-index d452db96..5f961e7d 100644
+index 5d6d3809..040f07d1 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-@@ -322,7 +322,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
- 		return NULL_BUFFER_ID;
- 	}
- 	if (!GuestRange {vaddr, size}.Valid()) {
--		EXIT("BufferCache: invalid buffer discovery request\n");
-+		EXIT("BufferCache: invalid buffer discovery request addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
- 	}
- 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
- 	if (owner != nullptr && *owner) {
-@@ -484,6 +484,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
- 	return source.first->Handle();
+@@ -1497,6 +1497,8 @@ StreamBuffer& BufferCache::GetShaderUploadBuffer() noexcept {
+ 	                                                                        : m_stream_buffer;
  }
  
 +extern "C" void KytyHostNoteGpuWrite(uint64_t address, uint64_t size, const void* caller);
@@ -77,28 +114,55 @@ index d452db96..5f961e7d 100644
  std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                         bool is_written, bool is_texel_buffer,
                                                         BufferId id) {
-@@ -515,6 +517,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t
- 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
- 	if (is_written) {
+@@ -1531,6 +1533,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t
+ 		InvalidateCopyFeedback(vaddr, size);
  		m_gpu_modified_ranges.Add(vaddr, size);
+ 		NoteGpuWrite(vaddr, size);
 +		KytyHostNoteGpuWrite(vaddr, size, __builtin_return_address(0));
+ 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
+ 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
  	}
- 	return {&buffer, buffer.Offset(vaddr)};
- }
 diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
-index e3abcc6d..e8ea07b8 100644
+index 3c985eaa..c5efb179 100644
 --- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
-@@ -1090,7 +1090,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
- 			const bool depth = image.info.IsDepth();
- 			if (depth) {
- 				const auto value = clear.color.float32[0];
--				clear.depthStencil = {value, 0u};
-+				clear.depthStencil = vk::ClearDepthStencilValue{value, 0u};
- 			}
- 			ClearImage(m_scheduler.Current(), id, depth ? image.backing.format : view.format,
- 			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
-@@ -1584,7 +1584,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
+@@ -174,7 +174,7 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
+ 		copy.bufferRowLength   = info.pitch;
+ 		copy.bufferImageHeight = info.extent.height;
+ 		copy.imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, layer, 1};
+-		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
++		copy.imageExtent       = vk::Extent3D{info.extent.width, info.extent.height, 1};
+ 	}
+ 	return copies;
+ }
+@@ -767,7 +767,7 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
+ 	info.pixel_format    = desc.info.pixel_format;
+ 	info.guest_format    = desc.info.guest_format;
+ 	info.type            = type;
+-	info.extent          = {1, 1, 1};
++	info.extent          = vk::Extent3D{1, 1, 1};
+ 	info.resources       = {1, 1};
+ 	info.pitch           = 1;
+ 	info.bytes_per_block = std::max(desc.info.bytes_per_block, 1u);
+@@ -1460,7 +1460,7 @@ void TextureCache::UploadStencil(Image& image, Buffer& source, uint64_t source_o
+ 		copy.bufferRowLength   = static_cast<uint32_t>(pitch);
+ 		copy.bufferImageHeight = info.extent.height;
+ 		copy.imageSubresource  = {vk::ImageAspectFlagBits::eStencil, 0, layer, 1};
+-		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
++		copy.imageExtent       = vk::Extent3D{info.extent.width, info.extent.height, 1};
+ 		tiles.push_back({block.family, 1, offset, slice_size, offset, slice_size, 0,
+ 		                 info.extent.width, info.extent.height, 1, static_cast<uint32_t>(pitch)});
+ 		tiles.back().surface_z = layer;
+@@ -1740,7 +1740,7 @@ bool TextureCache::UploadDepthPartial(Image& image) {
+ 		copy.bufferRowLength   = info.pitch;
+ 		copy.bufferImageHeight = info.extent.height;
+ 		copy.imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, picked[i], 1};
+-		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
++		copy.imageExtent       = vk::Extent3D{info.extent.width, info.extent.height, 1};
+ 	}
+ 	TileManager::Result linear {source->Handle(), source_offset, total};
+ 	if (info.IsTiled()) {
+@@ -2557,7 +2557,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
  		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
  		attachment.clearValue  = clear;
  		vk::RenderingInfo rendering {};
@@ -108,23 +172,23 @@ index e3abcc6d..e8ea07b8 100644
  		    std::max(image.info.extent.height >> range.baseMipLevel, 1u)};
  		rendering.layerCount           = range.layerCount;
 diff --git a/src/graphics/host_gpu/renderer/colorRenderTarget.cpp b/src/graphics/host_gpu/renderer/colorRenderTarget.cpp
-index e45c18e5..e4a04ed2 100644
+index 23457031..b21c769b 100644
 --- a/src/graphics/host_gpu/renderer/colorRenderTarget.cpp
 +++ b/src/graphics/host_gpu/renderer/colorRenderTarget.cpp
-@@ -205,7 +205,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
+@@ -297,7 +297,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
  	desc.info.pixel_format = target_format.format;
- 	desc.info.guest_format = target_format.guest_format;
+ 	desc.info.guest_format = transfer_format;
  	desc.info.type         = image_type;
 -	desc.info.extent       = {width, height, depth};
 +	desc.info.extent       = vk::Extent3D{width, height, depth};
- 	desc.info.resources       = {levels, volume ? 1u : view.image_layers};
+ 	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
+ 	desc.info.pitch        = pitch;
  	desc.info.bytes_per_block = bytes_per_element;
- 	desc.info.samples         = samples;
 diff --git a/src/graphics/host_gpu/renderer/context.cpp b/src/graphics/host_gpu/renderer/context.cpp
-index d71929fb..d139dc85 100644
+index a5744f07..dc9adb83 100644
 --- a/src/graphics/host_gpu/renderer/context.cpp
 +++ b/src/graphics/host_gpu/renderer/context.cpp
-@@ -97,7 +97,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
+@@ -161,7 +161,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
  	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
  
  	vk::RenderingInfo rendering {};
@@ -134,10 +198,10 @@ index d71929fb..d139dc85 100644
  	rendering.colorAttachmentCount = state.num_color_attachments;
  	rendering.pColorAttachments    = colors.data();
 diff --git a/src/graphics/host_gpu/renderer/depthRenderTarget.cpp b/src/graphics/host_gpu/renderer/depthRenderTarget.cpp
-index 036d644b..9118bc30 100644
+index 98eb0492..297705e0 100644
 --- a/src/graphics/host_gpu/renderer/depthRenderTarget.cpp
 +++ b/src/graphics/host_gpu/renderer/depthRenderTarget.cpp
-@@ -230,7 +230,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
+@@ -201,7 +201,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
  	desc.info.pixel_format    = format;
  	desc.info.guest_format    = guest_format;
  	desc.info.type            = Prospero::ImageType::kColor2D;
@@ -147,10 +211,10 @@ index 036d644b..9118bc30 100644
  	desc.info.pitch           = pitch;
  	desc.info.bytes_per_block = bytes;
 diff --git a/src/graphics/host_gpu/renderer/image/blitHelper.cpp b/src/graphics/host_gpu/renderer/image/blitHelper.cpp
-index f029dfd3..26eff8b1 100644
+index 8ef3df12..49a999b7 100644
 --- a/src/graphics/host_gpu/renderer/image/blitHelper.cpp
 +++ b/src/graphics/host_gpu/renderer/image/blitHelper.cpp
-@@ -160,10 +160,10 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
+@@ -174,10 +174,10 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
  	depth_attachment.imageLayout             = ColorToMsDepthLayout;
  	depth_attachment.loadOp                  = vk::AttachmentLoadOp::eClear;
  	depth_attachment.storeOp                 = vk::AttachmentStoreOp::eStore;
@@ -164,10 +228,10 @@ index f029dfd3..26eff8b1 100644
  	rendering.pDepthAttachment  = &depth_attachment;
  	command.beginRendering(&rendering);
 diff --git a/src/graphics/host_gpu/renderer/image/image.cpp b/src/graphics/host_gpu/renderer/image/image.cpp
-index c94866ed..5bfd27d3 100644
+index 5c5971ba..5a6aec66 100644
 --- a/src/graphics/host_gpu/renderer/image/image.cpp
 +++ b/src/graphics/host_gpu/renderer/image/image.cpp
-@@ -362,18 +362,18 @@ void Image::CopyImage(Image& source) {
+@@ -381,18 +381,18 @@ void Image::CopyImage(Image& source) {
  		copy.dstSubresource = {destination_aspect, level, 0, 1};
  		if (source.backing.image_type == backing.image_type) {
  			if (source.backing.image_type == vk::ImageType::e3D) {
@@ -190,7 +254,7 @@ index c94866ed..5bfd27d3 100644
  		}
  		copies.push_back(copy);
  	}
-@@ -520,11 +520,11 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
+@@ -537,11 +537,11 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
  				source_copy.imageSubresource = {
  				    source_aspect, level,
  				    source.backing.image_type == vk::ImageType::e3D ? 0u : slice, 1};
@@ -204,7 +268,7 @@ index c94866ed..5bfd27d3 100644
  				auto destination_copy             = source_copy;
  				destination_copy.imageSubresource = {
  				    destination_aspect, level,
-@@ -581,7 +581,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+@@ -588,7 +588,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
  		auto& copy          = copies[copy_count++];
  		copy.srcSubresource = {aspect, 0, 0, source_layers};
  		copy.dstSubresource = {aspect, mip, layer, destination_layers};
@@ -213,149 +277,143 @@ index c94866ed..5bfd27d3 100644
  	}
  	auto command = m_scheduler.Current().Handle();
  	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
-diff --git a/src/graphics/host_gpu/renderer/image/imageInfo.cpp b/src/graphics/host_gpu/renderer/image/imageInfo.cpp
-index df131002..4ae15668 100644
---- a/src/graphics/host_gpu/renderer/image/imageInfo.cpp
-+++ b/src/graphics/host_gpu/renderer/image/imageInfo.cpp
-@@ -350,7 +350,7 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
- 		                         : !IsTiled() ? mip.height * tiling.texel_height
- 		                                      : Common::AlignUp(active.height, tiling.texel_height);
- 		copy.imageSubresource  = {aspect, level, 0, 1};
--		copy.imageExtent       = {active.width, active.height, 1};
-+		copy.imageExtent       = vk::Extent3D{active.width, active.height, 1};
- 		if (image_heights[level] == 0) {
- 			for (uint32_t slice = 0; slice < active.depth; ++slice) {
- 				copy.bufferOffset                    = Add(Add(buffer_offset, mip.linear_offset),
+diff --git a/src/graphics/host_gpu/renderer/image/image.h b/src/graphics/host_gpu/renderer/image/image.h
+index 5b2e8cea..3fed239e 100644
+--- a/src/graphics/host_gpu/renderer/image/image.h
++++ b/src/graphics/host_gpu/renderer/image/image.h
+@@ -7,6 +7,7 @@
+ #include "graphics/host_gpu/renderer/image/imageInfo.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <compare>
+ #include <limits>
+ #include <optional>
+diff --git a/src/graphics/host_gpu/renderer/image/textureCommon.cpp b/src/graphics/host_gpu/renderer/image/textureCommon.cpp
+index d7de7686..2228c5de 100644
+--- a/src/graphics/host_gpu/renderer/image/textureCommon.cpp
++++ b/src/graphics/host_gpu/renderer/image/textureCommon.cpp
+@@ -256,7 +256,7 @@ std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayo
+ 		const auto          mip_depth = GetTextureLevelDepth(depth, mip_level, volume_texture);
+ 		vk::BufferImageCopy region {};
+ 		region.imageSubresource = {vk::ImageAspectFlagBits::eColor, mip_level, 0, 1};
+-		region.imageExtent      = {mip_width, mip_height, 1};
++		region.imageExtent      = vk::Extent3D{mip_width, mip_height, 1};
+ 		if (linear_texture) {
+ 			region.bufferRowLength   = layout.mips[mip_level].row_length;
+ 			region.bufferImageHeight = layout.mips[mip_level].image_height;
 diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
-index edea24b4..f8781635 100644
+index 357ce8a0..e0d14b1e 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
-@@ -47,6 +47,15 @@
- 
- namespace Libs::Graphics {
- 
-+extern "C" void KytyHostNoteWrittenBinding(uint64_t address, uint64_t size, bool sentinel);
-+
-+static void WarnScalarReadOverlap(const char* what) {
-+	static std::atomic<uint32_t> warnings {0};
-+	if (warnings.fetch_add(1, std::memory_order_relaxed) < 8) {
-+		std::fprintf(stderr, "[kyty-gpu] %s; continuing with the specialised pipeline\n", what);
-+	}
-+}
-+
- namespace {
- 
- using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
-@@ -574,7 +583,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+@@ -434,7 +434,7 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
+ 	}
+ 	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
+ 	desc.info.type            = Prospero::ImageType::kColor2D;
+-	desc.info.extent          = {1, 1, 1};
++	desc.info.extent          = vk::Extent3D{1, 1, 1};
+ 	desc.info.resources       = {1, 1};
+ 	desc.info.bytes_per_block = 4;
+ 	desc.info.samples         = 1;
+@@ -797,7 +797,7 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
  	desc.info.pixel_format = pixel_format;
  	desc.info.guest_format = format;
  	desc.info.type         = TextureBaseType(type);
 -	desc.info.extent       = {width, height, volume ? depth : 1u};
 +	desc.info.extent       = vk::Extent3D{width, height, volume ? depth : 1u};
  	desc.info.resources    = {levels, image_layers};
+ 	desc.info.pitch        = pitch;
  	desc.info.bytes_per_block =
- 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
-@@ -695,10 +704,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
- 	const auto& program  = *runtime.program;
- 	const auto& snapshot = *runtime.resources;
- 	prepared.runtime = &runtime;
--	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
--	prepared.flattened_srt = {};
--	prepared.shader_data_buffer = {};
--	prepared.shared_memory = {};
-+	prepared.gds = vk::DescriptorBufferInfo{nullptr, 0, VK_WHOLE_SIZE};
-+	prepared.flattened_srt = vk::DescriptorBufferInfo{};
-+	prepared.shader_data_buffer = vk::DescriptorBufferInfo{};
-+	prepared.shared_memory = vk::DescriptorBufferInfo{};
- 	prepared.images.resize(program.info.images.size());
- 	prepared.samplers.clear();
- 	prepared.shader_data.clear();
-@@ -757,7 +766,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
- 							if (read_address > address) {
- 								size = std::min(size, read_address - address);
- 							} else if (address - read_address < read_size) {
--								EXIT("scalar resource reads overlap a shader buffer write\n");
-+								WarnScalarReadOverlap("scalar resource reads overlap a shader buffer write");
- 							}
- 						}
- 					}
-@@ -769,6 +778,9 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
- 				}
- 			}
- 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
-+			if (program.info.buffers[resource].written) {
-+				KytyHostNoteWrittenBinding(address, size, descriptor.NumRecords() == UINT32_MAX);
-+			}
- 			source = {address, size, cache.FindBuffer(address, size)};
- 		}
+@@ -961,6 +961,8 @@ void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
  	}
-@@ -929,7 +941,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
- 		if (reads.empty()) continue;
- 		for (const auto* writer: prepared_bindings) {
- 			if (writer->runtime->program->has_address_writes) {
--				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
-+				WarnScalarReadOverlap("scalar resource reads cannot be proven disjoint from shader address writes");
- 			}
- 		}
- 		for (const auto [address, size]: reads) {
-@@ -941,7 +953,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
- 				                          image->info.metadata.range}) {
- 					if (written.size != 0 && ImageRangeOverlaps(address, size,
- 					                                          written.address, written.size)) {
--						EXIT("scalar resource reads overlap an image or attachment write\n");
-+						WarnScalarReadOverlap("scalar resource reads overlap an image or attachment write");
- 					}
- 				}
- 			}
-@@ -952,7 +964,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
- 					const auto& written = writer->buffer_sources[resource.descriptor_index];
- 					if (written.size != 0 && ImageRangeOverlaps(address, size,
- 					                                          written.address, written.size)) {
--						EXIT("scalar resource reads overlap a shader buffer write\n");
-+						WarnScalarReadOverlap("scalar resource reads overlap a shader buffer write");
- 					}
- 				}
- 			}
-@@ -1051,7 +1063,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
- 						                             ? cache.GetBdaPageTableBuffer()
- 						                             : cache.GetFaultBuffer();
- 						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
--						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
-+						view = vk::DescriptorBufferInfo{bda_buffer->Handle(), 0, bda_buffer->Size()};
- 						write.pBufferInfo = &view;
- 						break;
- 					}
-diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-index f93bef4a..119845d7 100644
---- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-+++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-@@ -41,7 +41,7 @@ namespace Libs::Graphics {
- 
- namespace {
- 
--constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
-+constexpr auto DriverCacheSaveInterval = std::chrono::seconds {30};
- 
- uint8_t RemapSourceAlphaFactor(uint8_t factor) {
- 	switch (static_cast<Prospero::BlendFactor>(factor)) {
-diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
-index efb2a988..073ebe8f 100644
---- a/src/graphics/host_gpu/renderer/renderCompute.cpp
-+++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
-@@ -236,7 +236,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
- 			size *= count;
- 		}
- 	}
--	bindings.shared_memory = {storage.Handle(), 0, size};
-+	bindings.shared_memory = vk::DescriptorBufferInfo{storage.Handle(), 0, size};
  }
  
- void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
++extern "C" void KytyHostNoteWrittenBinding(uint64_t address, uint64_t size, bool sentinel);
++
+ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 	KYTY_PROFILER_FUNCTION();
+ 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+@@ -986,6 +988,9 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 			prepared.buffer_sources.push_back({});
+ 			continue;
+ 		}
++		if (program.info.buffers[i].written) {
++			KytyHostNoteWrittenBinding(address, size, records == UINT32_MAX);
++		}
+ 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+ 	}
+ }
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index 7bb607f3..b2b47067 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -63,6 +63,8 @@ extern "C" {
+ volatile std::atomic<uint32_t> kyty_local_pipeline_index_mode {0};
+ }
+ 
++extern "C" const char* KytyHostSwitch(const char* name);
++
+ namespace Libs::Graphics {
+ 
+ namespace {
+@@ -400,7 +402,7 @@ struct PipelineCache::ProgramCache {
+ 		prefetch->loader = std::thread([this, path = std::move(path), identity = std::move(identity),
+ 		                                warm = std::move(warm)] {
+ 			LocalPlatform::SetThreadName("Kyty.Prefetch");
+-			LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
++			LocalPlatform::MakeBackgroundThread(KytyHostSwitch("KYTY_RENDER_CPUS"));
+ 			auto&      p     = *prefetch;
+ 			const auto begin = std::chrono::steady_clock::now();
+ 			if (!std::filesystem::exists(path) || !p.inputs.Open(path, identity) || p.inputs.records.empty()) {
+@@ -445,7 +447,7 @@ struct PipelineCache::ProgramCache {
+ 
+ 	void PrefetchWork() {
+ 		LocalPlatform::SetThreadName("Kyty.Prefetch");
+-		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
++		LocalPlatform::MakeBackgroundThread(KytyHostSwitch("KYTY_RENDER_CPUS"));
+ 		auto& p = *prefetch;
+ 		for (size_t n; !p.stop.load(std::memory_order_relaxed) &&
+ 		               (n = p.next.fetch_add(1, std::memory_order_relaxed)) < p.groups.size();) {
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index d0e1d435..aaa7252e 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -48,6 +48,8 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++thread_local FrameCapture::Call FrameCapture::g_call;
++
+ namespace Libs::Graphics {
+ static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
+ 	const uint64_t records = descriptor.NumRecords();
 diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
-index ee8bad43..96599195 100644
+index f028115b..364a7012 100644
 --- a/src/graphics/host_gpu/renderer/renderDraw.cpp
 +++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
-@@ -350,13 +350,13 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
+@@ -63,6 +63,8 @@
+ 
+ namespace Libs::Graphics {
+ 
++thread_local XprCapture::State XprCapture::g_state;
++
+ extern "C" {
+ // 0: a draw run reads no buffer range that any image overlaps; 1: sampled
+ // images whose contents still come from the CPU may overlap its read ranges.
+@@ -380,10 +382,10 @@ static void SetGraphicsDynamicParamsImpl(const Buffer& buffer, vk::CommandBuffer
+ 	if (color_count > 0 && colors[0].image_id) {
+ 		framebuffer_extent = colors[0].Extent();
+ 	} else if (depth.image_id) {
+-		framebuffer_extent = {depth.desc.info.extent.width, depth.desc.info.extent.height};
++		framebuffer_extent = vk::Extent2D{depth.desc.info.extent.width, depth.desc.info.extent.height};
+ 	} else {
+ 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
+-		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
++		framebuffer_extent = vk::Extent2D{limits.maxFramebufferWidth, limits.maxFramebufferHeight};
+ 	}
+ 
+ 	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
+@@ -410,13 +412,13 @@ static void SetGraphicsDynamicParamsImpl(const Buffer& buffer, vk::CommandBuffer
  		const auto final_scissor =
  		    calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent, i);
  		auto& scissor  = scissors[i];
@@ -371,25 +429,43 @@ index ee8bad43..96599195 100644
 +			scissor.extent = vk::Extent2D{0, 0};
  		}
  	}
- 	dynamic_state.SetViewports(std::span {viewports}.first(viewport_count));
+ 	vk_buffer.setViewportWithCount(viewport_count, viewports.data(), dispatch);
+@@ -591,7 +593,7 @@ static DynamicState Capture(const CommandBuffer& buffer, const ShaderVertexInput
+     state.color_count = color_count;
+     for (uint32_t i = 0; i < color_count; ++i)
+         state.colors[i] = {colors[i].Extent(), colors[i].target_slot, bool(colors[i].image_id)};
+-    state.depth.desc.info.extent = {depth.desc.info.extent.width, depth.desc.info.extent.height};
++    state.depth.desc.info.extent = vk::Extent2D{depth.desc.info.extent.width, depth.desc.info.extent.height};
+     state.depth.desc.view_info.format = depth.desc.view_info.format;
+     state.depth.stencil_dynamic_front = depth.stencil_dynamic_front;
+     state.depth.stencil_dynamic_back = depth.stencil_dynamic_back;
+@@ -1622,7 +1624,7 @@ bool BuildDrawIndexRun(std::span<const DrawIndexArgs> draws, DrawIndexRun& run)
+ 	DrawIndexRun next;
+ 	for (size_t i = 0; i < draws.size(); ++i) {
+ 		const auto& item = draws[i];
+-		next.commands[i] = {
++		next.commands[i] = vk::DrawIndexedIndirectCommand{
+ 		    item.index_count, item.instance_count,
+ 		    static_cast<uint32_t>((reinterpret_cast<uint64_t>(item.index_addr) - begin) /
+ 		                          element_size),
 diff --git a/src/graphics/presentation/videoOut.cpp b/src/graphics/presentation/videoOut.cpp
-index f93caa31..6e23d7fc 100644
+index 9a80cfe2..ffa1e5ce 100644
 --- a/src/graphics/presentation/videoOut.cpp
 +++ b/src/graphics/presentation/videoOut.cpp
-@@ -568,7 +568,7 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
+@@ -611,7 +611,7 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
  	info.pixel_format    = pixel_format.format;
  	info.guest_format    = pixel_format.guest_format;
  	info.type            = Graphics::Prospero::ImageType::kColor2D;
 -	info.extent          = {attribute.width, attribute.height, 1};
 +	info.extent          = vk::Extent3D{attribute.width, attribute.height, 1};
  	info.resources       = {1, 1};
+ 	info.pitch           = pitch;
  	info.bytes_per_block = pixel_format.bytes_per_element;
- 	info.samples         = 1;
 diff --git a/src/graphics/presentation/window/swapchain.cpp b/src/graphics/presentation/window/swapchain.cpp
-index 853bd8db..2e03216d 100644
+index 29920edd..640ca159 100644
 --- a/src/graphics/presentation/window/swapchain.cpp
 +++ b/src/graphics/presentation/window/swapchain.cpp
-@@ -182,7 +182,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent,
+@@ -209,7 +209,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent,
  	vk::ImageCreateInfo create {};
  	create.sType         = vk::StructureType::eImageCreateInfo;
  	create.imageType     = vk::ImageType::e2D;
@@ -398,7 +474,7 @@ index 853bd8db..2e03216d 100644
  	create.mipLevels     = 1;
  	create.arrayLayers   = 1;
  	create.format        = format;
-@@ -242,7 +242,7 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
+@@ -268,7 +268,7 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
  	vk::ImageCopy copy {};
  	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, source.backing.layers};
  	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, image.layers};
@@ -407,16 +483,7 @@ index 853bd8db..2e03216d 100644
  	                       std::min(source.backing.extent.height, image.extent.height), 1};
  	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
  	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
-@@ -406,7 +406,7 @@ void Swapchain::Create() {
- 	// during creation, the next presentation will detect the newer size.
- 	{
- 		Common::LockGuard lock(m_window.mutex);
--		m_window_extent = {graphics.screen_width, graphics.screen_height};
-+		m_window_extent = vk::Extent2D{graphics.screen_width, graphics.screen_height};
- 	}
- 	EXIT_IF(m_window_extent.width == 0);
- 	EXIT_IF(m_window_extent.height == 0);
-@@ -491,7 +491,7 @@ void Swapchain::Create() {
+@@ -569,7 +569,7 @@ void Swapchain::Create() {
  		view.image                           = m_images[i];
  		view.viewType                        = vk::ImageViewType::e2D;
  		view.format                          = m_format;
@@ -425,14 +492,116 @@ index 853bd8db..2e03216d 100644
  		view.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
  		view.subresourceRange.baseArrayLayer = 0;
  		view.subresourceRange.baseMipLevel   = 0;
-@@ -567,8 +567,8 @@ void Swapchain::Destroy() {
+@@ -640,7 +640,7 @@ void Swapchain::Destroy() {
  
- 	m_handle        = nullptr;
- 	m_format        = vk::Format::eUndefined;
--	m_extent        = {};
--	m_window_extent = {};
-+	m_extent        = vk::Extent2D{};
-+	m_window_extent = vk::Extent2D{};
- 	m_image_index   = static_cast<uint32_t>(-1);
- 	m_frame_index   = 0;
+ 	m_handle      = nullptr;
+ 	m_format      = vk::Format::eUndefined;
+-	m_extent      = {};
++	m_extent      = vk::Extent2D{};
+ 	m_image_index = static_cast<uint32_t>(-1);
+ 	m_frame_index = 0;
  	m_images.clear();
+diff --git a/src/graphics/presentation/window/vulkanWindow.cpp b/src/graphics/presentation/window/vulkanWindow.cpp
+index 5acc65a5..84da2a55 100644
+--- a/src/graphics/presentation/window/vulkanWindow.cpp
++++ b/src/graphics/presentation/window/vulkanWindow.cpp
+@@ -60,6 +60,8 @@
+ #define KYTY_ENABLE_DEBUG_PRINTF
+ #define KYTY_DBG_INPUT
+ 
++extern "C" const char* KytyHostSwitch(const char* name);
++
+ namespace Libs::Graphics {
+ 
+ struct VulkanExtensions {
+@@ -611,7 +613,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
+ 		}
+ 	}
+ #endif
+-	if (const char* readback = std::getenv("KYTY_READBACK_QUEUE");
++	if (const char* readback = KytyHostSwitch("KYTY_READBACK_QUEUE");
+ 	    readback != nullptr && readback[0] != '\0' && std::strcmp(readback, "0") != 0) {
+ 		uint32_t family_count = 0;
+ 		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+diff --git a/src/local/frame-capture.h b/src/local/frame-capture.h
+index 49d38abd..c2929985 100644
+--- a/src/local/frame-capture.h
++++ b/src/local/frame-capture.h
+@@ -80,7 +80,7 @@ inline std::mutex        g_mutex;        // guards g_dir (live thread -> Kyty.Gp
+ inline std::string       g_dir;
+ inline FILE*             g_file  = nullptr; // Kyty.Gpu only from here on
+ inline uint32_t          g_frame = 0, g_seq = 0;
+-inline thread_local Call g_call;
++extern thread_local Call g_call;
+ 
+ [[nodiscard]] inline bool Active() { return g_active.load(std::memory_order_relaxed); }
+ 
+diff --git a/src/local/frame-gen.cpp b/src/local/frame-gen.cpp
+index 6546eed3..da6962e4 100644
+--- a/src/local/frame-gen.cpp
++++ b/src/local/frame-gen.cpp
+@@ -788,7 +788,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
+ 	if (inputs.motion_attachment) {
+ 		ZeroStaticRect(vk_command, inputs.motion, inputs.motion_view);
+ 	}
+-	inputs.render_extent = {motion.backing.extent.width, motion.backing.extent.height};
++	inputs.render_extent = vk::Extent2D{motion.backing.extent.width, motion.backing.extent.height};
+ 	inputs.camera        = camera;
+ 	inputs.guest_frame   = g_guest_frame;
+ 	inputs.valid         = true;
+diff --git a/src/local/native-xpr.inc b/src/local/native-xpr.inc
+index 776e47ec..c7fa4cb1 100644
+--- a/src/local/native-xpr.inc
++++ b/src/local/native-xpr.inc
+@@ -1084,7 +1084,7 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
+ 						const auto aligned    = offset - offset % alignment;
+ 						const auto adjustment = offset - aligned;
+ 						if (adjustment < 256) {
+-							prepared->buffers[i] = {resolved->Handle(), aligned, source.size + adjustment};
++							prepared->buffers[i] = vk::DescriptorBufferInfo{resolved->Handle(), aligned, source.size + adjustment};
+ 							auto& word = prepared->shader_data[program.bindings.memory_offset_dword + i / 4u];
+ 							const auto shift = (i % 4u) * 8u;
+ 							word = (word & ~(0xffu << shift)) | (static_cast<uint32_t>(adjustment) << shift);
+diff --git a/src/local/performance-switches.h b/src/local/performance-switches.h
+index 4011649f..e54a2581 100644
+--- a/src/local/performance-switches.h
++++ b/src/local/performance-switches.h
+@@ -15,6 +15,7 @@
+ #include <string>
+ 
+ extern "C" {
++const char* KytyHostSwitch(const char* name);
+ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
+ extern volatile std::atomic_uint32_t kyty_local_image_pool_mode;
+ extern volatile std::atomic_uint32_t kyty_local_backing_read_mode;
+@@ -111,7 +112,7 @@ inline void InitializePerformanceSwitches() {
+ 	};
+ 	std::string enabled;
+ 	for (const auto& setting: switches) {
+-		const auto* text = std::getenv(setting.environment);
++		const auto* text = KytyHostSwitch(setting.environment);
+ 		if (text == nullptr) {
+ 			continue;
+ 		}
+@@ -130,7 +131,7 @@ inline void InitializePerformanceSwitches() {
+ 	// KYTY_RENDER_CPUS (e.g. "1,2,3,6,7"): the CPUs this thread may run on; other threads are
+ 	// not kept off them. On Windows the P-cores without CPU 0 (which takes most interrupts)
+ 	// measured best; a dedicated core made the whole process slower there.
+-	if (const char* cpus = std::getenv("KYTY_RENDER_CPUS"); cpus != nullptr && *cpus != '\0') {
++	if (const char* cpus = KytyHostSwitch("KYTY_RENDER_CPUS"); cpus != nullptr && *cpus != '\0') {
+ 		LocalPlatform::PinThreadToCpuList(cpus);
+ 		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CPUS=" + cpus;
+ 	}
+diff --git a/src/local/xpr-capture.h b/src/local/xpr-capture.h
+index 10b75b9d..be321eba 100644
+--- a/src/local/xpr-capture.h
++++ b/src/local/xpr-capture.h
+@@ -113,7 +113,7 @@ struct State {
+ 	uint32_t                                   written = 0;
+ 	std::unique_ptr<PendingDraw>               pending; // completed in ExecutePreparedDraw
+ };
+-inline thread_local State g_state;
++extern thread_local State g_state;
+ 
+ // Called once by the GPU thread before it consumes commands.
+ inline void Initialize() {

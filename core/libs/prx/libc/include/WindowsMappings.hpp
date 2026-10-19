@@ -733,6 +733,16 @@ public:
         return result;
     }
 
+    bool UniqueBacking(std::uintptr_t address, std::size_t bytes) {
+        MemoryLockProbe::Lock lock(mutex, "unique-backing", bytes);
+        if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
+        const auto end = address + bytes;
+        for (auto view = views.lower_bound(address & ~(pageBytes - 1)); view != views.end() && view->first < end; ++view) {
+            if (view->second.page->aliases.size() > 1) return false;
+        }
+        return true;
+    }
+
     void UnmapAlias(void* alias) {
         if (alias == nullptr) return;
         {

@@ -41,6 +41,7 @@ struct KytyGpuHostTable {
     void (*titleId)(char* value, std::size_t size);
     void* (*mapAlias)(std::uintptr_t address, std::size_t bytes);
     void (*unmapAlias)(void* alias);
+    bool (*uniqueBacking)(std::uintptr_t address, std::size_t bytes);
 };
 
 struct KytyGpuShader {
