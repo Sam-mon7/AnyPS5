@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -1626,5 +1627,103 @@ void RunVramLazyTests(const AgcDriver::Graphics::Context& device, AgcDriver::Gra
         Require(!LazyMirrorFillCovers(context, address, page) && VramLazyCounters().mirrorFills == 0, "disabled lazy writes offered a mirror fill");
         Require(VramLazyCounters().protectedAtRecord == initial.protectedAtRecord && VramLazyCounters().downloadedPages == initial.downloadedPages, "disabled lazy writes changed page ownership");
     }
+#endif
+}
+
+void RunLazyStorageWriteBackTests(const AgcDriver::Graphics::Context& device, AgcDriver::Graphics::Recorder& recorder) {
+#ifndef _WIN32
+    throw std::runtime_error("lazy storage write-back fixture requires Windows guest page protection");
+#else
+    using namespace AgcDriver::Graphics;
+    constexpr std::size_t block = 65536;
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+    constexpr std::size_t bytes = surfaceBytes + block;
+    auto context = device;
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    auto* raw = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    auto* alias = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    Require(raw != nullptr && alias != nullptr && section != nullptr, "cannot create the lazy storage write-back fixture");
+    GuestArena::GuestArenaMap_nid_postfix(raw, bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(alias, bytes, section, 0, PAGE_READWRITE);
+    std::memset(raw, 0x55, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(raw);
+    GuestAllocations::Mutation().Add(raw, bytes, true, true, true);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        std::uint8_t* raw;
+        std::uint8_t* alias;
+        HANDLE section;
+        ~Release() {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            ClearCachedTextures(context.device);
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            GuestAllocations::Mutation().Remove(raw);
+            for (auto* mapping : {raw, alias}) {
+                GuestArena::GuestArenaReset_nid_postfix(mapping, bytes);
+                GuestArena::GuestArenaRelease_nid_postfix(mapping, bytes);
+            }
+            CloseHandle(section);
+        }
+    } release{context, recorder, raw, alias, section};
+    {
+        GuestBufferMemory seed(context);
+        seed.SetAddressWrites(false);
+        seed.AcquireRegistered();
+        seed.Upload(true);
+        seed.WriteBack();
+    }
+    if (!MirrorSourceCovers(context, address, surfaceBytes)) {
+        std::cout << "no device-local mirror over the surface: lazy storage write-back not tested\n";
+        return;
+    }
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == surfaceBytes, "the lazy write-back surface has an unexpected size");
+    {
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearColorValue value{{1.0f, 0.0f, 0.0f, 1.0f}};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        image->MarkDirty();
+        const auto before = VramLazyCounters();
+        Require(StorageTexture::FlushPending(address, surfaceBytes, nullptr, "lazy storage write-back test"), "the pending storage image was not flushed");
+        const auto flushed = VramLazyCounters();
+        recorder.Sync();
+        if (StorageTexture::LazyMirrorWriteBack()) {
+            Require(flushed.downloadedPages == before.downloadedPages, "the GPU write-back into the lazy mirror downloaded pages");
+            Require(flushed.pendingPages > before.pendingPages, "the GPU write-back left no GPU-owned pages for the CPU to fault in");
+        } else {
+            Require(flushed.pendingPages <= before.pendingPages, "the CPU write-back left GPU-owned pages");
+        }
+        const auto* texels = static_cast<volatile const std::uint8_t*>(alias);
+        for (std::size_t i = 0; i < surfaceBytes; ++i) {
+            const std::uint8_t expected = i % 4 == 0 || i % 4 == 3 ? 255 : 0;
+            Require(texels[i] == expected, "guest memory does not hold the flushed storage image results");
+        }
+    }
+    recorder.Sync();
+    std::cout << "lazy storage write-back " << (StorageTexture::LazyMirrorWriteBack() ? "on the GPU" : "on the CPU") << " passed\n";
 #endif
 }

@@ -26,6 +26,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <vector>
 #include <atomic>
@@ -311,6 +312,8 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
     reason.second += bytes;
     reportStorageTraffic(traffic);
 }
+
+std::atomic<std::uint64_t> lazyMirrorWriteBacks{0};
 
 void countStorageWriteBack(std::uint64_t bytes, bool direct) {
     if (!LookupOutcomes::Profiled()) return;
@@ -2172,6 +2175,14 @@ bool StorageTexture::Refresh() {
         uploadedKeys = keys;
     }
     return false;
+}
+
+bool StorageTexture::LazyMirrorWriteBack() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_LAZY_STORAGE_WRITEBACK");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
@@ -4806,6 +4817,87 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         emptyWriteBacks.fetch_add(1, std::memory_order_relaxed);
         forgetStored();
         settle(true);
+        return;
+    }
+    if (auto* lazyRecorder = Recorder::Active(); LazyMirrorWriteBack() && VramLazyWrites() && lazyRecorder != nullptr && !Recorder::InCompletion() && !unsavedOutsideWatch &&
+        MirrorSourceCovers(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+        const auto span = static_cast<std::size_t>(lastStored - firstStored);
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddWritable(firstStored, span);
+        memory->Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = memory->Descriptor(firstStored, span, adjustment);
+        const auto targetOffset = view.offset + adjustment;
+        auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto tiledScratch = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::uint64_t storedBytes = 0;
+        for (const auto& [from, to] : keep) storedBytes += to - from;
+        detiler.BeginBatch();
+        lazyRecorder->FlushKeyStoresOverlapping(firstStored, span);
+        lazyRecorder->FlushStoresOverlapping(firstStored, span);
+        memory->BeginGpuWrites(*lazyRecorder);
+        const auto commands = lazyRecorder->Commands();
+        const auto timing = lazyRecorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
+        lazyRecorder->Keep(linear, linear->Size());
+        lazyRecorder->Keep(tiledScratch, tiledScratch->Size());
+        if (auto self = weak_from_this().lock()) lazyRecorder->Keep(std::move(self));
+        Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, 5);
+        const auto* storedLayers = trackedLayers == arrayLayers && trackedLayers > 1 ? &layers : nullptr;
+        VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toSource.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toSource.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSource.image = image;
+        toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+        std::vector<VkBufferCopy> seeds;
+        for (const auto& [from, to] : keep) seeds.push_back({targetOffset + (from - firstStored), from - descriptor.baseAddress, to - from});
+        CopyBuffers(context, commands, view.buffer, tiledScratch->Handle(), static_cast<std::uint32_t>(seeds.size()), seeds.data());
+        const auto regions = CopyRegions(storedLayers);
+        CopyImageToBuffer(context, commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        const VkMemoryBarrier scratchReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
+        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &scratchReady, 1, &linearRead, 0, nullptr);
+        for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+            if (storedLayers != nullptr && !(*storedLayers)[layer]) continue;
+            for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                const auto& mip = mips[level];
+                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiledScratch->Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
+            }
+        }
+        const auto scratchDone = WholeBufferBarrier(tiledScratch->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &scratchDone, 0, nullptr);
+        std::vector<VkBufferCopy> stores;
+        for (const auto& [from, to] : keep) stores.push_back({from - descriptor.baseAddress, targetOffset + (from - firstStored), to - from});
+        CopyBuffers(context, commands, tiledScratch->Handle(), view.buffer, static_cast<std::uint32_t>(stores.size()), stores.data());
+        VkImageMemoryBarrier backToGeneral = toSource;
+        backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        backToGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        backToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT};
+        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
+        lazyRecorder->EndGpuTiming(timing, storedBytes);
+        lazyRecorder->MarkShaderReadsCovered();
+        memory->RecordCopyBacks(*lazyRecorder);
+        memory->NotePendingWrites(*lazyRecorder);
+        lazyRecorder->Keep(memory);
+        lazyRecorder->OnComplete([memory] { memory->WriteBack(); });
+        memory->ReadyForSubmit(*lazyRecorder);
+        lazyMirrorWriteBacks.fetch_add(1, std::memory_order_relaxed);
+        countStorageWriteBack(storedBytes, true);
+        if (profile) Profile().storageGpu += timer.lap();
+        forgetStored();
+        traceKeyStore("lazy mirror write-back", descriptor, guestBytes);
+        if (!IsDccClear(filledKeys) && uploadedKeys != DccKeys::Uncompressed) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
+        uploadedKeys = DccKeys::Uncompressed;
+        for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
+        settle(true);
+        ++Profile().storageDirectWriteBacks;
         return;
     }
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
