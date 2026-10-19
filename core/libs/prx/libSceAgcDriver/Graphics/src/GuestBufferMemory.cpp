@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ResourcePhase.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/KytyBufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -3810,6 +3811,7 @@ std::shared_ptr<const GuestAllocations::Range> LeaseRegisteredRange(std::uint64_
 bool HeapMirrorExportInProgress() { return exportingHeapMirrors; }
 
 void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force) {
+    KytyBufferCache::Flush(address, bytes);
     if (BufferCache::WritesEnabled() && GuestMemory::CurrentReadSite() != GuestMemory::ReadSite::BufferUpload) BufferCache::Flush(address, bytes);
     ResourcePhase phase("mirror-writeback");
     if (VramLazyWrites() && bytes != 0) {
@@ -4025,6 +4027,7 @@ void ClearImageMirrors(VkDevice device) {
 
 void ClearHostImports(VkDevice device) {
     BufferCache::Clear(device);
+    KytyBufferCache::Clear(device);
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     state.parked.erase(device);
@@ -4964,6 +4967,11 @@ DispatchHeapRefreshStats DispatchHeapRefreshCounters() {
 }
 
 void GuestBufferMemory::AcquireRegistered() {
+    if (KytyBufferCache::Enabled()) {
+        Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
+        kytySpace = true;
+        return;
+    }
     const WholeHeapRefresh wholeHeaps;
     std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
     if (VramWritable() || VramDeviceLocalMirrors()) gpu.lock();
@@ -5372,6 +5380,10 @@ bool GuestBufferMemory::bindSparseMirror(Region& region, const GuestAllocations:
 }
 
 void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bool atomic, bool swept) {
+    if (KytyBufferCache::Enabled() && bytes != 0) {
+        kytyRanges.emplace_back(address, address + bytes, true);
+        return;
+    }
     addDescriptorRegion(address, bytes, atomic, swept);
     writes.emplace_back(address, address + bytes);
 }
@@ -5380,6 +5392,10 @@ void GuestBufferMemory::AddReadable(std::uint64_t address, std::size_t bytes) {
     // Not in `writes`: no reference copy (copyRegion), no write-back, no pending-write note, no
     // direct-write mark, and UploadPrepare copies it without the device lock. A written descriptor
     // overlapping the range still covers it through its own Writes() entry.
+    if (KytyBufferCache::Enabled() && bytes != 0) {
+        kytyRanges.emplace_back(address, address + bytes, false);
+        return;
+    }
     addDescriptorRegion(address, bytes, false, false);
 }
 
@@ -6614,6 +6630,18 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
 VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {
     Require(uploaded && !committed, "guest GPU memory is not available");
     Require(bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest buffer view");
+    if (!kytyRanges.empty()) {
+        bool covered = false, written = false;
+        for (const auto& [begin, end, writable] : kytyRanges) {
+            if (address < end && begin < address + bytes) {
+                covered = covered || (begin <= address && address + bytes <= end);
+                written = written || writable;
+            }
+        }
+        if (covered) {
+            if (auto served = KytyBufferCache::Descriptor(context, address, bytes, written, adjustment)) return *served;
+        }
+    }
     if (auto cached = BufferCache::Descriptor(this, address, bytes, adjustment)) return *cached;
     const auto* found = owner(address);
     Require(found != nullptr, "guest buffer has no GPU owner");
@@ -6677,6 +6705,13 @@ void GuestBufferMemory::AddressRanges(std::vector<ShaderRecompiler::BdaAbi::Rang
     own.clear();
     for (const auto& region : regions) own.push_back(addressRange(region));
     BufferCache::AddressRanges(this, own);
+    if (kytySpace) {
+        std::vector<ShaderRecompiler::BdaAbi::Range> served;
+        KytyBufferCache::AddressRanges(context, served);
+        std::erase_if(served, [&](const auto& range) { return std::any_of(own.begin(), own.end(), [&](const auto& mine) { return range.begin < mine.end && mine.begin < range.end; }); });
+        own.insert(own.end(), served.begin(), served.end());
+        std::sort(own.begin(), own.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+    }
     if (BufferCache::WritesEnabled()) std::sort(own.begin(), own.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
     result.clear();
     if (space != nullptr) {

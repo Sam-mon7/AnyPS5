@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/KytyBufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -487,6 +488,7 @@ bool Contains(const void* owner, std::uint64_t address, std::size_t bytes) {
 }
 
 bool Reusable(const void* owner) {
+    if (KytyBufferCache::Enabled()) return false;
     if (!WritesEnabled()) return !HasBindings(owner);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     const auto found = Sessions().find(owner);

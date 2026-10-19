@@ -1,0 +1,10 @@
+#ifndef ANYPS5_KYTY_ADAPTERS_GRAPHICS_GUEST_GPU_GRAPHICSRUN_H
+#define ANYPS5_KYTY_ADAPTERS_GRAPHICS_GUEST_GPU_GRAPHICSRUN_H
+
+namespace Libs::Graphics::GuestGpu {
+
+bool IsGpuThread();
+
+}
+
+#endif

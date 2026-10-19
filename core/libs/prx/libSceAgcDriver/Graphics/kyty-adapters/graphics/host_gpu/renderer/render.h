@@ -1,0 +1,6 @@
+#ifndef ANYPS5_KYTY_ADAPTERS_GRAPHICS_HOST_GPU_RENDERER_RENDER_H
+#define ANYPS5_KYTY_ADAPTERS_GRAPHICS_HOST_GPU_RENDERER_RENDER_H
+
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+
+#endif

@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <tuple>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -591,6 +592,8 @@ private:
     bool adjustedRegions = false;
     bool addressWrites = true;
     bool addressableUpload = false;
+    std::vector<std::tuple<std::uint64_t, std::uint64_t, bool>> kytyRanges;
+    bool kytySpace = false;
     std::uint64_t pageTicket = ~std::uint64_t{0};
     bool synchronousWrites = false;
     std::uint64_t fallbackCopyBytes = 0;

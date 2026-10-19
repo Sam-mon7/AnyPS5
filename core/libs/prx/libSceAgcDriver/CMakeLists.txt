@@ -220,6 +220,10 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferCache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/KytyBufferCache.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/kyty/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/kyty/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/kyty/src/graphics/host_gpu/memoryTracker.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderValidation.cpp
@@ -258,6 +262,16 @@ add_custom_target(agc_trace_revision
         COMMAND ${CMAKE_COMMAND} -DGIT=${GIT_EXECUTABLE} -DSOURCE=${CMAKE_SOURCE_DIR} -DOUTPUT=${agcTraceRevisionHeader} -P ${CMAKE_CURRENT_SOURCE_DIR}/trace_revision.cmake
         BYPRODUCTS ${agcTraceRevisionHeader}
         VERBATIM
+)
+set(agcKytySources
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/KytyBufferCache.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/kyty/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/kyty/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/kyty/src/graphics/host_gpu/memoryTracker.cpp
+)
+set_source_files_properties(${agcKytySources} PROPERTIES
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/Graphics/kyty-adapters;${CMAKE_SOURCE_DIR}/3rdparty/kyty/src;${CMAKE_SOURCE_DIR}/3rdparty/VulkanMemoryAllocator/include"
+        COMPILE_DEFINITIONS "VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1;VK_NO_PROTOTYPES;NOMINMAX;WIN32_LEAN_AND_MEAN;VMA_STATIC_VULKAN_FUNCTIONS=0;VMA_DYNAMIC_VULKAN_FUNCTIONS=1"
 )
 set(agcZlibIncludeDir ${CMAKE_SOURCE_DIR}/3rdparty/libjpeg-turbo/src/spng/zlib)
 set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp PROPERTIES
