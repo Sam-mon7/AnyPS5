@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -169,6 +170,15 @@ LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
     if (resources != nullptr && resources->HandleFault(access, address)) return EXCEPTION_CONTINUE_EXECUTION;
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+struct TerminateOnFatal {
+    static constexpr const char* name = "AnyPS5 fatal exit";
+    static void initialize() {}
+    static void emergency_shutdown() {
+        std::fflush(nullptr);
+        TerminateProcess(GetCurrentProcess(), 1);
+    }
+};
 
 struct Cookie {
     EventQueue::KernelFilter filter;
@@ -598,6 +608,7 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
     host = table;
     static_cast<void>(startTime());
     Common::InitializeThreads();
+    (new Common::Subsystems())->Initialize<TerminateOnFatal>();
     configure(width, height);
     faultHandler = AddVectoredExceptionHandler(1, &handleFault);
     hostWindow = SDL_Window{hwnd, static_cast<int>(width), static_cast<int>(height)};
