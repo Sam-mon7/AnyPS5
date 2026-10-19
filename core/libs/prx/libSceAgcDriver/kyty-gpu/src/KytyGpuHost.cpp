@@ -70,6 +70,18 @@ std::once_flag configured;
 std::once_flag shaders;
 void* faultHandler = nullptr;
 
+struct Counts {
+    std::atomic<std::uint64_t> dcbs{0};
+    std::atomic<std::uint64_t> acbs{0};
+    std::atomic<std::uint64_t> adds{0};
+    std::atomic<std::uint64_t> graphicsTriggers{0};
+    std::atomic<std::uint64_t> videoTriggers{0};
+    std::atomic<std::uint64_t> failedTriggers{0};
+    std::atomic<std::uint64_t> faults{0};
+};
+
+Counts counts;
+
 struct Protection {
     DWORD original;
     Mode mode;
@@ -166,6 +178,7 @@ LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
         std::lock_guard lock(protectionMutex);
         if (!protections.contains(address & ~(PageBytes - 1))) return EXCEPTION_CONTINUE_SEARCH;
     }
+    counts.faults.fetch_add(1, std::memory_order_relaxed);
     const auto access = record->ExceptionInformation[0] == 1 ? PageFaultAccess::Write : PageFaultAccess::Read;
     if (resources != nullptr && resources->HandleFault(access, address)) return EXCEPTION_CONTINUE_EXECUTION;
     return EXCEPTION_CONTINUE_SEARCH;
@@ -458,11 +471,19 @@ KernelEqueueRef KernelPinEqueue(KernelEqueue eq) {
 int KYTY_SYSV_ABI KernelAddEvent(KernelEqueue eq, const KernelEqueueEvent& event) {
     auto* cookie = new Cookie{event.filter};
     const auto current = toHost(event.event);
+    if (counts.adds.fetch_add(1, std::memory_order_relaxed) < 16) {
+        std::fprintf(stderr, "[kyty-gpu] add event eq=%lld ident=%llu filter=%d\n", static_cast<long long>(eq), static_cast<unsigned long long>(event.event.ident), event.event.filter);
+    }
     return host->addEvent(eq, &current, event.triggered, cookie, &eventHooks, event.filter.trigger_func != nullptr, event.filter.reset_func != nullptr, event.filter.delete_event_func != nullptr);
 }
 
 int KYTY_SYSV_ABI KernelTriggerEvent(KernelEqueue eq, uintptr_t ident, int16_t filter, void* trigger_data) {
-    return host->triggerEvent(eq, ident, filter, trigger_data);
+    const int result = host->triggerEvent(eq, ident, filter, trigger_data);
+    (filter == KERNEL_EVFILT_GRAPHICS ? counts.graphicsTriggers : counts.videoTriggers).fetch_add(1, std::memory_order_relaxed);
+    if (result != 0 && counts.failedTriggers.fetch_add(1, std::memory_order_relaxed) < 8) {
+        std::fprintf(stderr, "[kyty-gpu] trigger eq=%lld ident=%llu filter=%d failed: 0x%08x\n", static_cast<long long>(eq), static_cast<unsigned long long>(ident), filter, static_cast<unsigned>(result));
+    }
+    return result;
 }
 
 int KYTY_SYSV_ABI KernelDeleteEvent(KernelEqueue eq, uintptr_t ident, int16_t filter) {
@@ -636,7 +657,9 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             const auto now = window->loop.presented_frames.load(std::memory_order_relaxed);
-            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps)\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0);
+            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
+                         static_cast<unsigned long long>(counts.dcbs.load()), static_cast<unsigned long long>(counts.acbs.load()), static_cast<unsigned long long>(counts.adds.load()), static_cast<unsigned long long>(counts.graphicsTriggers.load()),
+                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()));
             previous = now;
         }
     }).detach();
@@ -644,10 +667,12 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
 }
 
 __declspec(dllexport) void KytyGpuSubmitDcb(const std::uint32_t* commands, std::uint32_t dwords) {
+    counts.dcbs.fetch_add(1, std::memory_order_relaxed);
     resources->GetGpu().Submit(std::span<const std::uint32_t>{commands, dwords}, {});
 }
 
 __declspec(dllexport) void KytyGpuSubmitAcb(std::uint32_t queue, const std::uint32_t* commands, std::uint32_t dwords) {
+    counts.acbs.fetch_add(1, std::memory_order_relaxed);
     resources->GetGpu().SubmitCompute(queue, std::span<const std::uint32_t>{commands, dwords});
 }
 
