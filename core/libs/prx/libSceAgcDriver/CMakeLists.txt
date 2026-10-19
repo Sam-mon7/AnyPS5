@@ -3001,6 +3001,18 @@ if(BUILD_TESTING AND WIN32)
             ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_DEVICE_LOCAL_MIRRORS=1;APS5_VRAM_LAZY_WRITES=1;APS5_VRAM_CLEANUP=1;APS5_VRAM_TEXTURES=1;APS5_RESIDENT_HEAP_MIRRORS=0;APS5_REBAR_MIB=0"
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_WRITABLE_STRICT=unset:;APS5_VRAM_DEFERRED=unset:;APS5_LAZY_MIRROR_LABELS=${lazyLabelValue}")
     endforeach()
+    foreach(lazyFixMode IN ITEMS off on nonexact)
+        add_test(NAME agc_lazy_fixes_${lazyFixMode} COMMAND agc_driver_recorder_tests --lazy-fixes-only)
+        set(lazyFixValue "unset:")
+        if(lazyFixMode STREQUAL "on")
+            set(lazyFixValue "set:1")
+        elseif(lazyFixMode STREQUAL "nonexact")
+            set(lazyFixValue "set:01")
+        endif()
+        set_tests_properties(agc_lazy_fixes_${lazyFixMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_DEVICE_LOCAL_MIRRORS=1;APS5_VRAM_LAZY_WRITES=1;APS5_RESIDENT_HEAP_MIRRORS=0;APS5_REBAR_MIB=0"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_WRITABLE_STRICT=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_LAZY_PAGE_BITS=${lazyFixValue};APS5_LAZY_DOWNLOAD_WINDOW=${lazyFixValue};APS5_LAZY_COMPLETION_REQUEUE=${lazyFixValue};APS5_MIRROR_PAGE_SHADOWS=${lazyFixValue}")
+    endforeach()
     foreach(keepOverlapMode IN ITEMS off on nonexact)
         add_test(NAME agc_keep_overlapping_results_${keepOverlapMode} COMMAND agc_driver_recorder_tests --lazy-storage-writeback-only)
         set(keepOverlapValue "unset:")

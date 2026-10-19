@@ -40,6 +40,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <set>
 #include <thread>
 #include <stop_token>
@@ -85,6 +86,8 @@ struct MirrorWriteInterval {
 // image range persists here. Read-only ranges are filled once: their pages change only through an
 // mprotect, which replaces the registered Range object, and a mirror whose Range is gone is rebuilt.
 // Writable ranges keep a shadow of the guest bytes and copy the 64 KiB blocks that differ on each use.
+inline std::atomic<std::uint64_t> shadowPagesHeld{0};
+
 struct ImageMirror {
     Context uploadContext;
     VkDevice device = VK_NULL_HANDLE;
@@ -110,6 +113,13 @@ struct ImageMirror {
     std::atomic<std::uint64_t> activeUsers{0};
     std::shared_ptr<MirrorWriteInterval> writer;
     std::map<std::uint64_t, std::shared_ptr<MirrorWriteInterval>> lazyPages;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> lazyBits;
+    std::size_t lazyWords = 0;
+    std::mutex shadowMutex;
+    std::unordered_map<std::uint64_t, std::unique_ptr<std::array<std::byte, 4096>>> pageShadows;
+    ~ImageMirror() {
+        if (!pageShadows.empty()) shadowPagesHeld.fetch_sub(pageShadows.size(), std::memory_order_relaxed);
+    }
     std::shared_ptr<MirrorWriteInterval> lazyAddressWriter;
     std::atomic<bool> lazyAny{false};
     std::uint64_t gpuRevision = 0;
@@ -1533,6 +1543,124 @@ LazyMirrors& LazyState() {
     return state;
 }
 
+std::atomic<std::uint64_t> lazyBitSkips{0};
+
+bool LazyPageBits() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_LAZY_PAGE_BITS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+void ensureLazyBits(ImageMirror& mirror) {
+    if (!LazyPageBits() || mirror.lazyBits != nullptr) return;
+    const auto words = static_cast<std::size_t>((mirror.bytes / 4096 + 63) / 64);
+    auto bits = std::make_unique<std::atomic<std::uint64_t>[]>(words);
+    for (std::size_t word = 0; word < words; ++word) bits[word].store(0, std::memory_order_relaxed);
+    mirror.lazyBits = std::move(bits);
+    mirror.lazyWords = words;
+}
+
+void setLazyBit(ImageMirror& mirror, std::uint64_t page, bool value) {
+    if (mirror.lazyBits == nullptr || page < mirror.base) return;
+    const auto index = (page - mirror.base) / 4096;
+    const auto word = static_cast<std::size_t>(index / 64);
+    if (word >= mirror.lazyWords) return;
+    const auto mask = std::uint64_t{1} << (index % 64);
+    if (value) mirror.lazyBits[word].fetch_or(mask, std::memory_order_release);
+    else mirror.lazyBits[word].fetch_and(~mask, std::memory_order_release);
+}
+
+bool lazyBitsOver(const ImageMirror& mirror, std::uint64_t begin, std::uint64_t end) {
+    if (mirror.lazyBits == nullptr) return false;
+    begin = std::max(begin, mirror.base);
+    end = std::min(end, mirror.base + mirror.bytes);
+    if (begin >= end) return false;
+    const auto first = (begin - mirror.base) / 4096;
+    const auto last = (end - 1 - mirror.base) / 4096;
+    for (auto word = static_cast<std::size_t>(first / 64); word <= static_cast<std::size_t>(last / 64) && word < mirror.lazyWords; ++word) {
+        auto mask = ~std::uint64_t{0};
+        if (word == first / 64) mask &= ~std::uint64_t{0} << (first % 64);
+        if (word == last / 64) mask &= ~std::uint64_t{0} >> (63 - last % 64);
+        if ((mirror.lazyBits[word].load(std::memory_order_acquire) & mask) != 0) return true;
+    }
+    return false;
+}
+
+bool LazyDownloadWindow() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_LAZY_DOWNLOAD_WINDOW");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::atomic<std::uint64_t> lazyRequeues{0};
+std::atomic<std::uint64_t> lazyRequeueDrops{0};
+
+bool MirrorPageShadows() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_MIRROR_PAGE_SHADOWS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t shadowPageLimit() {
+    static const std::uint64_t pages = [] {
+        const char* value = std::getenv("APS5_MIRROR_PAGE_SHADOW_MIB");
+        return ((value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull) << 20u) / 4096;
+    }();
+    return pages;
+}
+
+// The 4 KiB pages of [address, address + length) whose shadow differs from `bytes` or is missing, as
+// [begin, end) runs relative to `address`; empty when every page is shadowed and equal.
+std::vector<std::pair<std::size_t, std::size_t>> shadowDifferences(ImageMirror& mirror, std::uint64_t address, std::size_t length, const std::byte* bytes) {
+    std::vector<std::pair<std::size_t, std::size_t>> runs;
+    std::lock_guard lock(mirror.shadowMutex);
+    for (auto at = address; at < address + length;) {
+        const auto page = at & ~std::uint64_t{4095};
+        const auto stop = std::min<std::uint64_t>(address + length, page + 4096);
+        const auto found = mirror.pageShadows.find(page);
+        const bool equal = found != mirror.pageShadows.end() && std::memcmp(found->second->data() + (at - page), bytes + (at - address), static_cast<std::size_t>(stop - at)) == 0;
+        if (!equal) {
+            if (!runs.empty() && runs.back().second == at - address) runs.back().second = static_cast<std::size_t>(stop - address);
+            else runs.emplace_back(static_cast<std::size_t>(at - address), static_cast<std::size_t>(stop - address));
+        }
+        at = stop;
+    }
+    return runs;
+}
+
+// Records the bytes the mirror now holds over [address, address + bytes.size()). A page without a
+// shadow gets one only from a whole-page store, within the APS5_MIRROR_PAGE_SHADOW_MIB budget.
+void storeShadows(ImageMirror& mirror, std::uint64_t address, std::span<const std::byte> bytes) {
+    std::lock_guard lock(mirror.shadowMutex);
+    for (auto at = address; at < address + bytes.size();) {
+        const auto page = at & ~std::uint64_t{4095};
+        const auto stop = std::min<std::uint64_t>(address + bytes.size(), page + 4096);
+        auto found = mirror.pageShadows.find(page);
+        if (found == mirror.pageShadows.end()) {
+            if (at != page || stop != page + 4096 || shadowPagesHeld.load(std::memory_order_relaxed) >= shadowPageLimit()) { at = stop; continue; }
+            found = mirror.pageShadows.emplace(page, std::make_unique<std::array<std::byte, 4096>>()).first;
+            shadowPagesHeld.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::memcpy(found->second->data() + (at - page), bytes.data() + (at - address), static_cast<std::size_t>(stop - at));
+        at = stop;
+    }
+}
+
+void dropShadows(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end) {
+    if (!MirrorPageShadows()) return;
+    std::lock_guard lock(mirror.shadowMutex);
+    if (mirror.pageShadows.empty() || begin >= end) return;
+    for (auto page = begin & ~std::uint64_t{4095}; page < end; page += 4096) {
+        if (mirror.pageShadows.erase(page) != 0) shadowPagesHeld.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
 struct LazyImports {
     std::mutex mutex;
     std::map<std::uint64_t, std::uint64_t> unordered;
@@ -1599,6 +1727,8 @@ bool lazyAddressWritersOutstanding() {
     });
 }
 
+VramUploadStats& UploadCounts();
+
 void reportLazyWrites() {
     auto& state = LazyState();
     const auto now = std::chrono::steady_clock::now();
@@ -1641,12 +1771,19 @@ void reportLazyWrites() {
             static_cast<unsigned long long>(c.labelRefreshesSynced - state.reportedLabels.labelRefreshesSynced));
         state.reportedLabels = c;
     }
+    if (LazyPageBits() || LazyCompletionRequeue() || MirrorPageShadows()) {
+        AgcDriver::ProfilePrint_nid_no_patch("[vram-lazy] fixes cumulative: reads skipped by page bits %llu; completions requeued %llu, dropped %llu; shadow skips %llu, partial uploads %llu, shadow pages held %llu\n",
+            static_cast<unsigned long long>(lazyBitSkips.load(std::memory_order_relaxed)), static_cast<unsigned long long>(lazyRequeues.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(lazyRequeueDrops.load(std::memory_order_relaxed)), static_cast<unsigned long long>(UploadCounts().shadowSkips),
+            static_cast<unsigned long long>(UploadCounts().shadowPartials), static_cast<unsigned long long>(shadowPagesHeld.load(std::memory_order_relaxed)));
+    }
 }
 
 void stampGpuBlocks(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end) {
     constexpr std::uint64_t block = 65536;
     begin = std::max(begin, mirror.base);
     end = std::min(end, mirror.base + mirror.bytes);
+    if (begin < end) dropShadows(mirror, begin, end);
     if (mirror.gpuStamps.empty() || begin >= end) return;
     const auto stop = std::min<std::uint64_t>((end - 1) / block - mirror.base / block + 1, mirror.gpuStamps.size());
     for (auto index = begin / block - mirror.base / block; index < stop; ++index) mirror.gpuStamps[static_cast<std::size_t>(index)] = mirror.gpuRevision;
@@ -1666,6 +1803,7 @@ std::uint64_t gpuStampOver(const ImageMirror& mirror, std::uint64_t begin, std::
 void finishLazyAddressWriter(ImageMirror& mirror, bool fault = false) {
     const auto interval = mirror.lazyAddressWriter;
     if (interval == nullptr || interval->complete) return;
+    if (Recorder::InCompletion() && LazyCompletionRequeue() && interval->recorded && interval->ready && interval->recorder != nullptr) throw LazyWriterBusy("AGC graphics: a lazy BDA writer cannot be completed from this access");
     Require(interval->recorded && interval->ready && interval->recorder != nullptr && !Recorder::InCompletion(), "a lazy BDA writer cannot be completed from this access");
     const auto started = std::chrono::steady_clock::now();
     auto* recorder = interval->recorder;
@@ -1678,7 +1816,7 @@ void finishLazyAddressWriter(ImageMirror& mirror, bool fault = false) {
     if (fault) { ++LazyState().counts.faultBdaWaits; LazyState().counts.faultBdaWaitUs += elapsed; }
 }
 
-void publishLazyPages(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end, bool fault = false) {
+void publishLazyPages(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end, bool fault = false, std::uint64_t required = 0) {
     finishLazyAddressWriter(mirror, fault);
     auto next = mirror.lazyPages.lower_bound(begin & ~std::uint64_t{4095});
     if (next == mirror.lazyPages.end() || next->first >= end) return;
@@ -1700,7 +1838,12 @@ void publishLazyPages(ImageMirror& mirror, std::uint64_t begin, std::uint64_t en
             const auto page = next->first;
             const auto interval = next->second;
             if (!interval->complete) {
+                if (required != 0 && page != required) {
+                    ++next;
+                    continue;
+                }
                 Require(interval->recorded && interval->ready && interval->recorder != nullptr, "a lazy mirror CPU access has no submitted writer");
+                if (Recorder::InCompletion() && LazyCompletionRequeue()) throw LazyWriterBusy("AGC graphics: a lazy mirror CPU access cannot wait for another writer during completion");
                 Require(!Recorder::InCompletion(), "a lazy mirror CPU access cannot wait for another writer during completion");
                 const auto waited = std::chrono::steady_clock::now();
                 auto* recorder = interval->recorder;
@@ -1733,7 +1876,9 @@ void publishLazyPages(ImageMirror& mirror, std::uint64_t begin, std::uint64_t en
             PageTracker::Publish({page, 4096});
             GuestMemory::MarkWritten(page, 4096);
             Recorder::NoteWrittenBack(page, 4096);
+            if (MirrorPageShadows() && mirror.heap) storeShadows(mirror, page, std::span<const std::byte>(bytes).subspan(index * 4096, 4096));
             mirror.lazyPages.erase(page);
+            setLazyBit(mirror, page, false);
             --counts.pendingPages;
             ++counts.downloadedPages;
         }
@@ -1761,8 +1906,10 @@ std::vector<std::uint64_t> protectLazyRange(ImageMirror& mirror, const std::shar
         std::uint64_t calls = 0;
         const auto started = std::chrono::steady_clock::now();
         try {
+            ensureLazyBits(mirror);
             for (auto at = page; at < stop; at += 4096) {
                 mirror.lazyPages.emplace(at, interval);
+                setLazyBit(mirror, at, true);
                 added.push_back(at);
             }
             mirror.lazyAny.store(true, std::memory_order_release);
@@ -1771,6 +1918,7 @@ std::vector<std::uint64_t> protectLazyRange(ImageMirror& mirror, const std::shar
 #endif
         } catch (...) {
             mirror.lazyPages.erase(mirror.lazyPages.lower_bound(page), mirror.lazyPages.lower_bound(stop));
+            for (auto at = page; at < stop; at += 4096) setLazyBit(mirror, at, false);
             throw;
         }
         auto& counts = LazyState().counts;
@@ -1817,7 +1965,12 @@ bool writablePageFault(std::uintptr_t page, bool write) {
     if (VramLazyWrites()) {
         if (!mirror->lazyPages.contains(page)) return false;
         ++LazyState().counts.faults;
-        publishLazyPages(*mirror, page, page + 4096, true);
+        if (LazyDownloadWindow()) {
+            constexpr std::uint64_t window = 512 * 1024;
+            const auto begin = std::max(mirror->base, page & ~(window - 1));
+            const auto end = std::min(mirror->base + mirror->bytes, (page & ~(window - 1)) + window);
+            publishLazyPages(*mirror, begin, end, true, page);
+        } else publishLazyPages(*mirror, page, page + 4096, true);
         return true;
     }
     if (interval == nullptr || !interval->active || !intervalCovers(*interval, page)) return false;
@@ -2266,6 +2419,7 @@ void stageMirrorBlock(const RefreshBlock& block, std::vector<MirrorUpload>& uplo
     ++UploadCounts().blocks;
     if (mirror.heap && block.fill == 0) mirror.generations[static_cast<std::size_t>(block.address / 65536 - mirror.base / 65536)] = block.generation;
     if (!mirror.shadow.empty()) std::memcpy(mirror.shadow.data() + offset, target.data(), target.size());
+    if (mirror.heap && block.fill == 0 && MirrorPageShadows()) storeShadows(mirror, block.address, std::span<const std::byte>(target.data(), target.size()));
 }
 
 void initializeDeviceMirror(ImageMirror& mirror, std::span<const std::pair<std::uint64_t, std::uint64_t>> pieces) {
@@ -2302,6 +2456,27 @@ bool compareBlock(const RefreshBlock& block, std::vector<MirrorUpload>* uploads 
     if (!block.mirror->buffer->Mapped()) {
         if (block.fill == 0 && !block.mirror->heap && std::memcmp(block.mirror->shadow.data() + offset, guest, block.length) == 0) return false;
         Require(uploads != nullptr, "device mirror refresh has no upload batch");
+        if (block.fill == 0 && block.mirror->heap && MirrorPageShadows()) {
+            const auto* bytes = block.source != nullptr ? block.source : guest;
+            const auto runs = shadowDifferences(*block.mirror, block.address, block.length, bytes);
+            if (runs.empty()) {
+                ++UploadCounts().shadowSkips;
+                const bool whole = block.address % 65536 == 0 && (block.length == 65536 || block.address + block.length == block.mirror->base + block.mirror->bytes);
+                if (whole) block.mirror->generations[static_cast<std::size_t>(block.address / 65536 - block.mirror->base / 65536)] = block.generation;
+                return false;
+            }
+            if (runs.size() != 1 || runs.front().first != 0 || runs.front().second != block.length) {
+                ++UploadCounts().shadowPartials;
+                for (const auto& [from, to] : runs) {
+                    RefreshBlock part = block;
+                    part.address = block.address + from;
+                    part.length = to - from;
+                    if (block.source != nullptr) part.source = block.source + from;
+                    stageMirrorBlock(part, *uploads);
+                }
+                return true;
+            }
+        }
         stageMirrorBlock(block, *uploads);
         return true;
     }
@@ -3640,6 +3815,24 @@ void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force)
     if (VramLazyWrites() && bytes != 0) {
         if (!force && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::MirrorRefresh) return;
         const auto end = address + std::min<std::uint64_t>(bytes, std::numeric_limits<std::uint64_t>::max() - address);
+        if (LazyPageBits()) {
+            std::vector<std::shared_ptr<ImageMirror>> mirrors;
+            {
+                auto& state = Mirrors();
+                std::lock_guard lock(state.mutex);
+                auto found = state.entries.upper_bound(address);
+                if (found != state.entries.begin()) --found;
+                for (; found != state.entries.end() && found->first < end; ++found) {
+                    const auto& mirror = found->second;
+                    if (mirror->base + mirror->bytes <= address) continue;
+                    if (mirror->lazyAddressWriter != nullptr || lazyBitsOver(*mirror, address, end)) mirrors.push_back(mirror);
+                }
+            }
+            if (mirrors.empty()) { lazyBitSkips.fetch_add(1, std::memory_order_relaxed); return; }
+            std::lock_guard gpu(GuestMemory::GpuMutex());
+            for (const auto& mirror : mirrors) publishLazyPages(*mirror, address, end);
+            return;
+        }
         {
             auto& state = Mirrors();
             std::lock_guard lock(state.mutex);
@@ -4073,7 +4266,9 @@ VramCleanupStats VramCleanupCounters() {
 
 VramUploadStats VramUploadCounters() {
     std::lock_guard lock(GuestMemory::GpuMutex());
-    return UploadCounts();
+    auto counts = UploadCounts();
+    counts.shadowPagesHeld = shadowPagesHeld.load(std::memory_order_relaxed);
+    return counts;
 }
 
 void CollectVramMirrors(const Context& context) {
@@ -4145,9 +4340,24 @@ VramWritableStats VramWritableCounters() {
     return state.total;
 }
 
+bool LazyCompletionRequeue() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_LAZY_COMPLETION_REQUEUE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+void CountLazyCompletionRequeue(bool dropped) {
+    (dropped ? lazyRequeueDrops : lazyRequeues).fetch_add(1, std::memory_order_relaxed);
+}
+
 VramLazyStats VramLazyCounters() {
     std::lock_guard gpu(GuestMemory::GpuMutex());
     auto counts = LazyState().counts;
+    counts.bitSkips = lazyBitSkips.load(std::memory_order_relaxed);
+    counts.requeuedCompletions = lazyRequeues.load(std::memory_order_relaxed);
+    counts.droppedCompletions = lazyRequeueDrops.load(std::memory_order_relaxed);
     auto& imports = LazyImportState();
     std::lock_guard lock(imports.mutex);
     counts.unorderedImportRanges = imports.unordered.size();
