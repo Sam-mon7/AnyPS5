@@ -1067,7 +1067,7 @@ public:
                 if (HotPagesEnabled()) {
                     const auto now = GetTickCount64();
                     for (std::size_t sub = 0; sub < subpages; ++sub) {
-                        if (view.page->hotUntil[sub] > now) hot |= static_cast<std::uint8_t>(1u << sub);
+                        if (view.page->hotUntil[sub] > now && view.page->gpuOwners[sub] == 0) hot |= static_cast<std::uint8_t>(1u << sub);
                     }
                 }
                 std::uint8_t settled = 0;
