@@ -1,4 +1,5 @@
 #include "ShaderDiskCache.hpp"
+#include "RelaxedFloat.hpp"
 #include "CacheKey.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ThreadOwned.hpp"
@@ -1204,7 +1205,7 @@ std::vector<std::byte> buildSwitchKey(bool vertex) {
         if (std::find(std::begin(NeutralSwitches), std::end(NeutralSwitches), name) != std::end(NeutralSwitches)) continue;
         if (!vertex && std::find(std::begin(VertexStageSwitches), std::end(VertexStageSwitches), name) != std::end(VertexStageSwitches)) continue;
         const char* value = std::getenv(std::string(name).c_str());
-        if (value == nullptr || (name == "APS5_INDIRECT_SGPR_RUNTIME" && std::strcmp(value, "1") != 0)) continue;
+        if (value == nullptr || ((name == "APS5_INDIRECT_SGPR_RUNTIME" || name == "APS5_RELAXED_FLOAT32") && std::strcmp(value, "1") != 0)) continue;
         writer.Text(std::string(name));
         writer.Text(value);
     }
@@ -1492,12 +1493,14 @@ bool OutputKeyed() {
 }
 
 std::uint64_t OutputVersion() {
-    return IndirectSgprRuntime() ? IndirectSgprVersion(Generated::OutputVersion) : Generated::OutputVersion;
+    const auto version = IndirectSgprRuntime() ? IndirectSgprVersion(Generated::OutputVersion) : Generated::OutputVersion;
+    return RelaxedFloat32() ? RelaxedFloatVersion(version) : version;
 }
 
 std::uint64_t SourceVersion() {
     const auto legacy = OutputKeyed() ? Generated::OutputVersion : Generated::SourceVersion;
-    return IndirectSgprRuntime() ? IndirectSgprVersion(legacy) : legacy;
+    const auto version = IndirectSgprRuntime() ? IndirectSgprVersion(legacy) : legacy;
+    return RelaxedFloat32() ? RelaxedFloatVersion(version) : version;
 }
 
 bool VerifyHits() {

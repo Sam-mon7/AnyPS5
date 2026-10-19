@@ -1,5 +1,6 @@
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "RelaxedFloat.hpp"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -146,7 +147,7 @@ RdnaOperand TranslationContext::plainOperand(const RdnaOperand& operand) {
 }
 
 IrU32 TranslationContext::flushF32Denormal(IrU32 bits) {
-    if ((f32DenormalFlush & 1u) == 0u) return bits;
+    if (RelaxedFloat32() || (f32DenormalFlush & 1u) == 0u) return bits;
     if (bits.Value().HasImmediate()) {
         const std::uint32_t value = bits.Value().ImmediateU32();
         return (value & 0x7f800000u) == 0u ? IrU32(ir.Constant(value & 0x80000000u)) : bits;
@@ -156,7 +157,7 @@ IrU32 TranslationContext::flushF32Denormal(IrU32 bits) {
 }
 
 IrF32 TranslationContext::flushTinyProduct(IrValue* lhs, IrValue* rhs, IrValue* product, IrValue* addend, bool afterRounding) {
-    if ((f32DenormalFlush & 2u) == 0u || keepsProductOutOfTinyRange(*lhs) || keepsProductOutOfTinyRange(*rhs)) return IrF32(*product);
+    if (RelaxedFloat32() || (f32DenormalFlush & 2u) == 0u || keepsProductOutOfTinyRange(*lhs) || keepsProductOutOfTinyRange(*rhs)) return IrF32(*product);
     IrValue& lhsBits = ir.BitCastU32(*lhs);
     IrValue& rhsBits = ir.BitCastU32(*rhs);
     const std::uint32_t roundMode = floatMode.has_value() ? floatMode->floatMode & 3u : 0u;
@@ -342,6 +343,7 @@ IrU32 TranslationContext::quietNan32(IrU32 bits) {
 }
 
 IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct) {
+    if (RelaxedFloat32()) return result;
     const auto isNan = [&](IrValue& value) -> IrValue& { return ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&value}); };
     IrValue* candidate = nullptr;
     for (auto source = sources.end(); source != sources.begin();) {
