@@ -1518,7 +1518,11 @@ void disarmInterval(MirrorWriteInterval& interval) {
 }
 
 struct LazyMirrors {
+    struct SiteDownloads {
+        std::uint64_t calls = 0, pages = 0, us = 0;
+    };
     VramLazyStats counts;
+    std::array<SiteDownloads, static_cast<std::size_t>(GuestMemory::ReadSite::Count) + 1> sites{};
     std::uint64_t order = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -1619,6 +1623,17 @@ void reportLazyWrites() {
         static_cast<unsigned long long>(c.faultPageWaits), c.faultPageWaitUs / 1000.0, static_cast<unsigned long long>(c.faultBdaWaits), c.faultBdaWaitUs / 1000.0,
         static_cast<unsigned long long>(c.protectRuns), static_cast<unsigned long long>(c.protectCalls), c.protectUs / 1000.0,
         static_cast<unsigned long long>(c.snapshotCalls), c.snapshotUs / 1000.0);
+    std::string sites;
+    for (std::size_t site = 0; site < state.sites.size(); ++site) {
+        auto& entry = state.sites[site];
+        if (entry.calls == 0) continue;
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s %llu/%llu/%.1fms", site == static_cast<std::size_t>(GuestMemory::ReadSite::Count) ? "fault" : GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(site)),
+            static_cast<unsigned long long>(entry.calls), static_cast<unsigned long long>(entry.pages), entry.us / 1000.0);
+        sites += text;
+        entry = {};
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[vram-lazy] downloads by read site (10 s, calls/pages/ms):%s\n", sites.empty() ? " none" : sites.c_str());
 }
 
 void stampGpuBlocks(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end) {
@@ -1662,6 +1677,7 @@ void publishLazyPages(ImageMirror& mirror, std::uint64_t begin, std::uint64_t en
     if (next == mirror.lazyPages.end() || next->first >= end) return;
     const auto started = std::chrono::steady_clock::now();
     auto& counts = LazyState().counts;
+    const auto pagesBefore = counts.downloadedPages;
     auto& state = WritableState();
     const auto& context = mirror.uploadContext;
     if (state.device != context.device) {
@@ -1716,7 +1732,12 @@ void publishLazyPages(ImageMirror& mirror, std::uint64_t begin, std::uint64_t en
         }
         next = mirror.lazyPages.upper_bound(pages.back());
     }
-    counts.downloadUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+    const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+    counts.downloadUs += spent;
+    auto& site = LazyState().sites[fault ? static_cast<std::size_t>(GuestMemory::ReadSite::Count) : static_cast<std::size_t>(GuestMemory::CurrentReadSite())];
+    ++site.calls;
+    site.pages += counts.downloadedPages - pagesBefore;
+    site.us += spent;
     reportLazyWrites();
 }
 
