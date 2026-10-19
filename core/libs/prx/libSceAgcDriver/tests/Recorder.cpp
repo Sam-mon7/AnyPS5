@@ -1822,6 +1822,30 @@ void writeSettledTests(const Device& device, Recorder& recorder) {
     Require(recorder.Idle() && !recorder.PendingWriteOverlaps(0x50000, 0x100), "writes outlived their batches");
 }
 
+void inPlaceWriteTests(const Device& device, Recorder& recorder) {
+    using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    Ranges ranges{{1, 2}};
+    Require(!recorder.InPlaceWritesOver(0x54000, 0x1000, ranges) && ranges.empty(), "an unwritten range has in-place writes");
+    recorder.NotePendingWrite(0x54100, 0x100);
+    recorder.NotePendingWrite(0x54300, 0x80);
+    const std::array inPlace{std::pair<std::uint64_t, std::uint64_t>{0x54100, 0x54200}, std::pair<std::uint64_t, std::uint64_t>{0x54300, 0x54380}};
+    recorder.NoteInPlaceWrites(inPlace);
+    Require(recorder.InPlaceWritesOver(0x54000, 0x1000, ranges) && ranges == Ranges{{0x54100, 0x54200}, {0x54300, 0x54380}}, "in-place writes were not listed");
+    Require(recorder.InPlaceWritesOver(0x54180, 0x100, ranges) && ranges == Ranges{{0x54180, 0x54200}}, "in-place writes were not clipped to the access");
+    recorder.Submit();
+    recorder.NotePendingWrite(0x541f0, 0x20);
+    recorder.NoteInPlaceWrites(std::array{std::pair<std::uint64_t, std::uint64_t>{0x541f0, 0x54210}});
+    Require(recorder.InPlaceWritesOver(0x54000, 0x1000, ranges) && ranges == Ranges{{0x54100, 0x54210}, {0x54300, 0x54380}}, "in-place writes of open and in-flight batches were not merged");
+    recorder.NotePendingWrite(0x54800, 0x40);
+    Require(!recorder.InPlaceWritesOver(0x54000, 0x1000, ranges) && recorder.InPlaceWritesOver(0x54000, 0x800, ranges), "a write without an in-place note was accepted");
+    recorder.NotePendingWrite(0x54900, 0x40);
+    recorder.NoteInPlaceWrites(std::array{std::pair<std::uint64_t, std::uint64_t>{0x54900, 0x54920}});
+    Require(!recorder.InPlaceWritesOver(0x54900, 0x40, ranges), "a partly in-place write was accepted");
+    recorder.Sync();
+    device.WaitQueue();
+    Require(!recorder.InPlaceWritesOver(0x54000, 0x1000, ranges) && ranges.empty(), "in-place writes outlived their batches");
+}
+
 // Completion counting: a write-back completion (OnComplete) is pending until its batch finished;
 // a completion label the GPU also stored (AfterCompletions storedOnGpu) is pending only once a CPU
 // write-back overlapped it (NoteWrittenBack, once per label), one the GPU has no view of from its
@@ -8980,6 +9004,13 @@ int main(int argc, char** argv) {
         const bool submitWorkerTest = argc == 2 && std::string_view(argv[1]) == "--submit-worker-only";
         const bool completionProbe = argc == 2 && std::string_view(argv[1]) == "--completion-probe-only";
         const bool dispatchHeapTest = argc == 2 && std::string_view(argv[1]) == "--dispatch-heap-refresh-only";
+        if (argc == 2 && std::string_view(argv[1]) == "--heap-gpu-refresh-switch") {
+            const auto* value = std::getenv("APS5_HEAP_GPU_REFRESH");
+            const bool expected = value != nullptr && std::string_view(value) == "1";
+            Require(AgcDriver::Graphics::HeapGpuRefreshEnabled() == expected, "APS5_HEAP_GPU_REFRESH did not follow its exact value");
+            std::cout << "Heap GPU refresh switch " << (expected ? "on" : "off") << '\n';
+            return 0;
+        }
         std::unique_ptr<Device> created;
         try {
             created = std::make_unique<Device>(completionProbe || submitWorkerTest || dispatchHeapTest);
@@ -9285,6 +9316,7 @@ int main(int argc, char** argv) {
         overlappedRangeTests(recorder);
         spaceWriteSyncTests(device, recorder);
         writeSettledTests(device, recorder);
+        inPlaceWriteTests(device, recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
         directCompletionLabelTests(recorder);

@@ -45,4 +45,18 @@ struct DispatchHeapRefreshStats {
 
 DispatchHeapRefreshStats DispatchHeapRefreshCounters();
 
+bool HeapGpuRefreshEnabled();
+
+struct HeapGpuRefreshStats {
+    std::uint64_t runs;
+    std::uint64_t copies;
+    std::uint64_t bytes;
+    std::uint64_t notInPlace;
+    std::uint64_t pendingResults;
+    std::uint64_t unimported;
+    std::uint64_t unmirrored;
+};
+
+HeapGpuRefreshStats HeapGpuRefreshCounters();
+
 }

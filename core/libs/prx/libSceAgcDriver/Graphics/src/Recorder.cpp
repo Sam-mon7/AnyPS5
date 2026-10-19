@@ -3686,6 +3686,38 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
     return false;
 }
 
+void Recorder::NoteInPlaceWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (ranges.empty()) return;
+    ensureOpen();
+    for (const auto& range : ranges) if (range.second > range.first) open->inPlaceWrites.push_back(range);
+}
+
+bool Recorder::InPlaceWritesOver(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+    ranges.clear();
+    if (bytes == 0 || QueuedLabelOverlaps(address, bytes)) return false;
+    const auto end = address + bytes;
+    const auto collect = [&](const Batch& batch) {
+        for (const auto& [begin, finish] : batch.writes) {
+            if (finish <= address || end <= begin) continue;
+            if (std::none_of(batch.inPlaceWrites.begin(), batch.inPlaceWrites.end(), [&](const auto& range) { return range.first <= begin && finish <= range.second; })) return false;
+            ranges.emplace_back(std::max(begin, address), std::min(finish, end));
+        }
+        return true;
+    };
+    if (open != nullptr && !collect(*open)) return false;
+    for (const auto& batch : inFlight) {
+        if (!collect(*batch)) return false;
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::size_t out = 0;
+    for (const auto& [begin, finish] : ranges) {
+        if (out != 0 && begin <= ranges[out - 1].second) ranges[out - 1].second = std::max(ranges[out - 1].second, finish);
+        else ranges[out++] = {begin, finish};
+    }
+    ranges.resize(out);
+    return !ranges.empty();
+}
+
 bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     return bytes != 0 && open != nullptr && overlaps(*open, address, address + bytes);
 }

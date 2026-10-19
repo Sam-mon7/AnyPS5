@@ -199,6 +199,23 @@ HeapRefreshCounters& HeapRefreshes() {
     return counters;
 }
 
+struct HeapGpuRefreshCounts {
+    std::atomic<std::uint64_t> runs{0}, copies{0}, bytes{0}, notInPlace{0}, pendingResults{0}, unimported{0}, unmirrored{0};
+};
+
+HeapGpuRefreshCounts& HeapGpuRefreshes() {
+    static HeapGpuRefreshCounts counts;
+    return counts;
+}
+
+bool heapGpuRefresh() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_HEAP_GPU_REFRESH");
+        return value != nullptr && std::string_view(value) == "1" && !ResidentHeapMirrors() && !VramMirrorWrites() && !VramDeviceLocalMirrors();
+    }();
+    return enabled;
+}
+
 struct RetiredImport;
 bool aliasesLiveMirror(VkDevice device, std::uint64_t address, std::size_t bytes);
 
@@ -2396,6 +2413,72 @@ void prepareRange(std::uint64_t address, std::uint64_t bytes, bool flush = true)
     syncRange(address, bytes, flush);
 }
 
+bool gpuOrderedRun(const Context* context, std::span<ImageMirror* const> mirrors, std::uint64_t begin, std::uint64_t bytes) {
+    if (context == nullptr || bytes == 0 || !heapGpuRefresh()) return false;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || Recorder::InCompletion() || !recorder->PendingWriteOverlaps(begin, static_cast<std::size_t>(bytes))) return false;
+    auto& counts = HeapGpuRefreshes();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    if (!recorder->InPlaceWritesOver(begin, static_cast<std::size_t>(bytes), ranges)) {
+        counts.notInPlace.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (StorageTexture::AnyPendingOverlaps(ranges) || AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>>(ranges))) {
+        counts.pendingResults.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    struct Copy {
+        VkBuffer source;
+        VkDeviceSize sourceOffset;
+        ImageMirror* mirror;
+        VkDeviceSize offset;
+        VkDeviceSize bytes;
+    };
+    std::vector<Copy> copies;
+    for (const auto& [from, to] : ranges) {
+        const auto* import = HostImportFor(*context, from, static_cast<std::size_t>(to - from));
+        if (import == nullptr) {
+            counts.unimported.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        auto cursor = from;
+        for (auto* mirror : mirrors) {
+            const auto first = std::max(cursor, mirror->base);
+            const auto last = std::min(to, mirror->base + mirror->bytes);
+            if (first >= last) continue;
+            if (first != cursor || !mirror->buffer->Mapped()) break;
+            copies.push_back({import->buffer, first - import->base, mirror, first - mirror->base, last - first});
+            cursor = last;
+        }
+        if (cursor != to) {
+            counts.unmirrored.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    const auto end = begin + bytes;
+    auto cursor = begin;
+    for (const auto& [from, to] : ranges) {
+        if (cursor < from) prepareRange(cursor, from - cursor);
+        cursor = std::max(cursor, to);
+    }
+    if (cursor < end) prepareRange(cursor, end - cursor);
+    Require(GuestMemory::Accessible(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
+    const auto commands = recorder->Commands();
+    RecordMemoryBarrier(*context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    std::uint64_t copied = 0;
+    for (const auto& copy : copies) {
+        CopyBuffer(*context, commands, copy.source, copy.sourceOffset, copy.mirror->buffer->Handle(), copy.offset, copy.bytes);
+        recorder->Keep(copy.mirror->buffer);
+        copied += copy.bytes;
+    }
+    RecordMemoryBarrier(*context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    counts.runs.fetch_add(1, std::memory_order_relaxed);
+    counts.copies.fetch_add(copies.size(), std::memory_order_relaxed);
+    counts.bytes.fetch_add(copied, std::memory_order_relaxed);
+    return true;
+}
+
 void prepareMirrorRange(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes) {
     const bool flush = !(wholeHeapRefresh && mirror.heap);
     if (!VramLazyWrites() || mirror.lazyPages.empty()) {
@@ -2571,7 +2654,7 @@ void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t ge
     }
 }
 
-void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshBlock>& blocks) {
+void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshBlock>& blocks, const Context* context = nullptr) {
     if (VramMirrorWrites()) {
         for (auto* mirror : mirrors) Require(refreshWritableHeap(*mirror, blocks), "a writable heap grew during refresh");
         return;
@@ -2582,7 +2665,7 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
         while (last < mirrors.size() && mirrors[last]->base == mirrors[last - 1]->base + mirrors[last - 1]->bytes) ++last;
         const auto begin = mirrors[first]->base;
         const auto bytes = mirrors[last - 1]->base + mirrors[last - 1]->bytes - begin;
-        prepareRange(begin, bytes);
+        if (!gpuOrderedRun(context, std::span<ImageMirror* const>(mirrors).subspan(first, last - first), begin, bytes)) prepareRange(begin, bytes);
         ResourcePhase collect("mirror-collect");
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
         collect.End();
@@ -2808,7 +2891,7 @@ bool applyDispatchHeapRefresh(const GuestBufferMemory::AddressSpace& space, std:
     return true;
 }
 
-std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
+std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks, const Context* context = nullptr) {
     if (dispatchHeapRefresh != nullptr) {
         std::vector<std::pair<std::size_t, std::uint64_t>> checked;
         if (applyDispatchHeapRefresh(space, checked)) return checked;
@@ -2821,7 +2904,7 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
     checked.reserve(space.heapRuns.size());
     for (std::size_t index = 0; index < space.heapRuns.size(); ++index) {
         const auto& run = space.heapRuns[index];
-        prepareRange(run.begin, run.bytes);
+        if (!gpuOrderedRun(context, std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), run.begin, run.bytes)) prepareRange(run.begin, run.bytes);
         const auto generation = GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
         const auto since = space.verified[index].load(std::memory_order_relaxed);
@@ -2972,7 +3055,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         const bool resident = heap && !sparse && range->writable && ResidentHeapMirrors() && RebarMirrors();
         const bool video = vramMirrors() && (!sparse || VramWritable());
         const bool staged = VramDeviceLocalMirrors() && !hostMirror && mirror->base % 4 == 0 && mirror->bytes % 4 == 0;
-        const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | (staged ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
+        const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | (staged ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u) | (heap && heapGpuRefresh() ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
         mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(mirror->bytes), usage,
             staged ? Buffer::Access::DeviceMirror : !hostMirror && (resident || video) ? Buffer::Access::ResidentMirror : Buffer::Access::Default);
         if (staged) ++UploadCounts().deviceMirrors;
@@ -4398,6 +4481,17 @@ DispatchHeapRefreshScope::~DispatchHeapRefreshScope() {
     dispatchHeapRefresh = previous;
 }
 
+bool HeapGpuRefreshEnabled() {
+    return heapGpuRefresh();
+}
+
+HeapGpuRefreshStats HeapGpuRefreshCounters() {
+    const auto& counts = HeapGpuRefreshes();
+    return {counts.runs.load(std::memory_order_relaxed), counts.copies.load(std::memory_order_relaxed), counts.bytes.load(std::memory_order_relaxed),
+        counts.notInPlace.load(std::memory_order_relaxed), counts.pendingResults.load(std::memory_order_relaxed), counts.unimported.load(std::memory_order_relaxed),
+        counts.unmirrored.load(std::memory_order_relaxed)};
+}
+
 DispatchHeapRefreshStats DispatchHeapRefreshCounters() {
     const auto& counters = HeapRefreshes();
     return {counters.captured.load(std::memory_order_relaxed), counters.unavailable.load(std::memory_order_relaxed),
@@ -4645,8 +4739,8 @@ void GuestBufferMemory::AcquireRegistered() {
     }
     std::vector<std::pair<std::size_t, std::uint64_t>> checked;
     ResourcePhase mirrorPhase("mirrors");
-    if (served) checked = refreshHeapRuns(*space, blocks);
-    else refreshHeapMirrors(heaps, blocks);
+    if (served) checked = refreshHeapRuns(*space, blocks, &context);
+    else refreshHeapMirrors(heaps, blocks, &context);
     mirrorPhase.End();
     lap(timing.mirrorsUs, at);
     const auto copiedBefore = Mirrors().blocksCopied;
@@ -4802,7 +4896,7 @@ bool GuestBufferMemory::bindSparseMirror(Region& region, const GuestAllocations:
     }
     if (mirror != nullptr && mirror->heap && !mirror->sparse) {
         std::vector<ImageMirror*> whole{mirror.get()};
-        refreshHeapMirrors(whole, blocks);
+        refreshHeapMirrors(whole, blocks, &context);
     }
     compareBlocks(blocks);
     if (mirror == nullptr || !mirror->heap || region.begin < mirror->base || (region.begin - mirror->base) % context.limits.minStorageBufferOffsetAlignment != 0) return false;
@@ -6434,6 +6528,15 @@ void GuestBufferMemory::completeLazyWrites() {
 void GuestBufferMemory::NotePendingWrites(Recorder& recorder) const {
     if (!VramLazyWrites()) {
         recorder.NotePendingWrites(writes);
+        if (!heapGpuRefresh()) return;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlace;
+        for (const auto& range : writes) {
+            if (BufferCache::WritesEnabled() && BufferCache::Contains(this, range.first, static_cast<std::size_t>(range.second - range.first))) continue;
+            const auto* region = owner(range.first);
+            if (region == nullptr || range.second > region->end) continue;
+            if (region->direct != nullptr || (region->mirror == nullptr && region->mirrorPieces.empty() && region->gpuCopy && region->copiedBack)) inPlace.push_back(range);
+        }
+        recorder.NoteInPlaceWrites(inPlace);
         return;
     }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pending;

@@ -3815,6 +3815,15 @@ struct DispatchTimer {
                 static_cast<unsigned long long>(by[4]), static_cast<unsigned long long>(by[5]), static_cast<unsigned long long>(by[6]));
             report += text;
         }
+        if (Graphics::HeapGpuRefreshEnabled()) {
+            const auto refresh = Graphics::HeapGpuRefreshCounters();
+            char text[256];
+            std::snprintf(text, sizeof(text), " heap-gpu-refresh runs=%llu copies=%llu copied=%.1fMiB fallbacks not-in-place=%llu pending-results=%llu unimported=%llu unmirrored=%llu",
+                static_cast<unsigned long long>(refresh.runs), static_cast<unsigned long long>(refresh.copies), refresh.bytes / 1048576.0,
+                static_cast<unsigned long long>(refresh.notInPlace), static_cast<unsigned long long>(refresh.pendingResults),
+                static_cast<unsigned long long>(refresh.unimported), static_cast<unsigned long long>(refresh.unmirrored));
+            report += text;
+        }
         AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %llu dispatches, phase totals:%s\n", static_cast<unsigned long long>(d.profiledDispatches), report.c_str());
     }
     // The call's end: the proc lookups it made, the slow-call report, the [indirect] hold
