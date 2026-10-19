@@ -973,6 +973,30 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
             }
             if (statsEnabled()) {
                 std::lock_guard lock(hotMutex);
+                std::uint64_t hottest = 0;
+                std::uint32_t hottestCount = 0;
+                for (const auto& [page, count] : hotReads) {
+                    if (count > hottestCount) {
+                        hottest = page;
+                        hottestCount = count;
+                    }
+                }
+                if (hottestCount != 0) {
+                    std::vector<std::pair<std::uint32_t, std::tuple<std::uint64_t, std::uint64_t, bool>>> covering;
+                    for (const auto& [key, count] : writtenBindings) {
+                        const auto& [address, size, sentinel] = key;
+                        if (address <= hottest && hottest < address + size) covering.emplace_back(count, key);
+                    }
+                    std::sort(covering.begin(), covering.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    std::string text;
+                    for (std::size_t index = 0; index < std::min<std::size_t>(covering.size(), 6); ++index) {
+                        const auto& [address, size, sentinel] = covering[index].second;
+                        char item[96];
+                        std::snprintf(item, sizeof(item), " %llx+%llx%s:%u", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), sentinel ? "(unbounded)" : "", covering[index].first);
+                        text += item;
+                    }
+                    std::fprintf(stderr, "[kyty-gpu] bindings covering hottest read page %llx (%u faults, %zu bindings):%s\n", static_cast<unsigned long long>(hottest), hottestCount, covering.size(), text.c_str());
+                }
                 const auto reads = takeHot(hotReads);
                 const auto writes = takeHot(hotWrites);
                 std::vector<std::pair<std::uint32_t, std::uint64_t>> sites;
