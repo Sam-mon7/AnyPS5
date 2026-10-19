@@ -245,10 +245,27 @@ void Start(void* window, std::uint32_t width, std::uint32_t height) {
     std::size_t mapped = 0;
     std::uint64_t bytes = 0;
     for (const auto& range : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
-        if (range == nullptr || range->bytes == 0) continue;
-        loaded.mapMemory(range->address, range->bytes);
-        ++mapped;
-        bytes += range->bytes;
+        if (range == nullptr || range->bytes == 0 || !range->readable) continue;
+        const auto end = range->address + range->bytes;
+        for (auto at = range->address; at < end;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+            const auto stop = std::min<std::uint64_t>(end, reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize);
+            if (info.State == MEM_COMMIT) {
+                std::uint64_t runEnd = stop;
+                while (runEnd < end) {
+                    MEMORY_BASIC_INFORMATION next{};
+                    if (VirtualQuery(reinterpret_cast<const void*>(runEnd), &next, sizeof(next)) != sizeof(next) || next.State != MEM_COMMIT) break;
+                    runEnd = std::min<std::uint64_t>(end, reinterpret_cast<std::uint64_t>(next.BaseAddress) + next.RegionSize);
+                }
+                loaded.mapMemory(at, runEnd - at);
+                ++mapped;
+                bytes += runEnd - at;
+                at = runEnd;
+            } else {
+                at = stop;
+            }
+        }
     }
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(&mapRanges);
     GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(&unmapRange);
@@ -256,7 +273,7 @@ void Start(void* window, std::uint32_t width, std::uint32_t height) {
     started.store(true, std::memory_order_release);
     for (const auto& pending : pendingEqEvents) loaded.addEqEvent(pending.eq, pending.id, pending.udata);
     pendingEqEvents.clear();
-    std::fprintf(stderr, "[kyty-gpu] started on %ux%u; %zu guest ranges (%llu MiB) mapped\n", width, height, mapped, static_cast<unsigned long long>(bytes >> 20));
+    std::fprintf(stderr, "[kyty-gpu] started on %ux%u; %zu committed guest runs (%llu MiB) mapped\n", width, height, mapped, static_cast<unsigned long long>(bytes >> 20));
 }
 
 void Submit(const Packet* packet, std::uint32_t queue) {
