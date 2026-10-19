@@ -1,5 +1,5 @@
 diff --git a/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp b/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp
-index 12a7a60..8c086f7 100644
+index 12a7a605..8c086f70 100644
 --- a/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp
 +++ b/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp
 @@ -201,6 +201,7 @@ constexpr auto MakeOpcodeDispatchTable() {
@@ -11,7 +11,7 @@ index 12a7a60..8c086f7 100644
  	g_cp_op_func[Pm4::IT_DMA_DATA]                  = CpOpDmaData;
  	g_cp_op_func[Pm4::IT_ACQUIRE_MEM]               = CpOpAcquireMem;
 diff --git a/src/graphics/guest_gpu/command_processor/pm4Dispatch.h b/src/graphics/guest_gpu/command_processor/pm4Dispatch.h
-index 419c749..3be02ce 100644
+index 419c7490..3be02ce6 100644
 --- a/src/graphics/guest_gpu/command_processor/pm4Dispatch.h
 +++ b/src/graphics/guest_gpu/command_processor/pm4Dispatch.h
 @@ -159,6 +159,7 @@ uint32_t CpOpPopMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, u
@@ -23,7 +23,7 @@ index 419c749..3be02ce 100644
  } // namespace Libs::Graphics
  
 diff --git a/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp b/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
-index 83147cd..3564680 100644
+index 83147cdd..3564680c 100644
 --- a/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
 +++ b/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
 @@ -2221,6 +2221,11 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
@@ -56,7 +56,7 @@ index 83147cd..3564680 100644
  
  template <typename T>
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-index d452db9..9dfde55 100644
+index d452db96..9dfde553 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 @@ -322,7 +322,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -69,7 +69,7 @@ index d452db9..9dfde55 100644
  	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
  	if (owner != nullptr && *owner) {
 diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
-index e3abcc6..e8ea07b 100644
+index e3abcc6d..e8ea07b8 100644
 --- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 @@ -1090,7 +1090,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
@@ -91,7 +91,7 @@ index e3abcc6..e8ea07b 100644
  		    std::max(image.info.extent.height >> range.baseMipLevel, 1u)};
  		rendering.layerCount           = range.layerCount;
 diff --git a/src/graphics/host_gpu/renderer/colorRenderTarget.cpp b/src/graphics/host_gpu/renderer/colorRenderTarget.cpp
-index e45c18e..e4a04ed 100644
+index e45c18e5..e4a04ed2 100644
 --- a/src/graphics/host_gpu/renderer/colorRenderTarget.cpp
 +++ b/src/graphics/host_gpu/renderer/colorRenderTarget.cpp
 @@ -205,7 +205,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
@@ -104,7 +104,7 @@ index e45c18e..e4a04ed 100644
  	desc.info.bytes_per_block = bytes_per_element;
  	desc.info.samples         = samples;
 diff --git a/src/graphics/host_gpu/renderer/context.cpp b/src/graphics/host_gpu/renderer/context.cpp
-index d71929f..d139dc8 100644
+index d71929fb..d139dc85 100644
 --- a/src/graphics/host_gpu/renderer/context.cpp
 +++ b/src/graphics/host_gpu/renderer/context.cpp
 @@ -97,7 +97,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
@@ -117,7 +117,7 @@ index d71929f..d139dc8 100644
  	rendering.colorAttachmentCount = state.num_color_attachments;
  	rendering.pColorAttachments    = colors.data();
 diff --git a/src/graphics/host_gpu/renderer/depthRenderTarget.cpp b/src/graphics/host_gpu/renderer/depthRenderTarget.cpp
-index 036d644..9118bc3 100644
+index 036d644b..9118bc30 100644
 --- a/src/graphics/host_gpu/renderer/depthRenderTarget.cpp
 +++ b/src/graphics/host_gpu/renderer/depthRenderTarget.cpp
 @@ -230,7 +230,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
@@ -130,7 +130,7 @@ index 036d644..9118bc3 100644
  	desc.info.pitch           = pitch;
  	desc.info.bytes_per_block = bytes;
 diff --git a/src/graphics/host_gpu/renderer/image/blitHelper.cpp b/src/graphics/host_gpu/renderer/image/blitHelper.cpp
-index f029dfd..26eff8b 100644
+index f029dfd3..26eff8b1 100644
 --- a/src/graphics/host_gpu/renderer/image/blitHelper.cpp
 +++ b/src/graphics/host_gpu/renderer/image/blitHelper.cpp
 @@ -160,10 +160,10 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
@@ -147,7 +147,7 @@ index f029dfd..26eff8b 100644
  	rendering.pDepthAttachment  = &depth_attachment;
  	command.beginRendering(&rendering);
 diff --git a/src/graphics/host_gpu/renderer/image/image.cpp b/src/graphics/host_gpu/renderer/image/image.cpp
-index c94866e..5bfd27d 100644
+index c94866ed..5bfd27d3 100644
 --- a/src/graphics/host_gpu/renderer/image/image.cpp
 +++ b/src/graphics/host_gpu/renderer/image/image.cpp
 @@ -362,18 +362,18 @@ void Image::CopyImage(Image& source) {
@@ -197,7 +197,7 @@ index c94866e..5bfd27d 100644
  	auto command = m_scheduler.Current().Handle();
  	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 diff --git a/src/graphics/host_gpu/renderer/image/imageInfo.cpp b/src/graphics/host_gpu/renderer/image/imageInfo.cpp
-index df13100..4ae1566 100644
+index df131002..4ae15668 100644
 --- a/src/graphics/host_gpu/renderer/image/imageInfo.cpp
 +++ b/src/graphics/host_gpu/renderer/image/imageInfo.cpp
 @@ -350,7 +350,7 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
@@ -210,13 +210,15 @@ index df13100..4ae1566 100644
  			for (uint32_t slice = 0; slice < active.depth; ++slice) {
  				copy.bufferOffset                    = Add(Add(buffer_offset, mip.linear_offset),
 diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
-index edea24b..722f4bb 100644
+index edea24b4..f8781635 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
-@@ -47,6 +47,13 @@
+@@ -47,6 +47,15 @@
  
  namespace Libs::Graphics {
  
++extern "C" void KytyHostNoteWrittenBinding(uint64_t address, uint64_t size, bool sentinel);
++
 +static void WarnScalarReadOverlap(const char* what) {
 +	static std::atomic<uint32_t> warnings {0};
 +	if (warnings.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -227,7 +229,7 @@ index edea24b..722f4bb 100644
  namespace {
  
  using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
-@@ -574,7 +581,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+@@ -574,7 +583,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
  	desc.info.pixel_format = pixel_format;
  	desc.info.guest_format = format;
  	desc.info.type         = TextureBaseType(type);
@@ -236,7 +238,7 @@ index edea24b..722f4bb 100644
  	desc.info.resources    = {levels, image_layers};
  	desc.info.bytes_per_block =
  	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
-@@ -695,10 +702,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
+@@ -695,10 +704,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
  	const auto& program  = *runtime.program;
  	const auto& snapshot = *runtime.resources;
  	prepared.runtime = &runtime;
@@ -251,7 +253,7 @@ index edea24b..722f4bb 100644
  	prepared.images.resize(program.info.images.size());
  	prepared.samplers.clear();
  	prepared.shader_data.clear();
-@@ -757,7 +764,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
+@@ -757,7 +766,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
  							if (read_address > address) {
  								size = std::min(size, read_address - address);
  							} else if (address - read_address < read_size) {
@@ -260,7 +262,17 @@ index edea24b..722f4bb 100644
  							}
  						}
  					}
-@@ -929,7 +936,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+@@ -769,6 +778,9 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
+ 				}
+ 			}
+ 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
++			if (program.info.buffers[resource].written) {
++				KytyHostNoteWrittenBinding(address, size, descriptor.NumRecords() == UINT32_MAX);
++			}
+ 			source = {address, size, cache.FindBuffer(address, size)};
+ 		}
+ 	}
+@@ -929,7 +941,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
  		if (reads.empty()) continue;
  		for (const auto* writer: prepared_bindings) {
  			if (writer->runtime->program->has_address_writes) {
@@ -269,7 +281,7 @@ index edea24b..722f4bb 100644
  			}
  		}
  		for (const auto [address, size]: reads) {
-@@ -941,7 +948,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+@@ -941,7 +953,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
  				                          image->info.metadata.range}) {
  					if (written.size != 0 && ImageRangeOverlaps(address, size,
  					                                          written.address, written.size)) {
@@ -278,7 +290,7 @@ index edea24b..722f4bb 100644
  					}
  				}
  			}
-@@ -952,7 +959,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+@@ -952,7 +964,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
  					const auto& written = writer->buffer_sources[resource.descriptor_index];
  					if (written.size != 0 && ImageRangeOverlaps(address, size,
  					                                          written.address, written.size)) {
@@ -287,7 +299,7 @@ index edea24b..722f4bb 100644
  					}
  				}
  			}
-@@ -1051,7 +1058,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+@@ -1051,7 +1063,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
  						                             ? cache.GetBdaPageTableBuffer()
  						                             : cache.GetFaultBuffer();
  						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
@@ -297,7 +309,7 @@ index edea24b..722f4bb 100644
  						break;
  					}
 diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-index f93bef4..119845d 100644
+index f93bef4a..119845d7 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 @@ -41,7 +41,7 @@ namespace Libs::Graphics {
@@ -310,7 +322,7 @@ index f93bef4..119845d 100644
  uint8_t RemapSourceAlphaFactor(uint8_t factor) {
  	switch (static_cast<Prospero::BlendFactor>(factor)) {
 diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
-index efb2a98..073ebe8 100644
+index efb2a988..073ebe8f 100644
 --- a/src/graphics/host_gpu/renderer/renderCompute.cpp
 +++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
 @@ -236,7 +236,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
@@ -323,7 +335,7 @@ index efb2a98..073ebe8 100644
  
  void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
-index ee8bad4..9659919 100644
+index ee8bad43..96599195 100644
 --- a/src/graphics/host_gpu/renderer/renderDraw.cpp
 +++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
 @@ -350,13 +350,13 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
@@ -344,7 +356,7 @@ index ee8bad4..9659919 100644
  	}
  	dynamic_state.SetViewports(std::span {viewports}.first(viewport_count));
 diff --git a/src/graphics/presentation/videoOut.cpp b/src/graphics/presentation/videoOut.cpp
-index f93caa3..6e23d7f 100644
+index f93caa31..6e23d7fc 100644
 --- a/src/graphics/presentation/videoOut.cpp
 +++ b/src/graphics/presentation/videoOut.cpp
 @@ -568,7 +568,7 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
@@ -357,7 +369,7 @@ index f93caa3..6e23d7f 100644
  	info.bytes_per_block = pixel_format.bytes_per_element;
  	info.samples         = 1;
 diff --git a/src/graphics/presentation/window/swapchain.cpp b/src/graphics/presentation/window/swapchain.cpp
-index 853bd8d..2e03216 100644
+index 853bd8db..2e03216d 100644
 --- a/src/graphics/presentation/window/swapchain.cpp
 +++ b/src/graphics/presentation/window/swapchain.cpp
 @@ -182,7 +182,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent,

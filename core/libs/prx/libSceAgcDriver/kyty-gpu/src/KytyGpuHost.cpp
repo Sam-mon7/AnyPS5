@@ -49,6 +49,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <array>
 #include <map>
 #include <shared_mutex>
@@ -110,6 +111,7 @@ std::mutex hotMutex;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReads;
 std::unordered_map<std::uint64_t, std::uint32_t> hotWrites;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReadSites;
+std::map<std::tuple<std::uint64_t, std::uint64_t, bool>, std::uint32_t> writtenBindings;
 
 void noteHot(bool write, std::uint64_t address) {
     if (!statsEnabled()) return;
@@ -989,6 +991,18 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     text += item;
                 }
                 hotReadSites.clear();
+                std::vector<std::pair<std::uint32_t, std::tuple<std::uint64_t, std::uint64_t, bool>>> bindings;
+                for (const auto& [key, count] : writtenBindings) bindings.emplace_back(count, key);
+                std::sort(bindings.begin(), bindings.end(), [](const auto& a, const auto& b) { return static_cast<double>(a.first) * static_cast<double>(std::get<1>(a.second)) > static_cast<double>(b.first) * static_cast<double>(std::get<1>(b.second)); });
+                std::string written;
+                for (std::size_t index = 0; index < std::min<std::size_t>(bindings.size(), 8); ++index) {
+                    const auto& [address, size, sentinel] = bindings[index].second;
+                    char item[96];
+                    std::snprintf(item, sizeof(item), " %llx+%llx%s:%u", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), sentinel ? "(unbounded)" : "", bindings[index].first);
+                    written += item;
+                }
+                std::fprintf(stderr, "[kyty-gpu] written bindings (%zu distinct):%s\n", writtenBindings.size(), written.c_str());
+                writtenBindings.clear();
                 std::fprintf(stderr, "[kyty-gpu] read fault sites:%s\n", text.c_str());
                 std::fprintf(stderr, "[kyty-gpu] read faults: %s\n[kyty-gpu] write faults: %s\n", reads.c_str(), writes.c_str());
             }
@@ -1064,6 +1078,12 @@ __declspec(dllexport) void KytyGpuHostWrite(std::uint64_t address, std::uint64_t
         }
         if (tracked) notifyAccess(PageFaultAccess::Write, std::max(page, address));
     }
+}
+
+void KytyHostNoteWrittenBinding(std::uint64_t address, std::uint64_t size, bool sentinel) {
+    if (!statsEnabled()) return;
+    std::lock_guard lock(hotMutex);
+    ++writtenBindings[{address, size, sentinel}];
 }
 
 __declspec(dllexport) void KytyGpuSuspendPoint() {
