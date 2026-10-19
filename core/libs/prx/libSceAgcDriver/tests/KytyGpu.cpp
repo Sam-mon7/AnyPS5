@@ -45,7 +45,9 @@ int main() {
             return 1;
         }
         const char* stream = lookup("KYTY_STREAM_UPLOAD");
-        if (stream == nullptr || std::string_view(stream) != "0" || lookup("KYTY_NO_SUCH_SWITCH") != nullptr) {
+        const char* binaries = lookup("KYTY_PIPELINE_BINARIES");
+        if (stream == nullptr || std::string_view(stream) != "0" || binaries == nullptr || std::string_view(binaries) != "0" ||
+            lookup("KYTY_NO_SUCH_SWITCH") != nullptr) {
             std::fprintf(stderr, "KytyHostSwitch ignored the environment or invented a switch\n");
             return 1;
         }

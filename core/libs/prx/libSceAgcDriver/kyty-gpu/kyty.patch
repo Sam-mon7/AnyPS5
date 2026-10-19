@@ -502,7 +502,7 @@ index 29920edd..640ca159 100644
  	m_frame_index = 0;
  	m_images.clear();
 diff --git a/src/graphics/presentation/window/vulkanWindow.cpp b/src/graphics/presentation/window/vulkanWindow.cpp
-index 5acc65a5..84da2a55 100644
+index 5acc65a5..93a6a59c 100644
 --- a/src/graphics/presentation/window/vulkanWindow.cpp
 +++ b/src/graphics/presentation/window/vulkanWindow.cpp
 @@ -60,6 +60,8 @@
@@ -514,6 +514,15 @@ index 5acc65a5..84da2a55 100644
  namespace Libs::Graphics {
  
  struct VulkanExtensions {
+@@ -106,7 +108,7 @@ static bool HasExtension(const std::vector<const char*>& extensions, const char*
+ // for the pipeline creation flags it needs. KYTY_PIPELINE_BINARIES=0: the static pipeline cache instead.
+ static void AddPipelineBinaryExtensions(const std::vector<vk::ExtensionProperties>& available,
+                                         std::vector<const char*>&                   extensions) {
+-	const char* setting = std::getenv("KYTY_PIPELINE_BINARIES");
++	const char* setting = KytyHostSwitch("KYTY_PIPELINE_BINARIES");
+ 	if ((setting == nullptr || std::string_view(setting) != "0") &&
+ 	    HasExtension(available, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME) &&
+ 	    HasExtension(available, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
 @@ -611,7 +613,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
  		}
  	}

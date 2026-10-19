@@ -526,7 +526,7 @@ if(BUILD_TESTING AND TARGET kytygpu)
             set(kytyGpuValue "set:01")
         endif()
         set_tests_properties(agc_kyty_gpu_${kytyGpuMode} PROPERTIES TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_append:$<TARGET_FILE_DIR:kytygpu>;APS5_KYTY_GPU=${kytyGpuValue};APS5_KYTY_GPU_SAFE=unset:;KYTY_FRAME_PIPELINE=unset:;KYTY_DISPATCH_BATCH=unset:;KYTY_STREAM_UPLOAD=set:0")
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_append:$<TARGET_FILE_DIR:kytygpu>;APS5_KYTY_GPU=${kytyGpuValue};APS5_KYTY_GPU_SAFE=unset:;KYTY_FRAME_PIPELINE=unset:;KYTY_DISPATCH_BATCH=unset:;KYTY_STREAM_UPLOAD=set:0;KYTY_PIPELINE_BINARIES=unset:")
     endforeach()
     foreach(kytyGpuSafeMode IN ITEMS off on nonexact)
         add_test(NAME agc_kyty_gpu_safe_${kytyGpuSafeMode} COMMAND agc_kyty_gpu_tests)
@@ -537,7 +537,7 @@ if(BUILD_TESTING AND TARGET kytygpu)
             set(kytyGpuSafeValue "set:01")
         endif()
         set_tests_properties(agc_kyty_gpu_safe_${kytyGpuSafeMode} PROPERTIES TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_append:$<TARGET_FILE_DIR:kytygpu>;APS5_KYTY_GPU=set:1;APS5_KYTY_GPU_SAFE=${kytyGpuSafeValue};KYTY_FRAME_PIPELINE=unset:;KYTY_DISPATCH_BATCH=unset:;KYTY_STREAM_UPLOAD=set:0")
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_append:$<TARGET_FILE_DIR:kytygpu>;APS5_KYTY_GPU=set:1;APS5_KYTY_GPU_SAFE=${kytyGpuSafeValue};KYTY_FRAME_PIPELINE=unset:;KYTY_DISPATCH_BATCH=unset:;KYTY_STREAM_UPLOAD=set:0;KYTY_PIPELINE_BINARIES=unset:")
     endforeach()
 endif()
 

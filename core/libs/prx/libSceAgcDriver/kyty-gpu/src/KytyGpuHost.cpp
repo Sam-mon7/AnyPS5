@@ -1064,6 +1064,7 @@ extern "C" [[gnu::used]] volatile std::atomic_uint32_t kyty_local_backing_read_m
 
 extern "C" __declspec(dllexport) const char* KytyHostSwitch(const char* name) {
     if (const char* value = std::getenv(name); value != nullptr) return value;
+    if (std::string_view(name) == "KYTY_PIPELINE_BINARIES") return "0";
     const char* safe = std::getenv("APS5_KYTY_GPU_SAFE");
     if (safe != nullptr && std::string_view(safe) == "1") return nullptr;
     if (std::string_view(name) == "KYTY_RENDER_CPUS") return renderCpus().empty() ? nullptr : renderCpus().c_str();
