@@ -27,6 +27,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/Dispatch/PreparedHeapRefresh.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/MemoryLockProbe.hpp"
@@ -9018,6 +9019,13 @@ int main(int argc, char** argv) {
             Require(AgcDriver::Graphics::Recorder::FencePollWait() == exact("APS5_FENCE_POLL_WAIT"), "APS5_FENCE_POLL_WAIT did not follow its exact value");
             Require(AgcDriver::Graphics::Recorder::SlowFenceTrace() == exact("APS5_TRACE_SLOW_FENCES"), "APS5_TRACE_SLOW_FENCES did not follow its exact value");
             std::cout << "Fence wait switches: poll " << (exact("APS5_FENCE_POLL_WAIT") ? "on" : "off") << ", trace " << (exact("APS5_TRACE_SLOW_FENCES") ? "on" : "off") << '\n';
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--mirror-indirect-switch") {
+            const auto* value = std::getenv("APS5_MIRROR_INDIRECT");
+            const bool expected = value != nullptr && std::string_view(value) == "1";
+            Require(AgcDriver::VulkanDevice::MirrorIndirect() == expected, "APS5_MIRROR_INDIRECT did not follow its exact value");
+            std::cout << "Mirror indirect arguments " << (expected ? "on" : "off") << '\n';
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--heap-gpu-refresh-switch") {

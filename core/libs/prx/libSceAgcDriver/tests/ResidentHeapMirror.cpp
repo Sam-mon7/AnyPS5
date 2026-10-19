@@ -1337,6 +1337,23 @@ void RunVramLazyTests(const AgcDriver::Graphics::Context& device, AgcDriver::Gra
         Require(VirtualQuery(alias, &info, sizeof(info)) == sizeof(info) && info.Protect == PAGE_NOACCESS, "the native alias of a lazy page was not protected");
         Require(VirtualQuery(alias + page, &info, sizeof(info)) == sizeof(info) && info.Protect != PAGE_NOACCESS, "an unrelated page was protected");
     }
+    if (VramLazyWrites() && VramTextures()) {
+        const auto beforeSource = VramLazyCounters();
+        const auto source = MirrorSourceFor(context, address, 12);
+        Require(source.has_value() && source->buffer == backing, "lazily written indirect arguments have no device-local source");
+        auto words = std::make_shared<Buffer>(context, 12, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, recorder.Commands(), source->buffer, source->offset, words->Handle(), 0, 12);
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(words);
+        recorder.Keep(source->lifetime);
+        recorder.Sync();
+        const auto copied = words->ReadBytes(0, 12);
+        std::array<std::uint32_t, 3> values{};
+        std::memcpy(values.data(), copied.data(), sizeof(values));
+        Require(values[0] == 0x76543210u && values[1] == 0x11111111u && values[2] == 0x11111166u, "the device-local source of lazily written arguments lost the GPU store");
+        Require(VramLazyCounters().downloadedPages == beforeSource.downloadedPages, "the device-local source of lazily written arguments downloaded its page");
+    }
     const auto beforeFault = VramLazyCounters();
     Require(*reinterpret_cast<volatile std::uint32_t*>(alias) == 0x76543210u, "native read missed lazy GPU writes");
     if (VramLazyWrites()) Require(VramLazyCounters().downloadedPages == beforeFault.downloadedPages + 1, "native read did not download exactly its page");

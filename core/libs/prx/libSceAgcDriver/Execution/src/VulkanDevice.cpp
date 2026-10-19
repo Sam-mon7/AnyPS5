@@ -3898,7 +3898,27 @@ struct RecordedDispatch {
     // Whether the data refresh recorded anything.
     bool refreshed = false;
     bool resourceKeyMatched = false;
+    Graphics::HostImport argumentMirror{};
 };
+
+namespace {
+
+void countMirrorIndirect(bool served) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::mutex mutex;
+    static std::uint64_t counts[2] = {};
+    static auto lastReport = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    ++counts[served ? 0 : 1];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::fprintf(stderr, "[indirect-mirror] (10 s) %llu indirect dispatches read their arguments from a device-local mirror, %llu found no mirror\n", static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]));
+    counts[0] = counts[1] = 0;
+}
+
+}
 
 VkDevice VulkanDevice::Device() const {
     return state->device;
@@ -3912,6 +3932,14 @@ bool VulkanDevice::DispatchRecipes() {
 bool VulkanDevice::VerifyRecipes() {
     static const bool verifyRecipe = std::getenv("APS5_VERIFY_RECIPE") != nullptr;
     return verifyRecipe;
+}
+
+bool VulkanDevice::MirrorIndirect() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_MIRROR_INDIRECT");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
 }
 
 bool VulkanDevice::TemplateDataRefresh() {
@@ -4161,6 +4189,18 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         }
         return false;
     };
+    const auto mirrorArguments = [&] {
+        if (!MirrorIndirect()) return false;
+        const auto source = Graphics::MirrorSourceFor(context, arguments, 12);
+        countMirrorIndirect(source.has_value());
+        if (!source.has_value()) return false;
+        record.argumentMirror.base = arguments - source->offset;
+        record.argumentMirror.bytes = source->offset + 12;
+        record.argumentMirror.buffer = source->buffer;
+        record.argumentImport = &record.argumentMirror;
+        recorder.Keep(source->lifetime);
+        return true;
+    };
     if (Graphics::StorageTexture::FlushPending(arguments, 12, nullptr, "indirect dispatch arguments")) {
         // As the flush hook does: the stores were only recorded and the CPU is about to read them.
         outcome.cpuReason = 1;
@@ -4170,7 +4210,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         outcome.cpuReason = 8;
     } else if (labelPending() || state->CopiedWriterOverlaps(arguments, 12)) {
         outcome.cpuReason = 2;
-    } else if ((record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) == nullptr) {
+    } else if ((record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) == nullptr && !mirrorArguments()) {
         // Valid until the next refreshImports, which only runs under GuestMemory::GpuMutex (held
         // here, by every Dispatch caller) and Keeps a retired VkBuffer while the recorder is busy.
         outcome.cpuReason = 3;
