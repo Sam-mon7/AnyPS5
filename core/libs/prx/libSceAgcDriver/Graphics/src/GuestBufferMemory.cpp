@@ -202,6 +202,7 @@ HeapRefreshCounters& HeapRefreshes() {
 struct HeapGpuRefreshCounts {
     std::atomic<std::uint64_t> runs{0}, copies{0}, bytes{0}, notInPlace{0}, pendingResults{0}, unimported{0}, unmirrored{0}, mirrored{0}, labels{0}, heldWaits{0};
     std::atomic<std::uint64_t> waitNoMirror{0}, waitDirect{0}, waitUnnoted{0}, waitImport{0}, waitOtherMirror{0};
+    std::atomic<std::uint64_t> completionCopied{0}, completionDrawn{0}, completionLabels{0};
 };
 
 HeapGpuRefreshCounts& HeapGpuRefreshes() {
@@ -4587,6 +4588,12 @@ bool HeapGpuRefreshEnabled() {
     return heapGpuRefresh();
 }
 
+void CountCompletionWait(int kind) {
+    if (!heapGpuRefresh() || kind < 0 || kind > 2) return;
+    auto& counts = HeapGpuRefreshes();
+    (kind == 0 ? counts.completionCopied : kind == 1 ? counts.completionDrawn : counts.completionLabels).fetch_add(1, std::memory_order_relaxed);
+}
+
 HeapGpuRefreshStats HeapGpuRefreshCounters() {
     const auto& counts = HeapGpuRefreshes();
     return {counts.runs.load(std::memory_order_relaxed), counts.copies.load(std::memory_order_relaxed), counts.bytes.load(std::memory_order_relaxed),
@@ -4614,7 +4621,8 @@ std::string HeapGpuRefreshWriters() {
     const auto& counts = HeapGpuRefreshes();
     const auto value = [](const std::atomic<std::uint64_t>& counter) { return std::to_string(counter.load(std::memory_order_relaxed)); };
     std::string text = "labels:" + value(counts.labels) + ",held-waits:" + value(counts.heldWaits) + ",waits-no-mirror:" + value(counts.waitNoMirror) + ",waits-direct:" + value(counts.waitDirect) +
-        ",waits-unnoted:" + value(counts.waitUnnoted) + ",waits-import:" + value(counts.waitImport) + ",waits-other-mirror:" + value(counts.waitOtherMirror) + ",";
+        ",waits-unnoted:" + value(counts.waitUnnoted) + ",waits-import:" + value(counts.waitImport) + ",waits-other-mirror:" + value(counts.waitOtherMirror) + ",completion-copied:" + value(counts.completionCopied) +
+        ",completion-drawn:" + value(counts.completionDrawn) + ",completion-labels:" + value(counts.completionLabels) + ",";
     char entry[48];
     for (std::size_t index = 0; index < writers.size() && index < 6; ++index) {
         std::snprintf(entry, sizeof(entry), "%s+0x%llx:%llu", index == 0 ? "" : ",", static_cast<unsigned long long>(writers[index].second), static_cast<unsigned long long>(writers[index].first));

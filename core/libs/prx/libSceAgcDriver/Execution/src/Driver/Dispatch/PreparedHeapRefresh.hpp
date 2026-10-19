@@ -48,6 +48,7 @@ struct DispatchHeapRefreshStats {
 DispatchHeapRefreshStats DispatchHeapRefreshCounters();
 
 bool HeapGpuRefreshEnabled();
+void CountCompletionWait(int kind);
 
 struct HeapGpuRefreshStats {
     std::uint64_t runs;

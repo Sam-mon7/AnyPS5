@@ -46,6 +46,7 @@
 #include <unordered_set>
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/Dispatch/PreparedHeapRefresh.hpp"
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -3328,7 +3329,10 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); });
     };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
+    const bool copied = context.copiedWriters != nullptr && overlaps(*context.copiedWriters);
+    const bool drawn = !copied && overlaps(*drawWriters);
+    if (copied || drawn || (labels && recorder->PendingLabelIn(address, bytes))) {
+        CountCompletionWait(copied ? 0 : drawn ? 1 : 2);
         Recorder::CountSync(4, __builtin_return_address(0));
         recorder->SyncThrough(address, bytes);
         return true;
