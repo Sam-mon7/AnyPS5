@@ -36,6 +36,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -43,6 +44,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -591,6 +593,15 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
     renderer.InitializeGpu(&videoOut);
     ensureShaders();
     started.store(true, std::memory_order_release);
+    std::thread([] {
+        auto previous = window->loop.presented_frames.load(std::memory_order_relaxed);
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            const auto now = window->loop.presented_frames.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps)\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0);
+            previous = now;
+        }
+    }).detach();
     return 0;
 }
 
