@@ -8,6 +8,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -357,8 +358,24 @@ void GraphicsDbgDumpDcb(const char*, uint32_t, const uint32_t*) {}
 
 namespace Gen5 {
 
-bool AgcIsInternalDataPacket(uint32_t, const uint32_t*) {
-    return false;
+bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
+    constexpr uint32_t internalDataRegister = 0x342u;
+    constexpr uint32_t drawIndirectMultiBegin = 0xc6000008u;
+    constexpr uint32_t drawIndirectMultiEnd = 0xc6000000u;
+    constexpr uint32_t waitUserDataBegin32 = 0xc8010000u;
+    constexpr uint32_t waitUserDataBegin64 = 0xc8020000u;
+    constexpr uint32_t waitUserDataEnd = 0xc8000000u;
+    constexpr uint32_t waitUserDataBeginDwords = 4u;
+    constexpr uint32_t internalDataDwords = 3u;
+    if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG || KYTY_PM4_R(cmd_id) != 1u || payload[0] != internalDataRegister) {
+        return false;
+    }
+    const auto dwords = KYTY_PM4_LEN(cmd_id);
+    if (dwords == waitUserDataBeginDwords) {
+        const auto tag = payload[1] & 0xffff0000u;
+        return tag == waitUserDataBegin32 || tag == waitUserDataBegin64;
+    }
+    return dwords == internalDataDwords && (payload[1] == waitUserDataEnd || payload[1] == drawIndirectMultiBegin || payload[1] == drawIndirectMultiEnd);
 }
 
 }
