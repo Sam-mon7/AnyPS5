@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/KytyGpu.hpp"
 #include "prx/libSceAgcDriver/kyty-gpu/include/KytyGpuApi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 
@@ -48,6 +49,7 @@ struct Module {
     KytyGpuRangeFunction unmapMemory = nullptr;
     KytyGpuShaderFunction mapShader = nullptr;
     KytyGpuLookupFunction videoOut = nullptr;
+    KytyGpuHostWriteFunction hostWrite = nullptr;
     void (*suspendPoint)() = nullptr;
     void (*waitIdle)() = nullptr;
 };
@@ -193,6 +195,7 @@ const Module& module() {
         result.unmapMemory = symbol<KytyGpuRangeFunction>(result.handle, "KytyGpuUnmapMemory");
         result.mapShader = symbol<KytyGpuShaderFunction>(result.handle, "KytyGpuMapShader");
         result.videoOut = symbol<KytyGpuLookupFunction>(result.handle, "KytyGpuVideoOut");
+        result.hostWrite = symbol<KytyGpuHostWriteFunction>(result.handle, "KytyGpuHostWrite");
         result.suspendPoint = symbol<void (*)()>(result.handle, "KytyGpuSuspendPoint");
         result.waitIdle = symbol<void (*)()>(result.handle, "KytyGpuWaitIdle");
         return result;
@@ -208,6 +211,10 @@ void mapRanges(const GuestAllocations::Mapped& ranges, std::uint64_t) {
 
 void unmapRange(std::uintptr_t address, std::size_t bytes) {
     module().unmapMemory(address, bytes);
+}
+
+void hostWrite(std::uintptr_t address, std::size_t bytes, bool begin) {
+    module().hostWrite(address, bytes, begin);
 }
 
 }
@@ -239,6 +246,7 @@ void Start(void* window, std::uint32_t width, std::uint32_t height) {
     }
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(&mapRanges);
     GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(&unmapRange);
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&hostWrite);
     started.store(true, std::memory_order_release);
     for (const auto& pending : pendingEqEvents) loaded.addEqEvent(pending.eq, pending.id, pending.udata);
     pendingEqEvents.clear();

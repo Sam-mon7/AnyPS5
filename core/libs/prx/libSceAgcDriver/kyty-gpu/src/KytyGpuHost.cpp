@@ -80,6 +80,7 @@ struct Counts {
     std::atomic<std::uint64_t> faults{0};
     std::atomic<std::uint64_t> lateMaps{0};
     std::atomic<std::uint64_t> raceRetries{0};
+    std::atomic<std::uint64_t> hostWrites{0};
 };
 
 Counts counts;
@@ -91,6 +92,11 @@ struct Protection {
 
 std::mutex protectionMutex;
 std::unordered_map<std::uint64_t, Protection> protections;
+std::vector<std::pair<std::uint64_t, std::uint64_t>> hostWrites;
+
+bool inHostWrite(std::uint64_t page) {
+    return std::any_of(hostWrites.begin(), hostWrites.end(), [page](const auto& range) { return page < range.second && range.first < page + PageBytes; });
+}
 
 bool committed(std::uint64_t address, MEMORY_BASIC_INFORMATION& info) {
     return VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT;
@@ -126,7 +132,7 @@ bool protectPages(std::uint64_t address, std::uint64_t bytes, Mode mode) {
             const bool open = mode == Mode::ReadWrite || mode == Mode::ExecuteReadWrite;
             const DWORD wanted = open ? original : hostProtection(mode, original);
             DWORD previous = 0;
-            if (!VirtualProtect(reinterpret_cast<void*>(at), PageBytes, wanted, &previous)) return false;
+            if ((open || !inHostWrite(at)) && !VirtualProtect(reinterpret_cast<void*>(at), PageBytes, wanted, &previous)) return false;
             if (open) {
                 if (found != protections.end()) protections.erase(found);
             } else if (found != protections.end()) {
@@ -180,6 +186,19 @@ bool permits(std::uint64_t address, bool write) {
     return write ? writable : writable || protection == PAGE_READONLY || protection == PAGE_EXECUTE_READ;
 }
 
+bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
+    if (resources == nullptr) return false;
+    if (resources->HandleFault(access, address)) return true;
+    MEMORY_BASIC_INFORMATION region{};
+    if (!committed(address, region)) return false;
+    constexpr std::uint64_t block = 4ull << 20u;
+    const auto begin = std::max(address & ~(block - 1), reinterpret_cast<std::uint64_t>(region.BaseAddress));
+    const auto end = std::min((address & ~(block - 1)) + block, regionEnd(region));
+    counts.lateMaps.fetch_add(1, std::memory_order_relaxed);
+    resources->MapMemory(begin, end - begin);
+    return resources->HandleFault(access, address);
+}
+
 LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
     const auto* record = info->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
@@ -194,16 +213,7 @@ LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
     }
     counts.faults.fetch_add(1, std::memory_order_relaxed);
     const auto access = record->ExceptionInformation[0] == 1 ? PageFaultAccess::Write : PageFaultAccess::Read;
-    if (resources == nullptr) return EXCEPTION_CONTINUE_SEARCH;
-    if (resources->HandleFault(access, address)) return EXCEPTION_CONTINUE_EXECUTION;
-    MEMORY_BASIC_INFORMATION region{};
-    if (!committed(address, region)) return EXCEPTION_CONTINUE_SEARCH;
-    constexpr std::uint64_t block = 4ull << 20u;
-    const auto begin = std::max(address & ~(block - 1), reinterpret_cast<std::uint64_t>(region.BaseAddress));
-    const auto end = std::min((address & ~(block - 1)) + block, regionEnd(region));
-    counts.lateMaps.fetch_add(1, std::memory_order_relaxed);
-    resources->MapMemory(begin, end - begin);
-    return resources->HandleFault(access, address) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    return notifyAccess(access, address) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 struct TerminateOnFatal {
@@ -679,9 +689,9 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             const auto now = window->loop.presented_frames.load(std::memory_order_relaxed);
-            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
+            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
                          static_cast<unsigned long long>(counts.dcbs.load()), static_cast<unsigned long long>(counts.acbs.load()), static_cast<unsigned long long>(counts.adds.load()), static_cast<unsigned long long>(counts.graphicsTriggers.load()),
-                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()));
+                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()));
             previous = now;
         }
     }).detach();
@@ -728,6 +738,28 @@ __declspec(dllexport) void KytyGpuMapShader(const KytyGpuShader* shader) {
 
 __declspec(dllexport) void* KytyGpuVideoOut(const char* name) {
     return videoOutFunction(name);
+}
+
+__declspec(dllexport) void KytyGpuHostWrite(std::uint64_t address, std::uint64_t bytes, bool begin) {
+    if (resources == nullptr || bytes == 0) return;
+    {
+        std::lock_guard lock(protectionMutex);
+        if (begin) {
+            hostWrites.emplace_back(address, address + bytes);
+        } else if (const auto found = std::find(hostWrites.begin(), hostWrites.end(), std::make_pair(address, address + bytes)); found != hostWrites.end()) {
+            hostWrites.erase(found);
+        }
+    }
+    counts.hostWrites.fetch_add(begin ? 1 : 0, std::memory_order_relaxed);
+    const auto end = address + bytes;
+    for (auto page = address & ~(PageBytes - 1); page < end; page += PageBytes) {
+        bool tracked = false;
+        {
+            std::lock_guard lock(protectionMutex);
+            tracked = protections.contains(page);
+        }
+        if (tracked) notifyAccess(PageFaultAccess::Write, std::max(page, address));
+    }
 }
 
 __declspec(dllexport) void KytyGpuSuspendPoint() {

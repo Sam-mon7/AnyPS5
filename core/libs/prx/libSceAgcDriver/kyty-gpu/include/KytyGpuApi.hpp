@@ -57,6 +57,7 @@ using KytyGpuEqEventFunction = int (*)(std::int64_t eq, int id, void* udata);
 using KytyGpuRangeFunction = void (*)(std::uint64_t address, std::uint64_t bytes);
 using KytyGpuShaderFunction = void (*)(const KytyGpuShader* shader);
 using KytyGpuLookupFunction = void* (*)(const char* name);
+using KytyGpuHostWriteFunction = void (*)(std::uint64_t address, std::uint64_t bytes, bool begin);
 
 }
 

@@ -552,7 +552,18 @@ bool GuestArenaWriteWatched_nid_postfix() {
     return Arena::Get().WriteWatched();
 }
 
+namespace {
+
+std::atomic<void (*)(std::uintptr_t, std::size_t, bool)> hostWriteHook{nullptr};
+
+}
+
+void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes, bool begin)) {
+    hostWriteHook.store(hook, std::memory_order_release);
+}
+
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+    if (const auto hook = hostWriteHook.load(std::memory_order_acquire)) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
 #ifdef _WIN32
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else
@@ -567,6 +578,7 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #else
     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);
 #endif
+    if (const auto hook = hostWriteHook.load(std::memory_order_acquire)) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
 }
 
 #ifndef _WIN32
