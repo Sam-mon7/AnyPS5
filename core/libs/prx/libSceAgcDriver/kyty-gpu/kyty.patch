@@ -56,7 +56,7 @@ index 83147cdd..3564680c 100644
  
  template <typename T>
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-index d452db96..9dfde553 100644
+index d452db96..5f961e7d 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 @@ -322,7 +322,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -68,6 +68,23 @@ index d452db96..9dfde553 100644
  	}
  	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
  	if (owner != nullptr && *owner) {
+@@ -484,6 +484,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+ 	return source.first->Handle();
+ }
+ 
++extern "C" void KytyHostNoteGpuWrite(uint64_t address, uint64_t size, const void* caller);
++
+ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
+                                                        bool is_written, bool is_texel_buffer,
+                                                        BufferId id) {
+@@ -515,6 +517,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t
+ 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+ 	if (is_written) {
+ 		m_gpu_modified_ranges.Add(vaddr, size);
++		KytyHostNoteGpuWrite(vaddr, size, __builtin_return_address(0));
+ 	}
+ 	return {&buffer, buffer.Offset(vaddr)};
+ }
 diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 index e3abcc6d..e8ea07b8 100644
 --- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp

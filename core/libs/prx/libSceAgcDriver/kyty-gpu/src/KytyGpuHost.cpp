@@ -112,6 +112,7 @@ std::unordered_map<std::uint64_t, std::uint32_t> hotReads;
 std::unordered_map<std::uint64_t, std::uint32_t> hotWrites;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReadSites;
 std::map<std::tuple<std::uint64_t, std::uint64_t, bool>, std::uint32_t> writtenBindings;
+std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint32_t> gpuWrites;
 
 void noteHot(bool write, std::uint64_t address) {
     if (!statsEnabled()) return;
@@ -996,6 +997,22 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                         text += item;
                     }
                     std::fprintf(stderr, "[kyty-gpu] bindings covering hottest read page %llx (%u faults, %zu bindings):%s\n", static_cast<unsigned long long>(hottest), hottestCount, covering.size(), text.c_str());
+                    std::vector<std::pair<std::uint32_t, std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>>> writers;
+                    for (const auto& [key, count] : gpuWrites) {
+                        const auto& [address, size, caller] = key;
+                        if (address <= hottest && hottest < address + size) writers.emplace_back(count, key);
+                    }
+                    std::sort(writers.begin(), writers.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    std::string callers;
+                    for (std::size_t index = 0; index < std::min<std::size_t>(writers.size(), 6); ++index) {
+                        const auto& [address, size, caller] = writers[index].second;
+                        HMODULE module = nullptr;
+                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(caller), &module);
+                        char item[128];
+                        std::snprintf(item, sizeof(item), " %llx+%llx from +%llx:%u", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(caller - reinterpret_cast<std::uint64_t>(module)), writers[index].first);
+                        callers += item;
+                    }
+                    std::fprintf(stderr, "[kyty-gpu] GPU writes covering it (%zu):%s\n", writers.size(), callers.c_str());
                 }
                 const auto reads = takeHot(hotReads);
                 const auto writes = takeHot(hotWrites);
@@ -1027,6 +1044,7 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                 }
                 std::fprintf(stderr, "[kyty-gpu] written bindings (%zu distinct):%s\n", writtenBindings.size(), written.c_str());
                 writtenBindings.clear();
+                gpuWrites.clear();
                 std::fprintf(stderr, "[kyty-gpu] read fault sites:%s\n", text.c_str());
                 std::fprintf(stderr, "[kyty-gpu] read faults: %s\n[kyty-gpu] write faults: %s\n", reads.c_str(), writes.c_str());
             }
@@ -1102,6 +1120,12 @@ __declspec(dllexport) void KytyGpuHostWrite(std::uint64_t address, std::uint64_t
         }
         if (tracked) notifyAccess(PageFaultAccess::Write, std::max(page, address));
     }
+}
+
+void KytyHostNoteGpuWrite(std::uint64_t address, std::uint64_t size, const void* caller) {
+    if (!statsEnabled()) return;
+    std::lock_guard lock(hotMutex);
+    ++gpuWrites[{address, size, reinterpret_cast<std::uint64_t>(caller)}];
 }
 
 void KytyHostNoteWrittenBinding(std::uint64_t address, std::uint64_t size, bool sentinel) {
