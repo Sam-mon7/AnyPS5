@@ -81,6 +81,10 @@ struct Counts {
     std::atomic<std::uint64_t> lateMaps{0};
     std::atomic<std::uint64_t> raceRetries{0};
     std::atomic<std::uint64_t> hostWrites{0};
+    std::atomic<std::uint64_t> readFaults{0};
+    std::atomic<std::uint64_t> faultNs{0};
+    std::atomic<std::uint64_t> backingOpens{0};
+    std::atomic<std::uint64_t> backingNs{0};
 };
 
 Counts counts;
@@ -147,7 +151,7 @@ bool protectPages(std::uint64_t address, std::uint64_t bytes, Mode mode) {
 }
 
 template <typename Copy>
-bool backing(std::uint64_t address, std::uint64_t bytes, bool sparse, Copy&& copy) {
+bool backing(std::uint64_t address, std::uint64_t bytes, bool sparse, bool write, Copy&& copy) {
     for (auto at = address; at < address + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         const bool live = committed(at, info);
@@ -159,13 +163,23 @@ bool backing(std::uint64_t address, std::uint64_t bytes, bool sparse, Copy&& cop
             continue;
         }
         for (auto page = at; page < stop;) {
-            const auto next = std::min(stop, (page & ~(PageBytes - 1)) + PageBytes);
             std::unique_lock lock(protectionMutex);
-            const auto found = protections.find(page & ~(PageBytes - 1));
-            if (found == protections.end()) {
+            auto run = page;
+            while (run < stop) {
+                const auto blocked = protections.find(run & ~(PageBytes - 1));
+                if (blocked != protections.end() && (write || blocked->second.mode == Mode::NoAccess)) break;
+                run = std::min(stop, (run & ~(PageBytes - 1)) + PageBytes);
+            }
+            if (run > page) {
                 lock.unlock();
-                copy(page, next - page, true);
-            } else {
+                copy(page, run - page, true);
+                page = run;
+                continue;
+            }
+            const auto next = std::min(stop, (page & ~(PageBytes - 1)) + PageBytes);
+            const auto found = protections.find(page & ~(PageBytes - 1));
+            {
+                counts.backingOpens.fetch_add(1, std::memory_order_relaxed);
                 DWORD previous = 0;
                 VirtualProtect(reinterpret_cast<void*>(page & ~(PageBytes - 1)), PageBytes, found->second.original, &previous);
                 copy(page, next - page, true);
@@ -188,6 +202,12 @@ bool permits(std::uint64_t address, bool write) {
 
 bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
     if (resources == nullptr) return false;
+    const auto started = std::chrono::steady_clock::now();
+    struct Timer {
+        std::chrono::steady_clock::time_point started;
+        ~Timer() { counts.faultNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed); }
+    } timer{started};
+    if (access == PageFaultAccess::Read) counts.readFaults.fetch_add(1, std::memory_order_relaxed);
     if (resources->HandleFault(access, address)) return true;
     MEMORY_BASIC_INFORMATION region{};
     if (!committed(address, region)) return false;
@@ -528,7 +548,7 @@ namespace Libs::LibKernel::Memory {
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
     auto* bytes = static_cast<std::uint8_t*>(data);
-    return backing(vaddr, size, false, [&](std::uint64_t at, std::uint64_t length, bool) {
+    return backing(vaddr, size, false, false, [&](std::uint64_t at, std::uint64_t length, bool) {
         std::memcpy(bytes + (at - vaddr), reinterpret_cast<const void*>(at), static_cast<std::size_t>(length));
     });
 }
@@ -544,7 +564,7 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 
 bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
     auto* bytes = static_cast<std::uint8_t*>(data);
-    return backing(vaddr, size, true, [&](std::uint64_t at, std::uint64_t length, bool live) {
+    return backing(vaddr, size, true, false, [&](std::uint64_t at, std::uint64_t length, bool live) {
         if (live) {
             std::memcpy(bytes + (at - vaddr), reinterpret_cast<const void*>(at), static_cast<std::size_t>(length));
         } else {
@@ -572,7 +592,7 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
     const auto* bytes = static_cast<const std::uint8_t*>(data);
-    const bool written = backing(vaddr, size, false, [&](std::uint64_t at, std::uint64_t length, bool) {
+    const bool written = backing(vaddr, size, false, true, [&](std::uint64_t at, std::uint64_t length, bool) {
         std::memcpy(reinterpret_cast<void*>(at), bytes + (at - vaddr), static_cast<std::size_t>(length));
     });
     if (!written) {
@@ -689,9 +709,9 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             const auto now = window->loop.presented_frames.load(std::memory_order_relaxed);
-            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
+            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu read-faults=%llu fault-ms=%llu backing-opens=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
                          static_cast<unsigned long long>(counts.dcbs.load()), static_cast<unsigned long long>(counts.acbs.load()), static_cast<unsigned long long>(counts.adds.load()), static_cast<unsigned long long>(counts.graphicsTriggers.load()),
-                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()));
+                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()), static_cast<unsigned long long>(counts.readFaults.load()), static_cast<unsigned long long>(counts.faultNs.load() / 1000000), static_cast<unsigned long long>(counts.backingOpens.load()));
             previous = now;
         }
     }).detach();
