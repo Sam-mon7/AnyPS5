@@ -2,6 +2,7 @@
 
 #include "common/archive.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -561,6 +562,7 @@ void configure(std::uint32_t width, std::uint32_t height) {
         options.present_mode = Config::PresentMode::Mailbox;
         Config::Load(options);
         Log::Initialize();
+        if (statsEnabled()) Common::DebugCounters::SetEnabled(true);
     });
 }
 
@@ -953,6 +955,20 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                          static_cast<unsigned long long>(counts.dcbs.load()), static_cast<unsigned long long>(counts.acbs.load()), static_cast<unsigned long long>(counts.adds.load()), static_cast<unsigned long long>(counts.graphicsTriggers.load()),
                          static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()), static_cast<unsigned long long>(counts.readFaults.load()), static_cast<unsigned long long>(counts.faultNs.load() / 1000000), static_cast<unsigned long long>(counts.readFaultNs.load() / 1000000), static_cast<unsigned long long>(counts.protectNs.load() / 1000000), static_cast<unsigned long long>(counts.protectCalls.load()), static_cast<unsigned long long>(counts.protectSyscalls.load()), static_cast<unsigned long long>(counts.backingOpens.load()), static_cast<unsigned long long>(counts.aliasCopies.load()));
             previous = now;
+            if (statsEnabled()) {
+                using Common::DebugCounters::Counter;
+                static std::array<std::uint64_t, static_cast<std::size_t>(Counter::Count)> last{};
+                const auto delta = [](Counter counter) {
+                    const auto index = static_cast<std::size_t>(counter);
+                    const auto value = Common::DebugCounters::Detail::g_counters[index].load(std::memory_order_relaxed);
+                    const auto result = value - last[index];
+                    last[index] = value;
+                    return static_cast<unsigned long long>(result);
+                };
+                std::fprintf(stderr, "[kyty-gpu] 10 s: draws=%llu dispatches=%llu submits=%llu gpu-waits=%llu gpu-wait-ms=%llu buffer-up-mib=%llu buffer-down-mib=%llu texture-up-mib=%llu texture-down-mib=%llu buffer-evictions=%llu texture-evictions=%llu pipelines=%llu\n",
+                             delta(Counter::Draws), delta(Counter::Dispatches), delta(Counter::QueueSubmits), delta(Counter::GpuWaits), delta(Counter::GpuWaitNs) / 1000000, delta(Counter::BufferUploadBytes) >> 20, delta(Counter::BufferDownloadBytes) >> 20,
+                             delta(Counter::TextureUploadBytes) >> 20, delta(Counter::TextureDownloadBytes) >> 20, delta(Counter::BufferEvictions), delta(Counter::TextureEvictions), delta(Counter::PipelinesCreated));
+            }
             if (statsEnabled()) {
                 std::lock_guard lock(hotMutex);
                 const auto reads = takeHot(hotReads);
