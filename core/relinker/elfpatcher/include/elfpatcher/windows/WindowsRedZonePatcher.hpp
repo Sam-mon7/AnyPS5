@@ -31,6 +31,7 @@ struct RedZonePatchResult {
 class WindowsRedZonePatcher {
 public:
     static bool Enabled();
+    static bool VectorRegisters();
     RedZonePatchResult Build(const std::vector<std::uint8_t>& source, const std::vector<Domain::ProgramHeader>& headers, const WindowsLoadImage& image, std::vector<PeSection>& sections, std::uint32_t& nextRva, std::span<const std::uint32_t> baseRelocations = {}, std::string_view module = "executable") const;
 };
 

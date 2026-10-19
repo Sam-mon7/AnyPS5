@@ -182,6 +182,20 @@ void structural() {
     require(patch(dead).Result.MemoryInstructionCount == 0, "Dead red-zone data caused an unnecessary patch");
     const Fixture stack({0x48, 0x89, 0x44, 0x24, 0xf8, 0x48, 0x89, 0xa1, 0, 0, 0, 0, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3});
     require(patch(stack).Result.StackDependentMemoryInstructionCount == 1, "RSP source operand was not refused");
+    const bool precise = WindowsRedZonePatcher::VectorRegisters();
+    for (const auto& operand : {Bytes{0x0f, 0x11, 0x21, 0x90, 0x90}, Bytes{0xc5, 0xf8, 0x11, 0x21, 0x90}, Bytes{0xc5, 0xd8, 0x58, 0x01, 0x90}, Bytes{0x66, 0x0f, 0x3a, 0x16, 0x21, 0}}) {
+        Bytes code{0x48, 0x89, 0x44, 0x24, 0xf8};
+        code.insert(code.end(), operand.begin(), operand.end());
+        emit(code, {0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3});
+        const auto result = patch(Fixture(code)).Result;
+        require(result.MemoryInstructionCount == 1 && result.StackDependentMemoryInstructionCount == (precise ? 0u : 1u) && result.PatchedMemoryInstructionCount == (precise ? 1u : 0u), "Vector register 4 was classified against the vector-register switch");
+    }
+    for (const auto& operand : {Bytes{0xc4, 0xe2, 0xd8, 0xf2, 0x01}, Bytes{0x0f, 0xc3, 0x21, 0x90, 0x90}, Bytes{0xf2, 0x0f, 0x38, 0xf1, 0x21}}) {
+        Bytes code{0x48, 0x89, 0x44, 0x24, 0xf8};
+        code.insert(code.end(), operand.begin(), operand.end());
+        emit(code, {0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3});
+        require(patch(Fixture(code)).Result.StackDependentMemoryInstructionCount != 0, "A general-purpose RSP operand was admitted as a vector register");
+    }
     const Fixture indirect({0x48, 0x89, 0x44, 0x24, 0xf8, 0x48, 0x8b, 0x01, 0xff, 0xe0});
     const auto indirectResult = patch(indirect).Result;
     require(indirectResult.IndirectRedZoneFunctionCount == 1 && indirectResult.UnrelocatableMemoryInstructionCount == 1, "Unresolved indirect branch admitted a short relocation span");
@@ -343,8 +357,8 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* exception) {
     return fault->Unprotected ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
-int faultCanary(const bool store) {
-    const Fixture fixture(canaryFunction(store ? Bytes{0x48, 0x89, 0x81, 0, 0, 0, 0} : Bytes{0x48, 0x8b, 0x81, 0, 0, 0, 0}));
+int faultCanary(const bool store, const bool vectorStore = false) {
+    const Fixture fixture(canaryFunction(vectorStore ? Bytes{0xc4, 0xe1, 0xf9, 0x6e, 0xe0, 0xc4, 0xe3, 0x5d, 0x38, 0xe4, 0x01, 0xc5, 0xfe, 0x7f, 0x21} : store ? Bytes{0x48, 0x89, 0x81, 0, 0, 0, 0} : Bytes{0x48, 0x8b, 0x81, 0, 0, 0, 0}));
     const auto output = patch(fixture);
     const Executable executable(output.Sections);
     Allocation page(4096, PAGE_READWRITE);
@@ -362,7 +376,7 @@ int faultCanary(const bool store) {
     require(fault.Count == 1 && fault.Unprotected, "Fault fixture did not resume exactly one protected-page access");
     require(state.RspBefore == state.RspAfter, "Faulting instruction changed RSP");
     require(store ? *static_cast<std::uint64_t*>(page.Pointer) == Canary : state.Value == 0x1234, "Faulting instruction did not complete");
-    if (WindowsRedZonePatcher::Enabled()) {
+    if (WindowsRedZonePatcher::Enabled() && (!vectorStore || WindowsRedZonePatcher::VectorRegisters())) {
         require(intact(state), "Protected-page fault corrupted the patched red-zone canaries");
         require(fault.Rsp == state.RspBefore - 128, "Fault was not delivered below the original red zone");
     } else {
@@ -380,10 +394,12 @@ int main(const int argc, char* argv[]) {
         const std::string mode = argc > 1 ? argv[1] : "unit";
         if (mode == "fault-store") return faultCanary(true);
         if (mode == "fault-load") return faultCanary(false);
+        if (mode == "fault-vector-store") return faultCanary(true, true);
         require(mode == "unit", "Unknown red-zone test mode");
         structural();
         equivalent({0x48, 0x8b, 0x81, 0, 0, 0, 0}, false);
         equivalent({0x48, 0x89, 0x81, 0, 0, 0, 0}, true);
+        if (WindowsRedZonePatcher::VectorRegisters()) equivalent({0x66, 0x48, 0x0f, 0x6e, 0xe0, 0x66, 0x0f, 0xd6, 0x21}, true);
         ripRelative();
         liveCall();
         indirectCall();

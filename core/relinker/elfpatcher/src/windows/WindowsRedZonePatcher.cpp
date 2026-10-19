@@ -123,6 +123,31 @@ std::optional<std::uint32_t> target(const Instruction& instruction) {
     return static_cast<std::uint32_t>(address);
 }
 
+struct VectorFields {
+    bool Reg = false;
+    bool Rm = false;
+    bool Vvvv = false;
+};
+
+VectorFields vectorFields(const std::uint8_t* data, const Codegen::DecodedInstructionInfo& info) {
+    const auto at = info.OpcodeOffset;
+    if (!WindowsRedZonePatcher::VectorRegisters() || at + 1 >= info.Length) return {};
+    const auto first = data[at];
+    std::uint8_t map = 0;
+    std::size_t opcodeAt = 0;
+    if (first == 0xc5) { map = 1; opcodeAt = at + 2; }
+    else if (first == 0xc4) { map = data[at + 1] & 31; opcodeAt = at + 3; }
+    else if (first == 0x0f) { map = data[at + 1] == 0x38 ? 2 : data[at + 1] == 0x3a ? 3 : 1; opcodeAt = at + (map == 1 ? 1 : 2); }
+    if (map < 1 || map > 3 || opcodeAt >= info.Length) return {};
+    const auto opcode = data[opcodeAt];
+    if (map != 1) return {opcode < 0xf0, opcode < 0xf0 && (map == 2 || ((opcode & 0xfc) != 0x14 && opcode != 0x20 && opcode != 0x22)), opcode < 0xf0 || map == 3};
+    const bool gprRm = opcode == 0x2a || opcode == 0x6e || opcode == 0x7e || opcode == 0xc4;
+    const bool gprReg = opcode == 0x2c || opcode == 0x2d || opcode == 0x50 || opcode == 0xc5 || opcode == 0xd7;
+    if (first != 0x0f) return {!gprReg, !gprRm, true};
+    const bool sse = (opcode >= 0x10 && opcode <= 0x17) || (opcode >= 0x28 && opcode <= 0x2f) || (opcode >= 0x50 && opcode <= 0x7f && opcode != 0x78 && opcode != 0x79) || opcode == 0xc2 || opcode == 0xc4 || opcode == 0xc5 || opcode == 0xc6 || (opcode >= 0xd0 && opcode <= 0xfe);
+    return {sse && !gprReg, sse && !gprRm, false};
+}
+
 Instruction decode(std::vector<PeSection>& sections, const std::uint32_t address, const std::uint32_t end) {
     const auto* section = sectionAt(sections, address);
     if (section == nullptr || address >= end) throw Codegen::CodegenException("Red-zone instruction is outside executable code", address);
@@ -166,10 +191,11 @@ Instruction decode(std::vector<PeSection>& sections, const std::uint32_t address
     const auto rm = static_cast<std::uint8_t>((info.ModRmByte & 7) | ((rex & 1) << 3));
     const auto reg = static_cast<std::uint8_t>(info.ModRmRegField | ((rex & 4) << 1));
     const bool extension = scalar && (opcode == 0x80 || opcode == 0x81 || opcode == 0x82 || opcode == 0x83 || opcode == 0x8f || opcode == 0xc0 || opcode == 0xc1 || opcode == 0xc6 || opcode == 0xc7 || (opcode >= 0xd0 && opcode <= 0xd3) || opcode == 0xf6 || opcode == 0xf7 || opcode == 0xfe || opcode == 0xff);
-    result.UsesStack |= (!extension && reg == 4) || (mod == 3 && rm == 4);
+    const auto fields = vectorFields(data, info);
+    result.UsesStack |= (!extension && !fields.Reg && reg == 4) || (mod == 3 && !fields.Rm && rm == 4);
     if (vector) {
         const auto vvvvOffset = info.OpcodeOffset + (first == 0xc5 ? 1 : 2);
-        result.UsesStack |= ((~data[vvvvOffset] >> 3) & 15) == 4;
+        result.UsesStack |= !fields.Vvvv && ((~data[vvvvOffset] >> 3) & 15) == 4;
     }
     if (mod != 3) {
         result.Memory = Codegen::DecodeMemoryOperand(data, info.Length, position, rex, {});
@@ -671,6 +697,11 @@ bool WindowsRedZonePatcher::Enabled() {
     return enabled;
 }
 
+bool WindowsRedZonePatcher::VectorRegisters() {
+    static const bool enabled = [] { const auto* value = std::getenv("ANYPS5_RELINK_REDZONE_VECTOR_REGISTERS"); return Enabled() && value != nullptr && std::strcmp(value, "1") == 0; }();
+    return enabled;
+}
+
 RedZonePatchResult WindowsRedZonePatcher::Build(const Bytes& source, const std::vector<Domain::ProgramHeader>& headers, const WindowsLoadImage& image, std::vector<PeSection>& sections, std::uint32_t& nextRva, const std::span<const std::uint32_t> baseRelocations, const std::string_view module) const {
     RedZonePatchResult result;
     if (!Enabled()) return result;
@@ -715,7 +746,10 @@ RedZonePatchResult WindowsRedZonePatcher::Build(const Bytes& source, const std::
                 if (call(instruction) && instruction.Memory && !instruction.UsesStack && instruction.Info.ModRmRegField == 2 && std::find(instruction.BytesValue.begin(), prefixEnd, 0x66) == prefixEnd) {
                     instruction.Protect = true;
                     instruction.ProtectedCall = true;
-                } else if (instruction.UsesStack && !instruction.ReplacesStack) ++result.StackDependentMemoryInstructionCount;
+                } else if (instruction.UsesStack && !instruction.ReplacesStack) {
+                    ++result.StackDependentMemoryInstructionCount;
+                    if (VectorRegisters()) refused(module, address, "stack-dependent");
+                }
                 else if (call(instruction) || terminator(instruction)) ++result.ControlFlowMemoryInstructionCount;
                 else instruction.Protect = true;
             }
