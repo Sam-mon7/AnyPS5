@@ -21,6 +21,7 @@
 namespace AgcDriver::PageTracker {
 
 constexpr std::uint64_t PageShift = 12, RegionShift = 22;
+constexpr std::uint64_t ManualTicket = ~std::uint64_t{0};
 constexpr std::uint64_t PageBytes = 1ull << PageShift, RegionBytes = 1ull << RegionShift;
 constexpr std::size_t RegionPages = RegionBytes / PageBytes, BitmapWords = RegionPages / 64;
 using Bitmap = std::array<std::uint64_t, BitmapWords>;
@@ -97,7 +98,10 @@ public:
     void ExcludeImport(Range range);
     void MarkCpuWritten(Range range, Source source);
     void MarkGpuWritten(Range range, Source source);
-    void MarkGpuDeclared(Range range, Source source, std::uint64_t generation);
+    void MarkGpuDeclared(Range range, Source source, std::uint64_t generation, std::uint64_t ticket = ManualTicket);
+    void StampTicket(Range range, std::uint64_t ticket);
+    void MarkAliased(Range range);
+    void CompleteTicket(std::uint64_t ticket);
     std::vector<Range> UndeclaredRuns(Range range) const;
     void NoteSkippedDeclaration(std::uint64_t pages);
     std::uint64_t MappingGeneration() const { return mappingGeneration.load(std::memory_order_acquire); }
@@ -126,7 +130,8 @@ private:
         };
         mutable std::mutex mutex;
         std::unique_ptr<PageHistory> pages;
-        Bitmap cpuDirty{}, gpuDirty{}, observedPrivate{}, declared{};
+        Bitmap cpuDirty{}, gpuDirty{}, observedPrivate{}, declared{}, autoPending{}, aliased{};
+        std::array<std::uint64_t, BitmapWords> tickets{};
         std::array<Bitmap, static_cast<std::size_t>(Reason::Count)> reasons{};
         std::array<Bitmap, static_cast<std::size_t>(Kind::Count)> kinds{};
         std::uint64_t mapEpoch = 1, cpuEpoch = 1, gpuEpoch = 1;
@@ -151,12 +156,18 @@ private:
     std::atomic<bool> poisoned{false};
     std::atomic<std::uint64_t> observationSerial{0};
     std::atomic<std::uint64_t> mappingGeneration{1};
+    std::mutex ticketMutex;
+    std::map<std::uint64_t, std::vector<std::uint64_t>> ticketRegions;
 };
 
 bool Enabled();
 bool ProofsEnabled();
 Observation PollCpuWrites(std::span<const Range> ranges);
 bool ArmEnabled();
+bool PreciseWrites();
+bool CompleteWrites();
+std::pair<std::uint64_t, bool> BatchTicket(const void* recorder, std::uint64_t serial);
+void CompleteBatch(std::uint64_t ticket);
 bool PrepareReadbacks();
 bool ResolveReadback(void* context, bool (*download)(void*, bool) noexcept) noexcept;
 void CompletedFrame();
@@ -165,8 +176,8 @@ void Initialize();
 void ReportIfDue(void (*print)(const char*));
 bool ObserversRegistered();
 void CpuWrite(Range range, Source source = Source::DriverStore);
-void GpuWrite(Range range, Source source = Source::GpuDeclaration);
-void Publish(Range range);
+void GpuWrite(Range range, Source source = Source::GpuDeclaration, std::uint64_t ticket = ManualTicket);
+void Publish(Range range, std::uint64_t ticket = ManualTicket);
 
 }
 #endif

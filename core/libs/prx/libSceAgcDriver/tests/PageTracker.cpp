@@ -115,6 +115,39 @@ void epochs() {
     require(tracker.DirtySince(range, tracker.CaptureEpoch(range)), "dropped observation proved clean");
 }
 
+void completionTickets() {
+    Tracker tracker;
+    const Range range{Base + 8 * RegionBytes, 2 * PageBytes};
+    tracker.RegisterRange(range, Kind::Section, Bit(Reason::ProtectedSection));
+    require(tracker.CaptureEpoch(range).covered, "ticket fixture is not covered");
+    tracker.MarkGpuDeclared(range, Source::GpuDeclaration, tracker.MappingGeneration(), 5);
+    require(!tracker.CaptureEpoch(range).covered, "ticketed declaration left the range covered");
+    tracker.CompleteTicket(4);
+    require(!tracker.CaptureEpoch(range).covered, "another ticket cleared a pending declaration");
+    tracker.CompleteTicket(5);
+    require(tracker.CaptureEpoch(range).covered, "completed ticket left the range pending");
+    tracker.MarkGpuDeclared(range, Source::GpuDeclaration, tracker.MappingGeneration(), 6);
+    tracker.StampTicket(range, 7);
+    tracker.CompleteTicket(6);
+    require(!tracker.CaptureEpoch(range).covered, "an earlier ticket cleared a later skipped declaration");
+    tracker.CompleteTicket(7);
+    require(tracker.CaptureEpoch(range).covered, "the latest ticket did not clear its declaration");
+    tracker.MarkGpuWritten(range, Source::GpuDeclaration);
+    tracker.MarkGpuDeclared(range, Source::GpuDeclaration, tracker.MappingGeneration(), 8);
+    tracker.CompleteTicket(8);
+    require(!tracker.CaptureEpoch(range).covered, "a ticket cleared manually pending GPU work");
+    tracker.ReadbackGpuWrites(range);
+    require(tracker.CaptureEpoch(range).covered, "readback left manual pending work");
+    tracker.MarkGpuDeclared(range, Source::GpuDeclaration, tracker.MappingGeneration(), 9);
+    tracker.MarkGpuWritten({range.address, PageBytes}, Source::GpuDeclaration);
+    tracker.CompleteTicket(9);
+    require(!tracker.CaptureEpoch({range.address, PageBytes}).covered && tracker.CaptureEpoch({range.address + PageBytes, PageBytes}).covered, "manual and ticketed pages were not cleared independently");
+    const int recorder = 0;
+    const auto first = BatchTicket(&recorder, 1), again = BatchTicket(&recorder, 1), next = BatchTicket(&recorder, 2);
+    if (CompleteWrites()) require(first.second && !again.second && again.first == first.first && next.second && next.first != first.first && first.first != ManualTicket, "batch tickets are not unique per recorder batch");
+    else require(first.first == ManualTicket && !first.second && !next.second, "batch tickets issued with the switch off");
+}
+
 void dirtyPages() {
     Tracker tracker;
     const Range range{Base + RegionBytes - 65 * PageBytes + 7, 67 * PageBytes - 13};
@@ -638,7 +671,7 @@ int main() {
         require(GuestArena::GuestArenaHasPageObserver_nid_no_patch() == enabled, "switch-off registered mapping observer");
         inaccessible();
         aliases(enabled);
-        if (enabled) declarationSkips();
+        if (enabled && !CompleteWrites()) declarationSkips();
         if (ArmEnabled()) trustedAliasCoverage();
         protectedObservation();
         armingRefusals();
@@ -650,6 +683,7 @@ int main() {
         dirtyPages();
         coverage();
         concurrentEpochs();
+        completionTickets();
         if (!enabled) {
             CpuWrite({Base, PageBytes});
             GpuWrite({Base, PageBytes});

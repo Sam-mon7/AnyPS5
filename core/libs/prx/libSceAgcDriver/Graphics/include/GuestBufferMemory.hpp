@@ -571,6 +571,8 @@ private:
     bool stagingAllowed = false;
     bool adjustedRegions = false;
     bool addressWrites = true;
+    bool addressableUpload = false;
+    std::uint64_t pageTicket = ~std::uint64_t{0};
     bool synchronousWrites = false;
     std::uint64_t fallbackCopyBytes = 0;
     std::uint64_t snapshotCopyBytes = 0;

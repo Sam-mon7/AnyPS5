@@ -370,6 +370,27 @@ void NativeReadFaults(const Context& context, std::unique_lock<GuestMemory::GpuM
 }
 #endif
 
+void PreciseWrites(const Context& context, const Memory& memory) {
+    auto* tracker = PageTracker::Get();
+    Require(tracker != nullptr, "precise write test needs the page tracker");
+    memory.Track();
+    const PageTracker::Range written{memory.address + PageBytes, PageBytes};
+    GuestBufferMemory writer(context);
+    writer.AddReadable(memory.address, 3 * PageBytes);
+    writer.AddWritable(written.address, PageBytes);
+    writer.Upload(false);
+    Require(!writer.HasCopiedWrites(), "precise write fixture was not imported in place");
+    const auto before = tracker->Counts().gpuPages;
+    CommandBatch batch(context, CommandBatch::Mode::Independent);
+    writer.BeginGpuWrites(batch);
+    const auto declared = tracker->Counts().gpuPages - before;
+    Require(tracker->DirtySince(written, tracker->CaptureEpoch(written)), "written descriptor was not declared");
+    if (PageTracker::PreciseWrites()) Require(declared == 1, "precise declarations covered more than the written descriptor");
+    else Require(declared >= 3, "conservative declarations skipped the merged direct region");
+    writer.SealForSubmit(&batch);
+    batch.SubmitAndWait();
+}
+
 void AsyncRing(const Context& context, const Memory& memory) {
     BufferCache::Clear(context.device);
     memory.Track();
@@ -446,6 +467,18 @@ int main(int argc, char** argv) {
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         auto context = VulkanDeviceTestAccess::ContextOf(*device);
+        if (argc > 1 && std::strcmp(argv[1], "precise-writes") == 0) {
+            Memory memory;
+            try {
+                PreciseWrites(context, memory);
+            } catch (...) {
+                ClearHostImports(context.device);
+                throw;
+            }
+            ClearHostImports(context.device);
+            std::puts("buffer cache: ok");
+            return 0;
+        }
         context.hostImportAlignment = 0;
 #ifdef _WIN32
         if (argc > 1 && std::strcmp(argv[1], "read-faults") == 0) NativeReadFaults(context, gpu);

@@ -336,20 +336,36 @@ void Tracker::MarkGpuWritten(Range range, Source source) {
         Advance(region->gpuEpoch);
         Assign(region->gpuDirty, offset, bytes, true);
         Assign(region->reasons[static_cast<std::size_t>(Reason::PendingGpu)], offset, bytes, true);
+        Assign(region->autoPending, offset, bytes, false);
     });
     std::lock_guard lock(countsMutex);
     counts.sources[static_cast<std::size_t>(source)] += Pages(range);
     if (source == Source::GpuDeclaration) counts.gpuPages += Pages(range);
 }
 
-void Tracker::MarkGpuDeclared(Range range, Source source, std::uint64_t generation) {
-    Visit(range, true, [&](auto, auto offset, auto bytes, auto* region) {
+void Tracker::MarkGpuDeclared(Range range, Source source, std::uint64_t generation, std::uint64_t ticket) {
+    std::vector<std::uint64_t> touched;
+    Visit(range, true, [&](auto id, auto offset, auto bytes, auto* region) {
         if (region == nullptr) return;
         Advance(region->gpuEpoch);
         Assign(region->gpuDirty, offset, bytes, true);
-        Assign(region->reasons[static_cast<std::size_t>(Reason::PendingGpu)], offset, bytes, true);
+        auto& pending = region->reasons[static_cast<std::size_t>(Reason::PendingGpu)];
+        Words(offset, bytes, [&](auto word, auto mask) {
+            if (ticket == ManualTicket) region->autoPending[word] &= ~mask;
+            else {
+                region->autoPending[word] |= mask & ~(pending[word] & ~region->autoPending[word]);
+                region->tickets[word] = ticket;
+            }
+            pending[word] |= mask;
+        });
+        if (ticket != ManualTicket) touched.push_back(id);
         if (MappingGeneration() == generation) Assign(region->declared, offset, bytes, true);
     });
+    if (!touched.empty()) {
+        std::lock_guard lock(ticketMutex);
+        auto& regions = ticketRegions[ticket];
+        regions.insert(regions.end(), touched.begin(), touched.end());
+    }
     std::lock_guard lock(countsMutex);
     counts.sources[static_cast<std::size_t>(source)] += Pages(range);
     if (source == Source::GpuDeclaration) counts.gpuPages += Pages(range);
@@ -372,7 +388,7 @@ std::vector<Range> Tracker::UndeclaredRuns(Range range) const {
         if (region == nullptr) { add(base + offset, base + offset + bytes); return; }
         const auto& gpu = region->reasons[static_cast<std::size_t>(Reason::PendingGpu)];
         Words(offset, bytes, [&](auto word, auto mask) {
-            auto missing = mask & ~(region->declared[word] & gpu[word]);
+            auto missing = mask & ~(region->declared[word] & gpu[word] & ~(CompleteWrites() ? region->aliased[word] : 0));
             while (missing != 0) {
                 const auto first = static_cast<std::uint64_t>(std::countr_zero(missing));
                 const auto count = static_cast<std::uint64_t>(std::countr_one(missing >> first));
@@ -382,6 +398,56 @@ std::vector<Range> Tracker::UndeclaredRuns(Range range) const {
         });
     });
     return runs;
+}
+
+void Tracker::StampTicket(Range range, std::uint64_t ticket) {
+    if (ticket == ManualTicket) return;
+    std::vector<std::uint64_t> touched;
+    Visit(range, false, [&](auto id, auto offset, auto bytes, auto* region) {
+        if (region == nullptr) return;
+        bool any = false;
+        Words(offset, bytes, [&](auto word, auto mask) {
+            if ((region->autoPending[word] & mask) == 0) return;
+            region->tickets[word] = ticket;
+            any = true;
+        });
+        if (any) touched.push_back(id);
+    });
+    if (touched.empty()) return;
+    std::lock_guard lock(ticketMutex);
+    auto& regions = ticketRegions[ticket];
+    regions.insert(regions.end(), touched.begin(), touched.end());
+}
+
+void Tracker::MarkAliased(Range range) {
+    Visit(range, false, [&](auto, auto offset, auto bytes, auto* region) {
+        if (region != nullptr) Assign(region->aliased, offset, bytes, true);
+    });
+}
+
+void Tracker::CompleteTicket(std::uint64_t ticket) {
+    std::vector<std::uint64_t> regions;
+    {
+        std::lock_guard lock(ticketMutex);
+        const auto found = ticketRegions.find(ticket);
+        if (found == ticketRegions.end()) return;
+        regions = std::move(found->second);
+        ticketRegions.erase(found);
+    }
+    std::sort(regions.begin(), regions.end());
+    regions.erase(std::unique(regions.begin(), regions.end()), regions.end());
+    for (const auto id : regions) {
+        auto* region = GetRegion(id, false);
+        if (region == nullptr) continue;
+        std::lock_guard lock(region->mutex);
+        auto& pending = region->reasons[static_cast<std::size_t>(Reason::PendingGpu)];
+        for (std::size_t word = 0; word < BitmapWords; ++word) {
+            if (region->tickets[word] != ticket) continue;
+            pending[word] &= ~region->autoPending[word];
+            region->autoPending[word] = 0;
+            region->tickets[word] = 0;
+        }
+    }
 }
 
 void Tracker::NoteSkippedDeclaration(std::uint64_t pages) {
@@ -397,6 +463,7 @@ void Tracker::ReadbackGpuWrites(Range range) {
         Advance(region->gpuEpoch);
         Assign(region->gpuDirty, offset, bytes, false);
         Assign(region->reasons[static_cast<std::size_t>(Reason::PendingGpu)], offset, bytes, false);
+        Assign(region->autoPending, offset, bytes, false);
     });
 }
 
@@ -672,6 +739,16 @@ bool ArmEnabled() {
     return enabled;
 }
 
+bool PreciseWrites() {
+    static const bool enabled = [] { const auto* text = std::getenv("APS5_PAGE_TRACKER_PRECISE_WRITES"); return Enabled() && text != nullptr && std::string_view(text) == "1"; }();
+    return enabled;
+}
+
+bool CompleteWrites() {
+    static const bool enabled = [] { const auto* text = std::getenv("APS5_PAGE_TRACKER_COMPLETE_WRITES"); return Enabled() && text != nullptr && std::string_view(text) == "1"; }();
+    return enabled;
+}
+
 bool PrepareReadbacks() {
 #ifdef _WIN32
     static const bool enabled = [] {
@@ -769,12 +846,13 @@ void Initialize() {
 bool ObserversRegistered() { return registered.load(std::memory_order_acquire); }
 
 namespace {
-void declareGpuAliases(Tracker& tracker, Range range, Source source) {
+void declareGpuAliases(Tracker& tracker, Range range, Source source, std::uint64_t ticket) {
     const auto generation = tracker.MappingGeneration();
     const auto runs = tracker.UndeclaredRuns(range);
     std::uint64_t undeclared = 0;
     for (const auto run : runs) undeclared += Pages(run);
     if (Pages(range) > undeclared) tracker.NoteSkippedDeclaration(Pages(range) - undeclared);
+    tracker.StampTicket(range, ticket);
     if (runs.empty()) return;
     std::vector<Range> aliases;
 #ifdef _WIN32
@@ -791,17 +869,22 @@ void declareGpuAliases(Tracker& tracker, Range range, Source source) {
         else merged.push_back(alias);
     }
     aliases = std::move(merged);
+    std::uint64_t aliasBytes = 0;
+    for (const auto alias : aliases) aliasBytes += alias.bytes;
+    std::uint64_t runBytes = 0;
+    for (const auto run : runs) runBytes += run.bytes;
+    if (aliasBytes > runBytes) for (const auto run : runs) tracker.MarkAliased(run);
 #else
     aliases = runs;
 #endif
-    for (const auto alias : aliases) tracker.MarkGpuDeclared(alias, source, generation);
+    for (const auto alias : aliases) tracker.MarkGpuDeclared(alias, source, generation, ticket);
 }
 
-void writeAliases(Range range, Source source, bool gpu) {
+void writeAliases(Range range, Source source, bool gpu, std::uint64_t ticket = ManualTicket) {
     auto* tracker = Get();
     if (tracker == nullptr || !range.Valid()) return;
     if (gpu) {
-        try { declareGpuAliases(*tracker, range, source); } catch (...) { tracker->Poison(); }
+        try { declareGpuAliases(*tracker, range, source, CompleteWrites() ? ticket : ManualTicket); } catch (...) { tracker->Poison(); }
         return;
     }
     struct Event { Tracker* tracker; Source source; } event{tracker, source};
@@ -820,8 +903,26 @@ void writeAliases(Range range, Source source, bool gpu) {
 }
 
 void CpuWrite(Range range, Source source) { writeAliases(range, source, false); }
-void GpuWrite(Range range, Source source) { writeAliases(range, source, true); }
-void Publish(Range range) { writeAliases(range, Source::Copyback, true); }
+void GpuWrite(Range range, Source source, std::uint64_t ticket) { writeAliases(range, source, true, ticket); }
+void Publish(Range range, std::uint64_t ticket) { writeAliases(range, Source::Copyback, true, ticket); }
+
+std::pair<std::uint64_t, bool> BatchTicket(const void* recorder, std::uint64_t serial) {
+    if (!CompleteWrites() || recorder == nullptr) return {ManualTicket, false};
+    static std::mutex mutex;
+    static std::uint64_t next = 0;
+    static std::map<std::pair<const void*, std::uint64_t>, std::uint64_t> tickets;
+    std::lock_guard lock(mutex);
+    const auto [found, inserted] = tickets.try_emplace({recorder, serial}, 0);
+    if (inserted) {
+        found->second = ++next;
+        while (tickets.size() > 4096) tickets.erase(tickets.begin());
+    }
+    return {found->second, inserted};
+}
+
+void CompleteBatch(std::uint64_t ticket) {
+    if (auto* tracker = Get(); tracker != nullptr && ticket != ManualTicket) tracker->CompleteTicket(ticket);
+}
 
 void ReportIfDue(void (*print)(const char*)) {
     auto* tracker = Get();

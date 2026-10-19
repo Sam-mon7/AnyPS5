@@ -5163,6 +5163,7 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
     Require(!prepared && !uploaded, "guest memory was already uploaded");
     prepared = true;
+    addressableUpload = addressable;
     std::vector<std::uint32_t> order(regions.size());
     std::iota(order.begin(), order.end(), 0u);
     std::sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) { return regions[left].begin < regions[right].begin; });
@@ -6247,7 +6248,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
         const auto& region = *found;
         if (region.direct != nullptr || (region.mirror == nullptr && region.mirrorPieces.empty() && region.gpuCopy && region.copiedBack)) {
             const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            PageTracker::Publish({begin, end - begin});
+            PageTracker::Publish({begin, end - begin}, pageTicket);
             GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
             if (profile) {
                 const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -6514,15 +6515,22 @@ void GuestBufferMemory::prepareMirrorWrites(bool addressable) {
 
 void GuestBufferMemory::declarePageWrites() const {
     if (!PageTracker::Enabled()) return;
-    for (const auto& [begin, end] : writes) if (!BufferCache::WritesEnabled() || !BufferCache::Contains(this, begin, static_cast<std::size_t>(end - begin))) PageTracker::GpuWrite({begin, end - begin});
-    const auto mark = [](const auto& list) {
-        for (const auto& region : list) if (region.direct != nullptr && region.writable) PageTracker::GpuWrite({region.begin, region.end - region.begin});
+    for (const auto& [begin, end] : writes) if (!BufferCache::WritesEnabled() || !BufferCache::Contains(this, begin, static_cast<std::size_t>(end - begin))) PageTracker::GpuWrite({begin, end - begin}, PageTracker::Source::GpuDeclaration, pageTicket);
+    if (PageTracker::PreciseWrites() && !(addressableUpload && addressWrites)) return;
+    const auto mark = [&](const auto& list) {
+        for (const auto& region : list) if (region.direct != nullptr && region.writable) PageTracker::GpuWrite({region.begin, region.end - region.begin}, PageTracker::Source::GpuDeclaration, pageTicket);
     };
     if (space != nullptr) mark(space->base);
     mark(regions);
 }
 
 void GuestBufferMemory::BeginGpuWrites(Recorder& recorder) {
+    pageTicket = PageTracker::ManualTicket;
+    if (PageTracker::CompleteWrites() && !Recorder::InCompletion()) {
+        const auto [ticket, fresh] = PageTracker::BatchTicket(&recorder, recorder.Submissions() + 1);
+        pageTicket = ticket;
+        if (fresh) recorder.OnComplete([ticket] { PageTracker::CompleteBatch(ticket); });
+    }
     declarePageWrites();
     BufferCache::BeginWrites(this, recorder, writes);
     if (VramLazyWrites()) { beginLazyWrites(&recorder); return; }
@@ -6537,6 +6545,7 @@ void GuestBufferMemory::BeginGpuWrites(Recorder& recorder) {
 }
 
 void GuestBufferMemory::BeginGpuWrites(CommandBatch& batch) {
+    pageTicket = PageTracker::ManualTicket;
     declarePageWrites();
     if (!VramLazyWrites()) return;
     synchronousWrites = true;
