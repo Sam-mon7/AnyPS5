@@ -3804,12 +3804,15 @@ struct DispatchTimer {
         }
         if (Graphics::DispatchLockDietEnabled()) {
             const auto refresh = Graphics::DispatchHeapRefreshCounters();
-            char text[320];
-            std::snprintf(text, sizeof(text), " heap-refresh captured=%llu unavailable=%llu applied=%llu fallback=%llu staged=%.1fMiB/%.1fms presync=%llu presync-fallback=%llu",
+            char text[480];
+            const auto& by = refresh.unavailableBy;
+            std::snprintf(text, sizeof(text), " heap-refresh captured=%llu unavailable=%llu applied=%llu fallback=%llu staged=%.1fMiB/%.1fms presync=%llu presync-fallback=%llu unavailable-by=modes:%llu,space:%llu,sparse:%llu,writable:%llu,epoch:%llu,mirror:%llu,writers:%llu",
                 static_cast<unsigned long long>(refresh.captured), static_cast<unsigned long long>(refresh.unavailable),
                 static_cast<unsigned long long>(refresh.applied), static_cast<unsigned long long>(refresh.fallback),
                 refresh.stagedBytes / 1048576.0, refresh.stageUs / 1000.0,
-                static_cast<unsigned long long>(refresh.presyncs), static_cast<unsigned long long>(refresh.presyncFallbacks));
+                static_cast<unsigned long long>(refresh.presyncs), static_cast<unsigned long long>(refresh.presyncFallbacks),
+                static_cast<unsigned long long>(by[0]), static_cast<unsigned long long>(by[1]), static_cast<unsigned long long>(by[2]), static_cast<unsigned long long>(by[3]),
+                static_cast<unsigned long long>(by[4]), static_cast<unsigned long long>(by[5]), static_cast<unsigned long long>(by[6]));
             report += text;
         }
         AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %llu dispatches, phase totals:%s\n", static_cast<unsigned long long>(d.profiledDispatches), report.c_str());

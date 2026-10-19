@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -39,6 +40,7 @@ struct DispatchHeapRefreshStats {
     std::uint64_t fallback;
     std::uint64_t presyncs;
     std::uint64_t presyncFallbacks;
+    std::array<std::uint64_t, 7> unavailableBy;
 };
 
 DispatchHeapRefreshStats DispatchHeapRefreshCounters();

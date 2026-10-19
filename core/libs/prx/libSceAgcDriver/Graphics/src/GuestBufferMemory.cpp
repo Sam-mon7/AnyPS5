@@ -191,6 +191,7 @@ thread_local PreparedHeapRefresh* dispatchHeapRefresh = nullptr;
 
 struct HeapRefreshCounters {
     std::atomic<std::uint64_t> captured{0}, unavailable{0}, stagedBytes{0}, stageUs{0}, applied{0}, fallback{0}, presyncs{0}, presyncFallbacks{0};
+    std::array<std::atomic<std::uint64_t>, 7> unavailableBy{};
 };
 
 HeapRefreshCounters& HeapRefreshes() {
@@ -4266,19 +4267,21 @@ std::shared_ptr<PreparedHeapRefresh> CaptureDispatchHeapRefresh(const Context& c
     if (!DispatchLockDietEnabled()) return nullptr;
     Require(GuestMemory::GpuMutex().HeldByThisThread(), "dispatch heap capture requires the GPU mutex");
     if (writers != nullptr) writers->clear();
-    const auto unavailable = [] {
+    const auto unavailable = [](std::size_t reason) {
         HeapRefreshes().unavailable.fetch_add(1, std::memory_order_relaxed);
+        HeapRefreshes().unavailableBy[reason].fetch_add(1, std::memory_order_relaxed);
         return std::shared_ptr<PreparedHeapRefresh>{};
     };
-    if (ResidentHeapMirrors() || VramMirrorWrites() || VramDeviceLocalMirrors() || !pending) return unavailable();
+    if (ResidentHeapMirrors() || VramMirrorWrites() || VramDeviceLocalMirrors() || !pending) return unavailable(0);
     auto space = Spaces().current.load();
-    if (space == nullptr || space->device != context.device || space->heapRuns.empty() ||
-        !space->sparseMirrors.empty() || !space->writableMirrors.empty() ||
-        space->generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return unavailable();
+    if (space == nullptr || space->device != context.device || space->heapRuns.empty()) return unavailable(1);
+    if (!space->sparseMirrors.empty()) return unavailable(2);
+    if (!space->writableMirrors.empty()) return unavailable(3);
+    if (space->generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return unavailable(4);
     {
         auto& imports = Imports();
         std::lock_guard lock(imports.mutex);
-        if (imports.epoch != space->importsEpoch) return unavailable();
+        if (imports.epoch != space->importsEpoch) return unavailable(4);
     }
     auto prepared = std::make_shared<PreparedHeapRefresh>();
     prepared->space = std::move(space);
@@ -4289,7 +4292,7 @@ std::shared_ptr<PreparedHeapRefresh> CaptureDispatchHeapRefresh(const Context& c
     prepared->unwatchSerial = GuestMemory::UnwatchSerial();
     for (auto* mirror : prepared->space->heapMirrors) {
         if (!mirror->buffer->Mapped() || mirror->sparse || mirror->retired.load(std::memory_order_acquire) ||
-            mirror->writer != nullptr || mirror->lazyAddressWriter != nullptr || !mirror->pendingWrites.empty()) return unavailable();
+            mirror->writer != nullptr || mirror->lazyAddressWriter != nullptr || !mirror->pendingWrites.empty()) return unavailable(5);
         prepared->mirrors.push_back({mirror, mirror->generations, mirror->gpuRevision});
     }
     bool blocked = false;
@@ -4298,7 +4301,7 @@ std::shared_ptr<PreparedHeapRefresh> CaptureDispatchHeapRefresh(const Context& c
         blocked = true;
         if (writers != nullptr) writers->emplace_back(run.begin, run.bytes);
     }
-    if (blocked) return unavailable();
+    if (blocked) return unavailable(6);
     HeapRefreshes().captured.fetch_add(1, std::memory_order_relaxed);
     return prepared;
 }
@@ -4400,7 +4403,12 @@ DispatchHeapRefreshStats DispatchHeapRefreshCounters() {
     return {counters.captured.load(std::memory_order_relaxed), counters.unavailable.load(std::memory_order_relaxed),
         counters.stagedBytes.load(std::memory_order_relaxed), counters.stageUs.load(std::memory_order_relaxed),
         counters.applied.load(std::memory_order_relaxed), counters.fallback.load(std::memory_order_relaxed),
-        counters.presyncs.load(std::memory_order_relaxed), counters.presyncFallbacks.load(std::memory_order_relaxed)};
+        counters.presyncs.load(std::memory_order_relaxed), counters.presyncFallbacks.load(std::memory_order_relaxed),
+        [&] {
+            std::array<std::uint64_t, 7> by{};
+            for (std::size_t index = 0; index < by.size(); ++index) by[index] = counters.unavailableBy[index].load(std::memory_order_relaxed);
+            return by;
+        }()};
 }
 
 void GuestBufferMemory::AcquireRegistered() {
