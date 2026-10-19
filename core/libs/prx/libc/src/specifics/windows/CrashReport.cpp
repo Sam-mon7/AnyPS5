@@ -4,8 +4,10 @@
 #include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/FailureReport.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <span>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -243,11 +245,68 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+struct FaultSite {
+    std::atomic<std::uintptr_t> address{0};
+    std::atomic<std::uint64_t> count{0};
+};
+
+FaultSite g_faultSites[256];
+std::atomic<std::uint64_t> g_faultCounts[4];
+
+void NoteFault(std::uintptr_t instruction, bool write, bool handled) {
+    g_faultCounts[(write ? 0 : 2) + (handled ? 0 : 1)].fetch_add(1, std::memory_order_relaxed);
+    const auto start = static_cast<std::size_t>((instruction * 0x9e3779b97f4a7c15ull) >> 56u);
+    for (std::size_t probe = 0; probe < std::size(g_faultSites); ++probe) {
+        auto& site = g_faultSites[(start + probe) % std::size(g_faultSites)];
+        auto current = site.address.load(std::memory_order_relaxed);
+        if (current == 0 && site.address.compare_exchange_strong(current, instruction, std::memory_order_relaxed)) current = instruction;
+        if (current == instruction) {
+            site.count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+DWORD WINAPI ReportFaults(LPVOID) {
+    for (;;) {
+        Sleep(10000);
+        std::uint64_t counts[4];
+        for (std::size_t i = 0; i < 4; ++i) counts[i] = g_faultCounts[i].exchange(0, std::memory_order_relaxed);
+        std::uint64_t retries = 0, accepted = 0;
+        GuestArena::GuestArenaTakeFaultRetries_nid_no_patch(&retries, &accepted);
+        std::pair<std::uint64_t, std::uintptr_t> all[std::size(g_faultSites)]{};
+        std::size_t filled = 0;
+        for (auto& site : g_faultSites) {
+            const auto count = site.count.exchange(0, std::memory_order_relaxed);
+            const auto address = site.address.load(std::memory_order_relaxed);
+            if (count != 0 && address != 0) all[filled++] = {count, address};
+        }
+        std::sort(all, all + filled, [](const auto& a, const auto& b) { return a.first > b.first; });
+        const std::span<const std::pair<std::uint64_t, std::uintptr_t>> top(all, std::min<std::size_t>(filled, 8));
+        char sites[1024] = "";
+        std::size_t used = 0;
+        for (const auto& [count, address] : top) {
+            if (count == 0 || used >= sizeof(sites) - 96) continue;
+            HMODULE module = nullptr;
+            char name[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module) && module != nullptr) GetModuleFileNameA(module, name, sizeof(name));
+            const char* base = std::strrchr(name, '\\');
+            const auto offset = module != nullptr ? address - reinterpret_cast<std::uintptr_t>(module) : address;
+            used += static_cast<std::size_t>(std::snprintf(sites + used, sizeof(sites) - used, " %s+0x%llx x%llu", base != nullptr ? base + 1 : name, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(count)));
+        }
+        std::fprintf(stderr, "[gpu-faults] (10 s) writes %llu handled / %llu passed, reads %llu handled / %llu passed; GPU fault retries %llu, %llu resumed; top faulting instructions:%s\n", static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]), static_cast<unsigned long long>(retries), static_cast<unsigned long long>(accepted), sites);
+    }
+}
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] != 1 && GuestArena::GuestArenaHandleTransition_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2) {
+        const bool write = fault->ExceptionInformation[0] == 1;
+        const bool handled = write ? GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1]) : GuestArena::GuestArenaHandleTransition_nid_postfix(fault->ExceptionInformation[1]);
+        if (GuestArena::GuestArenaFaultTraceEnabled_nid_no_patch()) NoteFault(reinterpret_cast<std::uintptr_t>(fault->ExceptionAddress), write, handled);
+        if (handled) return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
@@ -519,6 +578,7 @@ const bool g_crashReportInstalled = [] {
     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
     if (IsEnvironmentSet("APS5_BUFFERED_STDERR")) BufferStderr();
+    if (GuestArena::GuestArenaFaultTraceEnabled_nid_no_patch()) CreateThread(nullptr, 0, ReportFaults, nullptr, 0, nullptr);
     AddVectoredExceptionHandler(1, ReportCrash);
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);

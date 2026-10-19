@@ -1568,9 +1568,12 @@ private:
         }
     }
 
+    inline static std::atomic<std::uint64_t> retryCalls{0}, retryAccepted{0};
+
     bool retryGpuFault(std::uintptr_t address, bool write) const {
         const auto serial = gpuProtectionSerial.load(std::memory_order_acquire);
         if (serial == 0) return false;
+        retryCalls.fetch_add(1, std::memory_order_relaxed);
         thread_local std::uintptr_t lastAddress = 0;
         thread_local std::uint64_t lastSerial = 0;
         if (lastAddress == address && lastSerial == serial) return false;
@@ -1579,8 +1582,16 @@ private:
         if (memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD) != 0 || (write ? !writable(protection) : protection != PAGE_READONLY && protection != PAGE_READWRITE && protection != PAGE_EXECUTE_READ && protection != PAGE_EXECUTE_READWRITE)) return false;
         lastAddress = address;
         lastSerial = serial;
+        retryAccepted.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
+
+public:
+    static std::pair<std::uint64_t, std::uint64_t> TakeRetryCounts() {
+        return {retryCalls.exchange(0, std::memory_order_relaxed), retryAccepted.exchange(0, std::memory_order_relaxed)};
+    }
+
+private:
 
     bool hasPageReads(std::uintptr_t address, std::size_t bytes) const {
         if (!PageReadFaultsRequested() || pageReads.empty()) return false;

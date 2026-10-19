@@ -69,6 +69,8 @@ std::size_t GuestArenaPageObserverMetadataBytes_nid_no_patch();
 void GuestArenaVisitPageAliases_nid_no_patch(std::uintptr_t address, std::size_t bytes, void (*visitor)(std::uintptr_t, std::size_t, void*), void* context);
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
 bool GuestArenaHandleTransition_nid_postfix(std::uintptr_t address);
+void GuestArenaTakeFaultRetries_nid_no_patch(std::uint64_t* calls, std::uint64_t* accepted);
+bool GuestArenaFaultTraceEnabled_nid_no_patch();
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* protection);

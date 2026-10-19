@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #ifndef _WIN32
 #include <cerrno>
 #include <fstream>
@@ -344,6 +346,20 @@ bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
 
 bool GuestArenaHandleTransition_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleTransition(address);
+}
+
+void GuestArenaTakeFaultRetries_nid_no_patch(std::uint64_t* calls, std::uint64_t* accepted) {
+    const auto [taken, kept] = WindowsMappings::TakeRetryCounts();
+    *calls = taken;
+    *accepted = kept;
+}
+
+bool GuestArenaFaultTraceEnabled_nid_no_patch() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_TRACE_GPU_FAULTS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
 }
 
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
