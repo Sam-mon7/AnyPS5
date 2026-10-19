@@ -3,6 +3,7 @@
 #include <tlhelp32.h>
 #include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/FailureReport.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <atomic>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <iterator>
 #include <utility>
+#include <vector>
 #include <mutex>
 #include "Sse4aEmulation.hpp"
 
@@ -251,20 +253,39 @@ struct FaultSite {
 };
 
 FaultSite g_faultSites[256];
+FaultSite g_faultBlocks[512];
 std::atomic<std::uint64_t> g_faultCounts[4];
 
-void NoteFault(std::uintptr_t instruction, bool write, bool handled) {
-    g_faultCounts[(write ? 0 : 2) + (handled ? 0 : 1)].fetch_add(1, std::memory_order_relaxed);
-    const auto start = static_cast<std::size_t>((instruction * 0x9e3779b97f4a7c15ull) >> 56u);
-    for (std::size_t probe = 0; probe < std::size(g_faultSites); ++probe) {
-        auto& site = g_faultSites[(start + probe) % std::size(g_faultSites)];
+void CountFault(std::span<FaultSite> table, std::uintptr_t key) {
+    const auto start = static_cast<std::size_t>((key * 0x9e3779b97f4a7c15ull) >> 32u);
+    for (std::size_t probe = 0; probe < table.size(); ++probe) {
+        auto& site = table[(start + probe) % table.size()];
         auto current = site.address.load(std::memory_order_relaxed);
-        if (current == 0 && site.address.compare_exchange_strong(current, instruction, std::memory_order_relaxed)) current = instruction;
-        if (current == instruction) {
+        if (current == 0 && site.address.compare_exchange_strong(current, key, std::memory_order_relaxed)) current = key;
+        if (current == key) {
             site.count.fetch_add(1, std::memory_order_relaxed);
             return;
         }
     }
+}
+
+void NoteFault(std::uintptr_t instruction, std::uintptr_t data, bool write, bool handled) {
+    g_faultCounts[(write ? 0 : 2) + (handled ? 0 : 1)].fetch_add(1, std::memory_order_relaxed);
+    CountFault(g_faultSites, instruction);
+    CountFault(g_faultBlocks, data & ~std::uintptr_t{0xffff});
+}
+
+std::size_t TakeTopFaults(std::span<FaultSite> table, std::span<std::pair<std::uint64_t, std::uintptr_t>> top) {
+    std::vector<std::pair<std::uint64_t, std::uintptr_t>> all;
+    for (auto& site : table) {
+        const auto count = site.count.exchange(0, std::memory_order_relaxed);
+        const auto address = site.address.load(std::memory_order_relaxed);
+        if (count != 0 && address != 0) all.emplace_back(count, address);
+    }
+    std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    const auto kept = std::min(all.size(), top.size());
+    std::copy_n(all.begin(), kept, top.begin());
+    return kept;
 }
 
 DWORD WINAPI ReportFaults(LPVOID) {
@@ -276,15 +297,18 @@ DWORD WINAPI ReportFaults(LPVOID) {
         GuestArena::GuestArenaTakeFaultRetries_nid_no_patch(&retries, &accepted);
         std::uint64_t queries = 0, queryNs = 0;
         GuestArena::GuestArenaTakeQueryCounts_nid_no_patch(&queries, &queryNs);
-        std::pair<std::uint64_t, std::uintptr_t> all[std::size(g_faultSites)]{};
-        std::size_t filled = 0;
-        for (auto& site : g_faultSites) {
-            const auto count = site.count.exchange(0, std::memory_order_relaxed);
-            const auto address = site.address.load(std::memory_order_relaxed);
-            if (count != 0 && address != 0) all[filled++] = {count, address};
+        std::pair<std::uint64_t, std::uintptr_t> all[8]{};
+        const std::span<const std::pair<std::uint64_t, std::uintptr_t>> top(all, TakeTopFaults(g_faultSites, all));
+        std::pair<std::uint64_t, std::uintptr_t> blockList[6]{};
+        const std::span<const std::pair<std::uint64_t, std::uintptr_t>> blocks(blockList, TakeTopFaults(g_faultBlocks, blockList));
+        char blockText[768] = "";
+        std::size_t blockUsed = 0;
+        for (const auto& [count, block] : blocks) {
+            const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(block, false);
+            if (range != nullptr) blockUsed += static_cast<std::size_t>(std::snprintf(blockText + blockUsed, sizeof(blockText) - blockUsed, " 0x%llx x%llu (allocation 0x%llx, %.1f MiB%s)", static_cast<unsigned long long>(block), static_cast<unsigned long long>(count), static_cast<unsigned long long>(range->allocationAddress), range->allocationBytes / 1048576.0, range->gpu ? ", GPU" : ""));
+            else blockUsed += static_cast<std::size_t>(std::snprintf(blockText + blockUsed, sizeof(blockText) - blockUsed, " 0x%llx x%llu (unregistered)", static_cast<unsigned long long>(block), static_cast<unsigned long long>(count)));
+            if (blockUsed >= sizeof(blockText) - 128) break;
         }
-        std::sort(all, all + filled, [](const auto& a, const auto& b) { return a.first > b.first; });
-        const std::span<const std::pair<std::uint64_t, std::uintptr_t>> top(all, std::min<std::size_t>(filled, 8));
         char sites[1024] = "";
         std::size_t used = 0;
         for (const auto& [count, address] : top) {
@@ -296,7 +320,7 @@ DWORD WINAPI ReportFaults(LPVOID) {
             const auto offset = module != nullptr ? address - reinterpret_cast<std::uintptr_t>(module) : address;
             used += static_cast<std::size_t>(std::snprintf(sites + used, sizeof(sites) - used, " %s+0x%llx x%llu", base != nullptr ? base + 1 : name, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(count)));
         }
-        std::fprintf(stderr, "[gpu-faults] (10 s) writes %llu handled / %llu passed, reads %llu handled / %llu passed; GPU fault retries %llu, %llu resumed; VirtualQuery %llu calls, %.1f ms; top faulting instructions:%s\n", static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]), static_cast<unsigned long long>(retries), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(queries), static_cast<double>(queryNs) / 1e6, sites);
+        std::fprintf(stderr, "[gpu-faults] (10 s) writes %llu handled / %llu passed, reads %llu handled / %llu passed; GPU fault retries %llu, %llu resumed; VirtualQuery %llu calls, %.1f ms; top faulting 64 KiB blocks:%s; top faulting instructions:%s\n", static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]), static_cast<unsigned long long>(retries), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(queries), static_cast<double>(queryNs) / 1e6, blockText, sites);
     }
 }
 
@@ -306,7 +330,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2) {
         const bool write = fault->ExceptionInformation[0] == 1;
         const bool handled = write ? GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1]) : GuestArena::GuestArenaHandleTransition_nid_postfix(fault->ExceptionInformation[1]);
-        if (GuestArena::GuestArenaFaultTraceEnabled_nid_no_patch()) NoteFault(reinterpret_cast<std::uintptr_t>(fault->ExceptionAddress), write, handled);
+        if (GuestArena::GuestArenaFaultTraceEnabled_nid_no_patch()) NoteFault(reinterpret_cast<std::uintptr_t>(fault->ExceptionAddress), fault->ExceptionInformation[1], write, handled);
         if (handled) return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
