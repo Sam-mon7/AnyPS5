@@ -1465,9 +1465,16 @@ static void CheckHotSharedPages() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         Require(collect(first, page * 2) == 1);
         Require(collect(first, page * 2) == 0 && armed(first));
+        left[7] = 3;
+        Require(collect(first, page * 2) == 1 && !armed(first));
+        GuestArena::GuestArenaCoolPages_nid_no_patch(reinterpret_cast<std::uintptr_t>(first), page * 2);
+        Require(collect(first, page * 2) == 1);
+        Require(collect(first, page * 2) == 0 && armed(first));
     } else {
         Require(armed(first));
         Require(collect(first, page * 2) == 0);
+        GuestArena::GuestArenaCoolPages_nid_no_patch(reinterpret_cast<std::uintptr_t>(first), page * 2);
+        Require(collect(first, page * 2) == 0 && armed(first));
     }
     Require(sceKernelMunmap(first, page * 2) == 0);
     Require(sceKernelMunmap(second, page * 2) == 0);

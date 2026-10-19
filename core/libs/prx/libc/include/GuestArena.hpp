@@ -71,6 +71,7 @@ bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
 bool GuestArenaHandleTransition_nid_postfix(std::uintptr_t address);
 void GuestArenaTakeFaultRetries_nid_no_patch(std::uint64_t* calls, std::uint64_t* accepted);
 void GuestArenaTakeQueryCounts_nid_no_patch(std::uint64_t* calls, std::uint64_t* nanoseconds);
+void GuestArenaCoolPages_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 bool GuestArenaFaultTraceEnabled_nid_no_patch();
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes);

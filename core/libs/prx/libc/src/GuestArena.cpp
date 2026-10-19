@@ -360,6 +360,10 @@ void GuestArenaTakeQueryCounts_nid_no_patch(std::uint64_t* calls, std::uint64_t*
     *nanoseconds = spent;
 }
 
+void GuestArenaCoolPages_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().CoolPages(address, bytes);
+}
+
 bool GuestArenaFaultTraceEnabled_nid_no_patch() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_TRACE_GPU_FAULTS");

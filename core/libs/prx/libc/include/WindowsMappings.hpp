@@ -106,6 +106,18 @@ public:
         return enabled;
     }
 
+    void CoolPages(std::uintptr_t address, std::size_t bytes) {
+        if (!HotPagesEnabled() || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return;
+        MemoryLockProbe::Lock lock(mutex, "cool-pages", bytes);
+        const auto end = address + bytes;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+            const auto mask = subpagesOf(it->first, address, end);
+            for (std::size_t sub = 0; sub < subpages; ++sub) {
+                if ((mask & (1u << sub)) != 0) it->second.page->hotUntil[sub] = 0;
+            }
+        }
+    }
+
     void EnablePageObservation(bool (*ready)() noexcept) {
         if (!ObservationRequested()) return;
         MemoryLockProbe::Lock lock(mutex, "page-observation-enable", 0);

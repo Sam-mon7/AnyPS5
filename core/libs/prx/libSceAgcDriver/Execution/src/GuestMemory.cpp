@@ -1469,15 +1469,22 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
         }
         return tracker.generation;
     };
+    const auto storeCooled = [&] {
+        const auto stored = store();
+#ifdef _WIN32
+        GuestArena::GuestArenaCoolPages_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+#endif
+        return stored;
+    };
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return stampStored(tracker, store());
+    if (!tracker.watched || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return stampStored(tracker, storeCooled());
     constexpr std::uint64_t page = 4096;
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return stampStored(tracker, store());
-    const auto stored = store();
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return stampStored(tracker, storeCooled());
+    const auto stored = storeCooled();
     walkWrites(tracker, first, stop, StampKind::Driver);
     return stampStored(tracker, stored);
 }
