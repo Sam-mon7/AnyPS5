@@ -377,15 +377,23 @@ bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
     constexpr uint32_t waitUserDataEnd = 0xc8000000u;
     constexpr uint32_t waitUserDataBeginDwords = 4u;
     constexpr uint32_t internalDataDwords = 3u;
-    if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG || KYTY_PM4_R(cmd_id) != 1u || payload[0] != internalDataRegister) {
+    if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG || payload[0] != internalDataRegister) {
         return false;
     }
     const auto dwords = KYTY_PM4_LEN(cmd_id);
+    bool internal = false;
     if (dwords == waitUserDataBeginDwords) {
         const auto tag = payload[1] & 0xffff0000u;
-        return tag == waitUserDataBegin32 || tag == waitUserDataBegin64;
+        internal = tag == waitUserDataBegin32 || tag == waitUserDataBegin64;
+    } else {
+        internal = dwords == internalDataDwords && (payload[1] == waitUserDataEnd || payload[1] == drawIndirectMultiBegin || payload[1] == drawIndirectMultiEnd);
     }
-    return dwords == internalDataDwords && (payload[1] == waitUserDataEnd || payload[1] == drawIndirectMultiBegin || payload[1] == drawIndirectMultiEnd);
+    if (!internal) {
+        std::fprintf(stderr, "[kyty-gpu] unknown internal data packet %08x:", cmd_id);
+        for (uint32_t index = 0; index + 1 < dwords; ++index) std::fprintf(stderr, " %08x", payload[index]);
+        std::fprintf(stderr, "\n");
+    }
+    return internal;
 }
 
 }
