@@ -162,6 +162,21 @@ std::uint64_t tscFrequency() {
     return sceKernelGetTscFrequency();
 }
 
+void* mapAlias(std::uintptr_t address, std::size_t bytes) {
+    try {
+        return GuestArena::GuestArenaMapAlias_nid_postfix(address, bytes);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void unmapAlias(void* alias) {
+    try {
+        GuestArena::GuestArenaUnmapAlias_nid_postfix(alias);
+    } catch (...) {
+    }
+}
+
 void titleId(char* value, std::size_t size) {
     const auto id = GetAppTitleId_nid_postfix();
     std::snprintf(value, size, "%.*s", static_cast<int>(sizeof(id.value)), id.value);
@@ -169,7 +184,7 @@ void titleId(char* value, std::size_t size) {
 
 constexpr KytyGpuHostTable hostTable{
     &readEvent, &writeEvent, &pendingCount, &pendingAt, &setPending, &addEvent, &triggerEvent, &deleteEvent, &pinEqueue,
-    &processTime, &processTimeCounter, &readTsc, &tscFrequency, &titleId,
+    &processTime, &processTimeCounter, &readTsc, &tscFrequency, &titleId, &mapAlias, &unmapAlias,
 };
 
 template <typename Function>

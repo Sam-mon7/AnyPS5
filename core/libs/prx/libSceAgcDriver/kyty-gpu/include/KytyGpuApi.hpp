@@ -39,6 +39,8 @@ struct KytyGpuHostTable {
     std::uint64_t (*readTsc)();
     std::uint64_t (*tscFrequency)();
     void (*titleId)(char* value, std::size_t size);
+    void* (*mapAlias)(std::uintptr_t address, std::size_t bytes);
+    void (*unmapAlias)(void* alias);
 };
 
 struct KytyGpuShader {

@@ -91,6 +91,7 @@ struct Counts {
     std::atomic<std::uint64_t> protectCalls{0};
     std::atomic<std::uint64_t> protectSyscalls{0};
     std::atomic<std::uint64_t> backingOpens{0};
+    std::atomic<std::uint64_t> aliasCopies{0};
     std::atomic<std::uint64_t> backingNs{0};
 };
 
@@ -156,8 +157,14 @@ constexpr std::uint8_t StateOpen = 0;
 constexpr std::uint8_t StateRead = 1;
 constexpr std::uint8_t StateNoAccess = 2;
 
+constexpr std::uint8_t AliasUnknown = 0;
+constexpr std::uint8_t AliasMapped = 1;
+constexpr std::uint8_t AliasUnavailable = 2;
+
 struct Region {
     std::mutex mutex;
+    std::uint8_t aliasState = AliasUnknown;
+    std::uint8_t* alias = nullptr;
     std::array<std::atomic<std::uint8_t>, RegionPages> state{};
     std::array<std::uint8_t, RegionPages> hostWrites{};
     std::array<DWORD, RegionPages> original{};
@@ -343,6 +350,30 @@ void mapLate(std::uint64_t address) {
     resources->MapMemory(begin, end - begin);
 }
 
+std::uint8_t* regionAlias(Region& region, std::uint64_t base) {
+    if (region.aliasState == AliasUnknown) {
+        auto* alias = host->mapAlias != nullptr ? static_cast<std::uint8_t*>(host->mapAlias(base, RegionBytes)) : nullptr;
+        region.alias = alias;
+        region.aliasState = alias != nullptr ? AliasMapped : AliasUnavailable;
+    }
+    return region.alias;
+}
+
+void dropAliases(std::uint64_t begin, std::uint64_t end) {
+    for (auto base = begin & ~(RegionBytes - 1); base < end; base += RegionBytes) {
+        auto* region = findRegion(base);
+        if (region == nullptr) continue;
+        std::uint8_t* alias = nullptr;
+        {
+            std::lock_guard lock(region->mutex);
+            alias = region->alias;
+            region->alias = nullptr;
+            region->aliasState = AliasUnknown;
+        }
+        if (alias != nullptr) host->unmapAlias(alias);
+    }
+}
+
 template <typename Copy>
 bool backing(std::uint64_t address, std::uint64_t bytes, bool sparse, bool write, Copy&& copy) {
     for (auto at = address; at < address + bytes;) {
@@ -359,11 +390,11 @@ bool backing(std::uint64_t address, std::uint64_t bytes, bool sparse, bool write
                     const bool live = committed(piece, info);
                     const auto stop = std::min(run, regionEnd(info) > piece ? regionEnd(info) : piece + PageBytes);
                     if (!live && !sparse) return false;
-                    copy(piece, stop - piece, live);
+                    copy(piece, stop - piece, live ? reinterpret_cast<std::uint8_t*>(piece) : nullptr);
                     piece = stop;
                 }
             } else {
-                copy(at, run - at, true);
+                copy(at, run - at, reinterpret_cast<std::uint8_t*>(at));
             }
             at = run;
             continue;
@@ -373,10 +404,16 @@ bool backing(std::uint64_t address, std::uint64_t bytes, bool sparse, bool write
         auto* region = findRegion(page);
         std::lock_guard lock(region->mutex);
         const auto index = (page % RegionBytes) / PageBytes;
+        if (auto* alias = regionAlias(*region, page & ~(RegionBytes - 1)); alias != nullptr) {
+            counts.aliasCopies.fetch_add(1, std::memory_order_relaxed);
+            copy(at, next - at, alias + (at % RegionBytes));
+            at = next;
+            continue;
+        }
         counts.backingOpens.fetch_add(1, std::memory_order_relaxed);
         DWORD previous = 0;
         VirtualProtect(reinterpret_cast<void*>(page), PageBytes, region->original[index], &previous);
-        copy(at, next - at, true);
+        copy(at, next - at, reinterpret_cast<std::uint8_t*>(at));
         VirtualProtect(reinterpret_cast<void*>(page), PageBytes, previous, &previous);
         at = next;
     }
@@ -742,8 +779,8 @@ namespace Libs::LibKernel::Memory {
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
     auto* bytes = static_cast<std::uint8_t*>(data);
-    return backing(vaddr, size, false, false, [&](std::uint64_t at, std::uint64_t length, bool) {
-        std::memcpy(bytes + (at - vaddr), reinterpret_cast<const void*>(at), static_cast<std::size_t>(length));
+    return backing(vaddr, size, false, false, [&](std::uint64_t at, std::uint64_t length, std::uint8_t* where) {
+        std::memcpy(bytes + (at - vaddr), where, static_cast<std::size_t>(length));
     });
 }
 
@@ -758,9 +795,9 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 
 bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
     auto* bytes = static_cast<std::uint8_t*>(data);
-    return backing(vaddr, size, true, false, [&](std::uint64_t at, std::uint64_t length, bool live) {
-        if (live) {
-            std::memcpy(bytes + (at - vaddr), reinterpret_cast<const void*>(at), static_cast<std::size_t>(length));
+    return backing(vaddr, size, true, false, [&](std::uint64_t at, std::uint64_t length, std::uint8_t* where) {
+        if (where != nullptr) {
+            std::memcpy(bytes + (at - vaddr), where, static_cast<std::size_t>(length));
         } else {
             std::memset(bytes + (at - vaddr), 0, static_cast<std::size_t>(length));
         }
@@ -788,8 +825,8 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
     const auto* bytes = static_cast<const std::uint8_t*>(data);
-    const bool written = backing(vaddr, size, false, true, [&](std::uint64_t at, std::uint64_t length, bool) {
-        std::memcpy(reinterpret_cast<void*>(at), bytes + (at - vaddr), static_cast<std::size_t>(length));
+    const bool written = backing(vaddr, size, false, true, [&](std::uint64_t at, std::uint64_t length, std::uint8_t* where) {
+        std::memcpy(where, bytes + (at - vaddr), static_cast<std::size_t>(length));
     });
     if (!written) {
         EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
@@ -912,9 +949,9 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             const auto now = window->loop.presented_frames.load(std::memory_order_relaxed);
-            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu read-faults=%llu fault-ms=%llu read-fault-ms=%llu protect-ms=%llu protect-calls=%llu protect-syscalls=%llu backing-opens=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
+            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu race-retries=%llu host-writes=%llu read-faults=%llu fault-ms=%llu read-fault-ms=%llu protect-ms=%llu protect-calls=%llu protect-syscalls=%llu backing-opens=%llu alias-copies=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
                          static_cast<unsigned long long>(counts.dcbs.load()), static_cast<unsigned long long>(counts.acbs.load()), static_cast<unsigned long long>(counts.adds.load()), static_cast<unsigned long long>(counts.graphicsTriggers.load()),
-                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()), static_cast<unsigned long long>(counts.readFaults.load()), static_cast<unsigned long long>(counts.faultNs.load() / 1000000), static_cast<unsigned long long>(counts.readFaultNs.load() / 1000000), static_cast<unsigned long long>(counts.protectNs.load() / 1000000), static_cast<unsigned long long>(counts.protectCalls.load()), static_cast<unsigned long long>(counts.protectSyscalls.load()), static_cast<unsigned long long>(counts.backingOpens.load()));
+                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()), static_cast<unsigned long long>(counts.raceRetries.load()), static_cast<unsigned long long>(counts.hostWrites.load()), static_cast<unsigned long long>(counts.readFaults.load()), static_cast<unsigned long long>(counts.faultNs.load() / 1000000), static_cast<unsigned long long>(counts.readFaultNs.load() / 1000000), static_cast<unsigned long long>(counts.protectNs.load() / 1000000), static_cast<unsigned long long>(counts.protectCalls.load()), static_cast<unsigned long long>(counts.protectSyscalls.load()), static_cast<unsigned long long>(counts.backingOpens.load()), static_cast<unsigned long long>(counts.aliasCopies.load()));
             previous = now;
             if (statsEnabled()) {
                 std::lock_guard lock(hotMutex);
@@ -972,6 +1009,7 @@ __declspec(dllexport) void KytyGpuUnmapMemory(std::uint64_t address, std::uint64
     if (resources == nullptr || bytes == 0) return;
     removeMapping(address, address + bytes);
     if (Libs::Graphics::GuestRange{address, bytes}.Valid()) resources->UnmapMemory(address, bytes);
+    dropAliases(address, address + bytes);
 }
 
 __declspec(dllexport) void KytyGpuMapShader(const KytyGpuShader* shader) {
