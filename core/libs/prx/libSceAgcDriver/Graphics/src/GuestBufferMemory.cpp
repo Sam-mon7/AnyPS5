@@ -200,7 +200,7 @@ HeapRefreshCounters& HeapRefreshes() {
 }
 
 struct HeapGpuRefreshCounts {
-    std::atomic<std::uint64_t> runs{0}, copies{0}, bytes{0}, notInPlace{0}, pendingResults{0}, unimported{0}, unmirrored{0}, mirrored{0}, labels{0};
+    std::atomic<std::uint64_t> runs{0}, copies{0}, bytes{0}, notInPlace{0}, pendingResults{0}, unimported{0}, unmirrored{0}, mirrored{0}, labels{0}, heldWaits{0};
 };
 
 HeapGpuRefreshCounts& HeapGpuRefreshes() {
@@ -2433,6 +2433,19 @@ void prepareRange(std::uint64_t address, std::uint64_t bytes, bool flush = true)
     syncRange(address, bytes, flush);
 }
 
+bool mirrorHoldsPendingWrites(const ImageMirror* mirror, std::uint64_t begin, std::uint64_t end) {
+    if (!heapGpuRefresh() || mirror == nullptr || !mirror->heap || end <= begin) return false;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || Recorder::InCompletion()) return false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::vector<Recorder::MirrorWrite> mirrored;
+    if (!recorder->InPlaceWritesOver(begin, static_cast<std::size_t>(end - begin), ranges, &mirrored) || !ranges.empty()) return false;
+    const auto tag = reinterpret_cast<std::uintptr_t>(mirror->buffer.get());
+    if (!std::all_of(mirrored.begin(), mirrored.end(), [&](const auto& write) { return write.mirror == tag; })) return false;
+    HeapGpuRefreshes().heldWaits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 void excludeBlocks(std::vector<RefreshBlock>& blocks, std::size_t first, std::span<const std::pair<std::uint64_t, std::uint64_t>> excluded) {
     if (excluded.empty() || first >= blocks.size()) return;
     std::vector<RefreshBlock> kept;
@@ -4581,7 +4594,7 @@ std::string HeapGpuRefreshWriters() {
         for (const auto& [offset, count] : NotInPlaceWriters()) writers.emplace_back(count, offset);
     }
     std::sort(writers.rbegin(), writers.rend());
-    std::string text = "labels:" + std::to_string(HeapGpuRefreshes().labels.load(std::memory_order_relaxed)) + ",";
+    std::string text = "labels:" + std::to_string(HeapGpuRefreshes().labels.load(std::memory_order_relaxed)) + ",held-waits:" + std::to_string(HeapGpuRefreshes().heldWaits.load(std::memory_order_relaxed)) + ",";
     char entry[48];
     for (std::size_t index = 0; index < writers.size() && index < 6; ++index) {
         std::snprintf(entry, sizeof(entry), "%s+0x%llx:%llu", index == 0 ? "" : ",", static_cast<unsigned long long>(writers[index].second), static_cast<unsigned long long>(writers[index].first));
@@ -5576,6 +5589,7 @@ void GuestBufferMemory::completeSpaceWrites() const {
         next = base.size();
         for (const auto index : candidates) {
             if (VramMirrorWrites() && base[index].mirror != nullptr && base[index].mirror->heap) continue;
+            if (mirrorHoldsPendingWrites(base[index].mirror.get(), base[index].begin, base[index].end)) continue;
             if (!CompletePendingCpuWrites(context, base[index].begin, static_cast<std::size_t>(base[index].end - base[index].begin))) continue;
             next = index + 1;
             break;
@@ -5590,7 +5604,11 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
-    for (const auto& region : regions) if (!VramMirrorWrites() || !mirrorOverlaps(context, region.begin, region.end)) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+    for (const auto& region : regions) {
+        if (VramMirrorWrites() && mirrorOverlaps(context, region.begin, region.end)) continue;
+        if (mirrorHoldsPendingWrites(region.mirror.get(), region.begin, region.end)) continue;
+        CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+    }
     if (space != nullptr) completeSpaceWrites();
     uploaded = true;
     for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
