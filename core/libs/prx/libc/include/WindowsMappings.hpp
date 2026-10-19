@@ -9,6 +9,7 @@
 #include <array>
 #include <bit>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -88,6 +89,22 @@ public:
     }
 
     static constexpr std::uint64_t HotPageMilliseconds = 1000;
+
+    static bool FastWriteFaults() {
+        static const bool enabled = [] {
+            const auto* value = std::getenv("APS5_FAST_WRITE_FAULTS");
+            return value != nullptr && std::string_view(value) == "1";
+        }();
+        return enabled;
+    }
+
+    static bool QueryTraceEnabled() {
+        static const bool enabled = [] {
+            const auto* value = std::getenv("APS5_TRACE_GPU_FAULTS");
+            return value != nullptr && std::string_view(value) == "1";
+        }();
+        return enabled;
+    }
 
     void EnablePageObservation(bool (*ready)() noexcept) {
         if (!ObservationRequested()) return;
@@ -1615,6 +1632,10 @@ public:
         return {retryCalls.exchange(0, std::memory_order_relaxed), retryAccepted.exchange(0, std::memory_order_relaxed)};
     }
 
+    static std::pair<std::uint64_t, std::uint64_t> TakeQueryCounts() {
+        return {queryCalls.exchange(0, std::memory_order_relaxed), queryNanoseconds.exchange(0, std::memory_order_relaxed)};
+    }
+
 private:
 
     bool hasPageReads(std::uintptr_t address, std::size_t bytes) const {
@@ -1647,6 +1668,7 @@ private:
         if (callback == nullptr) return std::nullopt;
         std::uintptr_t owner = 0;
         std::uint64_t serial = 0;
+        bool tracked = false;
         {
             MemoryLockProbe::Lock lock(mutex, "gpu-fault", 1);
             owner = gpuOwner(address);
@@ -1662,9 +1684,12 @@ private:
                     else observe(PageEvent::WriteFault, address & ~(subpageBytes - 1), subpageBytes);
                 }
                 serial = page.serial;
+            } else if (write && FastWriteFaults()) {
+                const auto view = views.find(address & ~(pageBytes - 1));
+                tracked = view != views.end() && writable(view->second.protection);
             }
         }
-        if (owner == 0) return retryGpuFault(address, write) ? std::optional<bool>{true} : std::nullopt;
+        if (owner == 0) return !tracked && retryGpuFault(address, write) ? std::optional<bool>{true} : std::nullopt;
         if (!callback(owner, write)) {
             MemoryLockProbe::Lock lock(mutex, "gpu-fault-stale", 1);
             const auto found = gpuPages.find(owner);
@@ -1849,9 +1874,17 @@ private:
         throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), operation);
     }
 
+    inline static std::atomic<std::uint64_t> queryCalls{0}, queryNanoseconds{0};
+
     static MEMORY_BASIC_INFORMATION query(std::uintptr_t address) {
         MEMORY_BASIC_INFORMATION memory{};
+        const bool timed = QueryTraceEnabled();
+        const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) != sizeof(memory)) fail("query guest memory");
+        if (timed) {
+            queryCalls.fetch_add(1, std::memory_order_relaxed);
+            queryNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+        }
         return memory;
     }
 

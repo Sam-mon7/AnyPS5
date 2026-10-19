@@ -354,6 +354,12 @@ void GuestArenaTakeFaultRetries_nid_no_patch(std::uint64_t* calls, std::uint64_t
     *accepted = kept;
 }
 
+void GuestArenaTakeQueryCounts_nid_no_patch(std::uint64_t* calls, std::uint64_t* nanoseconds) {
+    const auto [taken, spent] = WindowsMappings::TakeQueryCounts();
+    *calls = taken;
+    *nanoseconds = spent;
+}
+
 bool GuestArenaFaultTraceEnabled_nid_no_patch() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_TRACE_GPU_FAULTS");

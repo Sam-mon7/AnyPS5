@@ -274,6 +274,8 @@ DWORD WINAPI ReportFaults(LPVOID) {
         for (std::size_t i = 0; i < 4; ++i) counts[i] = g_faultCounts[i].exchange(0, std::memory_order_relaxed);
         std::uint64_t retries = 0, accepted = 0;
         GuestArena::GuestArenaTakeFaultRetries_nid_no_patch(&retries, &accepted);
+        std::uint64_t queries = 0, queryNs = 0;
+        GuestArena::GuestArenaTakeQueryCounts_nid_no_patch(&queries, &queryNs);
         std::pair<std::uint64_t, std::uintptr_t> all[std::size(g_faultSites)]{};
         std::size_t filled = 0;
         for (auto& site : g_faultSites) {
@@ -294,7 +296,7 @@ DWORD WINAPI ReportFaults(LPVOID) {
             const auto offset = module != nullptr ? address - reinterpret_cast<std::uintptr_t>(module) : address;
             used += static_cast<std::size_t>(std::snprintf(sites + used, sizeof(sites) - used, " %s+0x%llx x%llu", base != nullptr ? base + 1 : name, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(count)));
         }
-        std::fprintf(stderr, "[gpu-faults] (10 s) writes %llu handled / %llu passed, reads %llu handled / %llu passed; GPU fault retries %llu, %llu resumed; top faulting instructions:%s\n", static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]), static_cast<unsigned long long>(retries), static_cast<unsigned long long>(accepted), sites);
+        std::fprintf(stderr, "[gpu-faults] (10 s) writes %llu handled / %llu passed, reads %llu handled / %llu passed; GPU fault retries %llu, %llu resumed; VirtualQuery %llu calls, %.1f ms; top faulting instructions:%s\n", static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]), static_cast<unsigned long long>(retries), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(queries), static_cast<double>(queryNs) / 1e6, sites);
     }
 }
 

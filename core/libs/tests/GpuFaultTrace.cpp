@@ -17,6 +17,12 @@ int main() {
         std::cerr << "GPU fault retries were counted without any guest fault\n";
         return 1;
     }
+    std::uint64_t queries = 1, queryNs = 1;
+    GuestArena::GuestArenaTakeQueryCounts_nid_no_patch(&queries, &queryNs);
+    if (!expected && (queries != 0 || queryNs != 0)) {
+        std::cerr << "VirtualQuery calls were timed with the trace off\n";
+        return 1;
+    }
     std::cout << "GPU fault trace " << (expected ? "on" : "off") << '\n';
     return 0;
 }

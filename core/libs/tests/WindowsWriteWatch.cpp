@@ -2,10 +2,12 @@
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <thread>
 
 namespace {
@@ -537,6 +539,21 @@ void CheckGpuPrivate() {
 }
 }
 
+void CheckFastWriteFaults() {
+    const auto* setting = std::getenv("APS5_FAST_WRITE_FAULTS");
+    const bool fast = setting != nullptr && std::string_view(setting) == "1";
+    Region region;
+    Require(region.Collect(Collection::All) == Pages(0, 16), "fast-fault region did not start dirty");
+    Require(region.Protection(3) == PAGE_READONLY, "fast-fault page was not armed");
+    Mappings::TakeRetryCounts();
+    const auto before = faults.load();
+    region.Write(3, 0x5a);
+    const auto [retries, resumed] = Mappings::TakeRetryCounts();
+    Require(faults == before + 1 && region.first[3 * Small] == 0x5a && region.Protection(3) == PAGE_READWRITE, "tracked write fault was not handled once");
+    Require(region.Collect(Collection::Armed) == Pages(3, 4), "tracked write fault lost its dirty page");
+    Require(fast ? retries == 0 : retries == 1 && resumed == 0, "tracked write fault took the wrong retry path");
+}
+
 int main() {
     auto* handler = AddVectoredExceptionHandler(1, HandleWrite);
     try {
@@ -556,6 +573,7 @@ int main() {
         CheckGpuAliasOnlyMigration();
         CheckGpuProtectionAndAliases();
         CheckGpuPrivate();
+        CheckFastWriteFaults();
         Mappings::Get().SetGpuPageFault(nullptr);
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
