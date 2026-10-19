@@ -241,6 +241,10 @@ namespace {
 constexpr std::uint64_t Block = 65536;
 constexpr std::uint64_t FaultWindow = 4u << 20u;
 
+bool guestRange(std::uint64_t address, std::uint64_t bytes) {
+    return Libs::Graphics::GuestRange{address, bytes}.Valid();
+}
+
 struct State {
     VkInstance instance = VK_NULL_HANDLE;
     PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
@@ -326,6 +330,7 @@ bool pageFault(std::uintptr_t page, bool write) {
 }
 
 void pollCpuWrites(State& s, std::uint64_t begin, std::uint64_t end) {
+    if (end <= begin || !guestRange(begin, end - begin)) return;
     const auto first = begin / Block * Block;
     const auto last = (end + Block - 1) / Block * Block;
     const auto blocks = static_cast<std::size_t>((last - first) / Block);
@@ -401,7 +406,7 @@ void SetInstance(VkInstance instance, PFN_vkGetInstanceProcAddr getInstanceProcA
 }
 
 std::optional<VkDescriptorBufferInfo> Descriptor(const Context& context, std::uint64_t address, std::size_t bytes, bool written, std::uint32_t& adjustment) {
-    if (!Enabled() || bytes == 0 || Recorder::Active() == nullptr || Recorder::InCompletion()) return std::nullopt;
+    if (!Enabled() || !guestRange(address, bytes) || Recorder::Active() == nullptr || Recorder::InCompletion()) return std::nullopt;
     GuestMemory::AssertGpuLockHeld("Kyty buffer cache descriptor");
     auto* cache = ensure(context);
     if (cache == nullptr) return std::nullopt;
@@ -437,7 +442,7 @@ void AddressRanges(const Context& context, std::vector<ShaderRecompiler::BdaAbi:
         const auto window = address / FaultWindow * FaultWindow;
         const auto begin = std::max<std::uint64_t>(range->address, window);
         const auto end = std::min<std::uint64_t>(range->address + range->bytes, window + FaultWindow);
-        if (begin >= end || cache->IsRegionRegistered(begin, end - begin)) continue;
+        if (begin >= end || !guestRange(begin, end - begin) || cache->IsRegionRegistered(begin, end - begin)) continue;
         pollCpuWrites(s, begin, end);
         static_cast<void>(cache->ObtainBuffer(begin, end - begin, false));
         ++s.counts.mapped;
@@ -466,7 +471,7 @@ void AddressRanges(const Context& context, std::vector<ShaderRecompiler::BdaAbi:
 }
 
 void NoteUnmapped(std::uint64_t address) {
-    if (!Enabled()) return;
+    if (!Enabled() || !guestRange(address, 1)) return;
     auto& s = state();
     std::lock_guard lock(s.unmappedMutex);
     s.unmapped.push_back(address);
@@ -474,7 +479,7 @@ void NoteUnmapped(std::uint64_t address) {
 }
 
 void Flush(std::uint64_t address, std::size_t bytes) {
-    if (!Enabled() || bytes == 0) return;
+    if (!Enabled() || !guestRange(address, bytes)) return;
     auto& s = state();
     if (s.cache == nullptr || Recorder::InCompletion()) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());

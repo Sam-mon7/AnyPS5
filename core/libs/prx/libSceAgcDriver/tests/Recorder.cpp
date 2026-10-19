@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/KytyBufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -78,6 +79,7 @@ void RunVramWritableTests(const AgcDriver::Graphics::Context& context, AgcDriver
 void RunVramLazyTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, bool imports);
 void RunLazyStorageWriteBackTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 void RunLazyMirrorLabelTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
+void RunKytyBufferCacheTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 void RunLazyPathFixTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 void RunVramDeferredTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 void RunVramCleanupTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
@@ -313,6 +315,8 @@ public:
     ~Device() { release(); }
     bool NullDescriptors() const { return nullDescriptors; }
     const Context& GetContext() const { return context; }
+    VkInstance Instance() const { return instance; }
+    PFN_vkGetInstanceProcAddr InstanceProc() const { return instanceProc; }
     bool Graphics() const { return graphics; }
     VkPhysicalDeviceProperties Properties() const {
         VkPhysicalDeviceProperties properties{};
@@ -9168,6 +9172,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--record-worker-only") {
             copiedDirectOrderingTests(device, recorder, true);
             std::cout << "Record worker device tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--kyty-buffer-cache-only") {
+            AgcDriver::Graphics::KytyBufferCache::SetInstance(device.Instance(), device.InstanceProc());
+            RunKytyBufferCacheTests(device.GetContext(), recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--lazy-mirror-labels-only") {

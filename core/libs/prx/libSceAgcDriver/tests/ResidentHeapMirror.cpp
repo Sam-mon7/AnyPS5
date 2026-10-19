@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/KytyBufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RebarBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -2030,5 +2031,98 @@ void RunLazyPathFixTests(const AgcDriver::Graphics::Context& device, AgcDriver::
     }
     recorder.Sync();
     std::cout << "lazy path fixes: page bits " << (bits ? "on" : "off") << ", download window " << (window ? "on" : "off") << ", completion requeue " << (LazyCompletionRequeue() ? "on" : "off") << ", page shadows " << (shadows ? "on" : "off") << " passed\n";
+#endif
+}
+
+void RunKytyBufferCacheTests(const AgcDriver::Graphics::Context& device, AgcDriver::Graphics::Recorder& recorder) {
+#ifndef _WIN32
+    throw std::runtime_error("Kyty buffer cache fixture requires Windows guest page protection");
+#else
+    using namespace AgcDriver::Graphics;
+    namespace Memory = AgcDriver::GuestMemory;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 2 * block;
+    constexpr std::size_t page = 4096;
+    auto context = device;
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    auto* raw = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    auto* alias = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    Require(raw != nullptr && alias != nullptr && section != nullptr, "cannot create the Kyty buffer cache fixture");
+    GuestArena::GuestArenaMap_nid_postfix(raw, bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(alias, bytes, section, 0, PAGE_READWRITE);
+    std::memset(raw, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(raw);
+    GuestAllocations::Mutation().Add(raw, bytes, true, true, true);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        std::uint8_t* raw;
+        std::uint8_t* alias;
+        HANDLE section;
+        ~Release() {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            GuestAllocations::Mutation().Remove(raw);
+            for (auto* mapping : {raw, alias}) {
+                GuestArena::GuestArenaReset_nid_postfix(mapping, bytes);
+                GuestArena::GuestArenaRelease_nid_postfix(mapping, bytes);
+            }
+            CloseHandle(section);
+        }
+    } release{context, recorder, raw, alias, section};
+    const auto before = KytyBufferCache::Counters();
+    {
+        Memory::BumpCollectEpoch();
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddWritable(address, sizeof(std::uint32_t));
+        memory->Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = memory->Descriptor(address, sizeof(std::uint32_t), adjustment);
+        memory->BeginGpuWrites(recorder);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + adjustment, sizeof(std::uint32_t), 0x12345678u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        memory->RecordCopyBacks(recorder);
+        memory->NotePendingWrites(recorder);
+        recorder.Keep(memory);
+        recorder.OnComplete([memory] { memory->WriteBack(); });
+        memory->ReadyForSubmit(recorder);
+    }
+    recorder.Sync();
+    Require(*reinterpret_cast<volatile std::uint32_t*>(alias) == 0x12345678u, "a CPU read missed a GPU store through a guest buffer");
+    alias[page + 8] = 0x55;
+    auto output = std::make_shared<Buffer>(context, 2 * page, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    {
+        Memory::BumpCollectEpoch();
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddReadable(address, 2 * page);
+        memory->Upload(false);
+        memory->BeginGpuWrites(recorder);
+        std::uint32_t adjustment = 0;
+        const auto view = memory->Descriptor(address, 2 * page, adjustment);
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, recorder.Commands(), view.buffer, view.offset + adjustment, output->Handle(), 0, 2 * page);
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(memory);
+        recorder.Keep(output);
+        recorder.OnComplete([memory] { memory->WriteBack(); });
+    }
+    recorder.Sync();
+    const auto result = output->ReadBytes(0, 2 * page);
+    std::uint32_t stored = 0;
+    std::memcpy(&stored, result.data(), sizeof(stored));
+    Require(stored == 0x12345678u && result[page + 8] == std::byte{0x55} && result[8] == std::byte{0x11}, "a GPU read missed a GPU store or a later CPU store");
+    const auto after = KytyBufferCache::Counters();
+    if (KytyBufferCache::Enabled()) {
+        Require(after.descriptors >= before.descriptors + 2 && after.writtenDescriptors > before.writtenDescriptors && after.faults > before.faults, "the Kyty buffer cache did not serve the descriptors or the CPU read");
+    } else {
+        Require(after.descriptors == before.descriptors && after.faults == before.faults, "the Kyty buffer cache served descriptors with the switch off");
+    }
+    std::cout << "Kyty buffer cache " << (KytyBufferCache::Enabled() ? "on" : "off") << " passed\n";
 #endif
 }
