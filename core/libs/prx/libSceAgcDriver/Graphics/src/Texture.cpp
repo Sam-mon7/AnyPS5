@@ -250,6 +250,24 @@ StorageTraffic& Traffic() {
     return traffic;
 }
 
+enum { MirrorRefreshNotPending = static_cast<int>(MirrorChange::Count), MirrorRefreshOverlap, MirrorRefreshOutcomes };
+std::array<std::atomic<std::uint64_t>, MirrorRefreshOutcomes> mirrorRefreshOutcomes{};
+
+void countMirrorRefresh(int outcome) {
+    mirrorRefreshOutcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void reportMirrorRefresh() {
+    static constexpr const char* names[MirrorRefreshOutcomes] = {"kept (unchanged)", "untracked", "mirror identity", "GPU stamp", "range", "collect", "guest changed", "no pending results", "other image overlaps"};
+    std::string line;
+    for (std::size_t outcome = 0; outcome < MirrorRefreshOutcomes; ++outcome) {
+        const auto count = mirrorRefreshOutcomes[outcome].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        line += " " + std::string(names[outcome]) + " " + std::to_string(count);
+    }
+    if (!line.empty()) AgcDriver::ProfilePrint_nid_no_patch("[storage-mirror] (10 s) mirror storage refreshes by outcome:%s\n", line.c_str());
+}
+
 void reportStorageTraffic(StorageTraffic& traffic) {
     const auto now = std::chrono::steady_clock::now();
     if (now - traffic.lastReport < std::chrono::seconds(10)) return;
@@ -278,6 +296,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
+    reportMirrorRefresh();
     traffic.directWriteBacks = 0;
 }
 
@@ -1870,7 +1889,11 @@ bool StorageTexture::Refresh() {
         TextureEpoch::Count(TextureEpoch::Action::Fallback, 0, &descriptor, true);
     }
     if (MirrorSourceCovers(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && ProvedKeys() == DccKeys::Uncompressed) {
-        if (anyLayerPending() && !otherPendingOverlaps() && MirrorSourceUnchanged(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), mirrorProof, generation)) {
+        const bool pending = anyLayerPending();
+        const bool overlapped = pending && otherPendingOverlaps();
+        const auto change = pending && !overlapped ? MirrorSourceChange(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), mirrorProof, generation) : MirrorChange::Count;
+        if (profile) countMirrorRefresh(!pending ? MirrorRefreshNotPending : overlapped ? MirrorRefreshOverlap : static_cast<int>(change));
+        if (change == MirrorChange::None) {
             NoteProved();
             return true;
         }

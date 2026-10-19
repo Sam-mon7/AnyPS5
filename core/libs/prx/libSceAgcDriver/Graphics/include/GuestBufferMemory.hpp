@@ -103,6 +103,8 @@ struct MirrorSource {
 bool MirrorSourceCovers(const Context& context, std::uint64_t address, std::size_t bytes);
 std::optional<MirrorSource> MirrorSourceFor(const Context& context, std::uint64_t address, std::size_t bytes);
 bool MirrorSourceUnchanged(const Context& context, std::uint64_t address, std::size_t bytes, const MirrorSourceProof& proof, std::uint64_t generation);
+enum class MirrorChange { None, Untracked, Identity, Revision, Range, Collect, Guest, Count };
+MirrorChange MirrorSourceChange(const Context& context, std::uint64_t address, std::size_t bytes, const MirrorSourceProof& proof, std::uint64_t generation);
 // Whether a readable registered allocation contains [address, address + bytes) right now (one
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes);

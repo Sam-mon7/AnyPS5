@@ -7434,14 +7434,20 @@ std::optional<MirrorSource> MirrorSourceFor(const Context& context, std::uint64_
     return source;
 }
 
-bool MirrorSourceUnchanged(const Context& context, std::uint64_t address, std::size_t bytes, const MirrorSourceProof& proof, std::uint64_t generation) {
-    if (!VramTextures() || proof.identity == 0 || generation == 0 || bytes == 0 || bytes > UINT64_MAX - address) return false;
+MirrorChange MirrorSourceChange(const Context& context, std::uint64_t address, std::size_t bytes, const MirrorSourceProof& proof, std::uint64_t generation) {
+    if (!VramTextures() || proof.identity == 0 || generation == 0 || bytes == 0 || bytes > UINT64_MAX - address) return MirrorChange::Untracked;
     Require(GuestMemory::GpuMutex().HeldByThisThread(), "a mirror texture proof requires the GPU lock");
     const auto mirror = findMirror(context, address, address + bytes);
-    if (mirror == nullptr || mirror->serial != proof.identity || (VramLazyWrites() ? gpuStampOver(*mirror, address, address + bytes) : mirror->gpuRevision) != proof.revision) return false;
+    if (mirror == nullptr || mirror->serial != proof.identity) return MirrorChange::Identity;
+    if ((VramLazyWrites() ? gpuStampOver(*mirror, address, address + bytes) : mirror->gpuRevision) != proof.revision) return MirrorChange::Revision;
     const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, false);
-    if (range == nullptr || !range->readable || !sameRange(mirror->range, range)) return false;
-    return GuestMemory::CollectWritesUncached(address, bytes) != 0 && GuestMemory::UnchangedSince(address, bytes, generation);
+    if (range == nullptr || !range->readable || !sameRange(mirror->range, range)) return MirrorChange::Range;
+    if (GuestMemory::CollectWritesUncached(address, bytes) == 0) return MirrorChange::Collect;
+    return GuestMemory::UnchangedSince(address, bytes, generation) ? MirrorChange::None : MirrorChange::Guest;
+}
+
+bool MirrorSourceUnchanged(const Context& context, std::uint64_t address, std::size_t bytes, const MirrorSourceProof& proof, std::uint64_t generation) {
+    return MirrorSourceChange(context, address, bytes, proof, generation) == MirrorChange::None;
 }
 
 std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, std::size_t bytes, bool reconcile) {
