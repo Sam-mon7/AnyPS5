@@ -154,13 +154,32 @@ bool protectPages(std::uint64_t address, std::uint64_t bytes, Mode mode) {
             continue;
         }
         const auto stop = std::min(end, regionEnd(info));
+        std::uint64_t runBegin = page;
+        std::uint64_t runEnd = page;
+        DWORD runProtection = 0;
+        const auto flush = [&] {
+            DWORD previous = 0;
+            const bool applied = runEnd == runBegin || runProtection == info.Protect || VirtualProtect(reinterpret_cast<void*>(runBegin), runEnd - runBegin, runProtection, &previous);
+            runBegin = runEnd;
+            return applied;
+        };
         for (auto at = page; at < stop; at += PageBytes) {
             const auto found = protections.find(at);
             const DWORD original = found != protections.end() ? found->second.original : info.Protect;
             const bool open = mode == Mode::ReadWrite || mode == Mode::ExecuteReadWrite;
             const DWORD wanted = open ? original : hostProtection(mode, original);
-            DWORD previous = 0;
-            if ((open || !inHostWrite(at)) && !VirtualProtect(reinterpret_cast<void*>(at), PageBytes, wanted, &previous)) return false;
+            const bool apply = open || !inHostWrite(at);
+            if (!apply || wanted != runProtection || at != runEnd) {
+                if (!flush()) return false;
+                runBegin = at;
+                runEnd = at;
+            }
+            if (apply) {
+                runProtection = wanted;
+                runEnd = at + PageBytes;
+            } else {
+                runBegin = runEnd = at + PageBytes;
+            }
             if (open) {
                 if (found != protections.end()) protections.erase(found);
             } else if (found != protections.end()) {
@@ -169,6 +188,7 @@ bool protectPages(std::uint64_t address, std::uint64_t bytes, Mode mode) {
                 protections.emplace(at, Protection{original, mode});
             }
         }
+        if (!flush()) return false;
         page = stop;
     }
     return true;
