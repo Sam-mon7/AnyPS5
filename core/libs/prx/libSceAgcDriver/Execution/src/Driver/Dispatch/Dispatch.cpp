@@ -384,7 +384,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto invocation = InvocationFor(snapshot, codeOffset, request);
             timing.Mark("prepared_invocation");
 
-            const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+            const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
@@ -395,6 +395,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
             captureMs += phaseTiming.Elapsed();
             phaseTiming.Phase(PhaseCapture);
+            if (profile) {
+                const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBefore, phaseMs[PhaseCapture]);
+                phaseMs[PhaseCapture] -= waited;
+                phaseMs[PhaseCaptureWait] += waited;
+            }
             if (dumpShaders) static_cast<void>(dumpRequest(address, request));
             const auto started = std::chrono::steady_clock::now();
 
@@ -441,6 +446,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         parked.cached = cached;
         parked.validated = validated;
         parked.resolvedAt = std::chrono::steady_clock::now();
+        if (profile) {
+            phaseMs[PhasePrologue] = 0;
+            addDriverPhases(ResolvedAhead, phaseMs, cached, validated);
+        }
         ++groupStats.resolved;
         if (cached) ++groupStats.resolvedHits;
         return;
