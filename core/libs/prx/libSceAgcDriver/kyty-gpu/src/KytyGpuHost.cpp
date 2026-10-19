@@ -78,6 +78,7 @@ struct Counts {
     std::atomic<std::uint64_t> videoTriggers{0};
     std::atomic<std::uint64_t> failedTriggers{0};
     std::atomic<std::uint64_t> faults{0};
+    std::atomic<std::uint64_t> lateMaps{0};
 };
 
 Counts counts;
@@ -180,8 +181,16 @@ LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
     }
     counts.faults.fetch_add(1, std::memory_order_relaxed);
     const auto access = record->ExceptionInformation[0] == 1 ? PageFaultAccess::Write : PageFaultAccess::Read;
-    if (resources != nullptr && resources->HandleFault(access, address)) return EXCEPTION_CONTINUE_EXECUTION;
-    return EXCEPTION_CONTINUE_SEARCH;
+    if (resources == nullptr) return EXCEPTION_CONTINUE_SEARCH;
+    if (resources->HandleFault(access, address)) return EXCEPTION_CONTINUE_EXECUTION;
+    MEMORY_BASIC_INFORMATION region{};
+    if (!committed(address, region)) return EXCEPTION_CONTINUE_SEARCH;
+    constexpr std::uint64_t block = 4ull << 20u;
+    const auto begin = std::max(address & ~(block - 1), reinterpret_cast<std::uint64_t>(region.BaseAddress));
+    const auto end = std::min((address & ~(block - 1)) + block, regionEnd(region));
+    counts.lateMaps.fetch_add(1, std::memory_order_relaxed);
+    resources->MapMemory(begin, end - begin);
+    return resources->HandleFault(access, address) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 struct TerminateOnFatal {
@@ -657,9 +666,9 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             const auto now = window->loop.presented_frames.load(std::memory_order_relaxed);
-            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
+            std::fprintf(stderr, "[kyty-gpu] %llu presents over 10 s (%.1f fps); totals dcbs=%llu acbs=%llu event-adds=%llu eop-triggers=%llu video-triggers=%llu failed-triggers=%llu faults=%llu late-maps=%llu\n", static_cast<unsigned long long>(now - previous), static_cast<double>(now - previous) / 10.0,
                          static_cast<unsigned long long>(counts.dcbs.load()), static_cast<unsigned long long>(counts.acbs.load()), static_cast<unsigned long long>(counts.adds.load()), static_cast<unsigned long long>(counts.graphicsTriggers.load()),
-                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()));
+                         static_cast<unsigned long long>(counts.videoTriggers.load()), static_cast<unsigned long long>(counts.failedTriggers.load()), static_cast<unsigned long long>(counts.faults.load()), static_cast<unsigned long long>(counts.lateMaps.load()));
             previous = now;
         }
     }).detach();
