@@ -55,6 +55,19 @@ index 83147cd..3564680 100644
  }
  
  template <typename T>
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index d452db9..9dfde55 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -322,7 +322,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+ 		return NULL_BUFFER_ID;
+ 	}
+ 	if (!GuestRange {vaddr, size}.Valid()) {
+-		EXIT("BufferCache: invalid buffer discovery request\n");
++		EXIT("BufferCache: invalid buffer discovery request addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
+ 	}
+ 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+ 	if (owner != nullptr && *owner) {
 diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 index e3abcc6..e8ea07b 100644
 --- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
