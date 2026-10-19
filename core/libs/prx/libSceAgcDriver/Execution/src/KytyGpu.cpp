@@ -257,6 +257,7 @@ void Submit(const Packet* packet, std::uint32_t queue) {
 
 int AddEqEvent(KernelEqueue eq, int id, void* udata) {
     std::lock_guard lock(startMutex);
+    std::fprintf(stderr, "[kyty-gpu] sceAgcDriverAddEqEvent eq=%lld id=%d%s\n", static_cast<long long>(eq), id, Started() ? "" : " (before start)");
     if (Started()) return module().addEqEvent(eq, id, udata);
     if (eq == 0 || EqueuePin_nid_postfix(eq) == nullptr) throw std::runtime_error("sceAgcDriverAddEqEvent: invalid event queue");
     pendingEqEvents.push_back({eq, id, udata});
