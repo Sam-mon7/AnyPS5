@@ -1032,6 +1032,37 @@ void DrawWorkerPassOrder() {
     Expect(mock.signaled.empty() && mock.pools.empty(), "draw worker teardown leaked Vulkan objects");
 }
 
+void DrawPassEndedBeforeRecord() {
+    mock = MockDevice{};
+    const bool worker = Recorder::RecordWorkerEnabled();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(mockContext());
+        const PassAccess empty{};
+        auto start = recorder.StartDrawPass(1, false, false, empty, worker);
+        Expect(!start.continued, "the first draw continued a pass");
+        recorder.RecordCommand([](VkCommandBuffer commands) { mockCmdDispatch(commands, 0, 1, 1); });
+        recorder.LeaveRenderPassOpen(1, Recorder::NoTiming, false, empty);
+        start = recorder.StartDrawPass(1, false, false, empty, worker);
+        Expect(start.continued, "a draw did not continue the open pass");
+        Expect(recorder.ResumeDrawPass(start, 1, false, empty, worker).continued, "a draw left a pass nothing ended");
+        static_cast<void>(recorder.Commands());
+        start = recorder.ResumeDrawPass(start, 1, false, empty, worker);
+        Expect(!start.continued && start.barrier, "a draw continued a pass that ended before it was recorded");
+        recorder.RecordCommand([](VkCommandBuffer commands) { mockCmdDispatch(commands, 1, 1, 1); });
+        recorder.LeaveRenderPassOpen(1, Recorder::NoTiming, false, empty);
+        start = recorder.StartDrawPass(1, false, false, empty, worker);
+        Expect(recorder.ResumeDrawPass(start, 1, false, empty, worker).continued, "the restarted pass was not continued");
+        recorder.RecordCommand([](VkCommandBuffer commands) { mockCmdDispatch(commands, 2, 1, 1); });
+        recorder.LeaveRenderPassOpen(1, Recorder::NoTiming, false, empty);
+        recorder.Sync();
+    }
+    Expect(mock.dispatches.size() == 3, "draws around an ended pass were lost or duplicated");
+    for (std::size_t i = 0; i < mock.dispatches.size(); ++i) Expect(mock.dispatches[i] == i, "draws around an ended pass changed order");
+    const std::string recording(mock.recording.begin(), mock.recording.end());
+    Expect(std::count(recording.begin(), recording.end(), 'E') == 2, "an ended pass was not ended exactly once, or the restarted pass was left open");
+}
+
 void ParseTimeLabelTests() {
     using namespace AgcDriver;
     mock = MockDevice{};
@@ -1101,6 +1132,7 @@ int main(int argc, char** argv) {
             RecordWorkerOrderAndSync();
         } else if (argc == 2 && std::string_view(argv[1]) == "draw-worker") {
             DrawWorkerPassOrder();
+            DrawPassEndedBeforeRecord();
         } else if (argc == 2 && std::string_view(argv[1]) == "parse-time-labels") {
             ParseTimeLabelTests();
         } else if (argc == 2 && std::string_view(argv[1]) == "submit-worker") {

@@ -2116,6 +2116,11 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     return {commands, false, !elide};
 }
 
+Recorder::DrawPassStart Recorder::ResumeDrawPass(const DrawPassStart& start, std::uint64_t key, bool fenced, const PassAccess& access, bool deferred) {
+    if (!start.continued || (open != nullptr && open->renderPass.open && open->commands == start.commands)) return start;
+    return StartDrawPass(key, true, fenced, access, deferred);
+}
+
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;

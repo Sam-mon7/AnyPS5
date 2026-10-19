@@ -1918,8 +1918,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     static const bool residentHeapMirrors = VramOption("APS5_RESIDENT_HEAP_MIRRORS");
     const bool deferred = recorder->CanRecordDraw() && !capture && args == nullptr &&
         (!residentHeapMirrors || (!state.stages.mesh && !state.stages.tessellation && record.stencilReplay.empty() && record.proxies.empty() && !record.waited && resources.Reusable() && !resources.NeedsCompletion()));
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || (args != nullptr && args->runtimeSgprs), fenced, passAccess, deferred);
+    auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || (args != nullptr && args->runtimeSgprs), fenced, passAccess, deferred);
     resources.BeginGpuWrites(*recorder);
+    start = recorder->ResumeDrawPass(start, passKey, fenced, passAccess, deferred);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;

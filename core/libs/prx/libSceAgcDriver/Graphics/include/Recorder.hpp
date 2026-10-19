@@ -117,6 +117,7 @@ public:
         bool barrier = true;
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool deferred = false);
+    DrawPassStart ResumeDrawPass(const DrawPassStart& start, std::uint64_t key, bool fenced, const PassAccess& access, bool deferred = false);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
