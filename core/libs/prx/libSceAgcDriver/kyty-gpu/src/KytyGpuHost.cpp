@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -60,7 +61,7 @@ constexpr std::uint64_t PageBytes = 4096;
 
 const KytyGpuHostTable* host = nullptr;
 RenderContext* resources = nullptr;
-std::unique_ptr<Libs::Graphics::WindowContext> window;
+Libs::Graphics::WindowContext* window = nullptr;
 SDL_Window hostWindow;
 std::atomic<bool> started{false};
 std::once_flag configured;
@@ -579,10 +580,11 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
     if (started.load(std::memory_order_acquire)) return 0;
     host = table;
     static_cast<void>(startTime());
+    Common::InitializeThreads();
     configure(width, height);
     faultHandler = AddVectoredExceptionHandler(1, &handleFault);
     hostWindow = SDL_Window{hwnd, static_cast<int>(width), static_cast<int>(height)};
-    window = std::make_unique<Libs::Graphics::WindowContext>();
+    window = new Libs::Graphics::WindowContext();
     window->graphic_ctx.screen_width = width;
     window->graphic_ctx.screen_height = height;
     window->window = &hostWindow;
