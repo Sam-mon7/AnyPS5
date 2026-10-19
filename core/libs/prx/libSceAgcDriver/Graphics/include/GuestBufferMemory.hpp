@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -227,6 +228,9 @@ struct VramUploadStats {
     std::uint64_t syncUploads = 0;
     std::uint64_t syncBytes = 0;
     std::uint64_t syncUs = 0;
+    std::uint64_t shadowSkips = 0;
+    std::uint64_t shadowPartials = 0;
+    std::uint64_t shadowPagesHeld = 0;
 };
 VramUploadStats VramUploadCounters();
 struct VramLazyStats {
@@ -260,12 +264,20 @@ struct VramLazyStats {
     std::uint64_t importFillsBesideBda = 0;
     std::uint64_t cpuFills = 0;
     std::uint64_t cpuFillBytes = 0;
+    std::uint64_t bitSkips = 0;
+    std::uint64_t requeuedCompletions = 0;
+    std::uint64_t droppedCompletions = 0;
     std::uint64_t unorderedImportRanges = 0;
     std::uint64_t unorderedImportBytes = 0;
     std::uint64_t unorderedImportBuilds = 0;
     std::uint64_t readOnlyImportBuilds = 0;
 };
 VramLazyStats VramLazyCounters();
+struct LazyWriterBusy : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+bool LazyCompletionRequeue();
+void CountLazyCompletionRequeue(bool dropped);
 struct LazyMirrorFill {
     VkBuffer buffer = VK_NULL_HANDLE;
     std::uint64_t offset = 0;

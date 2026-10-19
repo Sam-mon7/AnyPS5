@@ -2275,6 +2275,13 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
+        for (auto& action : requeuedCompletions) {
+            open->completions.push_back(std::move(action));
+            noteProbeCompletion(*open);
+            ++open->writeBackCompletionCount;
+            writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
+        }
+        requeuedCompletions.clear();
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
@@ -4843,6 +4850,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     const bool profile = DrawProfiled();
     const auto completionStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (completionProbe != nullptr) completionProbe->Begin(*batch);
+    std::vector<std::function<void()>> requeued;
     {
         struct InCompletion {
             InCompletion() { ++completionDepth; }
@@ -4851,11 +4859,34 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         for (auto& action : batch->completions) {
             try {
                 action();
+            } catch (const LazyWriterBusy& error) {
+                if (LazyCompletionRequeue()) requeued.push_back(std::move(action));
+                else std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
             } catch (const std::exception& error) {
                 std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
             }
             if (completionProbe != nullptr) completionProbe->Delivered(*batch);
         }
+    }
+    // A write-back the busy writer of another recorder refused runs again when the next batch
+    // completes (APS5_LAZY_COMPLETION_REQUEUE=1); it joins the open batch, or waits for one.
+    for (auto& action : requeued) {
+        auto attempts = std::make_shared<unsigned>(0);
+        std::function<void()> retry = [action = std::move(action), attempts] {
+            if (++*attempts > 1024) {
+                CountLazyCompletionRequeue(true);
+                std::fprintf(stderr, "[gpu] deferred write-back dropped after %u retries\n", *attempts);
+                return;
+            }
+            action();
+        };
+        CountLazyCompletionRequeue(false);
+        if (open != nullptr) {
+            open->completions.push_back(std::move(retry));
+            noteProbeCompletion(*open);
+            ++open->writeBackCompletionCount;
+            writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
+        } else requeuedCompletions.push_back(std::move(retry));
     }
     if (profile) holdCounters.completions += batch->completions.size();
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

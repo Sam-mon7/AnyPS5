@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #ifdef _WIN32
 #include <windows.h>
@@ -1751,5 +1752,182 @@ void RunLazyStorageWriteBackTests(const AgcDriver::Graphics::Context& device, Ag
     }
     recorder.Sync();
     std::cout << "lazy storage write-back " << (StorageTexture::LazyMirrorWriteBack() ? "on the GPU" : "on the CPU") << (StorageTexture::KeepOverlappingResults() ? ", overlapping results kept" : "") << " passed\n";
+#endif
+}
+
+void RunLazyPathFixTests(const AgcDriver::Graphics::Context& device, AgcDriver::Graphics::Recorder& recorder) {
+#ifndef _WIN32
+    throw std::runtime_error("lazy path fix fixture requires Windows guest page protection");
+#else
+    using namespace AgcDriver::Graphics;
+    namespace Memory = AgcDriver::GuestMemory;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 2 * block;
+    constexpr std::size_t page = 4096;
+    auto context = device;
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    auto* raw = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    auto* alias = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    Require(raw != nullptr && alias != nullptr && section != nullptr, "cannot create lazy path fix fixture");
+    GuestArena::GuestArenaMap_nid_postfix(raw, bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(alias, bytes, section, 0, PAGE_READWRITE);
+    std::memset(raw, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(raw);
+    GuestAllocations::Mutation().Add(raw, bytes, true, true, true);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        std::uint8_t* raw;
+        std::uint8_t* alias;
+        HANDLE section;
+        ~Release() {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            GuestAllocations::Mutation().Remove(raw);
+            for (auto* mapping : {raw, alias}) {
+                GuestArena::GuestArenaReset_nid_postfix(mapping, bytes);
+                GuestArena::GuestArenaRelease_nid_postfix(mapping, bytes);
+            }
+            CloseHandle(section);
+        }
+    } release{context, recorder, raw, alias, section};
+    {
+        GuestBufferMemory seed(context);
+        seed.SetAddressWrites(false);
+        seed.AcquireRegistered();
+        seed.Upload(true);
+        seed.WriteBack();
+    }
+    recorder.Sync();
+    const auto writeOn = [&](Recorder& target, std::uint64_t at, std::uint32_t value) {
+        Memory::BumpCollectEpoch();
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddWritable(at, sizeof(std::uint32_t), true);
+        memory->Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = memory->Descriptor(at, sizeof(std::uint32_t), adjustment);
+        memory->BeginGpuWrites(target);
+        const auto commands = target.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + adjustment, sizeof(std::uint32_t), value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        memory->RecordCopyBacks(target);
+        memory->NotePendingWrites(target);
+        target.Keep(memory);
+        target.OnComplete([memory] { memory->WriteBack(); });
+        memory->ReadyForSubmit(target);
+    };
+    const auto write = [&](std::uint64_t at, std::uint32_t value) { writeOn(recorder, at, value); };
+    const auto refresh = [&](std::uint64_t at, std::size_t length) {
+        Memory::BumpCollectEpoch();
+        GuestBufferMemory memory(context);
+        memory.AddReadable(at, length);
+        memory.Upload(false);
+        memory.WriteBack();
+    };
+    const auto copyOut = [&](std::uint64_t at, std::size_t length) {
+        Memory::BumpCollectEpoch();
+        auto memory = std::make_shared<GuestBufferMemory>(context);
+        memory->AddReadable(at, length);
+        memory->Upload(false);
+        memory->BeginGpuWrites(recorder);
+        std::uint32_t adjustment = 0;
+        const auto view = memory->Descriptor(at, length, adjustment);
+        auto output = std::make_shared<Buffer>(context, length, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, recorder.Commands(), view.buffer, view.offset + adjustment, output->Handle(), 0, length);
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(memory);
+        recorder.Keep(output);
+        recorder.OnComplete([memory] { memory->WriteBack(); });
+        recorder.Sync();
+        return output->ReadBytes(0, length);
+    };
+    const bool bits = std::getenv("APS5_LAZY_PAGE_BITS") != nullptr && std::string_view(std::getenv("APS5_LAZY_PAGE_BITS")) == "1";
+    const bool window = std::getenv("APS5_LAZY_DOWNLOAD_WINDOW") != nullptr && std::string_view(std::getenv("APS5_LAZY_DOWNLOAD_WINDOW")) == "1";
+    const bool shadows = std::getenv("APS5_MIRROR_PAGE_SHADOWS") != nullptr && std::string_view(std::getenv("APS5_MIRROR_PAGE_SHADOWS")) == "1";
+    {
+        raw[16 * page + 100] = 0x5a;
+        const auto before = VramUploadCounters();
+        refresh(address + 16 * page, 64);
+        const auto first = VramUploadCounters();
+        Require(first.bytes == before.bytes + block, "the first refresh of a written heap block did not upload the block");
+        Require(first.shadowSkips == before.shadowSkips && first.shadowPartials == before.shadowPartials, "the first refresh of a block was served from page shadows");
+        raw[16 * page + 100] = 0x5a;
+        refresh(address + 16 * page, 64);
+        const auto same = VramUploadCounters();
+        if (shadows) Require(same.bytes == first.bytes && same.shadowSkips == first.shadowSkips + 1, "an identical rewrite of a shadowed block was uploaded again");
+        else Require(same.bytes == first.bytes + block && same.shadowSkips == first.shadowSkips, "page shadows served a refresh while off");
+        raw[17 * page + 5] = 0x77;
+        refresh(address + 16 * page, 64);
+        const auto changed = VramUploadCounters();
+        if (shadows) Require(changed.bytes == same.bytes + page && changed.shadowPartials == same.shadowPartials + 1, "a one-page change did not upload exactly its page");
+        else Require(changed.bytes == same.bytes + block && changed.shadowPartials == same.shadowPartials, "page shadows split a refresh while off");
+        const auto result = copyOut(address + 16 * page, 2 * page);
+        Require(result[100] == std::byte{0x5a} && result[page + 5] == std::byte{0x77}, "the GPU does not see the CPU bytes after a shadow-filtered refresh");
+        Require(shadows == (changed.shadowPagesHeld > before.shadowPagesHeld), "page shadows were held while off, or none were held while on");
+    }
+    {
+        write(address, 0x11111111u);
+        recorder.Sync();
+        const auto before = VramLazyCounters();
+        FlushHeapMirrorWrites(address + 8 * page, page);
+        const auto clean = VramLazyCounters();
+        Require(clean.downloadedPages == before.downloadedPages, "a driver read of a clean range downloaded a page");
+        Require(clean.bitSkips == before.bitSkips + (bits ? 1 : 0), "the page bitmap did not skip a clean range, or skipped one while off");
+        FlushHeapMirrorWrites(address, page);
+        const auto published = VramLazyCounters();
+        Require(published.downloadedPages == clean.downloadedPages + 1, "a driver read of a lazy page did not download it");
+        FlushHeapMirrorWrites(address, page);
+        Require(VramLazyCounters().bitSkips == published.bitSkips + (bits ? 1 : 0), "a published page kept its lazy bit");
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias) == 0x11111111u, "a driver read published the wrong bytes");
+    }
+    {
+        write(address + page, 0xaaaa0001u);
+        write(address + 2 * page, 0xaaaa0002u);
+        write(address + 3 * page, 0xaaaa0003u);
+        recorder.Sync();
+        write(address + 4 * page, 0xaaaa0004u);
+        const auto before = VramLazyCounters();
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias + 2 * page) == 0xaaaa0002u, "a native read missed a lazy GPU write");
+        const auto after = VramLazyCounters();
+        Require(after.faults == before.faults + 1, "the native read did not fault exactly once");
+        Require(after.downloadedPages == before.downloadedPages + (window ? 3 : 1), "the fault download window did not publish the completed neighbours, or published while off");
+        Require(after.faultPageWaits == before.faultPageWaits, "the fault download window waited for a writer it did not need");
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias + page) == 0xaaaa0001u && *reinterpret_cast<volatile std::uint32_t*>(alias + 3 * page) == 0xaaaa0003u, "neighbouring lazy pages lost their results");
+        Require(VramLazyCounters().downloadedPages == before.downloadedPages + 3, "the neighbours were not downloaded exactly once in total");
+        recorder.Sync();
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias + 4 * page) == 0xaaaa0004u, "the in-flight page lost its result");
+    }
+    {
+        const bool requeue = LazyCompletionRequeue();
+        Recorder other(context);
+        writeOn(other, address + 6 * page, 0xbbbb0006u);
+        bool ran = false;
+        recorder.Commands();
+        recorder.OnComplete([&] {
+            FlushHeapMirrorWrites(address + 6 * page, page);
+            ran = true;
+        });
+        const auto before = VramLazyCounters();
+        recorder.Sync();
+        Require(!ran, "a completion write-back waited for another recorder's writer during completion");
+        const auto blocked = VramLazyCounters();
+        Require(blocked.requeuedCompletions == before.requeuedCompletions + (requeue ? 1 : 0), "the blocked write-back was not requeued, or was requeued while off");
+        other.Sync();
+        other.FlushDeferredReleases();
+        recorder.Commands();
+        recorder.Sync();
+        Require(ran == requeue, requeue ? "the requeued write-back did not run after the writer completed" : "a dropped write-back ran while requeueing is off");
+        if (requeue) Require(VramLazyCounters().downloadedPages == blocked.downloadedPages + 1, "the requeued write-back did not publish its page");
+        Require(*reinterpret_cast<volatile std::uint32_t*>(alias + 6 * page) == 0xbbbb0006u, "the other recorder's lazy result was lost");
+        Require(VramLazyCounters().droppedCompletions == before.droppedCompletions, "a requeued write-back was dropped");
+    }
+    recorder.Sync();
+    std::cout << "lazy path fixes: page bits " << (bits ? "on" : "off") << ", download window " << (window ? "on" : "off") << ", completion requeue " << (LazyCompletionRequeue() ? "on" : "off") << ", page shadows " << (shadows ? "on" : "off") << " passed\n";
 #endif
 }
