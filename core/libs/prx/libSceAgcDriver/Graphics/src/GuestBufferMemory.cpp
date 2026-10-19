@@ -200,7 +200,7 @@ HeapRefreshCounters& HeapRefreshes() {
 }
 
 struct HeapGpuRefreshCounts {
-    std::atomic<std::uint64_t> runs{0}, copies{0}, bytes{0}, notInPlace{0}, pendingResults{0}, unimported{0}, unmirrored{0};
+    std::atomic<std::uint64_t> runs{0}, copies{0}, bytes{0}, notInPlace{0}, pendingResults{0}, unimported{0}, unmirrored{0}, mirrored{0};
 };
 
 HeapGpuRefreshCounts& HeapGpuRefreshes() {
@@ -2433,19 +2433,54 @@ void prepareRange(std::uint64_t address, std::uint64_t bytes, bool flush = true)
     syncRange(address, bytes, flush);
 }
 
-bool gpuOrderedRun(const Context* context, std::span<ImageMirror* const> mirrors, std::uint64_t begin, std::uint64_t bytes) {
+void excludeBlocks(std::vector<RefreshBlock>& blocks, std::size_t first, std::span<const std::pair<std::uint64_t, std::uint64_t>> excluded) {
+    if (excluded.empty() || first >= blocks.size()) return;
+    std::vector<RefreshBlock> kept;
+    for (auto index = first; index < blocks.size(); ++index) {
+        const auto& block = blocks[index];
+        auto cursor = block.address;
+        const auto end = block.address + block.length;
+        const bool split = std::any_of(excluded.begin(), excluded.end(), [&](const auto& range) { return range.first < end && cursor < range.second; });
+        const auto generation = split ? block.mirror->generations[static_cast<std::size_t>(block.address / 65536 - block.mirror->base / 65536)] : block.generation;
+        for (const auto& [from, to] : excluded) {
+            if (to <= cursor || end <= from) continue;
+            if (cursor < from) kept.push_back({block.mirror, cursor, static_cast<std::size_t>(from - cursor), generation, block.fill});
+            cursor = std::max(cursor, to);
+        }
+        if (cursor < end) kept.push_back({block.mirror, cursor, static_cast<std::size_t>(end - cursor), generation, block.fill});
+    }
+    blocks.resize(first);
+    blocks.insert(blocks.end(), kept.begin(), kept.end());
+}
+
+bool gpuOrderedRun(const Context* context, std::span<ImageMirror* const> mirrors, std::uint64_t begin, std::uint64_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& excluded) {
+    excluded.clear();
     if (context == nullptr || bytes == 0 || !heapGpuRefresh()) return false;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || Recorder::InCompletion() || !recorder->PendingWriteOverlaps(begin, static_cast<std::size_t>(bytes))) return false;
     auto& counts = HeapGpuRefreshes();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-    if (!recorder->InPlaceWritesOver(begin, static_cast<std::size_t>(bytes), ranges)) {
+    std::vector<Recorder::MirrorWrite> mirrored;
+    if (!recorder->InPlaceWritesOver(begin, static_cast<std::size_t>(bytes), ranges, &mirrored)) {
         counts.notInPlace.fetch_add(1, std::memory_order_relaxed);
         countNotInPlaceWriter(recorder->NotInPlaceWriter(begin, static_cast<std::size_t>(bytes)));
         return false;
     }
-    if (StorageTexture::AnyPendingOverlaps(ranges) || AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>>(ranges))) {
+    for (const auto& write : mirrored) {
+        const auto owner = std::find_if(mirrors.begin(), mirrors.end(), [&](const ImageMirror* mirror) { return mirror->base <= write.begin && write.end <= mirror->base + mirror->bytes; });
+        if (owner == mirrors.end() || reinterpret_cast<std::uintptr_t>((*owner)->buffer.get()) != write.mirror) {
+            counts.unmirrored.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        excluded.emplace_back(write.begin, write.end);
+    }
+    std::sort(excluded.begin(), excluded.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written = ranges;
+    written.insert(written.end(), excluded.begin(), excluded.end());
+    std::sort(written.begin(), written.end());
+    if (StorageTexture::AnyPendingOverlaps(written) || AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>>(written))) {
         counts.pendingResults.fetch_add(1, std::memory_order_relaxed);
+        excluded.clear();
         return false;
     }
     struct Copy {
@@ -2460,6 +2495,7 @@ bool gpuOrderedRun(const Context* context, std::span<ImageMirror* const> mirrors
         const auto* import = HostImportFor(*context, from, static_cast<std::size_t>(to - from));
         if (import == nullptr) {
             counts.unimported.fetch_add(1, std::memory_order_relaxed);
+            excluded.clear();
             return false;
         }
         auto cursor = from;
@@ -2473,18 +2509,25 @@ bool gpuOrderedRun(const Context* context, std::span<ImageMirror* const> mirrors
         }
         if (cursor != to) {
             counts.unmirrored.fetch_add(1, std::memory_order_relaxed);
+            excluded.clear();
             return false;
         }
     }
     const auto end = begin + bytes;
     auto cursor = begin;
-    for (const auto& [from, to] : ranges) {
+    for (const auto& [from, to] : written) {
         if (cursor < from) prepareRange(cursor, from - cursor);
         cursor = std::max(cursor, to);
     }
     if (cursor < end) prepareRange(cursor, end - cursor);
     Require(GuestMemory::Accessible(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
     const auto commands = recorder->Commands();
+    if (copies.empty()) {
+        RecordMemoryBarrier(*context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        counts.runs.fetch_add(1, std::memory_order_relaxed);
+        counts.mirrored.fetch_add(mirrored.size(), std::memory_order_relaxed);
+        return true;
+    }
     RecordMemoryBarrier(*context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     std::uint64_t copied = 0;
     for (const auto& copy : copies) {
@@ -2497,6 +2540,7 @@ bool gpuOrderedRun(const Context* context, std::span<ImageMirror* const> mirrors
     counts.runs.fetch_add(1, std::memory_order_relaxed);
     counts.copies.fetch_add(copies.size(), std::memory_order_relaxed);
     counts.bytes.fetch_add(copied, std::memory_order_relaxed);
+    counts.mirrored.fetch_add(mirrored.size(), std::memory_order_relaxed);
     return true;
 }
 
@@ -2686,13 +2730,16 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
         while (last < mirrors.size() && mirrors[last]->base == mirrors[last - 1]->base + mirrors[last - 1]->bytes) ++last;
         const auto begin = mirrors[first]->base;
         const auto bytes = mirrors[last - 1]->base + mirrors[last - 1]->bytes - begin;
-        if (!gpuOrderedRun(context, std::span<ImageMirror* const>(mirrors).subspan(first, last - first), begin, bytes)) prepareRange(begin, bytes);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> excluded;
+        if (!gpuOrderedRun(context, std::span<ImageMirror* const>(mirrors).subspan(first, last - first), begin, bytes, excluded)) prepareRange(begin, bytes);
         ResourcePhase collect("mirror-collect");
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
         collect.End();
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
         ResourcePhase changed("mirror-changed-blocks");
+        const auto appended = blocks.size();
         appendChangedBlocks(std::span<ImageMirror* const>(mirrors).subspan(first, last - first), generation, blocks);
+        excludeBlocks(blocks, appended, excluded);
         first = last;
     }
 }
@@ -2925,12 +2972,15 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
     checked.reserve(space.heapRuns.size());
     for (std::size_t index = 0; index < space.heapRuns.size(); ++index) {
         const auto& run = space.heapRuns[index];
-        if (!gpuOrderedRun(context, std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), run.begin, run.bytes)) prepareRange(run.begin, run.bytes);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> excluded;
+        if (!gpuOrderedRun(context, std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), run.begin, run.bytes, excluded)) prepareRange(run.begin, run.bytes);
         const auto generation = GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
         const auto since = space.verified[index].load(std::memory_order_relaxed);
+        const auto appended = blocks.size();
         if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since) || (ResidentHeapMirrors() && std::any_of(space.heapMirrors.begin() + run.first, space.heapMirrors.begin() + run.last, [](const auto* mirror) { return mirror->forgetSerial != GuestMemory::ForgetSerial(); }))) appendChangedBlocks(std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), generation, blocks);
-        checked.emplace_back(index, generation);
+        excludeBlocks(blocks, appended, excluded);
+        if (excluded.empty()) checked.emplace_back(index, generation);
     }
     return checked;
 }
@@ -4510,7 +4560,7 @@ HeapGpuRefreshStats HeapGpuRefreshCounters() {
     const auto& counts = HeapGpuRefreshes();
     return {counts.runs.load(std::memory_order_relaxed), counts.copies.load(std::memory_order_relaxed), counts.bytes.load(std::memory_order_relaxed),
         counts.notInPlace.load(std::memory_order_relaxed), counts.pendingResults.load(std::memory_order_relaxed), counts.unimported.load(std::memory_order_relaxed),
-        counts.unmirrored.load(std::memory_order_relaxed)};
+        counts.unmirrored.load(std::memory_order_relaxed), counts.mirrored.load(std::memory_order_relaxed)};
 }
 
 std::string HeapGpuRefreshWriters() {
@@ -6572,6 +6622,7 @@ void GuestBufferMemory::NotePendingWrites(Recorder& recorder) const {
             const auto* region = owner(range.first);
             if (region == nullptr || range.second > region->end) continue;
             if (region->direct != nullptr || (region->mirror == nullptr && region->mirrorPieces.empty() && region->gpuCopy && region->copiedBack)) inPlace.push_back(range);
+            else if (region->mirror != nullptr && region->mirror->heap && !region->gpuCopy && range.first >= region->mirror->base && range.second <= region->mirror->base + region->mirror->bytes) recorder.NoteInMirrorWrite(range.first, range.second, reinterpret_cast<std::uintptr_t>(region->mirror->buffer.get()));
         }
         recorder.NoteInPlaceWrites(inPlace);
         return;

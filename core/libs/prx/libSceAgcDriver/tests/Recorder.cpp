@@ -1841,6 +1841,12 @@ void inPlaceWriteTests(const Device& device, Recorder& recorder) {
     recorder.NotePendingWrite(0x54900, 0x40);
     recorder.NoteInPlaceWrites(std::array{std::pair<std::uint64_t, std::uint64_t>{0x54900, 0x54920}});
     Require(!recorder.InPlaceWritesOver(0x54900, 0x40, ranges), "a partly in-place write was accepted");
+    recorder.NotePendingWrite(0x55000, 0x100);
+    recorder.NoteInMirrorWrite(0x55000, 0x55100, 0x1234);
+    std::vector<Recorder::MirrorWrite> mirrored;
+    Require(!recorder.InPlaceWritesOver(0x55000, 0x200, ranges), "a mirror write passed without a mirror list");
+    Require(recorder.InPlaceWritesOver(0x55080, 0x200, ranges, &mirrored) && ranges.empty() && mirrored.size() == 1 && mirrored[0].begin == 0x55080 && mirrored[0].end == 0x55100 && mirrored[0].mirror == 0x1234, "a mirror write was not listed");
+    Require(recorder.NotInPlaceWriter(0x55000, 0x100) == nullptr && recorder.NotInPlaceWriter(0x54800, 0x40) != nullptr, "the blocking writer was misattributed");
     recorder.Sync();
     device.WaitQueue();
     Require(!recorder.InPlaceWritesOver(0x54000, 0x1000, ranges) && ranges.empty(), "in-place writes outlived their batches");

@@ -3700,15 +3700,28 @@ void Recorder::NoteInPlaceWrites(std::span<const std::pair<std::uint64_t, std::u
     for (const auto& range : ranges) if (range.second > range.first) open->inPlaceWrites.push_back(range);
 }
 
-bool Recorder::InPlaceWritesOver(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+void Recorder::NoteInMirrorWrite(std::uint64_t begin, std::uint64_t end, std::uint64_t mirror) {
+    if (end <= begin || mirror == 0) return;
+    ensureOpen();
+    open->inMirrorWrites.push_back({begin, end, mirror});
+}
+
+bool Recorder::InPlaceWritesOver(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::vector<MirrorWrite>* mirrored) const {
     ranges.clear();
+    if (mirrored != nullptr) mirrored->clear();
     if (bytes == 0 || QueuedLabelOverlaps(address, bytes)) return false;
     const auto end = address + bytes;
     const auto collect = [&](const Batch& batch) {
         for (const auto& [begin, finish] : batch.writes) {
             if (finish <= address || end <= begin) continue;
-            if (std::none_of(batch.inPlaceWrites.begin(), batch.inPlaceWrites.end(), [&](const auto& range) { return range.first <= begin && finish <= range.second; })) return false;
-            ranges.emplace_back(std::max(begin, address), std::min(finish, end));
+            if (std::any_of(batch.inPlaceWrites.begin(), batch.inPlaceWrites.end(), [&](const auto& range) { return range.first <= begin && finish <= range.second; })) {
+                ranges.emplace_back(std::max(begin, address), std::min(finish, end));
+                continue;
+            }
+            if (mirrored == nullptr) return false;
+            const auto found = std::find_if(batch.inMirrorWrites.begin(), batch.inMirrorWrites.end(), [&](const auto& write) { return write.begin <= begin && finish <= write.end; });
+            if (found == batch.inMirrorWrites.end()) return false;
+            mirrored->push_back({std::max(begin, address), std::min(finish, end), found->mirror});
         }
         return true;
     };
@@ -3723,7 +3736,7 @@ bool Recorder::InPlaceWritesOver(std::uint64_t address, std::size_t bytes, std::
         else ranges[out++] = {begin, finish};
     }
     ranges.resize(out);
-    return !ranges.empty();
+    return !ranges.empty() || (mirrored != nullptr && !mirrored->empty());
 }
 
 const void* Recorder::NotInPlaceWriter(std::uint64_t address, std::size_t bytes) const {
@@ -3732,7 +3745,8 @@ const void* Recorder::NotInPlaceWriter(std::uint64_t address, std::size_t bytes)
         for (std::size_t index = 0; index < batch.writes.size(); ++index) {
             const auto [begin, finish] = batch.writes[index];
             if (finish <= address || end <= begin) continue;
-            if (std::none_of(batch.inPlaceWrites.begin(), batch.inPlaceWrites.end(), [&](const auto& range) { return range.first <= begin && finish <= range.second; })) return index < batch.writeCallers.size() ? batch.writeCallers[index] : nullptr;
+            if (std::none_of(batch.inPlaceWrites.begin(), batch.inPlaceWrites.end(), [&](const auto& range) { return range.first <= begin && finish <= range.second; }) &&
+                std::none_of(batch.inMirrorWrites.begin(), batch.inMirrorWrites.end(), [&](const auto& write) { return write.begin <= begin && finish <= write.end; })) return index < batch.writeCallers.size() ? batch.writeCallers[index] : nullptr;
         }
         return nullptr;
     };

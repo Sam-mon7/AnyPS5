@@ -169,9 +169,18 @@ public:
     // Noted writes of the open batch that the GPU stores in place into host memory (a direct import
     // binding, or a copy-back recorded with them), for InPlaceWritesOver.
     void NoteInPlaceWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
-    // Whether every unfinished write over the range was noted in place and no queued label overlaps
-    // it; `ranges` gets those writes clipped to the range, sorted and merged.
-    bool InPlaceWritesOver(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
+    // Noted writes of the open batch that a shader stores into the device buffer `mirror` names (a
+    // descriptor bound to a heap mirror), for InPlaceWritesOver.
+    void NoteInMirrorWrite(std::uint64_t begin, std::uint64_t end, std::uint64_t mirror);
+    struct MirrorWrite {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::uint64_t mirror;
+    };
+    // Whether every unfinished write over the range was noted in place (or, with `mirrored`, into a
+    // mirror) and no queued label overlaps it; `ranges` gets the in-place writes clipped to the
+    // range, sorted and merged, and `mirrored` the clipped mirror writes.
+    bool InPlaceWritesOver(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::vector<MirrorWrite>* mirrored = nullptr) const;
     // The code address that noted the first unfinished write over the range without an in-place note.
     const void* NotInPlaceWriter(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
@@ -593,6 +602,7 @@ private:
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceWrites;
+        std::vector<MirrorWrite> inMirrorWrites;
         std::vector<const void*> writeCallers;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {

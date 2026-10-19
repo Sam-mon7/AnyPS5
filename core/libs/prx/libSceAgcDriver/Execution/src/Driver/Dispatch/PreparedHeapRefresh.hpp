@@ -56,6 +56,7 @@ struct HeapGpuRefreshStats {
     std::uint64_t pendingResults;
     std::uint64_t unimported;
     std::uint64_t unmirrored;
+    std::uint64_t mirrored;
 };
 
 HeapGpuRefreshStats HeapGpuRefreshCounters();

@@ -3821,8 +3821,8 @@ struct DispatchTimer {
         if (Graphics::HeapGpuRefreshEnabled()) {
             const auto refresh = Graphics::HeapGpuRefreshCounters();
             char text[256];
-            std::snprintf(text, sizeof(text), " heap-gpu-refresh runs=%llu copies=%llu copied=%.1fMiB fallbacks not-in-place=%llu pending-results=%llu unimported=%llu unmirrored=%llu",
-                static_cast<unsigned long long>(refresh.runs), static_cast<unsigned long long>(refresh.copies), refresh.bytes / 1048576.0,
+            std::snprintf(text, sizeof(text), " heap-gpu-refresh runs=%llu copies=%llu copied=%.1fMiB in-mirror=%llu fallbacks not-in-place=%llu pending-results=%llu unimported=%llu unmirrored=%llu",
+                static_cast<unsigned long long>(refresh.runs), static_cast<unsigned long long>(refresh.copies), refresh.bytes / 1048576.0, static_cast<unsigned long long>(refresh.mirrored),
                 static_cast<unsigned long long>(refresh.notInPlace), static_cast<unsigned long long>(refresh.pendingResults),
                 static_cast<unsigned long long>(refresh.unimported), static_cast<unsigned long long>(refresh.unmirrored));
             report += text;
