@@ -50,6 +50,7 @@ void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutpu
 }
 
 void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
+    if (auto* const recorder = FrameRecorder::Active()) recorder->UnregisterVideoOutput(handle);
     DriverDetail::Driver::Get().UnregisterVideoOutput(handle, output);
 }
 
