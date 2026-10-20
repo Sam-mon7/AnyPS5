@@ -120,6 +120,8 @@ std::unordered_map<std::uint64_t, std::uint32_t> hotWrites;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReadSites;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReadsGpu;
 std::map<std::array<std::uint64_t, 6>, std::uint32_t> gpuThreadStacks;
+std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> gpuThreadDirtyReads;
+thread_local std::uint64_t faultSite = 0;
 std::map<std::tuple<std::uint64_t, std::uint64_t, bool>, std::uint32_t> writtenBindings;
 std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint32_t> gpuWrites;
 
@@ -615,7 +617,14 @@ bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
     }
     const auto started = std::chrono::steady_clock::now();
     noteHot(access == PageFaultAccess::Write, address);
-    if (access == PageFaultAccess::Read && Libs::Graphics::GuestGpu::IsGpuThread() && !resources->GetBufferCache().HasGpuDirtyBytes(address & ~std::uint64_t{3}, 4)) counts.gpuThreadCleanReads.fetch_add(1, std::memory_order_relaxed);
+    if (access == PageFaultAccess::Read && Libs::Graphics::GuestGpu::IsGpuThread()) {
+        if (!resources->GetBufferCache().HasGpuDirtyBytes(address & ~std::uint64_t{3}, 4)) {
+            counts.gpuThreadCleanReads.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            std::lock_guard lock(hotMutex);
+            ++gpuThreadDirtyReads[{address & ~std::uint64_t{0xf}, faultSite}];
+        }
+    }
     bool handled = resources->HandleFault(access, address);
     if (!handled) {
         mapLate(address);
@@ -672,6 +681,7 @@ LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
         ++hotReadSites[reinterpret_cast<std::uint64_t>(record->ExceptionAddress)];
         if (frames[0] != 0) ++gpuThreadStacks[frames];
     }
+    faultSite = reinterpret_cast<std::uint64_t>(record->ExceptionAddress);
     return notifyAccess(access, address) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -1310,6 +1320,22 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     }
                     const auto pages = takeHot(hotReadsGpu);
                     gpuThreadStacks.clear();
+                    std::vector<std::pair<std::uint32_t, std::pair<std::uint64_t, std::uint64_t>>> dirty;
+                    for (const auto& [key, count] : gpuThreadDirtyReads) dirty.emplace_back(count, key);
+                    std::sort(dirty.begin(), dirty.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    std::string dirtyText;
+                    for (std::size_t index = 0; index < std::min<std::size_t>(dirty.size(), 10); ++index) {
+                        const auto [address, site] = dirty[index].second;
+                        HMODULE module = nullptr;
+                        char name[MAX_PATH] = "jit";
+                        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(site), &module)) GetModuleFileNameA(module, name, sizeof(name));
+                        const char* base = std::strrchr(name, '\\');
+                        char item[128];
+                        std::snprintf(item, sizeof(item), " %llx@%s+%llx:%u", static_cast<unsigned long long>(address), base != nullptr ? base + 1 : name, static_cast<unsigned long long>(site - reinterpret_cast<std::uint64_t>(module)), dirty[index].first);
+                        dirtyText += item;
+                    }
+                    gpuThreadDirtyReads.clear();
+                    std::fprintf(stderr, "[kyty-gpu] render-thread reads of GPU-written bytes:%s\n", dirtyText.c_str());
                     std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers), specialization-read downloads: %llu (%llu ms); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), static_cast<unsigned long long>(drains - lastDrains), static_cast<unsigned long long>((drainNs - lastDrainNs) / 1000000), pages.c_str(), writers.c_str(), chains.c_str());
                     lastFaults = faults;
                     lastNs = ns;
