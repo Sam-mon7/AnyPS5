@@ -85,20 +85,13 @@ std::uintptr_t RelativeTarget(const std::uint8_t* call) {
 }
 
 bool PatchCall(std::uint8_t* call, std::uintptr_t target) {
-    const auto word = reinterpret_cast<std::uintptr_t>(call) & ~std::uintptr_t{7};
-    if (reinterpret_cast<std::uintptr_t>(call) + 5 > word + 8) return false;
     std::array<std::uint8_t, 5> patch{0xe8};
     if (!WriteRelative(patch.data() + 1, reinterpret_cast<std::uintptr_t>(call) + 5, target)) return false;
     DWORD previous = 0;
-    if (!VirtualProtect(reinterpret_cast<void*>(word), 8, PAGE_EXECUTE_READWRITE, &previous)) return false;
-    auto* target64 = reinterpret_cast<volatile LONG64*>(word);
-    const LONG64 expected = *target64;
-    LONG64 desired = expected;
-    std::memcpy(reinterpret_cast<std::uint8_t*>(&desired) + (reinterpret_cast<std::uintptr_t>(call) - word), patch.data(), patch.size());
-    const bool swapped = InterlockedCompareExchange64(target64, desired, expected) == expected;
-    VirtualProtect(reinterpret_cast<void*>(word), 8, previous, &previous);
-    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(word), 8);
-    return swapped;
+    if (!VirtualProtect(call, patch.size(), PAGE_EXECUTE_READWRITE, &previous)) return false;
+    std::memcpy(call, patch.data(), patch.size());
+    VirtualProtect(call, patch.size(), previous, &previous);
+    return FlushInstructionCache(GetCurrentProcess(), call, patch.size()) != 0;
 }
 
 const char* Install() {
