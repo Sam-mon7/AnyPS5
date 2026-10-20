@@ -266,8 +266,8 @@ void spareSnapshot(TextureCache& cache, std::vector<std::byte>&& snapshot) {
         cache.spareSnapshots.erase(largest);
     }
     cache.spareBytes += snapshot.capacity();
-    const auto size = snapshot.size();
-    cache.spareSnapshots.emplace(size, std::move(snapshot));
+    const auto capacity = snapshot.capacity();
+    cache.spareSnapshots.emplace(capacity, std::move(snapshot));
 }
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
