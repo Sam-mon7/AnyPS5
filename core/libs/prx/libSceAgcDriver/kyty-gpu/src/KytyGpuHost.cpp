@@ -1162,6 +1162,14 @@ __declspec(dllexport) bool KytyHostCaptureEnabled() {
     return captureEnabled();
 }
 
+__declspec(dllexport) bool KytyHostReadWindowEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_KYTY_READ_WINDOW");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
+}
+
 __declspec(dllexport) const char* KytyHostCaptureRequest() {
     if (!captureEnabled()) return nullptr;
     static const auto paths = [] {

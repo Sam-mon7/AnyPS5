@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string_view>
+#include <utility>
 
 int main() {
     const char* text = std::getenv("APS5_KYTY_GPU");
@@ -28,14 +29,20 @@ int main() {
             std::fprintf(stderr, "kytygpu.dll resolved an unknown video out function\n");
             return 1;
         }
-        using Capture = bool (*)();
+        using Switch = bool (*)();
         auto* module = GetModuleHandleA("kytygpu.dll");
-        const auto capture = module != nullptr ? reinterpret_cast<Capture>(GetProcAddress(module, "KytyHostCaptureEnabled")) : nullptr;
-        const char* captureText = std::getenv("APS5_KYTY_GPU_CAPTURE");
-        const bool captureExpected = captureText != nullptr && std::string_view(captureText) == "1";
-        if (capture == nullptr || capture() != captureExpected) {
-            std::fprintf(stderr, "APS5_KYTY_GPU_CAPTURE parsed wrongly\n");
-            return 1;
+        const std::pair<const char*, const char*> switches[] = {
+            {"KytyHostCaptureEnabled", "APS5_KYTY_GPU_CAPTURE"},
+            {"KytyHostReadWindowEnabled", "APS5_KYTY_READ_WINDOW"},
+        };
+        for (const auto& [function, variable] : switches) {
+            const auto enabled = module != nullptr ? reinterpret_cast<Switch>(GetProcAddress(module, function)) : nullptr;
+            const char* switchText = std::getenv(variable);
+            const bool switchExpected = switchText != nullptr && std::string_view(switchText) == "1";
+            if (enabled == nullptr || enabled() != switchExpected) {
+                std::fprintf(stderr, "%s parsed wrongly\n", variable);
+                return 1;
+            }
         }
     }
     std::printf("Kyty GPU switch %s passed\n", expected ? "on" : "off");
