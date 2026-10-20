@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
+#include <algorithm>
 #include <mutex>
 
 namespace AgcDriver {
@@ -128,6 +129,13 @@ extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::Fl
 
 extern "C" std::uint32_t AgcDriverReserveEopFlipAt_nid_postfix(const AgcDriver::FlipInfo& info, std::uint32_t token) {
     return AgcDriver::DriverDetail::Driver::Get().ReserveEopFlipAt(info, token);
+}
+
+extern "C" std::size_t AgcDriverAwaitedAddresses_nid_postfix(std::uint64_t* addresses, std::size_t capacity) {
+    const auto awaited = AgcDriver::DriverDetail::Driver::Get().AwaitedAddresses();
+    const auto count = std::min(capacity, awaited.size());
+    std::copy_n(awaited.begin(), count, addresses);
+    return count;
 }
 
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed) {

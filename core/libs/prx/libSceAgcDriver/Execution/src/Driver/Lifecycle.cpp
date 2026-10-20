@@ -241,6 +241,13 @@ bool Driver::WaitIdleFor(std::chrono::milliseconds timeout) {
     return idle;
 }
 
+std::vector<std::uint64_t> Driver::AwaitedAddresses() {
+    std::lock_guard lock(awaitedMutex);
+    std::vector<std::uint64_t> result;
+    for (const auto& [queue, address] : awaitedAddresses) result.push_back(address);
+    return result;
+}
+
 std::uint64_t Driver::FlipSubmissions() const {
     return flipSubmissions.load(std::memory_order_relaxed);
 }
