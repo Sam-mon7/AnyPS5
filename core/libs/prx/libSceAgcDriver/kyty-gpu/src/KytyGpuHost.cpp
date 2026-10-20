@@ -93,6 +93,8 @@ struct Counts {
     std::atomic<std::uint64_t> gpuThreadReadFaultNs{0};
     std::atomic<std::uint64_t> gpuThreadCleanReads{0};
     std::atomic<std::uint64_t> specializationDrains{0};
+    std::atomic<std::uint64_t> dirtyReadsUnchanged{0};
+    std::atomic<std::uint64_t> dirtyReadsChanged{0};
     std::atomic<std::uint64_t> specializationDrainNs{0};
     std::atomic<std::uint64_t> protectNs{0};
     std::atomic<std::uint64_t> protectCalls{0};
@@ -121,6 +123,7 @@ std::unordered_map<std::uint64_t, std::uint32_t> hotReadSites;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReadsGpu;
 std::map<std::array<std::uint64_t, 6>, std::uint32_t> gpuThreadStacks;
 std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> gpuThreadDirtyReads;
+std::map<std::uint64_t, std::uint32_t> gpuThreadChangedReads;
 thread_local std::uint64_t faultSite = 0;
 std::map<std::tuple<std::uint64_t, std::uint64_t, bool>, std::uint32_t> writtenBindings;
 std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint32_t> gpuWrites;
@@ -617,15 +620,30 @@ bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
     }
     const auto started = std::chrono::steady_clock::now();
     noteHot(access == PageFaultAccess::Write, address);
+    std::array<std::uint8_t, 16> before{};
+    bool compare = false;
     if (access == PageFaultAccess::Read && Libs::Graphics::GuestGpu::IsGpuThread()) {
         if (!resources->GetBufferCache().HasGpuDirtyBytes(address & ~std::uint64_t{3}, 4)) {
             counts.gpuThreadCleanReads.fetch_add(1, std::memory_order_relaxed);
         } else {
+            compare = Libs::LibKernel::Memory::TryReadBacking(address & ~std::uint64_t{0xf}, before.data(), before.size());
             std::lock_guard lock(hotMutex);
             ++gpuThreadDirtyReads[{address & ~std::uint64_t{0xf}, faultSite}];
         }
     }
     bool handled = resources->HandleFault(access, address);
+    if (compare) {
+        std::array<std::uint8_t, 16> after{};
+        if (Libs::LibKernel::Memory::TryReadBacking(address & ~std::uint64_t{0xf}, after.data(), after.size())) {
+            if (before == after) {
+                counts.dirtyReadsUnchanged.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                counts.dirtyReadsChanged.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard lock(hotMutex);
+                ++gpuThreadChangedReads[address & ~std::uint64_t{0xf}];
+            }
+        }
+    }
     if (!handled) {
         mapLate(address);
         handled = resources->HandleFault(access, address);
@@ -1335,6 +1353,23 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                         dirtyText += item;
                     }
                     gpuThreadDirtyReads.clear();
+                    std::vector<std::pair<std::uint32_t, std::uint64_t>> changed;
+                    for (const auto& [address, count] : gpuThreadChangedReads) changed.emplace_back(count, address);
+                    std::sort(changed.begin(), changed.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    std::string changedText;
+                    for (std::size_t index = 0; index < std::min<std::size_t>(changed.size(), 8); ++index) {
+                        char item[48];
+                        std::snprintf(item, sizeof(item), " %llx:%u", static_cast<unsigned long long>(changed[index].second), changed[index].first);
+                        changedText += item;
+                    }
+                    gpuThreadChangedReads.clear();
+                    static std::uint64_t lastUnchanged = 0;
+                    static std::uint64_t lastChanged = 0;
+                    const auto unchanged = counts.dirtyReadsUnchanged.load(std::memory_order_relaxed);
+                    const auto changedCount = counts.dirtyReadsChanged.load(std::memory_order_relaxed);
+                    std::fprintf(stderr, "[kyty-gpu] render-thread faults on GPU-written bytes whose 16 bytes the download left unchanged: %llu, changed: %llu;%s\n", static_cast<unsigned long long>(unchanged - lastUnchanged), static_cast<unsigned long long>(changedCount - lastChanged), changedText.c_str());
+                    lastUnchanged = unchanged;
+                    lastChanged = changedCount;
                     std::fprintf(stderr, "[kyty-gpu] render-thread reads of GPU-written bytes:%s\n", dirtyText.c_str());
                     std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers), specialization-read downloads: %llu (%llu ms); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), static_cast<unsigned long long>(drains - lastDrains), static_cast<unsigned long long>((drainNs - lastDrainNs) / 1000000), pages.c_str(), writers.c_str(), chains.c_str());
                     lastFaults = faults;
