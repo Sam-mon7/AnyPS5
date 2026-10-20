@@ -450,31 +450,6 @@ bool readCleanBytes(std::uint64_t address, void* data, std::uint64_t size) {
     return true;
 }
 
-bool emulateCleanJitLoad(CONTEXT& context, std::uint64_t address) {
-    if (!Libs::Graphics::GuestGpu::IsGpuThread()) return false;
-    const auto* code = reinterpret_cast<const std::uint8_t*>(context.Rip);
-    if (code[0] != 0x44 || code[1] != 0x8b || (code[2] & 0x3f) != 0x17) return false;
-    std::int64_t displacement = 0;
-    std::uint64_t length = 3;
-    if ((code[2] >> 6) == 1) {
-        displacement = static_cast<std::int8_t>(code[3]);
-        length = 4;
-    } else if ((code[2] >> 6) == 2) {
-        std::int32_t value = 0;
-        std::memcpy(&value, code + 3, sizeof(value));
-        displacement = value;
-        length = 7;
-    } else if ((code[2] >> 6) != 0) {
-        return false;
-    }
-    if (context.Rdi + static_cast<std::uint64_t>(displacement) != address) return false;
-    std::uint32_t value = 0;
-    if (!readCleanBytes(address, &value, sizeof(value))) return false;
-    context.R10 = value;
-    context.Rip += length;
-    return true;
-}
-
 bool permits(std::uint64_t address, bool write) {
     MEMORY_BASIC_INFORMATION info{};
     if (!committed(address, info) || (info.Protect & PAGE_GUARD) != 0) return false;
@@ -522,7 +497,6 @@ LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
     }
     counts.faults.fetch_add(1, std::memory_order_relaxed);
     const auto access = record->ExceptionInformation[0] == 1 ? PageFaultAccess::Write : PageFaultAccess::Read;
-    if (record->ExceptionInformation[0] == 0 && cleanReadsEnabled() && emulateCleanJitLoad(*info->ContextRecord, address)) return EXCEPTION_CONTINUE_EXECUTION;
     if (access == PageFaultAccess::Read && statsEnabled()) {
         std::array<std::uint64_t, 6> frames{};
         if (Libs::Graphics::GuestGpu::IsGpuThread()) {
