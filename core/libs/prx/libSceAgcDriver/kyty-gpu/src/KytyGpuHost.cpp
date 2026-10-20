@@ -92,6 +92,7 @@ struct Counts {
     std::atomic<std::uint64_t> gpuThreadReadFaults{0};
     std::atomic<std::uint64_t> gpuThreadReadFaultNs{0};
     std::atomic<std::uint64_t> gpuThreadCleanReads{0};
+    std::atomic<std::uint64_t> cleanReadsServed{0};
     std::atomic<std::uint64_t> protectNs{0};
     std::atomic<std::uint64_t> protectCalls{0};
     std::atomic<std::uint64_t> protectSyscalls{0};
@@ -431,6 +432,49 @@ bool backing(std::uint64_t address, std::uint64_t bytes, bool sparse, bool write
     return true;
 }
 
+bool cleanReadsEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_KYTY_CLEAN_READS");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
+}
+
+bool readCleanBytes(std::uint64_t address, void* data, std::uint64_t size) {
+    if (resources == nullptr || size == 0 || !Libs::Graphics::GuestGpu::IsGpuThread() || !Libs::Graphics::GuestRange{address, size}.Valid()) return false;
+    bool watched = false;
+    for (auto page = address & ~(PageBytes - 1); page < address + size; page += PageBytes) watched |= pageState(page) == StateNoAccess;
+    if (!watched || resources->GetBufferCache().HasGpuDirtyBytes(address, size)) return false;
+    if (!Libs::LibKernel::Memory::TryReadBacking(address, data, size)) return false;
+    counts.cleanReadsServed.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool emulateCleanJitLoad(CONTEXT& context, std::uint64_t address) {
+    if (!Libs::Graphics::GuestGpu::IsGpuThread()) return false;
+    const auto* code = reinterpret_cast<const std::uint8_t*>(context.Rip);
+    if (code[0] != 0x44 || code[1] != 0x8b || (code[2] & 0x3f) != 0x17) return false;
+    std::int64_t displacement = 0;
+    std::uint64_t length = 3;
+    if ((code[2] >> 6) == 1) {
+        displacement = static_cast<std::int8_t>(code[3]);
+        length = 4;
+    } else if ((code[2] >> 6) == 2) {
+        std::int32_t value = 0;
+        std::memcpy(&value, code + 3, sizeof(value));
+        displacement = value;
+        length = 7;
+    } else if ((code[2] >> 6) != 0) {
+        return false;
+    }
+    if (context.Rdi + static_cast<std::uint64_t>(displacement) != address) return false;
+    std::uint32_t value = 0;
+    if (!readCleanBytes(address, &value, sizeof(value))) return false;
+    context.R10 = value;
+    context.Rip += length;
+    return true;
+}
+
 bool permits(std::uint64_t address, bool write) {
     MEMORY_BASIC_INFORMATION info{};
     if (!committed(address, info) || (info.Protect & PAGE_GUARD) != 0) return false;
@@ -478,6 +522,7 @@ LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
     }
     counts.faults.fetch_add(1, std::memory_order_relaxed);
     const auto access = record->ExceptionInformation[0] == 1 ? PageFaultAccess::Write : PageFaultAccess::Read;
+    if (record->ExceptionInformation[0] == 0 && cleanReadsEnabled() && emulateCleanJitLoad(*info->ContextRecord, address)) return EXCEPTION_CONTINUE_EXECUTION;
     if (access == PageFaultAccess::Read && statsEnabled()) {
         std::array<std::uint64_t, 6> frames{};
         if (Libs::Graphics::GuestGpu::IsGpuThread()) {
@@ -1087,7 +1132,9 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     static std::uint64_t lastFaults = 0;
                     static std::uint64_t lastNs = 0;
                     static std::uint64_t lastClean = 0;
+                    static std::uint64_t lastServed = 0;
                     const auto clean = counts.gpuThreadCleanReads.load(std::memory_order_relaxed);
+                    const auto served = counts.cleanReadsServed.load(std::memory_order_relaxed);
                     const auto faults = counts.gpuThreadReadFaults.load(std::memory_order_relaxed);
                     const auto ns = counts.gpuThreadReadFaultNs.load(std::memory_order_relaxed);
                     std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint64_t> blame;
@@ -1129,10 +1176,11 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     }
                     const auto pages = takeHot(hotReadsGpu);
                     gpuThreadStacks.clear();
-                    std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), pages.c_str(), writers.c_str(), chains.c_str());
+                    std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers; %llu clean reads served without a fault or drain); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), static_cast<unsigned long long>(served - lastServed), pages.c_str(), writers.c_str(), chains.c_str());
                     lastFaults = faults;
                     lastNs = ns;
                     lastClean = clean;
+                    lastServed = served;
                 }
                 const auto reads = takeHot(hotReads);
                 const auto writes = takeHot(hotWrites);
@@ -1274,6 +1322,14 @@ __declspec(dllexport) bool KytyHostComputeChainEnabled() {
         return text != nullptr && std::string_view(text) == "1";
     }();
     return enabled;
+}
+
+__declspec(dllexport) bool KytyHostCleanReadsEnabled() {
+    return cleanReadsEnabled();
+}
+
+bool KytyHostReadClean(std::uint64_t address, void* data, std::uint64_t size) {
+    return cleanReadsEnabled() && readCleanBytes(address, data, size);
 }
 
 __declspec(dllexport) bool KytyHostReadWindowEnabled() {

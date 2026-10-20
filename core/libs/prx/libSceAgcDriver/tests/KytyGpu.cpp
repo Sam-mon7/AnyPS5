@@ -36,6 +36,7 @@ int main() {
             {"KytyHostReadWindowEnabled", "APS5_KYTY_READ_WINDOW"},
             {"KytyHostAsyncReadbackEnabled", "APS5_KYTY_ASYNC_READBACK"},
             {"KytyHostComputeChainEnabled", "APS5_KYTY_COMPUTE_CHAIN"},
+            {"KytyHostCleanReadsEnabled", "APS5_KYTY_CLEAN_READS"},
         };
         for (const auto& [function, variable] : switches) {
             const auto enabled = module != nullptr ? reinterpret_cast<Switch>(GetProcAddress(module, function)) : nullptr;
