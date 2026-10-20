@@ -124,7 +124,7 @@ index 41aeee36..5de124c3 100644
  		case 0x00000039: {
  			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-index d452db96..487d9ef3 100644
+index d452db96..98ce1cba 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 @@ -15,6 +15,8 @@
@@ -152,12 +152,13 @@ index d452db96..487d9ef3 100644
  	if (!m_gpu_modified_ranges.Empty()) {
  		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
  	}
-@@ -296,25 +300,279 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+@@ -296,25 +300,299 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
  	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
  }
  
 +extern "C" bool KytyHostReadWindowEnabled();
 +extern "C" bool KytyHostAsyncReadbackEnabled();
++extern "C" bool KytyHostAsyncWriteReadbackEnabled();
 +extern "C" void KytyHostNoteReadback(uint32_t kind, uint64_t nanoseconds);
 +
 +namespace {
@@ -166,6 +167,7 @@ index d452db96..487d9ef3 100644
 +constexpr uint32_t ReadbackShared = 1;
 +constexpr uint32_t ReadbackSync   = 2;
 +constexpr uint32_t ReadbackDrain  = 3;
++constexpr uint32_t ReadbackWrite  = 4;
 +
 +} // namespace
 +
@@ -193,21 +195,28 @@ index d452db96..487d9ef3 100644
 -		if (is_write && !IsRegionRegistered(vaddr, size)) {
 -			return;
 +	auto& gpu = m_scheduler.Context().GetGpu();
-+	if (!is_write && !GuestGpu::IsGpuThread() && KytyHostAsyncReadbackEnabled()) {
++	if (is_write && !GuestGpu::IsGpuThread()) {
++		KytyHostNoteReadback(ReadbackWrite, 0);
++	}
++	const bool async_write = is_write && KytyHostAsyncWriteReadbackEnabled();
++	if ((!is_write || async_write) && !GuestGpu::IsGpuThread() && KytyHostAsyncReadbackEnabled()) {
 +		std::shared_ptr<GuestReadback> request;
 +		gpu.SendCommandSync([&] {
 +			bool completed = false;
 +			request        = BeginGuestReadback(vaddr, size, completed);
-+			if (!request && !completed) {
++			if (!request && (is_write || !completed)) {
 +				KytyHostNoteReadback(ReadbackSync, 0);
-+				ReadMemoryOnGpu(vaddr, size, false);
++				ReadMemoryOnGpu(vaddr, size, is_write);
 +			}
 +		});
 +		if (request) {
 +			CopyGuestReadback(request);
-+			gpu.SendCommandSync([this, request] {
++			gpu.SendCommandSync([this, request, vaddr, size, is_write] {
 +				if (m_guest_readbacks[request->slot] == request) {
 +					FinishGuestReadback(request->slot);
++				}
++				if (is_write) {
++					FinishWriteReadback(vaddr, size);
 +				}
 +			});
  		}
@@ -215,6 +224,17 @@ index d452db96..487d9ef3 100644
 +		return;
 +	}
 +	gpu.SendCommandSync([this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
++}
++
++void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size) {
++	if (!IsRegionRegistered(vaddr, size)) {
++		return;
++	}
++	if (m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
++		ReadMemoryOnGpu(vaddr, size, true);
++		return;
++	}
++	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 +}
  
 -		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
@@ -255,20 +275,20 @@ index d452db96..487d9ef3 100644
 +		const auto& pending = m_guest_readbacks[slot];
 +		if (!pending) {
 +			continue;
-+		}
-+		if (pending->copied.load(std::memory_order_acquire)) {
-+			FinishGuestReadback(slot);
-+			continue;
  		}
 -		if (is_write) {
 -			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
++		if (pending->copied.load(std::memory_order_acquire)) {
++			FinishGuestReadback(slot);
++			continue;
++		}
 +		if (std::ranges::any_of(pending->pages, [&](const GuestRange& page) {
 +			    return address >= page.address && address < page.End() &&
 +			           size <= page.End() - address;
 +		    })) {
 +			KytyHostNoteReadback(ReadbackShared, 0);
 +			return pending;
- 		}
++		}
 +	}
 +	DrainGuestReadback(address, size);
 +	auto&      buffer = m_slot_buffers[FindBuffer(address, size)];
@@ -287,7 +307,7 @@ index d452db96..487d9ef3 100644
 +			for (const auto& page: pending->pages) {
 +				available_pages.Subtract(page.address, page.size);
 +			}
-+		}
+ 		}
 +	}
 +	std::vector<vk::BufferCopy> copies;
 +	std::vector<GuestRange>     pages;
@@ -440,7 +460,7 @@ index d452db96..487d9ef3 100644
  }
  
  BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
-@@ -322,7 +580,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+@@ -322,7 +600,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
  		return NULL_BUFFER_ID;
  	}
  	if (!GuestRange {vaddr, size}.Valid()) {
@@ -449,7 +469,7 @@ index d452db96..487d9ef3 100644
  	}
  	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
  	if (owner != nullptr && *owner) {
-@@ -484,9 +742,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+@@ -484,9 +762,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
  	return source.first->Handle();
  }
  
@@ -462,7 +482,7 @@ index d452db96..487d9ef3 100644
  	auto& command = m_scheduler.Current();
  	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
  		EXIT("BufferCache: buffer request requires a recording command buffer\n");
-@@ -515,6 +776,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t
+@@ -515,6 +796,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t
  	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
  	if (is_written) {
  		m_gpu_modified_ranges.Add(vaddr, size);
@@ -470,7 +490,7 @@ index d452db96..487d9ef3 100644
  	}
  	return {&buffer, buffer.Offset(vaddr)};
  }
-@@ -523,6 +785,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
+@@ -523,6 +805,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
  	if (!GuestRange {vaddr, size}.Valid()) {
  		EXIT("BufferCache: invalid image source\n");
  	}
@@ -478,7 +498,7 @@ index d452db96..487d9ef3 100644
  	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
  	if (owner != nullptr && *owner) {
  		auto& buffer = m_slot_buffers[*owner];
-@@ -632,6 +895,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+@@ -632,6 +915,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
  }
  
  void BufferCache::RunGarbageCollector() {
@@ -487,7 +507,7 @@ index d452db96..487d9ef3 100644
  	if (m_graphics.CanReportMemoryUsage()) {
  		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
-index 27bf987c..5523b2e5 100644
+index 27bf987c..52152d60 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
 @@ -11,7 +11,9 @@
@@ -509,11 +529,12 @@ index 27bf987c..5523b2e5 100644
  	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
  	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
  	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
-@@ -124,6 +128,13 @@ private:
+@@ -124,6 +128,14 @@ private:
  	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
  	template <bool async>
  	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 +	void               ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
++	void               FinishWriteReadback(uint64_t vaddr, uint64_t size);
 +	struct GuestReadback;
 +	[[nodiscard]] std::shared_ptr<GuestReadback> BeginGuestReadback(uint64_t address, uint64_t size,
 +	                                                                bool& completed);
@@ -523,7 +544,7 @@ index 27bf987c..5523b2e5 100644
  
  	GraphicContext&                                   m_graphics;
  	CommandScheduler&                                 m_scheduler;
-@@ -145,6 +156,9 @@ private:
+@@ -145,6 +157,9 @@ private:
  	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
  	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
  	uint64_t m_gc_tick            = 0;

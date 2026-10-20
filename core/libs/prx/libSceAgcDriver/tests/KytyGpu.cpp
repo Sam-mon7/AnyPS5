@@ -35,6 +35,7 @@ int main() {
             {"KytyHostCaptureEnabled", "APS5_KYTY_GPU_CAPTURE"},
             {"KytyHostReadWindowEnabled", "APS5_KYTY_READ_WINDOW"},
             {"KytyHostAsyncReadbackEnabled", "APS5_KYTY_ASYNC_READBACK"},
+            {"KytyHostAsyncWriteReadbackEnabled", "APS5_KYTY_ASYNC_WRITE_READBACK"},
             {"KytyHostComputeChainEnabled", "APS5_KYTY_COMPUTE_CHAIN"},
             {"KytyHostProfileEnabled", "APS5_KYTY_GPU_PROFILE"},
         };

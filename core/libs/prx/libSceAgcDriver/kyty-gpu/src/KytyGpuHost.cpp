@@ -101,7 +101,7 @@ struct Counts {
     std::atomic<std::uint64_t> protectSyscalls{0};
     std::atomic<std::uint64_t> backingOpens{0};
     std::atomic<std::uint64_t> aliasCopies{0};
-    std::array<std::atomic<std::uint64_t>, 4> readbacks{};
+    std::array<std::atomic<std::uint64_t>, 5> readbacks{};
     std::atomic<std::uint64_t> readbackDrainNs{0};
     std::atomic<std::uint64_t> backingNs{0};
 };
@@ -1216,14 +1216,14 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                 std::fprintf(stderr, "[kyty-gpu] 10 s: draws=%llu dispatches=%llu submits=%llu gpu-waits=%llu gpu-wait-ms=%llu buffer-up-mib=%llu buffer-down-mib=%llu texture-up-mib=%llu texture-down-mib=%llu buffer-evictions=%llu texture-evictions=%llu pipelines=%llu\n",
                              delta(Counter::Draws), delta(Counter::Dispatches), delta(Counter::QueueSubmits), delta(Counter::GpuWaits), delta(Counter::GpuWaitNs) / 1000000, delta(Counter::BufferUploadBytes) >> 20, delta(Counter::BufferDownloadBytes) >> 20,
                              delta(Counter::TextureUploadBytes) >> 20, delta(Counter::TextureDownloadBytes) >> 20, delta(Counter::BufferEvictions), delta(Counter::TextureEvictions), delta(Counter::PipelinesCreated));
-                static std::array<std::uint64_t, 5> lastReadbacks{};
-                std::array<std::uint64_t, 5> readbacks{};
-                for (std::size_t kind = 0; kind < 4; ++kind) readbacks[kind] = counts.readbacks[kind].load(std::memory_order_relaxed);
-                readbacks[4] = counts.readbackDrainNs.load(std::memory_order_relaxed);
-                std::array<unsigned long long, 5> readbackDelta{};
-                for (std::size_t kind = 0; kind < 5; ++kind) readbackDelta[kind] = static_cast<unsigned long long>(readbacks[kind] - lastReadbacks[kind]);
+                static std::array<std::uint64_t, 6> lastReadbacks{};
+                std::array<std::uint64_t, 6> readbacks{};
+                for (std::size_t kind = 0; kind < 5; ++kind) readbacks[kind] = counts.readbacks[kind].load(std::memory_order_relaxed);
+                readbacks[5] = counts.readbackDrainNs.load(std::memory_order_relaxed);
+                std::array<unsigned long long, 6> readbackDelta{};
+                for (std::size_t kind = 0; kind < 6; ++kind) readbackDelta[kind] = static_cast<unsigned long long>(readbacks[kind] - lastReadbacks[kind]);
                 lastReadbacks = readbacks;
-                std::fprintf(stderr, "[kyty-gpu] 10 s readbacks: async=%llu shared=%llu sync=%llu drain-waits=%llu drain-ms=%llu\n", readbackDelta[0], readbackDelta[1], readbackDelta[2], readbackDelta[3], readbackDelta[4] / 1000000);
+                std::fprintf(stderr, "[kyty-gpu] 10 s readbacks: async=%llu shared=%llu sync=%llu drain-waits=%llu drain-ms=%llu guest-writes=%llu\n", readbackDelta[0], readbackDelta[1], readbackDelta[2], readbackDelta[3], readbackDelta[5] / 1000000, readbackDelta[4]);
             }
             if (statsEnabled()) {
                 std::lock_guard lock(hotMutex);
@@ -1517,6 +1517,14 @@ void KytyHostNoteReadback(std::uint32_t kind, std::uint64_t nanoseconds) {
     if (kind >= counts.readbacks.size()) return;
     counts.readbacks[kind].fetch_add(1, std::memory_order_relaxed);
     if (nanoseconds != 0) counts.readbackDrainNs.fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+
+bool KytyHostAsyncWriteReadbackEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_KYTY_ASYNC_WRITE_READBACK");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
 }
 
 bool KytyHostComputeChainEnabled() {
