@@ -89,6 +89,8 @@ struct Counts {
     std::atomic<std::uint64_t> readFaults{0};
     std::atomic<std::uint64_t> faultNs{0};
     std::atomic<std::uint64_t> readFaultNs{0};
+    std::atomic<std::uint64_t> gpuThreadReadFaults{0};
+    std::atomic<std::uint64_t> gpuThreadReadFaultNs{0};
     std::atomic<std::uint64_t> protectNs{0};
     std::atomic<std::uint64_t> protectCalls{0};
     std::atomic<std::uint64_t> protectSyscalls{0};
@@ -113,6 +115,8 @@ std::mutex hotMutex;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReads;
 std::unordered_map<std::uint64_t, std::uint32_t> hotWrites;
 std::unordered_map<std::uint64_t, std::uint32_t> hotReadSites;
+std::unordered_map<std::uint64_t, std::uint32_t> hotReadsGpu;
+std::map<std::array<std::uint64_t, 6>, std::uint32_t> gpuThreadStacks;
 std::map<std::tuple<std::uint64_t, std::uint64_t, bool>, std::uint32_t> writtenBindings;
 std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint32_t> gpuWrites;
 
@@ -452,6 +456,12 @@ bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
     const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
     counts.faultNs.fetch_add(elapsed, std::memory_order_relaxed);
     if (access == PageFaultAccess::Read) counts.readFaultNs.fetch_add(elapsed, std::memory_order_relaxed);
+    if (access == PageFaultAccess::Read && Libs::Graphics::GuestGpu::IsGpuThread()) {
+        counts.gpuThreadReadFaults.fetch_add(1, std::memory_order_relaxed);
+        counts.gpuThreadReadFaultNs.fetch_add(elapsed, std::memory_order_relaxed);
+        std::lock_guard lock(hotMutex);
+        ++hotReadsGpu[address & ~std::uint64_t{0xfff}];
+    }
     return handled;
 }
 
@@ -467,8 +477,27 @@ LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
     counts.faults.fetch_add(1, std::memory_order_relaxed);
     const auto access = record->ExceptionInformation[0] == 1 ? PageFaultAccess::Write : PageFaultAccess::Read;
     if (access == PageFaultAccess::Read && statsEnabled()) {
+        std::array<std::uint64_t, 6> frames{};
+        if (Libs::Graphics::GuestGpu::IsGpuThread()) {
+            CONTEXT context = *info->ContextRecord;
+            for (auto& frame : frames) {
+                frame = context.Rip;
+                DWORD64 imageBase = 0;
+                auto* function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+                if (function == nullptr) {
+                    context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+                    context.Rsp += 8;
+                } else {
+                    void* handlerData = nullptr;
+                    DWORD64 establisher = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
+                }
+                if (context.Rip == 0) break;
+            }
+        }
         std::lock_guard lock(hotMutex);
         ++hotReadSites[reinterpret_cast<std::uint64_t>(record->ExceptionAddress)];
+        if (frames[0] != 0) ++gpuThreadStacks[frames];
     }
     return notifyAccess(access, address) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -1051,6 +1080,54 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                         top += item;
                     }
                     std::fprintf(stderr, "[kyty-gpu] read faults on GPU-written pages: %llu of %llu; top writes by faults:%s\n", static_cast<unsigned long long>(covered), static_cast<unsigned long long>(total), top.c_str());
+                }
+                {
+                    static std::uint64_t lastFaults = 0;
+                    static std::uint64_t lastNs = 0;
+                    const auto faults = counts.gpuThreadReadFaults.load(std::memory_order_relaxed);
+                    const auto ns = counts.gpuThreadReadFaultNs.load(std::memory_order_relaxed);
+                    std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint64_t> blame;
+                    for (const auto& [page, count] : hotReadsGpu) {
+                        for (const auto& [key, writes] : gpuWrites) {
+                            const auto& [address, size, caller] = key;
+                            if (address < page + PageBytes && page < address + size) blame[key] += count;
+                        }
+                    }
+                    std::vector<std::pair<std::uint64_t, std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>>> ranked;
+                    for (const auto& [key, count] : blame) ranked.emplace_back(count, key);
+                    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    std::string writers;
+                    for (std::size_t index = 0; index < std::min<std::size_t>(ranked.size(), 6); ++index) {
+                        const auto& [address, size, caller] = ranked[index].second;
+                        HMODULE module = nullptr;
+                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(caller), &module);
+                        char item[128];
+                        std::snprintf(item, sizeof(item), " %llx+%llx from +%llx:%llu", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(caller - reinterpret_cast<std::uint64_t>(module)), static_cast<unsigned long long>(ranked[index].first));
+                        writers += item;
+                    }
+                    std::vector<std::pair<std::uint32_t, std::array<std::uint64_t, 6>>> stacks;
+                    for (const auto& [frames, count] : gpuThreadStacks) stacks.emplace_back(count, frames);
+                    std::sort(stacks.begin(), stacks.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    std::string chains;
+                    for (std::size_t index = 0; index < std::min<std::size_t>(stacks.size(), 6); ++index) {
+                        chains += " [" + std::to_string(stacks[index].first);
+                        for (const auto frame : stacks[index].second) {
+                            if (frame == 0) break;
+                            HMODULE module = nullptr;
+                            char name[MAX_PATH] = "?";
+                            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(frame), &module)) GetModuleFileNameA(module, name, sizeof(name));
+                            const char* base = std::strrchr(name, '\\');
+                            char item[96];
+                            std::snprintf(item, sizeof(item), " %s+%llx", base != nullptr ? base + 1 : name, static_cast<unsigned long long>(frame - reinterpret_cast<std::uint64_t>(module)));
+                            chains += item;
+                        }
+                        chains += "]";
+                    }
+                    const auto pages = takeHot(hotReadsGpu);
+                    gpuThreadStacks.clear();
+                    std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), pages.c_str(), writers.c_str(), chains.c_str());
+                    lastFaults = faults;
+                    lastNs = ns;
                 }
                 const auto reads = takeHot(hotReads);
                 const auto writes = takeHot(hotWrites);
