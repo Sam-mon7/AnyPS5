@@ -60,6 +60,7 @@ add_library(kytygpu SHARED EXCLUDE_FROM_ALL
         ${kytyCommonSources}
         ${kytyShaderHeaders}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/KytyGpuHost.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/kytygpu.def
 )
 target_include_directories(kytygpu PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include

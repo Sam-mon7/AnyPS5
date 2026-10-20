@@ -1,0 +1,6 @@
+EXPORTS
+    KytyHostAsyncReadbackEnabled
+    KytyHostCaptureEnabled
+    KytyHostComputeChainEnabled
+    KytyHostProfileEnabled
+    KytyHostReadWindowEnabled

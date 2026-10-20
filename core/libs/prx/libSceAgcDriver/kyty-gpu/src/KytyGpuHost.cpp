@@ -1433,11 +1433,11 @@ bool captureEnabled() {
     return enabled;
 }
 
-__declspec(dllexport) bool KytyHostCaptureEnabled() {
+bool KytyHostCaptureEnabled() {
     return captureEnabled();
 }
 
-__declspec(dllexport) bool KytyHostAsyncReadbackEnabled() {
+bool KytyHostAsyncReadbackEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_KYTY_ASYNC_READBACK");
         return text != nullptr && std::string_view(text) == "1";
@@ -1451,7 +1451,7 @@ void KytyHostNoteReadback(std::uint32_t kind, std::uint64_t nanoseconds) {
     if (nanoseconds != 0) counts.readbackDrainNs.fetch_add(nanoseconds, std::memory_order_relaxed);
 }
 
-__declspec(dllexport) bool KytyHostComputeChainEnabled() {
+bool KytyHostComputeChainEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_KYTY_COMPUTE_CHAIN");
         return text != nullptr && std::string_view(text) == "1";
@@ -1459,11 +1459,11 @@ __declspec(dllexport) bool KytyHostComputeChainEnabled() {
     return enabled;
 }
 
-__declspec(dllexport) bool KytyHostProfileEnabled() {
+bool KytyHostProfileEnabled() {
     return profileEnabled();
 }
 
-__declspec(dllexport) bool KytyHostReadWindowEnabled() {
+bool KytyHostReadWindowEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_KYTY_READ_WINDOW");
         return text != nullptr && std::string_view(text) == "1";
@@ -1471,7 +1471,7 @@ __declspec(dllexport) bool KytyHostReadWindowEnabled() {
     return enabled;
 }
 
-__declspec(dllexport) const char* KytyHostCaptureRequest() {
+const char* KytyHostCaptureRequest() {
     if (!captureEnabled()) return nullptr;
     static const auto paths = [] {
         char directory[MAX_PATH] = {};
@@ -1484,7 +1484,7 @@ __declspec(dllexport) const char* KytyHostCaptureRequest() {
     return paths.second.c_str();
 }
 
-__declspec(dllexport) void KytyHostCaptureWrite(const char* path, const void* pixels, std::uint32_t width, std::uint32_t height, bool rgba) {
+void KytyHostCaptureWrite(const char* path, const void* pixels, std::uint32_t width, std::uint32_t height, bool rgba) {
     if (path == nullptr || pixels == nullptr || width == 0 || height == 0) return;
     const auto rowBytes = static_cast<std::size_t>(width) * 4u;
     BITMAPFILEHEADER file{};
