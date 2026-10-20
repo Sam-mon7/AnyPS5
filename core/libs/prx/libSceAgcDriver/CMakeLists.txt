@@ -260,6 +260,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderDeviceProfile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Pm4.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubmissionCapture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FrameCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/VulkanDevice.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FloatFlushProbe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AspectFit.cpp
@@ -364,6 +365,7 @@ target_link_libraries(libSceAgcDriver PRIVATE
         libc
         libkernel
         jpeg_turbo
+        libzstd_static
         ${CMAKE_DL_LIBS}
 )
 if(APS5_ENABLE_TRACY)
@@ -406,6 +408,18 @@ if(BUILD_TESTING)
     set_tests_properties(agc_frame_dump_io PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_frame_dump_io PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_frame_capture_tests tests/FrameCapture.cpp Execution/src/FrameCapture.cpp)
+    target_include_directories(agc_frame_capture_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_frame_capture_tests PRIVATE libc libzstd_static)
+    set_target_properties(agc_frame_capture_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_frame_capture_tests)
+    add_test(NAME agc_frame_capture COMMAND agc_frame_capture_tests)
+    set_tests_properties(agc_frame_capture PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_frame_capture PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
