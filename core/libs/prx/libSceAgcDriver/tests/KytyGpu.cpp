@@ -34,6 +34,7 @@ int main() {
         const std::pair<const char*, const char*> switches[] = {
             {"KytyHostCaptureEnabled", "APS5_KYTY_GPU_CAPTURE"},
             {"KytyHostReadWindowEnabled", "APS5_KYTY_READ_WINDOW"},
+            {"KytyHostAsyncReadbackEnabled", "APS5_KYTY_ASYNC_READBACK"},
         };
         for (const auto& [function, variable] : switches) {
             const auto enabled = module != nullptr ? reinterpret_cast<Switch>(GetProcAddress(module, function)) : nullptr;

@@ -56,38 +56,323 @@ index 83147cdd..3564680c 100644
  
  template <typename T>
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-index d452db96..d0e0d924 100644
+index d452db96..487d9ef3 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-@@ -296,6 +296,8 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+@@ -15,6 +15,8 @@
+ #include "kernel/memory.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
+ #include <cinttypes>
+ #include <cstring>
+ #include <memory>
+@@ -101,6 +103,7 @@ void BufferCache::Unregister(BufferId id) {
+ 
+ template <bool insert>
+ void BufferCache::ChangeRegister(BufferId id) {
++	DrainGuestReadback(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size());
+ 	auto& buffer = m_slot_buffers[id];
+ 	PageTable::PageRange pages {};
+ 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
+@@ -275,6 +278,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
+ }
+ 
+ BufferCache::~BufferCache() {
++	DrainGuestReadback();
+ 	if (!m_gpu_modified_ranges.Empty()) {
+ 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
+ 	}
+@@ -296,25 +300,279 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
  	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
  }
  
 +extern "C" bool KytyHostReadWindowEnabled();
++extern "C" bool KytyHostAsyncReadbackEnabled();
++extern "C" void KytyHostNoteReadback(uint32_t kind, uint64_t nanoseconds);
++
++namespace {
++
++constexpr uint32_t ReadbackAsync  = 0;
++constexpr uint32_t ReadbackShared = 1;
++constexpr uint32_t ReadbackSync   = 2;
++constexpr uint32_t ReadbackDrain  = 3;
++
++} // namespace
++
++struct BufferCache::GuestReadback {
++	std::vector<vk::BufferCopy> copies;
++	std::vector<GuestRange>     pages;
++	uint64_t                    buffer_address = 0;
++	uint64_t                    begin          = 0;
++	uint64_t                    size           = 0;
++	uint64_t                    tick           = 0;
++	uint64_t                    total_size     = 0;
++	size_t                      slot           = 0;
++	Buffer*                     download       = nullptr;
++	std::atomic<bool>           copying {false};
++	std::atomic<bool>           copied {false};
++};
 +
  void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
  	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
  		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
-@@ -308,8 +310,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+ 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+ 		     vaddr, size);
+ 	}
+-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+-		if (is_write && !IsRegionRegistered(vaddr, size)) {
+-			return;
++	auto& gpu = m_scheduler.Context().GetGpu();
++	if (!is_write && !GuestGpu::IsGpuThread() && KytyHostAsyncReadbackEnabled()) {
++		std::shared_ptr<GuestReadback> request;
++		gpu.SendCommandSync([&] {
++			bool completed = false;
++			request        = BeginGuestReadback(vaddr, size, completed);
++			if (!request && !completed) {
++				KytyHostNoteReadback(ReadbackSync, 0);
++				ReadMemoryOnGpu(vaddr, size, false);
++			}
++		});
++		if (request) {
++			CopyGuestReadback(request);
++			gpu.SendCommandSync([this, request] {
++				if (m_guest_readbacks[request->slot] == request) {
++					FinishGuestReadback(request->slot);
++				}
++			});
  		}
- 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
++		return;
++	}
++	gpu.SendCommandSync([this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
++}
  
 -		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
 -			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-+		auto begin = vaddr;
-+		auto end   = vaddr + size;
-+		if (KytyHostReadWindowEnabled()) {
-+			constexpr uint64_t WindowSize = 512 * 1024;
-+			begin = std::max(vaddr & ~(WindowSize - 1), buffer.CpuAddress());
-+			end   = std::min(std::max(begin + WindowSize, vaddr + size),
-+			                 buffer.CpuAddress() + buffer.Size());
++void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
++	DrainGuestReadback();
++	if (is_write && !IsRegionRegistered(vaddr, size)) {
++		return;
++	}
++	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
++
++	auto begin = vaddr;
++	auto end   = vaddr + size;
++	if (KytyHostReadWindowEnabled()) {
++		constexpr uint64_t WindowSize = 512 * 1024;
++		begin = std::max(vaddr & ~(WindowSize - 1), buffer.CpuAddress());
++		end   = std::min(std::max(begin + WindowSize, vaddr + size),
++		                 buffer.CpuAddress() + buffer.Size());
++	}
++	if (DownloadBufferMemory<false>(buffer, begin, end - begin)) {
++		m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
++	}
++	if (is_write) {
++		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
++	}
++}
++
++std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(uint64_t address,
++                                                                            uint64_t size,
++                                                                            bool&    completed) {
++	completed                     = false;
++	constexpr uint64_t WindowSize = 512 * 1024;
++	constexpr uint64_t Capacity   = 2 * WindowSize;
++	if (!GuestRange {address, size}.Valid() || size > WindowSize) {
++		return {};
++	}
++	for (size_t slot = 0; slot < GuestReadbackSlots; ++slot) {
++		const auto& pending = m_guest_readbacks[slot];
++		if (!pending) {
++			continue;
 +		}
-+		if (DownloadBufferMemory<false>(buffer, begin, end - begin)) {
-+			m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
++		if (pending->copied.load(std::memory_order_acquire)) {
++			FinishGuestReadback(slot);
++			continue;
  		}
- 		if (is_write) {
- 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-@@ -322,7 +332,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+-		if (is_write) {
+-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
++		if (std::ranges::any_of(pending->pages, [&](const GuestRange& page) {
++			    return address >= page.address && address < page.End() &&
++			           size <= page.End() - address;
++		    })) {
++			KytyHostNoteReadback(ReadbackShared, 0);
++			return pending;
+ 		}
++	}
++	DrainGuestReadback(address, size);
++	auto&      buffer = m_slot_buffers[FindBuffer(address, size)];
++	const auto begin  = std::max(address & ~(WindowSize - 1), buffer.CpuAddress());
++	const auto end    = std::min(std::max(begin + WindowSize, address + size),
++	                             buffer.CpuAddress() + buffer.Size());
++	RangeSet   available_pages;
++	m_memory_tracker.ForEachDownloadRange<false>(
++	    begin, end - begin, [&](uint64_t page, uint64_t bytes) noexcept {
++		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, page, bytes,
++		                                           "guest readback");
++		    available_pages.Add(page, bytes);
++	    });
++	for (const auto& pending: m_guest_readbacks) {
++		if (pending) {
++			for (const auto& page: pending->pages) {
++				available_pages.Subtract(page.address, page.size);
++			}
++		}
++	}
++	std::vector<vk::BufferCopy> copies;
++	std::vector<GuestRange>     pages;
++	uint64_t                    total_size = 0;
++	available_pages.ForEach([&](uint64_t page_begin, uint64_t page_end) {
++		pages.push_back({page_begin, page_end - page_begin});
++		m_gpu_modified_ranges.ForEachInRange(page_begin, page_end - page_begin,
++		                                     [&](uint64_t start, uint64_t stop) {
++			                                     copies.emplace_back(buffer.Offset(start), total_size,
++			                                                         stop - start);
++			                                     total_size += Common::AlignUp(stop - start, 64);
++		                                     });
+ 	});
++	if (copies.empty()) {
++		completed = true;
++		return {};
++	}
++	if (total_size > Capacity) {
++		return {};
++	}
++	size_t slot = 0;
++	while (slot < GuestReadbackSlots && m_guest_readbacks[slot]) {
++		++slot;
++	}
++	if (slot == GuestReadbackSlots) {
++		slot = 0;
++		for (size_t i = 1; i < GuestReadbackSlots; ++i) {
++			if (m_guest_readbacks[i]->tick < m_guest_readbacks[slot]->tick) {
++				slot = i;
++			}
++		}
++		FinishGuestReadback(slot);
++	}
++	auto& download = m_guest_downloads[slot];
++	if (!download) {
++		download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
++		                                    vk::BufferUsageFlagBits::eTransferDst, Capacity);
++	}
++
++	auto& command = m_scheduler.Current();
++	command.EndRendering();
++	const auto              native = command.Handle();
++	vk::BufferMemoryBarrier before {};
++	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
++	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
++	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	before.buffer              = buffer.Handle();
++	before.offset              = 0;
++	before.size                = buffer.Size();
++	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
++	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
++	                       nullptr);
++	native.copyBuffer(buffer.Handle(), download->Handle(), static_cast<uint32_t>(copies.size()),
++	                  copies.data());
++	auto after          = before;
++	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
++	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
++	after.buffer        = download->Handle();
++	after.offset        = 0;
++	after.size          = total_size;
++	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
++	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
++	                       {}, 0, nullptr, 1, &after, 0, nullptr);
++	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
++
++	auto request            = std::make_shared<GuestReadback>();
++	request->copies         = std::move(copies);
++	request->pages          = std::move(pages);
++	request->buffer_address = buffer.CpuAddress();
++	request->begin          = begin;
++	request->size           = end - begin;
++	request->total_size     = total_size;
++	request->slot           = slot;
++	request->download       = download.get();
++	request->tick           = m_scheduler.CurrentTick();
++	m_scheduler.Flush();
++	m_guest_readbacks[slot] = request;
++	m_active_guest_readbacks |= 1u << slot;
++	KytyHostNoteReadback(ReadbackAsync, 0);
++	return request;
++}
++
++void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& request) {
++	if (request->copying.exchange(true, std::memory_order_acq_rel)) {
++		while (!request->copied.load(std::memory_order_acquire)) {
++			request->copied.wait(false);
++		}
++		return;
++	}
++	m_scheduler.GetMasterSemaphore().Wait(request->tick);
++	m_scheduler.WaitPriorityOperations(request->tick);
++	request->download->Invalidate(0, request->total_size);
++	const auto* source = request->download->Mapped().data();
++	for (const auto& copy: request->copies) {
++		LibKernel::Memory::WriteBacking(request->buffer_address + copy.srcOffset,
++		                                source + copy.dstOffset, copy.size);
++	}
++	request->copied.store(true, std::memory_order_release);
++	request->copied.notify_all();
++}
++
++void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_read_only) {
++	if (m_active_guest_readbacks == 0 || gpu_read_only) {
++		return;
++	}
++	for (size_t slot = 0; slot < GuestReadbackSlots; ++slot) {
++		const auto& request = m_guest_readbacks[slot];
++		if (!request) {
++			continue;
++		}
++		if (address != 0 &&
++		    (address >= request->begin + request->size ||
++		     (address < request->begin && size <= request->begin - address))) {
++			continue;
++		}
++		if (address != 0 && std::ranges::none_of(request->pages, [&](const GuestRange& page) {
++			    return address < page.End() &&
++			           (address >= page.address || size > page.address - address);
++		    })) {
++			continue;
++		}
++		FinishGuestReadback(slot);
++	}
++}
++
++void BufferCache::FinishGuestReadback(size_t slot) {
++	auto request = m_guest_readbacks[slot];
++	if (!request) {
++		return;
++	}
++	if (!request->copied.load(std::memory_order_acquire)) {
++		const auto started = std::chrono::steady_clock::now();
++		while (!request->copied.load(std::memory_order_acquire)) {
++			request->copied.wait(false);
++		}
++		KytyHostNoteReadback(ReadbackDrain,
++		                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++		                                               std::chrono::steady_clock::now() - started)
++		                                               .count()));
++	}
++	for (const auto& copy: request->copies) {
++		m_gpu_modified_ranges.Subtract(request->buffer_address + copy.srcOffset, copy.size);
++	}
++	for (const auto& page: request->pages) {
++		m_memory_tracker.UnmarkRegionAsGpuModified(page.address, page.size);
++	}
++	m_guest_readbacks[slot].reset();
++	m_active_guest_readbacks &= ~(1u << slot);
+ }
+ 
+ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+@@ -322,7 +580,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
  		return NULL_BUFFER_ID;
  	}
  	if (!GuestRange {vaddr, size}.Valid()) {
@@ -96,7 +381,7 @@ index d452db96..d0e0d924 100644
  	}
  	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
  	if (owner != nullptr && *owner) {
-@@ -484,6 +494,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+@@ -484,9 +742,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
  	return source.first->Handle();
  }
  
@@ -105,7 +390,11 @@ index d452db96..d0e0d924 100644
  std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                         bool is_written, bool is_texel_buffer,
                                                         BufferId id) {
-@@ -515,6 +527,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t
++	DrainGuestReadback(vaddr, size, !is_written && !is_texel_buffer);
+ 	auto& command = m_scheduler.Current();
+ 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
+ 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
+@@ -515,6 +776,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t
  	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
  	if (is_written) {
  		m_gpu_modified_ranges.Add(vaddr, size);
@@ -113,8 +402,71 @@ index d452db96..d0e0d924 100644
  	}
  	return {&buffer, buffer.Offset(vaddr)};
  }
+@@ -523,6 +785,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
+ 	if (!GuestRange {vaddr, size}.Valid()) {
+ 		EXIT("BufferCache: invalid image source\n");
+ 	}
++	DrainGuestReadback(vaddr, size);
+ 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+ 	if (owner != nullptr && *owner) {
+ 		auto& buffer = m_slot_buffers[*owner];
+@@ -632,6 +895,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+ }
+ 
+ void BufferCache::RunGarbageCollector() {
++	DrainGuestReadback();
+ 	const auto tick = m_gc_tick++;
+ 	if (m_graphics.CanReportMemoryUsage()) {
+ 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index 27bf987c..5523b2e5 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -11,7 +11,9 @@
+ #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+ #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+ 
++#include <array>
+ #include <map>
++#include <memory>
+ #include <span>
+ #include <utility>
+ #include <vector>
+@@ -52,6 +54,8 @@ public:
+ 
+ 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+ 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
++	void                   DrainGuestReadback(uint64_t address = 0, uint64_t size = UINT64_MAX,
++	                                          bool gpu_read_only = false);
+ 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
+ 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+ 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
+@@ -124,6 +128,13 @@ private:
+ 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
+ 	template <bool async>
+ 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
++	void               ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
++	struct GuestReadback;
++	[[nodiscard]] std::shared_ptr<GuestReadback> BeginGuestReadback(uint64_t address, uint64_t size,
++	                                                                bool& completed);
++	void CopyGuestReadback(const std::shared_ptr<GuestReadback>& request);
++	void FinishGuestReadback(size_t slot);
++	static constexpr size_t GuestReadbackSlots = 8;
+ 
+ 	GraphicContext&                                   m_graphics;
+ 	CommandScheduler&                                 m_scheduler;
+@@ -145,6 +156,9 @@ private:
+ 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
+ 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+ 	uint64_t m_gc_tick            = 0;
++	std::array<std::shared_ptr<GuestReadback>, GuestReadbackSlots> m_guest_readbacks {};
++	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots>        m_guest_downloads {};
++	uint32_t                                                       m_active_guest_readbacks = 0;
+ };
+ 
+ } // namespace Libs::Graphics
 diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
-index e3abcc6d..e8ea07b8 100644
+index e3abcc6d..5d8d8d0e 100644
 --- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 @@ -1090,7 +1090,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
@@ -126,7 +478,20 @@ index e3abcc6d..e8ea07b8 100644
  			}
  			ClearImage(m_scheduler.Current(), id, depth ? image.backing.format : view.format,
  			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
-@@ -1584,7 +1584,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
+@@ -1185,6 +1185,12 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
+ }
+ 
+ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
++	if (desc.info.data.size != 0) {
++		m_buffer_cache.DrainGuestReadback(desc.info.data.address, desc.info.data.size);
++	}
++	if (desc.info.stencil.size != 0) {
++		m_buffer_cache.DrainGuestReadback(desc.info.stencil.address, desc.info.stencil.size);
++	}
+ 	auto& command = m_scheduler.Current();
+ 	if (command.IsInvalid()) {
+ 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
+@@ -1584,7 +1590,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
  		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
  		attachment.clearValue  = clear;
  		vk::RenderingInfo rendering {};
@@ -379,6 +744,26 @@ index efb2a988..073ebe8f 100644
  }
  
  void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+diff --git a/src/graphics/host_gpu/renderer/renderContext.cpp b/src/graphics/host_gpu/renderer/renderContext.cpp
+index e256b8ae..6e7df99b 100644
+--- a/src/graphics/host_gpu/renderer/renderContext.cpp
++++ b/src/graphics/host_gpu/renderer/renderContext.cpp
+@@ -100,6 +100,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
+ 		     vaddr, size);
+ 	}
+ 	const auto unmap = [this, vaddr, size] {
++		m_buffer_cache.DrainGuestReadback(vaddr, size);
+ 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
+ 		// access a range with no cached data, so they must finish before it is unmapped.
+ 		if (m_command_scheduler.Active() &&
+@@ -129,6 +130,7 @@ void RenderContext::PrepareBda() {
+ 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
+ 		m_bda_logged = true;
+ 	}
++	m_buffer_cache.DrainGuestReadback();
+ 	std::shared_lock lock(m_mapped_ranges_mutex);
+ 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
+ 	m_fault_process_pending = true;
 diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
 index ee8bad43..96599195 100644
 --- a/src/graphics/host_gpu/renderer/renderDraw.cpp
