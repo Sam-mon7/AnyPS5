@@ -176,7 +176,7 @@ public:
     WatchedBlock() {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, 65536);
 #else
         constexpr std::uintptr_t alignment = 65536;
         void* mapped = mmap(nullptr, BlockBytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -209,6 +209,26 @@ public:
 
     std::uint8_t* Data() const { return block; }
     std::uint64_t Address() const { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block)); }
+
+    void CommitLayer() const {
+#ifdef _WIN32
+        GuestArena::GuestArenaCommit_nid_postfix(block + LayerBytes, LayerBytes, PAGE_READWRITE, 65536);
+#else
+        Require(mmap(block + LayerBytes, LayerBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED, "cannot commit the guest depth layer");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block + LayerBytes, LayerBytes);
+#endif
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(Address() + LayerBytes, LayerBytes);
+    }
+
+    void DecommitLayer() const {
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(block + LayerBytes, LayerBytes);
+#else
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block + LayerBytes, LayerBytes);
+        Require(mmap(block + LayerBytes, LayerBytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) != MAP_FAILED, "cannot decommit the guest depth layer");
+#endif
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(Address() + LayerBytes, LayerBytes);
+    }
 
 private:
     std::uint8_t* block = nullptr;
@@ -313,6 +333,59 @@ void RecordedUploads(const Context& context, const WatchedBlock& block) {
     recorder.Sync();
 }
 
+void UnreadableLayers(const Context& context, const WatchedBlock& block) {
+    using namespace AgcDriver::GuestMemory;
+    const auto address = block.Address();
+    ClearDepthSurfaces(context.device);
+    block.DecommitLayer();
+    DepthSurfaceView(context, DepthTarget{address, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0, 0});
+    DepthSurfaceView(context, DepthTarget{address + 2 * BlockBytes, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0, 0});
+    const auto resource = ArrayOver(address);
+    const auto sample = [&](bool upload, const char* when, bool advance = true) {
+        if (advance) BumpCollectEpoch();
+        bufferToImageCopies = 0;
+        Require(DepthSurfaceTexture(context, words, resource, components) != nullptr, "missing depth plane texture");
+        Require(bufferToImageCopies.load() == (upload ? 1u : 0u), std::string("unexpected depth plane upload ") + when);
+    };
+    sample(true, "on the first unreadable use");
+    sample(false, "on repeated unreadable use", false);
+    sample(false, "after an epoch change");
+    block.CommitLayer();
+    FillLayer(block.Data() + LayerBytes, 0.5f);
+    sample(true, "after committing the layer");
+    block.DecommitLayer();
+    sample(true, "after decommitting a nonzero layer");
+    sample(false, "after the zero layer was uploaded");
+    static const WatchedBlock* pending = nullptr;
+    pending = &block;
+    SetReadGuard([](std::uint64_t at, std::size_t) {
+        if (pending != nullptr && at == pending->Address() + LayerBytes) throw std::runtime_error("unreadable depth guard");
+    });
+    bool refused = false;
+    try { sample(false, "with a read guard"); }
+    catch (const std::runtime_error& error) { refused = std::string(error.what()) == "unreadable depth guard"; }
+    SetReadGuard(nullptr);
+    Require(refused, "the cached zero layer bypassed its read guard");
+    SetFlushHook([](std::uint64_t at, std::size_t) {
+        if (pending != nullptr && at == pending->Address() + LayerBytes) {
+            const auto* block = pending;
+            pending = nullptr;
+            block->CommitLayer();
+            FillLayer(block->Data() + LayerBytes, 0.75f);
+        }
+    });
+    try { sample(true, "after its flush materialized the layer"); }
+    catch (...) { SetFlushHook(nullptr); throw; }
+    SetFlushHook(nullptr);
+    Require(pending == nullptr, "the cached zero layer bypassed its GPU flush");
+    Unwatch(address + LayerBytes, LayerBytes);
+    FillLayer(block.Data() + LayerBytes, 0.25f);
+    sample(true, "after an untracked CPU write", false);
+    FillLayer(block.Data() + LayerBytes, 0.875f);
+    sample(true, "after another untracked CPU write in the same epoch", false);
+    std::puts("unreadable depth layers: reuse, commit, decommit, read guard and deferred write passed");
+}
+
 void RunCubeGather(const Context& base, const WatchedBlock& block) {
     TextureDetiler detiler(base);
     auto context = base;
@@ -385,8 +458,9 @@ void RunCubeTiledSlice(const Context& base, const WatchedBlock& block) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        Require(argc == 1 || (argc == 2 && std::string(argv[1]) == "--unreadable"), "usage: depth_plane_guest_layers [--unreadable]");
         if (!AgcDriver::GuestMemory::WriteWatched()) {
             std::puts("skipped, guest memory has no write watch");
             return Skipped;
@@ -405,10 +479,13 @@ int main() {
             context.detiler = &detiler;
             WatchedBlock block;
             Require(AgcDriver::GuestMemory::Watched(block.Address(), BlockBytes), "depth plane guest layers: the guest block is not write-watched");
-            Run(context, block);
-            RecordedUploads(context, block);
-            RunCubeGather(context, block);
-            RunCubeTiledSlice(context, block);
+            if (argc == 2) UnreadableLayers(context, block);
+            else {
+                Run(context, block);
+                RecordedUploads(context, block);
+                RunCubeGather(context, block);
+                RunCubeTiledSlice(context, block);
+            }
         }
         device.reset();
         std::puts("depth plane guest layer tests passed");

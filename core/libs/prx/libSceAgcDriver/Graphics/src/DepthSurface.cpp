@@ -1014,13 +1014,23 @@ public:
                 continue;
             }
             surface = {};
-            const GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes))};
-            if (held.generation != 0 && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation)) {
+            GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes))};
+            const bool sameLayout = held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick;
+            if (current.generation != 0 && held.generation != 0 && sameLayout && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation)) {
                 held.generation = current.generation;
                 continue;
             }
+            if (current.generation == 0) {
+                GuestMemory::GuardRead(current.address, static_cast<std::size_t>(current.bytes));
+                GuestMemory::FlushGpuWrites(current.address, static_cast<std::size_t>(current.bytes));
+                current.unreadable = GuestMemory::DescribeCommitted(current.address, static_cast<std::size_t>(current.bytes)).ranges.empty();
+                if (current.unreadable && held.unreadable && sameLayout && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes))) continue;
+            }
             auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
+            const auto bytes = upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes));
+            if (current.unreadable) std::fill(bytes.begin(), bytes.end(), std::byte{0});
+            else if (current.generation == 0) GuestMemory::ReadCommittedUnsynced(current.address, bytes);
+            else GuestMemory::ReadCommitted(current.address, bytes);
             uploads.push_back(std::move(upload));
             uploadLayers.push_back(layer);
             held = current;
@@ -1047,6 +1057,7 @@ private:
         TextureTileMode tileMode = TextureTileMode::kLinear;
         bool thick = false;
         std::uint64_t generation = 0;
+        bool unreadable = false;
     };
 
     VkImage image = VK_NULL_HANDLE;
