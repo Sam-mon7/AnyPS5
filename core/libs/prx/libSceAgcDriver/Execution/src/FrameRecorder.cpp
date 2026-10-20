@@ -387,14 +387,14 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
     std::vector<Range> result;
     std::uint64_t outsideBytes = 0;
     for (const auto& allocation : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
-        if (!allocation->gpu) continue;
+        if (!allocation->readable) continue;
         const auto first = allocation->address;
         const auto end = first + allocation->bytes;
         if (first < base || end > base + size) {
             outsideBytes += allocation->bytes;
             continue;
         }
-        const auto access = (allocation->readable ? FrameRangeAccess::Readable : 0u) | (allocation->writable ? FrameRangeAccess::Writable : 0u) | FrameRangeAccess::Gpu;
+        const auto access = FrameRangeAccess::Readable | (allocation->writable ? FrameRangeAccess::Writable : 0u) | (allocation->gpu ? FrameRangeAccess::Gpu : 0u);
         for (auto address = first; address < end;) {
             MEMORY_BASIC_INFORMATION info{};
             if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), &info, sizeof(info)) == 0) throw std::runtime_error("frame capture: VirtualQuery failed inside the guest arena");
@@ -416,7 +416,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
             address = regionEnd;
         }
     }
-    if (outsideBytes != 0) warnings.push_back(std::to_string(outsideBytes) + " bytes of GPU-visible allocations outside the guest arena are not captured");
+    if (outsideBytes != 0) warnings.push_back(std::to_string(outsideBytes) + " bytes of readable guest allocations outside the guest arena are not captured");
     return result;
 #else
     throw std::runtime_error("frame capture: guest memory capture is implemented on Windows only");

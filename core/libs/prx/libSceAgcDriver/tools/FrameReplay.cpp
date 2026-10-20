@@ -137,28 +137,56 @@ bool committedWritable(std::uint64_t address, std::uint64_t bytes) {
 
 std::pair<std::uint64_t, std::uint64_t> progress();
 
-void restoreMemory(const FrameCaptureReader& reader) {
+struct Skipped {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::uint64_t bytes = 0;
+
+    void Add(const FrameMemoryChunk& chunk) {
+        ranges.emplace_back(chunk.address, chunk.address + chunk.bytes);
+        bytes += chunk.bytes;
+    }
+
+    bool Overlaps(const FrameMemoryChunk& chunk) const {
+        return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return chunk.address < range.second && range.first < chunk.address + chunk.bytes; });
+    }
+};
+
+Skipped restoreMemory(const FrameCaptureReader& reader) {
     std::uintptr_t base = 0;
     std::size_t size = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
     if (!reader.Header().empty() && headerNumber(reader.Header(), "arena_base") != base) throw std::runtime_error("frame replay: the guest arena is at a different address than in the capture");
     progress();
-    std::vector<const FrameMemoryChunk*> snapshot;
+    Skipped skipped;
     {
         GuestAllocations::Mutation mutation;
         for (const auto& chunk : reader.Chunks()) {
-            if (chunk.kind == FrameMemoryKind::Snapshot) snapshot.push_back(&chunk);
-            if (chunk.kind != FrameMemoryKind::Range || committedWritable(chunk.address, chunk.bytes)) continue;
+            if (chunk.kind != FrameMemoryKind::Range) continue;
+            const bool gpu = (chunk.access & FrameRangeAccess::Gpu) != 0;
+            if (committedWritable(chunk.address, chunk.bytes)) {
+                if (!gpu) skipped.Add(chunk);
+                continue;
+            }
             auto* const pointer = reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address));
             const auto bytes = static_cast<std::size_t>(chunk.bytes);
-            GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, bytes);
+            try {
+                GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, bytes);
+            } catch (const std::exception&) {
+                if (gpu) throw;
+                skipped.Add(chunk);
+                continue;
+            }
 #ifdef _WIN32
             GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, PAGE_READWRITE, bytes);
 #else
             GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, 3, bytes);
 #endif
-            mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, (chunk.access & FrameRangeAccess::Gpu) != 0);
+            mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);
         }
+    }
+    std::vector<const FrameMemoryChunk*> snapshot;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Snapshot && !skipped.Overlaps(chunk)) snapshot.push_back(&chunk);
     }
     const auto workers = std::max<std::size_t>(1, std::thread::hardware_concurrency());
     for (std::size_t first = 0; first < snapshot.size(); first += workers) {
@@ -168,6 +196,7 @@ void restoreMemory(const FrameCaptureReader& reader) {
         }
         for (auto& future : pending) future.get();
     }
+    return skipped;
 }
 
 std::pair<std::uint64_t, std::uint64_t> progress() {
@@ -183,6 +212,7 @@ struct Replay {
     Frames frames;
     std::vector<std::shared_ptr<ReplayOutput>> outputs;
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
+    Skipped skipped;
     std::uint64_t paceTimeouts = 0;
     std::uint64_t staleRegistrations = 0;
     std::uint64_t submits = 0;
@@ -254,6 +284,7 @@ struct Replay {
             return;
         case FrameCallKind::Memory:
             for (const auto* chunk : groups[call.values.at(0)]) {
+                if (skipped.Overlaps(*chunk)) continue;
                 restore(reader, *chunk);
                 deltaBytes += chunk->bytes;
             }
@@ -325,9 +356,10 @@ int run(const Options& options) {
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
-    restoreMemory(reader);
+    auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
     Replay replay{options, reader};
+    replay.skipped = std::move(skipped);
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind == FrameMemoryKind::Delta) replay.groups[chunk.group].push_back(&chunk);
     }
@@ -342,10 +374,10 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"stale_registrations\":%llu,\"load_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"stale_registrations\":%llu,\"skipped_mib\":%.1f,\"load_s\":%.3f}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(),
                 static_cast<unsigned long long>(replay.submits), static_cast<double>(replay.deltaBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts),
-                static_cast<unsigned long long>(replay.staleRegistrations), std::chrono::duration<double>(loaded - loadStart).count());
+                static_cast<unsigned long long>(replay.staleRegistrations), static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), std::chrono::duration<double>(loaded - loadStart).count());
     std::fflush(stdout);
     return 0;
 }
