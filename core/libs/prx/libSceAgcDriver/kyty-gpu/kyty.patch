@@ -908,19 +908,20 @@ index 897d7935..ada854ab 100644
  private:
  	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
-index efb2a988..69e79d10 100644
+index efb2a988..13514aa3 100644
 --- a/src/graphics/host_gpu/renderer/renderCompute.cpp
 +++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
-@@ -38,6 +38,8 @@
+@@ -38,6 +38,9 @@
  #include <unordered_map>
  #include <vector>
  
 +extern "C" bool KytyHostComputeChainEnabled();
++extern "C" void KytyHostNoteShader(uint64_t address, uint64_t hash);
 +
  namespace Libs::Graphics {
  static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                   GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
-@@ -236,7 +238,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
+@@ -236,7 +239,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
  			size *= count;
  		}
  	}
@@ -929,7 +930,23 @@ index efb2a988..69e79d10 100644
  }
  
  void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
-@@ -364,9 +366,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -290,6 +293,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 
+ 	const auto& cs_regs = sh_ctx.GetCs();
+ 	const auto& sh_regs = ctx.GetShaderRegisters();
++	KytyHostNoteShader(cs_regs.cs_regs.data_addr, 0);
+ 
+ 	ShaderComputeInputInfo input_info {};
+ 	input_info.async_compute = async_compute;
+@@ -317,6 +321,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 
+ 	const auto& program   = *input_info.stage.program;
+ 	const auto& resources = *input_info.stage.resources;
++	KytyHostNoteShader(cs_regs.cs_regs.data_addr, program.shader_hash);
+ 	if (resources.specialization_reads.empty()) {
+ 		// Cached metadata addresses can be reused as ordinary buffers; preserve their guest writes.
+ 		UpdateComputeMetaClears(input_info, buffer);
+@@ -364,9 +369,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
  	BindSharedMemory(m_context, input_info, bindings);
  	RebindBuffers(bindings);
  
@@ -943,7 +960,7 @@ index efb2a988..69e79d10 100644
  	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
  	    HasShaderBufferWrites(input_info.stage);
  	has_storage_writes =
-@@ -377,7 +381,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -377,7 +384,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
  		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
  	                }) ||
  	    has_storage_writes;
@@ -952,7 +969,7 @@ index efb2a988..69e79d10 100644
  		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
  		// while allowing the queue to execute asynchronously.
  		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-@@ -448,7 +452,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -448,7 +455,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
  	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
  
  	// The removed host fence also ordered read-only dispatches before later writers.
@@ -965,7 +982,7 @@ index efb2a988..69e79d10 100644
  	ResetBindings();
  }
  
-@@ -493,30 +501,38 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -493,30 +504,38 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
  	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
  	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
  	RebindBuffers(bindings);
@@ -1037,10 +1054,19 @@ index e256b8ae..6e7df99b 100644
  	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
  	m_fault_process_pending = true;
 diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
-index ee8bad43..96599195 100644
+index ee8bad43..3f02b62e 100644
 --- a/src/graphics/host_gpu/renderer/renderDraw.cpp
 +++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
-@@ -350,13 +350,13 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
+@@ -47,6 +47,8 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++extern "C" void KytyHostNoteShader(uint64_t address, uint64_t hash);
++
+ namespace Libs::Graphics {
+ 
+ std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
+@@ -350,13 +352,13 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
  		const auto final_scissor =
  		    calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent, i);
  		auto& scissor  = scissors[i];
@@ -1057,6 +1083,14 @@ index ee8bad43..96599195 100644
  		}
  	}
  	dynamic_state.SetViewports(std::span {viewports}.first(viewport_count));
+@@ -892,6 +894,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+ 		}
+ 	}
+ 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
++	KytyHostNoteShader((uint64_t {1} << 63u) | vertex_shader_info.gs_regs.data_addr, 0);
+ 	if (draw.IsIndexed()) {
+ 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
+ 	}
 diff --git a/src/graphics/presentation/videoOut.cpp b/src/graphics/presentation/videoOut.cpp
 index f93caa31..6e23d7fc 100644
 --- a/src/graphics/presentation/videoOut.cpp

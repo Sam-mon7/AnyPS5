@@ -127,6 +127,25 @@ std::map<std::uint64_t, std::uint32_t> gpuThreadChangedReads;
 thread_local std::uint64_t faultSite = 0;
 std::map<std::tuple<std::uint64_t, std::uint64_t, bool>, std::uint32_t> writtenBindings;
 std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint32_t> gpuWrites;
+// The shader whose dispatch or draw Kyty's GPU thread is preparing: its code address, with bit 63
+// set for a draw (the vertex stage's address), so writes and reads can name it.
+std::atomic<std::uint64_t> currentShader{0};
+std::map<std::uint64_t, std::uint64_t> shaderHashes;
+std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint32_t> gpuWriteShaders;
+std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> gpuThreadDirtyReadShaders;
+
+std::string shaderName(std::uint64_t shader) {
+    char text[64];
+    const bool draw = (shader >> 63u) != 0;
+    const auto address = shader & ~(std::uint64_t{1} << 63u);
+    const auto hash = shaderHashes.find(shader);
+    if (hash != shaderHashes.end()) {
+        std::snprintf(text, sizeof(text), "%s %llx(%016llx)", draw ? "draw vs" : "cs", static_cast<unsigned long long>(address), static_cast<unsigned long long>(hash->second));
+    } else {
+        std::snprintf(text, sizeof(text), "%s %llx", draw ? "draw vs" : "cs", static_cast<unsigned long long>(address));
+    }
+    return text;
+}
 
 void noteHot(bool write, std::uint64_t address) {
     if (!statsEnabled()) return;
@@ -629,6 +648,7 @@ bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
             compare = Libs::LibKernel::Memory::TryReadBacking(address & ~std::uint64_t{0xf}, before.data(), before.size());
             std::lock_guard lock(hotMutex);
             ++gpuThreadDirtyReads[{address & ~std::uint64_t{0xf}, faultSite}];
+            ++gpuThreadDirtyReadShaders[{address & ~std::uint64_t{0xf}, currentShader.load(std::memory_order_relaxed)}];
         }
     }
     bool handled = resources->HandleFault(access, address);
@@ -1266,6 +1286,20 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                         callers += item;
                     }
                     std::fprintf(stderr, "[kyty-gpu] GPU writes covering it (%zu):%s\n", writers.size(), callers.c_str());
+                    std::vector<std::pair<std::uint32_t, std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>>> shaderWriters;
+                    for (const auto& [key, count] : gpuWriteShaders) {
+                        const auto& [address, size, shader] = key;
+                        if (address < hottest + PageBytes && hottest < address + size) shaderWriters.emplace_back(count, key);
+                    }
+                    std::sort(shaderWriters.begin(), shaderWriters.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    std::string shaderText;
+                    for (std::size_t index = 0; index < std::min<std::size_t>(shaderWriters.size(), 6); ++index) {
+                        const auto& [address, size, shader] = shaderWriters[index].second;
+                        char item[64];
+                        std::snprintf(item, sizeof(item), " %llx+%llx by ", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
+                        shaderText += item + shaderName(shader) + ":" + std::to_string(shaderWriters[index].first);
+                    }
+                    std::fprintf(stderr, "[kyty-gpu] shaders writing it (%zu):%s\n", shaderWriters.size(), shaderText.c_str());
                     std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint64_t> blame;
                     std::uint64_t covered = 0;
                     std::uint64_t total = 0;
@@ -1378,6 +1412,18 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     lastUnchanged = unchanged;
                     lastChanged = changedCount;
                     std::fprintf(stderr, "[kyty-gpu] render-thread reads of GPU-written bytes:%s\n", dirtyText.c_str());
+                    std::vector<std::pair<std::uint32_t, std::pair<std::uint64_t, std::uint64_t>>> readers;
+                    for (const auto& [key, count] : gpuThreadDirtyReadShaders) readers.emplace_back(count, key);
+                    std::sort(readers.begin(), readers.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    std::string readerText;
+                    for (std::size_t index = 0; index < std::min<std::size_t>(readers.size(), 10); ++index) {
+                        const auto [address, shader] = readers[index].second;
+                        char item[32];
+                        std::snprintf(item, sizeof(item), " %llx in ", static_cast<unsigned long long>(address));
+                        readerText += item + shaderName(shader) + ":" + std::to_string(readers[index].first);
+                    }
+                    gpuThreadDirtyReadShaders.clear();
+                    std::fprintf(stderr, "[kyty-gpu] render-thread reads of GPU-written bytes by shader (%zu):%s\n", readers.size(), readerText.c_str());
                     std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers), specialization-read downloads: %llu (%llu ms); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), static_cast<unsigned long long>(drains - lastDrains), static_cast<unsigned long long>((drainNs - lastDrainNs) / 1000000), pages.c_str(), writers.c_str(), chains.c_str());
                     lastFaults = faults;
                     lastNs = ns;
@@ -1416,6 +1462,7 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                 std::fprintf(stderr, "[kyty-gpu] written bindings (%zu distinct):%s\n", writtenBindings.size(), written.c_str());
                 writtenBindings.clear();
                 gpuWrites.clear();
+                gpuWriteShaders.clear();
                 std::fprintf(stderr, "[kyty-gpu] read fault sites:%s\n", text.c_str());
                 std::fprintf(stderr, "[kyty-gpu] read faults: %s\n[kyty-gpu] write faults: %s\n", reads.c_str(), writes.c_str());
             }
@@ -1607,6 +1654,15 @@ void KytyHostNoteGpuWrite(std::uint64_t address, std::uint64_t size, const void*
     if (!statsEnabled()) return;
     std::lock_guard lock(hotMutex);
     ++gpuWrites[{address, size, reinterpret_cast<std::uint64_t>(caller)}];
+    ++gpuWriteShaders[{address, size, currentShader.load(std::memory_order_relaxed)}];
+}
+
+void KytyHostNoteShader(std::uint64_t address, std::uint64_t hash) {
+    if (!statsEnabled()) return;
+    currentShader.store(address, std::memory_order_relaxed);
+    if (hash == 0) return;
+    std::lock_guard lock(hotMutex);
+    shaderHashes[address] = hash;
 }
 
 void KytyHostNoteWrittenBinding(std::uint64_t address, std::uint64_t size, bool sentinel) {
