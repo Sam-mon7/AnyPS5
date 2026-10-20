@@ -386,10 +386,26 @@ index f93caa31..6e23d7fc 100644
  	info.bytes_per_block = pixel_format.bytes_per_element;
  	info.samples         = 1;
 diff --git a/src/graphics/presentation/window/swapchain.cpp b/src/graphics/presentation/window/swapchain.cpp
-index 853bd8db..2e03216d 100644
+index 853bd8db..d4a8c4e7 100644
 --- a/src/graphics/presentation/window/swapchain.cpp
 +++ b/src/graphics/presentation/window/swapchain.cpp
-@@ -182,7 +182,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent,
+@@ -22,9 +22,15 @@
+ #include <atomic>
+ #include <limits>
+ #include <memory>
++#include <string>
+ #include <vector>
+ #include <vulkan/vk_platform.h>
+ 
++extern "C" bool        KytyHostCaptureEnabled();
++extern "C" const char* KytyHostCaptureRequest();
++extern "C" void        KytyHostCaptureWrite(const char* path, const void* pixels, uint32_t width,
++                                            uint32_t height, bool rgba);
++
+ // IWYU pragma: no_include <intrin.h>
+ 
+ namespace Libs::Graphics {
+@@ -182,7 +188,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent,
  	vk::ImageCreateInfo create {};
  	create.sType         = vk::StructureType::eImageCreateInfo;
  	create.imageType     = vk::ImageType::e2D;
@@ -398,7 +414,7 @@ index 853bd8db..2e03216d 100644
  	create.mipLevels     = 1;
  	create.arrayLayers   = 1;
  	create.format        = format;
-@@ -242,7 +242,7 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
+@@ -242,7 +248,7 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
  	vk::ImageCopy copy {};
  	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, source.backing.layers};
  	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, image.layers};
@@ -407,7 +423,31 @@ index 853bd8db..2e03216d 100644
  	                       std::min(source.backing.extent.height, image.extent.height), 1};
  	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
  	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
-@@ -406,7 +406,7 @@ void Swapchain::Create() {
+@@ -274,6 +280,8 @@ public:
+ 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
+ 	uint64_t Submit(CommandScheduler& scheduler);
+ 	[[nodiscard]] Status Present();
++	[[nodiscard]] bool   CapturePending() const noexcept { return m_capture_pending; }
++	void                 FinishCapture();
+ 
+ 	[[nodiscard]] uint32_t ImageCount() const noexcept {
+ 		return static_cast<uint32_t>(m_images.size());
+@@ -306,6 +314,14 @@ private:
+ 	std::vector<uint64_t>          m_image_acquired_ticks;
+ 	std::vector<vk::Semaphore>     m_render_complete;
+ 	std::unique_ptr<SystemOverlay> m_system_overlay;
++	bool                           m_capture_supported = false;
++	bool                           m_capture_pending   = false;
++	std::string                    m_capture_path;
++	vk::Buffer                     m_capture_buffer = nullptr;
++	vk::DeviceMemory               m_capture_memory = nullptr;
++	void*                          m_capture_mapped = nullptr;
++	uint64_t                       m_capture_bytes  = 0;
++	bool                           PrepareCapture();
+ 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
+ 	vk::PipelineLayout             m_overlay_layout      = nullptr;
+ 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
+@@ -406,7 +422,7 @@ void Swapchain::Create() {
  	// during creation, the next presentation will detect the newer size.
  	{
  		Common::LockGuard lock(m_window.mutex);
@@ -416,7 +456,19 @@ index 853bd8db..2e03216d 100644
  	}
  	EXIT_IF(m_window_extent.width == 0);
  	EXIT_IF(m_window_extent.height == 0);
-@@ -491,7 +491,7 @@ void Swapchain::Create() {
+@@ -454,6 +470,11 @@ void Swapchain::Create() {
+ 	create_info.imageArrayLayers = 1;
+ 	create_info.imageUsage =
+ 	    vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst;
++	m_capture_supported = KytyHostCaptureEnabled() &&
++	                      (surface.capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eTransferSrc);
++	if (m_capture_supported) {
++		create_info.imageUsage |= vk::ImageUsageFlagBits::eTransferSrc;
++	}
+ 	create_info.imageSharingMode = vk::SharingMode::eExclusive;
+ 	create_info.preTransform     = transform;
+ 	create_info.compositeAlpha   = composite;
+@@ -491,7 +512,7 @@ void Swapchain::Create() {
  		view.image                           = m_images[i];
  		view.viewType                        = vk::ImageViewType::e2D;
  		view.format                          = m_format;
@@ -425,7 +477,7 @@ index 853bd8db..2e03216d 100644
  		view.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
  		view.subresourceRange.baseArrayLayer = 0;
  		view.subresourceRange.baseMipLevel   = 0;
-@@ -567,8 +567,8 @@ void Swapchain::Destroy() {
+@@ -567,8 +588,8 @@ void Swapchain::Destroy() {
  
  	m_handle        = nullptr;
  	m_format        = vk::Format::eUndefined;
@@ -436,3 +488,124 @@ index 853bd8db..2e03216d 100644
  	m_image_index   = static_cast<uint32_t>(-1);
  	m_frame_index   = 0;
  	m_images.clear();
+@@ -823,13 +844,40 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame*
+ 		                           &black, 1, &to_transfer.subresourceRange);
+ 	}
+ 
++	auto present_layout = vk::ImageLayout::eTransferDstOptimal;
++	const char* capture = m_capture_supported ? KytyHostCaptureRequest() : nullptr;
++	if (capture != nullptr && PrepareCapture()) {
++		vk::ImageMemoryBarrier to_copy {};
++		to_copy.sType                           = vk::StructureType::eImageMemoryBarrier;
++		to_copy.srcAccessMask                   = vk::AccessFlagBits::eTransferWrite;
++		to_copy.dstAccessMask                   = vk::AccessFlagBits::eTransferRead;
++		to_copy.oldLayout                       = vk::ImageLayout::eTransferDstOptimal;
++		to_copy.newLayout                       = vk::ImageLayout::eTransferSrcOptimal;
++		to_copy.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
++		to_copy.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
++		to_copy.image                           = m_images[m_image_index];
++		to_copy.subresourceRange                = to_transfer.subresourceRange;
++		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
++		                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
++		                           nullptr, 0, nullptr, 1, &to_copy);
++		vk::BufferImageCopy copy {};
++		copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
++		copy.imageSubresource.layerCount = 1;
++		copy.imageExtent                 = vk::Extent3D {m_extent.width, m_extent.height, 1};
++		vk_command.copyImageToBuffer(m_images[m_image_index], vk::ImageLayout::eTransferSrcOptimal,
++		                             m_capture_buffer, 1, &copy);
++		present_layout    = vk::ImageLayout::eTransferSrcOptimal;
++		m_capture_path    = capture;
++		m_capture_pending = true;
++	}
++
+ 	vk::ImageMemoryBarrier to_present {};
+ 	to_present.sType               = vk::StructureType::eImageMemoryBarrier;
+-	to_present.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
++	to_present.srcAccessMask       = vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eTransferRead;
+ 	to_present.dstAccessMask       = draw_attachment ? vk::AccessFlagBits::eColorAttachmentRead |
+ 	                                                       vk::AccessFlagBits::eColorAttachmentWrite
+ 	                                                 : vk::AccessFlagBits::eMemoryRead;
+-	to_present.oldLayout           = vk::ImageLayout::eTransferDstOptimal;
++	to_present.oldLayout           = present_layout;
+ 	to_present.newLayout           = draw_attachment ? vk::ImageLayout::eColorAttachmentOptimal
+ 	                                                 : vk::ImageLayout::ePresentSrcKHR;
+ 	to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+@@ -871,6 +919,66 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame*
+ 	}
+ }
+ 
++bool Swapchain::PrepareCapture() {
++	const uint64_t bytes = uint64_t {m_extent.width} * m_extent.height * 4u;
++	if (bytes == 0) {
++		return false;
++	}
++	if (m_capture_buffer != nullptr && m_capture_bytes == bytes) {
++		return true;
++	}
++	auto& graphics = m_window.graphic_ctx;
++	if (m_capture_buffer != nullptr) {
++		graphics.device.unmapMemory(m_capture_memory);
++		graphics.device.destroyBuffer(m_capture_buffer);
++		graphics.device.freeMemory(m_capture_memory);
++		m_capture_buffer = nullptr;
++		m_capture_memory = nullptr;
++	}
++	vk::BufferCreateInfo info {};
++	info.size        = bytes;
++	info.usage       = vk::BufferUsageFlagBits::eTransferDst;
++	info.sharingMode = vk::SharingMode::eExclusive;
++	if (graphics.device.createBuffer(&info, nullptr, &m_capture_buffer) != vk::Result::eSuccess) {
++		m_capture_buffer = nullptr;
++		return false;
++	}
++	vk::MemoryRequirements requirements {};
++	graphics.device.getBufferMemoryRequirements(m_capture_buffer, &requirements);
++	vk::PhysicalDeviceMemoryProperties properties {};
++	graphics.physical_device.getMemoryProperties(&properties);
++	const auto wanted = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
++	uint32_t   type   = properties.memoryTypeCount;
++	for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
++		if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
++		    (properties.memoryTypes[i].propertyFlags & wanted) == wanted) {
++			type = i;
++			break;
++		}
++	}
++	vk::MemoryAllocateInfo allocate {};
++	allocate.allocationSize  = requirements.size;
++	allocate.memoryTypeIndex = type;
++	if (type == properties.memoryTypeCount ||
++	    graphics.device.allocateMemory(&allocate, nullptr, &m_capture_memory) != vk::Result::eSuccess ||
++	    graphics.device.bindBufferMemory(m_capture_buffer, m_capture_memory, 0) != vk::Result::eSuccess ||
++	    graphics.device.mapMemory(m_capture_memory, 0, bytes, {}, &m_capture_mapped) != vk::Result::eSuccess) {
++		graphics.device.destroyBuffer(m_capture_buffer);
++		if (m_capture_memory != nullptr) graphics.device.freeMemory(m_capture_memory);
++		m_capture_buffer = nullptr;
++		m_capture_memory = nullptr;
++		return false;
++	}
++	m_capture_bytes = bytes;
++	return true;
++}
++
++void Swapchain::FinishCapture() {
++	m_capture_pending = false;
++	const bool rgba   = m_format == vk::Format::eR8G8B8A8Unorm || m_format == vk::Format::eR8G8B8A8Srgb;
++	KytyHostCaptureWrite(m_capture_path.c_str(), m_capture_mapped, m_extent.width, m_extent.height, rgba);
++}
++
+ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
+ 	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
+ 	SubmitInfo submit;
+@@ -1047,6 +1155,10 @@ void Presenter::Impl::Present() {
+ 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+ 		                                draw_system_overlay);
+ 		const auto tick = swapchain.Submit(present_scheduler);
++		if (swapchain.CapturePending()) {
++			present_scheduler.Wait(tick);
++			swapchain.FinishCapture();
++		}
+ 		for (const auto& layer: layers) {
+ 			if (layer.frame != nullptr) {
+ 				layer.frame->present_tick = tick;

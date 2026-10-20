@@ -1122,6 +1122,64 @@ __declspec(dllexport) void KytyGpuHostWrite(std::uint64_t address, std::uint64_t
     }
 }
 
+bool captureEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_KYTY_GPU_CAPTURE");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
+}
+
+__declspec(dllexport) bool KytyHostCaptureEnabled() {
+    return captureEnabled();
+}
+
+__declspec(dllexport) const char* KytyHostCaptureRequest() {
+    if (!captureEnabled()) return nullptr;
+    static const auto paths = [] {
+        char directory[MAX_PATH] = {};
+        GetCurrentDirectoryA(MAX_PATH, directory);
+        const std::string base(directory);
+        return std::pair<std::string, std::string>{base + "\\kyty-capture.request", base + "\\kyty-capture.bmp"};
+    }();
+    if (GetFileAttributesA(paths.first.c_str()) == INVALID_FILE_ATTRIBUTES) return nullptr;
+    DeleteFileA(paths.first.c_str());
+    return paths.second.c_str();
+}
+
+__declspec(dllexport) void KytyHostCaptureWrite(const char* path, const void* pixels, std::uint32_t width, std::uint32_t height, bool rgba) {
+    if (path == nullptr || pixels == nullptr || width == 0 || height == 0) return;
+    const auto rowBytes = static_cast<std::size_t>(width) * 4u;
+    BITMAPFILEHEADER file{};
+    BITMAPINFOHEADER info{};
+    info.biSize = sizeof(info);
+    info.biWidth = static_cast<LONG>(width);
+    info.biHeight = -static_cast<LONG>(height);
+    info.biPlanes = 1;
+    info.biBitCount = 32;
+    info.biCompression = BI_RGB;
+    file.bfType = 0x4d42;
+    file.bfOffBits = sizeof(file) + sizeof(info);
+    file.bfSize = static_cast<DWORD>(file.bfOffBits + rowBytes * height);
+    const std::string temporary = std::string(path) + ".tmp";
+    FILE* out = std::fopen(temporary.c_str(), "wb");
+    if (out == nullptr) return;
+    std::fwrite(&file, sizeof(file), 1, out);
+    std::fwrite(&info, sizeof(info), 1, out);
+    std::vector<std::uint8_t> row(rowBytes);
+    const auto* source = static_cast<const std::uint8_t*>(pixels);
+    for (std::uint32_t y = 0; y < height; ++y) {
+        std::memcpy(row.data(), source + y * rowBytes, rowBytes);
+        if (rgba) {
+            for (std::size_t x = 0; x < rowBytes; x += 4) std::swap(row[x], row[x + 2]);
+        }
+        std::fwrite(row.data(), 1, rowBytes, out);
+    }
+    std::fclose(out);
+    MoveFileExA(temporary.c_str(), path, MOVEFILE_REPLACE_EXISTING);
+    std::fprintf(stderr, "[kyty-gpu] captured %ux%u to %s\n", width, height, path);
+}
+
 void KytyHostNoteGpuWrite(std::uint64_t address, std::uint64_t size, const void* caller) {
     if (!statsEnabled()) return;
     std::lock_guard lock(hotMutex);

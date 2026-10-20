@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/KytyGpu.hpp"
 
+#include <windows.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <string_view>
@@ -24,6 +26,15 @@ int main() {
         }
         if (AgcDriverKytyGpuVideoOut_nid_no_patch("NoSuchFunction") != nullptr) {
             std::fprintf(stderr, "kytygpu.dll resolved an unknown video out function\n");
+            return 1;
+        }
+        using Capture = bool (*)();
+        auto* module = GetModuleHandleA("kytygpu.dll");
+        const auto capture = module != nullptr ? reinterpret_cast<Capture>(GetProcAddress(module, "KytyHostCaptureEnabled")) : nullptr;
+        const char* captureText = std::getenv("APS5_KYTY_GPU_CAPTURE");
+        const bool captureExpected = captureText != nullptr && std::string_view(captureText) == "1";
+        if (capture == nullptr || capture() != captureExpected) {
+            std::fprintf(stderr, "APS5_KYTY_GPU_CAPTURE parsed wrongly\n");
             return 1;
         }
     }
