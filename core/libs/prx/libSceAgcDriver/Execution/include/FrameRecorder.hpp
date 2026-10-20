@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_FRAMERECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_FRAMERECORDER_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "SceShaders.hpp"
@@ -37,6 +38,7 @@ public:
     void Flip(const FlipInfo& info);
     void ReserveEopFlip(const FlipInfo& info, std::uint32_t token);
     void Suspend();
+    void PresentBuffer(const DisplayBuffer& buffer);
     void FrameBoundary();
 
 private:
@@ -67,6 +69,7 @@ private:
     void start();
     void finish();
     void snapshot(const Range& range);
+    void writeReferenceFrames();
     bool abandonIfDiskLow();
     std::string header() const;
     std::vector<Range> committedRanges();
@@ -83,6 +86,8 @@ private:
     std::vector<Range> ranges;
     std::map<std::uint64_t, std::uint64_t> shaderMarks;
     std::map<std::uint64_t, std::uint64_t> hostPageHashes;
+    std::mutex displayMutex;
+    std::map<std::uint64_t, DisplayBuffer> displayBuffers;
     std::uint64_t ordinal = 0;
     std::uint64_t boundaries = 0;
     std::uint64_t startBoundary = 0;

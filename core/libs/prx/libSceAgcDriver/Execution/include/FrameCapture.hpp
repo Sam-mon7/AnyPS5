@@ -28,6 +28,7 @@ enum class FrameCallKind : std::uint32_t {
     Memory,
     FrameStart,
     End,
+    DisplayBuffer,
 };
 
 struct FrameCall {
@@ -47,7 +48,7 @@ struct FrameCall {
     std::vector<ShaderRegister> primitive;
 };
 
-enum class FrameMemoryKind : std::uint32_t { Range = 1, Snapshot, Delta };
+enum class FrameMemoryKind : std::uint32_t { Range = 1, Snapshot, Delta, Reference };
 
 enum class FrameRangeKind : std::uint32_t { Watched = 1, Unwatched, Section, Alias, File, Host };
 
@@ -88,6 +89,7 @@ public:
     void WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access);
     std::uint64_t WriteSnapshot(std::uint64_t address, std::span<const std::byte> bytes);
     void WriteDelta(std::uint64_t group, std::uint64_t completed, std::uint64_t address, std::span<const std::byte> bytes);
+    void WriteReference(std::uint64_t index, std::uint64_t address, std::span<const std::byte> pixels);
     void Finish(std::string_view header);
 
     std::uint64_t RawBytes() const;

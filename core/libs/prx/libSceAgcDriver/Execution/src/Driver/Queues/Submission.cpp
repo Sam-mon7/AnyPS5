@@ -467,11 +467,7 @@ bool Driver::orderReleased(std::uint32_t queue, std::uint64_t received) const {
 }
 
 void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool blocked) {
-    {
-        std::lock_guard lock(awaitedMutex);
-        if (blocked) awaitedAddresses[queue] = awaited;
-        else awaitedAddresses.erase(queue);
-    }
+    awaitedAddresses[queue == 0 ? 0 : queue - 0x20 + 1].store(blocked ? awaited : 0, std::memory_order_release);
     if (blocked) {
         if (runningWorkers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             idleEpoch.fetch_add(1, std::memory_order_release);

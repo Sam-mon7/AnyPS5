@@ -62,6 +62,7 @@ void PresentClear(const PresentationWindow& window, bool opaque, void (*gpuReady
 }
 
 void PresentBuffer(const PresentationWindow& window, const DisplayBuffer& buffer, void (*gpuReady)(void*), void* context) {
+    if (auto* const recorder = FrameRecorder::Active()) recorder->PresentBuffer(buffer);
     DriverDetail::Driver::Get().Present(window, &buffer, true, gpuReady, context);
 }
 

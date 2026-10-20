@@ -197,6 +197,40 @@ void FrameRecorder::Suspend() {
     record(make(FrameCallKind::Suspend), false);
 }
 
+void FrameRecorder::PresentBuffer(const DisplayBuffer& buffer) {
+    std::lock_guard lock(displayMutex);
+    displayBuffers[buffer.address] = buffer;
+}
+
+void FrameRecorder::writeReferenceFrames() {
+    std::map<std::uint64_t, DisplayBuffer> presented;
+    {
+        std::lock_guard lock(displayMutex);
+        presented = displayBuffers;
+    }
+    if (presented.empty()) return;
+    if (!DriverDetail::Driver::Get().WaitIdleFor(std::chrono::seconds(10))) {
+        warnings.push_back("no reference frames: the driver did not go idle after the last frame");
+        return;
+    }
+    std::uint64_t index = 0;
+    for (const auto& [address, buffer] : presented) {
+        try {
+            const auto pixels = ReadDisplayBuffer(buffer);
+            writer->WriteReference(index, address, pixels);
+        } catch (const std::exception& failure) {
+            warnings.push_back(std::string("no reference frame for a display buffer: ") + failure.what());
+            continue;
+        }
+        auto call = make(FrameCallKind::DisplayBuffer);
+        call.ordinal = ++ordinal;
+        call.address = buffer.address;
+        call.values = {index, buffer.pixelFormat, buffer.width, buffer.height, buffer.tilingMode, buffer.pitchInPixel, buffer.dccAddress, buffer.dccClearColor, buffer.alignment};
+        writer->WriteCall(call);
+        ++index;
+    }
+}
+
 void FrameRecorder::record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders) {
     std::lock_guard lock(mutex);
     if (state == State::Waiting) {
@@ -416,6 +450,7 @@ void FrameRecorder::finish() {
     end.ordinal = ++ordinal;
     std::tie(end.accepted, end.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(end);
+    writeReferenceFrames();
     writer->Finish(header());
     std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
                  static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(deltaGroups), static_cast<double>(deltaBytes) / (1024.0 * 1024.0),

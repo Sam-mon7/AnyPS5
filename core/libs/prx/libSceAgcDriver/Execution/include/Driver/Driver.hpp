@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRIVER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
@@ -352,8 +353,7 @@ private:
 
     std::atomic<std::uint64_t> flipsCounted{0};
     std::atomic<std::uint64_t> flipSubmissions{0};
-    std::mutex awaitedMutex;
-    std::map<std::uint32_t, std::uint64_t> awaitedAddresses;
+    std::array<std::atomic<std::uint64_t>, SubmissionQueueEnd - 0x20 + 1> awaitedAddresses{};
     std::atomic<std::uint64_t> flipSerial{0};
     std::atomic<std::uint64_t> flipBatchesUnsignaled{0};
 

@@ -1,5 +1,7 @@
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -9,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -53,11 +56,12 @@ struct Dump {
 struct Options {
     std::filesystem::path directory;
     std::vector<Dump> dumps;
+    std::filesystem::path frames;
     bool pace = true;
     bool strict = false;
     std::chrono::milliseconds paceTimeout{10000};
     std::chrono::milliseconds memoryPaceTimeout{10000};
-    std::chrono::milliseconds releaseAfter{100};
+    std::chrono::milliseconds releaseAfter{3};
     std::chrono::milliseconds drainTimeout{10000};
     bool release = true;
 };
@@ -374,6 +378,7 @@ struct Replay {
         }
         case FrameCallKind::FrameStart:
         case FrameCallKind::End:
+        case FrameCallKind::DisplayBuffer:
             return;
         }
         throw std::runtime_error("frame replay: unknown call kind");
@@ -425,7 +430,7 @@ struct Replay {
             auto lastCompleted = progress().second;
             auto lastProgress = Clock::now();
             while (!finished.load()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 const auto completed = progress().second;
                 if (completed != lastCompleted) {
                     lastCompleted = completed;
@@ -507,10 +512,16 @@ struct Replay {
 };
 
 int usage() {
-    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--strict] [--dump <address>:<bytes>:<file>]...\n"
+    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict]\n"
+                         "                        [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
-                         "  build's AGC driver with no title running, and prints one JSON line with the frame times; --dump writes\n"
-                         "  guest memory to a file after the replay (address and size in hexadecimal or decimal)\n");
+                         "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
+                         "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
+                         "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
+                         "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
+                         "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
+                         "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
+                         "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
     return 2;
 }
 
@@ -536,6 +547,59 @@ void writeDump(const Dump& dump) {
     if (!file.good()) throw std::runtime_error("frame replay: cannot write " + dump.path.string());
 }
 
+struct FrameCheck {
+    std::size_t compared = 0;
+    double identical = 1.0;
+    int maxDifference = 0;
+};
+
+void writeFrame(const std::filesystem::path& path, const AgcDriver::DisplayBuffer& buffer, std::span<const std::byte> pixels) {
+    std::FILE* file = std::fopen(path.string().c_str(), "wb");
+    const auto failure = file != nullptr ? AgcDriver::WriteBmpAndClose_nid_no_patch(file, buffer.width, buffer.height, pixels) : AgcDriver::FrameDumpIoFailure{"open", errno};
+    if (failure) std::fprintf(stderr, "[frame-replay] cannot write %s (%s failed)\n", path.string().c_str(), failure.operation);
+}
+
+FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& options) {
+    FrameCheck check;
+    if (!options.frames.empty()) std::filesystem::create_directories(options.frames);
+    for (const auto& call : reader.Calls()) {
+        if (call.kind != FrameCallKind::DisplayBuffer || call.values.size() < 9) continue;
+        AgcDriver::DisplayBuffer buffer{};
+        buffer.address = call.address;
+        buffer.pixelFormat = call.values[1];
+        buffer.width = static_cast<std::uint32_t>(call.values[2]);
+        buffer.height = static_cast<std::uint32_t>(call.values[3]);
+        buffer.tilingMode = static_cast<std::uint32_t>(call.values[4]);
+        buffer.pitchInPixel = static_cast<std::uint32_t>(call.values[5]);
+        buffer.dccAddress = call.values[6];
+        buffer.dccClearColor = call.values[7];
+        buffer.alignment = static_cast<std::uint32_t>(call.values[8]);
+        const auto chunk = std::find_if(reader.Chunks().begin(), reader.Chunks().end(), [&](const FrameMemoryChunk& candidate) { return candidate.kind == FrameMemoryKind::Reference && candidate.group == call.values[0]; });
+        if (chunk == reader.Chunks().end()) continue;
+        const auto reference = reader.Read(*chunk);
+        const auto replayed = AgcDriver::ReadDisplayBuffer(buffer);
+        ++check.compared;
+        std::size_t same = 0;
+        const auto pixels = std::min(reference.size(), replayed.size()) / 4;
+        for (std::size_t pixel = 0; pixel < pixels; ++pixel) {
+            bool equal = true;
+            for (std::size_t channel = 0; channel < 4; ++channel) {
+                const auto difference = std::abs(static_cast<int>(reference[pixel * 4 + channel]) - static_cast<int>(replayed[pixel * 4 + channel]));
+                check.maxDifference = std::max(check.maxDifference, difference);
+                equal = equal && difference == 0;
+            }
+            same += equal ? 1 : 0;
+        }
+        const auto total = std::max(reference.size(), replayed.size()) / 4;
+        check.identical = std::min(check.identical, total == 0 ? 1.0 : static_cast<double>(same) / static_cast<double>(total));
+        if (options.frames.empty()) continue;
+        const auto index = std::to_string(call.values[0]);
+        writeFrame(options.frames / ("reference-" + index + ".bmp"), buffer, reference);
+        writeFrame(options.frames / ("replay-" + index + ".bmp"), buffer, replayed);
+    }
+    return check;
+}
+
 int run(const Options& options) {
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
@@ -556,23 +620,27 @@ int run(const Options& options) {
     if (frameStart == calls.end()) AgcDriverWaitIdle_nid_postfix();
     replay.endedAt = Clock::now();
     if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
+    FrameCheck check;
     if (replay.unfinished == 0) {
         for (const auto& dump : options.dumps) writeDump(dump);
+        check = compareFrames(reader, options);
     } else if (!options.dumps.empty()) {
         std::fprintf(stderr, "[frame-replay] no dumps written: the GPU work did not finish\n");
     }
     const auto ready = replay.frames.Times();
     std::vector<double> frameMs;
     for (std::size_t index = 1; index < ready.size(); ++index) frameMs.push_back(std::chrono::duration<double, std::milli>(ready[index] - ready[index - 1]).count());
+    std::string frameList;
+    for (const auto value : frameMs) frameList += (frameList.empty() ? "" : ",") + std::to_string(static_cast<long long>(value));
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"unfinished\":%llu,\"load_s\":%.3f}\n",
-                ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(),
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f}\n",
+                ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
-                static_cast<unsigned long long>(replay.unfinished), std::chrono::duration<double>(loaded - loadStart).count());
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count());
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }
@@ -585,8 +653,10 @@ int main(int argc, char** argv) {
         const std::string_view argument = argv[index];
         if (argument == "--no-pace") options.pace = false;
         else if (argument == "--no-release") options.release = false;
+        else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
+        else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
