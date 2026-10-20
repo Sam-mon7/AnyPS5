@@ -986,7 +986,7 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     std::vector<std::pair<std::uint32_t, std::tuple<std::uint64_t, std::uint64_t, bool>>> covering;
                     for (const auto& [key, count] : writtenBindings) {
                         const auto& [address, size, sentinel] = key;
-                        if (address <= hottest && hottest < address + size) covering.emplace_back(count, key);
+                        if (address < hottest + PageBytes && hottest < address + size) covering.emplace_back(count, key);
                     }
                     std::sort(covering.begin(), covering.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
                     std::string text;
@@ -1000,7 +1000,7 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     std::vector<std::pair<std::uint32_t, std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>>> writers;
                     for (const auto& [key, count] : gpuWrites) {
                         const auto& [address, size, caller] = key;
-                        if (address <= hottest && hottest < address + size) writers.emplace_back(count, key);
+                        if (address < hottest + PageBytes && hottest < address + size) writers.emplace_back(count, key);
                     }
                     std::sort(writers.begin(), writers.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
                     std::string callers;
@@ -1013,6 +1013,34 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                         callers += item;
                     }
                     std::fprintf(stderr, "[kyty-gpu] GPU writes covering it (%zu):%s\n", writers.size(), callers.c_str());
+                    std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint64_t> blame;
+                    std::uint64_t covered = 0;
+                    std::uint64_t total = 0;
+                    for (const auto& [page, count] : hotReads) {
+                        total += count;
+                        bool hit = false;
+                        for (const auto& [key, writes] : gpuWrites) {
+                            const auto& [address, size, caller] = key;
+                            if (address < page + PageBytes && page < address + size) {
+                                blame[key] += count;
+                                hit = true;
+                            }
+                        }
+                        if (hit) covered += count;
+                    }
+                    std::vector<std::pair<std::uint64_t, std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>>> ranked;
+                    for (const auto& [key, count] : blame) ranked.emplace_back(count, key);
+                    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    std::string top;
+                    for (std::size_t index = 0; index < std::min<std::size_t>(ranked.size(), 8); ++index) {
+                        const auto& [address, size, caller] = ranked[index].second;
+                        HMODULE module = nullptr;
+                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(caller), &module);
+                        char item[128];
+                        std::snprintf(item, sizeof(item), " %llx+%llx from +%llx:%llu", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(caller - reinterpret_cast<std::uint64_t>(module)), static_cast<unsigned long long>(ranked[index].first));
+                        top += item;
+                    }
+                    std::fprintf(stderr, "[kyty-gpu] read faults on GPU-written pages: %llu of %llu; top writes by faults:%s\n", static_cast<unsigned long long>(covered), static_cast<unsigned long long>(total), top.c_str());
                 }
                 const auto reads = takeHot(hotReads);
                 const auto writes = takeHot(hotWrites);
