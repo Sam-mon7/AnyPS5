@@ -138,6 +138,21 @@ public:
 
     std::uint8_t* At(std::size_t offset) { return block + offset; }
 
+    void Readable(std::size_t offset, bool readable) {
+        auto* slice = block + offset;
+#ifdef _WIN32
+        const DWORD protection = readable ? PAGE_READWRITE : PAGE_NOACCESS;
+        DWORD old = 0;
+        Require(VirtualProtect(slice, SliceBytes, protection, &old) != 0, "cannot change the guest depth slice protection");
+        GuestArena::GuestArenaSetProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(slice), SliceBytes, protection);
+#else
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(slice, SliceBytes);
+        Require(mprotect(slice, SliceBytes, readable ? PROT_READ | PROT_WRITE : PROT_NONE) == 0, "cannot change the guest depth slice protection");
+        if (readable) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(slice, SliceBytes);
+#endif
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(slice), SliceBytes);
+    }
+
 private:
     std::uint8_t* block = nullptr;
 };
@@ -432,6 +447,27 @@ void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block) {
     ExpectRefusal(device, block, CubeOffset, {Format32Float, 128, 128, TypeCube, 5, Swizzle64KbZX}, 1, "base slice 1 is not implemented", "a depth plane cube from base slice 1");
     ExpectRefusal(device, block, ArrayOffset, {Format32Float, 128, 128, Type2D, 0, Swizzle64KbZX}, 1, "slice 1 is not implemented", "a 2D depth plane view with a base slice");
 }
+
+void UnreadableCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    const Shape shape{Format32Float, 128, 128, Type2DArray, 2, Swizzle64KbZX};
+    auto* base = block.At(ArrayOffset);
+    AgcDriver::GuestMemory::Unwatch(reinterpret_cast<std::uintptr_t>(base + SliceBytes), SliceBytes);
+    FillSlice(base + SliceBytes, SliceBytes, Bits(0.625f), 4);
+    for (unsigned round = 0; round < 2; ++round) {
+        block.Readable(ArrayOffset + SliceBytes, false);
+        for (unsigned repeat = 0; repeat < 3; ++repeat) {
+            Load(device, base, shape, 1, output);
+            Expect(output, 0, "unreadable depth slice");
+        }
+        Load(device, base, shape, 0, output);
+        Expect(output, Bits(DrawnDepth), "live depth slice next to an unreadable slice");
+        Load(device, base, shape, 2, output);
+        Expect(output, Bits(0.75f), "readable guest slice next to an unreadable slice");
+        block.Readable(ArrayOffset + SliceBytes, true);
+        Load(device, base, shape, 1, output);
+        Expect(output, Bits(0.625f), "depth slice becoming readable again");
+    }
+}
 }
 
 int main() {
@@ -451,6 +487,7 @@ int main() {
         SmallD16CubeCase(*device, block, output);
         PaddedD16CubeCase(*device, block, output);
         BaseSliceCase(*device, block, output);
+        UnreadableCase(*device, block, output);
         RefusalCase(*device, block);
         std::puts("depth plane sampling tests passed");
         return 0;
