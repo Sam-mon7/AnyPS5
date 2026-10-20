@@ -371,6 +371,12 @@ void RedirectAgc(void* agcModule) {
         trampolines = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), pageBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     }
     if (trampolines == nullptr) throw std::runtime_error("Kyty GPU: no trampoline space near libSceAgc");
+    std::vector<std::uintptr_t> starts;
+    for (DWORD index = 0; index < exports->NumberOfFunctions; ++index) starts.push_back(reinterpret_cast<std::uintptr_t>(base) + functions[index]);
+    const auto& unwind = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    const auto* entries = reinterpret_cast<const RUNTIME_FUNCTION*>(base + unwind.VirtualAddress);
+    for (std::size_t index = 0; index < unwind.Size / sizeof(RUNTIME_FUNCTION); ++index) starts.push_back(reinterpret_cast<std::uintptr_t>(base) + entries[index].BeginAddress);
+    std::sort(starts.begin(), starts.end());
     std::vector<std::uintptr_t> patched;
     std::size_t redirected = 0;
     std::size_t kept = 0;
@@ -390,9 +396,8 @@ void RedirectAgc(void* agcModule) {
             ++refused;
             continue;
         }
-        DWORD64 image = 0;
-        const auto* entry = RtlLookupFunctionEntry(address, &image, nullptr);
-        if (entry == nullptr || image + entry->BeginAddress != address || entry->EndAddress - entry->BeginAddress < 5) {
+        const auto next = std::upper_bound(starts.begin(), starts.end(), address);
+        if (next != starts.end() && *next - address < 5) {
             ++refused;
             continue;
         }

@@ -1143,6 +1143,7 @@ __declspec(dllexport) void* KytyGpuAgcFunction(const char* nid) {
 __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd, std::uint32_t width, std::uint32_t height) {
     if (started.load(std::memory_order_acquire)) return 0;
     KytyGpuPrepare(table, width, height);
+    Common::InitializeThreads();
     faultHandler = AddVectoredExceptionHandler(1, &handleFault);
     hostWindow = SDL_Window{hwnd, static_cast<int>(width), static_cast<int>(height)};
     window = new Libs::Graphics::WindowContext();
