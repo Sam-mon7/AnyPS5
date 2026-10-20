@@ -1,7 +1,6 @@
 add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Apr/src/Apr.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/GpuBufferPages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/Equeue.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/EventAccessors.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/DescriptorControl.cpp
@@ -1316,27 +1315,6 @@ if(BUILD_TESTING)
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
         endforeach()
         set_property(TEST guest_job_priority_default APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_JOB_PRIORITY=unset:")
-        add_test_executable(guest_gpu_buffer_pages_tests ${LIBS_INCLUDE_DIR}/tests/GuestGpuBufferPages.cpp)
-        target_include_directories(guest_gpu_buffer_pages_tests PRIVATE ${LIBS_INCLUDE_DIR})
-        target_link_libraries(guest_gpu_buffer_pages_tests PRIVATE libkernel libc)
-        configure_windows_unwind(guest_gpu_buffer_pages_tests)
-        foreach(gpuBufferPages IN ITEMS off on nonexact)
-            add_test(NAME guest_gpu_buffer_pages_${gpuBufferPages} COMMAND guest_gpu_buffer_pages_tests)
-            set(gpuBufferPagesValue "unset:")
-            set(gpuBufferPagesPass "GPU buffer pages: passed")
-            if(gpuBufferPages STREQUAL "on")
-                set(gpuBufferPagesValue "set:1")
-                set(gpuBufferPagesPass "not installed: code signature differs(.|\n)*GPU buffer pages: passed")
-            elseif(gpuBufferPages STREQUAL "nonexact")
-                set(gpuBufferPagesValue "set:01")
-            endif()
-            set_tests_properties(guest_gpu_buffer_pages_${gpuBufferPages} PROPERTIES TIMEOUT 20
-                PASS_REGULAR_EXPRESSION "${gpuBufferPagesPass}"
-                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>;APS5_GPU_BUFFER_PAGES=${gpuBufferPagesValue}")
-            if(NOT gpuBufferPages STREQUAL "on")
-                set_tests_properties(guest_gpu_buffer_pages_${gpuBufferPages} PROPERTIES FAIL_REGULAR_EXPRESSION "gpu-buffer-pages")
-            endif()
-        endforeach()
         add_test_executable(guest_job_idle_wait_tests ${LIBS_INCLUDE_DIR}/tests/GuestJobIdleWait.cpp)
         target_include_directories(guest_job_idle_wait_tests PRIVATE ${LIBS_INCLUDE_DIR})
         target_link_libraries(guest_job_idle_wait_tests PRIVATE libkernel libc)
