@@ -21,9 +21,9 @@ enum class FrameCallKind : std::uint32_t {
     ResolveGraphicsStagesAbi,
     RegisterVideoOutput,
     SetTessellationFactorRing,
-    SetHsOffchipParam,
     Submit,
     Flip,
+    ReserveEopFlip,
     Suspend,
     Memory,
     FrameStart,
@@ -35,6 +35,7 @@ struct FrameCall {
     std::uint64_t ordinal = 0;
     std::uint64_t timeNs = 0;
     std::uint64_t thread = 0;
+    std::uint64_t accepted = 0;
     std::uint64_t completed = 0;
     std::uint32_t queue = 0;
     std::uint32_t flags = 0;

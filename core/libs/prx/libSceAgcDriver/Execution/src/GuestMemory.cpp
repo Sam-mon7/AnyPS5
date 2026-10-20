@@ -1418,6 +1418,55 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, false);
 }
 
+std::uint64_t WriteGeneration() {
+    return Tracker().generation.load(std::memory_order_acquire);
+}
+
+std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written) {
+    written.clear();
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return 0;
+#ifdef _WIN32
+    if (address < tracker.base || bytes > tracker.size || address - tracker.base > tracker.size - bytes) return 0;
+#endif
+    const auto end = address + bytes;
+    const auto first = tracker.blockOf(address);
+    const auto last = tracker.blockOf(end - 1);
+    const auto clip = [&](std::uint64_t block) {
+        const auto begin = tracker.blockBegin(block);
+        return std::pair{std::max(address, begin), std::min<std::uint64_t>(end, begin + WriteBlockBytes)};
+    };
+    std::uint64_t spanBegin = 0;
+    std::uint64_t spanEnd = 0;
+    const auto walkSpan = [&] {
+        if (spanEnd > spanBegin) walkWrites(tracker, spanBegin & ~std::uint64_t{WritePageBytes - 1}, (spanEnd + WritePageBytes - 1) & ~std::uint64_t{WritePageBytes - 1}, StampKind::Cpu);
+        spanBegin = spanEnd = 0;
+    };
+    for (auto block = first; block <= last; ++block) {
+        const auto [begin, stop] = clip(block);
+        if (!tracker.covers(begin, stop - begin)) {
+            walkSpan();
+            continue;
+        }
+        if (spanEnd != begin) {
+            walkSpan();
+            spanBegin = begin;
+        }
+        spanEnd = stop;
+    }
+    walkSpan();
+    for (auto block = first; block <= last; ++block) {
+        if (tracker.cpuStampOf(block) <= since) continue;
+        const auto [begin, stop] = clip(block);
+        if (!written.empty() && written.back().second == begin) written.back().second = stop;
+        else written.emplace_back(begin, stop);
+    }
+    return tracker.generation.load(std::memory_order_relaxed);
+}
+
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);

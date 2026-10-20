@@ -81,6 +81,7 @@ std::vector<std::byte> encodeCall(const FrameCall& call) {
     encoder.Put(call.ordinal);
     encoder.Put(call.timeNs);
     encoder.Put(call.thread);
+    encoder.Put(call.accepted);
     encoder.Put(call.completed);
     encoder.Put(call.queue);
     encoder.Put(call.flags);
@@ -101,6 +102,7 @@ FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload) {
     call.ordinal = decoder.Take<std::uint64_t>("ordinal");
     call.timeNs = decoder.Take<std::uint64_t>("time");
     call.thread = decoder.Take<std::uint64_t>("thread");
+    call.accepted = decoder.Take<std::uint64_t>("accepted serial");
     call.completed = decoder.Take<std::uint64_t>("completed serial");
     call.queue = decoder.Take<std::uint32_t>("queue");
     call.flags = decoder.Take<std::uint32_t>("flags");
@@ -163,9 +165,9 @@ std::string_view FrameCallName(FrameCallKind kind) {
     case FrameCallKind::ResolveGraphicsStagesAbi: return "resolve-graphics-stages-abi";
     case FrameCallKind::RegisterVideoOutput: return "register-video-output";
     case FrameCallKind::SetTessellationFactorRing: return "set-tf-ring";
-    case FrameCallKind::SetHsOffchipParam: return "set-hs-offchip-param";
     case FrameCallKind::Submit: return "submit";
     case FrameCallKind::Flip: return "flip";
+    case FrameCallKind::ReserveEopFlip: return "reserve-eop-flip";
     case FrameCallKind::Suspend: return "suspend";
     case FrameCallKind::Memory: return "memory";
     case FrameCallKind::FrameStart: return "frame-start";

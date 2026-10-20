@@ -229,6 +229,23 @@ void Driver::WaitIdle() {
     checkStopping();
 }
 
+bool Driver::WaitIdleFor(std::chrono::milliseconds timeout) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    std::unique_lock lock(mutex);
+    const auto target = accepted;
+    ++idleWaiters;
+    const bool idle = changed.wait_for(lock, timeout, [&] { return failure != nullptr || stopping || completed >= target; });
+    --idleWaiters;
+    rethrowFailure();
+    checkStopping();
+    return idle;
+}
+
+std::pair<std::uint64_t, std::uint64_t> Driver::SerialProgress() {
+    std::lock_guard lock(mutex);
+    return {accepted, completed};
+}
+
 void Driver::CheckFailure() {
     if (failed.load(std::memory_order_acquire)) {
         std::lock_guard lock(mutex);

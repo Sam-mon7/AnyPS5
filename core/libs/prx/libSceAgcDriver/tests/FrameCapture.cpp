@@ -51,7 +51,7 @@ bool sameRegisters(const std::vector<ShaderRegister>& left, const std::vector<Sh
 }
 
 bool sameCall(const FrameCall& left, const FrameCall& right) {
-    return left.kind == right.kind && left.ordinal == right.ordinal && left.timeNs == right.timeNs && left.thread == right.thread && left.completed == right.completed && left.queue == right.queue &&
+    return left.kind == right.kind && left.ordinal == right.ordinal && left.timeNs == right.timeNs && left.thread == right.thread && left.accepted == right.accepted && left.completed == right.completed && left.queue == right.queue &&
            left.flags == right.flags && left.cpuFlip == right.cpuFlip && left.address == right.address && left.size == right.size && left.values == right.values && sameRegisters(left.context, right.context) &&
            sameRegisters(left.primitive, right.primitive);
 }
@@ -75,6 +75,7 @@ std::vector<FrameCall> sampleCalls() {
     submit.ordinal = 3;
     submit.timeNs = 123456789;
     submit.thread = 4242;
+    submit.accepted = 20;
     submit.completed = 17;
     submit.queue = 0x21;
     submit.address = 0x2000030000;

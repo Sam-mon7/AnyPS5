@@ -57,6 +57,10 @@ public:
     void SubmitFlip(const FlipInfo& info);
     void SuspendPoint();
     std::uint32_t ReserveEopFlip(const FlipInfo& info);
+    std::uint32_t ReserveEopFlipAt(const FlipInfo& info, std::uint32_t token);
+    std::vector<std::uint32_t> PendingEopFlipTokens();
+    std::pair<std::uint64_t, std::uint64_t> SerialProgress();
+    bool WaitIdleFor(std::chrono::milliseconds timeout);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void AttachWindow(const PresentationWindow& window);

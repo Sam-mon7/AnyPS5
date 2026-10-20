@@ -1,0 +1,308 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "SceTypes.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <filesystem>
+#include <future>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+extern "C" int APS5_VABI sceAgcDriverSetTFRing(const volatile void* base, std::uint32_t size);
+
+namespace {
+
+using AgcDriver::FrameCall;
+using AgcDriver::FrameCallKind;
+using AgcDriver::FrameCaptureReader;
+using AgcDriver::FrameMemoryChunk;
+using AgcDriver::FrameMemoryKind;
+using Clock = std::chrono::steady_clock;
+
+struct Options {
+    std::filesystem::path directory;
+    bool pace = true;
+    bool strict = false;
+    std::chrono::milliseconds paceTimeout{10000};
+};
+
+class Frames {
+public:
+    void MarkReady() {
+        std::lock_guard lock(mutex);
+        ready.push_back(Clock::now());
+    }
+
+    void Failed(std::exception_ptr error) {
+        std::lock_guard lock(mutex);
+        if (!failure) failure = error;
+    }
+
+    std::vector<Clock::time_point> Times() const {
+        std::lock_guard lock(mutex);
+        return ready;
+    }
+
+    std::exception_ptr Failure() const {
+        std::lock_guard lock(mutex);
+        return failure;
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::vector<Clock::time_point> ready;
+    std::exception_ptr failure;
+};
+
+class ReplayFlip final : public AgcDriver::IFlipRequest {
+public:
+    explicit ReplayFlip(Frames& frames) : frames(frames) {}
+    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override { frames.MarkReady(); }
+    void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
+
+private:
+    Frames& frames;
+};
+
+class ReplayRenderingWait final : public AgcDriver::IRenderingWait {
+public:
+    void Wait() override {}
+};
+
+class ReplayOutput final : public AgcDriver::IVideoOutput {
+public:
+    explicit ReplayOutput(Frames& frames) : frames(frames) {}
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override { return std::make_shared<ReplayFlip>(frames); }
+    std::shared_ptr<AgcDriver::IRenderingWait> CaptureRenderingWait(std::uint32_t) override { return std::make_shared<ReplayRenderingWait>(); }
+    void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
+
+private:
+    Frames& frames;
+};
+
+std::uint64_t headerNumber(const std::string& header, std::string_view key) {
+    const auto quoted = "\"" + std::string(key) + "\":";
+    const auto at = header.find(quoted);
+    if (at == std::string::npos) throw std::runtime_error("frame replay: the capture header has no " + std::string(key));
+    return std::strtoull(header.c_str() + at + quoted.size(), nullptr, 10);
+}
+
+void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
+    reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
+}
+
+void restoreMemory(const FrameCaptureReader& reader) {
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    if (!reader.Header().empty() && headerNumber(reader.Header(), "arena_base") != base) throw std::runtime_error("frame replay: the guest arena is at a different address than in the capture");
+    std::vector<const FrameMemoryChunk*> snapshot;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Range) {
+            auto* const pointer = reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address));
+            GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, static_cast<std::size_t>(chunk.bytes));
+            GuestArena::GuestArenaCommit_nid_postfix(pointer, static_cast<std::size_t>(chunk.bytes), 0x04, static_cast<std::size_t>(chunk.bytes));
+        } else if (chunk.kind == FrameMemoryKind::Snapshot) {
+            snapshot.push_back(&chunk);
+        }
+    }
+    const auto workers = std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    for (std::size_t first = 0; first < snapshot.size(); first += workers) {
+        std::vector<std::future<void>> pending;
+        for (auto index = first; index < std::min(snapshot.size(), first + workers); ++index) {
+            pending.push_back(std::async(std::launch::async, [&reader, chunk = snapshot[index]] { restore(reader, *chunk); }));
+        }
+        for (auto& future : pending) future.get();
+    }
+}
+
+std::pair<std::uint64_t, std::uint64_t> progress() {
+    std::uint64_t accepted = 0;
+    std::uint64_t completed = 0;
+    AgcDriverSerialProgress_nid_postfix(&accepted, &completed);
+    return {accepted, completed};
+}
+
+struct Replay {
+    const Options& options;
+    const FrameCaptureReader& reader;
+    Frames frames;
+    std::vector<std::shared_ptr<ReplayOutput>> outputs;
+    std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
+    std::uint64_t paceTimeouts = 0;
+    std::uint64_t staleRegistrations = 0;
+    std::uint64_t submits = 0;
+    std::uint64_t deltaBytes = 0;
+    bool recording = false;
+    Clock::time_point startedAt{};
+    Clock::time_point endedAt{};
+
+    void pace(const FrameCall& call) {
+        if (!options.pace || !recording || call.accepted < call.completed) return;
+        const auto inFlight = call.accepted - call.completed;
+        const auto deadline = Clock::now() + options.paceTimeout;
+        while (true) {
+            const auto [accepted, completed] = progress();
+            if (accepted - completed <= inFlight) return;
+            if (Clock::now() >= deadline) {
+                ++paceTimeouts;
+                if (options.strict) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " waited longer than the pacing timeout");
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+
+    void execute(const FrameCall& call) {
+        pace(call);
+        switch (call.kind) {
+        case FrameCallKind::RegisterShader:
+            registration([&] { AgcDriverRegisterShader_nid_postfix(shader(call.address)); });
+            return;
+        case FrameCallKind::ResolveShaderAbi:
+            registration([&] { AgcDriverResolveShaderAbi_nid_postfix(shader(call.address), call.context, call.primitive); });
+            return;
+        case FrameCallKind::ResolveGraphicsAbi:
+            registration([&] { AgcDriverResolveGraphicsAbi_nid_postfix(shader(call.values.at(0)), shader(call.values.at(1)), static_cast<std::uint32_t>(call.values.at(2))); });
+            return;
+        case FrameCallKind::ResolveGraphicsStagesAbi: {
+            std::vector<const Shader*> stages;
+            for (const auto value : call.values) stages.push_back(shader(value));
+            registration([&] { AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, call.context, call.primitive); });
+            return;
+        }
+        case FrameCallKind::RegisterVideoOutput: {
+            auto output = std::make_shared<ReplayOutput>(frames);
+            outputs.push_back(output);
+            AgcDriverRegisterVideoOutput_nid_postfix(static_cast<std::uint32_t>(call.values.at(0)), output);
+            return;
+        }
+        case FrameCallKind::SetTessellationFactorRing:
+            sceAgcDriverSetTFRing(reinterpret_cast<const volatile void*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size));
+            return;
+        case FrameCallKind::Submit: {
+            const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
+            if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
+            else sceAgcDriverSubmitAcb(call.queue, &packet);
+            ++submits;
+            return;
+        }
+        case FrameCallKind::Flip:
+            AgcDriverSubmitFlip_nid_postfix(flipInfo(call));
+            return;
+        case FrameCallKind::ReserveEopFlip: {
+            const auto token = static_cast<std::uint32_t>(call.values.at(4));
+            if (AgcDriverReserveEopFlipAt_nid_postfix(flipInfo(call), token) != token) throw std::runtime_error("frame replay: EOP flip token " + std::to_string(token) + " was not reserved");
+            return;
+        }
+        case FrameCallKind::Suspend:
+            AgcDriverSuspendPoint_nid_postfix();
+            return;
+        case FrameCallKind::Memory:
+            for (const auto* chunk : groups[call.values.at(0)]) {
+                restore(reader, *chunk);
+                deltaBytes += chunk->bytes;
+            }
+            return;
+        case FrameCallKind::FrameStart:
+            recording = true;
+            startedAt = Clock::now();
+            return;
+        case FrameCallKind::End:
+            return;
+        }
+        throw std::runtime_error("frame replay: unknown call kind");
+    }
+
+    template <typename TFunction>
+    void registration(TFunction&& function) {
+        if (recording) {
+            function();
+            return;
+        }
+        try {
+            function();
+        } catch (const std::exception& error) {
+            ++staleRegistrations;
+            std::fprintf(stderr, "[frame-replay] prologue registration failed: %s\n", error.what());
+        }
+    }
+
+    static const Shader* shader(std::uint64_t address) {
+        return reinterpret_cast<const Shader*>(static_cast<std::uintptr_t>(address));
+    }
+
+    static AgcDriver::FlipInfo flipInfo(const FrameCall& call) {
+        return {static_cast<std::uint32_t>(call.values.at(0)), static_cast<std::int32_t>(call.values.at(1)), static_cast<std::uint32_t>(call.values.at(2)), static_cast<std::int64_t>(call.values.at(3))};
+    }
+};
+
+int usage() {
+    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--strict]\n"
+                         "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
+                         "  build's AGC driver with no title running, and prints one JSON line with the frame times\n");
+    return 2;
+}
+
+int run(const Options& options) {
+    const auto loadStart = Clock::now();
+    const FrameCaptureReader reader(options.directory);
+    if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
+    restoreMemory(reader);
+    const auto loaded = Clock::now();
+    Replay replay{options, reader};
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Delta) replay.groups[chunk.group].push_back(&chunk);
+    }
+    for (const auto& call : reader.Calls()) replay.execute(call);
+    AgcDriverWaitIdle_nid_postfix();
+    replay.endedAt = Clock::now();
+    if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
+    const auto ready = replay.frames.Times();
+    std::vector<double> frameMs;
+    for (std::size_t index = 1; index < ready.size(); ++index) frameMs.push_back(std::chrono::duration<double, std::milli>(ready[index] - ready[index - 1]).count());
+    std::sort(frameMs.begin(), frameMs.end());
+    const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
+    const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"stale_registrations\":%llu,\"load_s\":%.3f}\n",
+                ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(),
+                static_cast<unsigned long long>(replay.submits), static_cast<double>(replay.deltaBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts),
+                static_cast<unsigned long long>(replay.staleRegistrations), std::chrono::duration<double>(loaded - loadStart).count());
+    std::fflush(stdout);
+    return 0;
+}
+
+}
+
+int main(int argc, char** argv) {
+    Options options;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument = argv[index];
+        if (argument == "--no-pace") options.pace = false;
+        else if (argument == "--strict") options.strict = true;
+        else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
+        else return usage();
+    }
+    if (options.directory.empty()) return usage();
+    try {
+        const auto code = run(options);
+        AgcDriverShutdown_nid_postfix();
+        return code;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
+        return 2;
+    }
+}
