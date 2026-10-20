@@ -638,7 +638,14 @@ bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
             if (before == after) {
                 counts.dirtyReadsUnchanged.fetch_add(1, std::memory_order_relaxed);
             } else {
-                counts.dirtyReadsChanged.fetch_add(1, std::memory_order_relaxed);
+                const auto changed = counts.dirtyReadsChanged.fetch_add(1, std::memory_order_relaxed);
+                if (changed % 500 == 0 && changed < 5000) {
+                    std::uint32_t old[4];
+                    std::uint32_t now[4];
+                    std::memcpy(old, before.data(), sizeof(old));
+                    std::memcpy(now, after.data(), sizeof(now));
+                    std::fprintf(stderr, "[kyty-gpu] GPU-written read at %llx: %08x %08x %08x %08x -> %08x %08x %08x %08x\n", static_cast<unsigned long long>(address), old[0], old[1], old[2], old[3], now[0], now[1], now[2], now[3]);
+                }
                 std::lock_guard lock(hotMutex);
                 ++gpuThreadChangedReads[address & ~std::uint64_t{0xf}];
             }
