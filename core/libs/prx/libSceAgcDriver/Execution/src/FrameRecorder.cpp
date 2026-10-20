@@ -174,6 +174,7 @@ void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
     }
     if (state != State::Recording) return;
     emitDelta();
+    if (state != State::Recording) return;
     call.ordinal = ++ordinal;
     std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(call);
@@ -194,6 +195,7 @@ void FrameRecorder::record(FrameCall call, bool prologueCall) {
     }
     if (state != State::Recording) return;
     emitDelta();
+    if (state != State::Recording) return;
     call.ordinal = ++ordinal;
     std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(call);
@@ -223,6 +225,7 @@ bool FrameRecorder::triggered() {
 }
 
 void FrameRecorder::emitDelta() {
+    if (abandonIfDiskLow()) return;
     const auto mark = GuestMemory::WriteGeneration();
     const auto [accepted, completed] = DriverDetail::Driver::Get().SerialProgress();
     const auto group = deltaGroups + 1;
@@ -259,10 +262,27 @@ void FrameRecorder::snapshot(const Range& range) {
     }
     std::vector<std::byte> bytes;
     for (std::uint64_t at = 0; at < range.bytes; at += SnapshotPieceBytes) {
+        if (abandonIfDiskLow()) return;
         bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(SnapshotPieceBytes, range.bytes - at)));
         GuestMemory::ReadCommitted(range.address + at, bytes);
         snapshotBytes += writer->WriteSnapshot(range.address + at, bytes);
     }
+}
+
+bool FrameRecorder::abandonIfDiskLow() {
+    std::error_code error;
+    const auto space = std::filesystem::space(directory, error);
+    if (error || space.available >= MinimumFreeBytes) return false;
+    warnings.push_back("stopped: less than 4 GiB free on the capture volume");
+    std::fprintf(stderr, "[frame-capture] stopped: less than 4 GiB free on the capture volume\n");
+    try {
+        writer->Finish(header());
+    } catch (const std::exception& failure) {
+        std::fprintf(stderr, "[frame-capture] %s\n", failure.what());
+    }
+    writer.reset();
+    state = State::Done;
+    return true;
 }
 
 void FrameRecorder::start() {
@@ -285,7 +305,10 @@ void FrameRecorder::start() {
         if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) GuestMemory::CollectWrittenBlocks(range.address, static_cast<std::size_t>(range.bytes), std::numeric_limits<std::uint64_t>::max(), written);
     }
     generation = GuestMemory::WriteGeneration();
-    for (const auto& range : ranges) snapshot(range);
+    for (const auto& range : ranges) {
+        snapshot(range);
+        if (!writer) return;
+    }
     for (const auto& call : prologue) writer->WriteCall(call);
     std::uintptr_t ringBase = 0;
     std::uint32_t ringSize = 0;
@@ -313,6 +336,7 @@ void FrameRecorder::start() {
 
 void FrameRecorder::finish() {
     emitDelta();
+    if (!writer) return;
     auto end = make(FrameCallKind::End);
     end.ordinal = ++ordinal;
     std::tie(end.accepted, end.completed) = DriverDetail::Driver::Get().SerialProgress();

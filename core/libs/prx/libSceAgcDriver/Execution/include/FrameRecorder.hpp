@@ -22,6 +22,7 @@ public:
     static constexpr std::uint64_t DefaultFrames = 10;
     static constexpr std::size_t ReservationHistory = 256;
     static constexpr std::size_t SnapshotPieceBytes = 64u * 1024u * 1024u;
+    static constexpr std::uint64_t MinimumFreeBytes = std::uint64_t{4} << 30;
 
     static FrameRecorder* Active();
 
@@ -55,6 +56,7 @@ private:
     void start();
     void finish();
     void snapshot(const Range& range);
+    bool abandonIfDiskLow();
     std::string header() const;
     static std::vector<Range> committedRanges();
 
