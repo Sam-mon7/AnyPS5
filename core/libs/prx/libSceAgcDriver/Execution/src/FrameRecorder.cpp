@@ -6,9 +6,11 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -87,6 +89,12 @@ std::uint64_t flipValue(std::int64_t value) {
     return static_cast<std::uint64_t>(value);
 }
 
+std::uint64_t contentHash(std::span<const std::byte> bytes) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto value : bytes) hash = (hash ^ static_cast<std::uint64_t>(value)) * 0x100000001b3ull;
+    return hash == 0 ? 1 : hash;
+}
+
 }
 
 FrameRecorder* FrameRecorder::Active() {
@@ -116,7 +124,8 @@ FrameCall FrameRecorder::make(FrameCallKind kind) {
 void FrameRecorder::RegisterShader(const Shader* shader) {
     auto call = make(FrameCallKind::RegisterShader);
     call.address = pointer(shader);
-    record(std::move(call), true);
+    const std::array<const Shader*, 1> shaders{shader};
+    record(std::move(call), true, shaders);
 }
 
 void FrameRecorder::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
@@ -124,7 +133,8 @@ void FrameRecorder::ResolveShaderAbi(const Shader* shader, std::span<const Shade
     call.address = pointer(shader);
     call.context = copyRegisters(context);
     call.primitive = copyRegisters(primitive);
-    record(std::move(call), true);
+    const std::array<const Shader*, 1> shaders{shader};
+    record(std::move(call), true, shaders);
 }
 
 void FrameRecorder::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
@@ -132,13 +142,14 @@ void FrameRecorder::ResolveGraphicsStagesAbi(std::span<const Shader* const> stag
     for (const auto* stage : stages) call.values.push_back(pointer(stage));
     call.context = copyRegisters(context);
     call.primitive = copyRegisters(primitive);
-    record(std::move(call), true);
+    record(std::move(call), true, stages);
 }
 
 void FrameRecorder::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
     auto call = make(FrameCallKind::ResolveGraphicsAbi);
     call.values = {pointer(vertex), pointer(pixel), primitiveType};
-    record(std::move(call), true);
+    const std::array<const Shader*, 2> shaders{vertex, pixel};
+    record(std::move(call), true, shaders);
 }
 
 void FrameRecorder::RegisterVideoOutput(std::uint32_t handle) {
@@ -186,7 +197,7 @@ void FrameRecorder::Suspend() {
     record(make(FrameCallKind::Suspend), false);
 }
 
-void FrameRecorder::record(FrameCall call, bool prologueCall) {
+void FrameRecorder::record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders) {
     std::lock_guard lock(mutex);
     if (state == State::Waiting) {
         if (!prologueCall) return;
@@ -195,7 +206,8 @@ void FrameRecorder::record(FrameCall call, bool prologueCall) {
         return;
     }
     if (state != State::Recording) return;
-    emitDelta();
+    if (prologueCall) emitShaderDelta(shaders);
+    else emitDelta();
     if (state != State::Recording) return;
     call.ordinal = ++ordinal;
     std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
@@ -226,16 +238,79 @@ bool FrameRecorder::triggered() {
 }
 
 void FrameRecorder::emitDelta() {
-    if (abandonIfDiskLow()) return;
+    std::vector<Span> spans;
+    for (const auto& range : ranges) {
+        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) spans.push_back({range.address, range.bytes, generation});
+    }
     const auto mark = GuestMemory::WriteGeneration();
+    writeDelta(spans, {});
+    generation = mark;
+    shaderMarks.clear();
+}
+
+void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
+    std::set<std::uint64_t> blocks;
+    std::set<std::uint64_t> hostPages;
+    std::uintptr_t arenaBase = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+    const auto note = [&](const void* address) {
+        if (address == nullptr) return;
+        const auto at = pointer(address);
+        if (at >= arenaBase && at - arenaBase < arenaBytes) {
+            blocks.insert(at & ~std::uint64_t{FrameCaptureWriter::BlockBytes - 1});
+            return;
+        }
+        const auto page = at & ~std::uint64_t{HostPageBytes - 1};
+        hostPages.insert(page);
+        hostPages.insert(page + HostPageBytes);
+    };
+    for (const auto* shader : shaders) {
+        if (shader == nullptr || !GuestMemory::Accessible(shader, sizeof(Shader))) continue;
+        note(shader);
+        note(shader->user_data);
+        note(shader->cx_registers);
+        note(shader->sh_registers);
+        note(shader->specials);
+        note(shader->input_semantics);
+        note(shader->output_semantics);
+        if (shader->user_data == nullptr || !GuestMemory::Accessible(shader->user_data, sizeof(ShaderUserData))) continue;
+        note(shader->user_data->direct_resource_offset);
+        for (const auto* sharps : shader->user_data->sharp_resource_offset) note(sharps);
+    }
+    if (blocks.empty() && hostPages.empty()) return;
+    const auto mark = GuestMemory::WriteGeneration();
+    std::vector<Span> spans;
+    for (const auto block : blocks) {
+        const auto found = shaderMarks.find(block);
+        spans.push_back({block, 2 * FrameCaptureWriter::BlockBytes, found != shaderMarks.end() ? std::max(found->second, generation) : generation});
+    }
+    const std::vector<std::uint64_t> pages(hostPages.begin(), hostPages.end());
+    writeDelta(spans, pages);
+    for (const auto block : blocks) shaderMarks[block] = mark;
+}
+
+void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages) {
+    if (abandonIfDiskLow()) return;
     const auto [accepted, completed] = DriverDetail::Driver::Get().SerialProgress();
     const auto group = deltaGroups + 1;
     bool any = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     std::vector<std::byte> bytes;
-    for (const auto& range : ranges) {
-        if (range.kind != FrameRangeKind::Watched && range.kind != FrameRangeKind::Unwatched) continue;
-        GuestMemory::CollectWrittenBlocks(range.address, static_cast<std::size_t>(range.bytes), generation, written);
+    for (const auto page : hostPages) {
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes)) continue;
+        bytes.resize(HostPageBytes);
+        std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes);
+        const auto hash = contentHash(bytes);
+        auto& known = hostPageHashes[page];
+        if (known == hash) continue;
+        known = hash;
+        writer->WriteDelta(group, completed, page, bytes);
+        deltaBytes += bytes.size();
+        any = true;
+    }
+    for (const auto& span : spans) {
+        GuestMemory::CollectWrittenBlocks(span.address, static_cast<std::size_t>(span.bytes), span.since, written);
         for (const auto& [begin, end] : written) {
             bytes.resize(static_cast<std::size_t>(end - begin));
             GuestMemory::ReadCommittedUnsynced(begin, bytes);
@@ -244,7 +319,6 @@ void FrameRecorder::emitDelta() {
             any = true;
         }
     }
-    generation = mark;
     if (!any) return;
     deltaGroups = group;
     auto call = make(FrameCallKind::Memory);
@@ -385,15 +459,11 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
     if (size == 0) throw std::runtime_error("frame capture: the guest arena is not reserved");
     std::vector<Range> result;
-    std::uint64_t outsideBytes = 0;
     for (const auto& allocation : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
         if (!allocation->readable) continue;
         const auto first = allocation->address;
         const auto end = first + allocation->bytes;
-        if (first < base || end > base + size) {
-            outsideBytes += allocation->bytes;
-            continue;
-        }
+        const bool host = first < base || end > base + size;
         const auto access = FrameRangeAccess::Readable | (allocation->writable ? FrameRangeAccess::Writable : 0u) | (allocation->gpu ? FrameRangeAccess::Gpu : 0u);
         for (auto address = first; address < end;) {
             MEMORY_BASIC_INFORMATION info{};
@@ -407,7 +477,8 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
                 range.access = access;
                 const auto page = info.Protect & 0xffu;
                 range.readable = (info.Protect & PAGE_GUARD) == 0 && (page == PAGE_READONLY || page == PAGE_READWRITE || page == PAGE_WRITECOPY || page == PAGE_EXECUTE_READ || page == PAGE_EXECUTE_READWRITE || page == PAGE_EXECUTE_WRITECOPY);
-                if (info.Type == MEM_PRIVATE) range.kind = GuestMemory::Watched(range.address, static_cast<std::size_t>(range.bytes)) ? FrameRangeKind::Watched : FrameRangeKind::Unwatched;
+                if (host) range.kind = FrameRangeKind::Host;
+                else if (info.Type == MEM_PRIVATE) range.kind = GuestMemory::Watched(range.address, static_cast<std::size_t>(range.bytes)) ? FrameRangeKind::Watched : FrameRangeKind::Unwatched;
                 else range.kind = FrameRangeKind::Section;
                 auto& last = result.empty() ? range : result.back();
                 if (!result.empty() && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access) last.bytes += range.bytes;
@@ -416,7 +487,6 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
             address = regionEnd;
         }
     }
-    if (outsideBytes != 0) warnings.push_back(std::to_string(outsideBytes) + " bytes of readable guest allocations outside the guest arena are not captured");
     return result;
 #else
     throw std::runtime_error("frame capture: guest memory capture is implemented on Windows only");

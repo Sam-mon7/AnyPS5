@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -23,6 +24,7 @@ public:
     static constexpr std::size_t ReservationHistory = 256;
     static constexpr std::size_t SnapshotPieceBytes = 64u * 1024u * 1024u;
     static constexpr std::uint64_t MinimumFreeBytes = std::uint64_t{4} << 30;
+    static constexpr std::size_t HostPageBytes = 4096;
 
     static FrameRecorder* Active();
 
@@ -50,9 +52,17 @@ private:
     };
 
     FrameRecorder(std::filesystem::path directory, std::filesystem::path trigger, std::uint64_t atBoundary, std::uint64_t frames);
+    struct Span {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t since = 0;
+    };
+
     FrameCall make(FrameCallKind kind);
-    void record(FrameCall call, bool prologueCall);
+    void record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders = {});
     void emitDelta();
+    void emitShaderDelta(std::span<const Shader* const> shaders);
+    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages);
     bool triggered();
     void start();
     void finish();
@@ -71,6 +81,8 @@ private:
     std::vector<FrameCall> prologue;
     std::deque<FrameCall> reservations;
     std::vector<Range> ranges;
+    std::map<std::uint64_t, std::uint64_t> shaderMarks;
+    std::map<std::uint64_t, std::uint64_t> hostPageHashes;
     std::uint64_t ordinal = 0;
     std::uint64_t boundaries = 0;
     std::uint64_t startBoundary = 0;

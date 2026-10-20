@@ -37,6 +37,7 @@ using AgcDriver::FrameCaptureReader;
 using AgcDriver::FrameMemoryChunk;
 using AgcDriver::FrameMemoryKind;
 using AgcDriver::FrameRangeAccess;
+using AgcDriver::FrameRangeKind;
 using Clock = std::chrono::steady_clock;
 
 struct Dump {
@@ -151,6 +152,35 @@ struct Skipped {
     }
 };
 
+void mapHostRanges(const FrameCaptureReader& reader, Skipped& skipped) {
+    std::vector<const FrameMemoryChunk*> host;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Range && chunk.rangeKind == FrameRangeKind::Host) host.push_back(&chunk);
+    }
+#ifdef _WIN32
+    constexpr std::uint64_t Granularity = 64u * 1024u;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> envelopes;
+    for (const auto* chunk : host) {
+        const auto begin = chunk->address & ~(Granularity - 1);
+        const auto end = (chunk->address + chunk->bytes + Granularity - 1) & ~(Granularity - 1);
+        if (!envelopes.empty() && begin <= envelopes.back().second) envelopes.back().second = std::max(envelopes.back().second, end);
+        else envelopes.emplace_back(begin, end);
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> refused;
+    for (const auto& [begin, end] : envelopes) {
+        if (VirtualAlloc(reinterpret_cast<void*>(static_cast<std::uintptr_t>(begin)), static_cast<SIZE_T>(end - begin), MEM_RESERVE, PAGE_NOACCESS) == nullptr) refused.emplace_back(begin, end);
+    }
+    for (const auto* chunk : host) {
+        const bool blocked = std::any_of(refused.begin(), refused.end(), [&](const auto& range) { return chunk->address < range.second && range.first < chunk->address + chunk->bytes; });
+        if (!blocked && VirtualAlloc(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk->address)), static_cast<SIZE_T>(chunk->bytes), MEM_COMMIT, PAGE_READWRITE) != nullptr) continue;
+        if ((chunk->access & FrameRangeAccess::Gpu) != 0) throw std::runtime_error("frame replay: cannot map the GPU-visible host range at " + std::to_string(chunk->address));
+        skipped.Add(*chunk);
+    }
+#else
+    for (const auto* chunk : host) skipped.Add(*chunk);
+#endif
+}
+
 Skipped restoreMemory(const FrameCaptureReader& reader) {
     std::uintptr_t base = 0;
     std::size_t size = 0;
@@ -158,10 +188,11 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     if (!reader.Header().empty() && headerNumber(reader.Header(), "arena_base") != base) throw std::runtime_error("frame replay: the guest arena is at a different address than in the capture");
     progress();
     Skipped skipped;
+    mapHostRanges(reader, skipped);
     {
         GuestAllocations::Mutation mutation;
         for (const auto& chunk : reader.Chunks()) {
-            if (chunk.kind != FrameMemoryKind::Range) continue;
+            if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind == FrameRangeKind::Host) continue;
             const bool gpu = (chunk.access & FrameRangeAccess::Gpu) != 0;
             if (committedWritable(chunk.address, chunk.bytes)) {
                 if (!gpu) skipped.Add(chunk);

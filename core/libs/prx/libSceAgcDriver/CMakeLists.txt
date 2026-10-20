@@ -2724,6 +2724,9 @@ add_executable(agc_frame_replay EXCLUDE_FROM_ALL
 )
 target_include_directories(agc_frame_replay PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_frame_replay PRIVATE libSceAgcDriver libkernel libc libzstd_static)
+if(WIN32)
+    target_link_options(agc_frame_replay PRIVATE LINKER:--image-base=0x500000000000)
+endif()
 set_target_properties(agc_frame_replay PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_frame_replay)
 

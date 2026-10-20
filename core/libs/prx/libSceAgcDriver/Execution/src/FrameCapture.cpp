@@ -372,7 +372,7 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
         FrameMemoryChunk chunk;
         const auto kind = decoder.Take<std::uint32_t>("memory kind");
         const auto rangeKind = decoder.Take<std::uint32_t>("range kind");
-        requireCapture(kind >= 1 && kind <= 3 && rangeKind >= 1 && rangeKind <= 5, memoryPath.string() + ": corrupt chunk header at byte " + std::to_string(offset));
+        requireCapture(kind >= 1 && kind <= 3 && rangeKind >= 1 && rangeKind <= 6, memoryPath.string() + ": corrupt chunk header at byte " + std::to_string(offset));
         chunk.kind = static_cast<FrameMemoryKind>(kind);
         chunk.rangeKind = static_cast<FrameRangeKind>(rangeKind);
         chunk.protection = decoder.Take<std::uint32_t>("protection");

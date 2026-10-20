@@ -49,7 +49,7 @@ struct FrameCall {
 
 enum class FrameMemoryKind : std::uint32_t { Range = 1, Snapshot, Delta };
 
-enum class FrameRangeKind : std::uint32_t { Watched = 1, Unwatched, Section, Alias, File };
+enum class FrameRangeKind : std::uint32_t { Watched = 1, Unwatched, Section, Alias, File, Host };
 
 struct FrameRangeAccess {
     static constexpr std::uint32_t Readable = 1;
