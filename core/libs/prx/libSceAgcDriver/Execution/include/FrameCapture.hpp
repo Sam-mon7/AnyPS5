@@ -51,10 +51,17 @@ enum class FrameMemoryKind : std::uint32_t { Range = 1, Snapshot, Delta };
 
 enum class FrameRangeKind : std::uint32_t { Watched = 1, Unwatched, Section, Alias, File };
 
+struct FrameRangeAccess {
+    static constexpr std::uint32_t Readable = 1;
+    static constexpr std::uint32_t Writable = 2;
+    static constexpr std::uint32_t Gpu = 4;
+};
+
 struct FrameMemoryChunk {
     FrameMemoryKind kind = FrameMemoryKind::Range;
     FrameRangeKind rangeKind = FrameRangeKind::Watched;
     std::uint32_t protection = 0;
+    std::uint32_t access = 0;
     std::uint64_t group = 0;
     std::uint64_t completed = 0;
     std::uint64_t address = 0;
@@ -78,7 +85,7 @@ public:
     FrameCaptureWriter& operator=(const FrameCaptureWriter&) = delete;
 
     void WriteCall(const FrameCall& call);
-    void WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection);
+    void WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access);
     std::uint64_t WriteSnapshot(std::uint64_t address, std::span<const std::byte> bytes);
     void WriteDelta(std::uint64_t group, std::uint64_t completed, std::uint64_t address, std::span<const std::byte> bytes);
     void Finish(std::string_view header);

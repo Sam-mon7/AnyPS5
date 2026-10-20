@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
@@ -255,7 +256,7 @@ void FrameRecorder::emitDelta() {
 }
 
 void FrameRecorder::snapshot(const Range& range) {
-    writer->WriteRange(range.address, range.bytes, range.kind, range.protection);
+    writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
     if (!range.readable) {
         unreadableBytes += range.bytes;
         return;
@@ -384,26 +385,38 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
     if (size == 0) throw std::runtime_error("frame capture: the guest arena is not reserved");
     std::vector<Range> result;
-    const auto end = base + size;
-    for (auto address = base; address < end;) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == 0) throw std::runtime_error("frame capture: VirtualQuery failed inside the guest arena");
-        const auto regionEnd = std::min<std::uintptr_t>(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
-        if (info.State == MEM_COMMIT) {
-            Range range;
-            range.address = address;
-            range.bytes = regionEnd - address;
-            range.protection = info.Protect;
-            const auto access = info.Protect & 0xffu;
-            range.readable = (info.Protect & PAGE_GUARD) == 0 && (access == PAGE_READONLY || access == PAGE_READWRITE || access == PAGE_WRITECOPY || access == PAGE_EXECUTE_READ || access == PAGE_EXECUTE_READWRITE || access == PAGE_EXECUTE_WRITECOPY);
-            if (info.Type == MEM_PRIVATE) range.kind = GuestMemory::Watched(range.address, static_cast<std::size_t>(range.bytes)) ? FrameRangeKind::Watched : FrameRangeKind::Unwatched;
-            else range.kind = FrameRangeKind::Section;
-            auto& last = result.empty() ? range : result.back();
-            if (!result.empty() && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable) last.bytes += range.bytes;
-            else result.push_back(range);
+    std::uint64_t outsideBytes = 0;
+    for (const auto& allocation : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
+        if (!allocation->gpu) continue;
+        const auto first = allocation->address;
+        const auto end = first + allocation->bytes;
+        if (first < base || end > base + size) {
+            outsideBytes += allocation->bytes;
+            continue;
         }
-        address = regionEnd;
+        const auto access = (allocation->readable ? FrameRangeAccess::Readable : 0u) | (allocation->writable ? FrameRangeAccess::Writable : 0u) | FrameRangeAccess::Gpu;
+        for (auto address = first; address < end;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), &info, sizeof(info)) == 0) throw std::runtime_error("frame capture: VirtualQuery failed inside the guest arena");
+            const auto regionEnd = std::min<std::uint64_t>(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
+            if (info.State == MEM_COMMIT) {
+                Range range;
+                range.address = address;
+                range.bytes = regionEnd - address;
+                range.protection = info.Protect;
+                range.access = access;
+                const auto page = info.Protect & 0xffu;
+                range.readable = (info.Protect & PAGE_GUARD) == 0 && (page == PAGE_READONLY || page == PAGE_READWRITE || page == PAGE_WRITECOPY || page == PAGE_EXECUTE_READ || page == PAGE_EXECUTE_READWRITE || page == PAGE_EXECUTE_WRITECOPY);
+                if (info.Type == MEM_PRIVATE) range.kind = GuestMemory::Watched(range.address, static_cast<std::size_t>(range.bytes)) ? FrameRangeKind::Watched : FrameRangeKind::Unwatched;
+                else range.kind = FrameRangeKind::Section;
+                auto& last = result.empty() ? range : result.back();
+                if (!result.empty() && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access) last.bytes += range.bytes;
+                else result.push_back(range);
+            }
+            address = regionEnd;
+        }
     }
+    if (outsideBytes != 0) warnings.push_back(std::to_string(outsideBytes) + " bytes of GPU-visible allocations outside the guest arena are not captured");
     return result;
 #else
     throw std::runtime_error("frame capture: guest memory capture is implemented on Windows only");

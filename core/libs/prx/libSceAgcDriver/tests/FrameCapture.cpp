@@ -120,7 +120,7 @@ void testRoundTrip(const std::filesystem::path& directory) {
     std::uint64_t stored = 0;
     {
         FrameCaptureWriter writer(directory);
-        writer.WriteRange(Base, memory.size(), FrameRangeKind::Watched, 3);
+        writer.WriteRange(Base, memory.size(), FrameRangeKind::Watched, 3, AgcDriver::FrameRangeAccess::Readable | AgcDriver::FrameRangeAccess::Gpu);
         stored = writer.WriteSnapshot(Base, memory);
         for (const auto& call : calls) writer.WriteCall(call);
         writer.WriteDelta(1, 17, Base + 0x3000, delta);
@@ -145,7 +145,8 @@ void testRoundTrip(const std::filesystem::path& directory) {
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind == FrameMemoryKind::Range) {
             ++ranges;
-            check(chunk.address == Base && chunk.bytes == memory.size() && chunk.rangeKind == FrameRangeKind::Watched && chunk.protection == 3, "range does not round-trip");
+            check(chunk.address == Base && chunk.bytes == memory.size() && chunk.rangeKind == FrameRangeKind::Watched && chunk.protection == 3 &&
+                      chunk.access == (AgcDriver::FrameRangeAccess::Readable | AgcDriver::FrameRangeAccess::Gpu), "range does not round-trip");
             continue;
         }
         if (chunk.kind == FrameMemoryKind::Snapshot) {

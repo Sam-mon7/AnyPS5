@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "SceTypes.hpp"
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <map>
 #include <memory>
@@ -19,7 +21,11 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" int APS5_VABI sceAgcDriverSetTFRing(const volatile void* base, std::uint32_t size);
 
@@ -30,10 +36,18 @@ using AgcDriver::FrameCallKind;
 using AgcDriver::FrameCaptureReader;
 using AgcDriver::FrameMemoryChunk;
 using AgcDriver::FrameMemoryKind;
+using AgcDriver::FrameRangeAccess;
 using Clock = std::chrono::steady_clock;
+
+struct Dump {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::filesystem::path path;
+};
 
 struct Options {
     std::filesystem::path directory;
+    std::vector<Dump> dumps;
     bool pace = true;
     bool strict = false;
     std::chrono::milliseconds paceTimeout{10000};
@@ -104,19 +118,46 @@ void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
     reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
 }
 
+bool committedWritable(std::uint64_t address, std::uint64_t bytes) {
+#ifdef _WIN32
+    for (auto at = address; at < address + bytes;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) return false;
+        const auto access = info.Protect & 0xffu;
+        if ((info.Protect & PAGE_GUARD) != 0 || (access != PAGE_READWRITE && access != PAGE_EXECUTE_READWRITE)) return false;
+        at = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+    }
+    return true;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
+std::pair<std::uint64_t, std::uint64_t> progress();
+
 void restoreMemory(const FrameCaptureReader& reader) {
     std::uintptr_t base = 0;
     std::size_t size = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
     if (!reader.Header().empty() && headerNumber(reader.Header(), "arena_base") != base) throw std::runtime_error("frame replay: the guest arena is at a different address than in the capture");
+    progress();
     std::vector<const FrameMemoryChunk*> snapshot;
-    for (const auto& chunk : reader.Chunks()) {
-        if (chunk.kind == FrameMemoryKind::Range) {
+    {
+        GuestAllocations::Mutation mutation;
+        for (const auto& chunk : reader.Chunks()) {
+            if (chunk.kind == FrameMemoryKind::Snapshot) snapshot.push_back(&chunk);
+            if (chunk.kind != FrameMemoryKind::Range || committedWritable(chunk.address, chunk.bytes)) continue;
             auto* const pointer = reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address));
-            GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, static_cast<std::size_t>(chunk.bytes));
-            GuestArena::GuestArenaCommit_nid_postfix(pointer, static_cast<std::size_t>(chunk.bytes), 0x04, static_cast<std::size_t>(chunk.bytes));
-        } else if (chunk.kind == FrameMemoryKind::Snapshot) {
-            snapshot.push_back(&chunk);
+            const auto bytes = static_cast<std::size_t>(chunk.bytes);
+            GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, bytes);
+#ifdef _WIN32
+            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, PAGE_READWRITE, bytes);
+#else
+            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, 3, bytes);
+#endif
+            mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, (chunk.access & FrameRangeAccess::Gpu) != 0);
         }
     }
     const auto workers = std::max<std::size_t>(1, std::thread::hardware_concurrency());
@@ -251,10 +292,33 @@ struct Replay {
 };
 
 int usage() {
-    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--strict]\n"
+    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--strict] [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
-                         "  build's AGC driver with no title running, and prints one JSON line with the frame times\n");
+                         "  build's AGC driver with no title running, and prints one JSON line with the frame times; --dump writes\n"
+                         "  guest memory to a file after the replay (address and size in hexadecimal or decimal)\n");
     return 2;
+}
+
+Dump parseDump(std::string_view text) {
+    const auto first = text.find(':');
+    const auto second = first == std::string_view::npos ? std::string_view::npos : text.find(':', first + 1);
+    if (second == std::string_view::npos) throw std::invalid_argument("frame replay: --dump takes <address>:<bytes>:<file>");
+    const auto number = [](std::string_view part) {
+        const std::string value(part);
+        char* end = nullptr;
+        const auto parsed = std::strtoull(value.c_str(), &end, 0);
+        if (value.empty() || end != value.c_str() + value.size()) throw std::invalid_argument("frame replay: '" + value + "' is not a number");
+        return static_cast<std::uint64_t>(parsed);
+    };
+    return {number(text.substr(0, first)), number(text.substr(first + 1, second - first - 1)), std::filesystem::path(std::string(text.substr(second + 1)))};
+}
+
+void writeDump(const Dump& dump) {
+    auto* const pointer = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(dump.address));
+    GuestArena::GuestArenaPrepareHostRead_nid_no_patch(pointer, static_cast<std::size_t>(dump.bytes));
+    std::ofstream file(dump.path, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(pointer), static_cast<std::streamsize>(dump.bytes));
+    if (!file.good()) throw std::runtime_error("frame replay: cannot write " + dump.path.string());
 }
 
 int run(const Options& options) {
@@ -271,6 +335,7 @@ int run(const Options& options) {
     AgcDriverWaitIdle_nid_postfix();
     replay.endedAt = Clock::now();
     if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
+    for (const auto& dump : options.dumps) writeDump(dump);
     const auto ready = replay.frames.Times();
     std::vector<double> frameMs;
     for (std::size_t index = 1; index < ready.size(); ++index) frameMs.push_back(std::chrono::duration<double, std::milli>(ready[index] - ready[index - 1]).count());
@@ -293,10 +358,16 @@ int main(int argc, char** argv) {
         const std::string_view argument = argv[index];
         if (argument == "--no-pace") options.pace = false;
         else if (argument == "--strict") options.strict = true;
+        else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
     if (options.directory.empty()) return usage();
+#ifdef _WIN32
+    _putenv_s("APS5_FRAME_CAPTURE", "");
+#else
+    unsetenv("APS5_FRAME_CAPTURE");
+#endif
     try {
         const auto code = run(options);
         AgcDriverShutdown_nid_postfix();

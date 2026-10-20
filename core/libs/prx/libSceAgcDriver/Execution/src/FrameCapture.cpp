@@ -203,11 +203,12 @@ void FrameCaptureWriter::WriteCall(const FrameCall& call) {
     requireCapture(calls.good(), "cannot write " + (directory / CallsName).string());
 }
 
-void FrameCaptureWriter::WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection) {
+void FrameCaptureWriter::WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access) {
     FrameMemoryChunk chunk;
     chunk.kind = FrameMemoryKind::Range;
     chunk.rangeKind = kind;
     chunk.protection = protection;
+    chunk.access = access;
     chunk.address = address;
     chunk.bytes = bytes;
     std::lock_guard lock(mutex);
@@ -303,7 +304,7 @@ void FrameCaptureWriter::writeChunk(const FrameMemoryChunk& chunk, std::span<con
     encoder.Put(static_cast<std::uint32_t>(chunk.kind));
     encoder.Put(static_cast<std::uint32_t>(chunk.rangeKind));
     encoder.Put(chunk.protection);
-    encoder.Put(std::uint32_t{0});
+    encoder.Put(chunk.access);
     encoder.Put(chunk.group);
     encoder.Put(chunk.completed);
     encoder.Put(chunk.address);
@@ -375,7 +376,7 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
         chunk.kind = static_cast<FrameMemoryKind>(kind);
         chunk.rangeKind = static_cast<FrameRangeKind>(rangeKind);
         chunk.protection = decoder.Take<std::uint32_t>("protection");
-        decoder.Take<std::uint32_t>("reserved");
+        chunk.access = decoder.Take<std::uint32_t>("access");
         chunk.group = decoder.Take<std::uint64_t>("group");
         chunk.completed = decoder.Take<std::uint64_t>("completed serial");
         chunk.address = decoder.Take<std::uint64_t>("address");

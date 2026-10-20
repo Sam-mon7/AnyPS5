@@ -10,11 +10,17 @@ namespace AgcDriver {
 
 void Submit(const Packet* packet, std::uint32_t queue) try {
     KernelNoteGpuSubmit_nid_no_patch();
-    if (auto* const recorder = FrameRecorder::Active()) {
-        GuestMemory::CheckRange(packet, sizeof(Packet), alignof(Packet));
-        recorder->Submit(*packet, queue);
+    auto& driver = DriverDetail::Driver::Get();
+    auto* const recorder = FrameRecorder::Active();
+    if (recorder == nullptr) {
+        driver.Submit(packet, queue);
+        return;
     }
-    DriverDetail::Driver::Get().Submit(packet, queue);
+    GuestMemory::CheckRange(packet, sizeof(Packet), alignof(Packet));
+    recorder->Submit(*packet, queue);
+    const auto flips = driver.FlipSubmissions();
+    driver.Submit(packet, queue);
+    if (driver.FlipSubmissions() != flips) recorder->FrameBoundary();
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }

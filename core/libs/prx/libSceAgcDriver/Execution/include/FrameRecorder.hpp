@@ -45,6 +45,7 @@ private:
         std::uint64_t bytes = 0;
         FrameRangeKind kind = FrameRangeKind::Watched;
         std::uint32_t protection = 0;
+        std::uint32_t access = 0;
         bool readable = false;
     };
 
@@ -58,7 +59,7 @@ private:
     void snapshot(const Range& range);
     bool abandonIfDiskLow();
     std::string header() const;
-    static std::vector<Range> committedRanges();
+    std::vector<Range> committedRanges();
 
     std::filesystem::path directory;
     std::filesystem::path trigger;

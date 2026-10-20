@@ -401,6 +401,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
             submission.holdsFlip = true;
             flipsAhead.fetch_add(1, std::memory_order_acq_rel);
         }
+        if (!submission.flips.empty()) flipSubmissions.fetch_add(1, std::memory_order_relaxed);
         enqueue(std::move(submission));
         ++accepted;
     }

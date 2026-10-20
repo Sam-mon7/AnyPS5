@@ -60,6 +60,7 @@ public:
     std::uint32_t ReserveEopFlipAt(const FlipInfo& info, std::uint32_t token);
     std::vector<std::uint32_t> PendingEopFlipTokens();
     std::pair<std::uint64_t, std::uint64_t> SerialProgress();
+    std::uint64_t FlipSubmissions() const;
     bool WaitIdleFor(std::chrono::milliseconds timeout);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
@@ -349,6 +350,7 @@ private:
     std::shared_ptr<FrameTiming> pendingFrameTiming;
 
     std::atomic<std::uint64_t> flipsCounted{0};
+    std::atomic<std::uint64_t> flipSubmissions{0};
     std::atomic<std::uint64_t> flipSerial{0};
     std::atomic<std::uint64_t> flipBatchesUnsignaled{0};
 
