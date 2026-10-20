@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -53,6 +54,8 @@ struct Module {
     KytyGpuHostWriteFunction hostWrite = nullptr;
     void (*suspendPoint)() = nullptr;
     void (*waitIdle)() = nullptr;
+    void (*prepare)(const KytyGpuHostTable* table, std::uint32_t width, std::uint32_t height) = nullptr;
+    KytyGpuLookupFunction agcFunction = nullptr;
 };
 
 std::atomic<bool> started{false};
@@ -227,6 +230,8 @@ const Module& module() {
         result.hostWrite = symbol<KytyGpuHostWriteFunction>(result.handle, "KytyGpuHostWrite");
         result.suspendPoint = symbol<void (*)()>(result.handle, "KytyGpuSuspendPoint");
         result.waitIdle = symbol<void (*)()>(result.handle, "KytyGpuWaitIdle");
+        result.prepare = symbol<void (*)(const KytyGpuHostTable*, std::uint32_t, std::uint32_t)>(result.handle, "KytyGpuPrepare");
+        result.agcFunction = symbol<KytyGpuLookupFunction>(result.handle, "KytyGpuAgcFunction");
         return result;
     }();
     return loaded;
@@ -346,6 +351,71 @@ void WaitIdle() {
     if (Started()) module().waitIdle();
 }
 
+void RedirectAgc(void* agcModule) {
+    if (!Enabled() || agcModule == nullptr) return;
+    const auto& kyty = module();
+    kyty.prepare(&hostTable, 1920, 1080);
+    auto* base = static_cast<std::uint8_t*>(agcModule);
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const auto& directory = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (directory.Size == 0) return;
+    const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + directory.VirtualAddress);
+    const auto* names = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
+    const auto* ordinals = reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
+    const auto* functions = reinterpret_cast<const DWORD*>(base + exports->AddressOfFunctions);
+    constexpr std::size_t trampolineBytes = 16;
+    const std::size_t pageBytes = (static_cast<std::size_t>(exports->NumberOfNames) * trampolineBytes + 0xffffu) & ~std::size_t{0xffffu};
+    std::uint8_t* trampolines = nullptr;
+    for (std::uintptr_t candidate = (reinterpret_cast<std::uintptr_t>(base) & ~std::uintptr_t{0xffffu}) - 0x10000u;
+         trampolines == nullptr && candidate > 0x10000u && reinterpret_cast<std::uintptr_t>(base) - candidate < 0x7fff0000u; candidate -= 0x10000u) {
+        trampolines = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), pageBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    }
+    if (trampolines == nullptr) throw std::runtime_error("Kyty GPU: no trampoline space near libSceAgc");
+    std::vector<std::uintptr_t> patched;
+    std::size_t redirected = 0;
+    std::size_t kept = 0;
+    std::size_t refused = 0;
+    for (DWORD index = 0; index < exports->NumberOfNames; ++index) {
+        const auto* nid = reinterpret_cast<const char*>(base + names[index]);
+        const auto rva = functions[ordinals[index]];
+        if (rva >= directory.VirtualAddress && rva < directory.VirtualAddress + directory.Size) continue;
+        auto* target = kyty.agcFunction(nid);
+        if (target == nullptr) {
+            ++kept;
+            continue;
+        }
+        auto* site = base + rva;
+        const auto address = reinterpret_cast<std::uintptr_t>(site);
+        if (std::find(patched.begin(), patched.end(), address) != patched.end()) {
+            ++refused;
+            continue;
+        }
+        DWORD64 image = 0;
+        const auto* entry = RtlLookupFunctionEntry(address, &image, nullptr);
+        if (entry == nullptr || image + entry->BeginAddress != address || entry->EndAddress - entry->BeginAddress < 5) {
+            ++refused;
+            continue;
+        }
+        auto* trampoline = trampolines + redirected * trampolineBytes;
+        const std::uint8_t jumpIndirect[6] = {0xff, 0x25, 0, 0, 0, 0};
+        std::memcpy(trampoline, jumpIndirect, sizeof(jumpIndirect));
+        std::memcpy(trampoline + sizeof(jumpIndirect), &target, sizeof(target));
+        const auto displacement = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(trampoline) - static_cast<std::intptr_t>(address + 5));
+        DWORD previous = 0;
+        if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &previous)) throw std::runtime_error("Kyty GPU: cannot redirect a libSceAgc export");
+        site[0] = 0xe9;
+        std::memcpy(site + 1, &displacement, sizeof(displacement));
+        VirtualProtect(site, 5, previous, &previous);
+        FlushInstructionCache(GetCurrentProcess(), site, 5);
+        patched.push_back(address);
+        ++redirected;
+    }
+    DWORD previous = 0;
+    VirtualProtect(trampolines, pageBytes, PAGE_EXECUTE_READ, &previous);
+    FlushInstructionCache(GetCurrentProcess(), trampolines, pageBytes);
+    std::fprintf(stderr, "[kyty-gpu] libSceAgc: %zu exports run SuperMedo's agc.cpp, %zu stay AnyPS5's, %zu refused\n", redirected, kept, refused);
+}
+
 }
 
 extern "C" bool AgcDriverKytyGpuEnabled_nid_no_patch() {
@@ -358,4 +428,8 @@ extern "C" void AgcDriverKytyGpuStart_nid_no_patch(void* window, std::uint32_t w
 
 extern "C" void* AgcDriverKytyGpuVideoOut_nid_no_patch(const char* name) {
     return AgcDriver::KytyGpu::module().videoOut(name);
+}
+
+extern "C" void AgcDriverKytyGpuRedirectAgc_nid_no_patch(void* agcModule) {
+    AgcDriver::KytyGpu::RedirectAgc(agcModule);
 }

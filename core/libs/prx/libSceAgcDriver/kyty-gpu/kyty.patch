@@ -196,6 +196,78 @@ index 23457031..b21c769b 100644
  	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
  	desc.info.pitch        = pitch;
  	desc.info.bytes_per_block = bytes_per_element;
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+index ff75e14a..701090fb 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -30,6 +30,42 @@ static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+ 
+ namespace {
+ 
++vk::Device g_fault_device = nullptr;
++
++void ReportDeviceFault() {
++	auto& dispatch = VULKAN_HPP_DEFAULT_DISPATCHER;
++	if (g_fault_device == nullptr || dispatch.vkGetDeviceFaultInfoEXT == nullptr) {
++		std::printf("device fault: no query (device %d, function %d)\n", g_fault_device != nullptr, dispatch.vkGetDeviceFaultInfoEXT != nullptr);
++		return;
++	}
++	VkDeviceFaultCountsEXT counts {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
++	if (const auto counted = dispatch.vkGetDeviceFaultInfoEXT(g_fault_device, &counts, nullptr); counted != VK_SUCCESS) {
++		std::printf("device fault: count query failed %d\n", static_cast<int>(counted));
++		return;
++	}
++	std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
++	std::vector<VkDeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
++	VkDeviceFaultInfoEXT                     info {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
++	info.pAddressInfos = addresses.data();
++	info.pVendorInfos  = vendors.data();
++	counts.vendorBinarySize = 0;
++	if (const auto queried = dispatch.vkGetDeviceFaultInfoEXT(g_fault_device, &counts, &info); queried != VK_SUCCESS && queried != VK_INCOMPLETE) {
++		std::printf("device fault: info query failed %d\n", static_cast<int>(queried));
++		return;
++	}
++	std::printf("device fault: %s\n", info.description);
++	for (uint32_t i = 0; i < counts.addressInfoCount; ++i) {
++		std::printf("device fault address: type=%d address=0x%016" PRIx64 " precision=0x%" PRIx64 "\n",
++		            static_cast<int>(addresses[i].addressType), static_cast<uint64_t>(addresses[i].reportedAddress),
++		            static_cast<uint64_t>(addresses[i].addressPrecision));
++	}
++	for (uint32_t i = 0; i < counts.vendorInfoCount; ++i) {
++		std::printf("device fault vendor: %s code=0x%" PRIx64 " data=0x%" PRIx64 "\n", vendors[i].description,
++		            static_cast<uint64_t>(vendors[i].vendorFaultCode), static_cast<uint64_t>(vendors[i].vendorFaultData));
++	}
++	std::fflush(stdout);
++}
++
+ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
+                        uint64_t debug_submit, uint32_t arg0, uint32_t arg1, uint32_t arg2,
+                        uint32_t arg3, uint64_t arg4) {
+@@ -42,6 +78,7 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
+ 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
+ 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
+ 	std::fflush(stdout);
++	if (result == vk::Result::eErrorDeviceLost) ReportDeviceFault();
+ }
+ 
+ } // namespace
+@@ -110,7 +147,7 @@ bool CommandScheduler::InDeferredOperation() noexcept {
+ }
+ 
+ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+-    : m_master(graphics), m_context(context), m_graphics(graphics),
++    : m_master((g_fault_device = graphics.device, graphics)), m_context(context), m_graphics(graphics),
+       m_command_pool(graphics, m_master), m_command(*this),
+       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
+       m_tick_monitor([this](std::stop_token stop) {
+@@ -514,6 +551,7 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
+ 		result = dispatch.vkQueueSubmit(submit.queue, 1, &info, VK_NULL_HANDLE);
+ 	}
+ 	if (result != VK_SUCCESS) {
++		if (result == VK_ERROR_DEVICE_LOST) ReportDeviceFault();
+ 		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), submit.tick);
+ 	}
+ 	LocalVulkanRecording::NoteDeferredSubmitDone();
 diff --git a/src/graphics/host_gpu/renderer/context.cpp b/src/graphics/host_gpu/renderer/context.cpp
 index a5744f07..dc9adb83 100644
 --- a/src/graphics/host_gpu/renderer/context.cpp
@@ -514,7 +586,7 @@ index 29920edd..640ca159 100644
  	m_frame_index = 0;
  	m_images.clear();
 diff --git a/src/graphics/presentation/window/vulkanWindow.cpp b/src/graphics/presentation/window/vulkanWindow.cpp
-index 5acc65a5..93a6a59c 100644
+index 5acc65a5..aea31ba9 100644
 --- a/src/graphics/presentation/window/vulkanWindow.cpp
 +++ b/src/graphics/presentation/window/vulkanWindow.cpp
 @@ -60,6 +60,8 @@
@@ -544,6 +616,29 @@ index 5acc65a5..93a6a59c 100644
  	    readback != nullptr && readback[0] != '\0' && std::strcmp(readback, "0") != 0) {
  		uint32_t family_count = 0;
  		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+@@ -864,6 +866,12 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
+ 		present_id.pNext     = const_cast<void*>(create_info.pNext);
+ 		create_info.pNext    = &present_id;
+ 	}
++	vk::PhysicalDeviceFaultFeaturesEXT fault {};
++	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
++		fault.deviceFault = VK_TRUE;
++		fault.pNext       = const_cast<void*>(create_info.pNext);
++		create_info.pNext = &fault;
++	}
+ 	vk::PhysicalDevicePipelineBinaryFeaturesKHR     binaries {};
+ 	vk::PhysicalDeviceMaintenance5FeaturesKHR       maintenance5 {};
+ 	vk::DevicePipelineBinaryInternalCacheControlKHR internal_cache {};
+@@ -1285,7 +1293,8 @@ void WindowContext::CreateVulkan() {
+ 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+ 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+ 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
+-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
++		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
++		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME}) {
+ 			if (HasExtension(available_extensions, extension)) {
+ 				device_extensions.push_back(extension);
+ 			}
 diff --git a/src/local/frame-capture.h b/src/local/frame-capture.h
 index 49d38abd..c2929985 100644
 --- a/src/local/frame-capture.h

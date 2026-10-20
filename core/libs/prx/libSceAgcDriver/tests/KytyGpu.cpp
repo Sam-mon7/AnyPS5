@@ -51,6 +51,12 @@ int main() {
             std::fprintf(stderr, "KytyHostSwitch ignored the environment or invented a switch\n");
             return 1;
         }
+        using Agc = void* (*)(const char*);
+        const auto agc = reinterpret_cast<Agc>(GetProcAddress(module, "KytyGpuAgcFunction"));
+        if (agc == nullptr || agc("23LRUSvYu1M") == nullptr || agc("h9z6+0hEydk") != nullptr || agc("NoSuchNid") != nullptr) {
+            std::fprintf(stderr, "KytyGpuAgcFunction resolved the wrong libSceAgc functions\n");
+            return 1;
+        }
     }
     std::printf("Kyty GPU switch %s passed\n", expected ? "on" : "off");
     return 0;

@@ -16,11 +16,13 @@ int DeleteEqEvent(KernelEqueue eq, int id);
 void RegisterShader(const Shader* shader);
 void SuspendPoint();
 void WaitIdle();
+void RedirectAgc(void* agcModule);
 
 }
 
 extern "C" bool AgcDriverKytyGpuEnabled_nid_no_patch();
 extern "C" void AgcDriverKytyGpuStart_nid_no_patch(void* window, std::uint32_t width, std::uint32_t height);
 extern "C" void* AgcDriverKytyGpuVideoOut_nid_no_patch(const char* name);
+extern "C" void AgcDriverKytyGpuRedirectAgc_nid_no_patch(void* agcModule);
 
 #endif

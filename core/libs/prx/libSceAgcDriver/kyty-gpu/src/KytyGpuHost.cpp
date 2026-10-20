@@ -19,12 +19,15 @@
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/agc.h"
+#include "libs/libs.h"
+#include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 #include "loader/demonsSoulsWarp.h"
 #include "loader/timer.h"
@@ -56,6 +59,12 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+namespace Libs::LibGen5 {
+
+void InitAgcDriver_1(Loader::SymbolDatabase* s);
+
+}
 
 namespace {
 
@@ -679,39 +688,13 @@ void* videoOutFunction(std::string_view name) {
 
 namespace Libs::Graphics {
 
-void GraphicsDbgDumpDcb(const char*, uint32_t, const uint32_t*) {}
-
-namespace Gen5 {
-
-bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
-    constexpr uint32_t internalDataRegister = 0x342u;
-    constexpr uint32_t drawIndirectMultiBegin = 0xc6000008u;
-    constexpr uint32_t drawIndirectMultiEnd = 0xc6000000u;
-    constexpr uint32_t waitUserDataBegin32 = 0xc8010000u;
-    constexpr uint32_t waitUserDataBegin64 = 0xc8020000u;
-    constexpr uint32_t waitUserDataEnd = 0xc8000000u;
-    constexpr uint32_t waitUserDataBeginDwords = 4u;
-    constexpr uint32_t internalDataDwords = 3u;
-    if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG || payload[0] != internalDataRegister) {
-        return false;
-    }
-    const auto dwords = KYTY_PM4_LEN(cmd_id);
-    bool internal = false;
-    if (dwords == waitUserDataBeginDwords) {
-        const auto tag = payload[1] & 0xffff0000u;
-        internal = tag == waitUserDataBegin32 || tag == waitUserDataBegin64;
-    } else {
-        internal = dwords == internalDataDwords && (payload[1] == waitUserDataEnd || payload[1] == drawIndirectMultiBegin || payload[1] == drawIndirectMultiEnd);
-    }
-    if (!internal) {
-        std::fprintf(stderr, "[kyty-gpu] unknown internal data packet %08x:", cmd_id);
-        for (uint32_t index = 0; index + 1 < dwords; ++index) std::fprintf(stderr, " %08x", payload[index]);
-        std::fprintf(stderr, "\n");
-    }
-    return internal;
+Presenter& WindowInit(uint32_t, uint32_t) {
+    EXIT("Kyty's own window start-up is not used inside AnyPS5\n");
 }
 
-}
+void WindowShutdown() {}
+
+void RenderDocInit() {}
 
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
     return {false, 0};
@@ -1134,13 +1117,32 @@ int __gxx_personality_v0(int, int, std::uint64_t, void*, void*) {
     std::abort();
 }
 
+__declspec(dllexport) void KytyGpuPrepare(const KytyGpuHostTable* table, std::uint32_t width, std::uint32_t height) {
+    static std::once_flag prepared;
+    std::call_once(prepared, [&] {
+        host = table;
+        static_cast<void>(startTime());
+        Common::InitializeThreads();
+        (new Common::Subsystems())->Initialize<TerminateOnFatal>();
+        configure(width, height);
+        ensureShaders();
+    });
+}
+
+__declspec(dllexport) void* KytyGpuAgcFunction(const char* nid) {
+    static Loader::SymbolDatabase* const symbols = [] {
+        auto* database = new Loader::SymbolDatabase();
+        Libs::LibGen5::InitAgcDriver_1(database);
+        return database;
+    }();
+    if (nid == nullptr || std::string_view(nid) == "h9z6+0hEydk") return nullptr;
+    const auto* record = symbols->FindByNid(nid, Loader::SymbolType::Func);
+    return record != nullptr ? reinterpret_cast<void*>(record->vaddr) : nullptr;
+}
+
 __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd, std::uint32_t width, std::uint32_t height) {
     if (started.load(std::memory_order_acquire)) return 0;
-    host = table;
-    static_cast<void>(startTime());
-    Common::InitializeThreads();
-    (new Common::Subsystems())->Initialize<TerminateOnFatal>();
-    configure(width, height);
+    KytyGpuPrepare(table, width, height);
     faultHandler = AddVectoredExceptionHandler(1, &handleFault);
     hostWindow = SDL_Window{hwnd, static_cast<int>(width), static_cast<int>(height)};
     window = new Libs::Graphics::WindowContext();
@@ -1153,7 +1155,6 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
     auto& renderer = presenter.Renderer();
     resources = &renderer;
     renderer.InitializeGpu(&videoOut);
-    ensureShaders();
     started.store(true, std::memory_order_release);
     std::thread([] {
         auto previous = counts.flips.load(std::memory_order_relaxed);

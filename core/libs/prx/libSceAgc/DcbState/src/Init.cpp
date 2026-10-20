@@ -6,8 +6,27 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#ifdef _WIN32
+#include "prx/libSceAgcDriver/Execution/include/KytyGpu.hpp"
+
+#include <windows.h>
+#endif
 
 static constexpr int SCE_AGC_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80890001);
+
+#ifdef _WIN32
+namespace {
+
+const bool kytyRedirected = [] {
+    HMODULE self = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&kytyRedirected), &self)) {
+        AgcDriverKytyGpuRedirectAgc_nid_no_patch(self);
+    }
+    return true;
+}();
+
+}
+#endif
 
 extern "C" {
 

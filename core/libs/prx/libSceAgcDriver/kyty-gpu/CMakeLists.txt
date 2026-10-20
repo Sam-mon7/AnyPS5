@@ -66,6 +66,9 @@ add_library(kytygpu SHARED EXCLUDE_FROM_ALL
         ${kytyGraphicsSources}
         ${kytyCommonSources}
         ${kytyShaderHeaders}
+        ${kytySource}/libs/agc.cpp
+        ${kytySource}/libs/libAgcDriver.cpp
+        ${kytySource}/loader/symbolDatabase.cpp
         ${kytySource}/local/local-platform.cpp
         ${kytySource}/local/frame-gen.cpp
         ${kytySource}/local/vulkan-recording.cpp
