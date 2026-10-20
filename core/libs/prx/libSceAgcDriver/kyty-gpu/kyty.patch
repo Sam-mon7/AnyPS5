@@ -1399,3 +1399,25 @@ index 853bd8db..d4a8c4e7 100644
  		for (const auto& layer: layers) {
  			if (layer.frame != nullptr) {
  				layer.frame->present_tick = tick;
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+index da24f04a..4735e8c8 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+@@ -16,6 +16,8 @@
+ 
+ namespace Libs::Graphics::ShaderRecompiler::IR {
+ 
++extern "C" bool KytyHostReadClean(uint64_t address, void* data, uint64_t size);
++
+ SrtRuntime SrtReadCapture::ObservedRuntime() {
+ 	auto runtime = m_source;
+ 	runtime.userdata = this;
+@@ -38,7 +40,7 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
+ 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+ 	if (capture.m_source.read_memory != nullptr) {
+ 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
+-	} else {
++	} else if (!KytyHostReadClean(address, values.data(), values.size_bytes())) {
+ 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+ 	}
+ 	capture.m_ranges.emplace_back(address, values.size_bytes());

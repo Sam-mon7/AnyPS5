@@ -103,6 +103,7 @@ struct Counts {
     std::atomic<std::uint64_t> aliasCopies{0};
     std::array<std::atomic<std::uint64_t>, 5> readbacks{};
     std::atomic<std::uint64_t> readbackDrainNs{0};
+    std::atomic<std::uint64_t> cleanReadsServed{0};
     std::atomic<std::uint64_t> linearCopies{0};
     std::atomic<std::uint64_t> linearCopiesGpu{0};
     std::atomic<std::uint64_t> backingNs{0};
@@ -621,6 +622,24 @@ void runProfiler() {
         std::fprintf(stderr, "[kyty-gpu] GPU thread profile over %u samples; inclusive:%s\n[kyty-gpu] GPU thread profile self:%s\n", samples, inclusiveText.c_str(), selfText.c_str());
         samples = 0;
     }
+}
+
+bool cleanReadsEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_KYTY_CLEAN_READS");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
+}
+
+bool readCleanBytes(std::uint64_t address, void* data, std::uint64_t size) {
+    if (resources == nullptr || size == 0 || !Libs::Graphics::GuestGpu::IsGpuThread() || !Libs::Graphics::GuestRange{address, size}.Valid()) return false;
+    bool watched = false;
+    for (auto page = address & ~(PageBytes - 1); page < address + size; page += PageBytes) watched |= pageState(page) == StateNoAccess;
+    if (!watched || resources->GetBufferCache().HasGpuDirtyBytes(address, size)) return false;
+    if (!Libs::LibKernel::Memory::TryReadBacking(address, data, size)) return false;
+    counts.cleanReadsServed.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 bool permits(std::uint64_t address, bool write) {
@@ -1433,8 +1452,11 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     }
                     gpuThreadDirtyReadShaders.clear();
                     std::fprintf(stderr, "[kyty-gpu] render-thread reads of GPU-written bytes by shader (%zu):%s\n", readers.size(), readerText.c_str());
-                    std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers), specialization-read downloads: %llu (%llu ms); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), static_cast<unsigned long long>(drains - lastDrains), static_cast<unsigned long long>((drainNs - lastDrainNs) / 1000000), pages.c_str(), writers.c_str(), chains.c_str());
+                    static std::uint64_t lastServed = 0;
+                    const auto served = counts.cleanReadsServed.load(std::memory_order_relaxed);
+                    std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers; %llu clean reads served without a fault), specialization-read downloads: %llu (%llu ms); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), static_cast<unsigned long long>(served - lastServed), static_cast<unsigned long long>(drains - lastDrains), static_cast<unsigned long long>((drainNs - lastDrainNs) / 1000000), pages.c_str(), writers.c_str(), chains.c_str());
                     lastFaults = faults;
+                    lastServed = served;
                     lastNs = ns;
                     lastClean = clean;
                     lastDrains = drains;
@@ -1589,6 +1611,14 @@ bool KytyHostComputeChainEnabled() {
         return text != nullptr && std::string_view(text) == "1";
     }();
     return enabled;
+}
+
+bool KytyHostCleanReadsEnabled() {
+    return cleanReadsEnabled();
+}
+
+bool KytyHostReadClean(std::uint64_t address, void* data, std::uint64_t size) {
+    return cleanReadsEnabled() && readCleanBytes(address, data, size);
 }
 
 bool KytyHostLinearCopyEnabled() {

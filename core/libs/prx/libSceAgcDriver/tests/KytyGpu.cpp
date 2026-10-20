@@ -38,6 +38,7 @@ int main() {
             {"KytyHostAsyncWriteReadbackEnabled", "APS5_KYTY_ASYNC_WRITE_READBACK"},
             {"KytyHostComputeChainEnabled", "APS5_KYTY_COMPUTE_CHAIN"},
             {"KytyHostLinearCopyEnabled", "APS5_KYTY_LINEAR_COPY"},
+            {"KytyHostCleanReadsEnabled", "APS5_KYTY_CLEAN_READS"},
             {"KytyHostProfileEnabled", "APS5_KYTY_GPU_PROFILE"},
         };
         for (const auto& [function, variable] : switches) {

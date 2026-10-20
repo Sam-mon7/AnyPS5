@@ -2,6 +2,7 @@ EXPORTS
     KytyHostAsyncReadbackEnabled
     KytyHostAsyncWriteReadbackEnabled
     KytyHostCaptureEnabled
+    KytyHostCleanReadsEnabled
     KytyHostComputeChainEnabled
     KytyHostLinearCopyEnabled
     KytyHostProfileEnabled
