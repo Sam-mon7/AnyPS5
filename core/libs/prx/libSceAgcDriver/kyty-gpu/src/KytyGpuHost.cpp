@@ -431,6 +431,155 @@ bool backing(std::uint64_t address, std::uint64_t bytes, bool sparse, bool write
     return true;
 }
 
+bool profileEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_KYTY_GPU_PROFILE");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
+}
+
+std::atomic<DWORD> gpuThreadId{0};
+
+struct ProfileModule {
+    std::uint64_t base = 0;
+    std::uint64_t end = 0;
+    const RUNTIME_FUNCTION* functions = nullptr;
+    std::size_t count = 0;
+    std::string name;
+};
+
+std::vector<ProfileModule> profileModules() {
+    using Enumerate = BOOL(WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
+    const auto enumerate = reinterpret_cast<Enumerate>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32EnumProcessModules"));
+    std::vector<ProfileModule> modules;
+    std::vector<HMODULE> handles(1024);
+    DWORD needed = 0;
+    if (enumerate == nullptr || !enumerate(GetCurrentProcess(), handles.data(), static_cast<DWORD>(handles.size() * sizeof(HMODULE)), &needed)) return modules;
+    handles.resize(std::min<std::size_t>(handles.size(), needed / sizeof(HMODULE)));
+    for (const auto handle : handles) {
+        auto* base = reinterpret_cast<const std::uint8_t*>(handle);
+        const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+        const auto& directory = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        ProfileModule module;
+        module.base = reinterpret_cast<std::uint64_t>(base);
+        module.end = module.base + headers->OptionalHeader.SizeOfImage;
+        if (directory.VirtualAddress != 0 && directory.Size >= sizeof(RUNTIME_FUNCTION)) {
+            module.functions = reinterpret_cast<const RUNTIME_FUNCTION*>(base + directory.VirtualAddress);
+            module.count = directory.Size / sizeof(RUNTIME_FUNCTION);
+        }
+        char name[MAX_PATH] = "?";
+        GetModuleFileNameA(handle, name, sizeof(name));
+        const char* last = std::strrchr(name, '\\');
+        module.name = last != nullptr ? last + 1 : name;
+        modules.push_back(std::move(module));
+    }
+    std::sort(modules.begin(), modules.end(), [](const auto& a, const auto& b) { return a.base < b.base; });
+    return modules;
+}
+
+const ProfileModule* profileModule(const std::vector<ProfileModule>& modules, std::uint64_t address) {
+    auto found = std::upper_bound(modules.begin(), modules.end(), address, [](std::uint64_t value, const ProfileModule& module) { return value < module.base; });
+    if (found == modules.begin()) return nullptr;
+    --found;
+    return address < found->end ? &*found : nullptr;
+}
+
+const RUNTIME_FUNCTION* profileFunction(const ProfileModule& module, std::uint64_t address) {
+    if (module.functions == nullptr) return nullptr;
+    const auto rva = static_cast<DWORD>(address - module.base);
+    const auto* end = module.functions + module.count;
+    const auto* found = std::upper_bound(module.functions, end, rva, [](DWORD value, const RUNTIME_FUNCTION& function) { return value < function.BeginAddress; });
+    if (found == module.functions) return nullptr;
+    --found;
+    return rva < found->EndAddress ? found : nullptr;
+}
+
+void runProfiler() {
+    auto modules = profileModules();
+    auto refreshed = std::chrono::steady_clock::now();
+    auto reported = refreshed;
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    HANDLE thread = nullptr;
+    std::unordered_map<std::uint64_t, std::uint32_t> self;
+    std::unordered_map<std::uint64_t, std::uint32_t> inclusive;
+    std::uint32_t samples = 0;
+    std::array<std::uint64_t, 64> frames{};
+    for (;;) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -10000;
+        if (timer != nullptr && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
+        else Sleep(1);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - refreshed > std::chrono::seconds(5)) {
+            modules = profileModules();
+            refreshed = now;
+        }
+        if (thread == nullptr) {
+            const auto id = gpuThreadId.load(std::memory_order_acquire);
+            if (id == 0) continue;
+            thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, id);
+            if (thread == nullptr) continue;
+        }
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        if (SuspendThread(thread) == static_cast<DWORD>(-1)) continue;
+        std::size_t depth = 0;
+        if (GetThreadContext(thread, &context)) {
+            const auto top = context.Rsp;
+            while (depth < frames.size()) {
+                frames[depth++] = context.Rip;
+                const auto* module = profileModule(modules, context.Rip);
+                if (module == nullptr || module->functions == nullptr) break;
+                const auto* function = profileFunction(*module, context.Rip);
+                const auto stack = context.Rsp;
+                if (function == nullptr) {
+                    context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+                    context.Rsp += 8;
+                } else {
+                    void* handlerData = nullptr;
+                    DWORD64 establisher = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, module->base, context.Rip, const_cast<PRUNTIME_FUNCTION>(function), &context, &handlerData, &establisher, nullptr);
+                }
+                if (context.Rip == 0 || context.Rsp <= stack || context.Rsp - top > (std::uint64_t{16} << 20)) break;
+            }
+        }
+        ResumeThread(thread);
+        if (depth == 0) continue;
+        ++samples;
+        std::array<std::uint64_t, 64> keys{};
+        for (std::size_t index = 0; index < depth; ++index) {
+            const auto* module = profileModule(modules, frames[index]);
+            const auto* function = module != nullptr ? profileFunction(*module, frames[index]) : nullptr;
+            keys[index] = function != nullptr ? module->base + function->BeginAddress : (frames[index] & ~std::uint64_t{0xff});
+        }
+        ++self[keys[0]];
+        for (std::size_t index = 0; index < depth; ++index) {
+            if (std::find(keys.begin(), keys.begin() + index, keys[index]) == keys.begin() + index) ++inclusive[keys[index]];
+        }
+        if (now - reported < std::chrono::seconds(10)) continue;
+        reported = now;
+        const auto describe = [&](std::unordered_map<std::uint64_t, std::uint32_t>& counts, std::size_t limit) {
+            std::vector<std::pair<std::uint32_t, std::uint64_t>> sorted;
+            for (const auto& [key, count] : counts) sorted.emplace_back(count, key);
+            std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::string text;
+            for (std::size_t index = 0; index < std::min(limit, sorted.size()); ++index) {
+                const auto* module = profileModule(modules, sorted[index].second);
+                char item[128];
+                std::snprintf(item, sizeof(item), " %s+%llx:%.1f%%", module != nullptr ? module->name.c_str() : "?", static_cast<unsigned long long>(sorted[index].second - (module != nullptr ? module->base : 0)), 100.0 * sorted[index].first / samples);
+                text += item;
+            }
+            counts.clear();
+            return text;
+        };
+        const auto inclusiveText = describe(inclusive, 60);
+        const auto selfText = describe(self, 40);
+        std::fprintf(stderr, "[kyty-gpu] GPU thread profile over %u samples; inclusive:%s\n[kyty-gpu] GPU thread profile self:%s\n", samples, inclusiveText.c_str(), selfText.c_str());
+        samples = 0;
+    }
+}
+
 bool permits(std::uint64_t address, bool write) {
     MEMORY_BASIC_INFORMATION info{};
     if (!committed(address, info) || (info.Protect & PAGE_GUARD) != 0) return false;
@@ -982,6 +1131,7 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
     renderer.InitializeGpu(&videoOut);
     ensureShaders();
     started.store(true, std::memory_order_release);
+    if (profileEnabled()) std::thread(runProfiler).detach();
     std::thread([] {
         auto previous = window->loop.presented_frames.load(std::memory_order_relaxed);
         for (;;) {
@@ -1276,6 +1426,10 @@ __declspec(dllexport) bool KytyHostComputeChainEnabled() {
     return enabled;
 }
 
+__declspec(dllexport) bool KytyHostProfileEnabled() {
+    return profileEnabled();
+}
+
 __declspec(dllexport) bool KytyHostReadWindowEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_KYTY_READ_WINDOW");
@@ -1331,6 +1485,7 @@ __declspec(dllexport) void KytyHostCaptureWrite(const char* path, const void* pi
 }
 
 void KytyHostNoteGpuWrite(std::uint64_t address, std::uint64_t size, const void* caller) {
+    if (gpuThreadId.load(std::memory_order_relaxed) == 0) gpuThreadId.store(GetCurrentThreadId(), std::memory_order_release);
     if (!statsEnabled()) return;
     std::lock_guard lock(hotMutex);
     ++gpuWrites[{address, size, reinterpret_cast<std::uint64_t>(caller)}];
