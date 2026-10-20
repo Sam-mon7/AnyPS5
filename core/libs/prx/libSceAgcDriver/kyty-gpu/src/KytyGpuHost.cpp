@@ -92,6 +92,8 @@ struct Counts {
     std::atomic<std::uint64_t> gpuThreadReadFaults{0};
     std::atomic<std::uint64_t> gpuThreadReadFaultNs{0};
     std::atomic<std::uint64_t> gpuThreadCleanReads{0};
+    std::atomic<std::uint64_t> specializationDrains{0};
+    std::atomic<std::uint64_t> specializationDrainNs{0};
     std::atomic<std::uint64_t> protectNs{0};
     std::atomic<std::uint64_t> protectCalls{0};
     std::atomic<std::uint64_t> protectSyscalls{0};
@@ -995,7 +997,12 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
     if (resources != nullptr && Graphics::GuestRange{vaddr, size}.Valid()) {
         if (!Graphics::GuestGpu::IsGpuThread()) return false;
         auto& buffers = resources->GetBufferCache();
-        if (buffers.HasGpuDirtyBytes(vaddr, size)) buffers.ReadMemory(vaddr, size);
+        if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+            const auto started = std::chrono::steady_clock::now();
+            buffers.ReadMemory(vaddr, size);
+            counts.specializationDrains.fetch_add(1, std::memory_order_relaxed);
+            counts.specializationDrainNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+        }
     }
     return TryReadBacking(vaddr, data, size);
 }
@@ -1257,6 +1264,10 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     static std::uint64_t lastFaults = 0;
                     static std::uint64_t lastNs = 0;
                     static std::uint64_t lastClean = 0;
+                    static std::uint64_t lastDrains = 0;
+                    static std::uint64_t lastDrainNs = 0;
+                    const auto drains = counts.specializationDrains.load(std::memory_order_relaxed);
+                    const auto drainNs = counts.specializationDrainNs.load(std::memory_order_relaxed);
                     const auto clean = counts.gpuThreadCleanReads.load(std::memory_order_relaxed);
                     const auto faults = counts.gpuThreadReadFaults.load(std::memory_order_relaxed);
                     const auto ns = counts.gpuThreadReadFaultNs.load(std::memory_order_relaxed);
@@ -1299,10 +1310,12 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     }
                     const auto pages = takeHot(hotReadsGpu);
                     gpuThreadStacks.clear();
-                    std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), pages.c_str(), writers.c_str(), chains.c_str());
+                    std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers), specialization-read downloads: %llu (%llu ms); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), static_cast<unsigned long long>(drains - lastDrains), static_cast<unsigned long long>((drainNs - lastDrainNs) / 1000000), pages.c_str(), writers.c_str(), chains.c_str());
                     lastFaults = faults;
                     lastNs = ns;
                     lastClean = clean;
+                    lastDrains = drains;
+                    lastDrainNs = drainNs;
                 }
                 const auto reads = takeHot(hotReads);
                 const auto writes = takeHot(hotWrites);
