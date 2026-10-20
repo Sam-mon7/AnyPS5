@@ -103,6 +103,8 @@ struct Counts {
     std::atomic<std::uint64_t> aliasCopies{0};
     std::array<std::atomic<std::uint64_t>, 5> readbacks{};
     std::atomic<std::uint64_t> readbackDrainNs{0};
+    std::atomic<std::uint64_t> linearCopies{0};
+    std::atomic<std::uint64_t> linearCopiesGpu{0};
     std::atomic<std::uint64_t> backingNs{0};
 };
 
@@ -1244,6 +1246,13 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                 for (std::size_t kind = 0; kind < 6; ++kind) readbackDelta[kind] = static_cast<unsigned long long>(readbacks[kind] - lastReadbacks[kind]);
                 lastReadbacks = readbacks;
                 std::fprintf(stderr, "[kyty-gpu] 10 s readbacks: async=%llu shared=%llu sync=%llu drain-waits=%llu drain-ms=%llu guest-writes=%llu\n", readbackDelta[0], readbackDelta[1], readbackDelta[2], readbackDelta[3], readbackDelta[5] / 1000000, readbackDelta[4]);
+                static std::uint64_t lastLinearCopies = 0;
+                static std::uint64_t lastLinearCopiesGpu = 0;
+                const auto linearCopies = counts.linearCopies.load(std::memory_order_relaxed);
+                const auto linearCopiesGpu = counts.linearCopiesGpu.load(std::memory_order_relaxed);
+                std::fprintf(stderr, "[kyty-gpu] 10 s linear copies: %llu (%llu over GPU-written ranges)\n", static_cast<unsigned long long>(linearCopies - lastLinearCopies), static_cast<unsigned long long>(linearCopiesGpu - lastLinearCopiesGpu));
+                lastLinearCopies = linearCopies;
+                lastLinearCopiesGpu = linearCopiesGpu;
             }
             if (statsEnabled()) {
                 std::lock_guard lock(hotMutex);
@@ -1580,6 +1589,19 @@ bool KytyHostComputeChainEnabled() {
         return text != nullptr && std::string_view(text) == "1";
     }();
     return enabled;
+}
+
+bool KytyHostLinearCopyEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_KYTY_LINEAR_COPY");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
+}
+
+void KytyHostNoteLinearCopy(bool gpuWritten) {
+    counts.linearCopies.fetch_add(1, std::memory_order_relaxed);
+    if (gpuWritten) counts.linearCopiesGpu.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool KytyHostProfileEnabled() {

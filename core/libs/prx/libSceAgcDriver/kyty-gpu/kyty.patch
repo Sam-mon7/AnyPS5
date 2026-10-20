@@ -908,20 +908,86 @@ index 897d7935..ada854ab 100644
  private:
  	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
-index efb2a988..13514aa3 100644
+index efb2a988..5693c6fc 100644
 --- a/src/graphics/host_gpu/renderer/renderCompute.cpp
 +++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
-@@ -38,6 +38,9 @@
+@@ -38,6 +38,11 @@
  #include <unordered_map>
  #include <vector>
  
 +extern "C" bool KytyHostComputeChainEnabled();
++extern "C" bool KytyHostLinearCopyEnabled();
++extern "C" void KytyHostNoteLinearCopy(bool gpu_written);
 +extern "C" void KytyHostNoteShader(uint64_t address, uint64_t hash);
 +
  namespace Libs::Graphics {
  static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                   GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
-@@ -236,7 +239,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
+@@ -128,6 +133,63 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
+ 	return true;
+ }
+ 
++// Demon's Souls copies constants with a compute shader whose semantics are
++// dst[i] = src[i % period] for i < count. Its linear subset (period >= count) is a buffer copy,
++// which the buffer cache makes on the CPU while neither range holds GPU writes, so the
++// destination stays CPU-valid for the draws that read it while their resources are prepared.
++// Ported from KytyPS5-SuperMedo v1.0 (DemonsSouls::TryLinearCopy, GPL-2.0).
++static bool TryConsumeLinearCopy(const ShaderComputeInputInfo& input, CommandBuffer& command,
++                                 BufferCache& cache, uint32_t group_x, uint32_t group_y,
++                                 uint32_t group_z, uint32_t mode) {
++	const auto& program = *input.stage.program;
++	const auto& data    = input.stage.resources->user_data;
++	if (!KytyHostLinearCopyEnabled() || program.shader_hash != 0xeb7456322124ecc7ull ||
++	    data.size() != 12 || program.user_data_base != 0 || input.dispatch_thread_dimensions ||
++	    input.indirect_args_address != 0 || mode != 0x41u || input.threads_num[0] != 64 ||
++	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || !input.group_id[0] ||
++	    input.group_id[1] || input.group_id[2] || input.thread_ids_num != 1 ||
++	    input.workgroup_register != 12 || input.tg_size_en || group_y != 1 || group_z != 1 ||
++	    group_x == 0)
++		return false;
++	ShaderBufferResource source;
++	ShaderBufferResource destination;
++	ShaderBufferResource parameters;
++	std::memcpy(source.fields, data.data(), sizeof(source.fields));
++	std::memcpy(destination.fields, data.data() + 4, sizeof(destination.fields));
++	std::memcpy(parameters.fields, data.data() + 8, sizeof(parameters.fields));
++	for (const auto* buffer: {&source, &destination}) {
++		// The exact control bits of an idxen format_x UInt32 buffer; any other format, swizzle,
++		// out-of-bounds, cache or addressing mode keeps the shader.
++		if (buffer->fields[3] != 0x00014004u || (buffer->fields[1] & 0xffff0000u) != 0x00040000u ||
++		    buffer->Base48() == 0 || (buffer->Base48() & 3u) != 0)
++			return false;
++	}
++	const auto params = parameters.Base48();
++	if (parameters.fields[3] != 0x0004dfacu || (parameters.fields[1] & 0xffff0000u) != 0x00100000u ||
++	    parameters.NumRecords() != 1 || params == 0 || (params & 3u) != 0 ||
++	    cache.HasGpuDirtyBytes(params, 8))
++		return false;
++	std::array<uint32_t, 2> controls {};
++	if (!Libs::LibKernel::Memory::TryReadBacking(params, controls.data(), sizeof(controls)))
++		return false;
++	const uint64_t count  = controls[0];
++	const uint64_t period = controls[1];
++	const uint64_t bytes  = count * 4;
++	if (count == 0 || period < count || count > source.NumRecords() ||
++	    count > destination.NumRecords() || group_x != (count + 63) / 64 ||
++	    bytes > 16 * 1024 * 1024)
++		return false;
++	const auto src = source.Base48();
++	const auto dst = destination.Base48();
++	if ((src < dst + bytes && dst < src + bytes) || (params < dst + bytes && dst < params + 16))
++		return false;
++	KytyHostNoteLinearCopy(cache.IsRegionGpuModified(dst, bytes) ||
++	                       cache.IsRegionGpuModified(src, bytes));
++	command.EndRendering();
++	cache.CopyBuffer(dst, src, bytes, false, false);
++	return true;
++}
++
+ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
+                                           CommandBuffer& command, uint32_t group_x,
+                                           uint32_t group_y, uint32_t group_z, uint32_t mode) {
+@@ -236,7 +298,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
  			size *= count;
  		}
  	}
@@ -930,7 +996,7 @@ index efb2a988..13514aa3 100644
  }
  
  void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
-@@ -290,6 +293,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -290,6 +352,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
  
  	const auto& cs_regs = sh_ctx.GetCs();
  	const auto& sh_regs = ctx.GetShaderRegisters();
@@ -938,15 +1004,20 @@ index efb2a988..13514aa3 100644
  
  	ShaderComputeInputInfo input_info {};
  	input_info.async_compute = async_compute;
-@@ -317,6 +321,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -317,6 +380,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
  
  	const auto& program   = *input_info.stage.program;
  	const auto& resources = *input_info.stage.resources;
 +	KytyHostNoteShader(cs_regs.cs_regs.data_addr, program.shader_hash);
++	if (TryConsumeLinearCopy(input_info, buffer, m_context.GetBufferCache(), thread_group_x,
++	                         thread_group_y, thread_group_z, mode)) {
++		ResetBindings();
++		return;
++	}
  	if (resources.specialization_reads.empty()) {
  		// Cached metadata addresses can be reused as ordinary buffers; preserve their guest writes.
  		UpdateComputeMetaClears(input_info, buffer);
-@@ -364,9 +369,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -364,9 +433,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
  	BindSharedMemory(m_context, input_info, bindings);
  	RebindBuffers(bindings);
  
@@ -960,7 +1031,7 @@ index efb2a988..13514aa3 100644
  	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
  	    HasShaderBufferWrites(input_info.stage);
  	has_storage_writes =
-@@ -377,7 +384,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -377,7 +448,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
  		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
  	                }) ||
  	    has_storage_writes;
@@ -969,7 +1040,7 @@ index efb2a988..13514aa3 100644
  		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
  		// while allowing the queue to execute asynchronously.
  		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-@@ -448,7 +455,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -448,7 +519,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
  	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
  
  	// The removed host fence also ordered read-only dispatches before later writers.
@@ -982,7 +1053,7 @@ index efb2a988..13514aa3 100644
  	ResetBindings();
  }
  
-@@ -493,30 +504,38 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -493,30 +568,38 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
  	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
  	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
  	RebindBuffers(bindings);

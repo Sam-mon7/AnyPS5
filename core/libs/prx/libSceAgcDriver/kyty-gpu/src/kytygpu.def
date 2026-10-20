@@ -3,5 +3,6 @@ EXPORTS
     KytyHostAsyncWriteReadbackEnabled
     KytyHostCaptureEnabled
     KytyHostComputeChainEnabled
+    KytyHostLinearCopyEnabled
     KytyHostProfileEnabled
     KytyHostReadWindowEnabled
