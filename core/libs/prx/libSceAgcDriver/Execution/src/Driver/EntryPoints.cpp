@@ -132,10 +132,10 @@ extern "C" std::uint32_t AgcDriverReserveEopFlipAt_nid_postfix(const AgcDriver::
     return AgcDriver::DriverDetail::Driver::Get().ReserveEopFlipAt(info, token);
 }
 
-extern "C" std::size_t AgcDriverAwaitedAddresses_nid_postfix(std::uint64_t* addresses, std::size_t capacity) {
-    const auto awaited = AgcDriver::DriverDetail::Driver::Get().AwaitedAddresses();
+extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait* waits, std::size_t capacity) {
+    const auto awaited = AgcDriver::DriverDetail::Driver::Get().AwaitedWaits();
     const auto count = std::min(capacity, awaited.size());
-    std::copy_n(awaited.begin(), count, addresses);
+    std::copy_n(awaited.begin(), count, waits);
     return count;
 }
 

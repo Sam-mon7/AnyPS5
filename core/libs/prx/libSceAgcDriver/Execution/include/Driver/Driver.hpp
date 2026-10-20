@@ -62,7 +62,7 @@ public:
     std::vector<std::uint32_t> PendingEopFlipTokens();
     std::pair<std::uint64_t, std::uint64_t> SerialProgress();
     std::uint64_t FlipSubmissions() const;
-    std::vector<std::uint64_t> AwaitedAddresses();
+    std::vector<AwaitedWait> AwaitedWaits();
     bool WaitIdleFor(std::chrono::milliseconds timeout);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
@@ -353,7 +353,14 @@ private:
 
     std::atomic<std::uint64_t> flipsCounted{0};
     std::atomic<std::uint64_t> flipSubmissions{0};
-    std::array<std::atomic<std::uint64_t>, SubmissionQueueEnd - 0x20 + 1> awaitedAddresses{};
+    struct AwaitedSlot {
+        std::atomic<std::uint64_t> address{0};
+        std::atomic<std::uint64_t> reference{0};
+        std::atomic<std::uint64_t> mask{0};
+        std::atomic<std::uint64_t> shape{0};
+    };
+    std::array<AwaitedSlot, SubmissionQueueEnd - 0x20 + 1> awaitedSlots{};
+    void noteWaitFields(std::uint32_t queue, std::span<const std::uint32_t> packet);
     std::atomic<std::uint64_t> flipSerial{0};
     std::atomic<std::uint64_t> flipBatchesUnsignaled{0};
 

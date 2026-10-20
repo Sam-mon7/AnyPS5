@@ -241,10 +241,19 @@ bool Driver::WaitIdleFor(std::chrono::milliseconds timeout) {
     return idle;
 }
 
-std::vector<std::uint64_t> Driver::AwaitedAddresses() {
-    std::vector<std::uint64_t> result;
-    for (const auto& slot : awaitedAddresses) {
-        if (const auto address = slot.load(std::memory_order_acquire); address != 0) result.push_back(address);
+std::vector<AwaitedWait> Driver::AwaitedWaits() {
+    std::vector<AwaitedWait> result;
+    for (const auto& slot : awaitedSlots) {
+        const auto address = slot.address.load(std::memory_order_acquire);
+        if (address == 0) continue;
+        AwaitedWait wait;
+        wait.address = address;
+        wait.reference = slot.reference.load(std::memory_order_relaxed);
+        wait.mask = slot.mask.load(std::memory_order_relaxed);
+        const auto shape = slot.shape.load(std::memory_order_relaxed);
+        wait.function = static_cast<std::uint32_t>(shape);
+        wait.bytes = static_cast<std::uint32_t>(shape >> 32u);
+        if (slot.address.load(std::memory_order_acquire) == address) result.push_back(wait);
     }
     return result;
 }

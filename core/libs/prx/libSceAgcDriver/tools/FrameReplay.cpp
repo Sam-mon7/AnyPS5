@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -64,6 +65,7 @@ struct Options {
     std::chrono::milliseconds releaseAfter{3};
     std::chrono::milliseconds drainTimeout{10000};
     bool release = true;
+    bool synthesize = true;
 };
 
 class Frames {
@@ -267,6 +269,7 @@ struct Replay {
     std::atomic<std::uint64_t> stalledAt{0};
     std::atomic<std::uint64_t> earlyReleases{0};
     std::atomic<std::uint64_t> lateReleases{0};
+    std::atomic<std::uint64_t> syntheticReleases{0};
     std::atomic<std::size_t> sequenced{0};
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
@@ -384,33 +387,81 @@ struct Replay {
         throw std::runtime_error("frame replay: unknown call kind");
     }
 
-    bool writeRecordedValue(const FrameCall& call, std::uint64_t address) {
+    static std::uint64_t load(std::uint64_t address, std::size_t bytes) {
+        std::uint64_t value = 0;
+        std::memcpy(&value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), bytes);
+        return value;
+    }
+
+    static bool satisfies(const AgcDriver::AwaitedWait& wait, std::uint64_t value) {
+        const auto masked = value & wait.mask;
+        const auto reference = wait.reference & wait.mask;
+        switch (wait.function) {
+        case 1: return masked < reference;
+        case 2: return masked <= reference;
+        case 3: return masked == reference;
+        case 4: return masked != reference;
+        case 5: return masked >= reference;
+        case 6: return masked > reference;
+        default: return false;
+        }
+    }
+
+    static std::optional<std::uint64_t> satisfying(const AgcDriver::AwaitedWait& wait, std::uint64_t current) {
+        const auto keep = current & ~wait.mask;
+        const auto reference = wait.reference & wait.mask;
+        switch (wait.function) {
+        case 2:
+        case 3:
+        case 5: return keep | reference;
+        case 1: return reference == 0 ? std::nullopt : std::optional<std::uint64_t>(keep);
+        case 4: return keep | (~reference & wait.mask);
+        case 6: return reference == wait.mask ? std::nullopt : std::optional<std::uint64_t>(keep | ((reference + 1) & wait.mask));
+        default: return std::nullopt;
+        }
+    }
+
+    bool writeRecordedValue(const FrameCall& call, const AgcDriver::AwaitedWait& wait) {
         if (call.kind != FrameCallKind::Memory) return false;
         const auto found = groups.find(call.values.at(0));
         if (found == groups.end()) return false;
+        const auto address = wait.address;
         for (const auto* chunk : found->second) {
             if (chunk->address > address || address + 4 > chunk->address + chunk->bytes || skipped.Overlaps(*chunk)) continue;
             const auto bytes = reader.Read(*chunk);
-            const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(8, chunk->address + chunk->bytes - address));
+            const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(wait.bytes == 8 ? 8 : 4, chunk->address + chunk->bytes - address));
+            const auto* const recorded = bytes.data() + (address - chunk->address);
             auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(address));
-            if (std::memcmp(target, bytes.data() + (address - chunk->address), length) == 0) return false;
-            std::memcpy(target, bytes.data() + (address - chunk->address), length);
+            if (std::memcmp(target, recorded, length) == 0) return false;
+            std::uint64_t value = 0;
+            std::memcpy(&value, recorded, length);
+            if (wait.function != 0 && !satisfies(wait, value)) return false;
+            std::memcpy(target, recorded, length);
             return true;
         }
         return false;
     }
 
     void releaseAwaited(std::span<const FrameCall> calls, std::size_t from) {
-        std::array<std::uint64_t, 64> awaited{};
-        const auto count = AgcDriverAwaitedAddresses_nid_postfix(awaited.data(), awaited.size());
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
         for (std::size_t slot = 0; slot < count; ++slot) {
-            const auto address = awaited[slot];
-            if (address == 0) continue;
+            const auto& wait = awaited[slot];
+            if (wait.address == 0) continue;
+            const std::size_t bytes = wait.bytes == 8 ? 8 : 4;
+            if (wait.function != 0 && satisfies(wait, load(wait.address, bytes))) continue;
             bool released = false;
-            for (auto index = from; index < calls.size() && !released; ++index) released = writeRecordedValue(calls[index], address);
+            for (auto index = from; index < calls.size() && !released; ++index) released = writeRecordedValue(calls[index], wait);
             for (auto index = std::min(from, calls.size()); index > 0 && !released; --index) {
-                released = writeRecordedValue(calls[index - 1], address);
+                released = writeRecordedValue(calls[index - 1], wait);
                 if (released) ++lateReleases;
+            }
+            if (!released && options.synthesize) {
+                if (const auto value = satisfying(wait, load(wait.address, bytes))) {
+                    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), &*value, bytes);
+                    ++syntheticReleases;
+                    released = true;
+                }
             }
             if (released) ++earlyReleases;
         }
@@ -519,6 +570,7 @@ int usage() {
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
                          "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
+                         "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
@@ -635,11 +687,12 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
+                static_cast<unsigned long long>(replay.syntheticReleases.load()),
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count());
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
@@ -653,6 +706,7 @@ int main(int argc, char** argv) {
         const std::string_view argument = argv[index];
         if (argument == "--no-pace") options.pace = false;
         else if (argument == "--no-release") options.release = false;
+        else if (argument == "--no-synthesize") options.synthesize = false;
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
