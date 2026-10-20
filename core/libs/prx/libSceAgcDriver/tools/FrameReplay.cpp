@@ -52,6 +52,7 @@ struct Options {
     bool pace = true;
     bool strict = false;
     std::chrono::milliseconds paceTimeout{10000};
+    std::chrono::milliseconds memoryPaceTimeout{50};
 };
 
 class Frames {
@@ -246,20 +247,48 @@ struct Replay {
     Skipped skipped;
     std::uint64_t paceTimeouts = 0;
     std::uint64_t staleRegistrations = 0;
+    std::uint64_t failedRegistrations = 0;
     std::uint64_t submits = 0;
     std::uint64_t deltaBytes = 0;
+    Clock::duration paceWaited{};
+    bool stalled = false;
+    std::uint64_t stalledAt = 0;
     bool recording = false;
     Clock::time_point startedAt{};
     Clock::time_point endedAt{};
 
+    void report() const {
+        const auto [accepted, completed] = progress();
+        std::fprintf(stderr, "[frame-replay] %llu submits, %zu frames ready, %.1f s since the first frame, pacing waited %.1f s (%llu timeouts), serials %llu/%llu\n", static_cast<unsigned long long>(submits),
+                     frames.Times().size(), std::chrono::duration<double>(Clock::now() - startedAt).count(), std::chrono::duration<double>(paceWaited).count(), static_cast<unsigned long long>(paceTimeouts),
+                     static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
+    }
+
+    static bool paced(FrameCallKind kind) {
+        return kind == FrameCallKind::Submit || kind == FrameCallKind::Flip || kind == FrameCallKind::ReserveEopFlip || kind == FrameCallKind::Suspend || kind == FrameCallKind::Memory;
+    }
+
     void pace(const FrameCall& call) {
-        if (!options.pace || !recording || call.accepted < call.completed) return;
+        if (!options.pace || !recording || !paced(call.kind) || call.accepted < call.completed) return;
+        if (stalled) {
+            if (progress().second == stalledAt) return;
+            stalled = false;
+        }
         const auto inFlight = call.accepted - call.completed;
-        const auto deadline = Clock::now() + options.paceTimeout;
+        const bool memory = call.kind == FrameCallKind::Memory;
+        const auto began = Clock::now();
+        const auto deadline = began + (memory ? options.memoryPaceTimeout : options.paceTimeout);
+        const auto waited = [&] { paceWaited += Clock::now() - began; };
         while (true) {
             const auto [accepted, completed] = progress();
-            if (accepted - completed <= inFlight) return;
+            if (accepted - completed <= inFlight) return waited();
             if (Clock::now() >= deadline) {
+                waited();
+                if (memory) return;
+                stalled = true;
+                stalledAt = completed;
+                std::fprintf(stderr, "[frame-replay] pacing gave up at call %llu (%s): serials %llu/%llu, the capture had %llu in flight\n", static_cast<unsigned long long>(call.ordinal),
+                             std::string(AgcDriver::FrameCallName(call.kind)).c_str(), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(inFlight));
                 ++paceTimeouts;
                 if (options.strict) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " waited longer than the pacing timeout");
                 return;
@@ -299,7 +328,7 @@ struct Replay {
             const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
             if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
             else sceAgcDriverSubmitAcb(call.queue, &packet);
-            ++submits;
+            if (++submits % 25 == 0) report();
             return;
         }
         case FrameCallKind::Flip:
@@ -332,15 +361,12 @@ struct Replay {
 
     template <typename TFunction>
     void registration(TFunction&& function) {
-        if (recording) {
-            function();
-            return;
-        }
         try {
             function();
         } catch (const std::exception& error) {
-            ++staleRegistrations;
-            std::fprintf(stderr, "[frame-replay] prologue registration failed: %s\n", error.what());
+            if (recording && options.strict) throw;
+            ++(recording ? failedRegistrations : staleRegistrations);
+            std::fprintf(stderr, "[frame-replay] %s registration failed: %s\n", recording ? "recorded" : "prologue", error.what());
         }
     }
 
@@ -405,10 +431,11 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"stale_registrations\":%llu,\"skipped_mib\":%.1f,\"load_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"load_s\":%.3f}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(),
                 static_cast<unsigned long long>(replay.submits), static_cast<double>(replay.deltaBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts),
-                static_cast<unsigned long long>(replay.staleRegistrations), static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), std::chrono::duration<double>(loaded - loadStart).count());
+                std::chrono::duration<double>(replay.paceWaited).count(), static_cast<unsigned long long>(replay.staleRegistrations), static_cast<unsigned long long>(replay.failedRegistrations),
+                static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), std::chrono::duration<double>(loaded - loadStart).count());
     std::fflush(stdout);
     return 0;
 }
