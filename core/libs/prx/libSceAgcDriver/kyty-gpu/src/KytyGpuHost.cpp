@@ -440,6 +440,12 @@ bool profileEnabled() {
 }
 
 std::atomic<DWORD> gpuThreadId{0};
+std::atomic<std::uint64_t> gpuStackLow{0};
+std::atomic<std::uint64_t> gpuStackHigh{0};
+std::atomic<DWORD> profilerThreadId{0};
+CONTEXT profilerRecovery{};
+volatile bool profilerWalking = false;
+volatile bool profilerFaulted = false;
 
 struct ProfileModule {
     std::uint64_t base = 0;
@@ -496,6 +502,7 @@ const RUNTIME_FUNCTION* profileFunction(const ProfileModule& module, std::uint64
 }
 
 void runProfiler() {
+    profilerThreadId.store(GetCurrentThreadId(), std::memory_order_release);
     auto modules = profileModules();
     auto refreshed = std::chrono::steady_clock::now();
     auto reported = refreshed;
@@ -524,10 +531,17 @@ void runProfiler() {
         CONTEXT context{};
         context.ContextFlags = CONTEXT_FULL;
         if (SuspendThread(thread) == static_cast<DWORD>(-1)) continue;
-        std::size_t depth = 0;
-        if (GetThreadContext(thread, &context)) {
-            const auto top = context.Rsp;
-            while (depth < frames.size()) {
+        volatile std::size_t depth = 0;
+        const auto low = gpuStackLow.load(std::memory_order_acquire);
+        const auto high = gpuStackHigh.load(std::memory_order_acquire);
+        profilerFaulted = false;
+        RtlCaptureContext(&profilerRecovery);
+        if (profilerFaulted) {
+            profilerWalking = false;
+            depth = 0;
+        } else if (GetThreadContext(thread, &context)) {
+            profilerWalking = true;
+            while (depth < frames.size() && context.Rsp >= low && context.Rsp + 8 <= high) {
                 frames[depth++] = context.Rip;
                 const auto* module = profileModule(modules, context.Rip);
                 if (module == nullptr || module->functions == nullptr) break;
@@ -541,8 +555,9 @@ void runProfiler() {
                     DWORD64 establisher = 0;
                     RtlVirtualUnwind(UNW_FLAG_NHANDLER, module->base, context.Rip, const_cast<PRUNTIME_FUNCTION>(function), &context, &handlerData, &establisher, nullptr);
                 }
-                if (context.Rip == 0 || context.Rsp <= stack || context.Rsp - top > (std::uint64_t{16} << 20)) break;
+                if (context.Rip == 0 || context.Rsp <= stack) break;
             }
+            profilerWalking = false;
         }
         ResumeThread(thread);
         if (depth == 0) continue;
@@ -618,6 +633,11 @@ bool notifyAccess(PageFaultAccess access, std::uint64_t address) {
 
 LONG CALLBACK handleFault(EXCEPTION_POINTERS* info) {
     const auto* record = info->ExceptionRecord;
+    if (profilerWalking && record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && GetCurrentThreadId() == profilerThreadId.load(std::memory_order_relaxed)) {
+        profilerFaulted = true;
+        *info->ContextRecord = profilerRecovery;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     const auto address = static_cast<std::uint64_t>(record->ExceptionInformation[1]);
     if (pageState(address) == StateOpen) {
@@ -1485,7 +1505,16 @@ __declspec(dllexport) void KytyHostCaptureWrite(const char* path, const void* pi
 }
 
 void KytyHostNoteGpuWrite(std::uint64_t address, std::uint64_t size, const void* caller) {
-    if (gpuThreadId.load(std::memory_order_relaxed) == 0) gpuThreadId.store(GetCurrentThreadId(), std::memory_order_release);
+    if (gpuThreadId.load(std::memory_order_relaxed) == 0) {
+        using Limits = void(WINAPI*)(PULONG_PTR, PULONG_PTR);
+        static const auto limits = reinterpret_cast<Limits>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetCurrentThreadStackLimits"));
+        ULONG_PTR low = 0;
+        ULONG_PTR high = 0;
+        if (limits != nullptr) limits(&low, &high);
+        gpuStackLow.store(low, std::memory_order_relaxed);
+        gpuStackHigh.store(high, std::memory_order_relaxed);
+        gpuThreadId.store(GetCurrentThreadId(), std::memory_order_release);
+    }
     if (!statsEnabled()) return;
     std::lock_guard lock(hotMutex);
     ++gpuWrites[{address, size, reinterpret_cast<std::uint64_t>(caller)}];
