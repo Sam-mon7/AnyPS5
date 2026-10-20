@@ -92,7 +92,6 @@ struct Counts {
     std::atomic<std::uint64_t> gpuThreadReadFaults{0};
     std::atomic<std::uint64_t> gpuThreadReadFaultNs{0};
     std::atomic<std::uint64_t> gpuThreadCleanReads{0};
-    std::atomic<std::uint64_t> cleanReadsServed{0};
     std::atomic<std::uint64_t> protectNs{0};
     std::atomic<std::uint64_t> protectCalls{0};
     std::atomic<std::uint64_t> protectSyscalls{0};
@@ -429,24 +428,6 @@ bool backing(std::uint64_t address, std::uint64_t bytes, bool sparse, bool write
         VirtualProtect(reinterpret_cast<void*>(page), PageBytes, previous, &previous);
         at = next;
     }
-    return true;
-}
-
-bool cleanReadsEnabled() {
-    static const bool enabled = [] {
-        const char* text = std::getenv("APS5_KYTY_CLEAN_READS");
-        return text != nullptr && std::string_view(text) == "1";
-    }();
-    return enabled;
-}
-
-bool readCleanBytes(std::uint64_t address, void* data, std::uint64_t size) {
-    if (resources == nullptr || size == 0 || !Libs::Graphics::GuestGpu::IsGpuThread() || !Libs::Graphics::GuestRange{address, size}.Valid()) return false;
-    bool watched = false;
-    for (auto page = address & ~(PageBytes - 1); page < address + size; page += PageBytes) watched |= pageState(page) == StateNoAccess;
-    if (!watched || resources->GetBufferCache().HasGpuDirtyBytes(address, size)) return false;
-    if (!Libs::LibKernel::Memory::TryReadBacking(address, data, size)) return false;
-    counts.cleanReadsServed.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -1106,9 +1087,7 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     static std::uint64_t lastFaults = 0;
                     static std::uint64_t lastNs = 0;
                     static std::uint64_t lastClean = 0;
-                    static std::uint64_t lastServed = 0;
                     const auto clean = counts.gpuThreadCleanReads.load(std::memory_order_relaxed);
-                    const auto served = counts.cleanReadsServed.load(std::memory_order_relaxed);
                     const auto faults = counts.gpuThreadReadFaults.load(std::memory_order_relaxed);
                     const auto ns = counts.gpuThreadReadFaultNs.load(std::memory_order_relaxed);
                     std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint64_t> blame;
@@ -1150,11 +1129,10 @@ __declspec(dllexport) int KytyGpuStart(const KytyGpuHostTable* table, void* hwnd
                     }
                     const auto pages = takeHot(hotReadsGpu);
                     gpuThreadStacks.clear();
-                    std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers; %llu clean reads served without a fault or drain); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), static_cast<unsigned long long>(served - lastServed), pages.c_str(), writers.c_str(), chains.c_str());
+                    std::fprintf(stderr, "[kyty-gpu] render-thread read faults: %llu (%llu ms, %llu on bytes no GPU write covers); %s; covering writes:%s; stacks:%s\n", static_cast<unsigned long long>(faults - lastFaults), static_cast<unsigned long long>((ns - lastNs) / 1000000), static_cast<unsigned long long>(clean - lastClean), pages.c_str(), writers.c_str(), chains.c_str());
                     lastFaults = faults;
                     lastNs = ns;
                     lastClean = clean;
-                    lastServed = served;
                 }
                 const auto reads = takeHot(hotReads);
                 const auto writes = takeHot(hotWrites);
@@ -1296,14 +1274,6 @@ __declspec(dllexport) bool KytyHostComputeChainEnabled() {
         return text != nullptr && std::string_view(text) == "1";
     }();
     return enabled;
-}
-
-__declspec(dllexport) bool KytyHostCleanReadsEnabled() {
-    return cleanReadsEnabled();
-}
-
-bool KytyHostReadClean(std::uint64_t address, void* data, std::uint64_t size) {
-    return cleanReadsEnabled() && readCleanBytes(address, data, size);
 }
 
 __declspec(dllexport) bool KytyHostReadWindowEnabled() {
