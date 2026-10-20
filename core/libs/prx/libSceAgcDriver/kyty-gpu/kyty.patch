@@ -1,3 +1,15 @@
+diff --git a/src/graphics/guest_gpu/command_processor/commandProcessor.h b/src/graphics/guest_gpu/command_processor/commandProcessor.h
+index c976bd8f..46137a9b 100644
+--- a/src/graphics/guest_gpu/command_processor/commandProcessor.h
++++ b/src/graphics/guest_gpu/command_processor/commandProcessor.h
+@@ -105,6 +105,7 @@ public:
+ 	void PrepareCpuFlip(uint64_t request_id);
+ 	void SynchronizeGpu();
+ 	void EmitGlobalBarrier();
++	void BreakComputeChain();
+ 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
+ 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
+ 	                    uint32_t mode);
 diff --git a/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp b/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp
 index 12a7a605..8c086f70 100644
 --- a/src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp
@@ -23,10 +35,18 @@ index 419c7490..3be02ce6 100644
  } // namespace Libs::Graphics
  
 diff --git a/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp b/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
-index 83147cdd..3564680c 100644
+index 83147cdd..8859a672 100644
 --- a/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
 +++ b/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
-@@ -2221,6 +2221,11 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
+@@ -1291,6 +1291,7 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
+ 	KYTY_PROFILER_FUNCTION();
+ 
+ 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
++	cp.BreakComputeChain();
+ 	return KYTY_PM4_LEN(cmd_id) - 1;
+ }
+ 
+@@ -2221,6 +2222,11 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
  	return dw_num + 1;
  }
  
@@ -38,7 +58,7 @@ index 83147cdd..3564680c 100644
  KYTY_CP_OP_PARSER(CpOpReleaseMem) {
  	KYTY_PROFILER_FUNCTION();
  
-@@ -2490,14 +2495,14 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
+@@ -2490,14 +2496,14 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
  KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
  	KYTY_PROFILER_FUNCTION();
  
@@ -55,6 +75,54 @@ index 83147cdd..3564680c 100644
  }
  
  template <typename T>
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index 41aeee36..5de124c3 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -316,6 +316,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
+ 	}
+ 
+ 	(void)poll;
++	BreakComputeChain();
+ 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+ 		SuspendPm4();
+ 	}
+@@ -1033,6 +1034,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
+                                         uint32_t interrupt_context_id) {
+ 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
+ 
++	BreakComputeChain();
+ 	auto& command = CurrentBuffer();
+ 
+ 	if (GraphicsRunDebugDumpEnabled()) {
+@@ -1235,7 +1237,18 @@ void CommandProcessor::EmitGlobalBarrier() {
+ 	dependency.memoryBarrierCount = 1;
+ 	dependency.pMemoryBarriers    = &barrier;
+ 	GetScheduler().EndRendering();
+-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
++	CurrentBuffer().HandleForFullBarrier().pipelineBarrier2(dependency);
++}
++
++void CommandProcessor::BreakComputeChain() {
++	if (!GetScheduler().Active()) {
++		return;
++	}
++	Common::LockGuard lock(m_renderer.GetMutex());
++	auto& buffer = CurrentBuffer();
++	if (buffer.ComputeChainPending()) {
++		(void)buffer.Handle();
++	}
+ }
+ 
+ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
+@@ -1294,6 +1307,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
+ 			LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
+ 			     ", index 0x%08" PRIx32 "\n",
+ 			     event_type, event_index);
++			BreakComputeChain();
+ 			break;
+ 		case 0x00000039: {
+ 			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 index d452db96..487d9ef3 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
@@ -514,10 +582,52 @@ index e45c18e5..e4a04ed2 100644
  	desc.info.bytes_per_block = bytes_per_element;
  	desc.info.samples         = samples;
 diff --git a/src/graphics/host_gpu/renderer/context.cpp b/src/graphics/host_gpu/renderer/context.cpp
-index d71929fb..d139dc85 100644
+index d71929fb..316c8ca9 100644
 --- a/src/graphics/host_gpu/renderer/context.cpp
 +++ b/src/graphics/host_gpu/renderer/context.cpp
-@@ -97,7 +97,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
+@@ -7,6 +7,7 @@
+ #include "graphics/host_gpu/renderer/debug.h"
+ #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+ #include "graphics/host_gpu/renderer/image/imageView.h"
++#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+@@ -25,12 +26,32 @@ bool CommandBuffer::IsInvalid() const {
+ 
+ vk::CommandBuffer CommandBuffer::Handle() const {
+ 	EXIT_IF(IsInvalid());
++	if (m_compute_access_pending) {
++		ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
++		m_compute_access_pending = false;
++	}
++	return m_buffer;
++}
++
++vk::CommandBuffer CommandBuffer::ChainHandle() const {
++	EXIT_IF(IsInvalid() || m_rendering);
++	return m_buffer;
++}
++
++void CommandBuffer::ContinueComputeChain() const {
++	EXIT_IF(IsInvalid() || m_rendering);
++	m_compute_access_pending = true;
++}
++
++vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
++	EXIT_IF(IsInvalid());
++	m_compute_access_pending = false;
+ 	return m_buffer;
+ }
+ 
+ void CommandBuffer::Begin() {
+ 	EXIT_IF(m_rendering || IsInvalid());
+-	auto buffer = Handle();
++	const vk::CommandBuffer buffer = m_buffer;
+ 
+ 	vk::CommandBufferBeginInfo begin_info {};
+ 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+@@ -97,7 +118,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
  	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
  
  	vk::RenderingInfo rendering {};
@@ -620,7 +730,7 @@ index df131002..4ae15668 100644
  			for (uint32_t slice = 0; slice < active.depth; ++slice) {
  				copy.bufferOffset                    = Add(Add(buffer_offset, mip.linear_offset),
 diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
-index edea24b4..f8781635 100644
+index edea24b4..f363b61c 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 @@ -47,6 +47,15 @@
@@ -682,7 +792,20 @@ index edea24b4..f8781635 100644
  			source = {address, size, cache.FindBuffer(address, size)};
  		}
  	}
-@@ -929,7 +941,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+@@ -891,9 +903,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const>
+ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+                                     vk::PipelineBindPoint              pipeline_bind_point,
+                                     const PipelineCache::Pipeline&     pipeline,
+-                                    std::span<PreparedBindings* const> prepared_bindings) {
++                                    std::span<PreparedBindings* const> prepared_bindings,
++                                    bool                               compute_chain) {
+ 	KYTY_PROFILER_FUNCTION();
+-	auto   vk_buffer        = buffer.Handle();
++	auto   vk_buffer        = compute_chain ? buffer.ChainHandle() : buffer.Handle();
+ 	size_t image_descriptor_count = 0;
+ 	size_t write_count      = 0;
+ 	ShaderRecompiler::IR::PushData push_data;
+@@ -929,7 +942,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
  		if (reads.empty()) continue;
  		for (const auto* writer: prepared_bindings) {
  			if (writer->runtime->program->has_address_writes) {
@@ -691,7 +814,7 @@ index edea24b4..f8781635 100644
  			}
  		}
  		for (const auto [address, size]: reads) {
-@@ -941,7 +953,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+@@ -941,7 +954,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
  				                          image->info.metadata.range}) {
  					if (written.size != 0 && ImageRangeOverlaps(address, size,
  					                                          written.address, written.size)) {
@@ -700,7 +823,7 @@ index edea24b4..f8781635 100644
  					}
  				}
  			}
-@@ -952,7 +964,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+@@ -952,7 +965,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
  					const auto& written = writer->buffer_sources[resource.descriptor_index];
  					if (written.size != 0 && ImageRangeOverlaps(address, size,
  					                                          written.address, written.size)) {
@@ -709,7 +832,7 @@ index edea24b4..f8781635 100644
  					}
  				}
  			}
-@@ -1051,7 +1063,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+@@ -1051,7 +1064,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
  						                             ? cache.GetBdaPageTableBuffer()
  						                             : cache.GetFaultBuffer();
  						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
@@ -731,11 +854,52 @@ index f93bef4a..119845d7 100644
  
  uint8_t RemapSourceAlphaFactor(uint8_t factor) {
  	switch (static_cast<Prospero::BlendFactor>(factor)) {
+diff --git a/src/graphics/host_gpu/renderer/render.h b/src/graphics/host_gpu/renderer/render.h
+index 897d7935..ada854ab 100644
+--- a/src/graphics/host_gpu/renderer/render.h
++++ b/src/graphics/host_gpu/renderer/render.h
+@@ -108,6 +108,10 @@ public:
+ 	void EndRendering() const;
+ 
+ 	[[nodiscard]] vk::CommandBuffer Handle() const;
++	[[nodiscard]] vk::CommandBuffer ChainHandle() const;
++	[[nodiscard]] vk::CommandBuffer HandleForFullBarrier() const;
++	[[nodiscard]] bool ComputeChainPending() const noexcept { return m_compute_access_pending; }
++	void               ContinueComputeChain() const;
+ 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
+ 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
+ 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
+@@ -137,6 +141,7 @@ private:
+ 	uint64_t            m_debug_arg4      = 0;
+ 	mutable RenderState m_render_state;
+ 	mutable bool        m_rendering   = false;
++	mutable bool        m_compute_access_pending = false;
+ 	HW::Context*        m_registers   = nullptr;
+ 	HW::UserConfig*     m_user_config = nullptr;
+ 	HW::Shader*         m_shaders     = nullptr;
+@@ -160,7 +165,7 @@ public:
+ 	void                           RebindImages(PreparedBindings& bindings);
+ 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
+ 	                    const PipelineCache::Pipeline&     pipeline,
+-	                    std::span<PreparedBindings* const> bindings);
++	                    std::span<PreparedBindings* const> bindings, bool compute_chain = false);
+ 
+ private:
+ 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
-index efb2a988..073ebe8f 100644
+index efb2a988..69e79d10 100644
 --- a/src/graphics/host_gpu/renderer/renderCompute.cpp
 +++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
-@@ -236,7 +236,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
+@@ -38,6 +38,8 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++extern "C" bool KytyHostComputeChainEnabled();
++
+ namespace Libs::Graphics {
+ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
+                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
+@@ -236,7 +238,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
  			size *= count;
  		}
  	}
@@ -744,6 +908,93 @@ index efb2a988..073ebe8f 100644
  }
  
  void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -364,9 +366,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	BindSharedMemory(m_context, input_info, bindings);
+ 	RebindBuffers(bindings);
+ 
+-	auto              vk_buffer        = buffer.Handle();
++	const bool        chain            = KytyHostComputeChainEnabled();
++	auto              vk_buffer        = chain ? buffer.ChainHandle() : buffer.Handle();
+ 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+-	               std::span {&descriptor_stage, 1u});
++	               std::span {&descriptor_stage, 1u}, chain);
++	const bool continues_chain = chain && buffer.ComputeChainPending();
+ 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
+ 	    HasShaderBufferWrites(input_info.stage);
+ 	has_storage_writes =
+@@ -377,7 +381,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
+ 	                }) ||
+ 	    has_storage_writes;
+-	if (has_storage_writes) {
++	if (has_storage_writes && !continues_chain) {
+ 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
+ 		// while allowing the queue to execute asynchronously.
+ 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+@@ -448,7 +452,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+ 
+ 	// The removed host fence also ordered read-only dispatches before later writers.
+-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
++	if (chain) {
++		buffer.ContinueComputeChain();
++	} else {
++		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
++	}
+ 	ResetBindings();
+ }
+ 
+@@ -493,30 +501,38 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+ 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+ 	RebindBuffers(bindings);
++	const bool chain = KytyHostComputeChainEnabled();
+ 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+-	               std::span {&descriptor_stage, 1u});
+-	const auto vk_buffer = buffer.Handle();
++	               std::span {&descriptor_stage, 1u}, chain);
++	const bool continues_chain = chain && buffer.ComputeChainPending();
++	const auto vk_buffer = chain ? buffer.ChainHandle() : buffer.Handle();
+ 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
+ 	    HasShaderBufferWrites(input_info.stage) ||
+ 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+ 		    return image.written && image.resource_class ==
+ 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
+ 	    });
+-	if (has_storage_writes) {
++	if (has_storage_writes && !continues_chain) {
+ 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+ 	}
+-	vk::MemoryBarrier barrier {};
+-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+-	                              vk::PipelineStageFlagBits::eComputeShader |
+-	                              vk::PipelineStageFlagBits::eTransfer,
+-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
+-	                          1, &barrier, 0, nullptr, 0, nullptr);
++	if (!continues_chain) {
++		vk::MemoryBarrier barrier {};
++		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
++		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
++		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
++		                              vk::PipelineStageFlagBits::eComputeShader |
++		                              vk::PipelineStageFlagBits::eTransfer,
++		                          vk::PipelineStageFlagBits::eDrawIndirect, {},
++		                          1, &barrier, 0, nullptr, 0, nullptr);
++	}
+ 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+ 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+ 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
++	if (chain) {
++		buffer.ContinueComputeChain();
++	} else {
++		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
++	}
+ 	ResetBindings();
+ }
+ 
 diff --git a/src/graphics/host_gpu/renderer/renderContext.cpp b/src/graphics/host_gpu/renderer/renderContext.cpp
 index e256b8ae..6e7df99b 100644
 --- a/src/graphics/host_gpu/renderer/renderContext.cpp

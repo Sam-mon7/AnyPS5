@@ -1186,6 +1186,14 @@ void KytyHostNoteReadback(std::uint32_t kind, std::uint64_t nanoseconds) {
     if (nanoseconds != 0) counts.readbackDrainNs.fetch_add(nanoseconds, std::memory_order_relaxed);
 }
 
+__declspec(dllexport) bool KytyHostComputeChainEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_KYTY_COMPUTE_CHAIN");
+        return text != nullptr && std::string_view(text) == "1";
+    }();
+    return enabled;
+}
+
 __declspec(dllexport) bool KytyHostReadWindowEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_KYTY_READ_WINDOW");
