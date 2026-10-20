@@ -1702,6 +1702,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/TextureTiling.cpp
         tests/GuestTextureResource.cpp
         tests/GuestSamplerResource.cpp
+        tests/ImageTableEntryValidation.cpp
         tests/TextureDetiler.cpp
         tests/DepthSurfaceReuse.cpp
 )
