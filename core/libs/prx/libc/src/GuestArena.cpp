@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
@@ -175,6 +176,7 @@ private:
         GetSystemInfo(&system);
         const std::uintptr_t granularity = system.dwAllocationGranularity;
         const std::uintptr_t end = ApplicationAreaEnd;
+        WindowsMappings::Get().CacheRegionsUntil(&GuestAllocations::GuestAllocationsGeneration_nid_postfix);
         std::uint32_t retries = 0;
         for (std::uintptr_t cursor = ArenaStart; cursor < end;) {
             MEMORY_BASIC_INFORMATION info{};

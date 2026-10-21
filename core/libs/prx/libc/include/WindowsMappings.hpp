@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <map>
@@ -28,6 +29,12 @@ public:
         return *mappings;
     }
 
+    void CacheRegionsUntil(std::uint64_t (*generation)()) {
+        std::lock_guard lock(mutex);
+        regionsGeneration = generation;
+        privateRegions.clear();
+    }
+
     void* Reserve(void* address, std::size_t bytes) {
         return allocate(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
     }
@@ -36,6 +43,7 @@ public:
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
         std::lock_guard lock(mutex);
         collectableRanges.clear();
+        privateRegions.clear();
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
         for (auto cursor = reinterpret_cast<std::uintptr_t>(address); cursor < end;) {
             const auto memory = query(cursor);
@@ -80,6 +88,7 @@ public:
         if (sectionBytes < bytes && (resident || sectionBytes == 0 || bytes - sectionBytes >= pageBytes)) throw std::runtime_error("shared guest mapping extends a whole page past its section");
         std::lock_guard lock(mutex);
         collectableRanges.clear();
+        privateRegions.clear();
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         if (createdPrivate != nullptr) createdPrivate->reserve(createdPrivate->size() + bytes / pageBytes);
         reset(cursor, bytes);
@@ -155,6 +164,7 @@ public:
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
         collectableRanges.clear();
+        privateRegions.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
             it->second.armed = 0;
@@ -459,14 +469,18 @@ public:
                     cursor = next == views.end() ? end : std::min(end, next->first);
                     continue;
                 }
-                const auto memory = query(cursor);
-                if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
-                const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                const auto region = privateRegion(cursor);
+                if (!region.committed) return false;
+                const auto stop = std::min(end, region.end);
                 if (capacity == *count) return true;
                 const auto touched = (((stop + 4095) & ~static_cast<std::uintptr_t>(4095)) - (cursor & ~static_cast<std::uintptr_t>(4095))) / 4096;
                 ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, touched);
                 DWORD granularity = 0;
-                if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect private guest writes");
+                if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) {
+                    if (!region.cached) fail("collect private guest writes");
+                    privateRegions.clear();
+                    continue;
+                }
                 *count += available;
                 if (*count == capacity) return true;
                 cursor = stop;
@@ -477,6 +491,34 @@ public:
     }
 
 private:
+    struct PrivateRegion {
+        std::uintptr_t end = 0;
+        bool committed = false;
+        bool cached = false;
+    };
+
+    PrivateRegion privateRegion(std::uintptr_t address) {
+        static const bool enabled = std::getenv("APS5_NO_GUEST_REGION_CACHE") == nullptr;
+        const bool cache = enabled && regionsGeneration != nullptr;
+        if (cache) {
+            const auto generation = regionsGeneration();
+            if (generation != privateRegionsGeneration) {
+                privateRegions.clear();
+                privateRegionsGeneration = generation;
+            }
+            if (const auto found = privateRegions.upper_bound(address); found != privateRegions.begin() && address < std::prev(found)->second.end) {
+                auto region = std::prev(found)->second;
+                region.cached = true;
+                return region;
+            }
+        }
+        const auto memory = query(address);
+        const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+        const PrivateRegion region{base + memory.RegionSize, memory.State == MEM_COMMIT && memory.Type == MEM_PRIVATE, false};
+        if (cache) privateRegions[base] = region;
+        return region;
+    }
+
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         const auto proven = collectableRanges.upper_bound(address);
         if (proven != collectableRanges.begin() && std::prev(proven)->second >= end) return true;
@@ -816,6 +858,7 @@ private:
 
     void reset(std::uintptr_t address, std::size_t bytes) {
         collectableRanges.clear();
+        privateRegions.clear();
         const auto end = address + bytes;
         forgetClean(address, end);
         breakRun(address);
@@ -896,6 +939,9 @@ private:
 
     Ranges cleanRanges;
     Ranges collectableRanges;
+    std::map<std::uintptr_t, PrivateRegion> privateRegions;
+    std::uint64_t privateRegionsGeneration = 0;
+    std::uint64_t (*regionsGeneration)() = nullptr;
     Ranges freshRanges;
     std::map<std::uintptr_t, View> views;
 
