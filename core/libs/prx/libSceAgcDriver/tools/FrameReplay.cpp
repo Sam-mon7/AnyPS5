@@ -71,6 +71,7 @@ struct Options {
     std::size_t repeat = 1;
     bool shaders = false;
     std::size_t submits = 0;
+    bool traceSerials = false;
 };
 
 class Frames {
@@ -275,6 +276,7 @@ struct Replay {
     Frames frames;
     std::map<std::uint32_t, std::shared_ptr<ReplayOutput>> outputs;
     std::mutex memoryMutex;
+    std::mutex serialMutex;
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
     Skipped skipped;
     std::atomic<std::uint64_t> paceTimeouts{0};
@@ -392,13 +394,15 @@ struct Replay {
             return;
         case FrameCallKind::Submit: {
             const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
-            if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
-            else sceAgcDriverSubmitAcb(call.queue, &packet);
+            traced(call, [&] {
+                if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
+                else sceAgcDriverSubmitAcb(call.queue, &packet);
+            });
             if (++submits % 25 == 0) report();
             return;
         }
         case FrameCallKind::Flip:
-            AgcDriverSubmitFlip_nid_postfix(flipInfo(call));
+            traced(call, [&] { AgcDriverSubmitFlip_nid_postfix(flipInfo(call)); });
             return;
         case FrameCallKind::ReserveEopFlip: {
             const auto token = static_cast<std::uint32_t>(call.values.at(4));
@@ -606,6 +610,21 @@ struct Replay {
     }
 
     template <typename TFunction>
+    void traced(const FrameCall& call, TFunction&& function) {
+        if (!options.traceSerials) {
+            function();
+            return;
+        }
+        std::lock_guard lock(serialMutex);
+        const auto before = progress().first;
+        function();
+        const auto after = progress().first;
+        std::fprintf(stderr, "[frame-replay] serial %llu%s = call %llu (%s, thread %llu, queue 0x%x, %llu dwords at 0x%llx)\n", static_cast<unsigned long long>(after), after == before ? " (none taken)" : "",
+                     static_cast<unsigned long long>(call.ordinal), std::string(AgcDriver::FrameCallName(call.kind)).c_str(), static_cast<unsigned long long>(call.thread), call.queue,
+                     static_cast<unsigned long long>(call.size), static_cast<unsigned long long>(call.address));
+    }
+
+    template <typename TFunction>
     void registration(TFunction&& function) {
         try {
             function();
@@ -639,6 +658,7 @@ int usage() {
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --shaders           replays nothing; lists each shader registration with its code address, size and code\n"
                          "                      hash, and how many registrations share that code\n"
+                         "  --trace-serials     submits one call at a time and prints the serial each submission or flip took\n"
                          "  --submits <n>       replays nothing; lists the first n submissions and flips of the captured frames with\n"
                          "                      their queue and serials, the packets of each and the fields of its waits and releases\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
@@ -1000,7 +1020,11 @@ int main(int argc, char** argv) {
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--repeat" && index + 1 < argc) options.repeat = std::max<std::size_t>(1, std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--shaders") options.shaders = true;
-        else if (argument == "--submits" && index + 1 < argc) options.submits = std::strtoull(argv[++index], nullptr, 10);
+        else if (argument == "--submits" && index + 1 < argc) {
+            char* end = nullptr;
+            options.submits = std::strtoull(argv[++index], &end, 10);
+            if (options.submits == 0 || end == argv[index] || *end != '\0') return usage();
+        } else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
