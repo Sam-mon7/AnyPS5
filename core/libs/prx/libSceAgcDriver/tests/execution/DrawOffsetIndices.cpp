@@ -30,6 +30,7 @@ constexpr std::uint32_t Instances = 2;
 constexpr std::uint32_t Slots = Vertices * Instances;
 constexpr std::uint32_t Unwritten = 0xdeadbeefu;
 constexpr std::uint32_t NoLocation = 0x280u;
+constexpr std::uint32_t MergedHiddenWords = 8;
 
 alignas(256) constexpr std::array<std::uint32_t, 30> VertexCode{
     0x7e020305, 0x7e040308,
@@ -364,6 +365,29 @@ public:
         return result;
     }
 
+    static ShaderRecompiler::ShaderVertexStageInfo MergedVertexInfo() {
+        auto info = VertexInfo();
+        info.fetchAttribReg += MergedHiddenWords;
+        info.fetchBufferReg += MergedHiddenWords;
+        return info;
+    }
+
+    ShaderRecompiler::RecompileResult MergedVertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData) const {
+        const auto info = MergedVertexInfo();
+        const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
+            {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
+            {reinterpret_cast<std::uintptr_t>(BufferTable.data()), std::as_bytes(std::span(BufferTable))}
+        }};
+        ShaderRecompiler::RecompileRequest request{
+            {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+            {32, 0, userData, std::nullopt, std::nullopt, info, memory},
+            device->Target(),
+            {0, 0, 0, 64}
+        };
+        request.useCache = false;
+        return ShaderRecompiler::Recompile(request);
+    }
+
     AgcDriver::Graphics::State State(bool rectList = false) const {
         AgcDriver::Graphics::State state{};
         state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
@@ -578,6 +602,24 @@ std::string Run(Fixture& fixture) {
             fixture.Place(0, bufferIndices, 0);
             fixture.Draw(vertex, draw);
             failures += fixture.Check(what + ", drawn on the GPU like the CPU path draws it", bufferIndices, 0, 0, false);
+        }
+        {
+            const std::string what = "indexed indirect record of a merged program (eight hidden user words, user data from s0) that reads s10, its base vertex register";
+            std::vector<std::uint32_t> mergedUserData(MergedHiddenWords, 0u);
+            mergedUserData.insert(mergedUserData.end(), staleUserData.begin(), staleUserData.end());
+            const auto vertex = fixture.MergedVertex(VertexCode, mergedUserData);
+            AgcDriver::DriverDetail::DrawProgram program{};
+            program.firstUserSgpr = 0;
+            program.hiddenUserWords = MergedHiddenWords;
+            program.userData = mergedUserData;
+            AgcDriver::Pm4::DrawParameters draw{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+            draw.indirect = indexedIndirect;
+            draw.indirect->baseVertexSgpr = 10;
+            draw.indirect->startInstanceLocation = NoLocation;
+            draw.indirect->startInstanceSgpr = -1;
+            const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(), program, Fixture::MergedVertexInfo(), fixture.device, draw, false);
+            std::cout << what << ": classified to " << PathName(path) << ", user register reads 0x" << std::hex << vertex.userDataRegisterReads << std::dec << '\n';
+            if (!path) failures += what + ": classified to the GPU, but the program reads the register its packet writes the base vertex to\n";
         }
         {
             const std::string what = "indexed indirect record whose packet writes the base vertex over the program's vertex buffer table pointer s12";
