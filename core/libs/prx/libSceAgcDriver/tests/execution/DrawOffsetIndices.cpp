@@ -333,7 +333,7 @@ public:
         return userData;
     }
 
-    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, std::int32_t vertexSgpr = BaseVertexSgpr, std::int32_t instanceSgpr = StartInstanceSgpr) const {
+    static ShaderRecompiler::ShaderVertexStageInfo VertexInfo() {
         ShaderRecompiler::ShaderVertexStageInfo info{};
         info.resourcesNum = 2;
         info.resources[0].fields = {BufferTable[0], BufferTable[1], BufferTable[2], BufferTable[3]};
@@ -343,6 +343,11 @@ public:
         info.fetchAttribReg = 6;
         info.fetchBufferReg = 4;
         info.fetchEmbedded = true;
+        return info;
+    }
+
+    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, std::int32_t vertexSgpr = BaseVertexSgpr, std::int32_t instanceSgpr = StartInstanceSgpr) const {
+        const auto info = VertexInfo();
         const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
             {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
             {reinterpret_cast<std::uintptr_t>(BufferTable.data()), std::as_bytes(std::span(BufferTable))}
@@ -445,7 +450,7 @@ std::string PathName(const std::optional<Path>& path) {
 }
 
 std::string Classified(Fixture& fixture, const std::string& what, const ShaderRecompiler::RecompileResult& vertex, const std::vector<std::uint32_t>& userData, AgcDriver::Pm4::DrawParameters& draw, std::optional<Path> expectedPath, Rule expectedRule, bool rectList = false) {
-    const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(rectList), Program(userData), fixture.device, draw, false);
+    const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(rectList), Program(userData), Fixture::VertexInfo(), fixture.device, draw, false);
     const auto& indirect = *draw.indirect;
     const bool rules = expectedPath || (indirect.vertexRule == expectedRule && indirect.instanceRule == expectedRule);
     std::cout << what << ": classified to " << PathName(path) << '\n';
@@ -573,6 +578,14 @@ std::string Run(Fixture& fixture) {
             fixture.Place(0, bufferIndices, 0);
             fixture.Draw(vertex, draw);
             failures += fixture.Check(what + ", drawn on the GPU like the CPU path draws it", bufferIndices, 0, 0, false);
+        }
+        {
+            const std::string what = "indexed indirect record whose packet writes the base vertex over the program's vertex buffer table pointer s12";
+            const auto vertex = fixture.Vertex(UnreadOffsetsCode, staleUserData, -1, -1);
+            AgcDriver::Pm4::DrawParameters draw{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+            draw.indirect = indexedIndirect;
+            draw.indirect->baseVertexSgpr = 12;
+            failures += Classified(fixture, what, vertex, staleUserData, draw, Path::NotFolded, Rule::Constant);
         }
         {
             const std::string what = "indexed indirect record whose packet names no register for its offsets, user data s16 0x51, s17 0x62";

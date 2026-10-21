@@ -413,7 +413,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
-            indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), vertexInfos.front(), localDevice, drawParameters, traceIndirect);
         } else if (i == 0) {
             fold(result, drawParameters);
         }
