@@ -306,6 +306,21 @@ void testShaderCode(const std::filesystem::path& directory, bool host) {
         }
     }
     check(registered && captured == expected, "the complete separate shader code was not captured before registration");
+    CapturedMemory memory(reader);
+    std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Delta) groups[chunk.group].push_back(&chunk);
+    }
+    std::optional<std::vector<std::byte>> listed;
+    for (const auto& call : reader.Calls()) {
+        if (call.kind == FrameCallKind::RegisterShader) {
+            listed = memory.Read(address(code), CodeBytes);
+            break;
+        }
+        if (call.kind != FrameCallKind::Memory) continue;
+        if (const auto found = groups.find(call.values.at(0)); found != groups.end()) memory.Apply(found->second);
+    }
+    check(listed && *listed == expected, "the offline shader listing read other code than the capture holds at the registration");
 }
 
 }
