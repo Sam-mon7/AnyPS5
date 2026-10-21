@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BUFFERPOOL_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageMemory.hpp"
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -77,8 +78,23 @@ public:
     SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
     VkDeviceSize PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
+    ImageRange TakeImageRange(const std::shared_ptr<BufferPool>& self, const VkMemoryRequirements& requirements, std::uint32_t memoryType);
+    void PutImageRange(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size) noexcept;
+    void CountImageFallback(ImageFallback reason);
+    ImageBlockStats ImageStats();
+    VkDeviceSize ImageSlack(std::uint32_t heap);
 
 private:
+    struct ImageBlock {
+        ImageBlock(VkDeviceMemory memory, std::uint32_t type, VkDeviceSize bytes) : memory(memory), type(type), ranges(bytes) {}
+        VkDeviceMemory memory;
+        std::uint32_t type;
+        ImageRangeAllocator ranges;
+    };
+    bool imageHeapHasRoom(std::uint32_t type, VkDeviceSize bytes) const;
+    VkDeviceSize releaseEmptyImageBlocks() noexcept;
+    ImageBlockStats imageStats() const;
+    void reportImageBlocks();
     struct SlabBlock {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::byte* mapping = nullptr;
@@ -170,6 +186,12 @@ private:
     std::mutex slabMutex;
     std::unordered_map<std::uint64_t, Slab> slabs;
     std::unordered_map<VkDeviceMemory, std::unique_ptr<SlabBlock>> slabBlocks;
+    std::mutex imageMutex;
+    std::vector<std::unique_ptr<ImageBlock>> imageBlocks;
+    ImageBlockStats imageTotals;
+    ImageBlockStats imageReported;
+    std::chrono::steady_clock::time_point imageReportedAt = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point imageRetryAt{};
     static constexpr VkDeviceSize budget = 512ull * 1024 * 1024;
     // The small tier's own budget (slots of at most half a MiB each): pinned host memory the large
     // tier's budget does not count.
