@@ -16,6 +16,8 @@
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 
 namespace {
@@ -326,5 +328,26 @@ void RunUnmappedGapTests() {
     GuestArena::GuestArenaReset_nid_postfix(spare, page);
     GuestAllocations::GuestAllocationsInvalidate_nid_postfix(spareAddress, page);
     GuestArena::GuestArenaRelease_nid_postfix(spare, page);
+#elif defined(_WIN32)
+    namespace GuestMemory = AgcDriver::GuestMemory;
+    constexpr std::size_t page = 4096;
+    auto* block = static_cast<std::byte*>(VirtualAlloc(nullptr, 3 * page, MEM_RESERVE, PAGE_READWRITE));
+    Require(block != nullptr && VirtualAlloc(block, page, MEM_COMMIT, PAGE_READWRITE) == block && VirtualAlloc(block + 2 * page, page, MEM_COMMIT, PAGE_READWRITE) == block + 2 * page, "cannot commit the gap test pages");
+    std::memset(block, 0x5a, page);
+    std::memset(block + 2 * page, 0xa5, page);
+    const auto base = reinterpret_cast<std::uint64_t>(block);
+    const auto readAcross = [&](std::size_t from, std::size_t to) {
+        std::vector<std::byte> read(to - from, std::byte{0xcc});
+        GuestMemory::ReadCommitted(base + from, read);
+        for (std::size_t at = from; at < to; ++at) {
+            const auto expected = at < page ? std::byte{0x5a} : at < 2 * page ? std::byte{0} : std::byte{0xa5};
+            Require(read[at - from] == expected, "a committed read across an uncommitted gap did not zero the gap and copy the committed bytes");
+        }
+    };
+    readAcross(256, 3 * page - 256);
+    readAcross(page + 256, 3 * page);
+    readAcross(256, 2 * page - 256);
+    readAcross(page + 256, 2 * page - 256);
+    VirtualFree(block, 0, MEM_RELEASE);
 #endif
 }
