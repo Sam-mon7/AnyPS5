@@ -57,7 +57,9 @@ struct OwnedImage {
 
 class Texture {
 public:
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, bool detileFromImport = false);
+    static bool ImportDetileEnabled();
+    bool DetiledFromImport() const { return detiledFromImport; }
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
@@ -154,6 +156,7 @@ private:
     PerUseCopy perUseCopy = PerUseCopy::None;
     std::atomic<bool> released{false};
     bool copiedOnce = false;
+    bool detiledFromImport = false;
     bool srgbExpand = false;
     GuestTextureResource sourceDescriptor{};
     std::uint64_t copiedVersion = 0;

@@ -1427,6 +1427,19 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_storage_upload_lifetime COMMAND agc_driver_recorder_tests --storage-upload-lifetime-only)
+    foreach(textureImportDetileMode IN ITEMS off on non_one)
+        add_test(NAME agc_driver_texture_import_detile_${textureImportDetileMode} COMMAND agc_driver_recorder_tests --texture-import-detile-only)
+        set_tests_properties(agc_driver_texture_import_detile_${textureImportDetileMode} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_SAMPLED_FROM_STORAGE=1"
+            ENVIRONMENT_MODIFICATION "APS5_TEXTURE_IMPORT_DETILE=unset:"
+            SKIP_RETURN_CODE 77 TIMEOUT 30)
+        if(WIN32)
+            set_property(TEST agc_driver_texture_import_detile_${textureImportDetileMode} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_property(TEST agc_driver_texture_import_detile_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_TEXTURE_IMPORT_DETILE=set:1")
+    set_property(TEST agc_driver_texture_import_detile_non_one APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_TEXTURE_IMPORT_DETILE=set:01")
     add_test(NAME agc_sampled_storage_base_level_usage COMMAND agc_driver_recorder_tests --sampled-storage-base-level-usage-only)
     set_tests_properties(agc_sampled_storage_base_level_usage PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)

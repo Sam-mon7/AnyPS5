@@ -14,6 +14,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <thread>
 #include <array>
 #include <chrono>
@@ -142,6 +143,9 @@ struct TextureCache {
         std::uint64_t evicted = 0;
         std::uint64_t passed = 0;
         std::uint64_t stale = 0;
+        std::uint64_t importTextures = 0;
+        std::uint64_t importBytes = 0;
+        std::array<std::uint64_t, 5> importFallbacks{};
     } counts;
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
     VkPhysicalDevice budgetDevice = VK_NULL_HANDLE;
@@ -309,6 +313,7 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     if (now - cache.countsReported < std::chrono::seconds(10)) return;
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
+    if (Texture::ImportDetileEnabled()) AgcDriver::ProfilePrint_nid_no_patch("[texture-import] (10 s): %llu textures (%llu MiB) detiled from imported guest pages; %llu kept the snapshot path: %llu DCC surfaces, %llu without write stamps or partly resident, %llu under 64 KiB, %llu not imported, %llu lost their import\n", static_cast<unsigned long long>(counts.importTextures), static_cast<unsigned long long>(counts.importBytes >> 20u), static_cast<unsigned long long>(std::accumulate(counts.importFallbacks.begin(), counts.importFallbacks.end(), std::uint64_t{0})), static_cast<unsigned long long>(counts.importFallbacks[0]), static_cast<unsigned long long>(counts.importFallbacks[1]), static_cast<unsigned long long>(counts.importFallbacks[2]), static_cast<unsigned long long>(counts.importFallbacks[3]), static_cast<unsigned long long>(counts.importFallbacks[4]));
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame with the least recently used entry used this frame or the last, or a later use with it used this frame), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
 }
 
@@ -663,6 +668,21 @@ void reportGuestAllocation(const GuestTextureResource& resource, std::uint64_t g
     std::fprintf(stderr, "[gpu] view 0x%llx of %llu MiB lies in the guest allocation 0x%llx..0x%llx (%llu MiB, range 0x%llx..0x%llx, %s%s%s): %llu of its %u slices fit in the range\n", static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(guestBytes >> 20u), static_cast<unsigned long long>(range->allocationAddress), static_cast<unsigned long long>(range->allocationAddress + range->allocationBytes), static_cast<unsigned long long>(range->allocationBytes >> 20u), static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(end), range->readable ? "r" : "-", range->writable ? "w" : "-", range->gpu ? "g" : "-", static_cast<unsigned long long>(fitting), geometry.layers);
 }
 
+enum class ImportFallback : std::size_t { Dcc, Unstamped, TooSmall, NotImported, Lost };
+
+bool useImportDetile(const Context& context, TextureCache& cache, const GuestTextureResource& resource, DccKeys keys, std::size_t bytes, std::uint64_t generation, bool partial) {
+    if (!Texture::ImportDetileEnabled()) return false;
+    const auto refuse = [&](ImportFallback reason) {
+        ++cache.counts.importFallbacks[static_cast<std::size_t>(reason)];
+        return false;
+    };
+    if (keys != DccKeys::Uncompressed || resource.dccAddress != 0) return refuse(ImportFallback::Dcc);
+    if (generation == 0 || partial) return refuse(ImportFallback::Unstamped);
+    if (bytes < (std::size_t{64} << 10u)) return refuse(ImportFallback::TooSmall);
+    if (!HostImportCovers(context, resource.baseAddress, bytes)) return refuse(ImportFallback::NotImported);
+    return true;
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
@@ -900,7 +920,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, snapshotGeneration};
+    const bool importDetile = source == nullptr && useImportDetile(context, cache, resource, *keys, bytes, snapshotGeneration, committed.has_value());
+    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr || importDetile ? 0u : bytes), nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
     entry.surfaceBytes = bytes;
     if (source != nullptr) {
@@ -923,6 +944,15 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         entry.accounted = source->Cached() ? 0u : heldBytes(*source);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
+    } else if (importDetile) {
+        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, std::span<const std::byte>{}, depthCompare, true);
+        entry.accounted = entry.texture->AllocationBytes();
+        if (entry.texture->DetiledFromImport()) {
+            ++cache.counts.importTextures;
+            cache.counts.importBytes += bytes;
+        } else {
+            ++cache.counts.importFallbacks[static_cast<std::size_t>(ImportFallback::Lost)];
+        }
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         const bool pending = *keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes);
