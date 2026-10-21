@@ -340,6 +340,14 @@ std::vector<std::byte> FrameCaptureWriter::compress(std::span<const std::byte> b
     return output;
 }
 
+struct FrameCaptureReader::Stream {
+    std::ifstream memory;
+    std::vector<std::byte> compressed;
+    std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> context{ZSTD_createDCtx(), &ZSTD_freeDCtx};
+};
+
+FrameCaptureReader::~FrameCaptureReader() = default;
+
 FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) : directory(directory) {
     const auto callsPath = directory / FrameCaptureWriter::CallsName;
     const auto callBytes = readFile(callsPath);
@@ -435,15 +443,31 @@ void FrameCaptureReader::Read(const FrameMemoryChunk& chunk, std::span<std::byte
     requireCapture(chunk.kind != FrameMemoryKind::Range, "a range chunk has no bytes");
     requireCapture(destination.size() == chunk.bytes, "destination size does not match the chunk");
     const auto path = directory / FrameCaptureWriter::MemoryName;
-    std::ifstream memory(path, std::ios::binary);
-    requireCapture(memory.is_open(), "cannot open " + path.string());
-    std::vector<std::byte> compressed(chunk.compressedBytes);
-    memory.seekg(static_cast<std::streamoff>(chunk.offset));
-    memory.read(reinterpret_cast<char*>(compressed.data()), static_cast<std::streamsize>(compressed.size()));
-    requireCapture(memory.good(), "cannot read " + path.string());
-    const auto written = ZSTD_decompress(destination.data(), destination.size(), compressed.data(), compressed.size());
+    std::unique_ptr<Stream> stream;
+    {
+        std::lock_guard lock(streamsMutex);
+        if (!streams.empty()) {
+            stream = std::move(streams.back());
+            streams.pop_back();
+        }
+    }
+    if (stream == nullptr) {
+        stream = std::make_unique<Stream>();
+        stream->memory.open(path, std::ios::binary);
+    }
+    requireCapture(stream->memory.is_open(), "cannot open " + path.string());
+    requireCapture(stream->context != nullptr, "zstd: cannot create a decompression context");
+    auto& compressed = stream->compressed;
+    compressed.resize(chunk.compressedBytes);
+    stream->memory.clear();
+    stream->memory.seekg(static_cast<std::streamoff>(chunk.offset));
+    stream->memory.read(reinterpret_cast<char*>(compressed.data()), static_cast<std::streamsize>(compressed.size()));
+    requireCapture(stream->memory.good(), "cannot read " + path.string());
+    const auto written = ZSTD_decompressDCtx(stream->context.get(), destination.data(), destination.size(), compressed.data(), compressed.size());
     requireCapture(ZSTD_isError(written) == 0, std::string("zstd: ") + ZSTD_getErrorName(written));
     requireCapture(written == chunk.bytes, "chunk at " + std::to_string(chunk.address) + " decompressed to the wrong size");
+    std::lock_guard lock(streamsMutex);
+    streams.push_back(std::move(stream));
 }
 
 std::vector<std::byte> FrameCaptureReader::Read(const FrameMemoryChunk& chunk) const {
