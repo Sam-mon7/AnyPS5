@@ -73,6 +73,7 @@ public:
     std::pair<std::uint64_t, std::uint64_t> SerialProgress();
     std::uint64_t FlipSubmissions() const;
     std::vector<AwaitedWait> AwaitedWaits();
+    void WaitForPipelineJournal();
     bool WaitIdleFor(std::chrono::milliseconds timeout);
     bool WaitIdleOrParkedFor(std::chrono::milliseconds timeout);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
