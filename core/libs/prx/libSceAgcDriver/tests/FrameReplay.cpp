@@ -16,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -82,11 +83,8 @@ struct Layout {
 Layout allocate() {
     auto* const block = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
     check(block != nullptr, "cannot allocate guest memory");
-#ifdef _WIN32
-    GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
-#else
-    GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, 3, BlockBytes);
-#endif
+    constexpr std::uint32_t ArenaReadWrite = 0x04;
+    GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, ArenaReadWrite, BlockBytes);
     {
         GuestAllocations::Mutation mutation;
         mutation.Add(block, BlockBytes, true, true, true);
@@ -204,6 +202,17 @@ void testCaptureAndReplay(const std::filesystem::path& tool) {
     std::size_t passes = 0;
     for (auto found = repeated.find("\"frames\":2,\"p50\""); found != std::string::npos; found = repeated.find("\"frames\":2,\"p50\"", found + 1)) ++passes;
     check(passes == 3, "the repeated replay did not replay both frames in each of three passes: " + repeated);
+    const auto resets = [](const std::string& json) {
+        constexpr std::string_view Key = "\"reset_written_mib\":";
+        std::vector<double> values;
+        for (auto found = json.find(Key); found != std::string::npos; found = json.find(Key, found + 1)) values.push_back(std::strtod(json.c_str() + found + Key.size(), nullptr));
+        return values;
+    };
+    const auto changed = resets(repeated);
+    check(changed.size() == 3 && changed[0] == 0.0 && changed[1] > 0.0 && changed[2] > 0.0, "the repeated passes did not write back the pages the frames changed: " + repeated);
+    const auto fullJson = replay("--repeat 2 --full-reset", capture / "full.json");
+    const auto full = resets(fullJson);
+    check(full.size() == 2 && full[1] > changed[1], "a full reset did not write back more than the pages the frames changed: " + fullJson);
 }
 
 }

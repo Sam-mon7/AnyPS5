@@ -245,6 +245,17 @@ bool Driver::WaitIdleFor(std::chrono::milliseconds timeout) {
     return idle;
 }
 
+bool Driver::WaitCompletedFor(std::uint64_t serial, std::chrono::milliseconds timeout) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    std::unique_lock lock(mutex);
+    ++idleWaiters;
+    const bool reached = changed.wait_for(lock, timeout, [&] { return failure != nullptr || stopping || completed >= serial; });
+    --idleWaiters;
+    rethrowFailure();
+    checkStopping();
+    return reached;
+}
+
 std::vector<AwaitedWait> Driver::AwaitedWaits() {
     std::vector<AwaitedWait> result;
     for (const auto& slot : awaitedSlots) {

@@ -23,6 +23,7 @@
 #include <future>
 #include <map>
 #include <set>
+#include <sstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -34,6 +35,10 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
+#else
+#include <ctime>
+#include <unistd.h>
 #endif
 
 extern "C" int APS5_VABI sceAgcDriverSetTFRing(const volatile void* base, std::uint32_t size);
@@ -74,6 +79,7 @@ struct Options {
     std::size_t submits = 0;
     bool traceSerials = false;
     bool coldPipelines = false;
+    bool fullReset = false;
 };
 
 class Frames {
@@ -245,11 +251,8 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
                 skipped.Add(chunk);
                 continue;
             }
-#ifdef _WIN32
-            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, PAGE_READWRITE, bytes);
-#else
-            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, 3, bytes);
-#endif
+            constexpr std::uint32_t ArenaReadWrite = 0x04;
+            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, ArenaReadWrite, bytes);
             mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);
         }
     }
@@ -257,12 +260,101 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     return skipped;
 }
 
-void resetMemory(const FrameCaptureReader& reader, const Skipped& skipped) {
-    AgcDriverWaitIdle_nid_postfix();
-    for (const auto& chunk : reader.Chunks()) {
-        if (chunk.kind == FrameMemoryKind::Range && !skipped.Overlaps(chunk)) std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
+template<typename TWork>
+std::uint64_t inParallel(std::size_t count, const TWork& work) {
+    const auto workers = std::min(count, std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+    std::atomic<std::size_t> next{0};
+    std::vector<std::future<std::uint64_t>> pending;
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+        pending.push_back(std::async(std::launch::async, [&] {
+            std::uint64_t total = 0;
+            for (auto index = next.fetch_add(1); index < count; index = next.fetch_add(1)) total += work(index);
+            return total;
+        }));
     }
-    restoreSnapshot(reader, skipped);
+    std::uint64_t total = 0;
+    for (auto& future : pending) total += future.get();
+    return total;
+}
+
+constexpr std::uint64_t ResetPageBytes = 4096;
+
+std::uint64_t restoreChanged(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
+    auto* const live = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address));
+    const auto captured = reader.Read(chunk);
+    std::uint64_t written = 0;
+    for (std::uint64_t at = 0; at < chunk.bytes;) {
+        const auto end = std::min(chunk.bytes, (chunk.address + at + ResetPageBytes) / ResetPageBytes * ResetPageBytes - chunk.address);
+        const auto length = static_cast<std::size_t>(end - at);
+        if (std::memcmp(live + at, captured.data() + at, length) != 0) {
+            std::memcpy(live + at, captured.data() + at, length);
+            written += length;
+        }
+        at = end;
+    }
+    return written;
+}
+
+std::uint64_t zeroChanged(std::uint64_t begin, std::uint64_t end) {
+    static const std::array<std::byte, ResetPageBytes> zeros{};
+    std::uint64_t written = 0;
+    for (auto at = begin; at < end;) {
+        const auto stop = std::min(end, (at + ResetPageBytes) / ResetPageBytes * ResetPageBytes);
+        auto* const live = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(at));
+        const auto length = static_cast<std::size_t>(stop - at);
+        if (std::memcmp(live, zeros.data(), length) != 0) {
+            std::memset(live, 0, length);
+            written += length;
+        }
+        at = stop;
+    }
+    return written;
+}
+
+std::uint64_t resetMemory(const FrameCaptureReader& reader, const Skipped& skipped, bool full) {
+    AgcDriverWaitIdle_nid_postfix();
+    std::vector<const FrameMemoryChunk*> snapshot;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Snapshot || skipped.Overlaps(chunk)) continue;
+        snapshot.push_back(&chunk);
+        covered.emplace_back(chunk.address, chunk.address + chunk.bytes);
+    }
+    if (full) {
+        std::uint64_t written = 0;
+        for (const auto& chunk : reader.Chunks()) {
+            if (chunk.kind != FrameMemoryKind::Range || skipped.Overlaps(chunk)) continue;
+            std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
+            written += chunk.bytes;
+        }
+        restoreSnapshot(reader, skipped);
+        for (const auto* chunk : snapshot) written += chunk->bytes;
+        return written;
+    }
+    std::sort(covered.begin(), covered.end());
+    constexpr std::uint64_t PieceBytes = 64u * 1024u * 1024u;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> zeroed;
+    const auto addPieces = [&](std::uint64_t begin, std::uint64_t end) {
+        for (auto piece = begin; piece < end; piece += PieceBytes) zeroed.emplace_back(piece, std::min(end, piece + PieceBytes));
+    };
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Range || skipped.Overlaps(chunk)) continue;
+        auto at = chunk.address;
+        const auto end = chunk.address + chunk.bytes;
+        auto next = std::upper_bound(covered.begin(), covered.end(), at, [](std::uint64_t value, const auto& range) { return value < range.first; });
+        if (next != covered.begin() && std::prev(next)->second > at) --next;
+        while (at < end) {
+            if (next == covered.end() || next->first >= end) {
+                addPieces(at, end);
+                break;
+            }
+            if (next->first > at) addPieces(at, next->first);
+            at = std::max(at, next->second);
+            ++next;
+        }
+    }
+    return inParallel(zeroed.size(), [&](std::size_t index) { return zeroChanged(zeroed[index].first, zeroed[index].second); }) +
+           inParallel(snapshot.size(), [&](std::size_t index) { return restoreChanged(reader, *snapshot[index]); });
 }
 
 std::pair<std::uint64_t, std::uint64_t> progress() {
@@ -270,6 +362,15 @@ std::pair<std::uint64_t, std::uint64_t> progress() {
     std::uint64_t completed = 0;
     AgcDriverSerialProgress_nid_postfix(&accepted, &completed);
     return {accepted, completed};
+}
+
+void nameThread(const std::string& name) {
+#ifdef _WIN32
+    const std::wstring wide(name.begin(), name.end());
+    SetThreadDescription(GetCurrentThread(), wide.c_str());
+#else
+    pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
+#endif
 }
 
 struct Replay {
@@ -355,7 +456,8 @@ struct Replay {
                 if (options.strict) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " waited longer than the pacing timeout");
                 return;
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+            AgcDriverWaitCompleted_nid_postfix(accepted - inFlight, static_cast<std::uint32_t>(std::clamp<long long>(remaining, 1, 5)));
         }
     }
 
@@ -533,6 +635,7 @@ struct Replay {
         sequenced.store(0);
         stalled.store(false);
         std::thread breaker([&] {
+            nameThread("frame replay releaser");
             if (!options.release) return;
             auto lastCompleted = progress().second;
             auto lastProgress = Clock::now();
@@ -551,7 +654,8 @@ struct Replay {
         });
         std::vector<std::thread> workers;
         for (const auto& entry : byThread) {
-            workers.emplace_back([&, &indices = entry.second] {
+            workers.emplace_back([&, &indices = entry.second, number = workers.size()] {
+                nameThread("frame replay thread " + std::to_string(number));
                 for (const auto index : indices) {
                     std::unique_lock lock(mutex);
                     turn.wait(lock, [&] { return started == index || failure != nullptr; });
@@ -641,7 +745,7 @@ struct Replay {
 
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict]\n"
-                         "                        [--repeat <n>] [--cold-pipelines] [--dump <address>:<bytes>:<file>]...\n"
+                         "                        [--repeat <n>] [--full-reset] [--cold-pipelines] [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
@@ -650,7 +754,10 @@ int usage() {
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
-                         "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
+                         "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches;\n"
+                         "                      only the 4 KiB pages that differ from the snapshot are written back, so what the frames\n"
+                         "                      left unchanged stays cached as it would between frames of the title\n"
+                         "  --full-reset        writes the whole snapshot back before each repeated pass, so every page reads as written\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
                          "  --shaders           replays nothing and maps no guest memory; lists each shader registration with its code\n"
                          "                      address, size and code hash as the snapshot and the captured writes before it hold them,\n"
@@ -971,12 +1078,74 @@ int listSubmits(const Options& options) {
     return 0;
 }
 
+struct CpuTimes {
+    double process = 0.0;
+    std::map<std::string, double> named;
+};
+
+CpuTimes cpuTimes() {
+    CpuTimes times;
+#ifdef _WIN32
+    const auto seconds = [](const FILETIME& kernel, const FILETIME& user) {
+        const auto ticks = [](const FILETIME& time) { return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime; };
+        return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+    };
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) times.process = seconds(kernel, user);
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return times;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    const DWORD process = GetCurrentProcessId();
+    for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != process) continue;
+        const HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+        if (thread == nullptr) continue;
+        PWSTR description = nullptr;
+        if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+            std::string name;
+            for (const wchar_t* at = description; *at != L'\0'; ++at) name.push_back(*at < 0x80 ? static_cast<char>(*at) : '?');
+            if (!name.empty() && GetThreadTimes(thread, &creation, &exit, &kernel, &user)) times.named[name] += seconds(kernel, user);
+            LocalFree(description);
+        }
+        CloseHandle(thread);
+    }
+    CloseHandle(snapshot);
+#else
+    timespec now{};
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now) == 0) times.process = static_cast<double>(now.tv_sec) + static_cast<double>(now.tv_nsec) / 1e9;
+    const auto tick = static_cast<double>(sysconf(_SC_CLK_TCK));
+    std::error_code error;
+    for (const auto& task : std::filesystem::directory_iterator("/proc/self/task", error)) {
+        std::ifstream comm(task.path() / "comm");
+        std::string name;
+        std::getline(comm, name);
+        std::ifstream stat(task.path() / "stat");
+        std::string line;
+        std::getline(stat, line);
+        const auto close = line.rfind(')');
+        if (name.empty() || close == std::string::npos) continue;
+        std::istringstream fields(line.substr(close + 2));
+        std::string field;
+        double used = 0.0;
+        for (int index = 3; fields >> field && index <= 15; ++index) {
+            if (index == 14 || index == 15) used += std::strtod(field.c_str(), nullptr) / tick;
+        }
+        times.named[name] += used;
+    }
+#endif
+    return times;
+}
+
 struct Pass {
     std::size_t firstFrame = 0;
     std::size_t frames = 0;
     double seconds = 0.0;
     std::uint64_t paceTimeouts = 0;
     std::uint64_t synthesized = 0;
+    std::uint64_t resetBytes = 0;
+    CpuTimes cpuStart;
+    CpuTimes cpuEnd;
 };
 
 double percentile(std::vector<double> values, double fraction) {
@@ -1006,8 +1175,9 @@ int run(const Options& options) {
     for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
     std::vector<Pass> passes;
     for (std::size_t pass = 0; pass < options.repeat && (pass == 0 || replay.unfinished == 0); ++pass) {
+        std::uint64_t resetBytes = 0;
         if (pass > 0) {
-            resetMemory(reader, replay.skipped);
+            resetBytes = resetMemory(reader, replay.skipped, options.fullReset);
             replay.pass = pass;
             replay.recording = false;
             for (auto output = replay.outputs.begin(); output != replay.outputs.end();) {
@@ -1028,12 +1198,14 @@ int run(const Options& options) {
                 if (call->kind == FrameCallKind::ReserveEopFlip) replay.execute(*call);
             }
         }
-        Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
+        Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load(), resetBytes};
         replay.recording = true;
+        measured.cpuStart = cpuTimes();
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
         replay.endedAt = Clock::now();
+        measured.cpuEnd = cpuTimes();
         if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
         measured.frames = replay.frames.Times().size() - measured.firstFrame;
         measured.seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
@@ -1059,10 +1231,25 @@ int run(const Options& options) {
         const auto& measured = passes[index];
         std::vector<double> passMs;
         for (auto frame = measured.firstFrame + 1; frame < measured.firstFrame + measured.frames; ++frame) passMs.push_back(std::chrono::duration<double, std::milli>(ready[frame] - ready[frame - 1]).count());
-        char entry[192];
-        std::snprintf(entry, sizeof(entry), "%s{\"replay_s\":%.3f,\"frames\":%zu,\"p50\":%.3f,\"pace_timeouts\":%llu,\"synthesized\":%llu}", passList.empty() ? "" : ",", measured.seconds, measured.frames,
-                      percentile(passMs, 0.5), static_cast<unsigned long long>(measured.paceTimeouts), static_cast<unsigned long long>(measured.synthesized));
+        char entry[256];
+        std::snprintf(entry, sizeof(entry), "%s{\"replay_s\":%.3f,\"frames\":%zu,\"p50\":%.3f,\"pace_timeouts\":%llu,\"synthesized\":%llu,\"reset_written_mib\":%.3f,\"cpu_s\":%.3f,\"thread_cpu_s\":{", passList.empty() ? "" : ",", measured.seconds, measured.frames,
+                      percentile(passMs, 0.5), static_cast<unsigned long long>(measured.paceTimeouts), static_cast<unsigned long long>(measured.synthesized), static_cast<double>(measured.resetBytes) / (1024.0 * 1024.0), measured.cpuEnd.process - measured.cpuStart.process);
         passList += entry;
+        bool firstName = true;
+        for (const auto& [name, end] : measured.cpuEnd.named) {
+            const auto start = measured.cpuStart.named.find(name);
+            const auto used = end - (start == measured.cpuStart.named.end() ? 0.0 : start->second);
+            if (used < 0.0005) continue;
+            std::string escaped;
+            for (const char character : name) {
+                if (character == '"' || character == '\\') escaped.push_back('\\');
+                escaped.push_back(character);
+            }
+            std::snprintf(entry, sizeof(entry), "%s\"%s\":%.3f", firstName ? "" : ",", escaped.c_str(), used);
+            passList += entry;
+            firstName = false;
+        }
+        passList += "}}";
         if (index < firstMeasured) continue;
         for (const auto value : passMs) frameList += (frameList.empty() ? "" : ",") + std::to_string(static_cast<long long>(value));
         frameMs.insert(frameMs.end(), passMs.begin(), passMs.end());
@@ -1105,6 +1292,7 @@ int main(int argc, char** argv) {
             if (options.submits == 0 || end == argv[index] || *end != '\0') return usage();
         } else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
+        else if (argument == "--full-reset") options.fullReset = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;

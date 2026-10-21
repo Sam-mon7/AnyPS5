@@ -137,6 +137,10 @@ extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait*
     return count;
 }
 
+extern "C" bool AgcDriverWaitCompleted_nid_postfix(std::uint64_t serial, std::uint32_t timeoutMs) {
+    return AgcDriver::DriverDetail::Driver::Get().WaitCompletedFor(serial, std::chrono::milliseconds(timeoutMs));
+}
+
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix() {
     AgcDriver::DriverDetail::Driver::Get().WaitForPipelineJournal();
 }
