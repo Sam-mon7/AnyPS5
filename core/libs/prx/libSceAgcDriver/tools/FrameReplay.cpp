@@ -70,6 +70,7 @@ struct Options {
     bool synthesize = true;
     std::size_t repeat = 1;
     bool shaders = false;
+    std::filesystem::path shaderCode;
     std::size_t submits = 0;
     bool traceSerials = false;
 };
@@ -649,8 +650,9 @@ int usage() {
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
-                         "  --shaders           replays nothing; lists each shader registration with its code address, size and code\n"
-                         "                      hash, and how many registrations share that code\n"
+                         "  --shaders           replays nothing and maps no guest memory; lists each shader registration with its code\n"
+                         "                      address, size and code hash from the snapshot, and how many registrations share that code\n"
+                         "  --shader-code <dir> as --shaders, and writes each distinct code as <dir>/type<n>-<hash>.bin\n"
                          "  --trace-serials     prints each submission, flip and suspend point with its call ordinal and command\n"
                          "                      address as it is issued; with APS5_TRACE_GPU the driver prints the serial it accepts\n"
                          "                      for each address\n"
@@ -762,40 +764,92 @@ std::uint64_t contentHash(const std::byte* bytes, std::size_t size) {
     return hash;
 }
 
+class CapturedMemory {
+public:
+    explicit CapturedMemory(const FrameCaptureReader& reader) : reader(reader) {
+        for (const auto& chunk : reader.Chunks()) {
+            if (chunk.kind == FrameMemoryKind::Snapshot) snapshots.push_back(&chunk);
+            else if (chunk.kind == FrameMemoryKind::Range) ranges.push_back(&chunk);
+        }
+        const auto byAddress = [](const FrameMemoryChunk* a, const FrameMemoryChunk* b) { return a->address < b->address; };
+        std::sort(snapshots.begin(), snapshots.end(), byAddress);
+        std::sort(ranges.begin(), ranges.end(), byAddress);
+    }
+
+    std::optional<std::vector<std::byte>> Read(std::uint64_t address, std::uint64_t bytes) {
+        std::vector<std::byte> result(static_cast<std::size_t>(bytes));
+        for (auto at = address; at < address + bytes;) {
+            const auto* range = covering(ranges, at);
+            if (range == nullptr) return std::nullopt;
+            const auto* snapshot = covering(snapshots, at);
+            auto end = std::min(address + bytes, range->address + range->bytes);
+            if (snapshot != nullptr) {
+                end = std::min(end, snapshot->address + snapshot->bytes);
+                const auto& data = load(*snapshot);
+                std::memcpy(result.data() + (at - address), data.data() + (at - snapshot->address), static_cast<std::size_t>(end - at));
+            } else {
+                const auto next = std::upper_bound(snapshots.begin(), snapshots.end(), at, [](std::uint64_t value, const FrameMemoryChunk* chunk) { return value < chunk->address; });
+                if (next != snapshots.end()) end = std::min(end, (*next)->address);
+            }
+            at = end;
+        }
+        return result;
+    }
+
+private:
+    static const FrameMemoryChunk* covering(const std::vector<const FrameMemoryChunk*>& chunks, std::uint64_t address) {
+        const auto next = std::upper_bound(chunks.begin(), chunks.end(), address, [](std::uint64_t value, const FrameMemoryChunk* chunk) { return value < chunk->address; });
+        if (next == chunks.begin()) return nullptr;
+        const auto* chunk = *std::prev(next);
+        return address < chunk->address + chunk->bytes ? chunk : nullptr;
+    }
+
+    const std::vector<std::byte>& load(const FrameMemoryChunk& chunk) {
+        if (cached != &chunk) {
+            data = reader.Read(chunk);
+            cached = &chunk;
+        }
+        return data;
+    }
+
+    const FrameCaptureReader& reader;
+    std::vector<const FrameMemoryChunk*> snapshots;
+    std::vector<const FrameMemoryChunk*> ranges;
+    const FrameMemoryChunk* cached = nullptr;
+    std::vector<std::byte> data;
+};
+
 int listShaders(const Options& options) {
     const FrameCaptureReader reader(options.directory);
-    const auto skipped = restoreMemory(reader);
-    std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
-    for (const auto& chunk : reader.Chunks()) {
-        if (chunk.kind == FrameMemoryKind::Delta) groups[chunk.group].push_back(&chunk);
-    }
+    CapturedMemory memory(reader);
+    if (!options.shaderCode.empty()) std::filesystem::create_directories(options.shaderCode);
     const auto& calls = reader.Calls();
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
     std::map<std::uint64_t, std::size_t> copies;
     std::size_t listed = 0, inWindow = 0, unreadable = 0;
     for (auto call = calls.begin(); call != calls.end(); ++call) {
-        if (call->kind == FrameCallKind::Memory) {
-            if (const auto found = groups.find(call->values.at(0)); found != groups.end()) {
-                for (const auto* chunk : found->second) {
-                    if (!skipped.Overlaps(*chunk)) restore(reader, *chunk);
-                }
-            }
-            continue;
-        }
         if (call->kind != FrameCallKind::RegisterShader) continue;
-        if (!readable(call->address, sizeof(Shader))) {
+        const auto header = memory.Read(call->address, sizeof(Shader));
+        if (!header) {
             ++unreadable;
             continue;
         }
         Shader fields{};
-        std::memcpy(&fields, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(call->address)), sizeof(Shader));
+        std::memcpy(&fields, header->data(), sizeof(Shader));
         const auto code = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code)));
-        if (fields.shader_size == 0 || !readable(code, fields.shader_size)) {
+        const auto bytes = fields.shader_size != 0 ? memory.Read(code, fields.shader_size) : std::nullopt;
+        if (!bytes) {
             ++unreadable;
             continue;
         }
-        const auto hash = contentHash(reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(code)), fields.shader_size);
+        const auto hash = contentHash(bytes->data(), bytes->size());
         const auto copy = ++copies[hash];
+        if (copy == 1 && !options.shaderCode.empty()) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "type%u-%016llx.bin", static_cast<unsigned>(fields.type), static_cast<unsigned long long>(hash));
+            std::ofstream file(options.shaderCode / name, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
+        }
         const bool window = frameStart != calls.end() && call > frameStart;
         ++listed;
         inWindow += window ? 1 : 0;
@@ -1015,6 +1069,10 @@ int main(int argc, char** argv) {
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--repeat" && index + 1 < argc) options.repeat = std::max<std::size_t>(1, std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--shaders") options.shaders = true;
+        else if (argument == "--shader-code" && index + 1 < argc) {
+            options.shaders = true;
+            options.shaderCode = argv[++index];
+        }
         else if (argument == "--submits" && index + 1 < argc) {
             char* end = nullptr;
             options.submits = std::strtoull(argv[++index], &end, 10);
