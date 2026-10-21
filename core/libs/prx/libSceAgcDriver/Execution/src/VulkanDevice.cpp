@@ -2159,6 +2159,28 @@ void VulkanDevice::SavePipelineCache() {
     if (state->pipelineCache) state->pipelineCache->SaveNow();
 }
 
+DriverMemoryUsage VulkanDevice::MemoryUsage() const {
+    DriverMemoryUsage result;
+    result.device = true;
+    const auto context = graphicsContext();
+    if (state->bufferPool) result.pool = state->bufferPool->MemoryUsage();
+    result.importedGuest = Graphics::HostImportLiveBytes();
+    if (state->recorder) {
+        result.openKept = state->recorder->OpenKeptBytes();
+        result.inFlightKept = state->recorder->InFlightKeptBytes();
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    properties.pNext = &reported;
+    result.budgetAvailable = context.memoryProperties2 != nullptr;
+    if (result.budgetAvailable) context.memoryProperties2(context.physical, &properties);
+    for (std::uint32_t index = 0; index < context.memory.memoryHeapCount; ++index) {
+        const auto& heap = context.memory.memoryHeaps[index];
+        result.heaps.push_back({heap.size, reported.heapBudget[index], reported.heapUsage[index], (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0});
+    }
+    return result;
+}
+
 std::uint64_t VulkanDevice::ComputePipelinesCreated() const {
     return state->computePipelinesCreated.load(std::memory_order_relaxed);
 }

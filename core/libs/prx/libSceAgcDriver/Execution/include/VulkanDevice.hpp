@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ComputePipelineCapture.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryUsage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -46,6 +47,7 @@ public:
     // Starts the journal replay if the device has not (a headless device starts it at its first
     // draw or dispatch) and joins it (tests; the teardown joins it anyway).
     void WaitForPipelineJournalReplay();
+    DriverMemoryUsage MemoryUsage() const;
     void SavePipelineCache();
     // Compute pipelines this device built, by dispatches and by the journal replay (tests).
     std::uint64_t ComputePipelinesCreated() const;

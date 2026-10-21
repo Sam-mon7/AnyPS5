@@ -9,6 +9,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "SceTypes.hpp"
+#include "ReplayMemory.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -22,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <map>
 #include <set>
 #include <memory>
@@ -79,6 +81,8 @@ struct Options {
     bool nsight = false;
     std::size_t profileFromPass = 1;
     unsigned tracyWait = 0;
+    std::filesystem::path memoryReport;
+    bool memorySummary = false;
 };
 
 class ReplayProfile {
@@ -689,6 +693,8 @@ int usage() {
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
+                         "  --memory-report <file> writes RAM, Vulkan heap estimates and retained-resource checkpoints as JSONL\n"
+                         "  --memory-summary    lists capture memory sizes as JSON without mapping guest memory or replaying\n"
                          "  --profile-from-pass <n> collects Tracy zones and custom sampler stacks only in passes n onwards\n"
                          "  --tracy-wait <seconds> waits for a Tracy connection before each profiled pass (Tracy build required)\n"
                          "  --nsight            enables Vulkan draw/dispatch labels and headless frame boundaries; launch under\n"
@@ -1029,10 +1035,22 @@ double percentile(std::vector<double> values, double fraction) {
 int run(const Options& options) {
     AgcDriver::SetProfilingEnabled(false);
     AgcDriver::TracyZone::NameThread("frame replay");
+    if (!options.memoryReport.empty()) {
+        const auto output = std::filesystem::weakly_canonical(options.memoryReport);
+        for (const auto name : {AgcDriver::FrameCaptureWriter::CallsName, AgcDriver::FrameCaptureWriter::MemoryName, AgcDriver::FrameCaptureWriter::HeaderName}) {
+            const auto input = options.directory / name;
+            if (output == std::filesystem::weakly_canonical(input) || (std::filesystem::exists(output) && std::filesystem::exists(input) && std::filesystem::equivalent(output, input))) throw std::runtime_error("memory report: output would overwrite the capture");
+        }
+    }
+    AgcDriver::ReplayMemory::Report memory(options.memoryReport);
+    memory.Checkpoint("startup", 0, 0, false);
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
+    memory.Capture(reader);
+    memory.Checkpoint("capture_indexed", 0, 0, false);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
     auto skipped = restoreMemory(reader);
+    memory.Checkpoint("guest_restored", 0, skipped.bytes);
     const auto loaded = Clock::now();
     Replay replay{options, reader};
     replay.skipped = std::move(skipped);
@@ -1045,6 +1063,7 @@ int run(const Options& options) {
     const auto journalStart = Clock::now();
     AgcDriverWaitForPipelineJournal_nid_postfix();
     const auto journalSeconds = std::chrono::duration<double>(Clock::now() - journalStart).count();
+    memory.Checkpoint("journal_ready", 0, replay.skipped.bytes);
     std::set<std::uint32_t> initialOutputs;
     for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
     std::vector<Pass> passes;
@@ -1071,6 +1090,7 @@ int run(const Options& options) {
                 if (call->kind == FrameCallKind::ReserveEopFlip) replay.execute(*call);
             }
         }
+        memory.Checkpoint("pass_begin", pass + 1, replay.skipped.bytes);
         Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
         ReplayProfile profile(options, pass + 1);
         replay.recording = true;
@@ -1084,6 +1104,7 @@ int run(const Options& options) {
         measured.paceTimeouts = replay.paceTimeouts.load() - measured.paceTimeouts;
         measured.synthesized = replay.syntheticReleases.load() - measured.synthesized;
         passes.push_back(measured);
+        if (replay.unfinished == 0) memory.Checkpoint("pass_end", pass + 1, replay.skipped.bytes);
     }
     FrameCheck check;
     if (replay.unfinished == 0) {
@@ -1092,6 +1113,7 @@ int run(const Options& options) {
     } else if (!options.dumps.empty()) {
         std::fprintf(stderr, "[frame-replay] no dumps written: the GPU work did not finish\n");
     }
+    memory.Checkpoint(replay.unfinished == 0 ? "complete" : "unfinished", passes.size(), replay.skipped.bytes, replay.unfinished == 0);
     const auto ready = replay.frames.Times();
     const std::size_t firstMeasured = passes.size() > 1 ? 1 : 0;
     std::vector<double> frameMs;
@@ -1149,6 +1171,8 @@ int main(int argc, char** argv) {
             if (options.submits == 0 || end == argv[index] || *end != '\0') return usage();
         } else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
+        else if (argument == "--memory-summary") options.memorySummary = true;
+        else if (argument == "--memory-report" && index + 1 < argc) options.memoryReport = argv[++index];
         else if (argument == "--profile-from-pass" && index + 1 < argc) {
             char* end = nullptr;
             options.profileFromPass = std::strtoull(argv[++index], &end, 10);
@@ -1166,6 +1190,7 @@ int main(int argc, char** argv) {
         else return usage();
     }
     if (options.directory.empty() || options.profileFromPass > options.repeat) return usage();
+    if (static_cast<unsigned>(options.memorySummary) + static_cast<unsigned>(options.shaders) + static_cast<unsigned>(options.submits != 0) > 1 || (!options.memoryReport.empty() && (options.memorySummary || options.shaders || options.submits != 0))) return usage();
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
     if (options.nsight) {
@@ -1183,6 +1208,10 @@ int main(int argc, char** argv) {
 #endif
     int code = 2;
     try {
+        if (options.memorySummary) {
+            AgcDriver::ReplayMemory::Capture(std::cout, FrameCaptureReader(options.directory));
+            return 0;
+        }
         const bool listing = options.shaders || options.submits != 0;
         code = options.shaders ? listShaders(options) : options.submits != 0 ? listSubmits(options) : run(options);
         if (code == 0 && !listing) {

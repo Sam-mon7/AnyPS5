@@ -54,6 +54,8 @@
 
 ### Functional
 
+- [Replay memory report](../../../core/libs/prx/libSceAgcDriver/tools/ReplayMemory.hpp): counters are sampled at load and pass boundaries, not allocation lifetimes. Active textures, shader caches and allocator overhead are not individually attributed. Vulkan heap usage is estimated; pool slots overlap slab backing, imports alias guest RAM, and recorder kept bytes can share owners. Windows reports resident memory and private commit; Linux reports approximate resident, virtual and anonymous swap bytes from `/proc/self/status`; other hosts report null process counters. OS peaks cover the process lifetime. Capture range sizes count virtual addresses, not unique physical backing; the format does not preserve alias identity. Growth between passes alone does not distinguish cache warm-up from a leak.
+
 - [Replay profiling](../../../core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp): Windows ETW cannot unwind the driver's DWARF-only frames even with PDB symbols, and buffered ETW delivery can lose samples from very short passes. The custom process sampler walks DWARF and Windows unwind records, but refreshes its thread inventory every five seconds, so shorter-lived threads can be missed.
 - [Manual Tracy sampling](../../../core/libs/prx/libSceAgcDriver/Execution/src/WorkerSampler.cpp): Tracy 0.14.1 sends its sampling period at connection time and does not update it when manual sampling starts. A viewer connected before the first warm pass sees a zero period, so sampled CPU-time estimates are unavailable; zone timing, scheduling events and sampled stacks remain usable.
 

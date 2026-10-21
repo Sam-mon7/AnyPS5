@@ -141,6 +141,10 @@ extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix() {
     AgcDriver::DriverDetail::Driver::Get().WaitForPipelineJournal();
 }
 
+extern "C" AgcDriver::DriverMemoryUsage AgcDriverMemoryUsage_nid_no_patch() {
+    return AgcDriver::DriverDetail::Driver::Get().MemoryUsage();
+}
+
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed) {
     const auto [submitted, done] = AgcDriver::DriverDetail::Driver::Get().SerialProgress();
     *accepted = submitted;

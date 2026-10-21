@@ -64,6 +64,7 @@ public:
     std::uint64_t FlipSubmissions() const;
     std::vector<AwaitedWait> AwaitedWaits();
     void WaitForPipelineJournal();
+    DriverMemoryUsage MemoryUsage();
     bool WaitIdleFor(std::chrono::milliseconds timeout);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);

@@ -197,7 +197,13 @@ void testCaptureAndReplay(const std::filesystem::path& tool) {
         return std::string(reinterpret_cast<const char*>(json.data()), json.size());
     };
     replay("", capture / "replay.json");
-    const auto repeated = replay("--nsight --repeat 3 --profile-from-pass 2", capture / "repeat.json");
+    const auto memoryPath = capture / "memory.jsonl";
+    const auto repeated = replay("--nsight --repeat 3 --profile-from-pass 2 --memory-report \"" + memoryPath.string() + "\"", capture / "repeat.json");
+    const auto memoryBytes = readFile(memoryPath);
+    const std::string memoryReport(reinterpret_cast<const char*>(memoryBytes.data()), memoryBytes.size());
+    check(memoryReport.find("\"stage\":\"complete\",\"pass\":3") != std::string::npos, "the memory report omitted the final checkpoint");
+    check(memoryReport.find("\"stage\":\"pass_end\",\"pass\":2") != std::string::npos, "the memory report omitted the warm pass checkpoint");
+    check(memoryReport.find("\"device_local\":true") != std::string::npos, "the memory report omitted the Vulkan heaps");
     std::size_t passes = 0;
     for (auto found = repeated.find("\"frames\":2,\"p50\""); found != std::string::npos; found = repeated.find("\"frames\":2,\"p50\"", found + 1)) ++passes;
     check(passes == 3, "the repeated replay did not replay both frames in each of three passes: " + repeated);

@@ -516,6 +516,8 @@ void Slabs() {
             Buffer b(context, 300, storage);
             Buffer c(context, 260, storage);
             Expect(mock.allocations == 1, "buffers of one size class did not share one memory block");
+            const auto usage = context.bufferPool->MemoryUsage();
+            Expect(usage.retainedBuffers == 0 && usage.slabAllocated == 2 * MiB && usage.slabUnused == 2 * MiB - 3 * 512, "slab memory usage did not distinguish allocated blocks from unused slots");
             const auto block = mock.bound.at(a.Handle()).first;
             std::set<VkDeviceSize> offsets;
             for (auto* buffer : {&a, &b, &c}) {
@@ -969,8 +971,11 @@ void ImageMemoryReuse() {
     Expect(type == 0 && mock.allocations == 1, "the first image allocates device memory of its type");
     ReleaseImageMemory(context, first, 4 * MiB, 0);
     Expect(mock.frees == 0 && context.bufferPool->RetainedImages() == 1, "a released device-local image allocation is retained");
+    const auto usage = context.bufferPool->MemoryUsage();
+    Expect(usage.retainedImages == 4 * MiB && usage.retainedBuffers == 0, "retained image memory was also counted as a buffer");
     const auto again = AllocateImageMemory(context, allocation, 1u, "test image", &type);
     Expect(again == first && type == 0 && mock.allocations == 1 && context.bufferPool->RetainedImages() == 0, "the next image of the same type and size takes the retained allocation");
+    Expect(context.bufferPool->MemoryUsage().retainedImages == 0, "a reused image stayed in retained memory usage");
     auto smaller = allocation;
     smaller.allocationSize = 2 * MiB;
     const auto other = AllocateImageMemory(context, smaller, 1u, "test image", &type);

@@ -216,6 +216,23 @@ std::size_t BufferPool::RetainedImages() {
     return imageSlots;
 }
 
+PoolMemoryUsage BufferPool::MemoryUsage() {
+    PoolMemoryUsage result;
+    {
+        std::lock_guard lock(mutex);
+        result.retainedImages = imageBytes;
+        result.retainedBuffers = smallTier.retainedBytes + largeTier.retainedBytes + deviceTier.retainedBytes - imageBytes;
+    }
+    {
+        std::lock_guard lock(slabMutex);
+        for (const auto& [memory, block] : slabBlocks) {
+            result.slabAllocated += SlabBlockBytes(block->slotBytes);
+            result.slabUnused += block->slotBytes * block->free.size();
+        }
+    }
+    return result;
+}
+
 VkDeviceSize BufferPool::ReclaimTarget(VkDeviceSize bytes) {
     return bytes + std::max<VkDeviceSize>(bytes, VkDeviceSize{256} << 20u);
 }

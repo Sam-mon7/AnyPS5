@@ -256,6 +256,33 @@ int main(int argc, char** argv) {
             }
             check(!AgcDriver::ProfilingEnabled(), "profiling stayed enabled after a failed pass");
         }
+        else if (mode == "memory") {
+            using namespace AgcDriver::ReplayMemory;
+            check(RangeBytes({{10, 20}, {5, 15}, {30, 50}, {32, 40}, {50, 60}}) == 45, "overlapping capture ranges were counted twice");
+            check(RangeBytes({}) == 0, "empty capture ranges used memory");
+            FrameCaptureWriter writer(directory);
+            writer.WriteRange(4096, 8192, FrameRangeKind::Watched, ArenaReadWrite, FrameRangeAccess::Gpu);
+            writer.WriteRange(8192, 8192, FrameRangeKind::Watched, ArenaReadWrite, FrameRangeAccess::Gpu);
+            writer.WriteRange(65536, 8192, FrameRangeKind::Alias, ArenaReadWrite, FrameRangeAccess::Gpu);
+            const std::vector<std::byte> payload(8192, std::byte{0x17});
+            writer.WriteSnapshot(4096, payload);
+            writer.WriteDelta(1, 0, 4096, payload);
+            writer.Finish("{}");
+            const FrameCaptureReader reader(directory);
+            std::ostringstream summary;
+            Capture(summary, reader);
+            check(summary.str().find("\"range_address_bytes\":20480") != std::string::npos, "capture virtual ranges were miscounted");
+            check(summary.str().find("\"alias\":8192") != std::string::npos, "capture aliases were hidden");
+            check(summary.str().find("\"snapshot_payload_bytes\":8192,\"delta_payload_bytes\":8192") != std::string::npos, "disk payload was miscounted");
+            const auto process = ReadProcessUsage();
+#if defined(_WIN32) || defined(__linux__)
+            check(process.resident && *process.resident != 0 && process.peakResident >= process.resident, "process memory counters are unavailable or invalid");
+#endif
+            Report report(directory / "memory.jsonl");
+            report.Capture(reader);
+            report.Checkpoint("test", 1);
+            check(!AgcDriverMemoryUsage_nid_no_patch().device, "memory reporting created a Vulkan device");
+        }
         else if (mode == "order") testMemoryOrder(directory);
         else if (mode == "zero") testReusedMemory(directory);
         else if (mode == "tokens") testEopTokens();
