@@ -4288,6 +4288,7 @@ void reportRecipes() {
 // call or a new [indirect] maximum) and the running totals of Dispatches(); `indirect` charges the
 // [indirect] rows too (cleared when a CPU-resolved indirect dispatch continues as a direct one).
 struct DispatchTimer {
+    TracyZone phaseZone{"Dispatch phase"};
     bool profile;
     bool indirect;
     std::size_t spirvWords;
@@ -4304,6 +4305,8 @@ struct DispatchTimer {
         if (indirect) d.indirectHold.phaseMs[which] += ms;
     }
     void phase(DispatchPhase which) {
+        phaseZone.Name(DispatchRowName(which));
+        phaseZone.Restart("Dispatch phase");
         if (!profile) return;
         const auto now = std::chrono::steady_clock::now();
         const auto ms = std::chrono::duration<double, std::milli>(now - phaseStart).count();
@@ -4312,7 +4315,10 @@ struct DispatchTimer {
         // Slow phases are reported as they finish, so a dispatch that never completes shows where it is.
         if (ms > 1000) AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %s took %.0f ms (%zu words, program 0x%llx)\n", DispatchRowName(which), ms, spirvWords, static_cast<unsigned long long>(programAddress));
     }
-    void restart() { phaseStart = std::chrono::steady_clock::now(); }
+    void restart() {
+        phaseZone.Restart("Dispatch phase");
+        phaseStart = std::chrono::steady_clock::now();
+    }
     // The call's phases as text, only when wanted: a slow call, or a new [indirect] maximum.
     std::string formatCall() const {
         std::string text;

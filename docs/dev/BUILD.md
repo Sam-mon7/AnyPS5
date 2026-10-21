@@ -103,6 +103,8 @@ Project switches accept `ON` or `OFF`:
 | `-DANYPS5_USE_SYSTEM_DEPS=ON`    | `OFF`   | Resolve SDL2, freetype, Vulkan-Headers, SPIRV-Headers, glslang and SPIRV-Tools from the system instead of the submodules. |
 | `-DAPS5_ENABLE_TIMING_LOG=ON`    | `OFF`   | Compile frame timing logging.                    |
 | `-DAPS5_ENABLE_TRACY=ON`         | `OFF`   | Build the [Tracy](#tracy) profiler client into the agc driver. |
+| `-DAPS5_TRACY_SYSTEM_TRACING=ON` | `ON`    | Include scheduling events and sampled stacks in Tracy builds. |
+| `-DAPS5_CV2PDB=<executable>`    | empty   | Generate PDBs after linking MinGW Tracy binaries; also enables DWARF 4 debug information. |
 | `-DAPS5_AGC_CREATE_LOG=OFF`      | `ON`    | Disable successful `sceAgcCreateShader` logging. |
 | `-DAGC_BUILD_VISUAL_TEST=ON`     | `OFF`   | Build the standalone AGC SPIR-V visual test.     |
 
@@ -145,7 +147,22 @@ With `CMAKE_OSX_ARCHITECTURES=x86_64` Apple silicon runs the tests through Roset
 
 ## Tracy
 
-`-DAPS5_ENABLE_TRACY=ON` builds the [Tracy](https://github.com/wolfpld/tracy) 0.14.1 client from `3rdparty/tracy` as a shared library next to the patched `.prx` files (`libTracyClient.dll`, `libTracyClient.so.0.14.1` on Linux); copy it with them. Every `PerformanceTimer` scope of libSceAgcDriver and libSceVideoOut is a zone, every presented flip ends a frame, and the queue workers and the presenter are named threads. Connect the Tracy 0.14.1 profiler to `127.0.0.1`: the client listens only on localhost and records only while a profiler is connected. Sampling, system tracing, call stacks, code transfer and Tracy's crash handler are disabled. Without the flag nothing of Tracy is built.
+`-DAPS5_ENABLE_TRACY=ON` builds the [Tracy](https://github.com/wolfpld/tracy) 0.14.1 client from `3rdparty/tracy` as a shared library next to the patched `.prx` files (`libTracyClient.dll`, `libTracyClient.so.0.14.1` on Linux); copy it with them. Every `PerformanceTimer` scope of libSceAgcDriver and libSceVideoOut is a zone, every presented flip ends a frame, and the queue workers and the presenter are named threads. Connect the Tracy 0.14.1 profiler to `127.0.0.1`: the client listens only on localhost and records only while a profiler is connected. Scheduling events and sampled stacks are enabled by default in Tracy builds; `-DAPS5_TRACY_SYSTEM_TRACING=OFF` restores zone-only tracing. Sampling starts with queue worker 0 or a selected replay pass, using Tracy's manual sampling API after profiler initialization. VSync capture, code transfer and Tracy's crash handler are disabled. Without `APS5_ENABLE_TRACY` nothing of Tracy is built.
+
+The replay target uses the same client. Its `Replay frames` marks come from completed replay flips, and `Replay passes` delimits each profiled pass. Zones cover committer work, dispatch device calls and their phases, queued read-range construction and checks, and pending texture stores. `GuestMemory GPU lock` uses Tracy's lock tracking to show owners, acquisitions and waiters; `GpuMutex.Acquire` also includes the spin before a blocking wait.
+
+For a Windows MinGW profiling build, use the supported toolchain and configure `-DCMAKE_BUILD_TYPE=RelWithDebInfo -DAPS5_ENABLE_TRACY=ON -DAPS5_CV2PDB=C:/path/to/cv2pdb64.exe`, then build `agc_frame_replay`. Python is required for conversion. Conversion runs after the existing `.ehfram` unwind-section fix for the executable and PRX libraries, and pads the converted PE to its file alignment so DbgHelp can read cv2pdb's final debug section. Keep their generated `.pdb` files beside the binaries. Run elevated for ETW sampling. PDBs supply symbols, but ETW still follows Windows unwind metadata: stacks through the driver's DWARF frames can be truncated. The custom process sampler below also walks DWARF.
+
+```powershell
+$env:PATH = "$PWD/build-tracy/core/libs/libs/unpatched;$env:PATH"
+tracy-capture -a 127.0.0.1 -o replay.tracy
+```
+
+In another terminal with the same library path, set `$env:TRACY_SYMBOL_OFFLINE_RESOLVE = '1'` and run `build-tracy/core/libs/prx/libSceAgcDriver/agc_frame_replay.exe <capture> --repeat 3 --profile-from-pass 2 --tracy-wait 60`. Offline symbol mode avoids Windows driver-symbol searches delaying the symbol worker until after a short replay has exited. After capture, run `tracy-update -r replay.tracy replay-symbols.tracy` and open the resolved file. Keep the matching binaries and PDBs at their captured paths until resolution finishes. System and GPU-driver symbols still depend on their vendors' symbol availability.
+
+Pass numbers are one-based. The first pass warms caches; custom samplers, ETW sampling and Tracy zones start at pass 2 and pause during snapshot resets and shutdown. `--tracy-wait` waits up to the given seconds for a profiler connection before each selected pass, and rejects builds without Tracy. Lock events cover the connected capture so ownership stays balanced across pass boundaries; select the `Replay passes` interval for warm-pass analysis. ETW delivery is buffered, so very short passes can have few or no samples; use the custom samplers alongside it. Use ordinary replay for performance measurements without profiler overhead.
+
+Tracy 0.14.1 sends the sampling period when it connects, before a manually started replay sampling session sets that period. Use zone durations and scheduling events for timing; sampled stacks and counts provide attribution, but sampled CPU-time estimates can have a zero period in this workflow.
 
 On Windows MinGW frees `thread_local` objects before their destructors run, so the Tracy client is built without `thread_local` destructors and never destroys its event queue: a thread that emitted a zone and ended keeps its event blocks (2 MiB each) until the process exits.
 
@@ -213,7 +230,7 @@ On a device that supports `VK_EXT_device_fault`, the first `VK_ERROR_DEVICE_LOST
 
 Set `APS5_SAMPLE_WORKER=<file>` to sample queue worker 0 every millisecond (in practice every timer tick). Every 20 s and at exit it writes `<file>`, one `module offset self inclusive` line per sampled address, and `<file stem>.collapsed.txt`, the worker's whole stacks in the collapsed format that speedscope.app and flamegraph.pl read: one `frame;...;frame count` line per distinct stack, root first, each frame as `module+0xRVA`. A walk that ends before the thread's root starts with `[truncated]`. The `#` lines give the samples, the walk depth (64 frames), the truncated walks, the mean and longest time the worker was suspended, and the size and PE timestamp of each module, to check the binary a file is symbolized against. A frame with `.pdata` is stepped by `RtlVirtualUnwind`; any other frame by its DWARF record in `.ehfram`, the unwind data the libraries are built with. Those steps read only inside the worker's stack, and a module is indexed after the worker resumes, the first time a walk meets it.
 
-`APS5_SAMPLE_THREADS=<file>` samples every thread of the process every 2 ms and writes the 40 hottest addresses of each busy thread to `<file>`, 12 frames deep and through `.pdata` only. Both samplers exist only on Windows; the addresses are symbolized offline, for example with `nm` on the `.prx`.
+`APS5_SAMPLE_THREADS=<file>` samples every thread of the process every 2 ms and writes the 40 hottest addresses of each busy thread to `<file>`. It also writes `<file>.thread-<id>.collapsed.txt` for each sampled thread, using the same 64-frame `.pdata`/DWARF walk as the worker sampler. The thread list refreshes every five seconds. Both samplers exist only on Windows; the addresses are symbolized offline, for example with `nm` on the `.prx`. Replay's `--profile-from-pass 2 --repeat 3` limits both samplers to the warm passes, including when Tracy is disabled.
 
 ## Performance trace
 

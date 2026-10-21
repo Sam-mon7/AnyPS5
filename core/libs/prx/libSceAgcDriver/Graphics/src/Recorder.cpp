@@ -1818,6 +1818,7 @@ bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint6
 }
 
 void Recorder::FlushStores() {
+    AgcDriver::TracyZone trace("Recorder.FlushStores");
     if (open == nullptr || open->run.queued.empty()) return;
     closeStoreRun(false);
 }
@@ -2709,6 +2710,7 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
 }
 
 void Recorder::BoundKeptBytes() {
+    AgcDriver::TracyZone trace("Recorder.BoundKeptBytes");
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
@@ -3205,6 +3207,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> Recorder::notedReads(const 
 }
 
 bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, bool ignoreSignaled) const {
+    AgcDriver::TracyZone trace("Recorder.PendingReadOverlaps");
     if (bytes == 0) return false;
     readQueries.fetch_add(1, std::memory_order_relaxed);
     const auto end = address + bytes;

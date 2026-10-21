@@ -9,6 +9,9 @@
 #include <span>
 #include <utility>
 #include <vector>
+#ifdef TRACY_ENABLE
+#include <tracy/Tracy.hpp>
+#endif
 
 namespace AgcDriver::GuestMemory {
 
@@ -155,7 +158,11 @@ public:
 
 private:
     void acquired();
+#ifdef TRACY_ENABLE
+    TracyLockableN(std::recursive_mutex, mutex, "GuestMemory GPU lock");
+#else
     std::recursive_mutex mutex;
+#endif
     // The holder's thread token and recursion depth, written by the holder only; another thread
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};

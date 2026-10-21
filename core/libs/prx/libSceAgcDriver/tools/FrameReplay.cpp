@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -76,6 +77,40 @@ struct Options {
     bool traceSerials = false;
     bool coldPipelines = false;
     bool nsight = false;
+    std::size_t profileFromPass = 1;
+    unsigned tracyWait = 0;
+};
+
+class ReplayProfile {
+public:
+    ReplayProfile(const Options& options, std::size_t pass) : active(pass >= options.profileFromPass) {
+        AgcDriver::SetProfilingEnabled(false);
+        if (!active) return;
+        if (options.tracyWait != 0) {
+            const auto deadline = Clock::now() + std::chrono::seconds(options.tracyWait);
+            while (!AgcDriver::TracyZone::Connected()) {
+                if (Clock::now() >= deadline) {
+                    AgcDriver::SetProfilingEnabled(false);
+                    throw std::runtime_error("frame replay: timed out waiting for Tracy");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        AgcDriver::SetProfilingEnabled(true);
+        AgcDriver::TracyZone::BeginFrame("Replay passes");
+        zone.emplace("Replay pass");
+        zone->Value(pass);
+    }
+
+    ~ReplayProfile() {
+        zone.reset();
+        if (active) AgcDriver::TracyZone::EndFrame("Replay passes");
+        AgcDriver::SetProfilingEnabled(false);
+    }
+
+private:
+    bool active;
+    std::optional<AgcDriver::TracyZone> zone;
 };
 
 class Frames {
@@ -83,6 +118,7 @@ public:
     void MarkReady() {
         std::lock_guard lock(mutex);
         ready.push_back(Clock::now());
+        AgcDriver::TracyZone::MarkFrame("Replay frames");
     }
 
     void Failed(std::exception_ptr error) {
@@ -531,6 +567,7 @@ struct Replay {
         sequenced.store(0);
         stalled.store(false);
         std::thread breaker([&] {
+            AgcDriver::TracyZone::NameThread("replay wait release");
             if (!options.release) return;
             auto lastCompleted = progress().second;
             auto lastProgress = Clock::now();
@@ -549,7 +586,9 @@ struct Replay {
         });
         std::vector<std::thread> workers;
         for (const auto& entry : byThread) {
-            workers.emplace_back([&, &indices = entry.second] {
+            workers.emplace_back([&, &indices = entry.second, threadId = entry.first] {
+                const auto name = "replay guest thread " + std::to_string(threadId);
+                AgcDriver::TracyZone::NameThread(name.c_str());
                 for (const auto index : indices) {
                     std::unique_lock lock(mutex);
                     turn.wait(lock, [&] { return started == index || failure != nullptr; });
@@ -650,6 +689,8 @@ int usage() {
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
+                         "  --profile-from-pass <n> collects Tracy zones and custom sampler stacks only in passes n onwards\n"
+                         "  --tracy-wait <seconds> waits for a Tracy connection before each profiled pass (Tracy build required)\n"
                          "  --nsight            enables Vulkan draw/dispatch labels and headless frame boundaries; launch under\n"
                          "                      Nsight Graphics with the VK_frame_boundary delimiter; orders CPU flips\n"
                          "  --shaders           replays nothing and maps no guest memory; lists each shader registration with its code\n"
@@ -986,6 +1027,8 @@ double percentile(std::vector<double> values, double fraction) {
 }
 
 int run(const Options& options) {
+    AgcDriver::SetProfilingEnabled(false);
+    AgcDriver::TracyZone::NameThread("frame replay");
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
@@ -1029,6 +1072,7 @@ int run(const Options& options) {
             }
         }
         Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
+        ReplayProfile profile(options, pass + 1);
         replay.recording = true;
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
@@ -1105,13 +1149,23 @@ int main(int argc, char** argv) {
             if (options.submits == 0 || end == argv[index] || *end != '\0') return usage();
         } else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
+        else if (argument == "--profile-from-pass" && index + 1 < argc) {
+            char* end = nullptr;
+            options.profileFromPass = std::strtoull(argv[++index], &end, 10);
+            if (options.profileFromPass == 0 || end == argv[index] || *end != '\0') return usage();
+        } else if (argument == "--tracy-wait" && index + 1 < argc) {
+            char* end = nullptr;
+            const auto seconds = std::strtoul(argv[++index], &end, 10);
+            if (seconds == 0 || seconds > 600 || end == argv[index] || *end != '\0' || !AgcDriver::TracyZone::Available()) return usage();
+            options.tracyWait = static_cast<unsigned>(seconds);
+        }
         else if (argument == "--nsight") options.nsight = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
-    if (options.directory.empty()) return usage();
+    if (options.directory.empty() || options.profileFromPass > options.repeat) return usage();
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
     if (options.nsight) {

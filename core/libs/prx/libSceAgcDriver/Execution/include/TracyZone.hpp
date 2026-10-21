@@ -1,12 +1,14 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_TRACYZONE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_TRACYZONE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include <cstdint>
 #ifdef TRACY_ENABLE
 #include <tracy/TracyC.h>
 #include <array>
 #include <atomic>
 #include <cstddef>
-#include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <stdexcept>
 #endif
@@ -17,7 +19,7 @@ class TracyZone {
 public:
     explicit TracyZone([[maybe_unused]] const char* name) {
 #ifdef TRACY_ENABLE
-        context = ___tracy_emit_zone_begin(location(name), 1);
+        if (ProfilingEnabled()) context = ___tracy_emit_zone_begin(location(name), 1);
 #endif
     }
 
@@ -36,9 +38,56 @@ public:
 #endif
     }
 
-    static void MarkFrame() {
+    void Value([[maybe_unused]] std::uint64_t value) {
 #ifdef TRACY_ENABLE
-        ___tracy_emit_frame_mark(nullptr);
+        if (context.active != 0) ___tracy_emit_zone_value(context, value);
+#endif
+    }
+
+    void Name([[maybe_unused]] const char* name) {
+#ifdef TRACY_ENABLE
+        if (context.active != 0) ___tracy_emit_zone_name(context, name, std::strlen(name));
+#endif
+    }
+
+    void Restart([[maybe_unused]] const char* name) {
+        End();
+#ifdef TRACY_ENABLE
+        if (ProfilingEnabled()) context = ___tracy_emit_zone_begin(location(name), 1);
+#endif
+    }
+
+    static bool Available() {
+#ifdef TRACY_ENABLE
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    static bool Connected() {
+#ifdef TRACY_ENABLE
+        return ___tracy_connected() != 0;
+#else
+        return false;
+#endif
+    }
+
+    static void MarkFrame([[maybe_unused]] const char* name = nullptr) {
+#ifdef TRACY_ENABLE
+        if (ProfilingEnabled()) ___tracy_emit_frame_mark(name);
+#endif
+    }
+
+    static void BeginFrame([[maybe_unused]] const char* name) {
+#ifdef TRACY_ENABLE
+        if (ProfilingEnabled()) ___tracy_emit_frame_mark_start(name);
+#endif
+    }
+
+    static void EndFrame([[maybe_unused]] const char* name) {
+#ifdef TRACY_ENABLE
+        if (ProfilingEnabled()) ___tracy_emit_frame_mark_end(name);
 #endif
     }
 
@@ -72,7 +121,7 @@ private:
         throw std::runtime_error("Tracy: too many zone names");
     }
 
-    TracyCZoneCtx context;
+    TracyCZoneCtx context{};
 #endif
 };
 

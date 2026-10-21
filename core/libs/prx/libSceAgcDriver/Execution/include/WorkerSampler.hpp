@@ -6,6 +6,8 @@ namespace AgcDriver {
 // Starts sampling the calling thread when APS5_SAMPLE_WORKER names an output file.
 void StartWorkerSampler();
 void StopWorkerSampler();
+void SetProfilingEnabled(bool enabled);
+bool ProfilingEnabled();
 
 }
 

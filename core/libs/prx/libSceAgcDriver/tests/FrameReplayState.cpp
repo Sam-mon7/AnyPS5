@@ -239,7 +239,24 @@ int main(int argc, char** argv) {
         check(argc == 3, "expected a test name and capture directory");
         const std::string mode = argv[1];
         const std::filesystem::path directory = argv[2];
-        if (mode == "order") testMemoryOrder(directory);
+        if (mode == "profiling") {
+            Options options;
+            options.profileFromPass = 2;
+            AgcDriver::SetProfilingEnabled(false);
+            {
+                ReplayProfile cold(options, 1);
+                check(!AgcDriver::ProfilingEnabled(), "cold pass enabled profiling");
+            }
+            try {
+                ReplayProfile warm(options, 2);
+                check(AgcDriver::ProfilingEnabled(), "warm pass did not enable profiling");
+                throw std::runtime_error("test unwinding");
+            } catch (const std::runtime_error& error) {
+                check(std::string_view(error.what()) == "test unwinding", "warm profiling did not start");
+            }
+            check(!AgcDriver::ProfilingEnabled(), "profiling stayed enabled after a failed pass");
+        }
+        else if (mode == "order") testMemoryOrder(directory);
         else if (mode == "zero") testReusedMemory(directory);
         else if (mode == "tokens") testEopTokens();
         else if (mode == "blocking") testBlockingSubmission(directory);

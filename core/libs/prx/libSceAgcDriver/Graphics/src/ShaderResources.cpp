@@ -3263,6 +3263,7 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    AgcDriver::TracyZone trace("Resources.Revalidate");
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4305,6 +4306,7 @@ bool ShaderResources::DataWordsDiffer(const CompiledShader& shader) const {
 }
 
 bool ShaderResources::RefreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder) {
+    AgcDriver::TracyZone trace("Resources.RefreshData");
     Require(shader.program != nullptr, "missing compiled shader");
     Require(!refreshResourceKey.empty() && MatchesContentKey(shader, refreshResourceKey), "runtime data refresh cannot replace bound resources");
     return refreshData(commands, shader, recorder);

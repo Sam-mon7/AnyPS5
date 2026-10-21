@@ -2,6 +2,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#ifdef TRACY_ENABLE
+#include <tracy/TracyC.h>
+#include <mutex>
+#endif
 #ifdef _WIN32
 #include "prx/libSceAgcDriver/Execution/include/StackWalk.hpp"
 #include <windows.h>
@@ -21,6 +26,33 @@
 #endif
 
 namespace AgcDriver {
+
+namespace {
+std::atomic<bool> profilingEnabled{true};
+
+void updateSystemSampling([[maybe_unused]] bool enabled) {
+#ifdef TRACY_ENABLE
+    static std::mutex mutex;
+    static bool sampling = false;
+    std::lock_guard lock(mutex);
+    if (enabled && !sampling) sampling = TracyCBeginSamplingProfiling() != 0;
+    else if (!enabled && sampling) {
+        TracyCEndSamplingProfiling();
+        sampling = false;
+    }
+#endif
+}
+}
+
+void SetProfilingEnabled(bool enabled) {
+    if (!enabled) profilingEnabled.store(false, std::memory_order_release);
+    updateSystemSampling(enabled);
+    profilingEnabled.store(enabled, std::memory_order_release);
+}
+
+bool ProfilingEnabled() {
+    return profilingEnabled.load(std::memory_order_acquire);
+}
 
 #ifdef _WIN32
 namespace {
@@ -126,6 +158,7 @@ struct Sampler {
     }
 
     void sample() {
+        if (!ProfilingEnabled()) return;
         CONTEXT context{};
         context.ContextFlags = CONTEXT_FULL;
         std::array<std::uint64_t, WorkerDepth> frames;
@@ -134,7 +167,16 @@ struct Sampler {
         LARGE_INTEGER resumed{};
         QueryPerformanceCounter(&suspended);
         if (SuspendThread(target) == static_cast<DWORD>(-1)) return;
-        if (GetThreadContext(target, &context) != 0) count = walk(context, frames);
+        if (GetThreadContext(target, &context) != 0) {
+            if (context.Rsp < stackLow || context.Rsp >= stackHigh) {
+                MEMORY_BASIC_INFORMATION stack{};
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(context.Rsp), &stack, sizeof(stack)) != 0 && stack.State == MEM_COMMIT) {
+                    stackLow = reinterpret_cast<std::uint64_t>(stack.BaseAddress);
+                    stackHigh = stackLow + stack.RegionSize;
+                }
+            }
+            count = walk(context, frames);
+        }
         ResumeThread(target);
         QueryPerformanceCounter(&resumed);
         if (pendingModule != 0) indexModule();
@@ -226,13 +268,19 @@ struct ProcessSampler {
         for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
             if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
             auto& thread = threads[entry.th32ThreadID];
-            if (thread.target == nullptr) thread.target = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+            if (thread.target == nullptr) {
+                thread.target = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+                thread.depth = Sampler::WorkerDepth;
+                thread.keepStacks = true;
+                thread.path = path + ".thread-" + std::to_string(entry.th32ThreadID) + ".txt";
+            }
         }
         CloseHandle(snapshot);
         enumerated = std::chrono::steady_clock::now();
     }
 
     void sample() {
+        if (!ProfilingEnabled()) return;
         if (threads.empty() || std::chrono::steady_clock::now() - enumerated > std::chrono::seconds(5)) enumerate();
         for (auto& [id, thread] : threads) {
             if (thread.target != nullptr) thread.sample();
@@ -262,6 +310,9 @@ struct ProcessSampler {
             }
         }
         std::fclose(file);
+        for (auto& [id, thread] : threads) {
+            if (thread.samples != 0) thread.writeStacks();
+        }
     }
 };
 
@@ -275,6 +326,7 @@ void StartProcessSampler() {
         auto flushed = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            if (!ProfilingEnabled()) continue;
             sampler->sample();
             if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(20)) {
                 sampler->write();
@@ -288,6 +340,7 @@ void StartProcessSampler() {
 }
 
 void StartWorkerSampler() {
+    if (ProfilingEnabled()) updateSystemSampling(true);
     StartProcessSampler();
     const char* path = std::getenv("APS5_SAMPLE_WORKER");
     if (path == nullptr) return;
@@ -306,6 +359,7 @@ void StartWorkerSampler() {
         auto flushed = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (!ProfilingEnabled()) continue;
             sampler->sample();
             if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(20)) {
                 sampler->write();
@@ -321,10 +375,13 @@ void StopWorkerSampler() {
     workerSamplerThread.request_stop();
     if (processSamplerThread.joinable()) processSamplerThread.join();
     if (workerSamplerThread.joinable()) workerSamplerThread.join();
+    updateSystemSampling(false);
 }
 #else
-void StartWorkerSampler() {}
-void StopWorkerSampler() {}
+void StartWorkerSampler() {
+    if (ProfilingEnabled()) updateSystemSampling(true);
+}
+void StopWorkerSampler() { updateSystemSampling(false); }
 #endif
 
 }

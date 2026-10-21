@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -78,6 +79,7 @@ void DrawPipeline::rethrowFailure() {
 }
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads) {
+    TracyZone trace("DrawPipeline.Enqueue");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::unique_lock lock(mutex);
     rethrowFailure();
@@ -141,6 +143,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 void DrawPipeline::run() {
+    TracyZone::NameThread("draw committer");
     PerformanceTrace::BindThread("draw committer");
     for (;;) {
         Commit* commit = nullptr;
@@ -158,6 +161,7 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
+            TracyZone trace("DrawPipeline.Commit");
             if (commit != nullptr) (*commit)();
         } catch (const std::exception&) {
             failed = true;
@@ -199,6 +203,8 @@ void DrawPipeline::Stop() {
 }
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
+    TracyZone trace("DrawPipeline.Drain");
+    trace.Value(static_cast<std::uint64_t>(reason));
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
@@ -220,6 +226,7 @@ std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
 }
 
 bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
+    TracyZone trace("DrawPipeline.HeldReads");
     if (bytes == 0 || std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr) return false;
     const auto end = address + bytes;
     auto& pipeline = Queue0();
@@ -241,6 +248,7 @@ void DrawPipeline::ReleaseRunningReads() {
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
+    TracyZone trace("DrawPipeline.PendingLabel");
     if (bytes == 0 || bytes > 8) return std::nullopt;
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
@@ -256,6 +264,7 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 }
 
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
+    TracyZone trace("DrawPipeline.Overlaps");
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
     for (const auto& item : items) {

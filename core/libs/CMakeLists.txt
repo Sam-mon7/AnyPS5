@@ -53,6 +53,12 @@ function(configure_windows_unwind target)
                 COMMAND "${CMAKE_OBJCOPY}" --rename-section .eh_frame=.ehfram "$<TARGET_FILE:${target}>"
                 VERBATIM
         )
+        if(APS5_ENABLE_TRACY AND APS5_CV2PDB)
+            add_custom_command(TARGET ${target} POST_BUILD
+                    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/cmake/ConvertPdb.py" "${APS5_CV2PDB}" "$<TARGET_FILE:${target}>"
+                    VERBATIM
+            )
+        endif()
     endif()
 endfunction()
 
