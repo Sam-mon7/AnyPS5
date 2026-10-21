@@ -187,12 +187,23 @@ void testCaptureAndReplay(const std::filesystem::path& tool) {
 
     const auto firstDump = capture / "first.bin";
     const auto secondDump = capture / "second.bin";
-    const auto command = "\"\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --dump " + std::to_string(at(layout.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + firstDump.string() +
-                         "\" --dump " + std::to_string(at(late.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + secondDump.string() + "\"\"";
-    const auto code = std::system(command.c_str());
-    check(code == 0, "agc_frame_replay exited with " + std::to_string(code));
-    check(readFile(firstDump) == first, "the replay did not reproduce the first copy");
-    check(readFile(secondDump) == second, "the replay did not reproduce the second copy");
+    const auto replay = [&](const std::string& options, const std::filesystem::path& output) {
+        std::filesystem::remove(firstDump);
+        std::filesystem::remove(secondDump);
+        const auto command = "\"\"" + tool.string() + "\" \"" + capture.string() + "\" --strict " + options + " --dump " + std::to_string(at(layout.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" +
+                             firstDump.string() + "\" --dump " + std::to_string(at(late.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + secondDump.string() + "\" > \"" + output.string() + "\"\"";
+        const auto code = std::system(command.c_str());
+        check(code == 0, "agc_frame_replay " + options + " exited with " + std::to_string(code));
+        check(readFile(firstDump) == first, "the replay " + options + " did not reproduce the first copy");
+        check(readFile(secondDump) == second, "the replay " + options + " did not reproduce the second copy");
+        const auto json = readFile(output);
+        return std::string(reinterpret_cast<const char*>(json.data()), json.size());
+    };
+    replay("", capture / "replay.json");
+    const auto repeated = replay("--repeat 3", capture / "repeat.json");
+    std::size_t passes = 0;
+    for (auto found = repeated.find("\"frames\":2,\"p50\""); found != std::string::npos; found = repeated.find("\"frames\":2,\"p50\"", found + 1)) ++passes;
+    check(passes == 3, "the repeated replay did not replay both frames in each of three passes: " + repeated);
 }
 
 }
