@@ -368,6 +368,11 @@ void Driver::execute(const Submission& submission) {
                     flipInterruptDeferred = localDevice->AfterRecordedWork([this, queueId] { deliverFlipEopInterrupt(queueId); }, false);
                 }
             }
+            static const bool debugAnnotations = std::getenv("APS5_VULKAN_DEBUG") != nullptr;
+            if (debugAnnotations) {
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (const auto localDevice = device.Load()) localDevice->MarkFrameBoundary();
+            }
             if (!flipInterruptDeferred) deliverFlipEopInterrupt(submission.queue);
             ++flipsCounted;
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;

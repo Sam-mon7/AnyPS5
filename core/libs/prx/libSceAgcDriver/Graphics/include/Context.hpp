@@ -265,6 +265,18 @@ struct Context {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
     }
     VertexInputCache* vertexInputs = nullptr;
+    PFN_vkCmdBeginDebugUtilsLabelEXT beginDebugLabel = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT endDebugLabel = nullptr;
+    bool frameBoundary = false;
+
+    void MarkFrameBoundary(std::uint64_t frame) const {
+        if (!frameBoundary) return;
+        VkFrameBoundaryEXT boundary{VK_STRUCTURE_TYPE_FRAME_BOUNDARY_EXT};
+        boundary.flags = VK_FRAME_BOUNDARY_FRAME_END_BIT_EXT;
+        boundary.frameID = frame;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &boundary};
+        Check(Function<PFN_vkQueueSubmit>("vkQueueSubmit")(queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit frame boundary");
+    }
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
@@ -357,6 +369,38 @@ inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
     if (context.graphicsPipelineLibrary) context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);
     else context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
 }
+
+class DebugLabel {
+public:
+    template<typename... TArgs>
+    DebugLabel(const Context& context, VkCommandBuffer commands, const char* format, TArgs... args) : commands(commands) {
+        if (context.beginDebugLabel == nullptr || context.endDebugLabel == nullptr) return;
+        char name[512];
+        std::snprintf(name, sizeof(name), format, args...);
+        VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+        label.pLabelName = name;
+        label.color[0] = 0.25f;
+        label.color[1] = 0.65f;
+        label.color[2] = 1.0f;
+        label.color[3] = 1.0f;
+        context.beginDebugLabel(commands, &label);
+        end = context.endDebugLabel;
+    }
+
+    ~DebugLabel() { End(); }
+    DebugLabel(const DebugLabel&) = delete;
+    DebugLabel& operator=(const DebugLabel&) = delete;
+
+    void End() {
+        if (end == nullptr) return;
+        end(commands);
+        end = nullptr;
+    }
+
+private:
+    VkCommandBuffer commands;
+    PFN_vkCmdEndDebugUtilsLabelEXT end = nullptr;
+};
 
 std::uint32_t ImageTableCapacity(const Context& context);
 std::uint32_t StorageTableCapacity(const Context& context);

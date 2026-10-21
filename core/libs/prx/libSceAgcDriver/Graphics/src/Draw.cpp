@@ -1476,6 +1476,9 @@ struct IndirectRecord {
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
 void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset, std::uint32_t firstIndex = 0) {
+    DebugLabel label(context, commands, "AnyPS5 Draw submission=%llu queue=0x%x offset=%zu target=0x%llx indexed=%u count=%u instances=%u indirect=0x%llx",
+                     static_cast<unsigned long long>(draw.debugSubmission), draw.debugQueue, draw.debugPacketOffset, static_cast<unsigned long long>(state.hasColorTarget ? state.color.address : 0),
+                     draw.indexed ? 1u : 0u, draw.indexCount, draw.instanceCount, static_cast<unsigned long long>(draw.indirect ? draw.indirect->arguments : 0));
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && args != nullptr) {

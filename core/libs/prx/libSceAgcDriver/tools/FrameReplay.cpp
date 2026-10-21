@@ -75,6 +75,7 @@ struct Options {
     std::size_t submits = 0;
     bool traceSerials = false;
     bool coldPipelines = false;
+    bool nsight = false;
 };
 
 class Frames {
@@ -649,6 +650,8 @@ int usage() {
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
+                         "  --nsight            enables Vulkan draw/dispatch labels and headless frame boundaries; launch under\n"
+                         "                      Nsight Graphics with the VK_frame_boundary delimiter; orders CPU flips\n"
                          "  --shaders           replays nothing and maps no guest memory; lists each shader registration with its code\n"
                          "                      address, size and code hash as the snapshot and the captured writes before it hold them,\n"
                          "                      and how many registrations share that code\n"
@@ -1102,6 +1105,7 @@ int main(int argc, char** argv) {
             if (options.submits == 0 || end == argv[index] || *end != '\0') return usage();
         } else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
+        else if (argument == "--nsight") options.nsight = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
@@ -1110,9 +1114,17 @@ int main(int argc, char** argv) {
     if (options.directory.empty()) return usage();
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
+    if (options.nsight) {
+        _putenv_s("APS5_VULKAN_DEBUG", "1");
+        _putenv_s("APS5_CPU_FLIP_IN_ORDER", "1");
+    }
     if (!options.coldPipelines) _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", "1");
 #else
     unsetenv("APS5_FRAME_CAPTURE");
+    if (options.nsight) {
+        setenv("APS5_VULKAN_DEBUG", "1", 1);
+        setenv("APS5_CPU_FLIP_IN_ORDER", "1", 1);
+    }
     if (!options.coldPipelines) setenv("APS5_HEADLESS_PIPELINE_CACHE", "1", 1);
 #endif
     int code = 2;

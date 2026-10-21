@@ -36,6 +36,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return DrawVerdict::Drawn;
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
+    drawParameters.debugSubmission = submission.serial;
+    drawParameters.debugPacketOffset = static_cast<std::size_t>(packet.data() - submission.commands.data());
+    drawParameters.debugQueue = submission.queue;
     const bool pipelined = DrawPipeline::Active();
     static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
     if (pipelined && drawParameters.indirect) {
@@ -566,6 +569,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             }
             Pm4::DrawParameters direct{0, arguments.count, 0, arguments.instances, drawParameters.flags, drawParameters.indexed, 0, 0};
+            direct.debugSubmission = drawParameters.debugSubmission;
+            direct.debugPacketOffset = drawParameters.debugPacketOffset;
+            direct.debugQueue = drawParameters.debugQueue;
             if (drawParameters.indexed) {
 
                 if (arguments.firstVertexOrIndex >= drawParameters.indexCount) continue;

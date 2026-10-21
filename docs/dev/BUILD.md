@@ -191,6 +191,14 @@ cmake --build build --target agc_frame_replay
 build/core/libs/prx/libSceAgcDriver/agc_frame_replay capture
 ```
 
+For Nsight Graphics, pass `--nsight` to the replay and select the `VK_frame_boundary` delimiter. This enables optional `VK_EXT_debug_utils` labels and `VK_EXT_frame_boundary`, and orders CPU flips behind earlier submissions. Draw labels identify the replay driver's accepted submission, guest queue and packet dword offset; `--trace-serials` maps accepted submissions back to captured calls. Dispatch labels identify the guest program address, translated shader variant and workgroup counts. The driver prints which extensions are available; frame boundaries are normally unavailable outside a supporting capture tool. Normal replay does not enable these annotations.
+
+```sh
+ngfx-capture --exe /path/to/agc_frame_replay --args "/path/to/capture --nsight --repeat 3 --trace-serials" --delimiter-vk-frame-boundary-ext --capture-frame 2 --frame-count 1 --terminate-after-capture --output-file replay.ngfx-capture
+```
+
+Choose a later capture frame to exclude cache warmup. Frame numbers count flips across repeat passes: for a six-frame capture, frame 8 is the second frame of the second pass. Instrumented runs include capture overhead and CPU flip ordering; measure performance separately with ordinary replay. The exported Vulkan capture fixes the translator's output, so testing translator changes still requires the original AnyPS5 capture.
+
 On Windows use `agc_frame_replay.exe` and prepend `build/core/libs/libs/unpatched` to the process `PATH`. With `BUILD_TESTING=ON`, `agc_frame_capture` checks the file format (round trip, zero-block elision, truncated and corrupt files), and `agc_driver_frame_capture_eop` reserves and submits six EOP flips with `APS5_FRAME_CAPTURE_FRAMES=3` and checks that the capture starts after the first flipping submission and holds three frames of one reservation and one submission each, and `agc_driver_frame_replay` captures two frames of CPU writes followed by DMA copies, replays them in `agc_frame_replay`, once and with `--repeat 3`, and compares the copies.
 
 ## Pipeline statistics

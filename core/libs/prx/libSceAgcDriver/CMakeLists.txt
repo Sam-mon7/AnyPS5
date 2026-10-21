@@ -2786,6 +2786,20 @@ endif()
 set_target_properties(agc_frame_replay PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_frame_replay)
 
+if(BUILD_TESTING)
+    add_test_executable(agc_debug_annotations_tests tests/DebugAnnotations.cpp)
+    target_include_directories(agc_debug_annotations_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
+    target_link_libraries(agc_debug_annotations_tests PRIVATE libSceAgcDriver libkernel libc)
+    configure_windows_unwind(agc_debug_annotations_tests)
+    add_test(NAME agc_debug_annotations COMMAND agc_debug_annotations_tests)
+    add_test(NAME agc_debug_annotations_gpu COMMAND agc_debug_annotations_tests --gpu)
+    set_tests_properties(agc_debug_annotations_gpu PROPERTIES ENVIRONMENT "APS5_VULKAN_DEBUG=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_debug_annotations agc_debug_annotations_gpu PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_executable(agc_pm4_replay EXCLUDE_FROM_ALL
         tools/Pm4Replay.cpp
         tools/Pm4Analysis.cpp

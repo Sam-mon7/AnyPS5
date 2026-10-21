@@ -269,6 +269,11 @@ struct WorkgroupMemory {
 
 struct VulkanDevice::State {
     bool compileOnly = false;
+    bool debugAnnotations = false;
+    bool frameBoundary = false;
+    std::uint64_t debugFrame = 0;
+    PFN_vkCmdBeginDebugUtilsLabelEXT beginDebugLabel = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT endDebugLabel = nullptr;
     void* library = nullptr;
     PFN_vkGetInstanceProcAddr instanceProc = nullptr;
     PFN_vkGetDeviceProcAddr deviceProc = nullptr;
@@ -997,6 +1002,7 @@ VulkanDevice::VulkanDevice(CompileOnly) : VulkanDevice(nullptr, true) {}
 
 VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
     state->compileOnly = compileOnly;
+    const bool debugAnnotations = !compileOnly && std::getenv("APS5_VULKAN_DEBUG") != nullptr;
     APS5_LOG_OUT("VulkanDevice constructor window=%p", static_cast<const void*>(window));
 #ifdef _WIN32
     state->library = SDL_LoadObject("vulkan-1.dll");
@@ -1043,6 +1049,17 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
     }
+    if (debugAnnotations) {
+        const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties");
+        std::uint32_t availableCount = 0;
+        check(enumerateExtensions(nullptr, &availableCount, nullptr), "vkEnumerateInstanceExtensionProperties");
+        std::vector<VkExtensionProperties> available(availableCount);
+        check(enumerateExtensions(nullptr, &availableCount, available.data()), "vkEnumerateInstanceExtensionProperties");
+        state->debugAnnotations = std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; });
+        if (state->debugAnnotations && std::none_of(instanceExtensions.begin(), instanceExtensions.end(), [](const auto* name) { return std::strcmp(name, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; })) instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+    create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+    create.ppEnabledExtensionNames = instanceExtensions.data();
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));
     if (window != nullptr) {
@@ -1930,10 +1947,28 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
     deviceInfo.pNext = &bdaFeatures;
+    VkPhysicalDeviceFrameBoundaryFeaturesEXT frameBoundaryFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAME_BOUNDARY_FEATURES_EXT};
+    if (debugAnnotations && hasExtension(VK_EXT_FRAME_BOUNDARY_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 queried{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &frameBoundaryFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &queried);
+        if (frameBoundaryFeatures.frameBoundary == VK_TRUE) {
+            state->frameBoundary = true;
+            frameBoundaryFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
+            deviceInfo.pNext = &frameBoundaryFeatures;
+            deviceExtensions.push_back(VK_EXT_FRAME_BOUNDARY_EXTENSION_NAME);
+            deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+            deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+        }
+    }
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->shaderProfile = std::move(shaderProfile);
     if (compileOnly) return;
+    if (state->debugAnnotations) {
+        state->beginDebugLabel = state->DeviceFunction<PFN_vkCmdBeginDebugUtilsLabelEXT>("vkCmdBeginDebugUtilsLabelEXT");
+        state->endDebugLabel = state->DeviceFunction<PFN_vkCmdEndDebugUtilsLabelEXT>("vkCmdEndDebugUtilsLabelEXT");
+    }
+    if (debugAnnotations) std::fprintf(stderr, "[gpu-debug] labels=%s frame_boundary=%s\n", state->debugAnnotations ? "enabled" : "unavailable", state->frameBoundary ? "enabled" : "unavailable (launch under a tool supporting VK_EXT_frame_boundary)");
     if (calibratedTimestamps != nullptr) {
         const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
         const auto domains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(state->instanceProc(state->instance, khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
@@ -3713,6 +3748,12 @@ Graphics::Context VulkanDevice::graphicsContext() const {
     return buildContext();
 }
 
+void VulkanDevice::MarkFrameBoundary() {
+    if (!state->frameBoundary) return;
+    SubmitRecorded(false);
+    graphicsContext().MarkFrameBoundary(++state->debugFrame);
+}
+
 Graphics::Context VulkanDevice::buildContext() const {
     auto context = Graphics::Context{
         state->device,
@@ -3757,6 +3798,9 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
     context.vertexInputs = state->vertexInputs.get();
+    context.beginDebugLabel = state->beginDebugLabel;
+    context.endDebugLabel = state->endDebugLabel;
+    context.frameBoundary = state->frameBoundary;
     context.samplerCache = state->samplerCache.get();
     context.drawIndirectFirstInstance = state->drawIndirectFirstInstance;
     context.multiDrawIndirect = state->multiDrawIndirect;
@@ -4829,6 +4873,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
+    Graphics::DebugLabel label(context, commands, "AnyPS5 Dispatch program=0x%llx variant=0x%llx groups=%ux%ux%u indirect=0x%llx",
+                               static_cast<unsigned long long>(record.programAddress), static_cast<unsigned long long>(record.shader->program->variantId),
+                               record.x, record.y, record.z, static_cast<unsigned long long>(record.arguments));
     if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, indirectBuffer, indirectOffset);
     } else {
@@ -4866,6 +4913,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             }
         }
     }
+    label.End();
     recorder.EndGpuTiming(gpuTiming);
     const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
