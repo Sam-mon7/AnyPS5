@@ -64,6 +64,7 @@ struct Options {
     std::chrono::milliseconds memoryPaceTimeout{10000};
     std::chrono::milliseconds releaseAfter{3};
     std::chrono::milliseconds drainTimeout{10000};
+    std::chrono::milliseconds busyDrainTimeout{600000};
     bool release = true;
     bool synthesize = true;
     std::size_t repeat = 1;
@@ -295,9 +296,24 @@ struct Replay {
 
     void report() const {
         const auto [accepted, completed] = progress();
-        std::fprintf(stderr, "[frame-replay] %llu submits, %zu frames ready, %.1f s since the first frame, pacing waited %.1f s (%llu timeouts), serials %llu/%llu\n",
+        std::fprintf(stderr, "[frame-replay] %llu submits, %zu frames ready, %.1f s since the first frame, pacing waited %.1f s (%llu timeouts), serials %llu/%llu, blocked on%s\n",
                      static_cast<unsigned long long>(submits.load()), frames.Times().size(), std::chrono::duration<double>(Clock::now() - startedAt).count(), paceWaitedSeconds(),
-                     static_cast<unsigned long long>(paceTimeouts.load()), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
+                     static_cast<unsigned long long>(paceTimeouts.load()), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), describeBlocked().c_str());
+    }
+
+    static std::string describeBlocked() {
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        std::string text;
+        for (std::size_t slot = 0; slot < count; ++slot) {
+            const auto& wait = awaited[slot];
+            if (wait.address == 0) continue;
+            char entry[128];
+            std::snprintf(entry, sizeof(entry), " 0x%llx (function %u, reference 0x%llx, mask 0x%llx, now 0x%llx)", static_cast<unsigned long long>(wait.address), static_cast<unsigned>(wait.function),
+                          static_cast<unsigned long long>(wait.reference), static_cast<unsigned long long>(wait.mask), static_cast<unsigned long long>(load(wait.address, wait.bytes == 8 ? 8 : 4)));
+            text += entry;
+        }
+        return text.empty() ? " nothing" : text;
     }
 
     static bool paced(FrameCallKind kind) {
@@ -559,16 +575,23 @@ struct Replay {
     void drain() {
         auto lastCompleted = progress().second;
         auto lastProgress = Clock::now();
+        auto lastReport = lastProgress;
         while (true) {
             const auto [accepted, completed] = progress();
             unfinished = accepted - completed;
             if (unfinished == 0) return;
+            const auto now = Clock::now();
             if (completed != lastCompleted) {
                 lastCompleted = completed;
-                lastProgress = Clock::now();
-            } else if (Clock::now() - lastProgress >= options.drainTimeout) {
-                std::fprintf(stderr, "[frame-replay] %llu submissions did not complete after the last captured call (serials %llu/%llu)\n", static_cast<unsigned long long>(unfinished),
-                             static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
+                lastProgress = now;
+            } else if (now - lastReport >= options.drainTimeout) {
+                lastReport = now;
+                std::fprintf(stderr, "[frame-replay] draining: %llu submissions pending for %.0f s (serials %llu/%llu), blocked on%s\n", static_cast<unsigned long long>(unfinished),
+                             std::chrono::duration<double>(now - lastProgress).count(), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), describeBlocked().c_str());
+            }
+            if (now - lastProgress >= options.busyDrainTimeout) {
+                std::fprintf(stderr, "[frame-replay] %llu submissions did not complete after the last captured call (serials %llu/%llu), blocked on%s\n", static_cast<unsigned long long>(unfinished),
+                             static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), describeBlocked().c_str());
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
