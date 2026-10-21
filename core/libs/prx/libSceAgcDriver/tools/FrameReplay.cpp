@@ -73,6 +73,7 @@ struct Options {
     std::filesystem::path shaderCode;
     std::size_t submits = 0;
     bool traceSerials = false;
+    bool coldPipelines = false;
 };
 
 class Frames {
@@ -640,7 +641,7 @@ struct Replay {
 
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict]\n"
-                         "                        [--repeat <n>] [--dump <address>:<bytes>:<file>]...\n"
+                         "                        [--repeat <n>] [--cold-pipelines] [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
@@ -650,6 +651,7 @@ int usage() {
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
+                         "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
                          "  --shaders           replays nothing and maps no guest memory; lists each shader registration with its code\n"
                          "                      address, size and code hash as the snapshot and the captured writes before it hold them,\n"
                          "                      and how many registrations share that code\n"
@@ -997,6 +999,9 @@ int run(const Options& options) {
     const auto& calls = reader.Calls();
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
     for (auto call = calls.begin(); call != frameStart; ++call) replay.execute(*call);
+    const auto journalStart = Clock::now();
+    AgcDriverWaitForPipelineJournal_nid_postfix();
+    const auto journalSeconds = std::chrono::duration<double>(Clock::now() - journalStart).count();
     std::set<std::uint32_t> initialOutputs;
     for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
     std::vector<Pass> passes;
@@ -1065,14 +1070,14 @@ int run(const Options& options) {
         frames += measured.frames;
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
-                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count());
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds);
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }
@@ -1099,6 +1104,7 @@ int main(int argc, char** argv) {
             options.submits = std::strtoull(argv[++index], &end, 10);
             if (options.submits == 0 || end == argv[index] || *end != '\0') return usage();
         } else if (argument == "--trace-serials") options.traceSerials = true;
+        else if (argument == "--cold-pipelines") options.coldPipelines = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
@@ -1107,8 +1113,10 @@ int main(int argc, char** argv) {
     if (options.directory.empty()) return usage();
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
+    if (!options.coldPipelines) _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", "1");
 #else
     unsetenv("APS5_FRAME_CAPTURE");
+    if (!options.coldPipelines) setenv("APS5_HEADLESS_PIPELINE_CACHE", "1", 1);
 #endif
     int code = 2;
     try {
