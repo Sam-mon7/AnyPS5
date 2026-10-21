@@ -581,27 +581,27 @@ struct Replay {
     void drain() {
         auto lastCompleted = progress().second;
         auto lastProgress = Clock::now();
+        auto lastReport = lastProgress;
         while (true) {
             const auto [accepted, completed] = progress();
             unfinished = accepted - completed;
             if (unfinished == 0) return;
-            const auto quiet = Clock::now() - lastProgress;
+            const auto now = Clock::now();
             if (completed != lastCompleted) {
                 lastCompleted = completed;
-                lastProgress = Clock::now();
-            } else if (quiet >= options.drainTimeout && (blockedQueues() != 0 || quiet >= options.busyDrainTimeout)) {
+                lastProgress = now;
+            } else if (now - lastReport >= options.drainTimeout) {
+                lastReport = now;
+                std::fprintf(stderr, "[frame-replay] draining: %llu submissions pending for %.0f s (serials %llu/%llu), blocked on%s\n", static_cast<unsigned long long>(unfinished),
+                             std::chrono::duration<double>(now - lastProgress).count(), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), describeBlocked().c_str());
+            }
+            if (now - lastProgress >= options.busyDrainTimeout) {
                 std::fprintf(stderr, "[frame-replay] %llu submissions did not complete after the last captured call (serials %llu/%llu), blocked on%s\n", static_cast<unsigned long long>(unfinished),
                              static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), describeBlocked().c_str());
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-    }
-
-    static std::size_t blockedQueues() {
-        std::array<AgcDriver::AwaitedWait, 64> awaited{};
-        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
-        return static_cast<std::size_t>(std::count_if(awaited.begin(), awaited.begin() + static_cast<std::ptrdiff_t>(count), [](const AgcDriver::AwaitedWait& wait) { return wait.address != 0; }));
     }
 
     template <typename TFunction>
