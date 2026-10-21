@@ -2607,8 +2607,15 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
         std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
         return;
     }
-    std::memset(destination.data(), 0, destination.size());
-    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+    static const bool zeroWhole = std::getenv("APS5_ZERO_WHOLE_COMMITTED_READS") != nullptr;
+    if (zeroWhole) std::memset(destination.data(), 0, destination.size());
+    auto zeroedTo = address;
+    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) {
+        if (!zeroWhole && begin > zeroedTo) std::memset(destination.data() + (zeroedTo - address), 0, static_cast<std::size_t>(begin - zeroedTo));
+        std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+        zeroedTo = end;
+    }
+    if (!zeroWhole && zeroedTo < address + destination.size()) std::memset(destination.data() + (zeroedTo - address), 0, static_cast<std::size_t>(address + destination.size() - zeroedTo));
 }
 
 }

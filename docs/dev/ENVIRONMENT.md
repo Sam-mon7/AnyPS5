@@ -476,6 +476,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_WRITE_WATCH_IMPORTS` | string | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | how host imports are write-tracked: `probe`, `watch` or `unwatch` |
 | `APS5_WRITTEN_SHADOW_MAX_KIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 2048 (8192 on a discrete GPU) | upper bound in KiB of the written staging window; a set value is used as given on both device types |
 | `APS5_WRITTEN_SHADOW_MIN_KIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 16 | lower bound in KiB of the written staging window |
+| `APS5_ZERO_WHOLE_COMMITTED_READS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp` |  | zeroes the whole destination of a committed read that is not fully accessible before copying its committed runs over it, instead of zeroing only the gaps between them |
 
 ### libSceAjm.native
 
