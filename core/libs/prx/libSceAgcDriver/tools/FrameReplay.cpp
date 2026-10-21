@@ -651,7 +651,8 @@ int usage() {
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --shaders           replays nothing and maps no guest memory; lists each shader registration with its code\n"
-                         "                      address, size and code hash from the snapshot, and how many registrations share that code\n"
+                         "                      address, size and code hash as the snapshot and the captured writes before it hold them,\n"
+                         "                      and how many registrations share that code\n"
                          "  --shader-code <dir> as --shaders, and writes each distinct code as <dir>/type<n>-<hash>.bin\n"
                          "  --trace-serials     prints each submission, flip and suspend point with its call ordinal and command\n"
                          "                      address as it is issued; with APS5_TRACE_GPU the driver prints the serial it accepts\n"
@@ -793,7 +794,18 @@ public:
             }
             at = end;
         }
+        for (const auto* delta : deltas) {
+            const auto begin = std::max(address, delta->address);
+            const auto end = std::min(address + bytes, delta->address + delta->bytes);
+            if (begin >= end) continue;
+            const auto data = reader.Read(*delta);
+            std::memcpy(result.data() + (begin - address), data.data() + (begin - delta->address), static_cast<std::size_t>(end - begin));
+        }
         return result;
+    }
+
+    void Apply(std::span<const FrameMemoryChunk* const> chunks) {
+        deltas.insert(deltas.end(), chunks.begin(), chunks.end());
     }
 
 private:
@@ -815,6 +827,7 @@ private:
     const FrameCaptureReader& reader;
     std::vector<const FrameMemoryChunk*> snapshots;
     std::vector<const FrameMemoryChunk*> ranges;
+    std::vector<const FrameMemoryChunk*> deltas;
     const FrameMemoryChunk* cached = nullptr;
     std::vector<std::byte> data;
 };
@@ -823,11 +836,19 @@ int listShaders(const Options& options) {
     const FrameCaptureReader reader(options.directory);
     CapturedMemory memory(reader);
     if (!options.shaderCode.empty()) std::filesystem::create_directories(options.shaderCode);
+    std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Delta) groups[chunk.group].push_back(&chunk);
+    }
     const auto& calls = reader.Calls();
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
     std::map<std::uint64_t, std::size_t> copies;
     std::size_t listed = 0, inWindow = 0, unreadable = 0;
     for (auto call = calls.begin(); call != calls.end(); ++call) {
+        if (call->kind == FrameCallKind::Memory) {
+            if (const auto found = groups.find(call->values.at(0)); found != groups.end()) memory.Apply(found->second);
+            continue;
+        }
         if (call->kind != FrameCallKind::RegisterShader) continue;
         const auto header = memory.Read(call->address, sizeof(Shader));
         if (!header) {
