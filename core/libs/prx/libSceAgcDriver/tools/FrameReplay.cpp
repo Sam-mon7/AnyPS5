@@ -70,6 +70,7 @@ struct Options {
     bool synthesize = true;
     std::size_t repeat = 1;
     bool shaders = false;
+    std::size_t submits = 0;
 };
 
 class Frames {
@@ -638,6 +639,8 @@ int usage() {
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --shaders           replays nothing; lists each shader registration with its code address, size and code\n"
                          "                      hash, and how many registrations share that code\n"
+                         "  --submits <n>       replays nothing; lists the first n submissions and flips of the captured frames with\n"
+                         "                      their queue and serials, the packets of each and the fields of its waits and releases\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
     return 2;
@@ -789,6 +792,93 @@ int listShaders(const Options& options) {
     return 0;
 }
 
+std::string_view packetName(std::uint32_t opcode) {
+    switch (opcode) {
+    case 0x10: return "NOP";
+    case 0x15: return "DISPATCH_DIRECT";
+    case 0x16: return "DISPATCH_INDIRECT";
+    case 0x27: return "DRAW_INDEX_2";
+    case 0x2d: return "DRAW_INDEX_AUTO";
+    case 0x35: return "DRAW_INDEX_OFFSET_2";
+    case 0x37: return "WRITE_DATA";
+    case 0x3c: return "WAIT_REG_MEM";
+    case 0x3f: return "INDIRECT_BUFFER";
+    case 0x46: return "EVENT_WRITE";
+    case 0x49: return "RELEASE_MEM";
+    case 0x50: return "DMA_DATA";
+    case 0x58: return "ACQUIRE_MEM";
+    case 0x69: return "SET_CONTEXT_REG";
+    case 0x76: return "SET_SH_REG";
+    case 0x79: return "SET_UCONFIG_REG";
+    default: return {};
+    }
+}
+
+void describeSubmission(const FrameCall& call) {
+    const auto* words = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(call.address));
+    if (!readable(call.address, call.size * sizeof(std::uint32_t))) {
+        std::printf("    (command buffer not readable)\n");
+        return;
+    }
+    std::map<std::string, std::size_t> counts;
+    for (std::size_t at = 0; at < call.size;) {
+        const auto header = words[at];
+        const auto type = header >> 30u;
+        const auto length = type == 3u ? static_cast<std::size_t>((header >> 16u) & 0x3fffu) + 2u : 1u;
+        if (type == 3u) {
+            const auto opcode = (header >> 8u) & 0xffu;
+            const auto name = packetName(opcode);
+            char label[24];
+            std::snprintf(label, sizeof(label), "0x%02x", opcode);
+            const std::string key = name.empty() ? std::string(label) : std::string(name);
+            const auto word = [&](std::size_t index) { return at + index < call.size ? words[at + index] : 0u; };
+            if (opcode == 0x3c) {
+                std::printf("    @%zu WAIT_REG_MEM function %u space %u address 0x%llx reference 0x%x mask 0x%x\n", at, word(1) & 7u, (word(1) >> 4u) & 3u,
+                            static_cast<unsigned long long>(word(2)) | (static_cast<unsigned long long>(word(3)) << 32u), word(4), word(5));
+            } else if (opcode == 0x49 || opcode == 0x37 || opcode == 0x46) {
+                std::printf("    @%zu %s", at, key.c_str());
+                for (std::size_t index = 1; index < length && index < 8; ++index) std::printf(" %08x", word(index));
+                std::printf("\n");
+            }
+            ++counts[key];
+        }
+        at += length;
+    }
+    std::printf("    packets:");
+    for (const auto& [name, count] : counts) std::printf(" %s x%zu", name.c_str(), count);
+    std::printf("\n");
+}
+
+int listSubmits(const Options& options) {
+    const FrameCaptureReader reader(options.directory);
+    const auto skipped = restoreMemory(reader);
+    std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Delta) groups[chunk.group].push_back(&chunk);
+    }
+    const auto& calls = reader.Calls();
+    const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
+    std::size_t listed = 0;
+    for (auto call = frameStart; call != calls.end() && listed < options.submits; ++call) {
+        if (call->kind == FrameCallKind::Memory) {
+            if (const auto found = groups.find(call->values.at(0)); found != groups.end()) {
+                for (const auto* chunk : found->second) {
+                    if (!skipped.Overlaps(*chunk)) restore(reader, *chunk);
+                }
+            }
+            continue;
+        }
+        if (call->kind != FrameCallKind::Submit && call->kind != FrameCallKind::Flip && call->kind != FrameCallKind::ReserveEopFlip) continue;
+        ++listed;
+        std::printf("#%zu ordinal %llu %s thread %llu queue 0x%x serials %llu/%llu address 0x%llx dwords %llu\n", listed, static_cast<unsigned long long>(call->ordinal), std::string(AgcDriver::FrameCallName(call->kind)).c_str(),
+                    static_cast<unsigned long long>(call->thread), call->queue, static_cast<unsigned long long>(call->completed), static_cast<unsigned long long>(call->accepted),
+                    static_cast<unsigned long long>(call->address), static_cast<unsigned long long>(call->size));
+        if (call->kind == FrameCallKind::Submit) describeSubmission(*call);
+    }
+    std::fflush(stdout);
+    return 0;
+}
+
 struct Pass {
     std::size_t firstFrame = 0;
     std::size_t frames = 0;
@@ -910,6 +1000,7 @@ int main(int argc, char** argv) {
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--repeat" && index + 1 < argc) options.repeat = std::max<std::size_t>(1, std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--shaders") options.shaders = true;
+        else if (argument == "--submits" && index + 1 < argc) options.submits = std::strtoull(argv[++index], nullptr, 10);
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
@@ -923,8 +1014,9 @@ int main(int argc, char** argv) {
 #endif
     int code = 2;
     try {
-        code = options.shaders ? listShaders(options) : run(options);
-        if (code == 0 && !options.shaders) {
+        const bool listing = options.shaders || options.submits != 0;
+        code = options.shaders ? listShaders(options) : options.submits != 0 ? listSubmits(options) : run(options);
+        if (code == 0 && !listing) {
             AgcDriverShutdown_nid_postfix();
             return 0;
         }
