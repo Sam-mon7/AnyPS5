@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,21 @@ class WindowsMappings {
 public:
     enum class Collection { All, Armed, Fresh };
 
+    struct RegionCacheStatistics {
+        std::uint64_t hits = 0;
+        std::uint64_t regionQueries = 0;
+        std::uint64_t validationQueries = 0;
+        std::uint64_t queryNanoseconds = 0;
+        std::uint64_t generationInvalidations = 0;
+        std::uint64_t mappingInvalidations = 0;
+        std::uint64_t writeWatchRetries = 0;
+    };
+
+    RegionCacheStatistics RegionCacheStats() {
+        std::lock_guard lock(mutex);
+        return regionStats;
+    }
+
     static WindowsMappings& Get() {
         static auto* mappings = new WindowsMappings;
         return *mappings;
@@ -32,7 +48,7 @@ public:
     void CacheRegionsUntil(std::uint64_t (*generation)()) {
         std::lock_guard lock(mutex);
         regionsGeneration = generation;
-        privateRegions.clear();
+        invalidatePrivateRegions();
     }
 
     void* Reserve(void* address, std::size_t bytes) {
@@ -43,7 +59,7 @@ public:
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
         std::lock_guard lock(mutex);
         collectableRanges.clear();
-        privateRegions.clear();
+        invalidatePrivateRegions();
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
         for (auto cursor = reinterpret_cast<std::uintptr_t>(address); cursor < end;) {
             const auto memory = query(cursor);
@@ -88,7 +104,7 @@ public:
         if (sectionBytes < bytes && (resident || sectionBytes == 0 || bytes - sectionBytes >= pageBytes)) throw std::runtime_error("shared guest mapping extends a whole page past its section");
         std::lock_guard lock(mutex);
         collectableRanges.clear();
-        privateRegions.clear();
+        invalidatePrivateRegions();
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         if (createdPrivate != nullptr) createdPrivate->reserve(createdPrivate->size() + bytes / pageBytes);
         reset(cursor, bytes);
@@ -164,7 +180,7 @@ public:
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
         collectableRanges.clear();
-        privateRegions.clear();
+        invalidatePrivateRegions();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
             it->second.armed = 0;
@@ -337,6 +353,7 @@ public:
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
         std::lock_guard lock(mutex);
+        if (profileRegions) reportRegions();
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -478,6 +495,7 @@ public:
                 DWORD granularity = 0;
                 if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) {
                     if (!region.cached) fail("collect private guest writes");
+                    if (profileRegions) ++regionStats.writeWatchRetries;
                     privateRegions.clear();
                     continue;
                 }
@@ -491,6 +509,32 @@ public:
     }
 
 private:
+    void invalidatePrivateRegions() {
+        if (profileRegions && !privateRegions.empty()) ++regionStats.mappingInvalidations;
+        privateRegions.clear();
+    }
+
+    MEMORY_BASIC_INFORMATION collectQuery(std::uintptr_t address, bool validation) {
+        if (!profileRegions) return query(address);
+        const auto start = std::chrono::steady_clock::now();
+        const auto memory = query(address);
+        regionStats.queryNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+        if (validation) ++regionStats.validationQueries;
+        else ++regionStats.regionQueries;
+        return memory;
+    }
+
+    void reportRegions() {
+        const auto now = GetTickCount64();
+        if (now - regionReportTime < 10000) return;
+        regionReportTime = now;
+        std::fprintf(stderr, "[guest-regions] cumulative: hits=%llu region_queries=%llu validation_queries=%llu query_ms=%.3f generation_invalidations=%llu mapping_invalidations=%llu write_watch_retries=%llu entries=%zu\n",
+            static_cast<unsigned long long>(regionStats.hits), static_cast<unsigned long long>(regionStats.regionQueries),
+            static_cast<unsigned long long>(regionStats.validationQueries), regionStats.queryNanoseconds / 1e6,
+            static_cast<unsigned long long>(regionStats.generationInvalidations), static_cast<unsigned long long>(regionStats.mappingInvalidations),
+            static_cast<unsigned long long>(regionStats.writeWatchRetries), privateRegions.size());
+    }
+
     struct PrivateRegion {
         std::uintptr_t end = 0;
         bool committed = false;
@@ -503,16 +547,18 @@ private:
         if (cache) {
             const auto generation = regionsGeneration();
             if (generation != privateRegionsGeneration) {
+                if (profileRegions && !privateRegions.empty()) ++regionStats.generationInvalidations;
                 privateRegions.clear();
                 privateRegionsGeneration = generation;
             }
             if (const auto found = privateRegions.upper_bound(address); found != privateRegions.begin() && address < std::prev(found)->second.end) {
+                if (profileRegions) ++regionStats.hits;
                 auto region = std::prev(found)->second;
                 region.cached = true;
                 return region;
             }
         }
-        const auto memory = query(address);
+        const auto memory = collectQuery(address, false);
         const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
         const PrivateRegion region{base + memory.RegionSize, memory.State == MEM_COMMIT && memory.Type == MEM_PRIVATE, false};
         if (cache) privateRegions[base] = region;
@@ -530,7 +576,7 @@ private:
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
-            const auto memory = query(cursor);
+            const auto memory = collectQuery(cursor, true);
             if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
             cursor = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
         }
@@ -858,7 +904,7 @@ private:
 
     void reset(std::uintptr_t address, std::size_t bytes) {
         collectableRanges.clear();
-        privateRegions.clear();
+        invalidatePrivateRegions();
         const auto end = address + bytes;
         forgetClean(address, end);
         breakRun(address);
@@ -939,6 +985,9 @@ private:
 
     Ranges cleanRanges;
     Ranges collectableRanges;
+    const bool profileRegions = std::getenv("APS5_PROFILE_GUEST_REGIONS") != nullptr;
+    RegionCacheStatistics regionStats;
+    ULONGLONG regionReportTime = GetTickCount64();
     std::map<std::uintptr_t, PrivateRegion> privateRegions;
     std::uint64_t privateRegionsGeneration = 0;
     std::uint64_t (*regionsGeneration)() = nullptr;

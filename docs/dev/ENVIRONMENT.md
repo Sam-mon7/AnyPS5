@@ -539,6 +539,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_HELPER_AFFINITY_MASK` | integer | `core/libs/prx/libc/include/CpuTopology.hpp` |  | hex core mask that helper threads (deferred release, mirror refresh) are pinned to |
 | `APS5_LOG_TIMESTAMPS` | presence | `core/libs/prx/libc/include/general/LogMacros.hpp` |  | prefixes each log line with the milliseconds since the first log |
 | `APS5_NO_GUEST_REGION_CACHE` | presence | `core/libs/prx/libc/include/WindowsMappings.hpp` |  | queries the extent of private guest memory before every write-watch collection instead of remembering it until the guest allocations or their mappings change |
+| `APS5_PROFILE_GUEST_REGIONS` | presence | `core/libs/prx/libc/include/WindowsMappings.hpp` |  | prints cumulative private-region cache hits, collection and validation query counts, total query time, generation and mapping invalidations that discarded entries, write-watch retries and current entries every 10 seconds during collection; absent by default |
 | `APS5_NO_PROCMAP_QUERY` | presence | `core/libs/prx/libc/include/specifics/linux/HostMapping.hpp` |  | skips the /proc/self/maps PROCMAP_QUERY ioctl and scans the maps file instead |
 | `APS5_NO_SSE4A_EMULATION` | presence | `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp` |  | disables emulation of AMD-only SSE4a instructions, making such a fault fatal |
 | `APS5_NO_WRITE_WATCH` | presence | `core/libs/prx/libc/src/GuestArena.cpp` |  | disables write watching so guest buffers are fully re-read on every use |

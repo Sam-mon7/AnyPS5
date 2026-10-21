@@ -12,6 +12,11 @@ using Collection = Mappings::Collection;
 constexpr std::size_t Small = 4096;
 constexpr std::size_t Bytes = 65536;
 std::atomic<unsigned> faults{0};
+std::uint64_t allocationGeneration = 1;
+
+std::uint64_t AllocationGeneration() {
+    return allocationGeneration;
+}
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -172,6 +177,119 @@ void CheckPrivate() {
     VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+std::set<std::size_t> CollectPrivate(unsigned char* memory, std::size_t bytes, bool clear = true, std::size_t capacity = 32) {
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    const auto end = address + bytes;
+    std::set<std::size_t> result;
+    for (auto cursor = address; cursor < end;) {
+        std::array<void*, 32> pages{};
+        auto count = capacity;
+        Require(Mappings::Get().Collect(cursor, end - cursor, pages.data(), &count, clear), "private collection failed");
+        for (std::size_t i = 0; i < count; ++i) result.insert((reinterpret_cast<std::uintptr_t>(pages[i]) - address) / Small);
+        if (count < capacity) break;
+        cursor = reinterpret_cast<std::uintptr_t>(pages[count - 1]) + Small;
+    }
+    return result;
+}
+
+void CheckPrivateRegions() {
+    auto& mappings = Mappings::Get();
+    const bool cached = std::getenv("APS5_NO_GUEST_REGION_CACHE") == nullptr;
+    auto* memory = static_cast<unsigned char*>(mappings.Reserve(nullptr, 2 * Bytes));
+    Require(memory != nullptr, "private regions reservation failed");
+    mappings.Commit(memory, 2 * Bytes, PAGE_READWRITE, Bytes, true);
+    CollectPrivate(memory, 2 * Bytes);
+    const auto before = mappings.RegionCacheStats();
+    static_cast<volatile unsigned char*>(memory)[Small] = 1;
+    static_cast<volatile unsigned char*>(memory)[Bytes + Small] = 2;
+    const std::set<std::size_t> written{1, 17};
+    Require(CollectPrivate(memory, 2 * Bytes, false) == written, "cached collect lost a write across allocations");
+    Require(CollectPrivate(memory, 2 * Bytes, false) == written, "nonreset collect consumed private writes");
+    Require(CollectPrivate(memory, 2 * Bytes, true, 1) == written, "small output buffers lost private writes");
+    Require(CollectPrivate(memory, 2 * Bytes).empty(), "cached collect did not reset private writes");
+    const auto after = mappings.RegionCacheStats();
+    Require(cached ? after.hits > before.hits && after.regionQueries == before.regionQueries
+                   : after.hits == before.hits && after.regionQueries > before.regionQueries,
+            "private region cache did not follow its enable flag");
+
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    mappings.SetProtection(address + 4 * Small, Small, PAGE_READONLY);
+    DWORD previous;
+    Require(VirtualProtect(memory + 4 * Small, Small, PAGE_READONLY, &previous), "cannot split private protection");
+    static_cast<volatile unsigned char*>(memory)[5 * Small] = 3;
+    Require(CollectPrivate(memory, Bytes) == Pages(5, 6), "protection split lost a private write");
+    const auto protectedStats = mappings.RegionCacheStats();
+    Require(protectedStats.regionQueries > after.regionQueries, "protection change kept cached extents");
+    if (cached) Require(protectedStats.mappingInvalidations == after.mappingInvalidations + 1, "protection invalidation was not counted");
+
+    mappings.Reset(memory, Bytes);
+    std::array<void*, 32> pages{};
+    auto count = pages.size();
+    Require(!mappings.Collect(address, Bytes, pages.data(), &count, false), "reset private memory stayed committed in the cache");
+    mappings.Commit(memory, Bytes, PAGE_READWRITE, Bytes, true);
+    static_cast<volatile unsigned char*>(memory)[6 * Small] = 4;
+    Require(CollectPrivate(memory, 2 * Bytes) == Pages(6, 7), "recommit retained a cached uncommitted region");
+
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Bytes, nullptr);
+    Require(section != nullptr, "cannot allocate private replacement section");
+    mappings.Map(memory, Bytes, section, 0, PAGE_READWRITE);
+    Require(CollectPrivate(memory, Bytes) == Pages(0, 16), "mapping a section retained private collection state");
+    mappings.Reset(memory, Bytes);
+    mappings.Reset(memory + Bytes, Bytes);
+    Require(VirtualFree(memory, 0, MEM_RELEASE) && VirtualFree(memory + Bytes, 0, MEM_RELEASE), "cannot release private regions");
+    CloseHandle(section);
+}
+
+void CheckPrivateGeneration() {
+    auto& mappings = Mappings::Get();
+    auto* memory = static_cast<unsigned char*>(VirtualAlloc(nullptr, Bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE));
+    Require(memory != nullptr, "generation test allocation failed");
+    ++allocationGeneration;
+    CollectPrivate(memory, Bytes);
+    const auto before = mappings.RegionCacheStats();
+    Require(VirtualFree(memory, Bytes, MEM_DECOMMIT), "cannot decommit private test memory");
+    ++allocationGeneration;
+    std::array<void*, 32> pages{};
+    auto count = pages.size();
+    Require(!mappings.Collect(reinterpret_cast<std::uintptr_t>(memory), Bytes, pages.data(), &count, false), "generation change kept a decommitted region");
+    if (std::getenv("APS5_NO_GUEST_REGION_CACHE") == nullptr) {
+        Require(mappings.RegionCacheStats().generationInvalidations == before.generationInvalidations + 1, "generation invalidation was not counted");
+    }
+    Require(VirtualAlloc(memory, Bytes, MEM_COMMIT, PAGE_READWRITE) == memory, "cannot recommit private test memory");
+    ++allocationGeneration;
+    static_cast<volatile unsigned char*>(memory)[Small] = 5;
+    Require(CollectPrivate(memory, Bytes) == Pages(1, 2), "generation change retained a negative cache entry");
+    Require(VirtualFree(memory, 0, MEM_RELEASE), "cannot release private test memory");
+    Require(VirtualAlloc(memory, Bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) == memory, "cannot reuse private test address");
+    ++allocationGeneration;
+    static_cast<volatile unsigned char*>(memory)[2 * Small] = 6;
+    Require(CollectPrivate(memory, Bytes) == Pages(2, 3), "address reuse lost a private write");
+    Require(VirtualFree(memory, 0, MEM_RELEASE), "cannot release reused private memory");
+    ++allocationGeneration;
+}
+
+void CheckPrivateRetry() {
+    auto& mappings = Mappings::Get();
+    auto* memory = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2 * Bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE));
+    Require(memory != nullptr, "retry test allocation failed");
+    ++allocationGeneration;
+    CollectPrivate(memory, 2 * Bytes);
+    const auto before = mappings.RegionCacheStats();
+    Require(VirtualFree(memory, 0, MEM_RELEASE), "cannot release retry test memory");
+    Require(VirtualAlloc(memory, Bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) == memory, "cannot reuse first half of retry allocation");
+    Require(VirtualAlloc(memory + Bytes, Bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) == memory + Bytes, "cannot reuse second half of retry allocation");
+    static_cast<volatile unsigned char*>(memory)[Small] = 7;
+    static_cast<volatile unsigned char*>(memory)[Bytes + Small] = 8;
+    const std::set<std::size_t> written{1, 17};
+    Require(CollectPrivate(memory, 2 * Bytes, false) == written, "stale extent retry lost private writes");
+    const auto after = mappings.RegionCacheStats();
+    Require(after.writeWatchRetries - before.writeWatchRetries == (std::getenv("APS5_NO_GUEST_REGION_CACHE") == nullptr ? 1u : 0u), "stale extent did not retry exactly once");
+    Require(CollectPrivate(memory, 2 * Bytes) == written, "retry consumed private writes without reset");
+    Require(CollectPrivate(memory, 2 * Bytes).empty(), "retried private writes did not reset");
+    Require(VirtualFree(memory, 0, MEM_RELEASE) && VirtualFree(memory + Bytes, 0, MEM_RELEASE), "cannot release retry test allocations");
+    ++allocationGeneration;
+}
+
 void CheckForgottenSectionKeepsNoPages() {
     auto& mappings = Mappings::Get();
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Bytes, nullptr);
@@ -218,7 +336,10 @@ void CheckConcurrentWrites() {
 }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    _putenv_s("APS5_PROFILE_GUEST_REGIONS", "1");
+    _putenv_s("APS5_NO_GUEST_REGION_CACHE", argc == 2 && std::string(argv[1]) == "--no-region-cache" ? "0" : "");
+    Mappings::Get().CacheRegionsUntil(AllocationGeneration);
     auto* handler = AddVectoredExceptionHandler(1, HandleWrite);
     try {
         Require(handler != nullptr, "cannot install test handler");
@@ -228,8 +349,12 @@ int main() {
         CheckPinsAndHostWrites();
         CheckFailureAndHoles();
         CheckPrivate();
+        CheckPrivateRegions();
+        CheckPrivateGeneration();
+        CheckPrivateRetry();
         CheckConcurrentWrites();
         CheckForgottenSectionKeepsNoPages();
+        Mappings::Get().CacheRegionsUntil(nullptr);
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
