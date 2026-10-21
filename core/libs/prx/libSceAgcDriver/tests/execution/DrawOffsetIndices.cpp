@@ -78,6 +78,12 @@ alignas(256) constexpr auto NoCarryCode = [] {
     return code;
 }();
 
+alignas(256) constexpr auto UnreadOffsetsCode = [] {
+    auto code = PostAddCode;
+    for (std::size_t word = 2; word < 6; ++word) code[word] = 0xbf800000u;
+    return code;
+}();
+
 alignas(256) constexpr std::array<std::uint32_t, 30> CarryCode{
     0x7e020280, 0x7e040280,
     0xd70f7d05, 0x00020a10,
@@ -327,7 +333,7 @@ public:
         return userData;
     }
 
-    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData) const {
+    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, std::int32_t vertexSgpr = BaseVertexSgpr, std::int32_t instanceSgpr = StartInstanceSgpr) const {
         ShaderRecompiler::ShaderVertexStageInfo info{};
         info.resourcesNum = 2;
         info.resources[0].fields = {BufferTable[0], BufferTable[1], BufferTable[2], BufferTable[3]};
@@ -349,7 +355,7 @@ public:
         };
         request.useCache = false;
         auto result = ShaderRecompiler::Recompile(request);
-        Require(result.vertexOffsetSgpr == static_cast<std::int32_t>(BaseVertexSgpr) && result.instanceOffsetSgpr == static_cast<std::int32_t>(StartInstanceSgpr), "the fetch adds of s16 and s17 were not folded into the draw (vertex " + std::to_string(result.vertexOffsetSgpr) + ", instance " + std::to_string(result.instanceOffsetSgpr) + ")");
+        Require(result.vertexOffsetSgpr == vertexSgpr && result.instanceOffsetSgpr == instanceSgpr, "the program folded vertex " + std::to_string(result.vertexOffsetSgpr) + ", instance " + std::to_string(result.instanceOffsetSgpr) + " into the draw, expected " + std::to_string(vertexSgpr) + ", " + std::to_string(instanceSgpr));
         return result;
     }
 
@@ -557,6 +563,16 @@ std::string Run(Fixture& fixture) {
             fixture.Draw(vertex, draw);
             failures += fixture.Check(what + ", drawn in place on the GPU", bufferIndices, indexedRecord[3], indexedRecord[4], false);
             if (code == &NoCarryCode) std::cout << "no-carry indexed indirect GPU readback checked\n";
+        }
+        {
+            const std::string what = "indexed indirect record whose program never reads the registers its packet writes the offsets to, vertex offset 700, start instance 59455";
+            const auto vertex = fixture.Vertex(UnreadOffsetsCode, staleUserData, -1, -1);
+            AgcDriver::Pm4::DrawParameters draw{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+            draw.indirect = indexedIndirect;
+            failures += Classified(fixture, what, vertex, staleUserData, draw, std::nullopt, Rule::Constant);
+            fixture.Place(0, bufferIndices, 0);
+            fixture.Draw(vertex, draw);
+            failures += fixture.Check(what + ", drawn on the GPU like the CPU path draws it", bufferIndices, 0, 0, false);
         }
         {
             const std::string what = "indexed indirect record whose packet names no register for its offsets, user data s16 0x51, s17 0x62";

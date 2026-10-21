@@ -40,8 +40,12 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) fail(Path::DrawIndex);
     if (indirect.countIndirect && !support.count) fail(Path::FeatureGap);
     if (indirect.countIndirect && indirect.count > 1 && !support.multi) fail(Path::FeatureGap);
+    const auto reads = [&](std::int32_t sgpr) {
+        const auto word = static_cast<std::int64_t>(sgpr) - static_cast<std::int64_t>(frontProgram.firstUserSgpr) - static_cast<std::int64_t>(frontProgram.hiddenUserWords);
+        return word < 0 || word >= 64 || ((result.userDataRegisterReads >> word) & 1u) != 0;
+    };
     const auto dimension = [&](std::int32_t k, std::int32_t p, bool shared, bool conflict, std::uint32_t x, Rule& rule, std::uint32_t& constant) {
-        if (p < 0) {
+        if (p < 0 || (k < 0 && !conflict && !reads(p))) {
             rule = Rule::Constant;
             const auto offset = k >= 0 ? drawUserWord(frontProgram, k) : 0u;
             require(offset <= std::numeric_limits<std::uint32_t>::max() - x, "draw vertex offset overflow");
