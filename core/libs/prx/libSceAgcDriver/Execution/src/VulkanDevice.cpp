@@ -4947,7 +4947,12 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
         const auto path = capture.WriteOptional(directory);
         if (!path.empty()) std::fprintf(stderr, "[compute-capture] %s\n", path.string().c_str());
     }
-    if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
+    if (profile && shader.spirv.size() > 100000) {
+        std::string constants;
+        for (const auto& value : shader.specialization) constants += " " + std::to_string(value.id) + "=" + std::to_string(value.value);
+        std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx, spirv %016llx, %zu specialization constants:%s)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress),
+                     static_cast<unsigned long long>(shader.spirv.ContentHash().low), shader.specialization.size(), constants.c_str());
+    }
     CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization);
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
