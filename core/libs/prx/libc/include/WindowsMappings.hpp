@@ -530,9 +530,9 @@ private:
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
-            const auto memory = query(cursor);
-            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
-            cursor = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            const auto region = privateRegion(cursor);
+            if (!region.committed) return false;
+            cursor = std::min(end, region.end);
         }
         remember(collectableRanges, address, end);
         return true;
