@@ -5,6 +5,7 @@
 #include "../include/Pthread.hpp"
 #include "../include/ThreadLifecycle.hpp"
 #include "../include/WindowsThreadLocal.hpp"
+#include "../include/DemonsSoulsIdle.hpp"
 #include "../include/Cancel.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
@@ -953,6 +954,24 @@ static void ApplyJobAffinity(PthreadPrivate& thread, void* handle) {
     });
     CpuTopology::PinTraced(thread.name.c_str(), handle, mask);
 }
+
+static void ApplyJobIdleWait(const PthreadPrivate& thread) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_JOB_IDLE_WAIT");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled || thread.name.compare(0, std::strlen(JOB_WORKER_PREFIX), JOB_WORKER_PREFIX) != 0) return;
+    static std::once_flag installed;
+    std::call_once(installed, [] {
+        auto* image = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+        const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+        const char* failure = DemonsSoulsIdle::Install(image, headers->OptionalHeader.SizeOfImage);
+        if (failure != nullptr)
+            std::fprintf(stderr, "[job-idle-wait] not installed: %s\n", failure);
+        else
+            std::fprintf(stderr, "[job-idle-wait] installed a 50 us sleep in the job workers' idle poll\n");
+    });
+}
 #endif
 
 struct NativeThreadArgs {
@@ -987,6 +1006,7 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
         if (!self->name.empty()) {
             SetThreadDescription(GetCurrentThread(), ThreadDescription(self->name).c_str());
             ApplyJobAffinity(*self, nullptr);
+            ApplyJobIdleWait(*self);
         }
         args->initialized.set_value();
     } catch (...) {
@@ -1427,6 +1447,7 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
 #ifdef _WIN32
     SetThreadDescription(static_cast<HANDLE>(thread->nativeHandle), ThreadDescription(thread->name).c_str());
     ApplyJobAffinity(*thread, thread->nativeHandle);
+    ApplyJobIdleWait(*thread);
 #endif
     return SCE_OK;
 }
