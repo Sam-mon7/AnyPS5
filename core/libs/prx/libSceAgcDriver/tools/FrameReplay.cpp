@@ -67,6 +67,7 @@ struct Options {
     bool release = true;
     bool synthesize = true;
     std::size_t repeat = 1;
+    bool shaders = false;
 };
 
 class Frames {
@@ -611,6 +612,8 @@ int usage() {
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
+                         "  --shaders           replays nothing; lists each shader registration with its code address, size and code\n"
+                         "                      hash, and how many registrations share that code\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
     return 2;
@@ -689,6 +692,77 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
         writeFrame(options.frames / ("replay-" + index + ".bmp"), buffer, replayed);
     }
     return check;
+}
+
+bool readable(std::uint64_t address, std::uint64_t bytes) {
+#ifdef _WIN32
+    for (auto at = address; at < address + bytes;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) return false;
+        const auto access = info.Protect & 0xffu;
+        if ((info.Protect & PAGE_GUARD) != 0 || access == PAGE_NOACCESS || access == PAGE_EXECUTE) return false;
+        at = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+    }
+    return true;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
+std::uint64_t contentHash(const std::byte* bytes, std::size_t size) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (std::size_t index = 0; index < size; ++index) {
+        hash ^= std::to_integer<std::uint64_t>(bytes[index]);
+        hash *= 0x100000001b3ull;
+    }
+    return hash;
+}
+
+int listShaders(const Options& options) {
+    const FrameCaptureReader reader(options.directory);
+    const auto skipped = restoreMemory(reader);
+    std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Delta) groups[chunk.group].push_back(&chunk);
+    }
+    const auto& calls = reader.Calls();
+    const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
+    std::map<std::uint64_t, std::size_t> copies;
+    std::size_t listed = 0, inWindow = 0, unreadable = 0;
+    for (auto call = calls.begin(); call != calls.end(); ++call) {
+        if (call->kind == FrameCallKind::Memory) {
+            if (const auto found = groups.find(call->values.at(0)); found != groups.end()) {
+                for (const auto* chunk : found->second) {
+                    if (!skipped.Overlaps(*chunk)) restore(reader, *chunk);
+                }
+            }
+            continue;
+        }
+        if (call->kind != FrameCallKind::RegisterShader) continue;
+        if (!readable(call->address, sizeof(Shader))) {
+            ++unreadable;
+            continue;
+        }
+        Shader fields{};
+        std::memcpy(&fields, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(call->address)), sizeof(Shader));
+        const auto code = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code)));
+        if (fields.shader_size == 0 || !readable(code, fields.shader_size)) {
+            ++unreadable;
+            continue;
+        }
+        const auto hash = contentHash(reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(code)), fields.shader_size);
+        const auto copy = ++copies[hash];
+        const bool window = frameStart != calls.end() && call > frameStart;
+        ++listed;
+        inWindow += window ? 1 : 0;
+        std::printf("{\"ordinal\":%llu,\"in_window\":%s,\"header\":%llu,\"code\":%llu,\"bytes\":%u,\"type\":%u,\"hash\":\"%016llx\",\"copy\":%zu}\n", static_cast<unsigned long long>(call->ordinal), window ? "true" : "false",
+                    static_cast<unsigned long long>(call->address), static_cast<unsigned long long>(code), fields.shader_size, static_cast<unsigned>(fields.type), static_cast<unsigned long long>(hash), copy);
+    }
+    std::printf("{\"registrations\":%zu,\"in_window\":%zu,\"distinct_code\":%zu,\"unreadable\":%zu}\n", listed, inWindow, copies.size(), unreadable);
+    std::fflush(stdout);
+    return 0;
 }
 
 struct Pass {
@@ -795,6 +869,7 @@ int main(int argc, char** argv) {
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--repeat" && index + 1 < argc) options.repeat = std::max<std::size_t>(1, std::strtoull(argv[++index], nullptr, 10));
+        else if (argument == "--shaders") options.shaders = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
@@ -808,8 +883,8 @@ int main(int argc, char** argv) {
 #endif
     int code = 2;
     try {
-        code = run(options);
-        if (code == 0) {
+        code = options.shaders ? listShaders(options) : run(options);
+        if (code == 0 && !options.shaders) {
             AgcDriverShutdown_nid_postfix();
             return 0;
         }
