@@ -276,7 +276,6 @@ struct Replay {
     Frames frames;
     std::map<std::uint32_t, std::shared_ptr<ReplayOutput>> outputs;
     std::mutex memoryMutex;
-    std::mutex serialMutex;
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
     Skipped skipped;
     std::atomic<std::uint64_t> paceTimeouts{0};
@@ -418,7 +417,7 @@ struct Replay {
             return;
         }
         case FrameCallKind::Suspend:
-            AgcDriverSuspendPoint_nid_postfix();
+            traced(call, [] { AgcDriverSuspendPoint_nid_postfix(); });
             return;
         case FrameCallKind::Memory: {
             std::lock_guard lock(memoryMutex);
@@ -611,17 +610,11 @@ struct Replay {
 
     template <typename TFunction>
     void traced(const FrameCall& call, TFunction&& function) {
-        if (!options.traceSerials) {
-            function();
-            return;
+        if (options.traceSerials) {
+            std::fprintf(stderr, "[frame-replay] call %llu (%s, thread %llu, queue 0x%x, %llu dwords at 0x%llx)\n", static_cast<unsigned long long>(call.ordinal), std::string(AgcDriver::FrameCallName(call.kind)).c_str(),
+                         static_cast<unsigned long long>(call.thread), call.queue, static_cast<unsigned long long>(call.size), static_cast<unsigned long long>(call.address));
         }
-        std::lock_guard lock(serialMutex);
-        const auto before = progress().first;
         function();
-        const auto after = progress().first;
-        std::fprintf(stderr, "[frame-replay] serial %llu%s = call %llu (%s, thread %llu, queue 0x%x, %llu dwords at 0x%llx)\n", static_cast<unsigned long long>(after), after == before ? " (none taken)" : "",
-                     static_cast<unsigned long long>(call.ordinal), std::string(AgcDriver::FrameCallName(call.kind)).c_str(), static_cast<unsigned long long>(call.thread), call.queue,
-                     static_cast<unsigned long long>(call.size), static_cast<unsigned long long>(call.address));
     }
 
     template <typename TFunction>
@@ -658,7 +651,9 @@ int usage() {
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --shaders           replays nothing; lists each shader registration with its code address, size and code\n"
                          "                      hash, and how many registrations share that code\n"
-                         "  --trace-serials     submits one call at a time and prints the serial each submission or flip took\n"
+                         "  --trace-serials     prints each submission, flip and suspend point with its call ordinal and command\n"
+                         "                      address as it is issued; with APS5_TRACE_GPU the driver prints the serial it accepts\n"
+                         "                      for each address\n"
                          "  --submits <n>       replays nothing; lists the first n submissions and flips of the captured frames with\n"
                          "                      their queue and serials, the packets of each and the fields of its waits and releases\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
