@@ -22,7 +22,7 @@ void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, co
     if (result.instanceOffsetSgpr >= 0) parameters.firstInstance = drawUserWord(program, result.instanceOffsetSgpr);
 }
 
-std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect) {
+std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect) {
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     auto& indirect = *drawParameters.indirect;
     using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
@@ -42,7 +42,13 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     if (indirect.countIndirect && indirect.count > 1 && !support.multi) fail(Path::FeatureGap);
     const auto reads = [&](std::int32_t sgpr) {
         const auto word = static_cast<std::int64_t>(sgpr) - static_cast<std::int64_t>(frontProgram.firstUserSgpr) - static_cast<std::int64_t>(frontProgram.hiddenUserWords);
-        return word < 0 || word >= 64 || ((result.userDataRegisterReads >> word) & 1u) != 0;
+        if (word < 0 || word >= 64) return true;
+        if (vertexInfo) {
+            for (const auto reg : {static_cast<std::int64_t>(vertexInfo->fetchAttribReg), static_cast<std::int64_t>(vertexInfo->fetchBufferReg)}) {
+                if (word == reg || word == reg + 1) return true;
+            }
+        }
+        return ((result.userDataRegisterReads >> word) & 1u) != 0;
     };
     const auto dimension = [&](std::int32_t k, std::int32_t p, bool shared, bool conflict, std::uint32_t x, Rule& rule, std::uint32_t& constant) {
         if (p < 0 || (k < 0 && !conflict && !reads(p))) {
