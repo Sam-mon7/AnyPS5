@@ -146,30 +146,36 @@ void RepeatedIndirectDrawsStayOnTheGpu() {
     const auto records = reinterpret_cast<std::uintptr_t>(Records);
     Append(commands, 0x11, {1, static_cast<std::uint32_t>(records), static_cast<std::uint32_t>(records >> 32u)});
     for (std::size_t draw = 0; draw < Draws; ++draw) Append(commands, 0x24, {0, BaseVertexLocation, 0, 2});
-    const auto pathsBefore = AgcDriver::Graphics::IndirectDrawCounts();
-    const auto cacheBefore = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
     std::vector<double> frameMs;
+    std::uint64_t gpuSide = 0, cpuSide = 0, hits = 0;
+    std::size_t measured = 0;
     for (std::size_t frame = 0; frame < Frames; ++frame) {
+        const auto pathsBefore = AgcDriver::Graphics::IndirectDrawCounts();
+        const auto cacheBefore = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
         const auto start = std::chrono::steady_clock::now();
         Submit(commands);
         frameMs.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        const auto paths = AgcDriver::Graphics::IndirectDrawCounts();
+        const auto cache = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+        bool reset = cache.hits < cacheBefore.hits;
+        for (std::size_t path = 0; path < paths.size(); ++path) reset = reset || paths[path] < pathsBefore[path];
+        if (reset || frame == 0) continue;
+        ++measured;
+        gpuSide += paths[static_cast<std::size_t>(Path::Gpu)] - pathsBefore[static_cast<std::size_t>(Path::Gpu)];
+        for (std::size_t path = 1; path < paths.size(); ++path) {
+            cpuSide += paths[path] - pathsBefore[path];
+            if (paths[path] != pathsBefore[path]) std::printf("frame %zu, CPU path, %s: %llu\n", frame, AgcDriver::Graphics::IndirectDrawPathName(static_cast<Path>(path)), static_cast<unsigned long long>(paths[path] - pathsBefore[path]));
+        }
+        hits += cache.hits - cacheBefore.hits;
     }
-    const auto paths = AgcDriver::Graphics::IndirectDrawCounts();
-    const auto cache = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
-    std::uint64_t cpuSide = 0;
-    for (std::size_t path = 1; path < paths.size(); ++path) {
-        cpuSide += paths[path] - pathsBefore[path];
-        if (paths[path] != pathsBefore[path]) std::printf("CPU path, %s: %llu\n", AgcDriver::Graphics::IndirectDrawPathName(static_cast<Path>(path)), static_cast<unsigned long long>(paths[path] - pathsBefore[path]));
-    }
-    const auto gpuSide = paths[static_cast<std::size_t>(Path::Gpu)] - pathsBefore[static_cast<std::size_t>(Path::Gpu)];
     std::vector<double> warm(frameMs.begin() + 2, frameMs.end());
     std::sort(warm.begin(), warm.end());
     const auto median = warm[warm.size() / 2];
-    std::printf("%zu frames of %zu indirect draws: median %.2f ms per frame (%.1f us per draw) after two warm-up frames; %llu on the GPU, %llu on the CPU; draw cache: %llu lookups, %llu without an entry, %llu inserts, %llu hits\n", Frames, Draws, median,
-                median * 1000.0 / static_cast<double>(Draws), static_cast<unsigned long long>(gpuSide), static_cast<unsigned long long>(cpuSide), static_cast<unsigned long long>(cache.lookups - cacheBefore.lookups),
-                static_cast<unsigned long long>(cache.absent - cacheBefore.absent), static_cast<unsigned long long>(cache.inserts - cacheBefore.inserts), static_cast<unsigned long long>(cache.hits - cacheBefore.hits));
-    Require(cpuSide == 0 && gpuSide == Draws * Frames, "the indirect draws whose program ignores its base vertex register took the CPU path " + std::to_string(cpuSide) + " times");
-    Require(cache.hits - cacheBefore.hits >= (Frames - 1) * Draws, "the repeated indirect draws hit the draw cache " + std::to_string(cache.hits - cacheBefore.hits) + " times");
+    std::printf("%zu frames of %zu indirect draws: median %.2f ms per frame (%.1f us per draw) after two warm-up frames; in %zu frames whose statistics were not reset: %llu draws on the GPU, %llu on the CPU, %llu draw-cache hits\n", Frames, Draws, median,
+                median * 1000.0 / static_cast<double>(Draws), measured, static_cast<unsigned long long>(gpuSide), static_cast<unsigned long long>(cpuSide), static_cast<unsigned long long>(hits));
+    Require(measured + 2 >= Frames, "the draw statistics were reset in " + std::to_string(Frames - 1 - measured) + " frames");
+    Require(cpuSide == 0 && gpuSide == Draws * measured, "the indirect draws whose program ignores its base vertex register took the CPU path " + std::to_string(cpuSide) + " times");
+    Require(hits == Draws * measured, "the repeated indirect draws hit the draw cache " + std::to_string(hits) + " times in " + std::to_string(measured) + " frames");
 }
 
 }
