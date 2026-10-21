@@ -22,6 +22,7 @@
 #include <fstream>
 #include <future>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -793,12 +794,28 @@ int run(const Options& options) {
     const auto& calls = reader.Calls();
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
     for (auto call = calls.begin(); call != frameStart; ++call) replay.execute(*call);
+    std::set<std::uint32_t> initialOutputs;
+    for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
     std::vector<Pass> passes;
     for (std::size_t pass = 0; pass < options.repeat && (pass == 0 || replay.unfinished == 0); ++pass) {
         if (pass > 0) {
             resetMemory(reader, replay.skipped);
             replay.pass = pass;
             replay.recording = false;
+            for (auto output = replay.outputs.begin(); output != replay.outputs.end();) {
+                if (initialOutputs.contains(output->first)) {
+                    ++output;
+                    continue;
+                }
+                AgcDriverUnregisterVideoOutput_nid_postfix(output->first, output->second);
+                output = replay.outputs.erase(output);
+            }
+            for (const auto handle : initialOutputs) {
+                if (replay.outputs.contains(handle)) continue;
+                auto output = std::make_shared<ReplayOutput>(replay.frames);
+                AgcDriverRegisterVideoOutput_nid_postfix(handle, output);
+                replay.outputs.emplace(handle, std::move(output));
+            }
             for (auto call = calls.begin(); call != frameStart; ++call) {
                 if (call->kind == FrameCallKind::ReserveEopFlip) replay.execute(*call);
             }
