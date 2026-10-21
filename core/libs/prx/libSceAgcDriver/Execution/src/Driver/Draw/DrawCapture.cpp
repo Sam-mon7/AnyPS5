@@ -210,6 +210,10 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
     const bool cacheable = useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu);
     const bool admitted = cacheable && (verifyHit || admitDrawKey(drawKey, registerKey && drawDataHits() ? shapeKey : 0));
     const bool replaceShape = cacheable && !admitted && shapeNeedsEntry;
+    if (traceDrawCache() && useDrawEntries && !drawHit && !admitted) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        ++(drawParameters.indirect && indirectCpu ? drawEntryCounters.skippedIndirectCpu : drawEntryCounters.skippedNotAdmitted);
+    }
     if (admitted || replaceShape) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0, differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
