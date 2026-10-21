@@ -25,6 +25,7 @@ using AgcDriver::FrameCallKind;
 using AgcDriver::FrameCaptureReader;
 
 constexpr std::uint32_t Handle = 7;
+constexpr std::uint32_t ArenaReadWrite = 0x04;
 constexpr std::size_t BlockBytes = 1u << 20;
 constexpr std::size_t Frames = 6;
 constexpr std::size_t CapturedFrames = 3;
@@ -57,11 +58,7 @@ public:
 std::byte* allocate() {
     auto* const block = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
     check(block != nullptr, "cannot allocate guest memory");
-#ifdef _WIN32
-    GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
-#else
-    GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, 3, BlockBytes);
-#endif
+    GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, ArenaReadWrite, BlockBytes);
     GuestAllocations::Mutation mutation;
     mutation.Add(block, BlockBytes, true, true, true);
     return block;

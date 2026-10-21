@@ -48,6 +48,7 @@ using AgcDriver::FrameMemoryKind;
 using AgcDriver::FrameRangeAccess;
 using AgcDriver::FrameRangeKind;
 using Clock = std::chrono::steady_clock;
+constexpr std::uint32_t ArenaReadWrite = 0x04;
 
 struct Dump {
     std::uint64_t address = 0;
@@ -245,11 +246,7 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
                 skipped.Add(chunk);
                 continue;
             }
-#ifdef _WIN32
-            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, PAGE_READWRITE, bytes);
-#else
-            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, 3, bytes);
-#endif
+            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, ArenaReadWrite, bytes);
             mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);
         }
     }
