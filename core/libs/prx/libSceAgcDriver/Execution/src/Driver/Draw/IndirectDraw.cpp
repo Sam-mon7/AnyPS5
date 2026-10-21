@@ -41,7 +41,7 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     if (indirect.countIndirect && !support.count) fail(Path::FeatureGap);
     if (indirect.countIndirect && indirect.count > 1 && !support.multi) fail(Path::FeatureGap);
     const auto reads = [&](std::int32_t sgpr) {
-        const auto word = static_cast<std::int64_t>(sgpr) - static_cast<std::int64_t>(frontProgram.firstUserSgpr) - static_cast<std::int64_t>(frontProgram.hiddenUserWords);
+        const auto word = static_cast<std::int64_t>(sgpr) - static_cast<std::int64_t>(frontProgram.firstUserSgpr);
         if (word < 0 || word >= 64) return true;
         if (vertexInfo && vertexInfo->resourcesNum != 0) {
             for (const auto reg : {static_cast<std::int64_t>(vertexInfo->fetchAttribReg), static_cast<std::int64_t>(vertexInfo->fetchBufferReg)}) {
