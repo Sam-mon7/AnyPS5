@@ -141,7 +141,11 @@ void Driver::run(std::uint32_t id) noexcept {
     PinWorkerThread(role);
 
     GuestMemory::TagGpuLockThread(id);
-    if (id == 0) StartWorkerSampler();
+    static const auto sampledQueue = [] {
+        const char* value = std::getenv("APS5_SAMPLE_WORKER_QUEUE");
+        return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    if (id == sampledQueue) StartWorkerSampler();
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(id);
