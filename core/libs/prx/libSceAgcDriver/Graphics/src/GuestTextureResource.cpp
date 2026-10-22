@@ -4,9 +4,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
+#include "ThreadOwned.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 namespace AgcDriver::Graphics {
 
@@ -240,6 +243,48 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
         result.mipCount = lastLevel + 1u;
     }
     return result;
+}
+
+namespace {
+
+struct DescriptorWordsHash {
+    std::size_t operator()(const std::array<std::uint32_t, 8>& words) const {
+        std::uint64_t hash = 0xcbf29ce484222325ull;
+        for (const auto word : words) hash = (hash ^ word) * 0x100000001b3ull;
+        return static_cast<std::size_t>(hash ^ (hash >> 29u));
+    }
+};
+
+using DecodeFailures = std::unordered_map<std::array<std::uint32_t, 8>, std::string, DescriptorWordsHash>;
+
+constexpr std::size_t DecodeFailureEntries = 4096;
+
+}
+
+std::optional<GuestTextureResource> TryDecodeTextureResource(std::span<const std::uint32_t> words, std::string* failure) {
+    static const bool remembered = std::getenv("APS5_NO_DECODE_FAILURE_MEMO") == nullptr;
+    thread_local DecodeFailures* slot = nullptr;
+    std::array<std::uint32_t, 8> key{};
+    const bool keyed = remembered && words.size() == key.size();
+    if (keyed) {
+        std::copy(words.begin(), words.end(), key.begin());
+        auto& failures = ShaderRecompiler::ThreadOwned(slot);
+        if (const auto found = failures.find(key); found != failures.end()) {
+            if (failure != nullptr) *failure = found->second;
+            return std::nullopt;
+        }
+    }
+    try {
+        return DecodeTextureResource(words);
+    } catch (const std::runtime_error& error) {
+        if (keyed) {
+            auto& failures = ShaderRecompiler::ThreadOwned(slot);
+            if (failures.size() >= DecodeFailureEntries) failures.clear();
+            failures.emplace(key, error.what());
+        }
+        if (failure != nullptr) *failure = error.what();
+        return std::nullopt;
+    }
 }
 
 float EffectiveMinLod(const GuestTextureResource& resource) {

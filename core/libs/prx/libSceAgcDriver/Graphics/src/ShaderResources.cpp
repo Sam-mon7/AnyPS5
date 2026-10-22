@@ -5012,8 +5012,15 @@ void ShaderResources::resolveImageTables() {
             std::uint64_t guestBytes = 0;
             bool firstLayer = false;
             auto shape = ShaderRecompiler::DescriptorImageShape::Image2D;
+            std::string failure;
+            const auto decoded = TryDecodeTextureResource(words, &failure);
+            if (!decoded.has_value()) {
+                table.map[faults + element] = rejectTableElement(table, words, failure);
+                if (reusable) fresh.elements.push_back({{}, {}, {}, 0, false, true, failure});
+                continue;
+            }
             try {
-                resource = DecodeTextureResource(words);
+                resource = *decoded;
                 shape = binding.imageShapes.at(element);
                 firstLayer = shape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
                 if (!firstLayer && !MatchesGuestDimension(shape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the table entry's image shape (shape " + std::to_string(static_cast<int>(shape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
@@ -5220,11 +5227,12 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
     for (const auto& binding : deferredCompute.program->bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::ImageTable) continue;
         for (std::size_t element = 0; element < binding.guestDescriptor.size() / 8u; ++element) {
+            const auto resource = TryDecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 8u, 8u));
+            if (!resource.has_value()) continue;
             try {
-                const auto resource = DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 8u, 8u));
-                const auto guestBytes = DescribeSurface(resource).guestBytes;
-                consider(resource.format, resource.baseAddress, guestBytes, true);
-                considerKeys(resource.dccAddress, guestBytes);
+                const auto guestBytes = DescribeSurface(*resource).guestBytes;
+                consider(resource->format, resource->baseAddress, guestBytes, true);
+                considerKeys(resource->dccAddress, guestBytes);
             } catch (const std::runtime_error&) {
             }
         }
