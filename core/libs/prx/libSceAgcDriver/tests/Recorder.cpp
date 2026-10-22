@@ -56,6 +56,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <cmath>
 #include <chrono>
@@ -8372,6 +8373,121 @@ void expectRed(float got, float want, const char* what) {
     if (std::abs(got - want) > 1.5f / 255.0f) throw std::runtime_error(std::string(what) + ": read " + std::to_string(got) + ", expected " + std::to_string(want));
 }
 
+struct SampledViewProbe {
+    Context& context;
+    PFN_vkGetDeviceProcAddr resolver;
+    std::uint32_t views = 0;
+    std::uint32_t images = 0;
+    VkImageCreateInfo imageInfo{};
+    std::vector<VkImageSubresourceRange> ranges;
+    bool checking = false;
+    static inline SampledViewProbe* active = nullptr;
+    explicit SampledViewProbe(Context& context) : context(context), resolver(context.deviceProc) {
+        Require(active == nullptr, "sampled view probe is already active");
+        active = this;
+        context.deviceProc = resolve;
+    }
+    ~SampledViewProbe() {
+        context.deviceProc = resolver;
+        active = nullptr;
+    }
+    static VKAPI_ATTR VkResult VKAPI_CALL createImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* callbacks, VkImage* created) {
+        Require(info->mipLevels > 0 && info->mipLevels <= std::bit_width(std::max({info->extent.width, info->extent.height, info->extent.depth})), "sampled image mip levels exceed its extent");
+        const auto result = reinterpret_cast<PFN_vkCreateImage>(active->resolver(device, "vkCreateImage"))(device, info, callbacks, created);
+        if (result == VK_SUCCESS) {
+            active->imageInfo = *info;
+            ++active->images;
+        }
+        return result;
+    }
+    static VKAPI_ATTR VkResult VKAPI_CALL createView(VkDevice device, const VkImageViewCreateInfo* info, const VkAllocationCallbacks* callbacks, VkImageView* created) {
+        if (active->checking && info->format == VK_FORMAT_R8G8B8A8_SRGB) {
+            const auto* next = static_cast<const VkBaseInStructure*>(info->pNext);
+            while (next != nullptr && next->sType != VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO) next = next->pNext;
+            if (next == nullptr || reinterpret_cast<const VkImageViewUsageCreateInfo*>(next)->usage != VK_IMAGE_USAGE_SAMPLED_BIT) return VK_ERROR_VALIDATION_FAILED_EXT;
+            ++active->views;
+        }
+        const auto result = reinterpret_cast<PFN_vkCreateImageView>(active->resolver(device, "vkCreateImageView"))(device, info, callbacks, created);
+        if (result == VK_SUCCESS) active->ranges.push_back(info->subresourceRange);
+        return result;
+    }
+    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL resolve(VkDevice device, const char* name) {
+        if (std::strcmp(name, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(createImage);
+        if (std::strcmp(name, "vkCreateImageView") == 0) return reinterpret_cast<PFN_vkVoidFunction>(createView);
+        return active->resolver(device, name);
+    }
+};
+
+void textureLevelClampTests(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    SampledViewProbe probe(context);
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    Recorder recorder(context);
+    recorder.Activate();
+    SampleProgram sampler(context, recorder, SAMPLE_ARRAY_SPV);
+    constexpr std::uint32_t width = 4;
+    constexpr std::uint32_t height = 1;
+    constexpr std::uint32_t layers = 4;
+    constexpr std::uint32_t lastLevel = 10;
+    std::array<std::uint32_t, 8> words{
+        0x1000u,
+        (56u << 20u) | (((width - 1u) & 3u) << 30u),
+        ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+        0xfacu | (lastLevel << 16u) | (1u << 20u) | (13u << 28u),
+        layers - 1u, lastLevel << 4u, 0u, 0u,
+    };
+    const auto geometry = DescribeSurface(DecodeTextureResource(words));
+    const auto bytes = static_cast<std::size_t>(geometry.guestBytes);
+    std::vector<std::byte> memory(bytes + 256);
+    auto* surface = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(memory.data()) + 255) & ~std::uintptr_t{255});
+    const auto value = [](std::uint32_t level, std::uint32_t layer) { return static_cast<std::uint8_t>(16u + 48u * layer + 4u * level); };
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        for (std::uint32_t level = 0; level <= lastLevel; ++level) {
+            const auto& mip = geometry.mips[level];
+            std::fill_n(surface + geometry.GuestLayerOffset(layer) + mip.tiledOffset, static_cast<std::size_t>(mip.tiledSize), std::byte{value(level, layer)});
+        }
+    }
+    const auto address = reinterpret_cast<std::uint64_t>(surface);
+    words[0] = static_cast<std::uint32_t>(address >> 8u);
+    words[1] |= static_cast<std::uint32_t>((address >> 40u) & 0xffu);
+    const std::span<const std::byte> snapshot(surface, bytes);
+    for (const auto baseLevel : {0u, lastLevel}) {
+        words[3] = (words[3] & ~(0xfu << 12u)) | (baseLevel << 12u);
+        const auto resource = DecodeTextureResource(words);
+        Require(resource.width == width && resource.height == height && resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray + 1u == layers, "the level clamp fixture has the wrong extent or array layers");
+        const auto allowedLevels = std::bit_width(std::max({resource.width, resource.height, geometry.imageDepth}));
+        Require(allowedLevels == 3u && resource.mipCount == lastLevel + 1u && resource.lastLevel == lastLevel && resource.baseLevel == baseLevel, "the level clamp fixture did not retain its oversized mip chain");
+        const auto expectedBase = baseLevel == 0u ? 0u : 2u;
+        probe.images = 0;
+        probe.ranges.clear();
+        const auto submissions = recorder.Submissions();
+        const Texture texture(context, detiler, resource, VkComponentMapping{}, snapshot);
+        Require(probe.images == 1u && probe.imageInfo.mipLevels == allowedLevels, "the sampled image did not retain exactly the allowed mip levels");
+        Require(probe.imageInfo.extent.width == width && probe.imageInfo.extent.height == height && probe.imageInfo.extent.depth == 1u && probe.imageInfo.arrayLayers == layers, "mip clamping changed the image extent or array layers");
+        Require(probe.ranges.size() == 2u, "the sampled array did not create its array and first-layer views");
+        for (const auto& range : probe.ranges) {
+            Require(range.baseMipLevel == expectedBase && range.levelCount == allowedLevels - expectedBase, "the sampled view did not clamp its mip range");
+            Require(range.baseMipLevel < probe.imageInfo.mipLevels && range.levelCount <= probe.imageInfo.mipLevels - range.baseMipLevel, "the sampled view mip range exceeds the image");
+            Require(range.baseArrayLayer == 0u && range.layerCount > 0u && range.layerCount <= layers, "the sampled view layer range exceeds the image");
+        }
+        const auto view = texture.SampledViewRange(false);
+        Require(view.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY && view.levels == allowedLevels - expectedBase && view.layers == layers, "the sampled array view reports the wrong range");
+        recorder.Submit();
+        recorder.Sync();
+        Require(recorder.Submissions() > submissions && recorder.CompletedThrough() == recorder.Submissions(), "the clamped texture upload did not complete");
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            for (std::uint32_t level = 0; level < view.levels; ++level) {
+                const auto red = sampler.Red(texture.View(), texture.Layout(), static_cast<float>(level), static_cast<float>(layer));
+                Require(std::isfinite(red), "the clamped texture sample is not finite");
+                expectRed(red, value(expectedBase + level, layer) / 255.0f, "the clamped texture sampled the wrong mip or layer");
+            }
+        }
+    }
+    std::cout << "texture level clamp upload, view ranges and out-of-range base level tests passed\n";
+}
+
 bool textureImportDetileTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
     std::lock_guard gpu(GpuMutex());
@@ -8627,36 +8743,6 @@ void cubeExtraSliceTests(const Device& device, Recorder& recorder) {
         expectRed(program.Red(repackCopy.View(), repackCopy.Layout(), 0, static_cast<float>(layer)), static_cast<float>(layer + 1), "a cube repacked copy with a slice past its last whole cube sampled the wrong slice");
     }
 }
-
-struct SampledViewProbe {
-    Context& context;
-    PFN_vkGetDeviceProcAddr resolver;
-    std::uint32_t views = 0;
-    bool checking = false;
-    static inline SampledViewProbe* active = nullptr;
-    explicit SampledViewProbe(Context& context) : context(context), resolver(context.deviceProc) {
-        Require(active == nullptr, "sampled view probe is already active");
-        active = this;
-        context.deviceProc = resolve;
-    }
-    ~SampledViewProbe() {
-        context.deviceProc = resolver;
-        active = nullptr;
-    }
-    static VKAPI_ATTR VkResult VKAPI_CALL createView(VkDevice device, const VkImageViewCreateInfo* info, const VkAllocationCallbacks* callbacks, VkImageView* created) {
-        if (active->checking && info->format == VK_FORMAT_R8G8B8A8_SRGB) {
-            const auto* next = static_cast<const VkBaseInStructure*>(info->pNext);
-            while (next != nullptr && next->sType != VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO) next = next->pNext;
-            if (next == nullptr || reinterpret_cast<const VkImageViewUsageCreateInfo*>(next)->usage != VK_IMAGE_USAGE_SAMPLED_BIT) return VK_ERROR_VALIDATION_FAILED_EXT;
-            ++active->views;
-        }
-        return reinterpret_cast<PFN_vkCreateImageView>(active->resolver(device, "vkCreateImageView"))(device, info, callbacks, created);
-    }
-    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL resolve(VkDevice device, const char* name) {
-        if (std::strcmp(name, "vkCreateImageView") == 0) return reinterpret_cast<PFN_vkVoidFunction>(createView);
-        return active->resolver(device, name);
-    }
-};
 
 void sampledStorageBaseLevelUsageTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
@@ -10078,6 +10164,10 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && std::string_view(argv[1]) == "--texture-level-clamp-only") {
+            textureLevelClampTests(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--texture-import-detile-only") return textureImportDetileTests(device) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-lifetime-only") return RunHostImportLifetimeTests(device.GetContext());
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-mutation-race-only") return RunHostImportMutationRaceTests(device.GetContext());
