@@ -1,13 +1,17 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
+#include "Optimization/ResourceProgram.hpp"
+#include "ShaderDiskCache.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <new>
@@ -284,6 +288,12 @@ alignas(256) constexpr std::array<std::uint32_t, 33> SkippedReloadCode{
 
 alignas(256) constexpr std::array<std::uint32_t, 5> PixelCode{0x7e0002f2u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
 
+alignas(256) constexpr std::array<std::uint32_t, 12> BufferBaseCode{
+    0xf4080508u, 0xfa000000u, 0xbf8cc07fu, 0x7e060280u,
+    0xe0002000u, 0x80050a03u, 0xbf8c3f70u,
+    0x7e200210u, 0x7e2202f2u, 0xf80008cfu, 0x1110100au, 0xbf810000u,
+};
+
 constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 32;
 alignas(256) std::array<std::byte, Width * Height * 4> Pixels{};
@@ -515,6 +525,122 @@ std::string Analysis(Fixture& fixture) {
     return failures;
 }
 
+void SameResult(const ShaderRecompiler::RecompileResult& patched, const ShaderRecompiler::RecompileResult& full) {
+    std::vector<std::byte> patchedBytes, fullBytes;
+    ShaderRecompiler::ShaderDiskCache::EncodeResult(patched, patchedBytes);
+    ShaderRecompiler::ShaderDiskCache::EncodeResult(full, fullBytes);
+    Require(patchedBytes == fullBytes && patched.variantId == full.variantId && patched.specializationId == full.specializationId && patched.cacheHit == full.cacheHit, "indirect stage differs from full materialization");
+}
+
+std::string IndirectPushPatches(Fixture& fixture, bool bufferBase) {
+    using Driver = AgcDriver::DriverDetail::Driver;
+    const bool enabled = std::getenv("APS5_NO_INDIRECT_PUSH_PATCH") == nullptr;
+    const bool verify = std::getenv("APS5_VERIFY_INDIRECT_PUSH_PATCH") != nullptr;
+    auto program = Program(fixture.UserData(0x51u, 0x62u));
+    const std::span<const std::uint32_t> code = bufferBase ? std::span<const std::uint32_t>(BufferBaseCode) : std::span<const std::uint32_t>(VertexCode);
+    program.binary = {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}};
+    alignas(256) std::array<std::uint32_t, 8> otherTable = BufferTable;
+    std::copy_n(BufferTable.begin() + 4, 4, otherTable.begin());
+    const auto tableAddress = reinterpret_cast<std::uintptr_t>(BufferTable.data());
+    if (bufferBase) {
+        program.userData[8] = static_cast<std::uint32_t>(tableAddress);
+        program.userData[9] = static_cast<std::uint32_t>(tableAddress >> 32u);
+    }
+    const std::array<ShaderRecompiler::MemoryRegion, 3> regions{{
+        {program.binary.codeAddress, std::as_bytes(code)},
+        {tableAddress, std::as_bytes(std::span(BufferTable))},
+        {reinterpret_cast<std::uintptr_t>(otherTable.data()), std::as_bytes(std::span(otherTable))}
+    }};
+    const std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo = bufferBase ? ShaderRecompiler::ShaderVertexStageInfo{} : Fixture::VertexInfo();
+    ShaderRecompiler::RecompileRequest request{
+        program.binary, {32, 8, program.userData, std::nullopt, std::nullopt, vertexInfo, regions}, fixture.device->Target(), {0, 0, 0, 64}
+    };
+    const auto handle = ShaderRecompiler::PrepareShader(request);
+    Require(handle != nullptr, "indirect patch test has no prepared shader");
+    AgcDriver::ShaderMemory memory(regions);
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    const auto materialize = [&] {
+        const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle);
+        Require(invocation.has_value(), "indirect patch test lost its prepared invocation");
+        capture = memory.Capture(*invocation);
+        return invocation->Materialize(*capture);
+    };
+    auto result = *materialize();
+    const auto original = result;
+    const auto initialCapture = capture;
+    std::uint32_t materializations = 0;
+    const auto refresh = [&] {
+        return Driver::RefreshIndirectStage(result, capture.get(), program, vertexInfo, [&] {
+            ++materializations;
+            return materialize();
+        });
+    };
+    if (bufferBase) {
+        Require((capture->userDataUse.asBase & (std::uint64_t{1} << 8u)) != 0, "buffer-base test did not capture s16 as a base");
+        Require(std::count(result.shaderDataUserWords.begin(), result.shaderDataUserWords.end(), 8u) == 1, "buffer-base test did not also forward s16");
+        const auto otherAddress = reinterpret_cast<std::uintptr_t>(otherTable.data());
+        program.userData[8] = static_cast<std::uint32_t>(otherAddress);
+        program.userData[9] = static_cast<std::uint32_t>(otherAddress >> 32u);
+        Require(!refresh() && materializations == 1, "indirect buffer base did not fall back to materialization");
+        SameResult(result, *materialize());
+        const auto buffers = std::find_if(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers; });
+        Require(buffers != result.bindings.end() && buffers->guestDescriptor.size() >= 4 && std::equal(otherTable.begin(), otherTable.begin() + 4, buffers->guestDescriptor.begin()), "buffer-base fallback retained the old descriptor");
+        std::cout << "indirect buffer-base fallback checked\n";
+        return {};
+    }
+    Require(std::count(result.shaderDataUserWords.begin(), result.shaderDataUserWords.end(), 8u) == 1 && std::count(result.shaderDataUserWords.begin(), result.shaderDataUserWords.end(), 9u) == 1, "indirect patch test did not forward both offset registers");
+    const std::array<std::array<std::uint32_t, 5>, 3> records{{
+        {Vertices, Instances, 0, 700, 59455},
+        {Vertices, Instances, 0, 19, 37},
+        {Vertices, Instances, 0, 0x51u, 0x62u}
+    }};
+    for (std::size_t record = 0; record < records.size(); ++record) std::copy(records[record].begin(), records[record].end(), fixture.Records() + record * 5u);
+    AgcDriver::Pm4::DrawParameters::IndirectDraw indirect{reinterpret_cast<std::uintptr_t>(fixture.Records()), 0x38u, 20u, 20u, static_cast<std::uint32_t>(records.size()), false, 0u, 0x10u, 0x11u, NoLocation, false, 0u};
+    indirect.baseVertexSgpr = BaseVertexSgpr;
+    indirect.startInstanceSgpr = StartInstanceSgpr;
+    const auto indexAddress = reinterpret_cast<std::uintptr_t>(Indices.data());
+    AgcDriver::Pm4::DrawParameters packet{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+    packet.indirect = indirect;
+    std::string failures = Classified(fixture, "multi-record indirect push patch", result, program.userData, packet, Path::NotFolded, Rule::Constant);
+    const std::array<std::uint32_t, Vertices> raw{Indices[0], Indices[1], Indices[2]};
+    for (std::uint32_t record = 0; record < indirect.count; ++record) {
+        const auto arguments = AgcDriver::Pm4::ReadDrawArguments(indirect, record);
+        program.userData[8] = arguments.vertexOffset;
+        program.userData[9] = arguments.firstInstance;
+        if (record == 0 && enabled) {
+            const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle);
+            Require(invocation.has_value(), "indirect eligibility test lost its prepared invocation");
+            const auto full = invocation->Materialize(*memory.Capture(*invocation));
+            for (std::uint32_t refusal = 0; refusal < 6; ++refusal) {
+                auto candidate = result;
+                auto captured = *capture;
+                auto info = vertexInfo;
+                if (refusal == 0) candidate.shaderDataUserWords.back() = candidate.shaderDataUserWords.front();
+                if (refusal == 1) candidate.shaderDataUserWords.front() = 64;
+                if (refusal == 2) candidate.pushConstants.clear();
+                if (refusal == 3) captured.userDataUse.asValue |= std::uint64_t{1} << 8u;
+                if (refusal == 4) captured.userDataUse.asBase |= std::uint64_t{1} << 8u;
+                if (refusal == 5) info->fetchBufferReg = 8;
+                std::uint32_t calls = 0;
+                Require(!Driver::RefreshIndirectStage(candidate, &captured, program, info, [&] { ++calls; return full; }) && calls == 1, "unsafe indirect push mapping did not fall back");
+                SameResult(candidate, *full);
+            }
+        }
+        Require(refresh() == enabled, "forwarded indirect offsets did not select the expected patch path");
+        const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle);
+        Require(invocation.has_value(), "indirect comparison lost its prepared invocation");
+        SameResult(result, *invocation->Materialize(*memory.Capture(*invocation)));
+        const auto draw = FoldedDraw(result, program.userData, {indexAddress, arguments.count, 2, arguments.instances, 0, true, 0, 0});
+        fixture.Place(arguments.vertexOffset, raw, arguments.firstInstance);
+        fixture.Draw(result, draw);
+        failures += fixture.Check("indirect push patch record " + std::to_string(record), raw, arguments.vertexOffset, arguments.firstInstance, true);
+    }
+    Require(materializations == (!enabled || verify ? records.size() : 0u), "indirect patch or verification switch used the wrong number of materializations");
+    SameResult(original, *ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle)->Materialize(*initialCapture));
+    std::cout << "indirect push patch records checked: " << records.size() << ", materializations " << materializations << '\n';
+    return failures;
+}
+
 std::string Run(Fixture& fixture) {
     std::string failures = Analysis(fixture);
     const std::array<std::uint32_t, Vertices> autoIndices{0, 1, 2};
@@ -658,12 +784,13 @@ std::string Run(Fixture& fixture) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         std::shared_ptr<AgcDriver::VulkanDevice> device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Fixture fixture(device);
-        const auto failures = Run(fixture);
+        const std::string mode = argc > 1 ? argv[1] : "";
+        const auto failures = mode == "--indirect-push-patch" ? IndirectPushPatches(fixture, false) : mode == "--indirect-buffer-base" ? IndirectPushPatches(fixture, true) : Run(fixture);
         if (!failures.empty()) {
             std::cerr << "vertex and instance indices differ from the guest's:\n" << failures;
             return 1;
