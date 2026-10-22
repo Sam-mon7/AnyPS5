@@ -79,6 +79,7 @@ struct TextureKey {
     std::array<std::uint32_t, 8> words;
     std::array<std::uint32_t, 4> components;
     bool depthCompare = false;
+    bool clearSnapshot = false;
     bool operator==(const TextureKey&) const = default;
 };
 
@@ -91,6 +92,7 @@ struct TextureKeyHash {
     std::size_t operator()(const TextureKey& key) const noexcept {
         auto hash = 14695981039346656037ull ^ reinterpret_cast<std::uintptr_t>(key.device);
         hash = hashWords(hash, key.words.data(), key.words.size()) ^ static_cast<std::uint64_t>(key.depthCompare);
+        hash = (hash ^ static_cast<std::uint64_t>(key.clearSnapshot)) * 1099511628211ull;
         return static_cast<std::size_t>(hashWords(hash, key.components.data(), key.components.size()));
     }
 };
@@ -532,6 +534,11 @@ bool ClearedViewEnabled() {
     return !disabled;
 }
 
+bool ClearSnapshotCacheEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_CLEAR_SNAPSHOT_CACHE") == nullptr;
+    return enabled;
+}
+
 std::uint64_t DepthCopyMinBytes() {
     static const std::uint64_t bytes = [] {
         const char* text = std::getenv("APS5_DEPTH_COPY_MIN_KIB");
@@ -915,7 +922,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     const auto untracked = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed ? untrackedKey(address, bytes) : std::array<std::uint64_t, 4>{};
     auto& cache = Textures();
-    const auto key = MakeTextureKey(context.device, words, components, depthCompare);
+    auto key = MakeTextureKey(context.device, words, components, depthCompare);
+    key.clearSnapshot = ClearSnapshotCacheEnabled() && source == nullptr && IsDccClear(*keys);
     std::lock_guard lock(cache.mutex);
     const CacheHold held(sampledCacheHeld);
     dropUncachedViews(cache);
@@ -3114,6 +3122,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
+        if (ClearSnapshotCacheEnabled() && source != nullptr && surface.resource.dccAddress != 0 && IsDccClear(source->FilledKeys())) return fail(FastFail::Keys);
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
             // below is the record's too): the scan repeats on every call, as before.
@@ -3243,6 +3252,7 @@ bool ShaderResources::fastRevalidateEach() {
         if (surface.collected == 0) return false;
         if (PendingStorageOverlaps(address, bytes, surface.source)) return false;
         if (surface.source != nullptr && surface.resource.dccAddress != 0 && surface.resource.dccAddress != surface.source->Descriptor().dccAddress) return false;
+        if (ClearSnapshotCacheEnabled() && surface.source != nullptr && surface.resource.dccAddress != 0 && IsDccClear(surface.source->FilledKeys())) return false;
         if (surface.source != nullptr) {
             // The view follows the image: it needs the image current with guest memory, as the
             // lookup's Refresh would make it.
