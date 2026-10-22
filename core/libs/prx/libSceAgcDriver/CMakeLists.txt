@@ -2264,6 +2264,25 @@ target_include_directories(agc_driver_image_table_cache_bounds_tests PRIVATE $<T
 
 target_include_directories(agc_driver_draw_cache_relocation_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
+target_include_directories(agc_driver_draw_offset_indices_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+
+if(BUILD_TESTING)
+    add_test(NAME agc_driver_indirect_push_patch COMMAND agc_driver_draw_offset_indices_tests --indirect-push-patch)
+    add_test(NAME agc_driver_indirect_push_patch_disabled COMMAND agc_driver_draw_offset_indices_tests --indirect-push-patch)
+    add_test(NAME agc_driver_indirect_push_patch_verify COMMAND agc_driver_draw_offset_indices_tests --indirect-push-patch)
+    add_test(NAME agc_driver_indirect_push_patch_buffer_base COMMAND agc_driver_draw_offset_indices_tests --indirect-buffer-base)
+    set(indirectPushPatchTests agc_driver_indirect_push_patch agc_driver_indirect_push_patch_disabled agc_driver_indirect_push_patch_verify agc_driver_indirect_push_patch_buffer_base)
+    set_tests_properties(${indirectPushPatchTests} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1"
+            ENVIRONMENT_MODIFICATION "APS5_NO_INDIRECT_PUSH_PATCH=unset:;APS5_VERIFY_INDIRECT_PUSH_PATCH=unset:"
+            SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
+    set_property(TEST agc_driver_indirect_push_patch_disabled APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_INDIRECT_PUSH_PATCH=set:1")
+    set_property(TEST agc_driver_indirect_push_patch_verify APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VERIFY_INDIRECT_PUSH_PATCH=set:1")
+    if(WIN32)
+        set_property(TEST ${indirectPushPatchTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 if(BUILD_TESTING)
     add_test(NAME agc_driver_linear_target_completion_points_sync_flip COMMAND agc_driver_linear_target_completion_points_tests --flip)
     set_tests_properties(agc_driver_linear_target_completion_points_sync_flip PROPERTIES

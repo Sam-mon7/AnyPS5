@@ -2,9 +2,87 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "Optimization/ResourceProgram.hpp"
+#include "ShaderDiskCache.hpp"
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+bool PatchIndirectPushConstants(ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo) {
+    if (capture == nullptr || capture->plan == nullptr || capture->plan->userDataBase != program.firstUserSgpr || capture->snapshot.userData.size() != program.userData.size()) return false;
+    if (!capture->plan->resourceTrackingComplete || !capture->plan->srtPlanComplete || capture->plan->requiresSpecializationMemory) return false;
+    if (program.binary.stage != ShaderRecompiler::ShaderStage::Vertex && program.binary.stage != ShaderRecompiler::ShaderStage::Fragment) return false;
+    const auto& mapping = result.shaderDataUserWords;
+    if (mapping.empty() || mapping.size() != result.memoryOffsetDword || mapping.size() > result.shaderDataDwords || result.shaderDataDwords > result.pushConstants.size() / sizeof(std::uint32_t)) return false;
+    if (std::any_of(result.bindings.begin(), result.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; })) return false;
+    std::uint64_t forwarded = 0;
+    for (const auto word : mapping) {
+        if (word >= ShaderRecompiler::SrtUserDataUse::TrackedWords || word >= program.userData.size() || (forwarded & (std::uint64_t{1} << word)) != 0) return false;
+        forwarded |= std::uint64_t{1} << word;
+    }
+    if (forwarded != result.userDataRegisterReads) return false;
+    const auto consumed = capture->userDataUse.asBase | capture->userDataUse.asValue;
+    for (std::size_t word = 0; word < program.userData.size(); ++word) {
+        if (program.userData[word] == capture->snapshot.userData[word]) continue;
+        if (word >= ShaderRecompiler::SrtUserDataUse::TrackedWords || ((forwarded & ~consumed) & (std::uint64_t{1} << word)) == 0) return false;
+        if (word < program.hiddenUserWords) return false;
+        if (vertexInfo && vertexInfo->resourcesNum != 0) {
+            for (const auto reg : {vertexInfo->fetchAttribReg, vertexInfo->fetchBufferReg}) {
+                for (const auto hidden : {0u, program.hiddenUserWords}) {
+                    const auto first = static_cast<std::uint64_t>(reg) + hidden;
+                    if (word == first || word == first + 1u) return false;
+                }
+            }
+        }
+    }
+    for (std::size_t slot = 0; slot < mapping.size(); ++slot) {
+        std::memcpy(result.pushConstants.data() + slot * sizeof(std::uint32_t), &program.userData[mapping[slot]], sizeof(std::uint32_t));
+    }
+    return true;
+}
+
+void CountIndirectStage(bool patched, bool verified) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::atomic<std::uint64_t> patches{0}, materializations{0}, verifications{0};
+    (patched ? patches : materializations).fetch_add(1, std::memory_order_relaxed);
+    if (verified) verifications.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto due = nextReport.load(std::memory_order_relaxed);
+    if (now < due || !nextReport.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count(), std::memory_order_relaxed)) return;
+    ProfilePrint_nid_no_patch("[indirect-push] stages (cumulative): %llu patched, %llu re-materialized, %llu verified\n", static_cast<unsigned long long>(patches.load(std::memory_order_relaxed)), static_cast<unsigned long long>(materializations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verifications.load(std::memory_order_relaxed)));
+}
+
+}
+
+bool Driver::RefreshIndirectStage(ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, const std::function<std::shared_ptr<const ShaderRecompiler::RecompileResult>()>& materialize) {
+    static const bool enabled = std::getenv("APS5_NO_INDIRECT_PUSH_PATCH") == nullptr;
+    static const bool verify = std::getenv("APS5_VERIFY_INDIRECT_PUSH_PATCH") != nullptr;
+    const bool patched = enabled && PatchIndirectPushConstants(result, capture, program, vertexInfo);
+    if (!patched || verify) {
+        const auto full = materialize();
+        require(full != nullptr, "indirect stage materialization returned no result");
+        if (patched) {
+            std::vector<std::byte> patchedBytes, fullBytes;
+            ShaderRecompiler::ShaderDiskCache::EncodeResult(result, patchedBytes);
+            ShaderRecompiler::ShaderDiskCache::EncodeResult(*full, fullBytes);
+            if (patchedBytes != fullBytes || result.variantId != full->variantId || result.specializationId != full->specializationId || result.cacheHit != full->cacheHit || result.meshBarycentrics != full->meshBarycentrics) {
+                std::fprintf(stderr, "APS5_VERIFY_INDIRECT_PUSH_PATCH: program 0x%llx stage %u differs from re-materialization\n", static_cast<unsigned long long>(program.binary.codeAddress), static_cast<unsigned>(program.binary.stage));
+                std::abort();
+            }
+        } else {
+            result = *full;
+        }
+    }
+    CountIndirectStage(patched, patched && verify);
+    return patched;
+}
 
 std::uint32_t Driver::drawUserWord(const DrawProgram& program, std::int32_t sgpr) {
     require(sgpr >= 0 && static_cast<std::uint32_t>(sgpr) >= program.firstUserSgpr, "invalid draw offset SGPR");
