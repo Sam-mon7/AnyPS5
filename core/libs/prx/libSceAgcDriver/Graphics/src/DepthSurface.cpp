@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -15,10 +16,12 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <shared_mutex>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -995,6 +998,44 @@ struct DepthPlaneSlice {
     std::uint64_t written = 0;
 };
 
+struct DepthPlaneUploads {
+    std::atomic<std::uint64_t> kept{0};
+    std::atomic<std::uint64_t> empty{0};
+    std::atomic<std::uint64_t> unproven{0};
+    std::atomic<std::uint64_t> unwatched{0};
+    std::atomic<std::uint64_t> moved{0};
+    std::atomic<std::uint64_t> recorded{0};
+    std::atomic<std::uint64_t> changed{0};
+    std::atomic<std::uint64_t> bytes{0};
+    std::atomic<long long> lastReport{0};
+};
+
+DepthPlaneUploads& depthPlaneUploads() {
+    static DepthPlaneUploads counts;
+    return counts;
+}
+
+bool depthPlaneProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+void reportDepthPlaneUploads() {
+    auto& counts = depthPlaneUploads();
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counts.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10000 || !counts.lastReport.compare_exchange_strong(last, now)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto kept = take(counts.kept);
+    const auto empty = take(counts.empty);
+    const auto unproven = take(counts.unproven);
+    const auto unwatched = take(counts.unwatched);
+    const auto moved = take(counts.moved);
+    const auto recorded = take(counts.recorded);
+    const auto changed = take(counts.changed);
+    AgcDriver::ProfilePrint_nid_no_patch("[depth-plane] (10 s): %llu guest layers kept, %llu kept as still uncommitted, %llu uploaded (%llu MiB): %llu without a proven earlier upload (%llu now unprovable), %llu moved or reshaped, %llu under a recorded snapshot write, %llu written since\n", kept, empty, unproven + moved + recorded + changed, take(counts.bytes) >> 20u, unproven, unwatched, moved, recorded, changed);
+}
+
 class DepthPlaneCopy {
 public:
     DepthPlaneCopy(const Context& context, VkExtent2D extent, VkFormat format, std::uint32_t layers) : context(context), extent(extent), format(format), layers(layers), guestLayers(layers), surfaceLayers(layers) {
@@ -1063,13 +1104,41 @@ public:
             const GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes))};
             if (held.generation != 0 && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation)) {
                 held.generation = current.generation;
+                if (depthPlaneProfiled()) {
+                    depthPlaneUploads().kept.fetch_add(1, std::memory_order_relaxed);
+                    reportDepthPlaneUploads();
+                }
                 continue;
+            }
+            static const bool emptyLayers = std::getenv("APS5_NO_EMPTY_DEPTH_LAYER_MEMO") == nullptr;
+            const auto registry = emptyLayers ? GuestAllocations::GuestAllocationsGeneration_nid_postfix() : 0;
+            if (emptyLayers && current.generation == 0 && held.empty && held.registry == registry && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes))) {
+                if (depthPlaneProfiled()) {
+                    depthPlaneUploads().empty.fetch_add(1, std::memory_order_relaxed);
+                    reportDepthPlaneUploads();
+                }
+                continue;
+            }
+            if (depthPlaneProfiled()) {
+                auto& counts = depthPlaneUploads();
+                const bool same = held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick;
+                if (held.generation == 0) counts.unproven.fetch_add(1, std::memory_order_relaxed);
+                else if (!same) counts.moved.fetch_add(1, std::memory_order_relaxed);
+                else if (Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes))) counts.recorded.fetch_add(1, std::memory_order_relaxed);
+                else counts.changed.fetch_add(1, std::memory_order_relaxed);
+                if (current.generation == 0) counts.unwatched.fetch_add(1, std::memory_order_relaxed);
+                counts.bytes.fetch_add(current.bytes, std::memory_order_relaxed);
+                reportDepthPlaneUploads();
             }
             auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
             uploads.push_back(std::move(upload));
             uploadLayers.push_back(layer);
             held = current;
+            if (emptyLayers && current.generation == 0) {
+                held.empty = GuestMemory::DescribeCommitted(current.address, static_cast<std::size_t>(current.bytes)).ranges.empty();
+                held.registry = registry;
+            }
         }
         if (!copiedLayers.empty() || !uploads.empty()) record(slices, resource, geometry, copiedLayers, uploads, uploadLayers);
         const std::array<std::uint32_t, 6> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType), baseLayer};
@@ -1093,6 +1162,8 @@ private:
         TextureTileMode tileMode = TextureTileMode::kLinear;
         bool thick = false;
         std::uint64_t generation = 0;
+        bool empty = false;
+        std::uint64_t registry = 0;
     };
 
     VkImage image = VK_NULL_HANDLE;

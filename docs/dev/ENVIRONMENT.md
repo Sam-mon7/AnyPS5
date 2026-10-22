@@ -228,6 +228,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_DRAW_RESOURCE_CACHE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | builds every draw's shader resources instead of reusing a cached identical build |
 | `APS5_NO_DRAW_SRT_ENTRIES` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawCache.cpp` |  | disables the draw cache's SRT entries, so every draw decodes its programs |
 | `APS5_NO_DRAW_STAGE_DATA_HITS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawCache.cpp` |  | disables draw-cache hits that differ only in a stage's ShaderData words |
+| `APS5_NO_EMPTY_DEPTH_LAYER_MEMO` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp` |  | uploads a sampled depth plane layer whose guest memory has no committed page again at every refresh, instead of keeping its zero upload until the guest allocations change |
 | `APS5_NO_EPOCH_COLLECT_MAP` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp` |  | drops the per-epoch map of completed collects, leaving only the fixed-size thread memo to answer a repeated collect |
 | `APS5_NO_EPOCH_REVALIDATE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | runs every Revalidate's per-element and per-region checks instead of the epoch gate |
 | `APS5_NO_FAST_REVALIDATE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | always repeats the resource lookups instead of using the fast proof |
