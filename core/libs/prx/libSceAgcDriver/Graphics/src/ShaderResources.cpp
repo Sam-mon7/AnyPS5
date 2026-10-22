@@ -314,7 +314,7 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     if (now - cache.countsReported < std::chrono::seconds(10)) return;
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
-    if (Texture::ImportDetileEnabled()) AgcDriver::ProfilePrint_nid_no_patch("[texture-import] (10 s): %llu textures (%llu MiB) detiled from imported guest pages; %llu kept the snapshot path: %llu DCC surfaces, %llu without write stamps or partly resident, %llu under 64 KiB, %llu not imported, %llu lost their import\n", static_cast<unsigned long long>(counts.importTextures), static_cast<unsigned long long>(counts.importBytes >> 20u), static_cast<unsigned long long>(std::accumulate(counts.importFallbacks.begin(), counts.importFallbacks.end(), std::uint64_t{0})), static_cast<unsigned long long>(counts.importFallbacks[0]), static_cast<unsigned long long>(counts.importFallbacks[1]), static_cast<unsigned long long>(counts.importFallbacks[2]), static_cast<unsigned long long>(counts.importFallbacks[3]), static_cast<unsigned long long>(counts.importFallbacks[4]));
+    if (Texture::ImportDetileEnabled()) AgcDriver::ProfilePrint_nid_no_patch("[texture-import] (10 s): %llu textures (%llu MiB) detiled from imported guest pages; %llu kept the snapshot path: %llu with compressed or cleared DCC keys, %llu without write stamps or partly resident, %llu under 64 KiB, %llu not imported, %llu lost their import\n", static_cast<unsigned long long>(counts.importTextures), static_cast<unsigned long long>(counts.importBytes >> 20u), static_cast<unsigned long long>(std::accumulate(counts.importFallbacks.begin(), counts.importFallbacks.end(), std::uint64_t{0})), static_cast<unsigned long long>(counts.importFallbacks[0]), static_cast<unsigned long long>(counts.importFallbacks[1]), static_cast<unsigned long long>(counts.importFallbacks[2]), static_cast<unsigned long long>(counts.importFallbacks[3]), static_cast<unsigned long long>(counts.importFallbacks[4]));
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame with the least recently used entry used this frame or the last, or a later use with it used this frame), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
 }
 
@@ -681,7 +681,7 @@ bool useImportDetile(const Context& context, TextureCache& cache, const GuestTex
         ++cache.counts.importFallbacks[static_cast<std::size_t>(reason)];
         return false;
     };
-    if (keys != DccKeys::Uncompressed || resource.dccAddress != 0) return refuse(ImportFallback::Dcc);
+    if (keys != DccKeys::Uncompressed) return refuse(ImportFallback::Dcc);
     if (generation == 0 || partial) return refuse(ImportFallback::Unstamped);
     if (bytes < (std::size_t{64} << 10u)) return refuse(ImportFallback::TooSmall);
     if (!HostImportCovers(context, resource.baseAddress, bytes)) return refuse(ImportFallback::NotImported);
