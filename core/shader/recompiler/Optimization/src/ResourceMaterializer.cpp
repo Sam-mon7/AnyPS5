@@ -30,6 +30,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -376,6 +377,17 @@ struct TableCounters {
     std::atomic<std::uint64_t> selected{0};
     std::atomic<std::uint64_t> reusedUnwritten{0};
     std::atomic<std::uint64_t> reusedCompared{0};
+    std::atomic<std::uint64_t> resolved{0};
+    std::atomic<std::uint64_t> resolvedSame{0};
+    std::atomic<std::uint64_t> resolvedEqual{0};
+    std::atomic<std::uint64_t> resolveNanoseconds{0};
+    std::atomic<std::uint64_t> resolvedUnkept{0};
+    std::atomic<std::uint64_t> resolutionDropsVariant{0};
+    std::atomic<std::uint64_t> resolutionDropsSize{0};
+    std::atomic<std::uint64_t> resolutionWords{0};
+    std::atomic<std::uint64_t> decodeHits{0};
+    std::atomic<std::uint64_t> decodeMisses{0};
+    std::atomic<std::uint64_t> decodeClears{0};
     std::atomic<std::uint64_t> nanoseconds{0};
     std::atomic<long long> lastReport{0};
 };
@@ -425,9 +437,12 @@ void reportTables() {
         skips += " " + std::string(NarrowSkipNames[reason]) + "=" + std::to_string(count);
         if (reason == static_cast<std::size_t>(NarrowSkip::KeyScan)) skips += " (up to " + std::to_string(counters.narrowPositions.exchange(0, std::memory_order_relaxed)) + " positions, APS5_IMAGE_TABLE_KEY_SCAN " + std::to_string(TableKeyScanLimit()) + ")";
     }
-    std::fprintf(stderr, "[image-table] (10 s): %llu snapshots, %llu tables, %llu keys, %llu selected records, structural poison:%s, narrowing %llu applied / %llu skipped%s%s, reused %llu unwritten / %llu compared, %.1f ms\n",
+    std::fprintf(stderr, "[image-table] (10 s): %llu snapshots, %llu tables, %llu keys, %llu selected records, structural poison:%s, narrowing %llu applied / %llu skipped%s%s, reused %llu unwritten / %llu compared, %.1f ms; resolutions %llu (%.1f ms, %llu too large to keep), shared %llu same / %llu equal; resolution memo drops: variant %llu, size %llu, %llu words held; decodes %llu memo hits / %llu decoded, %llu memo clears\n",
         static_cast<unsigned long long>(snapshots), static_cast<unsigned long long>(counters.tables.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.keys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.selected.exchange(0, std::memory_order_relaxed)), poison.empty() ? " none" : poison.c_str(),
-        static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowSkipped.exchange(0, std::memory_order_relaxed)), skips.empty() ? "" : ":", skips.c_str(), static_cast<unsigned long long>(counters.reusedUnwritten.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.reusedCompared.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.nanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6);
+        static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowSkipped.exchange(0, std::memory_order_relaxed)), skips.empty() ? "" : ":", skips.c_str(), static_cast<unsigned long long>(counters.reusedUnwritten.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.reusedCompared.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.nanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6,
+        static_cast<unsigned long long>(counters.resolved.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.resolveNanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.resolvedUnkept.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.resolvedSame.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.resolvedEqual.exchange(0, std::memory_order_relaxed)),
+        static_cast<unsigned long long>(counters.resolutionDropsVariant.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.resolutionDropsSize.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.resolutionWords.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(counters.decodeHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.decodeMisses.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.decodeClears.exchange(0, std::memory_order_relaxed)));
 }
 
 enum class RecordState : std::uint8_t { OutsideDomain, Read, Unmapped, Carried };
@@ -1573,21 +1588,116 @@ DecodeMemo& decodeMemo() {
 constexpr std::uint32_t DecodeMemoEntries = 1u << 20u;
 constexpr std::uint32_t DecodeFailed = 0x80000000u;
 
+struct DecodeSlot {
+    DecodeMemoKey key;
+    std::uint32_t value = 0;
+};
+
+constexpr std::size_t DecodeSetWays = 4;
+constexpr std::size_t DecodeSets = std::size_t{1} << 18u;
+constexpr std::size_t DecodeStripes = 256;
+
+struct FlatDecodeMemo {
+    std::unique_ptr<DecodeSlot[]> slots = std::make_unique<DecodeSlot[]>(DecodeSets * DecodeSetWays);
+    std::array<std::atomic_flag, DecodeStripes> stripes{};
+};
+
+FlatDecodeMemo& flatDecodeMemo() {
+    static FlatDecodeMemo memo;
+    return memo;
+}
+
+bool FlatDecodeMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_FLAT_DECODE_MEMO") == nullptr;
+    return enabled;
+}
+
+class StripeLock {
+public:
+    explicit StripeLock(std::atomic_flag& flag) : flag(flag) {
+        while (flag.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
+    }
+    ~StripeLock() { flag.clear(std::memory_order_release); }
+    StripeLock(const StripeLock&) = delete;
+    StripeLock& operator=(const StripeLock&) = delete;
+
+private:
+    std::atomic_flag& flag;
+};
+
+std::uint64_t decodeMemoHash(const DecodeMemoKey& key) {
+    auto hash = static_cast<std::uint64_t>(DecodeMemoHash{}(key));
+    hash ^= hash >> 33u;
+    hash *= 0xff51afd7ed558ccdull;
+    hash ^= hash >> 33u;
+    return hash;
+}
+
+DecodeSlot* decodeSet(FlatDecodeMemo& memo, std::uint64_t hash) {
+    return memo.slots.get() + static_cast<std::size_t>(hash & (DecodeSets - 1u)) * DecodeSetWays;
+}
+
+std::atomic_flag& decodeStripe(FlatDecodeMemo& memo, std::uint64_t hash) {
+    return memo.stripes[static_cast<std::size_t>(hash & (DecodeStripes - 1u))];
+}
+
+std::optional<std::uint32_t> flatDecodeFind(const DecodeMemoKey& key, std::uint64_t hash) {
+    auto& memo = flatDecodeMemo();
+    auto* ways = decodeSet(memo, hash);
+    StripeLock lock(decodeStripe(memo, hash));
+    for (std::size_t way = 0; way < DecodeSetWays && ways[way].key.artifact != 0u; ++way) {
+        if (!(ways[way].key == key)) continue;
+        const auto value = ways[way].value;
+        std::rotate(ways, ways + way, ways + way + 1);
+        return value;
+    }
+    return std::nullopt;
+}
+
+void flatDecodeInsert(const DecodeMemoKey& key, std::uint64_t hash, std::uint32_t value) {
+    auto& memo = flatDecodeMemo();
+    auto* ways = decodeSet(memo, hash);
+    StripeLock lock(decodeStripe(memo, hash));
+    for (std::size_t way = 0; way < DecodeSetWays && ways[way].key.artifact != 0u; ++way) {
+        if (ways[way].key == key) return;
+    }
+    std::move_backward(ways, ways + DecodeSetWays - 1u, ways + DecodeSetWays);
+    ways[0] = {key, value};
+}
+
 RuntimeImageModeMatch tryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes, bool diagnostics);
 
 std::uint32_t decodeTableEntry(const ImageResource& image, std::span<const ImageResource> modes, const DescriptorValue& words, std::uint64_t memoKey, std::uint32_t resource) {
     DecodeMemoKey key{memoKey, resource, words.dwords};
-    if (memoKey != 0u) {
+    const bool flat = memoKey != 0u && FlatDecodeMemoEnabled();
+    const auto hash = flat ? decodeMemoHash(key) : 0u;
+    auto& counters = tableCounters();
+    const bool profiled = MaterializeProfiled();
+    if (flat) {
+        if (const auto found = flatDecodeFind(key, hash)) {
+            if (profiled) counters.decodeHits.fetch_add(1, std::memory_order_relaxed);
+            return *found;
+        }
+    } else if (memoKey != 0u) {
         auto& memo = decodeMemo();
         std::lock_guard lock(memo.mutex);
-        if (const auto found = memo.entries.find(key); found != memo.entries.end()) return found->second;
+        if (const auto found = memo.entries.find(key); found != memo.entries.end()) {
+            if (profiled) counters.decodeHits.fetch_add(1, std::memory_order_relaxed);
+            return found->second;
+        }
     }
     const auto match = tryRuntimeImageMode(image, words, modes, false);
     const auto value = match.mode.has_value() ? *match.mode : DecodeFailed | static_cast<std::uint32_t>(match.reason);
-    if (memoKey != 0u) {
+    if (profiled) counters.decodeMisses.fetch_add(1, std::memory_order_relaxed);
+    if (flat) {
+        flatDecodeInsert(key, hash, value);
+    } else if (memoKey != 0u) {
         auto& memo = decodeMemo();
         std::lock_guard lock(memo.mutex);
-        if (memo.entries.size() >= DecodeMemoEntries) memo.entries.clear();
+        if (memo.entries.size() >= DecodeMemoEntries) {
+            memo.entries.clear();
+            if (profiled) counters.decodeClears.fetch_add(1, std::memory_order_relaxed);
+        }
         memo.entries.emplace(key, value);
     }
     return value;
@@ -1632,8 +1742,21 @@ ResolutionMemo& resolutionMemo() {
 }
 
 constexpr std::size_t ResolutionMemoEntries = 256;
-constexpr std::size_t ResolutionMemoVariantEntries = 4;
-constexpr std::size_t ResolutionMemoWords = std::size_t{1} << 23u;
+
+std::size_t positiveSetting(const char* value, std::size_t fallback) {
+    const auto parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    return parsed != 0ull ? static_cast<std::size_t>(parsed) : fallback;
+}
+
+std::size_t resolutionMemoVariantEntries() {
+    static const std::size_t entries = positiveSetting(std::getenv("APS5_TABLE_RESOLUTION_MEMO_VARIANT_ENTRIES"), 4u);
+    return entries;
+}
+
+std::size_t resolutionMemoWords() {
+    static const std::size_t words = positiveSetting(std::getenv("APS5_TABLE_RESOLUTION_MEMO_MIB"), 32u) * (std::size_t{1} << 20u) / sizeof(std::uint32_t);
+    return words;
+}
 
 bool sameColumns(const std::vector<ImageTableColumnSnapshot>& left, const std::vector<ImageTableColumnSnapshot>& right, bool contents) {
     if (left.size() != right.size()) return false;
@@ -1857,12 +1980,15 @@ std::shared_ptr<const ResolvedImageTables> ResourceMaterializer::ResolveImageTab
     auto reducing = reducingSamplers(info, snapshot);
     auto& memo = resolutionMemo();
     auto& totals = tableReuseTotals();
+    auto& counters = tableCounters();
+    const bool profiled = MaterializeProfiled();
     {
         std::lock_guard lock(memo.mutex);
         const auto find = [&](bool contents) {
             return std::find_if(memo.entries.begin(), memo.entries.end(), [&](const ResolutionMemoEntry& entry) { return entry.memoKey == memoKey && entry.reducing == reducing && sameColumns(entry.tables, snapshot.tables.tables, contents); });
         };
         auto found = find(false);
+        auto& hit = found != memo.entries.end() ? counters.resolvedSame : counters.resolvedEqual;
         if (found == memo.entries.end() && ImageTableContentReuse()) {
             found = find(true);
             if (found != memo.entries.end()) found->tables = snapshot.tables.tables;
@@ -1870,13 +1996,22 @@ std::shared_ptr<const ResolvedImageTables> ResourceMaterializer::ResolveImageTab
         if (found != memo.entries.end()) {
             std::rotate(memo.entries.begin(), found, found + 1);
             totals.resolutionsShared.fetch_add(1, std::memory_order_relaxed);
+            if (profiled) hit.fetch_add(1, std::memory_order_relaxed);
             return memo.entries.front().resolved;
         }
     }
+    const auto started = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto resolved = std::make_shared<const ResolvedImageTables>(ResolveImageTables(info, snapshot, memoKey));
     totals.resolutions.fetch_add(1, std::memory_order_relaxed);
+    if (profiled) {
+        counters.resolved.fetch_add(1, std::memory_order_relaxed);
+        counters.resolveNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+    }
     const auto footprint = resolutionFootprint(*resolved, snapshot.tables.tables);
-    if (footprint > ResolutionMemoWords) return resolved;
+    if (footprint > resolutionMemoWords()) {
+        if (profiled) counters.resolvedUnkept.fetch_add(1, std::memory_order_relaxed);
+        return resolved;
+    }
     std::lock_guard lock(memo.mutex);
     memo.entries.insert(memo.entries.begin(), ResolutionMemoEntry{memoKey, snapshot.tables.tables, std::move(reducing), resolved, footprint});
     std::size_t kept = 0;
@@ -1885,13 +2020,17 @@ std::shared_ptr<const ResolvedImageTables> ResourceMaterializer::ResolveImageTab
     for (std::size_t index = 0; index < memo.entries.size(); index++) {
         auto& entry = memo.entries[index];
         const bool sameVariant = entry.memoKey == memoKey;
-        if ((sameVariant && variantEntries == ResolutionMemoVariantEntries) || kept == ResolutionMemoEntries || total + entry.footprint > ResolutionMemoWords) continue;
+        if ((sameVariant && variantEntries == resolutionMemoVariantEntries()) || kept == ResolutionMemoEntries || total + entry.footprint > resolutionMemoWords()) {
+            if (profiled) (sameVariant && variantEntries == resolutionMemoVariantEntries() ? counters.resolutionDropsVariant : counters.resolutionDropsSize).fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         if (sameVariant) variantEntries++;
         total += entry.footprint;
         if (kept != index) memo.entries[kept] = std::move(entry);
         kept++;
     }
     memo.entries.resize(kept);
+    if (profiled) counters.resolutionWords.store(total, std::memory_order_relaxed);
     return resolved;
 }
 
