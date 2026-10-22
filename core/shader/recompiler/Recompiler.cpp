@@ -1352,7 +1352,7 @@ std::size_t resultMemoWays() {
     static const std::size_t ways = [] {
         const char* value = std::getenv("APS5_RESULT_MEMO_WAYS");
         const auto parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
-        return parsed != 0ull ? static_cast<std::size_t>(std::min(parsed, 256ull)) : std::size_t{1};
+        return parsed != 0ull ? static_cast<std::size_t>(std::min(parsed, 256ull)) : std::size_t{4};
     }();
     return ways;
 }
