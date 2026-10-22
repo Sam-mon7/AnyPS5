@@ -1681,6 +1681,16 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_storage_upload_lifetime COMMAND agc_driver_recorder_tests --storage-upload-lifetime-only)
+    add_test(NAME agc_driver_texture_level_clamp COMMAND agc_driver_recorder_tests --texture-level-clamp-only)
+    set_tests_properties(agc_driver_texture_level_clamp PROPERTIES
+        ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation"
+        ENVIRONMENT_MODIFICATION "APS5_NO_TEXTURE_LEVEL_CLAMP=unset:;APS5_SYNC_TEXTURE_UPLOAD=unset:;APS5_DUMP_TEXTURE=unset:"
+        FAIL_REGULAR_EXPRESSION "VUID-;[Vv]alidation [Ee]rror;was not found but was requested by env var VK_INSTANCE_LAYERS"
+        SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_property(TEST agc_driver_texture_level_clamp APPEND PROPERTY ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_sampled_storage_base_level_usage COMMAND agc_driver_recorder_tests --sampled-storage-base-level-usage-only)
     set_tests_properties(agc_sampled_storage_base_level_usage PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)
