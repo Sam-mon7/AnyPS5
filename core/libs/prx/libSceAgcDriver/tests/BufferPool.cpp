@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "AllocationFailure.hpp"
 #include "SlabReturn.hpp"
 #include <algorithm>
@@ -10,6 +12,7 @@
 #include <cstdio>
 #include <deque>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <new>
@@ -60,6 +63,10 @@ struct MockDevice {
     unsigned binds = 0;
     unsigned maps = 0;
     unsigned unmaps = 0;
+    std::map<VkFence, bool> signaled;
+    unsigned submits = 0;
+    unsigned fenceWaits = 0;
+    VkDeviceSize requirementsPadding = 0;
 };
 
 MockDevice mock;
@@ -73,7 +80,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateBuffer(VkDevice, const VkBufferCreateIn
 }
 
 VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer buffer, VkMemoryRequirements* requirements) {
-    *requirements = {mock.sizes.at(buffer), 256, 3};
+    *requirements = {mock.sizes.at(buffer) + mock.requirementsPadding, 256, 3};
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
@@ -136,6 +143,46 @@ VKAPI_ATTR VkDeviceAddress VKAPI_CALL mockGetBufferDeviceAddress(VkDevice, const
     return 0x100000000000ULL + reinterpret_cast<std::uintptr_t>(info->buffer) * 0x10000;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL mockAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer* commands) {
+    *commands = reinterpret_cast<VkCommandBuffer>(static_cast<std::uintptr_t>(mock.next++));
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockFreeCommandBuffers(VkDevice, VkCommandPool, std::uint32_t, const VkCommandBuffer*) {}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateFence(VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence* fence) {
+    *fence = reinterpret_cast<VkFence>(static_cast<std::uintptr_t>(mock.next++));
+    mock.signaled[*fence] = false;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockDestroyFence(VkDevice, VkFence fence, const VkAllocationCallbacks*) { mock.signaled.erase(fence); }
+VKAPI_ATTR VkResult VKAPI_CALL mockGetFenceStatus(VkDevice, VkFence fence) { return mock.signaled.at(fence) ? VK_SUCCESS : VK_NOT_READY; }
+
+VKAPI_ATTR VkResult VKAPI_CALL mockWaitForFences(VkDevice, std::uint32_t count, const VkFence* fences, VkBool32, std::uint64_t) {
+    for (std::uint32_t i = 0; i < count; ++i) mock.signaled.at(fences[i]) = true;
+    ++mock.fenceWaits;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockResetFences(VkDevice, std::uint32_t count, const VkFence* fences) {
+    for (std::uint32_t i = 0; i < count; ++i) mock.signaled.at(fences[i]) = false;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockBeginCommandBuffer(VkCommandBuffer, const VkCommandBufferBeginInfo*) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL mockEndCommandBuffer(VkCommandBuffer) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) { ++mock.submits; return VK_SUCCESS; }
+VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, const void*) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdBeginQuery(VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdEndQuery(VkCommandBuffer, VkQueryPool, std::uint32_t) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdResetQueryPool(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdCopyQueryPoolResults(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize, VkDeviceSize, VkQueryResultFlags) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t, const void*) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t, std::uint32_t) {}
+
 PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
     static const std::map<std::string_view, PFN_vkVoidFunction> table{
         {"vkCreateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCreateBuffer)},
@@ -147,6 +194,25 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkDestroyBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyBuffer)},
         {"vkFreeMemory", reinterpret_cast<PFN_vkVoidFunction>(mockFreeMemory)},
         {"vkGetBufferDeviceAddressKHR", reinterpret_cast<PFN_vkVoidFunction>(mockGetBufferDeviceAddress)},
+        {"vkAllocateCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateCommandBuffers)},
+        {"vkFreeCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(mockFreeCommandBuffers)},
+        {"vkCreateFence", reinterpret_cast<PFN_vkVoidFunction>(mockCreateFence)},
+        {"vkDestroyFence", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyFence)},
+        {"vkGetFenceStatus", reinterpret_cast<PFN_vkVoidFunction>(mockGetFenceStatus)},
+        {"vkWaitForFences", reinterpret_cast<PFN_vkVoidFunction>(mockWaitForFences)},
+        {"vkResetFences", reinterpret_cast<PFN_vkVoidFunction>(mockResetFences)},
+        {"vkBeginCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockBeginCommandBuffer)},
+        {"vkEndCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockEndCommandBuffer)},
+        {"vkQueueSubmit", reinterpret_cast<PFN_vkVoidFunction>(mockQueueSubmit)},
+        {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)},
+        {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPipelineBarrier)},
+        {"vkCmdBeginQuery", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBeginQuery)},
+        {"vkCmdEndQuery", reinterpret_cast<PFN_vkVoidFunction>(mockCmdEndQuery)},
+        {"vkCmdResetQueryPool", reinterpret_cast<PFN_vkVoidFunction>(mockCmdResetQueryPool)},
+        {"vkCmdCopyQueryPoolResults", reinterpret_cast<PFN_vkVoidFunction>(mockCmdCopyQueryPoolResults)},
+        {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
+        {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
+        {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -1001,8 +1067,279 @@ void ImageMemoryReuse() {
     Expect(mock.frees == 35 && context.bufferPool->RetainedImages() == 1, "the pool retains image memory again after a trim");
 }
 
+constexpr VkBufferUsageFlags ScratchUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+void ScratchLifetime() {
+    mock = MockDevice{};
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto context = mockContext();
+        const auto pool = GetBufferPool(context);
+        Recorder recorder(context);
+        constexpr auto bytes = 256 * 1024 + 1;
+        auto host = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible, true);
+        auto device = std::make_shared<DeviceBuffer>(context, bytes, ScratchUsage, true);
+        const auto hostMemory = MemoryOf(host->Handle());
+        const auto deviceMemory = MemoryOf(device->Handle());
+        std::memset(host->Bytes().data(), 0x5a, host->Bytes().size());
+        std::weak_ptr<Buffer> keptHost = host;
+        std::weak_ptr<DeviceBuffer> keptDevice = device;
+        recorder.Keep(std::move(host), bytes);
+        recorder.Keep(std::move(device), bytes);
+        Buffer duringHost(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible, true);
+        DeviceBuffer duringDevice(context, bytes, ScratchUsage, true);
+        Expect(MemoryOf(duringHost.Handle()) != hostMemory && MemoryOf(duringDevice.Handle()) != deviceMemory, "an open recorder batch's scratch memory was reused");
+        recorder.Submit();
+        Expect(mock.submits == 1 && !recorder.Reap(), "the scratch batch did not remain pending at its unsignaled fence");
+        recorder.FlushDeferredReleases();
+        Expect(!keptHost.expired() && !keptDevice.expired(), "pending scratch buffers were released before GPU completion");
+        Expect(pool->ScratchCounters(true).retained == 0 && pool->ScratchCounters(false).retained == 0, "in-flight scratch memory was counted as retained");
+        mock.signaled.begin()->second = true;
+        Expect(recorder.Reap() && mock.fenceWaits == 0, "the signaled scratch batch was not reaped without waiting");
+        Expect(!keptHost.expired() && !keptDevice.expired(), "scratch buffers bypassed deferred release");
+        recorder.FlushDeferredReleases();
+        Expect(keptHost.expired() && keptDevice.expired(), "completed scratch buffers were not released by the recorder");
+        const auto made = mock.allocations;
+        Buffer nextHost(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible, true);
+        DeviceBuffer nextDevice(context, bytes, ScratchUsage, true);
+        Expect(MemoryOf(nextHost.Handle()) == hostMemory && MemoryOf(nextDevice.Handle()) == deviceMemory && mock.allocations == made, "completed scratch buffers were not reused");
+        Expect(std::all_of(nextHost.Bytes().begin(), nextHost.Bytes().end(), [](std::byte value) { return value == std::byte{0x5a}; }), "host scratch reuse lost its mapping or bytes");
+        Expect(pool->ScratchCounters(true).hits == 1 && pool->ScratchCounters(false).hits == 1 && pool->ScratchCounters(true).retained == 0 && pool->ScratchCounters(false).retained == 0, "taking scratch memory did not remove its retained bytes exactly once");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty() && mock.signaled.empty(), "scratch lifetime leaked resources");
+}
+
+void ScratchClasses() {
+    constexpr std::size_t minimum = 64 * 1024;
+    for (std::size_t base = minimum; base <= 128 * MiB; base *= 2) {
+        const auto step = base / 8;
+        for (std::size_t bucket = base; bucket < base * 2; bucket += step) {
+            Expect(BufferPool::ScratchCapacity(bucket) == bucket, "a scratch class boundary was rounded up");
+            Expect(BufferPool::ScratchCapacity(bucket + 1) == bucket + step && BufferPool::ScratchCapacity(bucket + step - 1) == bucket + step, "scratch rounding exceeded its 12.5 percent class");
+        }
+    }
+    Expect(BufferPool::ScratchCapacity(std::numeric_limits<std::size_t>::max()) == 0, "scratch capacity overflow was not rejected");
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        const auto pool = GetBufferPool(context);
+        Expect(!pool->ScratchEligible(minimum - 1, HostVisible) && pool->ScratchEligible(minimum, HostVisible), "the scratch minimum is not 64 KiB");
+        Expect(!pool->ScratchEligible(std::numeric_limits<std::size_t>::max(), HostVisible), "an overflowing scratch request was admitted");
+        VkDeviceMemory deviceMemory;
+        VkDeviceMemory hostMemory;
+        {
+            DeviceBuffer device(context, minimum + 1, ScratchUsage, true);
+            Buffer host(context, minimum + 1, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible, true);
+            deviceMemory = MemoryOf(device.Handle());
+            hostMemory = MemoryOf(host.Handle());
+            Expect(ClassOf(device.Handle()) == 72 * 1024 && ClassOf(host.Handle()) == 72 * 1024 && pool->SlabBlocks() == 0, "small scratch buffers did not use dedicated 12.5 percent classes");
+        }
+        {
+            DeviceBuffer device(context, minimum + 2, ScratchUsage, true);
+            Buffer host(context, minimum + 2, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible, true);
+            Expect(MemoryOf(device.Handle()) == deviceMemory && MemoryOf(host.Handle()) == hostMemory, "different sizes in a scratch class did not reuse memory");
+            Expect(device.Size() == minimum + 2 && host.Bytes().size() == minimum + 2 && mock.sizes.at(device.Handle()) == minimum + 2 && mock.sizes.at(host.Handle()) == minimum + 2, "scratch reuse changed the requested buffer ranges");
+        }
+        {
+            DeviceBuffer large(context, 12 * MiB, ScratchUsage, true);
+            deviceMemory = MemoryOf(large.Handle());
+        }
+        {
+            DeviceBuffer smaller(context, 7 * MiB, ScratchUsage, true);
+            Expect(MemoryOf(smaller.Handle()) == deviceMemory, "scratch lookup did not search larger classes up to twice the request");
+        }
+        DeviceBuffer tooSmall(context, 5 * MiB, ScratchUsage, true);
+        Expect(MemoryOf(tooSmall.Handle()) != deviceMemory, "scratch reuse exceeded twice the requested size");
+        Buffer addressed(context, 12 * MiB, ScratchUsage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+        Expect(MemoryOf(addressed.Handle()) != deviceMemory && addressed.DeviceAddress() != 0, "scratch reuse mixed incompatible buffer usages");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "scratch classes leaked resources");
+}
+
+void ScratchBounds(VkDeviceSize deviceLimit, VkDeviceSize hostLimit) {
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        const auto pool = GetBufferPool(context);
+        Expect(pool->ScratchCounters(true).limit == deviceLimit && pool->ScratchCounters(false).limit == hostLimit, "scratch budget configuration was not applied");
+        for (const bool device : {true, false}) {
+            const auto properties = device ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : HostVisible;
+            const auto limit = device ? deviceLimit : hostLimit;
+            if (limit == 0) {
+                Expect(!pool->ScratchEligible(64 * 1024, properties), "a zero scratch budget admitted a request");
+                Buffer fallback(context, 64 * 1024, ScratchUsage, properties, true);
+                continue;
+            }
+            const auto bytes = static_cast<std::size_t>(limit / 2);
+            Expect(pool->ScratchEligible(bytes, properties) && !pool->ScratchEligible(bytes + 1, properties), "scratch admission did not stop at half its budget");
+            std::vector<std::unique_ptr<Buffer>> buffers;
+            for (int i = 0; i < 3; ++i) buffers.push_back(std::make_unique<Buffer>(context, bytes, ScratchUsage, properties, true));
+            const auto first = MemoryOf(buffers.front()->Handle());
+            for (auto& buffer : buffers) buffer.reset();
+            const auto retained = pool->ScratchCounters(device);
+            Expect(retained.retained == limit && retained.slots == 2 && retained.evictions == 1 && !mock.memoryBytes.contains(first), "scratch retention exceeded its byte budget or evicted out of LRU order");
+            Buffer oversized(context, bytes + 1, ScratchUsage, properties, true);
+            Buffer tiny(context, 4096, ScratchUsage, properties, true);
+            Expect(pool->ScratchCounters(device).misses == 3, "ineligible scratch requests entered the scratch tier");
+        }
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "scratch budget eviction leaked resources");
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        context.limits.maxMemoryAllocationCount = 20;
+        const auto pool = GetBufferPool(context);
+        if (deviceLimit != 0) {
+            std::vector<std::unique_ptr<DeviceBuffer>> buffers;
+            for (int i = 0; i < 3; ++i) buffers.push_back(std::make_unique<DeviceBuffer>(context, 64 * 1024, ScratchUsage, true));
+            for (auto& buffer : buffers) buffer.reset();
+            Expect(pool->ScratchCounters(true).slots == 2 && pool->ScratchCounters(true).evictions == 1, "scratch slots did not respect the five-tier allocation-count bound");
+        }
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "scratch slot eviction leaked resources");
+    if (deviceLimit == 0) return;
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        const auto pool = GetBufferPool(context);
+        mock.requirementsPadding = deviceLimit / 2;
+        const auto physicalBytes = mock.requirementsPadding + 64 * 1024;
+        { DeviceBuffer padded(context, 64 * 1024, ScratchUsage, true); }
+        Expect(pool->ScratchCounters(true).retained == physicalBytes, "scratch retention counted the size class instead of the Vulkan allocation");
+        { DeviceBuffer padded(context, 128 * 1024, ScratchUsage, true); }
+        Expect(pool->ScratchCounters(true).retained == mock.requirementsPadding + 128 * 1024 && pool->ScratchCounters(true).evictions == 1, "scratch eviction ignored Vulkan allocation padding");
+        mock.requirementsPadding = deviceLimit;
+        { DeviceBuffer oversized(context, 256 * 1024, ScratchUsage, true); }
+        Expect(pool->ScratchCounters(true).slots == 1 && mock.frees == 2, "an allocation larger than the scratch budget was retained");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "padded scratch allocations leaked resources");
+}
+
+void ScratchPressure() {
+    for (const auto result : {VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_TOO_MANY_OBJECTS}) {
+        mock = MockDevice{};
+        {
+            auto context = budgetContext();
+            reportedBudget = 2048 * MiB;
+            reportedUsage = 0;
+            const auto pool = GetBufferPool(context);
+            DeviceBuffer active(context, MiB, ScratchUsage, true);
+            const auto activeMemory = MemoryOf(active.Handle());
+            { DeviceBuffer idle(context, 4 * MiB, ScratchUsage, true); }
+            { Buffer idle(context, 2 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible, true); }
+            { Buffer idle(context, 256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT); }
+            VkMemoryAllocateInfo image{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            image.allocationSize = MiB;
+            const auto memory = pool->TakeImageMemory(image, "scratch pressure image");
+            pool->PutImageMemory(memory, MiB, 0);
+            if (ImageSuballocationLevel() != 0) {
+                auto range = pool->TakeImageRange(pool, {MiB, 256, 1}, 0);
+                Expect(range.Valid(), "scratch pressure did not allocate an image block");
+                range.Release();
+                Expect(pool->ImageStats().emptyBlocks == 1, "scratch pressure did not retain an empty image block");
+            }
+            mock.limit = 9 * MiB;
+            mock.pressureResult = result;
+            const auto before = mock.attempts;
+            DeviceBuffer recovered(context, 8 * MiB, ScratchUsage);
+            Expect(mock.attempts == before + 2 && mock.liveBytes == 9 * MiB && mock.memoryBytes.contains(activeMemory), "scratch allocation recovery did not reclaim exactly the idle allocations before retrying");
+            Expect(pool->ScratchCounters(true).retained == 0 && pool->ScratchCounters(false).retained == 0 && pool->ScratchCounters(true).evictions == 1 && pool->ScratchCounters(false).evictions == 1, "scratch trim left stale retained bytes or eviction counts");
+            Expect(pool->RetainedImages() == 0 && pool->SlabBlocks() == 0, "scratch trim did not reclaim the existing image and slab pools");
+            Expect(pool->ImageStats().blocks == 0, "scratch trim did not reclaim empty image blocks");
+        }
+        Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "scratch recovery leaked resources");
+    }
+    mock = MockDevice{};
+    {
+        auto context = budgetContext();
+        reportedBudget = 512 * MiB;
+        reportedUsage = reportedBudget;
+        const auto pool = GetBufferPool(context);
+        VkDeviceMemory hostMemory;
+        {
+            DeviceBuffer fallback(context, 4 * MiB, ScratchUsage, true);
+            hostMemory = MemoryOf(fallback.Handle());
+            Expect(mock.memoryTypes.at(hostMemory) == 1, "scratch changed the current host placement policy under pressure");
+        }
+        Expect(pool->ScratchCounters(false).retained == 4 * MiB && pool->ScratchCounters(true).retained == 0, "host-placed scratch was charged to the device budget");
+        const auto made = mock.allocations;
+        DeviceBuffer reused(context, 4 * MiB, ScratchUsage, true);
+        Expect(MemoryOf(reused.Handle()) == hostMemory && mock.allocations == made && pool->ScratchCounters(false).hits == 1, "host-placed scratch was not reused under VRAM pressure");
+        { DeviceBuffer ordinary(context, 4 * MiB, ScratchUsage); }
+        Expect(mock.frees == 1, "ordinary host-placed memory entered the scratch pool");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "host-placed scratch leaked resources");
+    unsigned rejected = 0;
+    for (int point = 0; point < 12; ++point) {
+        mock = MockDevice{};
+        {
+            auto context = mockContext();
+            context.limits.maxMemoryAllocationCount = 20;
+            const auto pool = GetBufferPool(context);
+            { DeviceBuffer buffer(context, 96 * 1024, ScratchUsage, true); }
+            const auto allocation = pool->Take(96 * 1024, BufferPool::Usage(ScratchUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+            Require(allocation.has_value(), "scratch metadata failure fixture did not retain its buffer");
+            SetAllocationFailureCountdown(point);
+            pool->Put(*allocation);
+            SetAllocationFailureCountdown(-1);
+            if (mock.frees != 0) ++rejected;
+            std::vector<std::unique_ptr<DeviceBuffer>> others;
+            for (int i = 0; i < 3; ++i) others.push_back(std::make_unique<DeviceBuffer>(context, MiB, ScratchUsage, true));
+            for (auto& other : others) other.reset();
+            Expect(context.bufferPool->ScratchCounters(true).slots == 2, "a scratch return metadata failure broke later retention");
+        }
+        Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "a scratch return metadata failure leaked resources");
+    }
+    Expect(rejected != 0, "scratch return metadata failures were not exercised");
+}
+
+void ScratchOff() {
+    Expect(!BufferPool::ScratchEnabled(), "a value other than exact 1 enabled scratch pooling");
+    const auto observe = [](bool requestScratch) {
+        mock = MockDevice{};
+        std::vector<std::uint64_t> observed;
+        {
+            auto context = mockContext();
+            const auto pool = GetBufferPool(context);
+            for (const auto bytes : {std::size_t{4096}, std::size_t{64 * 1024 + 1}, 5 * MiB + 1, 5 * MiB + 2, 5 * MiB + 1}) {
+                Buffer host(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible, requestScratch);
+                DeviceBuffer device(context, bytes, ScratchUsage, requestScratch);
+                std::memset(host.Bytes().data(), 0x6b, bytes);
+                for (const auto buffer : {host.Handle(), device.Handle()}) {
+                    observed.insert(observed.end(), {reinterpret_cast<std::uintptr_t>(buffer), reinterpret_cast<std::uintptr_t>(MemoryOf(buffer)), mock.sizes.at(buffer), mock.usages.at(buffer), ClassOf(buffer), mock.bound.at(buffer).second});
+                }
+                observed.insert(observed.end(), {host.Bytes().size(), device.Size(), static_cast<std::uint64_t>(host.Bytes().back())});
+            }
+            for (const bool device : {true, false}) {
+                const auto stats = pool->ScratchCounters(device);
+                Expect(stats.hits == 0 && stats.misses == 0 && stats.evictions == 0 && stats.slots == 0 && stats.retained == 0 && stats.limit == 0, "disabled scratch pooling changed scratch accounting");
+            }
+        }
+        observed.insert(observed.end(), {mock.allocations, mock.frees, mock.attempts, mock.destroyedBuffers, mock.binds, mock.maps, mock.unmaps});
+        Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "disabled scratch pooling leaked resources");
+        return observed;
+    };
+    const auto ordinary = observe(false);
+    Expect(observe(true) == ordinary, "disabled scratch requests changed allocation sizes, usages, handles, mappings or bytes");
+    HostPlacement();
+    RefusedDevicePlacement();
+}
+
 int main(int argc, char** argv) {
     try {
+        if (argc >= 2 && std::string_view(argv[1]).starts_with("--scratch-")) {
+            const std::string_view mode = argv[1];
+            if (mode == "--scratch-off") ScratchOff();
+            else {
+                Expect(BufferPool::ScratchEnabled(), "scratch pooling is not enabled for this test");
+                if (mode == "--scratch-lifetime") ScratchLifetime();
+                else if (mode == "--scratch-classes") ScratchClasses();
+                else if (mode == "--scratch-pressure") ScratchPressure();
+                else if (mode == "--scratch-bounds" && argc == 4) ScratchBounds(std::strtoull(argv[2], nullptr, 10) * MiB, std::strtoull(argv[3], nullptr, 10) * MiB);
+                else Expect(false, "unknown scratch test mode");
+            }
+            return failures == 0 ? 0 : 1;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--small-device-retention") {
             SmallDeviceRetention();
             return failures == 0 ? 0 : 1;

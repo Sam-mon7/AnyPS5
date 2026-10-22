@@ -8,7 +8,7 @@ namespace AgcDriver::Graphics {
 
 class Buffer {
 public:
-    Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, bool requestScratch = false);
     ~Buffer();
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
@@ -36,6 +36,8 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkDeviceSize offset = 0;
     bool slab = false;
+    bool scratch = false;
+    std::uint32_t memoryType = 0;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::shared_ptr<BufferPool> cache;
@@ -46,7 +48,7 @@ private:
 // copies and are only swizzled in video memory.
 class DeviceBuffer {
 public:
-    DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage);
+    DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, bool requestScratch = false);
     ~DeviceBuffer();
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
@@ -64,6 +66,8 @@ private:
     VkBufferUsageFlags usage;
     std::shared_ptr<BufferPool> cache;
     bool hostPlaced = false;
+    bool scratch = false;
+    std::uint32_t memoryType = 0;
     bool ready = false;
 };
 

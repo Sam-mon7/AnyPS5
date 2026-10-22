@@ -28,6 +28,13 @@ struct BufferAllocation {
     bool slab = false;
     std::size_t bufferBytes = 0;
     std::uint32_t memoryType = 0;
+    bool scratch = false;
+};
+
+struct ScratchStats {
+    std::uint64_t hits = 0, misses = 0, evictions = 0;
+    std::size_t slots = 0;
+    VkDeviceSize retained = 0, limit = 0;
 };
 
 struct SlabSlot {
@@ -45,9 +52,6 @@ struct SlabSlot {
 // builds no longer sweeps the large ones out. Free slots are kept per size, usage and memory
 // properties, so a lookup does not scan the other slots. Reuse is safe because a Buffer is only released once
 // the GPU work using it completed (kept until the batch fence, or after a CommandBatch wait).
-// APS5_NO_BUFFER_CLASSES=1 matches exact sizes only, as before; APS5_BUFFER_POOL_SLOTS=<n> sets the
-// slot count (the bound applies to each tier below, and is held to a sixth of the device's
-// maxMemoryAllocationCount so the three tiers keep half of it free).
 //
 // The size classes and the exact-size allocations are retained in two tiers with a budget each:
 // the multi-MiB texture scratch buffers that come back from a batch (GPU-direct uploads and
@@ -71,8 +75,12 @@ public:
     VkDeviceMemory TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr);
     void PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
     std::size_t RetainedImages();
-    std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, bool scratch = false);
     void Put(const BufferAllocation& allocation) noexcept;
+    static bool ScratchEnabled();
+    static std::size_t ScratchCapacity(std::size_t bytes);
+    bool ScratchEligible(std::size_t bytes, VkMemoryPropertyFlags properties) const;
+    ScratchStats ScratchCounters(bool device);
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
     static VkDeviceSize SlabBlockBytes(std::size_t capacity);
     SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
@@ -146,6 +154,9 @@ private:
     static VkDeviceSize deviceBudget(const Context& context);
     static bool DeviceTiered(VkMemoryPropertyFlags properties);
     static std::size_t NextCapacity(std::size_t capacity);
+    static VkDeviceSize ScratchBudget(bool device);
+    Tier& scratchTier(VkMemoryPropertyFlags properties);
+    std::optional<BufferAllocation> takeScratch(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     VkDeviceSize destroy(const BufferAllocation& allocation) noexcept;
     VkDeviceSize trim();
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the
@@ -173,6 +184,8 @@ private:
     Tier smallTier;
     Tier largeTier;
     Tier deviceTier;
+    Tier scratchDeviceTier;
+    Tier scratchHostTier;
     std::chrono::steady_clock::time_point heapRead{};
     bool heapOver = false;
     VkDeviceSize imageBudget = 0;
