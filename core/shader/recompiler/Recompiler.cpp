@@ -23,6 +23,7 @@
 #include <new>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/include/ControlFlow/Structurizer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaInstructionDecoder.hpp"
@@ -359,8 +360,8 @@ struct EmissionFailure {
 };
 
 constexpr std::size_t ResultMemoSets = 64;
-constexpr std::size_t ResultMemoWays = 4;
-using ResultMemoTable = std::array<ResultMemoEntry, ResultMemoSets * ResultMemoWays>;
+constexpr std::size_t ResultMemoEvictedKeys = std::size_t{1} << 16u;
+using ResultMemoTable = std::vector<ResultMemoEntry>;
 
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::mutex mutex;
@@ -379,6 +380,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::vector<std::shared_ptr<const CompiledVariant>> variants;
     std::vector<EmissionFailure> emissionFailures;
     std::unique_ptr<ResultMemoTable> memo;
+    std::unordered_set<std::uint64_t> evictedMemoKeys;
     std::uint64_t memoClock = 0;
 };
 
@@ -1301,13 +1303,26 @@ bool ResultMemo() {
     return resultMemo;
 }
 
+std::size_t resultMemoWays() {
+    static const std::size_t ways = [] {
+        const char* value = std::getenv("APS5_RESULT_MEMO_WAYS");
+        const auto parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+        return parsed != 0ull ? static_cast<std::size_t>(std::min(parsed, 256ull)) : std::size_t{4};
+    }();
+    return ways;
+}
+
 ResultMemoEntry* memoSet(SourceEntry& source, std::uint64_t index) {
     if (source.memo == nullptr) return nullptr;
-    return source.memo->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSets) * ResultMemoWays;
+    return source.memo->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSets) * resultMemoWays();
+}
+
+std::uint64_t memoIndex(std::uint64_t variantId, std::uint64_t hash) {
+    return (variantId * 0x9e3779b97f4a7c15ull) ^ hash;
 }
 
 struct ResultMemoCounters {
-    std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
+    std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, returning{0}, populateNanoseconds{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -1330,8 +1345,9 @@ void reportResultMemo() {
     const auto hits = counters.hits.exchange(0, std::memory_order_relaxed);
     const auto misses = counters.misses.exchange(0, std::memory_order_relaxed);
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
+    const auto returning = counters.returning.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions, %llu misses of evicted results (%zu ways)\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(returning), resultMemoWays());
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
@@ -1418,9 +1434,9 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     auto& counters = resultMemoCounters();
     {
         std::lock_guard lock(source.mutex);
-        index = (variant->artifact.variantId * 0x9e3779b97f4a7c15ull) ^ hash;
+        index = memoIndex(variant->artifact.variantId, hash);
         if (auto* set = memoSet(source, index)) {
-            for (std::size_t way = 0; way < ResultMemoWays; ++way) {
+            for (std::size_t way = 0; way < resultMemoWays(); ++way) {
                 auto& entry = set[way];
                 if (entry.result == nullptr || entry.variantId != variant->artifact.variantId || entry.hash != hash) continue;
                 entry.used = ++source.memoClock;
@@ -1439,11 +1455,11 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     {
         std::lock_guard lock(source.mutex);
-        if (source.memo == nullptr) source.memo = std::make_unique<ResultMemoTable>();
+        if (source.memo == nullptr) source.memo = std::make_unique<ResultMemoTable>(ResultMemoSets * resultMemoWays());
         auto* set = memoSet(source, index);
         auto* victim = set;
         bool present = false;
-        for (std::size_t way = 0; way < ResultMemoWays && !present; ++way) {
+        for (std::size_t way = 0; way < resultMemoWays() && !present; ++way) {
             auto& entry = set[way];
             if (entry.result != nullptr && entry.variantId == variant->artifact.variantId && entry.hash == hash) {
                 entry.used = ++source.memoClock;
@@ -1454,7 +1470,14 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             }
         }
         if (!present) {
-            if (victim->result != nullptr) counters.evictions.fetch_add(1, std::memory_order_relaxed);
+            if (profile && source.evictedMemoKeys.erase(index) != 0u) counters.returning.fetch_add(1, std::memory_order_relaxed);
+            if (victim->result != nullptr) {
+                counters.evictions.fetch_add(1, std::memory_order_relaxed);
+                if (profile) {
+                    if (source.evictedMemoKeys.size() >= ResultMemoEvictedKeys) source.evictedMemoKeys.clear();
+                    source.evictedMemoKeys.insert(memoIndex(victim->variantId, victim->hash));
+                }
+            }
             *victim = {variant->artifact.variantId, hash, shared, ++source.memoClock};
         }
     }

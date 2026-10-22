@@ -1307,6 +1307,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
+    "APS5_NO_FLAT_DECODE_MEMO",
     "APS5_NO_IMAGE_TABLE_CONTENT_REUSE",
     "APS5_NO_PERF_FRONTEND_PAIR",
     "APS5_NO_PERF_DISK_PLANS",
@@ -1316,6 +1317,9 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_RESULT_MEMO",
     "APS5_NO_TABLE_RESOLUTION_REUSE",
     "APS5_NO_TABLE_SNAPSHOT_REUSE",
+    "APS5_RESULT_MEMO_WAYS",
+    "APS5_TABLE_RESOLUTION_MEMO_MIB",
+    "APS5_TABLE_RESOLUTION_MEMO_VARIANT_ENTRIES",
 };
 
 const std::vector<std::byte>& switchKey() {
