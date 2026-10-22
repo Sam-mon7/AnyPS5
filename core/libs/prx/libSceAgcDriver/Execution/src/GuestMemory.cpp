@@ -2602,6 +2602,28 @@ void CopyGuestBytes(void* destination, const void* source, std::size_t bytes) {
 
 namespace {
 
+void copyUnlessUnmapped(std::byte* destination, std::uint64_t source, std::size_t bytes) {
+#ifdef _WIN32
+    static const bool plain = std::getenv("APS5_NO_GUARDED_PARTIAL_READS") != nullptr;
+    if (plain) {
+        std::memcpy(destination, reinterpret_cast<const void*>(source), bytes);
+        return;
+    }
+    SIZE_T copied = 0;
+    if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(source), destination, bytes, &copied) && copied == bytes) return;
+    constexpr std::uint64_t Page = 4096;
+    for (auto at = source; at < source + bytes;) {
+        const auto next = std::min<std::uint64_t>((at & ~(Page - 1u)) + Page, source + bytes);
+        const auto size = static_cast<std::size_t>(next - at);
+        auto* target = destination + (at - source);
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), target, size, &copied) || copied != size) std::memset(target, 0, size);
+        at = next;
+    }
+#else
+    std::memcpy(destination, reinterpret_cast<const void*>(source), bytes);
+#endif
+}
+
 void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (Accessible(reinterpret_cast<const void*>(address), destination.size())) {
         std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
@@ -2612,7 +2634,7 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
     auto zeroedTo = address;
     for (const auto& [begin, end] : CommittedRanges(address, destination.size())) {
         if (!zeroWhole && begin > zeroedTo) std::memset(destination.data() + (zeroedTo - address), 0, static_cast<std::size_t>(begin - zeroedTo));
-        std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+        copyUnlessUnmapped(destination.data() + (begin - address), begin, static_cast<std::size_t>(end - begin));
         zeroedTo = end;
     }
     if (!zeroWhole && zeroedTo < address + destination.size()) std::memset(destination.data() + (zeroedTo - address), 0, static_cast<std::size_t>(address + destination.size() - zeroedTo));
