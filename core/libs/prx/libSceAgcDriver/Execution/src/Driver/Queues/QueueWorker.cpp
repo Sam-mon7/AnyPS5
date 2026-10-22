@@ -145,7 +145,8 @@ void Driver::run(std::uint32_t id) noexcept {
         const char* value = std::getenv("APS5_SAMPLE_WORKER_QUEUE");
         return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
     }();
-    if (id == sampledQueue) StartWorkerSampler();
+    static const bool committerSampled = std::getenv("APS5_SAMPLE_COMMITTER") != nullptr;
+    if (!committerSampled && id == sampledQueue) StartWorkerSampler();
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(id);

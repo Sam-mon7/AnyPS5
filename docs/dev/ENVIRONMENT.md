@@ -369,6 +369,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_RELEASE_UNDER_LOCK` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | destroys deferred batches in finish() under the lock instead of on a release thread |
 | `APS5_RESOURCE_CACHE_ENTRIES` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` | 1024 | maximum entries in the per-device shader-resource cache |
 | `APS5_RESOURCE_CACHE_TABLE_ELEMENTS` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` | 65536 | number of image-table elements the shader-resource cache keeps (0 keeps the default) |
+| `APS5_SAMPLE_COMMITTER` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp` |  | makes `APS5_SAMPLE_WORKER` sample the draw committer thread instead of a queue worker |
 | `APS5_SAMPLE_THREADS` | string | `core/libs/prx/libSceAgcDriver/Execution/src/WorkerSampler.cpp` |  | samples every thread of the process every 2 ms and writes each busy thread's hottest frames to a file (Windows only) |
 | `APS5_SAMPLE_WORKER` | string | `core/libs/prx/libSceAgcDriver/Execution/src/WorkerSampler.cpp` |  | samples the calling queue worker every millisecond and writes its stacks to a file (Windows only) |
 | `APS5_SAMPLE_WORKER_QUEUE` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/QueueWorker.cpp` | 0 | the queue worker `APS5_SAMPLE_WORKER` samples (for example 0x50) |
