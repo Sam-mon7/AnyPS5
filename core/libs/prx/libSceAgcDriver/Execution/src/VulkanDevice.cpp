@@ -4832,6 +4832,17 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
                 cached = state->resourceCache.Find(prepared->key);
             }
         }
+        static const bool exactFallback = std::getenv("APS5_NO_DISPATCH_EXACT_FALLBACK") == nullptr;
+        if (cached == nullptr && !prepared->exact && DispatchMove() && exactFallback) {
+            auto exactKey = DispatchContentKey(compute, context.device, false);
+            if (exactKey != prepared->key) {
+                cached = state->resourceCache.Find(exactKey);
+                if (cached != nullptr) {
+                    prepared->key = std::move(exactKey);
+                    prepared->exact = true;
+                }
+            }
+        }
         prepared->cached = cached;
         phase(PreparedDispatch::PrepareFind);
     }
