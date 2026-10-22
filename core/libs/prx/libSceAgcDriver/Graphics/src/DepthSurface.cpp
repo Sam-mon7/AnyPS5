@@ -1111,8 +1111,7 @@ public:
                 continue;
             }
             static const bool emptyLayers = std::getenv("APS5_NO_EMPTY_DEPTH_LAYER_MEMO") == nullptr;
-            const auto registry = emptyLayers ? GuestAllocations::GuestAllocationsGeneration_nid_postfix() : 0;
-            if (emptyLayers && current.generation == 0 && held.empty && held.registry == registry && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes))) {
+            if (emptyLayers && current.generation == 0 && held.empty && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && GuestMemory::DescribeCommitted(current.address, static_cast<std::size_t>(current.bytes)).ranges.empty()) {
                 if (depthPlaneProfiled()) {
                     depthPlaneUploads().empty.fetch_add(1, std::memory_order_relaxed);
                     reportDepthPlaneUploads();
@@ -1130,15 +1129,13 @@ public:
                 counts.bytes.fetch_add(current.bytes, std::memory_order_relaxed);
                 reportDepthPlaneUploads();
             }
+            const bool empty = emptyLayers && current.generation == 0 && GuestMemory::DescribeCommitted(current.address, static_cast<std::size_t>(current.bytes)).ranges.empty();
             auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
             uploads.push_back(std::move(upload));
             uploadLayers.push_back(layer);
             held = current;
-            if (emptyLayers && current.generation == 0) {
-                held.empty = GuestMemory::DescribeCommitted(current.address, static_cast<std::size_t>(current.bytes)).ranges.empty();
-                held.registry = registry;
-            }
+            held.empty = empty;
         }
         if (!copiedLayers.empty() || !uploads.empty()) record(slices, resource, geometry, copiedLayers, uploads, uploadLayers);
         const std::array<std::uint32_t, 6> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType), baseLayer};
@@ -1163,7 +1160,6 @@ private:
         bool thick = false;
         std::uint64_t generation = 0;
         bool empty = false;
-        std::uint64_t registry = 0;
     };
 
     VkImage image = VK_NULL_HANDLE;
