@@ -118,6 +118,10 @@ public:
         std::uint64_t dedicatedPools = 0;
         std::uint64_t keptSets = 0;
         std::uint64_t reusedSets = 0;
+        std::uint64_t liveSets = 0;
+        std::uint64_t exhaustedPools = 0;
+        std::uint64_t recycledSets = 0;
+        std::uint64_t reopenedPools = 0;
     };
     Stats Counters() const;
 

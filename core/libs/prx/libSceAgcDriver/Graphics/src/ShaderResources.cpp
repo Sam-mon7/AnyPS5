@@ -2652,7 +2652,7 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto descriptors = context.descriptorCache != nullptr ? context.descriptorCache->Counters() : DescriptorCache::Stats{};
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools (live sets %llu, exhausted pools %llu, reopened %llu, recycled sets held %llu), samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(descriptors.liveSets), static_cast<unsigned long long>(descriptors.exhaustedPools), static_cast<unsigned long long>(descriptors.reopenedPools), static_cast<unsigned long long>(descriptors.recycledSets), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
 template<typename TVisitor>
@@ -4342,14 +4342,29 @@ void DescriptorCache::Free(const SetAllocation& allocation, std::shared_ptr<cons
     auto& pool = chain[allocation.poolIndex];
     if (pool.handle != allocation.pool || pool.liveSets == 0) std::terminate();
     if (freeDescriptorSets != nullptr && freeDescriptorSets(context.device, allocation.pool, 1, &allocation.set) != VK_SUCCESS) std::terminate();
-    if (--pool.liveSets != 0) return;
+    if (--pool.liveSets != 0) {
+        static const bool reuse = std::getenv("APS5_NO_DESCRIPTOR_POOL_REUSE") == nullptr;
+        if (reuse && pool.exhausted && freeDescriptorSets != nullptr && pool.liveSets <= ChainPoolSets / 2) {
+            pool.exhausted = false;
+            ++stats.reopenedPools;
+        }
+        return;
+    }
     if (resetPool(context.device, pool.handle, 0) != VK_SUCCESS) std::terminate();
     pool.exhausted = false;
 }
 
 DescriptorCache::Stats DescriptorCache::Counters() const {
     std::lock_guard lock(mutex);
-    return stats;
+    auto counters = stats;
+    for (const auto* chain : {&pools, &updateAfterBindPools}) {
+        for (const auto& pool : *chain) {
+            counters.liveSets += pool.liveSets;
+            counters.exhaustedPools += pool.exhausted ? 1u : 0u;
+        }
+    }
+    for (const auto& [key, list] : recycled) counters.recycledSets += list.size();
+    return counters;
 }
 
 std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> words) const {
