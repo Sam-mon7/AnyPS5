@@ -2111,6 +2111,133 @@ void ProtectTablePage(std::uintptr_t page, std::uint32_t protection) {
     GuestAllocations::GuestAllocationsInvalidate_nid_postfix(page, 4096u);
 }
 
+void verifyImageTableContentReuse(bool identityOnly) {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    require((std::getenv("APS5_NO_IMAGE_TABLE_CONTENT_REUSE") != nullptr) == identityOnly, "image table content reuse: unexpected switch setting");
+    require(std::getenv("APS5_NO_TABLE_RESOLUTION_REUSE") == nullptr, "image table content reuse: resolution reuse must be enabled");
+    constexpr std::uint64_t Variant = 0x100000000ull;
+    ShaderRecompiler::ImageResource image{};
+    image.resourceClass = ShaderRecompiler::ImageResourceClass::Sampled;
+    image.dimension = ShaderRecompiler::RdnaImageDimension::Dim2D;
+    image.table = 0u;
+    const ShaderRecompiler::DescriptorValue valid{TableT(reinterpret_cast<const void*>(0x100000000ull), TableFormat32UInt, TableType2D), 8u, 0xffu};
+    auto incompatible = valid;
+    incompatible.dwords[1] = (incompatible.dwords[1] & ~(0x1ffu << 20u)) | (TableFormat8888UNorm << 20u);
+    const auto modes = ShaderRecompiler::ResourceMaterializer::RuntimeImageModes(image);
+    const auto mode = ShaderRecompiler::ResourceMaterializer::RuntimeImageMode(image, valid, modes);
+    ShaderRecompiler::ShaderInfo info{};
+    info.images.push_back(image);
+    info.runtimeImageModes.push_back({modes.at(mode)});
+    info.samplers.resize(2u);
+    info.samplers[1].table = 1u;
+    info.sampledPairs.push_back({0u, 0u, 0u});
+    ShaderRecompiler::ResourceSnapshot snapshot{};
+    snapshot.samplers.resize(2u);
+    snapshot.samplers[0].dwordCount = 4u;
+    snapshot.samplers[0].availableDwordMask = 0xfu;
+    snapshot.tables.tables.resize(2u);
+    auto& images = snapshot.tables.tables[0];
+    images.base = 0x1000u;
+    images.size = 96u;
+    images.records = 3u;
+    images.keys = 3u;
+    images.codes = ShaderRecompiler::SharedValues<std::uint32_t>({0u, 1u, 0u});
+    images.words = ShaderRecompiler::SharedValues<ShaderRecompiler::DescriptorValue>({valid, incompatible});
+    auto& samplers = snapshot.tables.tables[1];
+    samplers.base = 0x2000u;
+    samplers.size = 16u;
+    samplers.records = 1u;
+    samplers.keys = 1u;
+    samplers.codes = ShaderRecompiler::SharedValues<std::uint32_t>({0u});
+    samplers.words = ShaderRecompiler::SharedValues<ShaderRecompiler::DescriptorValue>({snapshot.samplers[0]});
+    const auto recapture = [](const ShaderRecompiler::ResourceSnapshot& previous) {
+        auto next = previous;
+        for (auto& column : next.tables.tables) {
+            column.codes = ShaderRecompiler::SharedValues<std::uint32_t>(column.codes.Copy());
+            column.words = ShaderRecompiler::SharedValues<ShaderRecompiler::DescriptorValue>(column.words.Copy());
+        }
+        next.userData = {0x3000u, 1u};
+        next.flattenedSrt = {0x4000u, 1u};
+        return next;
+    };
+    const auto same = [](const ShaderRecompiler::ResolvedImageTables& a, const ShaderRecompiler::ResolvedImageTables& b) {
+        return a.map == b.map && a.faults == b.faults
+            && std::ranges::equal(a.elements, b.elements, [](const auto& x, const auto& y) { return x.words == y.words && x.dimension == y.dimension && x.depthCompare == y.depthCompare && x.kind == y.kind && x.samplers == y.samplers; })
+            && std::ranges::equal(a.samplers, b.samplers, [](const auto& x, const auto& y) { return x.words == y.words && x.compare == y.compare && x.point == y.point; })
+            && std::ranges::equal(a.poison, b.poison, [](const auto& x, const auto& y) { return x.words == y.words && x.dwordCount == y.dwordCount && x.resource == y.resource && x.reason == y.reason; });
+    };
+    const auto original = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, snapshot, Variant);
+    require(original->elements.size() == 1u && !original->samplers.empty() && original->faults == 1u, "image table content reuse: fixture lacks an image, sampler or poison record");
+    const auto match = ShaderRecompiler::ResourceMaterializer::TryRuntimeImageMode(image, incompatible, info.runtimeImageModes[0]);
+    require(!match.mode.has_value() && !match.detail.empty() && original->poison.back().reason == match.reason, "image table content reuse: discarded diagnostics changed the poison reason or public diagnostics");
+    require(ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, snapshot, Variant) == original, "image table content reuse: identity lookup missed");
+    const auto captured = recapture(snapshot);
+    for (std::size_t index = 0; index < captured.tables.tables.size(); ++index) {
+        require(!captured.tables.tables[index].codes.Shares(snapshot.tables.tables[index].codes) && !captured.tables.tables[index].words.Shares(snapshot.tables.tables[index].words), "image table content reuse: recapture retained column identities");
+    }
+    const auto before = ShaderRecompiler::ResourceMaterializer::TableReuse();
+    const auto reused = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, captured, Variant);
+    const auto after = ShaderRecompiler::ResourceMaterializer::TableReuse();
+    require((reused == original) == !identityOnly && after.resolutions - before.resolutions == static_cast<std::uint64_t>(identityOnly) && after.resolutionsShared - before.resolutionsShared == static_cast<std::uint64_t>(!identityOnly), "image table content reuse: independent equal columns did not obey the switch");
+    require(same(*reused, *original) && same(*reused, ShaderRecompiler::ResourceMaterializer::ResolveImageTables(info, captured)), "image table content reuse: equal columns changed the resolved result");
+    require(ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, captured, Variant) == reused, "image table content reuse: repeated capture lost identity reuse");
+    const auto miss = [&](const ShaderRecompiler::ResourceSnapshot& changed, const char* message) {
+        const auto baseline = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, snapshot, Variant);
+        const auto beforeMiss = ShaderRecompiler::ResourceMaterializer::TableReuse();
+        const auto resolved = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, changed, Variant);
+        const auto afterMiss = ShaderRecompiler::ResourceMaterializer::TableReuse();
+        require(resolved != baseline && resolved != original && resolved != reused && afterMiss.resolutions == beforeMiss.resolutions + 1u && afterMiss.resolutionsShared == beforeMiss.resolutionsShared, message);
+        require(same(*resolved, ShaderRecompiler::ResourceMaterializer::ResolveImageTables(info, changed)), "image table content reuse: a miss differs from uncached resolution");
+        return resolved;
+    };
+    auto changed = recapture(snapshot);
+    auto words = changed.tables.tables[0].words.Copy();
+    words[0].dwords[0]++;
+    changed.tables.tables[0].words = ShaderRecompiler::SharedValues<ShaderRecompiler::DescriptorValue>(std::move(words));
+    const auto changedWord = miss(changed, "image table content reuse: a changed descriptor word hit");
+    require(!same(*changedWord, *original), "image table content reuse: descriptor change did not affect the fixture");
+    if (!identityOnly) {
+        require(ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, recapture(snapshot), Variant) == original, "image table content reuse: returning to the first content state missed");
+        require(ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, recapture(changed), Variant) == changedWord, "image table content reuse: alternating content states missed");
+    }
+    changed = recapture(snapshot);
+    words = changed.tables.tables[0].words.Copy();
+    words[0].availableDwordMask &= static_cast<std::uint8_t>(~(1u << 3u));
+    changed.tables.tables[0].words = ShaderRecompiler::SharedValues<ShaderRecompiler::DescriptorValue>(std::move(words));
+    const auto unavailable = miss(changed, "image table content reuse: a changed availability mask hit");
+    require(unavailable->elements.empty() && unavailable->faults > original->faults, "image table content reuse: unavailable descriptor did not poison the image");
+    changed = recapture(snapshot);
+    changed.tables.tables[0].codes = ShaderRecompiler::SharedValues<std::uint32_t>({1u, 0u, 0u});
+    miss(changed, "image table content reuse: changed column codes hit");
+    changed = recapture(snapshot);
+    words = changed.tables.tables[1].words.Copy();
+    words[0].dwordCount = 3u;
+    changed.tables.tables[1].words = ShaderRecompiler::SharedValues<ShaderRecompiler::DescriptorValue>(std::move(words));
+    miss(changed, "image table content reuse: changed descriptor width hit");
+    for (unsigned field = 0; field < 6u; ++field) {
+        changed = recapture(snapshot);
+        auto& column = changed.tables.tables[0];
+        switch (field) {
+            case 0: column.base += 32u; break;
+            case 1: column.size += 32u; break;
+            case 2: column.records++; break;
+            case 3: column.keys++; column.codes = ShaderRecompiler::SharedValues<std::uint32_t>({0u, 1u, 0u, 0u}); break;
+            case 4: column.fault = Abi::PoisonFlag | static_cast<std::uint32_t>(Abi::PoisonReason::OutsideSnapshot); break;
+            case 5: column.outside = true; break;
+        }
+        miss(changed, "image table content reuse: changed column metadata hit");
+    }
+    changed = recapture(snapshot);
+    changed.samplers[0].dwords[0] = 1u << 29u;
+    changed.samplers[0].dwords[2] = 1u << 20u;
+    require(miss(changed, "image table content reuse: changed reducing sampler state hit")->elements.empty(), "image table content reuse: reducing sampler did not poison the integer image");
+    const auto baseline = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, snapshot, Variant);
+    auto otherInfo = info;
+    otherInfo.images[0].tableOperation = ShaderRecompiler::TableOperation::Unsupported;
+    const auto otherVariant = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(otherInfo, snapshot, Variant + 1u);
+    require(otherVariant != baseline && !same(*otherVariant, *baseline) && same(*otherVariant, ShaderRecompiler::ResourceMaterializer::ResolveImageTables(otherInfo, snapshot)), "image table content reuse: distinct compiled variants shared a resolution");
+}
+
 void verifyTableSnapshotReuse() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -8628,6 +8755,10 @@ int main(int argc, char** argv) {
             verifyTableVouch();
             verifyTableSpanQuery();
             verifyTableEdgeStore();
+            return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--image-table-content-reuse" || std::string_view(argv[1]) == "--image-table-identity-only")) {
+            verifyImageTableContentReuse(std::string_view(argv[1]) == "--image-table-identity-only");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--selected-records-image-limit") {

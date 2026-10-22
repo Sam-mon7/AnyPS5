@@ -29,6 +29,7 @@
 #include <unordered_set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -167,13 +168,6 @@ struct ImageDecode {
     std::string detail;
 };
 
-ImageDecode rejectImage(PoisonReason reason, std::string detail) {
-    ImageDecode result;
-    result.reason = reason;
-    result.detail = std::move(detail);
-    return result;
-}
-
 PoisonReason invalidImageReason(const DescriptorValue& descriptor) {
     const auto type = rawImageType(descriptor);
     if (type < ImageType::Color1D) {
@@ -188,7 +182,13 @@ PoisonReason invalidImageReason(const DescriptorValue& descriptor) {
     return PoisonReason::Dimension;
 }
 
-ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const ImageResource& base, std::uint32_t srgbDecodeFormats) {
+ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const ImageResource& base, std::uint32_t srgbDecodeFormats, bool diagnostics = true) {
+    const auto rejectImage = [diagnostics](PoisonReason reason, std::string_view detail) {
+        ImageDecode result;
+        result.reason = reason;
+        if (diagnostics) result.detail = detail;
+        return result;
+    };
     ImageDecode result;
     auto& decoded = result.decoded;
     decoded.mipCount = storageMipCount(base, descriptor);
@@ -223,10 +223,10 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
     const auto format = rawImageFormat(descriptor);
     if (decoded.dimension == RdnaImageDimension::Dim2DMsaa && rawImageType(descriptor) == ImageType::Color2DMsaa && multisamplePlaneRead(base) && !IsFmaskTextureFormat(format) && !IsDepthBitsTexture(descriptor.dwords[1], descriptor.dwords[3])) decoded.dimension = RdnaImageDimension::Dim2D;
     if (base.atomic64 && format != IrBufferFormat::Format32_32UInt && format != IrBufferFormat::Format32_32SInt && format != IrBufferFormat::Format32_32Float) {
-        return rejectImage(PoisonReason::InvalidFormat, "64-bit atomic image descriptor uses an unsupported format " + std::to_string(static_cast<std::uint32_t>(format)));
+        return rejectImage(PoisonReason::InvalidFormat, diagnostics ? "64-bit atomic image descriptor uses an unsupported format " + std::to_string(static_cast<std::uint32_t>(format)) : "");
     }
     if (base.atomic && !base.atomic64 && format != IrBufferFormat::Format32UInt && format != IrBufferFormat::Format32SInt && format != IrBufferFormat::Format32Float) {
-        return rejectImage(PoisonReason::InvalidFormat, "atomic image descriptor uses an unsupported format " + std::to_string(static_cast<std::uint32_t>(format)));
+        return rejectImage(PoisonReason::InvalidFormat, diagnostics ? "atomic image descriptor uses an unsupported format " + std::to_string(static_cast<std::uint32_t>(format)) : "");
     }
     const bool storage = base.resourceClass == ImageResourceClass::Storage;
     const bool table = base.table != NoTable;
@@ -1573,6 +1573,8 @@ DecodeMemo& decodeMemo() {
 constexpr std::uint32_t DecodeMemoEntries = 1u << 20u;
 constexpr std::uint32_t DecodeFailed = 0x80000000u;
 
+RuntimeImageModeMatch tryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes, bool diagnostics);
+
 std::uint32_t decodeTableEntry(const ImageResource& image, std::span<const ImageResource> modes, const DescriptorValue& words, std::uint64_t memoKey, std::uint32_t resource) {
     DecodeMemoKey key{memoKey, resource, words.dwords};
     if (memoKey != 0u) {
@@ -1580,7 +1582,7 @@ std::uint32_t decodeTableEntry(const ImageResource& image, std::span<const Image
         std::lock_guard lock(memo.mutex);
         if (const auto found = memo.entries.find(key); found != memo.entries.end()) return found->second;
     }
-    const auto match = ResourceMaterializer::TryRuntimeImageMode(image, words, modes);
+    const auto match = tryRuntimeImageMode(image, words, modes, false);
     const auto value = match.mode.has_value() ? *match.mode : DecodeFailed | static_cast<std::uint32_t>(match.reason);
     if (memoKey != 0u) {
         auto& memo = decodeMemo();
@@ -1606,6 +1608,11 @@ bool TableResolutionReuse() {
     return enabled;
 }
 
+bool ImageTableContentReuse() {
+    static const bool enabled = std::getenv("APS5_NO_IMAGE_TABLE_CONTENT_REUSE") == nullptr;
+    return enabled;
+}
+
 struct ResolutionMemoEntry {
     std::uint64_t memoKey = 0;
     std::vector<ImageTableColumnSnapshot> tables;
@@ -1628,12 +1635,14 @@ constexpr std::size_t ResolutionMemoEntries = 256;
 constexpr std::size_t ResolutionMemoVariantEntries = 4;
 constexpr std::size_t ResolutionMemoWords = std::size_t{1} << 23u;
 
-bool sameColumns(const std::vector<ImageTableColumnSnapshot>& left, const std::vector<ImageTableColumnSnapshot>& right) {
+bool sameColumns(const std::vector<ImageTableColumnSnapshot>& left, const std::vector<ImageTableColumnSnapshot>& right, bool contents) {
     if (left.size() != right.size()) return false;
     for (std::size_t index = 0; index < left.size(); index++) {
         const auto& a = left[index];
         const auto& b = right[index];
-        if (a.base != b.base || a.size != b.size || a.records != b.records || a.keys != b.keys || a.fault != b.fault || a.outside != b.outside || !a.codes.Shares(b.codes) || !a.words.Shares(b.words)) return false;
+        if (a.base != b.base || a.size != b.size || a.records != b.records || a.keys != b.keys || a.fault != b.fault || a.outside != b.outside) return false;
+        if (a.codes.Shares(b.codes) && a.words.Shares(b.words)) continue;
+        if (!contents || a.codes.Hash() != b.codes.Hash() || a.words.Hash() != b.words.Hash() || a.codes != b.codes || a.words != b.words) return false;
     }
     return true;
 }
@@ -1850,7 +1859,14 @@ std::shared_ptr<const ResolvedImageTables> ResourceMaterializer::ResolveImageTab
     auto& totals = tableReuseTotals();
     {
         std::lock_guard lock(memo.mutex);
-        const auto found = std::find_if(memo.entries.begin(), memo.entries.end(), [&](const ResolutionMemoEntry& entry) { return entry.memoKey == memoKey && entry.reducing == reducing && sameColumns(entry.tables, snapshot.tables.tables); });
+        const auto find = [&](bool contents) {
+            return std::find_if(memo.entries.begin(), memo.entries.end(), [&](const ResolutionMemoEntry& entry) { return entry.memoKey == memoKey && entry.reducing == reducing && sameColumns(entry.tables, snapshot.tables.tables, contents); });
+        };
+        auto found = find(false);
+        if (found == memo.entries.end() && ImageTableContentReuse()) {
+            found = find(true);
+            if (found != memo.entries.end()) found->tables = snapshot.tables.tables;
+        }
         if (found != memo.entries.end()) {
             std::rotate(memo.entries.begin(), found, found + 1);
             totals.resolutionsShared.fetch_add(1, std::memory_order_relaxed);
@@ -2087,11 +2103,13 @@ const char* ResourceMaterializer::UnnormalizedSampleMismatch(const ImageResource
     return nullptr;
 }
 
-RuntimeImageModeMatch ResourceMaterializer::TryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes) {
+namespace {
+
+RuntimeImageModeMatch tryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes, bool diagnostics) {
     RuntimeImageModeMatch result;
-    const auto reject = [&](PoisonReason reason, std::string detail) {
+    const auto reject = [&](PoisonReason reason, std::string_view detail) {
         result.reason = reason;
-        result.detail = std::move(detail);
+        if (diagnostics) result.detail = detail;
         return result;
     };
     if (descriptor.dwordCount != 8u) throw std::runtime_error("runtime image descriptor must contain eight dwords");
@@ -2100,7 +2118,7 @@ RuntimeImageModeMatch ResourceMaterializer::TryRuntimeImageMode(const ImageResou
         result.mode = 0u;
         return result;
     }
-    const auto inspected = inspectImageDescriptor(descriptor, image, image.srgbDecodeFormats);
+    const auto inspected = inspectImageDescriptor(descriptor, image, image.srgbDecodeFormats, diagnostics);
     if (inspected.reason.has_value()) return reject(*inspected.reason, inspected.detail);
     const auto& decoded = inspected.decoded;
     const auto format = rawImageFormat(descriptor);
@@ -2140,13 +2158,6 @@ RuntimeImageModeMatch ResourceMaterializer::TryRuntimeImageMode(const ImageResou
     }
     if (image.dimension == RdnaImageDimension::Dim1D && decoded.dimension != RdnaImageDimension::Dim1D) return reject(PoisonReason::Dimension, "image address has too few coordinate components");
     if (image.foldTexelOffsetsOnly) return reject(PoisonReason::UnsupportedOperation, "image sample with a texel offset that is not a constant takes only images an unnormalized S# can sample without VK_KHR_maintenance8 and shaderImageGatherExtended");
-    const auto describe = [](IrTextureNumericClass numeric, RdnaImageDimension dimension, IrBufferFormat conversion, IrBufferFormat packed, bool cube, bool depthBits, bool depthUnorm16, bool srgb) {
-        return "{class " + std::to_string(static_cast<int>(numeric)) + ", dim " + std::to_string(static_cast<int>(dimension)) + ", conversion " + std::to_string(static_cast<int>(conversion)) + ", packed " + std::to_string(static_cast<int>(packed)) + ", cube " + std::to_string(cube) + ", depthBits " + std::to_string(depthBits) + ", unorm16 " + std::to_string(depthUnorm16) + ", srgb " + std::to_string(srgb) + "}";
-    };
-    std::string message = "image descriptor is incompatible with the static runtime image interface: descriptor format " + std::to_string(static_cast<int>(format)) + " decodes to " + describe(decoded.numericClass, decoded.dimension, decoded.conversionFormat, decoded.packedFormat, decoded.cube, decoded.depthBits, decoded.depthUnorm16, decoded.srgbDecode) + (emulated ? " (emulated compare)" : "") + "; modes:";
-    for (const auto& mode : modes) message += " " + describe(mode.numericClass, mode.dimension, mode.conversionFormat, mode.packedFormat, mode.cube, mode.depthBits, mode.depthUnorm16, mode.srgbDecode);
-    char words[96];
-    std::snprintf(words, sizeof(words), "; T# %08x %08x %08x %08x %08x %08x %08x %08x", descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]);
     const auto reason = emulated ? PoisonReason::ColorCompare
         : decoded.fmask ? PoisonReason::Fmask
         : decoded.depthBits ? PoisonReason::DepthBits16
@@ -2155,7 +2166,21 @@ RuntimeImageModeMatch ResourceMaterializer::TryRuntimeImageMode(const ImageResou
         : decoded.dimension == RdnaImageDimension::Dim2DMsaa || decoded.dimension == RdnaImageDimension::Dim2DMsaaArray ? PoisonReason::Multisampled
         : std::none_of(modes.begin(), modes.end(), [&](const ImageResource& mode) { return mode.dimension == decoded.dimension && mode.cube == decoded.cube; }) ? PoisonReason::Dimension
         : PoisonReason::NumericClass;
+    if (!diagnostics) return reject(reason, {});
+    const auto describe = [](IrTextureNumericClass numeric, RdnaImageDimension dimension, IrBufferFormat conversion, IrBufferFormat packed, bool cube, bool depthBits, bool depthUnorm16, bool srgb) {
+        return "{class " + std::to_string(static_cast<int>(numeric)) + ", dim " + std::to_string(static_cast<int>(dimension)) + ", conversion " + std::to_string(static_cast<int>(conversion)) + ", packed " + std::to_string(static_cast<int>(packed)) + ", cube " + std::to_string(cube) + ", depthBits " + std::to_string(depthBits) + ", unorm16 " + std::to_string(depthUnorm16) + ", srgb " + std::to_string(srgb) + "}";
+    };
+    std::string message = "image descriptor is incompatible with the static runtime image interface: descriptor format " + std::to_string(static_cast<int>(format)) + " decodes to " + describe(decoded.numericClass, decoded.dimension, decoded.conversionFormat, decoded.packedFormat, decoded.cube, decoded.depthBits, decoded.depthUnorm16, decoded.srgbDecode) + (emulated ? " (emulated compare)" : "") + "; modes:";
+    for (const auto& mode : modes) message += " " + describe(mode.numericClass, mode.dimension, mode.conversionFormat, mode.packedFormat, mode.cube, mode.depthBits, mode.depthUnorm16, mode.srgbDecode);
+    char words[96];
+    std::snprintf(words, sizeof(words), "; T# %08x %08x %08x %08x %08x %08x %08x %08x", descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]);
     return reject(reason, message + words);
+}
+
+}
+
+RuntimeImageModeMatch ResourceMaterializer::TryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes) {
+    return tryRuntimeImageMode(image, descriptor, modes, true);
 }
 
 std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes) {
