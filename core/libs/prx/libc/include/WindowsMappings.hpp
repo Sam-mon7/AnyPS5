@@ -445,6 +445,11 @@ public:
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
+        static const bool rangeSkip = std::getenv("APS5_NO_COLLECT_RANGE_SKIP") == nullptr;
+        if (rangeSkip && collection != Collection::Fresh) {
+            const auto clean = cleanRanges.upper_bound(address);
+            if (clean != cleanRanges.begin() && std::prev(clean)->second >= end) return true;
+        }
         if (collection == Collection::Fresh) {
             const auto fresh = freshRanges.upper_bound(address);
             if ((fresh == freshRanges.begin() || std::prev(fresh)->second <= address) && (fresh == freshRanges.end() || fresh->first >= end)) return true;
@@ -594,10 +599,18 @@ public:
 
 private:
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
-        const auto proven = collectableRanges.upper_bound(address);
+        auto proven = collectableRanges.upper_bound(address);
         if (proven != collectableRanges.begin() && std::prev(proven)->second >= end) return true;
+        static const bool rangeSkip = std::getenv("APS5_NO_COLLECT_RANGE_SKIP") == nullptr;
         auto position = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
+            if (rangeSkip) {
+                while (proven != collectableRanges.end() && proven->first <= cursor) ++proven;
+                if (proven != collectableRanges.begin() && cursor < std::prev(proven)->second) {
+                    cursor = std::min(end, std::prev(proven)->second);
+                    continue;
+                }
+            }
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = viewAt(base, position); found != views.end()) {
                 if (found->second.protection == PAGE_NOACCESS || (found->second.resident ? !watchResident : found->second.page->comparedWhenShared)) return false;
