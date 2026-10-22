@@ -1398,7 +1398,17 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
         else {
-            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+            WriteTracker::Memo merged{first, stop, epoch, serial};
+            static const bool mergeMemo = std::getenv("APS5_NO_COLLECT_MEMO_MERGE") == nullptr;
+            if (mergeMemo) {
+                for (auto& entry : threadCollectMemo.entries) {
+                    if (entry.epoch != epoch || entry.unwatched != serial || entry.begin > merged.end || merged.begin > entry.end) continue;
+                    merged.begin = std::min(merged.begin, entry.begin);
+                    merged.end = std::max(merged.end, entry.end);
+                    entry = {};
+                }
+            }
+            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = merged;
             if (epochCollectMapEnabled()) {
                 auto& entry = epochCollectMap(epoch).ranges[first];
                 if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
