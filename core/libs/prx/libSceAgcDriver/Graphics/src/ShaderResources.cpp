@@ -926,7 +926,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         ++cache.counts.stale;
     }
     const bool importDetile = source == nullptr && useImportDetile(context, cache, resource, *keys, bytes, snapshotGeneration, committed.has_value());
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr || importDetile ? 0u : bytes), nullptr, *keys, snapshotGeneration};
+    constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
+    static const bool overwriteSnapshots = std::getenv("APS5_NO_TEXTURE_SNAPSHOT_OVERWRITE") == nullptr;
+    const bool transientSnapshot = overwriteSnapshots && source == nullptr && !importDetile && snapshotGeneration != 0 && bytes > SnapshotCompareBytes && (*keys == DccKeys::Uncompressed || *keys == DccKeys::ClearSingle);
+    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr || importDetile || transientSnapshot ? 0u : bytes), nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
     entry.surfaceBytes = bytes;
     if (source != nullptr) {
@@ -962,17 +965,18 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         const bool pending = *keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes);
         if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
-        ReadTextureSurface(resource, *keys, entry.bytes);
+        const auto transient = transientSnapshot ? std::make_unique_for_overwrite<std::byte[]>(bytes) : std::unique_ptr<std::byte[]>{};
+        const auto snapshot = transientSnapshot ? std::span<std::byte>(transient.get(), bytes) : std::span<std::byte>(entry.bytes);
+        ReadTextureSurface(resource, *keys, snapshot);
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
             std::size_t nonzero = 0;
-            for (std::size_t i = 0; i < entry.bytes.size(); i += 64) nonzero += entry.bytes[i] != std::byte{0};
-            std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
+            for (std::size_t i = 0; i < snapshot.size(); i += 64) nonzero += snapshot[i] != std::byte{0};
+            std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, snapshot.size() / 64);
         }
-        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
         entry.accounted = entry.texture->AllocationBytes();
-        constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
         if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0)) std::vector<std::byte>().swap(entry.bytes);
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
