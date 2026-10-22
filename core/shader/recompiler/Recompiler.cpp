@@ -394,6 +394,69 @@ public:
     }
 };
 
+std::size_t cacheLimit(const char* value, std::size_t fallback) {
+    return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : fallback;
+}
+
+std::size_t ModuleCacheLimit() {
+    static const std::size_t limit = cacheLimit(std::getenv("APS5_MODULE_CACHE_LIMIT"), 0u);
+    return limit;
+}
+
+std::size_t PlanCacheLimit() {
+    static const std::size_t limit = cacheLimit(std::getenv("APS5_PLAN_CACHE_LIMIT"), 2048u);
+    return limit;
+}
+
+template <typename Key, typename Entry>
+class GenerationalCache {
+public:
+    explicit GenerationalCache(std::size_t (*limit)()) : limit(limit) {}
+
+    std::shared_ptr<Entry> FindOrInsert(const Key& key) {
+        {
+            std::shared_lock lock(mutex);
+            if (const auto found = current.find(key); found != current.end()) return found->second;
+        }
+        std::unique_lock lock(mutex);
+        if (const auto found = current.find(key); found != current.end()) return found->second;
+        std::shared_ptr<Entry> entry;
+        if (const auto old = previous.find(key); old != previous.end()) {
+            entry = std::move(old->second);
+            previous.erase(old);
+        } else {
+            entry = std::make_shared<Entry>();
+            created++;
+        }
+        const auto bound = limit();
+        if (bound != 0u && current.size() >= bound) {
+            previous = std::move(current);
+            current.clear();
+            rotations++;
+        }
+        current.emplace(key, entry);
+        return entry;
+    }
+
+    struct Sizes {
+        std::size_t current = 0, previous = 0;
+        std::uint64_t created = 0, rotations = 0;
+    };
+
+    Sizes Measure() {
+        std::shared_lock lock(mutex);
+        return {current.size(), previous.size(), created, rotations};
+    }
+
+private:
+    std::size_t (*limit)();
+    PrimedSharedMutex mutex;
+    std::map<Key, std::shared_ptr<Entry>> current;
+    std::map<Key, std::shared_ptr<Entry>> previous;
+    std::uint64_t created = 0;
+    std::uint64_t rotations = 0;
+};
+
 struct ResourceProgram {
     explicit ResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true) : program(std::make_unique<IrProgram>(PrepareResourceProgram(request, preparation))) {
         const auto clearRegisterState = [](const auto& storage) {
@@ -874,21 +937,25 @@ struct RegistrationModuleEntry {
     std::shared_ptr<const SpecializedModule> module;
 };
 
+GenerationalCache<std::vector<std::uint64_t>, RegistrationModuleEntry>& registrationModules() {
+    static GenerationalCache<std::vector<std::uint64_t>, RegistrationModuleEntry> cache(ModuleCacheLimit);
+    return cache;
+}
+
+GenerationalCache<std::vector<std::uint64_t>, PreparedBindingPlan>& preparedBindingPlans() {
+    static GenerationalCache<std::vector<std::uint64_t>, PreparedBindingPlan> cache(PlanCacheLimit);
+    return cache;
+}
+
+GenerationalCache<std::vector<std::uint64_t>, SpecializedModuleEntry>& specializedModules() {
+    static GenerationalCache<std::vector<std::uint64_t>, SpecializedModuleEntry> cache(ModuleCacheLimit);
+    return cache;
+}
+
 std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<std::shared_ptr<const SpecializedModule>()>& specialize) {
     std::vector<std::uint64_t> key{variantId};
     key.insert(key.end(), moduleKey.begin(), moduleKey.end());
-    static PrimedSharedMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<RegistrationModuleEntry>> modules;
-    std::shared_ptr<RegistrationModuleEntry> entry;
-    {
-        std::shared_lock lock(mutex);
-        if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
-    }
-    if (entry == nullptr) {
-        std::unique_lock lock(mutex);
-        const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<RegistrationModuleEntry>()).first->second;
-    }
+    const auto entry = registrationModules().FindOrInsert(key);
     std::call_once(entry->ready, [&] {
         try {
             entry->module = specialize();
@@ -927,18 +994,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
-    static PrimedSharedMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
-    std::shared_ptr<PreparedBindingPlan> plan;
-    {
-        std::shared_lock lock(mutex);
-        if (const auto found = plans.find(key); found != plans.end()) plan = found->second;
-    }
-    if (plan == nullptr) {
-        std::unique_lock lock(mutex);
-        const auto found = plans.find(key);
-        plan = found != plans.end() ? found->second : plans.emplace(key, std::make_shared<PreparedBindingPlan>()).first->second;
-    }
+    const auto plan = preparedBindingPlans().FindOrInsert(key);
     std::call_once(plan->ready, [&] {
         try {
             plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, variant.artifact.registrationModule, fragmentDescriptorSet);
@@ -956,18 +1012,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     key.clear();
     key.push_back(artifact.variantId);
     for (const auto& constant : constants) key.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
-    static PrimedSharedMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<SpecializedModuleEntry>> modules;
-    std::shared_ptr<SpecializedModuleEntry> entry;
-    {
-        std::shared_lock lock(mutex);
-        if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
-    }
-    if (entry == nullptr) {
-        std::unique_lock lock(mutex);
-        const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
-    }
+    const auto entry = specializedModules().FindOrInsert(key);
     std::call_once(entry->ready, [&] {
         try {
             entry->module = buildSpecializedModule(artifact, classes, constants, target);
@@ -1348,6 +1393,10 @@ void reportResultMemo() {
     const auto returning = counters.returning.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions, %llu misses of evicted results (%zu ways)\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(returning), resultMemoWays());
+    const auto plans = preparedBindingPlans().Measure();
+    const auto modules = specializedModules().Measure();
+    const auto registration = registrationModules().Measure();
+    std::fprintf(stderr, "[recompile] caches (cumulative): binding plans %zu + %zu previous (%llu built, %llu rotations, limit %zu), specialized modules %zu + %zu (%llu built, %llu rotations), registration modules %zu + %zu (%llu built, %llu rotations, limit %zu)\n", plans.current, plans.previous, static_cast<unsigned long long>(plans.created), static_cast<unsigned long long>(plans.rotations), PlanCacheLimit(), modules.current, modules.previous, static_cast<unsigned long long>(modules.created), static_cast<unsigned long long>(modules.rotations), registration.current, registration.previous, static_cast<unsigned long long>(registration.created), static_cast<unsigned long long>(registration.rotations), ModuleCacheLimit());
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the

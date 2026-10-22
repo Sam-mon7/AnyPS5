@@ -1305,6 +1305,8 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
 constexpr std::string_view NeutralSwitches[] = {
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
+    "APS5_MODULE_CACHE_LIMIT",
+    "APS5_PLAN_CACHE_LIMIT",
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
     "APS5_NO_FLAT_DECODE_MEMO",
