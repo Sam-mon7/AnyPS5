@@ -781,4 +781,12 @@ void RunGuestTextureResourceTests() {
     single.depth = 3;
     Require(!FirstLayerDescriptor(pack(single), narrowed), "a 2D array T# of its base slice alone needs no narrowing");
     Require(!FirstLayerDescriptor(baseWords, narrowed), "a 2D T# needs no narrowing");
+
+    const auto nullWords = pack(zeroAddress);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::string failure;
+        Require(!TryDecodeTextureResource(nullWords, &failure).has_value() && failure.find("null base address") != std::string::npos, "a rejected T# must be reported with its reason, also when the rejection is remembered");
+    }
+    const auto tried = TryDecodeTextureResource(baseWords);
+    Require(tried.has_value() && tried->baseAddress == DecodeTextureResource(baseWords).baseAddress && tried->format == DecodeTextureResource(baseWords).format, "a valid T# must decode through TryDecodeTextureResource");
 }

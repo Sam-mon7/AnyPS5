@@ -4,7 +4,9 @@
 #include "Recompiler.hpp"
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string>
 
 namespace AgcDriver::Graphics {
 
@@ -98,6 +100,7 @@ float EffectiveMinLod(const GuestTextureResource& resource);
 bool IsNullTextureResource(std::span<const std::uint32_t> words);
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);
 std::array<std::uint32_t, 8> EncodeTextureResource(const GuestTextureResource& resource);
+std::optional<GuestTextureResource> TryDecodeTextureResource(std::span<const std::uint32_t> words, std::string* failure = nullptr);
 bool DescriptorSingleLevel(std::span<const std::uint32_t> words);
 bool FirstLayerDescriptor(std::span<const std::uint32_t> words, std::array<std::uint32_t, 8>& narrowed);
 bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, TextureDimension dimension);
