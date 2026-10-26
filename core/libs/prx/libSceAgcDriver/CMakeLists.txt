@@ -2661,6 +2661,7 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    set_property(TEST agc_driver agc_driver_pm4 agc_driver_image_table_vouch_queued_draws agc_driver_queue_zero_late_interrupt APPEND PROPERTY ENVIRONMENT "APS5_PIPELINED_DRAWS=1")
     foreach(agcCleanTest IN ITEMS storage_one_slice_alias linear_target_cpu_writes storage_flush_ordering dcc_key_presync)
         add_test(NAME agc_driver_${agcCleanTest}_clean_proof COMMAND agc_driver_${agcCleanTest}_tests)
         set_tests_properties(agc_driver_${agcCleanTest}_clean_proof PROPERTIES
