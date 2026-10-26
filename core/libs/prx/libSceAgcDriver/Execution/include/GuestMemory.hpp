@@ -111,6 +111,8 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
+std::uint64_t ResourceProofSerial();
+bool ResourceEpochProofsEnabled();
 void BreakProofs();
 void MarkProofThread();
 std::uint64_t CollectEpoch();

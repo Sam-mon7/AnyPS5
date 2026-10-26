@@ -1705,6 +1705,7 @@ std::uint64_t CollectEpochBumps() {
 
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
+std::atomic<std::uint64_t> resourceProofSerial{1};
 thread_local bool proofThread = false;
 }
 
@@ -1712,8 +1713,21 @@ std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
+bool ResourceEpochProofsEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_RESOURCE_EPOCH_PROOFS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t ResourceProofSerial() {
+    return resourceProofSerial.load(std::memory_order_acquire);
+}
+
 void BreakProofs() {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    if (ResourceEpochProofsEnabled()) resourceProofSerial.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void MarkProofThread() {
@@ -2385,7 +2399,13 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        if (!proofThread) proofSerial.fetch_add(1, std::memory_order_acq_rel);
+        if (ResourceEpochProofsEnabled()) {
+            static const void* resourceProofOwner = nullptr;
+            const auto token = CurrentThreadToken();
+            if (resourceProofOwner != token) resourceProofSerial.fetch_add(1, std::memory_order_acq_rel);
+            resourceProofOwner = token;
+        }
     }
 }
 
