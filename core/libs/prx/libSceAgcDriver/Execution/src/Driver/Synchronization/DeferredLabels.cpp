@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "ThreadOwned.hpp"
+#include <algorithm>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -97,6 +98,38 @@ std::uint64_t Driver::batchCap() {
         return text ? std::strtoull(text, nullptr, 10) : 64ull;
     }();
     return value;
+}
+
+void Driver::flushAwaitedLabels(std::uint32_t queue) {
+    static const bool enabled = std::getenv("APS5_NO_AWAITED_LABEL_FLUSH") == nullptr;
+    if (!enabled) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto ownSlot = queue == 0 ? 0 : queue - 0x20 + 1;
+    const auto& labels = deferredLabels().labels;
+    for (std::size_t index = 0; index < awaitedSlots.size(); ++index) {
+        if (index == ownSlot) continue;
+        const auto& slot = awaitedSlots[index];
+        const auto address = slot.address.load(std::memory_order_acquire);
+        if (address == 0) continue;
+        const auto bytes = slot.shape.load(std::memory_order_relaxed) >> 32u;
+        if (bytes != 4 && bytes != 8) continue;
+        const bool overlaps = std::any_of(labels.begin(), labels.end(), [&](const DeferredLabel& label) {
+            return address >= label.address ? address - label.address < label.size : label.address - address < bytes;
+        });
+        if (!overlaps) continue;
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+        if (!gpuLock.owns_lock()) {
+            if (profile) ++waitOutcomes().awaitedLabelBusy;
+            return;
+        }
+        const auto localDevice = device.Load();
+        if (localDevice == nullptr) return;
+        recordDeferredLabels(localDevice.get(), queue);
+        localDevice->SubmitRecorded(false);
+        if (profile) ++waitOutcomes().awaitedLabelFlushes;
+        return;
+    }
 }
 
 void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue) {
