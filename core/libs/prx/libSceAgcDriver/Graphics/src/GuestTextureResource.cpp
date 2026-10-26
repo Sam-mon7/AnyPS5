@@ -62,7 +62,16 @@ bool IsNullTextureResource(std::span<const std::uint32_t> words) {
     return base40 == 0 || type <= 1;
 }
 
+void TrapPoisonedWords(std::span<const std::uint32_t> words, const char* site) {
+    static const bool armed = std::getenv("APS5_POISON_FREED_RESULTS") != nullptr;
+    if (!armed || words.empty() || words[0] != 0xbaddcafeu) return;
+    std::fprintf(stderr, "[poison] %s read the descriptor words of a freed result\n", site);
+    std::fflush(stderr);
+    __builtin_trap();
+}
+
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words) {
+    TrapPoisonedWords(words, "DecodeTextureResource");
     Require(words.size() == 8, "guest texture descriptor must contain 8 dwords");
 
     const auto base40 = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1]) << 32u)) & 0xffffffffffull;

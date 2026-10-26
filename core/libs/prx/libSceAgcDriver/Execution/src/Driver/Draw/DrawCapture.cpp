@@ -102,7 +102,20 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 
     timing.Mark("capture_resources");
     try {
+        const auto materializeStart = std::chrono::steady_clock::now();
         stageCapture.compiled = invocation.Materialize(*capture);
+        if (const auto materializeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - materializeStart).count(); materializeMs > 3.0) {
+            static std::atomic<int> printed{0};
+            if (printed.fetch_add(1) < 4000) {
+                std::string pixelText;
+                if (request.context.pixel) {
+                    const auto& pixelInfo = *request.context.pixel;
+                    pixelText = " dual " + std::to_string(pixelInfo.dualSourceBlend) + " reversed " + std::to_string(pixelInfo.reversedBlend) + " raster " + std::to_string(static_cast<int>(pixelInfo.rasterPrimitive)) + " layer " + std::to_string(pixelInfo.layerExported) + " packing";
+                    for (const auto packing : pixelInfo.targetExportPacking) pixelText += " " + std::to_string(static_cast<int>(packing));
+                }
+                std::fprintf(stderr, "[slow-materialize] %.2f ms code 0x%llx stage %d spec %016llx variant %016llx index 0x%llx count %u size %u instances %u user0 %08x%s\n", materializeMs, static_cast<unsigned long long>(program.binary.codeAddress), static_cast<int>(program.binary.stage), static_cast<unsigned long long>(stageCapture.compiled->specializationId), static_cast<unsigned long long>(stageCapture.compiled->variantId), static_cast<unsigned long long>(drawParameters.indexAddress), drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount, program.userData.empty() ? 0u : program.userData[0], pixelText.c_str());
+            }
+        }
     } catch (const std::exception& error) {
         throw named(error, request.context.memory);
     }

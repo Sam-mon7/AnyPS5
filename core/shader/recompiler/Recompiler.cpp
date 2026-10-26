@@ -5,6 +5,7 @@
 #include <cstring>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include <cstdio>
 #include "CacheKey.hpp"
@@ -22,8 +23,10 @@
 #include <mutex>
 #include <new>
 #include <shared_mutex>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
+#include <type_traits>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/include/ControlFlow/Structurizer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaInstructionDecoder.hpp"
@@ -391,6 +394,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::unique_ptr<ResultMemoTable> memo;
     std::unordered_set<std::uint64_t> evictedMemoKeys;
     std::uint64_t memoClock = 0;
+    std::chrono::steady_clock::time_point memoryReported{};
 };
 
 namespace {
@@ -585,6 +589,20 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 }
                 if (disk) ShaderDiskCache::StorePlan(std::move(planKey), source->plan);
             }
+            static const bool traceMemory = std::getenv("APS5_TRACE_PLAN_MEMORY") != nullptr;
+            if (traceMemory) {
+                const auto& plan = *source->plan;
+                std::size_t arguments = 0, uses = 0, phi = 0, phiNodes = 0;
+                for (const auto& value : plan.valueStorage) {
+                    arguments += value.Arguments().capacity() * sizeof(IrValue*);
+                    uses += value.OperandUseCapacity() * sizeof(IrUse);
+                    phi += value.PhiBlockCount() * sizeof(IrBlock*);
+                    phiNodes += value.PhiBlockCount() != 0;
+                }
+                const auto& compact = plan.compact;
+                const auto compactBytes = compact.values.capacity() * sizeof(CompactPlanValue) + (compact.arguments.capacity() + compact.sourceDwords.capacity() + compact.srtReads.capacity() + compact.conditions.capacity()) * sizeof(std::uint32_t);
+                std::fprintf(stderr, "[plan-memory] retain source=%p plan=%p nodes=%zu nodeBytes=%zu argumentCapacityBytes=%zu useCapacityBytes=%zu phiUsedBytes=%zu blockBytes=%zu compactCapacityBytes=%zu phiNodes=%zu\n", static_cast<const void*>(source.get()), static_cast<const void*>(source->plan.get()), plan.valueStorage.Size(), plan.valueStorage.Size() * sizeof(IrValue), arguments, uses, phi, plan.blockStorage.size() * sizeof(IrBlock), compactBytes, phiNodes);
+            }
         }
     }
     return source;
@@ -606,7 +624,11 @@ std::shared_ptr<const IrResourcePlan> acquirePlan(const RecompileRequest& reques
 void releaseUndrawnPlan(const SourceHandle& handle) {
     if (handle.source == nullptr || !diskPlans()) return;
     std::lock_guard lock(handle.source->mutex);
-    if (!handle.source->runtimeCaptured) handle.source->plan.reset();
+    if (!handle.source->runtimeCaptured) {
+        static const bool traceMemory = std::getenv("APS5_TRACE_PLAN_MEMORY") != nullptr;
+        if (traceMemory && handle.source->plan != nullptr) std::fprintf(stderr, "[plan-memory] release source=%p plan=%p\n", static_cast<const void*>(handle.source.get()), static_cast<const void*>(handle.source->plan.get()));
+        handle.source->plan.reset();
+    }
 }
 
 std::array<std::uint32_t, 3> partialThreads(const RecompileRequest& request) {
@@ -1486,6 +1508,75 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     return hash;
 }
 
+std::size_t PoisonQuarantine() {
+    static const std::size_t size = cacheLimit(std::getenv("APS5_POISON_FREED_RESULTS"), 0u);
+    return size;
+}
+
+struct PoisonedResults {
+    std::mutex mutex;
+    std::deque<std::unique_ptr<RecompileResult>> held;
+};
+
+PoisonedResults& poisonedResults() {
+    static PoisonedResults results;
+    return results;
+}
+
+std::shared_ptr<RecompileResult> memoResult(RecompileResult&& value) {
+    if (PoisonQuarantine() == 0u) return std::make_shared<RecompileResult>(std::move(value));
+    return std::shared_ptr<RecompileResult>(new RecompileResult(std::move(value)), [](RecompileResult* dead) {
+        for (auto& binding : dead->bindings) std::fill(binding.guestDescriptor.begin(), binding.guestDescriptor.end(), 0xbaddcafeu);
+        std::fill(dead->shaderDataUserWords.begin(), dead->shaderDataUserWords.end(), 0xbaddcafeu);
+        std::fill(dead->pushConstants.begin(), dead->pushConstants.end(), std::byte{0xcd});
+        std::unique_ptr<RecompileResult> released;
+        auto& quarantine = poisonedResults();
+        std::lock_guard lock(quarantine.mutex);
+        quarantine.held.emplace_back(dead);
+        if (quarantine.held.size() > PoisonQuarantine()) {
+            released = std::move(quarantine.held.front());
+            quarantine.held.pop_front();
+        }
+    });
+}
+
+void reportResultMemoMemory(SourceEntry& source) {
+    static const bool traceMemory = std::getenv("APS5_TRACE_PLAN_MEMORY") != nullptr;
+    if (!traceMemory || source.memo == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - source.memoryReported < std::chrono::seconds(10)) return;
+    source.memoryReported = now;
+    struct Bytes { std::size_t used = 0, capacity = 0; } bindings, descriptors, auxiliary, flags, other;
+    const auto add = [](Bytes& total, const auto&... vectors) {
+        ((total.used += vectors.size() * sizeof(typename std::remove_cvref_t<decltype(vectors)>::value_type), total.capacity += vectors.capacity() * sizeof(typename std::remove_cvref_t<decltype(vectors)>::value_type)), ...);
+    };
+    std::size_t occupied = 0, flagBits = 0, flagCapacityBits = 0;
+    std::unordered_set<const RecompileResult*> unique;
+    std::unordered_set<const DescriptorFlags*> uniqueFlags;
+    for (const auto& entry : *source.memo) {
+        if (entry.result == nullptr) continue;
+        ++occupied;
+        if (!unique.insert(entry.result.get()).second) continue;
+        const auto& result = *entry.result;
+        add(bindings, result.bindings);
+        for (const auto& binding : result.bindings) {
+            add(descriptors, binding.guestDescriptor);
+            add(auxiliary, binding.imageShapes, binding.imageSamplers, binding.bufferExtent);
+            if (!binding.flags || !uniqueFlags.insert(binding.flags.get()).second) continue;
+            for (const auto* bits : {&binding.Flags().samplerDepthCompare, &binding.Flags().imageWritten, &binding.Flags().imageDepthCompare, &binding.Flags().imageAtomic, &binding.Flags().imageAtomic64, &binding.Flags().bufferAtomic, &binding.Flags().bufferWritten, &binding.Flags().samplerUnnormalized, &binding.Flags().samplerIntegerBorder, &binding.Flags().samplerCoordinatesIgnored, &binding.Flags().imageUnnormalized, &binding.Flags().imageUnnormalizedBaseLevel, &binding.Flags().bufferRead}) {
+                flagBits += bits->size();
+                flagCapacityBits += bits->capacity();
+                flags.used += (bits->size() + CHAR_BIT - 1u) / CHAR_BIT;
+                flags.capacity += (bits->capacity() + CHAR_BIT - 1u) / CHAR_BIT;
+            }
+        }
+        add(other, result.vertexInputPatches, result.runtimeImageResources, result.parameterExports, result.stencilReferences, result.shaderDataUserWords, result.vertexInputs, result.fragmentParameters, result.specialization, result.pushConstants, result.vertexAttributes, result.imageTablePoison, result.imageTableRanges, result.imageTableReadRanges);
+        if (result.meshBarycentrics.has_value()) add(other, result.meshBarycentrics->parameters);
+        for (const auto& ranges : result.imageTableReadRanges) add(other, ranges);
+    }
+    std::fprintf(stderr, "[memo-memory] source=%p timeMs=%lld clock=%llu slots=%zu occupied=%zu bodies=%zu tableCapacityBytes=%zu bodyBytes=%zu bindingBytes=%zu bindingCapacityBytes=%zu descriptorBytes=%zu descriptorCapacityBytes=%zu auxiliaryBytes=%zu auxiliaryCapacityBytes=%zu flagGroups=%zu flagGroupBytes=%zu flagBytes=%zu flagCapacityBytes=%zu flagBits=%zu flagCapacityBits=%zu otherBytes=%zu otherCapacityBytes=%zu\n", static_cast<const void*>(&source), static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count()), static_cast<unsigned long long>(source.memoClock), source.memo->size(), occupied, unique.size(), source.memo->capacity() * sizeof(ResultMemoEntry), unique.size() * sizeof(RecompileResult), bindings.used, bindings.capacity, descriptors.used, descriptors.capacity, auxiliary.used, auxiliary.capacity, uniqueFlags.size(), uniqueFlags.size() * sizeof(DescriptorFlags), flags.used, flags.capacity, flagBits, flagCapacityBits, other.used, other.capacity);
+}
+
 // The memo'd result of `source`'s variant for the snapshot (design13 R5): a hit returns the shared
 // object, a miss materializes outside the source mutex and inserts (a concurrent miss's object is
 // as good). `memoHit` reports the hit.
@@ -1504,13 +1595,14 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
                 entry.used = ++source.memoClock;
                 counters.hits.fetch_add(1, std::memory_order_relaxed);
                 if (memoHit != nullptr) *memoHit = true;
+                reportResultMemoMemory(source);
                 reportResultMemo();
                 return entry.result;
             }
         }
     }
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
+    auto result = memoResult(materializeResult(*variant, request, snapshot));
     result->cacheHit = cacheHit;
     if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     counters.misses.fetch_add(1, std::memory_order_relaxed);
@@ -1542,6 +1634,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             }
             *victim = {variant->artifact.variantId, hash, shared, ++source.memoClock};
         }
+        reportResultMemoMemory(source);
     }
     reportResultMemo();
     return shared;

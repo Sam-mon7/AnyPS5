@@ -382,6 +382,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
         insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        if (profile) timing.Mark("cache_insert");
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];

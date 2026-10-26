@@ -3385,6 +3385,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::optional<PerformanceTimer> frameTiming;
+    if (profile) frameTiming.emplace("Resources.Revalidate");
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
@@ -3414,6 +3416,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // they must hand back the very objects the set's views belong to. The build appended them stage
     // by stage, binding by binding, so the walk repeats that order.
     const auto fullWalk = [&] {
+        std::optional<PerformanceTimer> walkTiming;
+        if (profile) walkTiming.emplace("Resources.RevalidateFull");
         lastFullWalk = std::chrono::steady_clock::now();
         lookupLog().clear();
         BuildLookups lookups;
@@ -4302,6 +4306,7 @@ std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> w
 
 std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read, std::uint32_t extent) {
     Require(words.size() == 4, "buffer descriptor must contain four DWORDs");
+    TrapPoisonedWords(words, "addGuestBuffer");
     const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1] & ~0x40000000u, words[2], words[3]}};
     Require(descriptor.Type() == 0u, "buffer descriptor uses an unsupported type");
     const auto address = descriptor.Base48();
@@ -4514,6 +4519,9 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
 }
 
 void ShaderResources::PrecollectSurfaces() const {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::optional<PerformanceTimer> frameTiming;
+    if (profile) frameTiming.emplace("Resources.Precollect");
     for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
 }
 

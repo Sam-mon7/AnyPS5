@@ -274,6 +274,8 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
         const auto mapped = mapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapping);
         Check(mapped, "vkMapMemory buffer slab");
         block->mapping = static_cast<std::byte*>(mapping);
+        static const bool traceHostMaps = std::getenv("APS5_TRACE_HOST_MAPS") != nullptr;
+        if (traceHostMaps) std::fprintf(stderr, "[host-map] kind=slab address=%p bytes=%llu capacity=%zu type=%u heap=%u properties=0x%x\n", mapping, static_cast<unsigned long long>(blockBytes), capacity, allocation.memoryTypeIndex, context.memory.memoryTypes[allocation.memoryTypeIndex].heapIndex, context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags);
     }
     const auto slots = static_cast<std::uint32_t>(blockBytes / capacity);
     block->free.reserve(slots);

@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 
 namespace AgcDriver::Graphics {
@@ -103,6 +105,8 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
+        static const bool traceHostMaps = std::getenv("APS5_TRACE_HOST_MAPS") != nullptr;
+        if (traceHostMaps && mapping != nullptr) std::fprintf(stderr, "[host-map] kind=buffer address=%p bytes=%llu size=%zu capacity=%zu type=%u heap=%u properties=0x%x\n", mapping, static_cast<unsigned long long>(allocationBytes), size, capacity, allocation.memoryTypeIndex, context.memory.memoryTypes[allocation.memoryTypeIndex].heapIndex, context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags);
         ready = true;
     } catch (...) {
         release();

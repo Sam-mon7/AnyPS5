@@ -4497,6 +4497,8 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     static const bool lockedBuild = std::getenv("APS5_LOCKED_BUILD") != nullptr;
     if (lockedBuild || shader.spirv.size() < 5 || shader.spirv[0] != 0x07230203u) return nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::optional<PerformanceTimer> frameTiming;
+    if (profile) frameTiming.emplace("Vulkan.PrepareDispatch");
     const auto start = std::chrono::steady_clock::now();
     const Graphics::CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
     const auto context = graphicsContext();
@@ -4587,6 +4589,8 @@ std::span<const double, 5> VulkanDevice::PreparePhaseMs(const PreparedDispatch& 
 
 std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<const Recipe>& recipe, bool indirect) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::optional<PerformanceTimer> frameTiming;
+    if (profile) frameTiming.emplace("Vulkan.PrepareRecipe");
     auto& counters = Recipes().kinds[indirect ? 1 : 0];
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto miss = [&](RecipeMiss reason) {
