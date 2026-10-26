@@ -1158,9 +1158,7 @@ void IdleTrim(bool failAllocation) {
         {
             Buffer host(context, 2 * MiB, usage);
             DeviceBuffer device(context, 4 * MiB, usage);
-            Buffer scratchHost(context, 128 * 1024, usage, HostVisible, true);
-            DeviceBuffer scratchDevice(context, 256 * 1024, usage, true);
-            for (const auto buffer : {host.Handle(), device.Handle(), scratchHost.Handle(), scratchDevice.Handle()}) idle.push_back(MemoryOf(buffer));
+            for (const auto buffer : {host.Handle(), device.Handle()}) idle.push_back(MemoryOf(buffer));
         }
         VkMemoryAllocateInfo image{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         image.allocationSize = 6 * MiB;

@@ -6435,8 +6435,8 @@ void resourceTests() {
         descriptor[1] |= stride << 16u;
         return descriptor;
     };
-    expectSingleAccepted(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); binding.bufferWritten = {false}; }), "a read-only strided V# whose last record runs 8 bytes into the render target");
-    expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); binding.bufferWritten = {true}; }), "aliases the render target");
+    expectSingleAccepted(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); auto flags = binding.Flags(); flags.bufferWritten = {false}; binding.SetFlags(std::move(flags)); }), "a read-only strided V# whose last record runs 8 bytes into the render target");
+    expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); auto flags = binding.Flags(); flags.bufferWritten = {true}; binding.SetFlags(std::move(flags)); }), "aliases the render target");
     expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(60); }), "aliases the render target");
     expectSingleAccepted(changed([](auto& binding) { binding.count = 3; binding.guestDescriptor = join(join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)), vsharp(reinterpret_cast<const void*>(0x1000), 8)); }), "an unmapped V# element");
     expectSingleFailure(changed([&](auto& binding) { binding.count = 2; binding.guestDescriptor = join(vsharp(guestFirst.data(), 16), vsharp(reinterpret_cast<const void*>(state.color.address), 64)); }), "aliases the render target");
@@ -7986,7 +7986,7 @@ void sampleOrderTests() {
         written.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
         written.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
         written.count = 1;
-        written.bufferWritten = {true};
+        { auto flags = written.Flags(); flags.bufferWritten = {true}; written.SetFlags(std::move(flags)); }
         memoryWriter.bindings.push_back(written);
         const std::array<CompiledShader, 1> writing{{{ShaderRecompiler::ShaderStage::Fragment, &memoryWriter, 0}}};
         const std::array<CompiledShader, 1> notWriting{{{ShaderRecompiler::ShaderStage::Fragment, &memoryKeeper, 0}}};

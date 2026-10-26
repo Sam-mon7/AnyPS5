@@ -572,7 +572,7 @@ ShaderRecompiler::RecompileResult SampledProgram(const std::array<std::uint32_t,
     binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + PlaceholderDimensionsPerClass + 2u;
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageWritten.assign(1, false);
+    { auto flags = binding.Flags(); flags.imageWritten.assign(1, false); binding.SetFlags(std::move(flags)); }
     binding.imageSamplers.assign(1, 0u);
     binding.guestDescriptor.assign(words.begin(), words.end());
     ShaderRecompiler::RecompileResult program;

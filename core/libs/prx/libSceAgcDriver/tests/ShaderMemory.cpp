@@ -3607,7 +3607,7 @@ void verifyImageTableRegistration() {
     const auto& atomicMap = TableMap(*atomic.result);
     const auto atomicFault = atomicMap[Abi::TableHeader(0) + Abi::TableFault];
     const auto* atomicTable = TableBinding(*atomic.result, DescriptorRole::ImageStorageTable);
-    require((atomicFault & Abi::PoisonFlag) == 0u && atomicTable != nullptr && atomicTable->count != 0u && atomicTable->imageAtomic.size() == atomicTable->count && std::all_of(atomicTable->imageWritten.begin(), atomicTable->imageWritten.end(), [](bool written) { return written; }) && std::all_of(atomicTable->imageAtomic.begin(), atomicTable->imageAtomic.end(), [](bool atomic) { return atomic; }), "image table registration: the image_atomic_add table was not bound as atomic storage elements");
+    require((atomicFault & Abi::PoisonFlag) == 0u && atomicTable != nullptr && atomicTable->count != 0u && atomicTable->Flags().imageAtomic.size() == atomicTable->count && std::all_of(atomicTable->Flags().imageWritten.begin(), atomicTable->Flags().imageWritten.end(), [](bool written) { return written; }) && std::all_of(atomicTable->Flags().imageAtomic.begin(), atomicTable->Flags().imageAtomic.end(), [](bool atomic) { return atomic; }), "image table registration: the image_atomic_add table was not bound as atomic storage elements");
     require(TableBinding(*atomic.result, DescriptorRole::ImageTable) == nullptr || TableBinding(*atomic.result, DescriptorRole::ImageTable)->count == 0u, "image table registration: an atomic-only table bound sampled elements");
     auto atomic64Code = storeCode;
     atomic64Code[8] = 0xf0440308u;
@@ -3621,7 +3621,7 @@ void verifyImageTableRegistration() {
     const auto& atomic64Map = TableMap(*atomic64.result);
     const auto atomic64Fault = atomic64Map[Abi::TableHeader(0) + Abi::TableFault];
     const auto* atomic64Table = TableBinding(*atomic64.result, DescriptorRole::ImageStorageTable);
-    require((atomic64Fault & Abi::PoisonFlag) == 0u && atomic64Table != nullptr && atomic64Table->count != 0u && atomic64Table->imageAtomic64.size() == atomic64Table->count && std::all_of(atomic64Table->imageAtomic64.begin(), atomic64Table->imageAtomic64.end(), [](bool atomic) { return atomic; }), "image table registration: the image_atomic64_add table was not bound as 64-bit atomic storage elements");
+    require((atomic64Fault & Abi::PoisonFlag) == 0u && atomic64Table != nullptr && atomic64Table->count != 0u && atomic64Table->Flags().imageAtomic64.size() == atomic64Table->count && std::all_of(atomic64Table->Flags().imageAtomic64.begin(), atomic64Table->Flags().imageAtomic64.end(), [](bool atomic) { return atomic; }), "image table registration: the image_atomic64_add table was not bound as 64-bit atomic storage elements");
     const std::array<std::pair<std::uint32_t, const char*>, 2> unsupportedStores{{{0xf0240f08u, "image_store_mip"}, {0xf0280f08u, "image_store_pck"}}};
     for (const auto& [instruction, name] : unsupportedStores) {
         auto code = storeCode;

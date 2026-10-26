@@ -110,10 +110,10 @@ void CheckTailArgumentRemoval() {
     last->AddArgument(source);
     last->AddArgument(source);
     last->ReplaceArgument(0, nullptr);
-    Require(source->OperandUses() == std::vector<IrUse>({{first, 0}, {last, 1}}));
+    Require(std::ranges::equal(source->OperandUses(), std::vector<IrUse>({{first, 0}, {last, 1}})));
     last->ReplaceArgument(1, graph.Value(3));
-    Require(source->OperandUses() == std::vector<IrUse>({{first, 0}}));
-    Require(graph.Value(3)->OperandUses() == std::vector<IrUse>({{last, 1}}));
+    Require(std::ranges::equal(source->OperandUses(), std::vector<IrUse>({{first, 0}})));
+    Require(std::ranges::equal(graph.Value(3)->OperandUses(), std::vector<IrUse>({{last, 1}})));
     first->Invalidate();
     Require(!source->HasUses() && first->Argument(0) == nullptr);
 }
