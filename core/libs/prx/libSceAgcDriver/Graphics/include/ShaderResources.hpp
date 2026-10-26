@@ -523,7 +523,10 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
+        std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     };
+    bool collectPartialSnapshot(ValidatedSurface& surface);
+    bool finishPartialSnapshots(std::uint64_t forgetBefore);
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
     // (index into textures, or into storageTextures when `storage`) whose own object stands in for
