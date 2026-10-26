@@ -50,6 +50,92 @@ bool DrawProfiled() {
     return profiled;
 }
 
+struct WaitWriteRange {
+    std::uint64_t end;
+    std::shared_ptr<const Recorder::WaitWriter> writer;
+};
+
+struct WaitLabelCounts {
+    std::uint64_t count = 0, ages = 0;
+    double waitedUs = 0, maxUs = 0, ageUs = 0, maxAgeUs = 0;
+};
+
+using WaitWriterKey = std::tuple<std::uint32_t, std::uint32_t, Recorder::WaitStage, bool>;
+using WaitGroupKey = std::tuple<WaitWriterKey, WaitWriterKey, Recorder::WaitEnd>;
+using WaitLabelGroups = std::map<std::uint32_t, std::map<std::uint64_t, std::map<WaitGroupKey, WaitLabelCounts>>>;
+
+struct WaitLabelProfiler {
+    std::mutex mutex;
+    std::map<std::uint64_t, WaitWriteRange> writes;
+    WaitLabelGroups groups;
+    std::unordered_map<const void*, std::shared_ptr<Recorder::WaitBatch>> batches;
+    std::uint64_t dropped = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+WaitLabelProfiler& WaitLabels() {
+    static auto* profiler = new WaitLabelProfiler;
+    return *profiler;
+}
+
+std::shared_ptr<Recorder::WaitBatch> WaitBatchFor(const void* batch) {
+    auto& profile = WaitLabels();
+    std::lock_guard lock(profile.mutex);
+    return profile.batches.at(batch);
+}
+
+WaitWriterKey WriterKey(const Recorder::WaitWriterSnapshot& snapshot) {
+    if (!snapshot.writer) return {0xffffffffu, GuestMemory::NoPacket, Recorder::WaitStage::Unknown, false};
+    return {snapshot.writer->queue, snapshot.writer->opcode, snapshot.stage, snapshot.writer->cpu};
+}
+
+const char* WaitStageName(Recorder::WaitStage stage) {
+    constexpr const char* names[] = {"unknown", "deferred", "recorded", "submitted", "GPU-complete/unreaped", "retired", "CPU-visible", "discarded"};
+    return names[static_cast<std::size_t>(stage)];
+}
+
+std::string WaitWriterName(const WaitWriterKey& key) {
+    const auto [queue, opcode, stage, cpu] = key;
+    if (stage == Recorder::WaitStage::Unknown) return "unobserved CPU/GPU writer";
+    std::string packet = "unknown";
+    for (const auto& item : Pm4::Opcodes) if (item.value == opcode) packet = item.name;
+    char text[256];
+    std::snprintf(text, sizeof(text), "queue=0x%x packet=%s(0x%x) %s %s", queue, packet.c_str(), opcode,
+                  cpu ? "CPU" : stage == Recorder::WaitStage::Deferred ? "worker" : "GPU", WaitStageName(stage));
+    return text;
+}
+
+void PrintWaitLabels(WaitLabelGroups groups, std::uint64_t dropped, double seconds) {
+    constexpr const char* ends[] = {"at-entry", "polled", "recorder", "GPU-fence", "store-history", "held-at-submit", "aborted"};
+    for (const auto& [queue, labels] : groups) {
+        std::vector<std::pair<double, std::uint64_t>> hot;
+        std::uint64_t count = 0;
+        double total = 0;
+        for (const auto& [address, groups] : labels) {
+            double waited = 0;
+            for (const auto& [key, stats] : groups) { waited += stats.waitedUs; count += stats.count; }
+            hot.emplace_back(waited, address);
+            total += waited;
+        }
+        std::sort(hot.begin(), hot.end(), std::greater<>());
+        AgcDriver::ProfilePrint_nid_no_patch("[wait-label] queue 0x%x (%.1f s): %llu waits %.3f ms, %zu labels; top 8 by elapsed wait; writer-history resets %llu\n",
+            queue, seconds, static_cast<unsigned long long>(count), total / 1000.0, labels.size(), static_cast<unsigned long long>(dropped));
+        for (std::size_t i = 0; i < hot.size() && i < 8; ++i) {
+            const auto address = hot[i].second;
+            const auto& groups = labels.at(address);
+            AgcDriver::ProfilePrint_nid_no_patch("[wait-label] queue 0x%x label=0x%llx total=%.3f ms groups=%zu\n", queue,
+                static_cast<unsigned long long>(address), hot[i].first / 1000.0, groups.size());
+            for (const auto& [key, stats] : groups) {
+                const auto& [entry, seen, end] = key;
+                AgcDriver::ProfilePrint_nid_no_patch("[wait-label]   x%llu wait=%.3f ms max=%.3f ms entry-last-known={%s} seen-last-known={%s} end=%s record-to-seen[n=%llu avg=%.1f us max=%.1f us]\n",
+                    static_cast<unsigned long long>(stats.count), stats.waitedUs / 1000.0, stats.maxUs / 1000.0,
+                    WaitWriterName(entry).c_str(), WaitWriterName(seen).c_str(), ends[static_cast<std::size_t>(end)],
+                    static_cast<unsigned long long>(stats.ages), stats.ages ? stats.ageUs / stats.ages : 0.0, stats.maxAgeUs);
+            }
+        }
+    }
+}
+
 std::uint64_t syncCounts[5] = {};
 // Fence wait time by sync source (APS5_PROFILE_DRAW), and the source CountSync announced for the
 // Sync/SyncThrough that follows it on this thread.
@@ -244,6 +330,89 @@ thread_local int completionDepth = 0;
 // This thread's hook syncs that waited for an unsignaled target (Recorder::ThreadHookWaits).
 thread_local std::uint64_t hookRealWaits = 0;
 
+}
+
+void Recorder::ProfileStore(std::uint64_t address, std::size_t bytes, std::uint32_t queue, std::uint32_t opcode, WaitStage stage, std::shared_ptr<WaitBatch> batch, bool cpu) {
+    if (!DrawProfiled() || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    auto& profile = WaitLabels();
+    std::lock_guard lock(profile.mutex);
+    auto& writes = profile.writes;
+    const auto end = address + bytes;
+    const auto split = [&](std::uint64_t at) {
+        auto next = writes.upper_bound(at);
+        if (next == writes.begin()) return;
+        const auto previous = std::prev(next);
+        if (at <= previous->first || at >= previous->second.end) return;
+        const auto tail = previous->second;
+        previous->second.end = at;
+        writes.emplace(at, tail);
+    };
+    split(address);
+    split(end);
+    writes.erase(writes.lower_bound(address), writes.lower_bound(end));
+    if (writes.size() >= 65536) { writes.clear(); ++profile.dropped; }
+    auto writer = std::make_shared<WaitWriter>(WaitWriter{queue, opcode, stage, cpu || stage == WaitStage::Cpu, std::chrono::steady_clock::now(), std::move(batch)});
+    writes.emplace(address, WaitWriteRange{end, std::move(writer)});
+}
+
+Recorder::WaitWriterSnapshot Recorder::ProfileWriter(std::uint64_t address, std::size_t bytes) {
+    if (!DrawProfiled() || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return {};
+    auto& profile = WaitLabels();
+    std::lock_guard lock(profile.mutex);
+    auto it = profile.writes.upper_bound(address);
+    if (it == profile.writes.begin()) return {};
+    --it;
+    if (it->second.end < address + bytes) return {};
+    const auto& writer = it->second.writer;
+    auto stage = writer->stage;
+    if (writer->batch) {
+        const auto& batch = *writer->batch;
+        stage = batch.stage;
+        if (stage == WaitStage::Submitted && batch.status(batch.device, batch.fence) == VK_SUCCESS) stage = WaitStage::GpuComplete;
+    }
+    return {writer, stage};
+}
+
+Recorder::WaitProfile::WaitProfile(std::uint32_t queue, std::uint64_t address, std::size_t bytes)
+    : queue(queue), address(address), bytes(bytes), started(std::chrono::steady_clock::now()), entry(ProfileWriter(address, bytes)) {}
+
+Recorder::WaitProfile::~WaitProfile() {
+    try {
+        const auto seen = ProfileWriter(address, bytes);
+        const auto now = std::chrono::steady_clock::now();
+        auto& profile = WaitLabels();
+        std::lock_guard lock(profile.mutex);
+        auto& stats = profile.groups[queue][address][{WriterKey(entry), WriterKey(seen), end}];
+        const auto us = std::chrono::duration<double, std::micro>(now - started).count();
+        ++stats.count;
+        stats.waitedUs += us;
+        stats.maxUs = std::max(stats.maxUs, us);
+        if (seen.writer && seen.stage != WaitStage::Deferred && seen.stage != WaitStage::Discarded && end != WaitEnd::Aborted && end != WaitEnd::Held) {
+            const auto age = std::chrono::duration<double, std::micro>(now - seen.writer->recorded).count();
+            ++stats.ages;
+            stats.ageUs += age;
+            stats.maxAgeUs = std::max(stats.maxAgeUs, age);
+        }
+    } catch (...) {
+    }
+}
+
+void Recorder::ReportWaitLabels(bool force) {
+    if (!DrawProfiled()) return;
+    auto& profile = WaitLabels();
+    WaitLabelGroups report;
+    std::uint64_t dropped = 0;
+    double seconds = 0;
+    {
+        std::lock_guard lock(profile.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        seconds = std::chrono::duration<double>(now - profile.reported).count();
+        if (!force && seconds < 10) return;
+        report.swap(profile.groups);
+        profile.reported = now;
+        dropped = std::exchange(profile.dropped, 0);
+    }
+    if (!report.empty()) PrintWaitLabels(std::move(report), dropped, seconds);
 }
 
 bool Recorder::InCompletion() {
@@ -1592,6 +1761,14 @@ void Recorder::ensureOpen() {
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands, &begin), "vkBeginCommandBuffer recorder");
+            if (DrawProfiled()) {
+                auto state = std::make_shared<WaitBatch>();
+                state->device = context.device;
+                state->fence = batch->fence;
+                state->status = function(getFenceStatus, "vkGetFenceStatus");
+                std::lock_guard lock(WaitLabels().mutex);
+                WaitLabels().batches.emplace(batch.get(), std::move(state));
+            }
         } catch (...) {
             release(*batch);
             throw;
@@ -2965,6 +3142,10 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
+    if (DrawProfiled() && !ownLabel) {
+        const auto packet = GuestMemory::CurrentPacket();
+        ProfileStore(address, bytes, packet.queue, packet.opcode, WaitStage::Recorded, WaitBatchFor(open.get()));
+    }
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
@@ -3370,6 +3551,7 @@ bool Recorder::HasCompletions() const {
 }
 
 void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion) {
+    if (DrawProfiled()) ProfileStore(address, bytes.size(), queue, GuestMemory::CurrentPacket().opcode, WaitStage::Recorded, WaitBatchFor(&batch), behindCompletion);
     // One entry per dword; a label overlapping older entries (a 4-byte store inside an 8-byte one or
     // the reverse) replaces exactly the dwords it stores, so a lookup composes what memory will hold.
     std::lock_guard tableLock(labelTableMutex);
@@ -3691,6 +3873,10 @@ void Recorder::Submit() {
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
+    if (DrawProfiled()) {
+        std::lock_guard lock(WaitLabels().mutex);
+        WaitLabels().batches.at(batch.get())->stage = WaitStage::Submitted;
+    }
     CaptureTrace::Log("submit-confirmed batch=%llu tokens=%s", static_cast<unsigned long long>(batch->serial), tokensStr.c_str());
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
@@ -4182,6 +4368,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         }
     }
     readGpuTiming(*batch);
+    if (DrawProfiled()) {
+        std::lock_guard lock(WaitLabels().mutex);
+        WaitLabels().batches.at(batch.get())->stage = WaitStage::GpuComplete;
+    }
     readSamples(*batch);
     if (batch->serial != 0) {
         std::lock_guard ringLock(completedMutex);
@@ -4254,6 +4444,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     }
     // The batch's label entries leave the table (a later label to the same dword already replaced
     // its entry and belongs to another batch). Correctness never depended on this removal.
+    if (DrawProfiled()) {
+        std::lock_guard lock(WaitLabels().mutex);
+        WaitLabels().batches.at(batch.get())->stage = WaitStage::Retired;
+    }
     removeLabels(*batch);
     release(*batch);
 }
@@ -4286,6 +4480,14 @@ void Recorder::removeLabels(Batch& batch) {
 }
 
 void Recorder::release(Batch& batch) noexcept {
+    if (DrawProfiled()) {
+        auto& profile = WaitLabels();
+        std::lock_guard lock(profile.mutex);
+        if (const auto found = profile.batches.find(&batch); found != profile.batches.end()) {
+            if (found->second->stage != WaitStage::Retired) found->second->stage = WaitStage::Discarded;
+            profile.batches.erase(found);
+        }
+    }
     if (batch.queries != VK_NULL_HANDLE) {
         if (!GpuTimingEnabled() && sparePools.size() < 64) {
             try {

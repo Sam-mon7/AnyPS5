@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -2838,6 +2839,11 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
     if (source.size() >= PageBytes) StoreOwnBytes(address, source);
     else StoreOwnBytes(address, source.size(), [&] { std::memcpy(destination, source.data(), source.size()); });
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) {
+        const auto packet = CurrentPacket();
+        Graphics::Recorder::ProfileStore(address, source.size(), packet.queue, packet.opcode, Graphics::Recorder::WaitStage::Cpu);
+    }
 }
 
 }

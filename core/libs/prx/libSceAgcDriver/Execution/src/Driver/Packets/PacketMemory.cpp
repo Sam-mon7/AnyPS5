@@ -85,6 +85,10 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 auto& entry = deferred.labels.emplace_back();
                 entry.address = label->address;
                 entry.size = bytes.size();
+                if (profile) {
+                    deferredLabelOpcodes().push_back(opcode);
+                    Graphics::Recorder::ProfileStore(label->address, bytes.size(), submission.queue, opcode, Graphics::Recorder::WaitStage::Deferred);
+                }
                 std::memcpy(entry.bytes.data(), bytes.data(), bytes.size());
                 ++queuedLabels;
                 wroteOnGpu = true;
@@ -412,6 +416,8 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
         address = label->address;
         bytes.assign(stored.begin(), stored.end());
         writes.emplace_back(address, address + bytes.size());
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile) Graphics::Recorder::ProfileStore(address, bytes.size(), queue, opcode, Graphics::Recorder::WaitStage::Deferred);
     }
     if (endOfPipeInterrupt) bumpEpoch(&EpochBumps::drains);
     auto stored = bytes;
