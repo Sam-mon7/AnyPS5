@@ -3065,6 +3065,192 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+void stagingResidencyTests(const Device& device, Recorder& recorder) {
+#ifdef _WIN32
+    using namespace AgcDriver::GuestMemory;
+    const auto* enabled = std::getenv("APS5_STAGING_REUSE");
+    if (enabled != nullptr && std::strcmp(enabled, "0") == 0) return;
+    const auto& context = device.GetContext();
+    if (!WriteWatched() || context.hostImportAlignment == 0) {
+        std::cout << "watched private imports unavailable: staging residency not tested\n";
+        return;
+    }
+    const auto previousWatch = PrepareImportWatch(context);
+    struct RestoreWatch {
+        const Context& context;
+        ImportWatch previous;
+        ~RestoreWatch() { SetImportWatch(context, previous); }
+    } restoreWatch{context, previousWatch};
+    SetImportWatch(context, ImportWatch::Watch);
+    constexpr std::size_t bytes = 1u << 20u;
+    const auto produce = [&](GuestBufferMemory& memory) {
+        memory.RecordCopyBacks(recorder);
+        recorder.NotePendingWrites(memory.Writes());
+        memory.MarkDirectWrites();
+    };
+    const auto fill = [&](VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, std::uint32_t value) {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, buffer, offset, size, value);
+    };
+    const auto check = [&](GuestBufferMemory& memory, std::uint64_t address, std::size_t size, std::byte value, std::byte tail) {
+        produce(memory);
+        std::uint32_t adjustment = 0;
+        const auto descriptor = memory.Descriptor(address, size, adjustment);
+        Buffer readback(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, descriptor.buffer, descriptor.offset + adjustment, readback.Handle(), 0, size);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        const auto contents = readback.Bytes();
+        Require(std::all_of(contents.begin(), contents.end() - 4, [&](std::byte byte) { return byte == value; }), "staging residency returned stale buffer bytes");
+        Require(std::all_of(contents.end() - 4, contents.end(), [&](std::byte byte) { return byte == tail; }), "staging residency returned a stale tail");
+    };
+    {
+        auto* block = static_cast<std::byte*>(AllocateWatched(bytes, 65536));
+        Require(block != nullptr, "cannot allocate private staging residency memory");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, bytes, true, true, true);
+        }
+        struct Cleanup {
+            const Context& context;
+            Recorder& recorder;
+            void* block;
+            ~Cleanup() noexcept(false) {
+                recorder.Sync();
+                ClearHostImports(context.device);
+                { GuestAllocations::Mutation mutation; mutation.Remove(block); }
+                ReleaseWatched(block, bytes);
+            }
+        } cleanup{context, recorder, block};
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        std::memset(block, 0x11, bytes);
+        const auto* import = HostImportFor(context, address, bytes);
+        Require(import != nullptr && Watched(address, bytes), "private staging import lost its write watch");
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(block, &info, sizeof(info)) != 0 && info.Type == MEM_PRIVATE, "staging residency fixture is not private");
+        CollectWritesUncached(address, bytes);
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(address, bytes);
+        memory.Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto descriptor = memory.Descriptor(address, bytes, adjustment);
+        fill(descriptor.buffer, descriptor.offset + adjustment, bytes, 0x22222222u);
+        check(memory, address, bytes, std::byte{0x22}, std::byte{0x22});
+        Require(memory.RecordStagingCopies(recorder) == 1, "retired private staging data was not reused");
+        const auto read = recorder.DescribePendingRead(address, bytes);
+        Require(read && read->open && read->kind == Recorder::ReadKind::GpuCopy, "staging reuse lost its copy-HLE read footprint");
+        check(memory, address, bytes, std::byte{0x22}, std::byte{0x22});
+
+        *reinterpret_cast<volatile std::uint32_t*>(block + bytes - 4) = 0x33333333u;
+        Require(memory.RecordStagingCopies(recorder) == 0, "raw CPU write did not force a staging refill");
+        check(memory, address, bytes, std::byte{0x22}, std::byte{0x33});
+
+        fill(import->buffer, HostImportOffset(*import, address), bytes, 0x44444444u);
+        recorder.NotePendingWrite(address, bytes);
+        MarkWritten(address, bytes);
+        recorder.Sync();
+        Require(memory.RecordStagingCopies(recorder) == 0, "retired foreign GPU write did not force a staging refill");
+        check(memory, address, bytes, std::byte{0x44}, std::byte{0x44});
+
+        fill(import->buffer, HostImportOffset(*import, address), bytes, 0x55555555u);
+        recorder.NotePendingWrite(address, bytes);
+        MarkWritten(address, bytes);
+        Require(memory.RecordStagingCopies(recorder) == 0, "pending GPU writer was ignored by staging reuse");
+        check(memory, address, bytes, std::byte{0x55}, std::byte{0x55});
+
+        fill(import->buffer, HostImportOffset(*import, address), bytes, 0x66666666u);
+        recorder.NotePendingRead(address, bytes, Recorder::ReadKind::AddressBased);
+        Require(memory.RecordStagingCopies(recorder) == 0, "pending BDA writer was ignored by staging reuse");
+        check(memory, address, bytes, std::byte{0x66}, std::byte{0x66});
+
+        Require(memory.RecordStagingCopies(recorder) == 1, "staging data did not recover after its refill");
+        produce(memory);
+        Require(memory.RecordStagingCopies(recorder) == 0, "open producer was accepted by staging reuse");
+        check(memory, address, bytes, std::byte{0x66}, std::byte{0x66});
+        Require(memory.RecordStagingCopies(recorder) == 1, "retired staging data stopped being reusable");
+        produce(memory);
+        recorder.Submit();
+        device.WaitQueue();
+        Require(memory.RecordStagingCopies(recorder) == 0, "signaled but unretired producer was accepted by staging reuse");
+        check(memory, address, bytes, std::byte{0x66}, std::byte{0x66});
+
+        const std::array<std::byte, 4> label{};
+        Recorder::NoteQueuedLabel(address, label, 9001, GpuLockThreadTag());
+        Require(memory.RecordStagingCopies(recorder) == 0, "deferred worker label was ignored by staging reuse");
+        Recorder::ForgetQueuedLabels();
+        check(memory, address, bytes, std::byte{0x66}, std::byte{0x66});
+
+        Require(memory.RecordStagingCopies(recorder) == 1, "staging data was not reused before abandoned work");
+        fill(descriptor.buffer, descriptor.offset + adjustment, bytes, 0xaaaaaaaa);
+        recorder.Sync();
+        Require(memory.RecordStagingCopies(recorder) == 0, "abandoned work reused an older staging checkpoint");
+        check(memory, address, bytes, std::byte{0x66}, std::byte{0x66});
+
+        fill(import->buffer, HostImportOffset(*import, address), bytes, 0x88888888u);
+        recorder.NotePendingRead(address, bytes, Recorder::ReadKind::AddressBased);
+        const auto failures = recorder.CompletionFailures();
+        recorder.OnComplete([] { throw std::runtime_error("intentional staging write-attribution failure"); });
+        recorder.Sync();
+        Require(recorder.CompletionFailures() == failures + 1, "failed write attribution did not invalidate staging checkpoints");
+        Require(memory.RecordStagingCopies(recorder) == 0, "untracked GPU write survived a failed completion");
+        check(memory, address, bytes, std::byte{0x88}, std::byte{0x88});
+
+        {
+            GuestBufferMemory partial(context);
+            partial.AllowDeviceStaging();
+            partial.AddReadable(address, bytes);
+            partial.AddWritable(address, bytes / 2);
+            partial.Upload(false);
+            check(partial, address, bytes, std::byte{0x88}, std::byte{0x88});
+            Require(partial.RecordStagingCopies(recorder) == 0, "partial copyback supplied a full staging checkpoint");
+            check(partial, address, bytes, std::byte{0x88}, std::byte{0x88});
+        }
+        Unwatch(address, bytes);
+        std::memset(block, 0x99, bytes);
+        Require(memory.RecordStagingCopies(recorder) == 0, "unwatched memory was reused in staging");
+        check(memory, address, bytes, std::byte{0x99}, std::byte{0x99});
+    }
+    {
+        constexpr std::size_t size = 65536;
+        struct Cleanup {
+            const Context& context;
+            Recorder& recorder;
+            void* mapping = nullptr;
+            void* alias = nullptr;
+            std::int64_t physical = -1;
+            ~Cleanup() noexcept(false) {
+                recorder.Sync();
+                ClearHostImports(context.device);
+                if (alias != nullptr) sceKernelMunmap(alias, size);
+                if (mapping != nullptr) sceKernelMunmap(mapping, size);
+                if (physical >= 0) sceKernelReleaseDirectMemory(physical, size);
+            }
+        } cleanup{context, recorder};
+        Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, size, size, 0, &cleanup.physical) == 0, "cannot allocate staging alias backing");
+        Require(sceKernelMapDirectMemory(&cleanup.mapping, size, 0x33, 0, cleanup.physical, size) == 0, "cannot map staging alias backing");
+        Require(sceKernelMapDirectMemory(&cleanup.alias, size, 0x33, 0, cleanup.physical, size) == 0, "cannot map the second staging alias");
+        const auto address = reinterpret_cast<std::uint64_t>(cleanup.mapping);
+        std::memset(cleanup.mapping, 0x77, size);
+        Require(HostImportFor(context, address, size) != nullptr && Watched(address, size), "mapped staging alias is not watched");
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(cleanup.mapping, &info, sizeof(info)) != 0 && info.Type == MEM_MAPPED, "staging alias fixture is not shared");
+        CollectWritesUncached(address, size);
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(address, size);
+        memory.Upload(false);
+        check(memory, address, size, std::byte{0x77}, std::byte{0x77});
+        Require(memory.RecordStagingCopies(recorder) == 0, "shared mapped staging data was reused");
+        check(memory, address, size, std::byte{0x77}, std::byte{0x77});
+    }
+    std::cout << "staging residency: reuse, raw CPU/GPU writes, pending writers/labels, retirement, abandoned work, completion failure, partial/unwatched/shared memory, and read footprint passed\n";
+#endif
+}
+
 bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -3140,6 +3326,7 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         mutation.Remove(block);
     }
     HostImportFor(context, address, bytes);
+    stagingResidencyTests(device, recorder);
     return true;
 }
 

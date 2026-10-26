@@ -3994,7 +3994,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     struct Finishing {
         Recorder& recorder;
         const Batch* batch;
+        int exceptions;
         ~Finishing() {
+            if (std::uncaught_exceptions() > exceptions) ++recorder.completionFailures;
             auto& list = recorder.finishing;
             list.erase(std::remove(list.begin(), list.end(), batch), list.end());
             // The batch's completion labels have landed, or never will (fence failure below).
@@ -4008,7 +4010,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             } catch (...) {
             }
         }
-    } finishingScope{*this, batch.get()};
+    } finishingScope{*this, batch.get(), std::uncaught_exceptions()};
     finishing.push_back(batch.get());
     if (wait) {
         // APS5_PROFILE_DRAW: how long the CPU waits for recorded GPU work, reported every 10 s.
@@ -4093,6 +4095,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             try {
                 action();
             } catch (const BdaUnalignedAccess& error) {
+                ++completionFailures;
                 static std::mutex failuresMutex;
                 static std::unordered_map<std::uint32_t, std::uint64_t> failures;
                 constexpr std::uint64_t kDeferredFailureFirst = 8, kDeferredFailureEvery = 1024;
@@ -4103,6 +4106,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 if (count <= kDeferredFailureFirst) std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
                 else if (count % kDeferredFailureEvery == 0) std::fprintf(stderr, "[gpu] deferred write-back failed with an unaligned BDA access at pc 0x%x %llu times so far; latest: %s\n", error.instruction, static_cast<unsigned long long>(count), error.what());
             } catch (const std::exception& error) {
+                ++completionFailures;
                 AgcDriver::LogCoalescedStderr_nid_no_patch("[gpu] deferred write-back failed: %s\n", error.what());
             }
         }

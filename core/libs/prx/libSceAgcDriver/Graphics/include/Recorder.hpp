@@ -87,6 +87,8 @@ public:
     bool Recording() const { return open != nullptr; }
     bool Idle() const { return open == nullptr && inFlight.empty(); }
     std::uint64_t OpenSerial() const { return submissions + 1; }
+    std::uint64_t Identity() const { return id; }
+    std::uint64_t CompletionFailures() const { return completionFailures; }
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
@@ -814,6 +816,7 @@ private:
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;
+    std::uint64_t completionFailures = 0;
     // Every access holds the table mutex (Recorder.cpp): the recorded entries are mutated under
     // GuestMemory::GpuMutex as well, the queued ones (NoteQueuedLabel) under the table mutex alone.
     // Ordered, so a range (a noted write, PendingLabelIn) finds its dwords by lower_bound.

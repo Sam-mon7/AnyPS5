@@ -287,11 +287,7 @@ public:
     // that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
     void AllowAdjustedRegions() { adjustedRegions = true; }
-    // Records the copy-in of every staged region anew for another use of this upload (a resource
-    // cache hit, from ShaderResources::Revalidate, under GuestMemory::GpuMutex, once the imports
-    // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
-    // RecordCopyBacks copies it back again. Nothing to do without staged regions.
-    void RecordStagingCopies(Recorder& recorder);
+    std::size_t RecordStagingCopies(Recorder& recorder);
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -430,6 +426,7 @@ private:
         // mapping, so nothing is ever stored from it by the CPU, and the region is taken even when
         // the import could bind it in place.
         bool deviceLocal = false;
+        mutable StagingVersion stagingVersion;
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
@@ -482,6 +479,7 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    bool reusableStaging(const Region& region, const StagingVersion& version, Recorder& recorder) const;
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;
