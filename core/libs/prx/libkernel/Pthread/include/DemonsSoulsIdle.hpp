@@ -145,7 +145,7 @@ static inline const char* Install(std::uint8_t* image, std::uintptr_t imageSize)
     const auto caveDisplacement = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(cave) - reinterpret_cast<std::intptr_t>(call + 5));
     std::memcpy(patch + 1, &caveDisplacement, sizeof(caveDisplacement));
     if (!VirtualProtect(reinterpret_cast<void*>(word), 8, PAGE_EXECUTE_READWRITE, &previous)) {
-        if (ownCave) VirtualFree(cave, 0, MEM_RELEASE);
+        if (ownCave && !ScanHooked) VirtualFree(cave, 0, MEM_RELEASE);
         return "cannot unprotect the call site";
     }
     LONG64 desired = expected;
@@ -153,7 +153,7 @@ static inline const char* Install(std::uint8_t* image, std::uintptr_t imageSize)
     const bool swapped = InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(word), desired, expected) == expected;
     VirtualProtect(reinterpret_cast<void*>(word), 8, previous, &previous);
     FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(word), 8);
-    if (!swapped && ownCave) VirtualFree(cave, 0, MEM_RELEASE);
+    if (!swapped && ownCave && !ScanHooked) VirtualFree(cave, 0, MEM_RELEASE);
     return swapped ? nullptr : "the call site changed while it was patched";
 }
 
