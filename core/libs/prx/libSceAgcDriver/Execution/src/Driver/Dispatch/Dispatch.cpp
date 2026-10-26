@@ -67,6 +67,33 @@ void notePrologueSplit(bool indirect, const std::array<std::chrono::steady_clock
     }
 }
 
+void NoteCaptureSplit(bool indirect, const std::array<std::chrono::steady_clock::time_point, 4>& marks, double waitedMs, std::span<const ShaderRecompiler::MemoryRegion> captured) {
+    struct Counts {
+        std::uint64_t calls = 0;
+        std::uint64_t regions = 0;
+        std::uint64_t bytes = 0;
+        std::array<double, 3> ms{};
+        double waitedMs = 0;
+    };
+    static thread_local std::array<Counts, 2> counts{};
+    static thread_local auto reportedAt = marks[0];
+    auto& count = counts[indirect ? 1 : 0];
+    ++count.calls;
+    count.regions += captured.size();
+    for (const auto& region : captured) count.bytes += region.bytes.size();
+    count.waitedMs += waitedMs;
+    for (std::size_t index = 0; index < count.ms.size(); ++index) count.ms[index] += std::chrono::duration<double, std::milli>(marks[index + 1] - marks[index]).count();
+    if (marks.back() - reportedAt < std::chrono::seconds(10)) return;
+    reportedAt = marks.back();
+    for (std::size_t kind = 0; kind < counts.size(); ++kind) {
+        const auto& total = counts[kind];
+        if (total.calls == 0) continue;
+        const auto perCall = 1000.0 / static_cast<double>(total.calls);
+        std::fprintf(stderr, "[dispatch] capture split queue 0 %s (10 s, %llu misses), us per miss: invocation %.1f capture %.1f regions %.1f hook GPU waits %.1f (overlaps capture); %llu regions, %llu bytes\n", kind == 0 ? "direct" : "indirect", static_cast<unsigned long long>(total.calls), total.ms[0] * perCall, total.ms[1] * perCall, total.ms[2] * perCall, total.waitedMs * perCall, static_cast<unsigned long long>(total.regions), static_cast<unsigned long long>(total.bytes));
+    }
+    counts = {};
+}
+
 enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
@@ -416,17 +443,27 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         try {
+            const bool splitCapture = profile && submission.queue == 0 && !resolving;
+            std::array<std::chrono::steady_clock::time_point, 4> captureMarks{};
+            if (splitCapture) captureMarks[0] = std::chrono::steady_clock::now();
             auto invocation = InvocationFor(snapshot, codeOffset, request);
             timing.Mark("prepared_invocation");
+            if (splitCapture) captureMarks[1] = std::chrono::steady_clock::now();
 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+            const auto captureWaitedBefore = splitCapture ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
                 return CaptureInvocation(*shaderMemory, snapshot, codeOffset, request, invocation);
             }();
+            if (splitCapture) captureMarks[2] = std::chrono::steady_clock::now();
             captured = shaderMemory->Regions();
             request.context.memory = captured;
+            if (splitCapture) {
+                captureMarks[3] = std::chrono::steady_clock::now();
+                NoteCaptureSplit(indirectArguments != 0, captureMarks, Graphics::Recorder::ThreadWaitedMs() - captureWaitedBefore, captured);
+            }
             if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
             captureMs += phaseTiming.Elapsed();
             phaseTiming.Phase(PhaseCapture);
