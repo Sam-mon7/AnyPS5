@@ -13,6 +13,11 @@ inline constexpr std::uintptr_t CallRva = 0x84b59b;
 inline constexpr std::uintptr_t PollRva = 0x84b880;
 inline constexpr std::array<std::uint8_t, 24> CallBytes{0xe8, 0xe0, 0x02, 0x00, 0x00, 0x84, 0xc0, 0x74, 0xd7, 0x4c, 0x8b, 0x7d, 0xc8, 0x49, 0x8b, 0xb7, 0x90, 0x00, 0x00, 0x00, 0x48, 0x85, 0xf6, 0x74};
 inline constexpr std::array<std::uint8_t, 24> PollBytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00, 0x4c, 0x8b, 0x35, 0x25};
+inline constexpr std::uintptr_t ScanRva = 0x84b6fd;
+inline constexpr std::uintptr_t ScanCallOffset = 10;
+inline constexpr std::uintptr_t ClockRva = 0x841a40;
+inline constexpr std::array<std::uint8_t, 21> ScanBytes{0xf3, 0x90, 0x4e, 0x8b, 0xbc, 0xf3, 0x10, 0x0e, 0x00, 0x00, 0xe8, 0x34, 0x63, 0xff, 0xff, 0x4c, 0x29, 0xf8, 0x48, 0x85, 0xc0};
+inline bool ScanHooked = false;
 
 struct Timer {
     HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -27,10 +32,16 @@ static inline void APS5_VABI Wait() {
     Sleep(1);
 }
 
-inline constexpr std::size_t CaveBytes = 86;
+inline constexpr std::size_t PollCaveBytes = 86;
+inline constexpr std::size_t ScanCaveOffset = 96;
+inline constexpr std::size_t ScanCaveBytes = 69;
+inline constexpr std::size_t CaveBytes = ScanCaveOffset + ScanCaveBytes;
 
 static inline std::uint8_t* ImageSlack(std::uint8_t* image) {
-    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x1000) return nullptr;
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+    if (headers->Signature != IMAGE_NT_SIGNATURE) return nullptr;
     const auto* section = IMAGE_FIRST_SECTION(headers);
     for (unsigned index = 0; index < headers->FileHeader.NumberOfSections; ++index, ++section) {
         if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
@@ -88,15 +99,47 @@ static inline const char* Install(std::uint8_t* image, std::uintptr_t imageSize)
         0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58, 0x9d,
         0xc3,
     };
-    static_assert(sizeof(code) == CaveBytes);
+    static_assert(sizeof(code) == PollCaveBytes);
     const auto pollDisplacement = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(poll) - reinterpret_cast<std::intptr_t>(cave + 9));
     std::memcpy(code + 5, &pollDisplacement, sizeof(pollDisplacement));
     const auto wait = reinterpret_cast<std::uint64_t>(&Wait);
     std::memcpy(code + 49, &wait, sizeof(wait));
     std::memcpy(cave, code, sizeof(code));
-    if (!VirtualProtect(cave, ownCave ? 0x1000 : CaveBytes, PAGE_EXECUTE_READ, &previous) || !FlushInstructionCache(GetCurrentProcess(), cave, sizeof(code))) {
+    auto* scan = image + ScanRva;
+    const bool hookScan = ScanRva + ScanBytes.size() <= imageSize && std::memcmp(scan, ScanBytes.data(), ScanBytes.size()) == 0;
+    if (hookScan) {
+        std::uint8_t idle[] = {
+            0x9c, 0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
+            0x48, 0x81, 0xec, 0x08, 0x02, 0x00, 0x00,
+            0x48, 0x0f, 0xae, 0x04, 0x24,
+            0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,
+            0xff, 0xd0,
+            0x48, 0x0f, 0xae, 0x0c, 0x24,
+            0x48, 0x81, 0xc4, 0x08, 0x02, 0x00, 0x00,
+            0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58, 0x9d,
+            0xe9, 0, 0, 0, 0,
+        };
+        static_assert(sizeof(idle) == ScanCaveBytes);
+        std::memcpy(idle + 28, &wait, sizeof(wait));
+        const auto clockDisplacement = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(image + ClockRva) - reinterpret_cast<std::intptr_t>(cave + ScanCaveOffset + sizeof(idle)));
+        std::memcpy(idle + 65, &clockDisplacement, sizeof(clockDisplacement));
+        std::memcpy(cave + ScanCaveOffset, idle, sizeof(idle));
+    }
+    if (!VirtualProtect(cave, ownCave ? 0x1000 : CaveBytes, PAGE_EXECUTE_READ, &previous) || !FlushInstructionCache(GetCurrentProcess(), cave, CaveBytes)) {
         if (ownCave) VirtualFree(cave, 0, MEM_RELEASE);
         return "cannot make the code cave executable";
+    }
+    if (hookScan) {
+        auto* scanCall = scan + ScanCallOffset;
+        std::uint8_t scanPatch[5] = {0xe8};
+        const auto scanDisplacement = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(cave + ScanCaveOffset) - reinterpret_cast<std::intptr_t>(scanCall + 5));
+        std::memcpy(scanPatch + 1, &scanDisplacement, sizeof(scanDisplacement));
+        if (VirtualProtect(scanCall, sizeof(scanPatch), PAGE_EXECUTE_READWRITE, &previous)) {
+            std::memcpy(scanCall, scanPatch, sizeof(scanPatch));
+            VirtualProtect(scanCall, sizeof(scanPatch), previous, &previous);
+            FlushInstructionCache(GetCurrentProcess(), scanCall, sizeof(scanPatch));
+            ScanHooked = true;
+        }
     }
     std::uint8_t patch[5] = {0xe8};
     const auto caveDisplacement = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(cave) - reinterpret_cast<std::intptr_t>(call + 5));

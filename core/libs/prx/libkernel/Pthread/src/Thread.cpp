@@ -884,7 +884,7 @@ static void ApplyJobIdleWait(const PthreadPrivate& thread) {
         if (failure != nullptr)
             std::fprintf(stderr, "[job-idle-wait] not installed: %s\n", failure);
         else
-            std::fprintf(stderr, "[job-idle-wait] installed a 50 us sleep in the job workers' idle poll\n");
+            std::fprintf(stderr, "[job-idle-wait] installed a 50 us sleep in the job workers' idle poll%s\n", DemonsSoulsIdle::ScanHooked ? " and their scan loop" : "");
     });
 }
 #endif
