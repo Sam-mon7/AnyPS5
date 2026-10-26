@@ -381,6 +381,17 @@ public:
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
 
 private:
+    friend struct GuestBufferMemoryTestAccess;
+    struct StagingVersion {
+        std::uint64_t generation = 0;
+        std::uint64_t batch = 0;
+        std::uint64_t recorder = 0;
+        std::uint64_t completionFailures = 0;
+        std::uint64_t allocation = 0;
+        std::uint64_t forget = 0;
+        std::uint64_t unwatch = 0;
+        std::uint64_t commit = 0;
+    };
     struct Region {
         std::uint64_t begin;
         std::uint64_t end;

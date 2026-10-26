@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <initializer_list>
@@ -31,6 +32,19 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+
+namespace AgcDriver::Graphics {
+
+struct GuestBufferMemoryTestAccess {
+    static std::size_t SnapshotCapacity(const GuestBufferMemory& memory) {
+        std::size_t bytes = 0;
+        for (const auto& region : memory.regions) bytes += region.snapshot.capacity();
+        return bytes;
+    }
+};
+
+}
+
 namespace {
 
 using namespace AgcDriver::Graphics;
@@ -93,7 +107,9 @@ void snapshotTableTests(const Context& context, const BdaTestAccess& access) {
         if (addressable) memory.AcquireRegistered();
         if (written) memory.AddWritable(reinterpret_cast<std::uint64_t>(block) + 256, 64);
         memory.AddSnapshot({address, bytes});
+        Require(GuestBufferMemoryTestAccess::SnapshotCapacity(memory) >= bytes.size(), "the snapshot did not allocate its CPU copy");
         memory.Upload(addressable);
+        if (std::getenv("APS5_NO_BUFFER_SNAPSHOT_RELEASE") == nullptr) Require(GuestBufferMemoryTestAccess::SnapshotCapacity(memory) == 0, "an uploaded snapshot retained its CPU allocation");
         std::uint32_t adjustment = 0;
         result.view = memory.Descriptor(address, bytes.size(), adjustment).buffer;
         if (!addressable) return result;

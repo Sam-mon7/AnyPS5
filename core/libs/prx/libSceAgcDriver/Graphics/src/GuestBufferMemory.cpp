@@ -5282,6 +5282,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     takeHeapReferences();
     ResidentBuffer::FlushChanged(context);
+    static const bool releaseSnapshots = std::getenv("APS5_NO_BUFFER_SNAPSHOT_RELEASE") == nullptr;
+    if (releaseSnapshots) for (auto& region : regions) std::vector<std::byte>().swap(region.snapshot);
     if (!profile) return;
     const auto loopUs = microsecondsSince(loopStart);
     readUs.fetch_add(refreshUs, std::memory_order_relaxed);
