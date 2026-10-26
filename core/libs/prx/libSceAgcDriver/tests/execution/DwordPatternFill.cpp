@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -187,7 +188,7 @@ void KnownCaptureTests(const std::shared_ptr<AgcDriver::VulkanDevice>& device) {
     using Access = AgcDriver::DriverDetail::DriverTestAccess;
     using Memory = AgcDriver::ShaderMemory;
     namespace Guest = AgcDriver::GuestMemory;
-    constexpr std::size_t HeapBytes = 65536;
+    constexpr std::size_t HeapBytes = 1u << 20u;
     auto* heap = static_cast<std::uint32_t*>(GuestArena::GuestArenaAllocate_nid_postfix(HeapBytes, HeapBytes));
     Require(heap != nullptr, "known fill: cannot allocate guest memory");
     GuestArena::GuestArenaCommit_nid_postfix(heap, HeapBytes, 0x04u, HeapBytes);
@@ -195,6 +196,7 @@ void KnownCaptureTests(const std::shared_ptr<AgcDriver::VulkanDevice>& device) {
     GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(heap, HeapBytes);
 #endif
     std::fill_n(heap, HeapBytes / 4, Untouched);
+    GuestAllocations::Mutation().Add(heap, HeapBytes, true, true, true);
     const auto base = reinterpret_cast<std::uint64_t>(heap);
     const bool enabled = std::getenv("APS5_NO_FILL_KNOWN_VALUES") == nullptr;
     const bool verify = std::getenv("APS5_VERIFY_KNOWN_VALUES") != nullptr;
@@ -222,16 +224,18 @@ void KnownCaptureTests(const std::shared_ptr<AgcDriver::VulkanDevice>& device) {
         return memory;
     };
     std::unique_lock lock(Guest::GpuMutex());
-    Guest::CollectWritesUncached(base, HeapBytes);
+    Require(Guest::CollectWritesUncached(base, HeapBytes) != 0, "known fill: guest memory is not write-watched");
     Access::Fill(device, base, 64, Pattern);
     Require(AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(base, 64), "known fill: no pending producer");
     Require(heap[0] == Untouched, "known fill: the producer ran before capture");
+    Require(Guest::Watched(base, 64), "known fill: the GPU import disabled write tracking");
     Require(AgcDriver::DriverDetail::Driver::QueryPendingSpan(base + 4, 4, {}) == expectedPolicy, "known fill: wrong subrange read policy");
     Require(AgcDriver::DriverDetail::Driver::QueryPendingSpan(base + 60, 8, {}) == Memory::PendingWrite::Sync, "known fill: a crossing read was served from a partial value");
     const auto knownBefore = Memory::KnownValues();
     auto first = capture(base, Pattern[0]);
     Require((Memory::KnownValues().served > knownBefore.served) == enabled, "known fill: capture did not follow the switch");
     if (enabled && !verify) Require(heap[0] == Untouched && AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(base, 64), "known fill: capture submitted or waited for its producer");
+    else Require(heap[0] == Pattern[0] && !AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(base, 64), "known fill: capture did not synchronize its producer");
     static_cast<void>(capture(base + 4, Pattern[1]));
     static_cast<void>(capture(base + 64, Untouched));
     device->WaitIdle();
@@ -273,6 +277,7 @@ void KnownCaptureTests(const std::shared_ptr<AgcDriver::VulkanDevice>& device) {
     Require(AgcDriver::DriverDetail::Driver::QueryPendingSpan(base, 4, {}) == Memory::PendingWrite::Sync, "known fill: an oversized producer retained a known value");
     device->WaitIdle();
     Require(Memory::KnownValues().mismatches == knownBefore.mismatches, "known fill: verification found a stale known value");
+    GuestAllocations::Mutation().Remove(heap);
     std::puts("known fill capture tests passed");
 }
 
