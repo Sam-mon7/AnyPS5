@@ -6169,10 +6169,10 @@ bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof)
     return state.device == proof.device && state.epoch == proof.epoch && state.refreshedGeneration == proof.refreshedGeneration && !importsStale(context, state);
 }
 
-HostImportsProof HostImportsIdentity(const Context& context) {
+HostImportsProof HostImportsIdentity(const Context& context, bool requireCurrent) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
-    if (importsStale(context, state)) return {};
+    if (requireCurrent && importsStale(context, state)) return {};
     return {state.device, state.epoch, state.refreshedGeneration};
 }
 

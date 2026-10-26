@@ -303,6 +303,7 @@ public:
     struct ProofReport {
         ProofPath path = ProofPath::Fast;
         ProofFailure failure = ProofFailure::None;
+        bool epochReused = false;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();
@@ -654,7 +655,31 @@ private:
     std::uint64_t provedEpoch = 0;
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;
-    bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
+    struct ResourceEpochProof {
+        std::uint64_t epoch = 0;
+        std::uint64_t writes = 0;
+        std::uint64_t pending = 0;
+        std::uint64_t tracker = 0;
+        std::uint64_t allocations = 0;
+        std::uint64_t commits = 0;
+        std::uint64_t forgotten = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t depth = 0;
+        std::uint64_t depthReleased = 0;
+        bool operator==(const ResourceEpochProof&) const = default;
+    };
+    struct EpochImage {
+        const StorageTexture* image;
+        std::uint64_t version;
+        std::uint64_t keys;
+    };
+    ResourceEpochProof resourceEpochProof;
+    HostImportsProof epochImports;
+    std::uint64_t profiledResourceEpoch = 0;
+    std::vector<EpochImage> epochImages;
+    static ResourceEpochProof currentResourceEpochProof();
+    bool canRememberResourceEpoch() const;
+    bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, bool epochProofs = false);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).

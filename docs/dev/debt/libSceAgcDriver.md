@@ -279,4 +279,6 @@
 
 ### Opt-in draw paths
 
+- [Resource epoch proofs](../../../core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp) under `APS5_RESOURCE_EPOCH_PROOFS=1` have not been runtime-validated on Windows or against Vulkan validation. Native depth, partially resident snapshots and untracked image memory retain ordinary revalidation. Any tracker-generation change invalidates the proof, including an unrelated clean collection; the resulting hit rate is unmeasured. The separate resource write serial retains explicit write invalidations and GPU mutex handoffs between threads; reacquisition by the same thread does not invalidate it. Per-use imports, completions, staging, depth-copy refresh and the lookup audit remain active.
+
 - [Draw finisher](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp) (`APS5_DRAW_PIPELINE`) - opt-in. The Linux main-image page table it adds matches what Windows already does by default.

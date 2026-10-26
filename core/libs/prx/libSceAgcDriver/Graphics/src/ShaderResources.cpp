@@ -45,6 +45,7 @@
 #include <unordered_set>
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -2879,12 +2880,23 @@ constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> Fas
 using OwnRefreshFallback = ShaderResources::OwnRefreshFallback;
 constexpr std::array<const char*, static_cast<std::size_t>(OwnRefreshFallback::Count)> OwnRefreshFallbackNames{"disabled", "snapshot texture", "cleared view", "foreign view", "surface key", "not imported", "uncached", "re-run failed"};
 
+enum class EpochRefusal : std::size_t { Unlocked, Disabled, NoEpoch, Cold, Epoch, Writes, Tracker, Mapping, Pending, Depth, Cache, Images, Imports, Audit, Verify, PerUse, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(EpochRefusal::Count)> EpochRefusalNames{"unlocked", "proof override", "no epoch", "cold or ineligible", "epoch changed", "write or foreign GPU holder", "tracker changed", "mapping changed", "pending image", "depth identity", "cache identity", "image version or keys", "imports", "audit", "verification", "per-use failure"};
+enum class EpochIneligible : std::size_t { Records, Depth, Partial, Tracking, Cache, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(EpochIneligible::Count)> EpochIneligibleNames{"no records", "native or overlapping depth", "partial snapshot", "untracked texels or keys", "cache identity"};
+
 struct RevalidateProfile {
     std::atomic<std::uint64_t> calls{0};
     std::atomic<std::uint64_t> nanoseconds{0};
     std::atomic<std::uint64_t> fast{0};
     std::atomic<std::uint64_t> full{0};
     std::atomic<std::uint64_t> failed{0};
+    std::array<std::atomic<std::uint64_t>, 3> epochHits{};
+    std::array<std::atomic<std::uint64_t>, 3> epochRepeats{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(EpochRefusal::Count)> epochRefusals{};
+    std::atomic<std::uint64_t> epochRemembered{0};
+    std::atomic<std::uint64_t> epochUnstable{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(EpochIneligible::Count)> epochIneligible{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FastFail::Count)> fastFails{};
     // Epoch gate: registry scans skipped because the pending serial was unchanged, and import
     // serial loops skipped because the table's identity was unchanged.
@@ -3003,6 +3015,11 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
+    if (GuestMemory::ResourceEpochProofsEnabled()) {
+        const auto refusals = byReason(profile.epochRefusals, EpochRefusalNames);
+        const auto ineligible = byReason(profile.epochIneligible, EpochIneligibleNames);
+        AgcDriver::ProfilePrint_nid_no_patch("[rescache] resource epoch proofs (10 s): hits inline draw %llu, dispatch %llu, pipelined draw %llu; repeat calls inline draw %llu, dispatch %llu, pipelined draw %llu; remembered %llu, not retained %llu; refused:%s; ineligible:%s\n", static_cast<unsigned long long>(profile.epochHits[0].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.epochHits[1].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.epochHits[2].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.epochRepeats[0].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.epochRepeats[1].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.epochRepeats[2].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.epochRemembered.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.epochUnstable.exchange(0, std::memory_order_relaxed)), refusals.c_str(), ineligible.c_str());
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)));
 }
 
@@ -3508,6 +3525,7 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    if (GuestMemory::ResourceEpochProofsEnabled()) return revalidateFull(shaders, report, true);
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
@@ -3538,7 +3556,37 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     return revalidateFull(shaders, report);
 }
 
-bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
+ShaderResources::ResourceEpochProof ShaderResources::currentResourceEpochProof() {
+    return {GuestMemory::CollectEpoch(), GuestMemory::ResourceProofSerial(), StorageTexture::PendingSerial(), GuestMemory::TrackerGeneration(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), GuestArena::GuestArenaCommitGeneration_nid_postfix(), GuestMemory::ForgetSerial(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial(), DepthSurfacesReleased()};
+}
+
+bool ShaderResources::canRememberResourceEpoch() const {
+    const auto fail = [](EpochIneligible reason) {
+        if (BuildProfiled()) Revalidations().epochIneligible[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (validatedTextures.size() != textures.size()) return fail(EpochIneligible::Records);
+    if (HoldsReleasedTexture() || !HasCachedStorageImages()) return fail(EpochIneligible::Cache);
+    const auto trackedKeys = [](const GuestTextureResource& resource, std::uint64_t bytes) {
+        return resource.dccAddress == 0 || GuestMemory::Watched(resource.dccAddress, DccKeyBytes(bytes));
+    };
+    for (const auto& surface : validatedTextures) {
+        if (!surface.valid) return fail(EpochIneligible::Records);
+        if (surface.depth || DepthSurfaceOverlaps(context.device, surface.resource.baseAddress, surface.bytes)) return fail(EpochIneligible::Depth);
+        if (surface.committed.has_value()) return fail(EpochIneligible::Partial);
+        if (!trackedKeys(surface.resource, surface.bytes) || (surface.source == nullptr ? surface.generation == 0 : surface.source->Generation() == 0)) return fail(EpochIneligible::Tracking);
+        if (!GuestMemory::Watched(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes))) return fail(EpochIneligible::Tracking);
+        if (surface.source != nullptr && !trackedKeys(surface.source->Descriptor(), surface.source->GuestBytes())) return fail(EpochIneligible::Tracking);
+    }
+    for (const auto& image : storageTextures) {
+        if (image == nullptr) return fail(EpochIneligible::Records);
+        if (DepthSurfaceOverlaps(context.device, image->Descriptor().baseAddress, image->GuestBytes())) return fail(EpochIneligible::Depth);
+        if (image->Generation() == 0 || !trackedKeys(image->Descriptor(), image->GuestBytes()) || !GuestMemory::Watched(image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()))) return fail(EpochIneligible::Tracking);
+    }
+    return true;
+}
+
+bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, bool epochProofs) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3558,7 +3606,48 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     }
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
+    const auto epochBefore = epochProofs ? currentResourceEpochProof() : ResourceEpochProof{};
+    const auto importsBefore = epochProofs ? HostImportsIdentity(context, false) : HostImportsProof{};
+    bool epochReused = false;
+    if (epochProofs) {
+        const auto refusal = [&] {
+            if (!GuestMemory::GpuMutex().HeldByThisThread()) return EpochRefusal::Unlocked;
+            if (noFast || !EpochRevalidate() || VerifyProofs()) return EpochRefusal::Disabled;
+            if (epochBefore.epoch == 0) return EpochRefusal::NoEpoch;
+            if (resourceEpochProof.epoch == 0) return EpochRefusal::Cold;
+            if (resourceEpochProof.epoch != epochBefore.epoch) return EpochRefusal::Epoch;
+            if (resourceEpochProof.writes != epochBefore.writes) return EpochRefusal::Writes;
+            if (resourceEpochProof.pending != epochBefore.pending) return EpochRefusal::Pending;
+            if (resourceEpochProof.allocations != epochBefore.allocations || resourceEpochProof.commits != epochBefore.commits || resourceEpochProof.forgotten != epochBefore.forgotten || (epochBefore.forgotten & 1u) != 0 || resourceEpochProof.unwatched != epochBefore.unwatched) return EpochRefusal::Mapping;
+            if (resourceEpochProof.depth != epochBefore.depth || resourceEpochProof.depthReleased != epochBefore.depthReleased) return EpochRefusal::Depth;
+            if (resourceEpochProof.tracker != epochBefore.tracker) return EpochRefusal::Tracker;
+            if (HoldsReleasedTexture() || !HasCachedStorageImages()) return EpochRefusal::Cache;
+            for (const auto& entry : epochImages) {
+                if (entry.image->Version() != entry.version || entry.image->Descriptor().dccAddress != entry.keys) return EpochRefusal::Images;
+            }
+            if (epochImports != importsBefore) return EpochRefusal::Imports;
+            if (TemplateAuditDue(lastFullWalk)) return EpochRefusal::Audit;
+            static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+            thread_local std::uint64_t reuses = 0;
+            if (verify && ++reuses % 64u == 0u) return EpochRefusal::Verify;
+            return EpochRefusal::Count;
+        }();
+        epochReused = refusal == EpochRefusal::Count;
+        if (!epochReused) resourceEpochProof = {};
+        if (profile) {
+            const auto use = !drawBuild ? 1 : DrawPipelineEnabled() ? 2 : 0;
+            if (epochBefore.epoch != 0 && profiledResourceEpoch == epochBefore.epoch) Revalidations().epochRepeats[use].fetch_add(1, std::memory_order_relaxed);
+            profiledResourceEpoch = epochBefore.epoch;
+            if (!epochReused) Revalidations().epochRefusals[static_cast<std::size_t>(refusal)].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+        if (epochProofs && !ok) resourceEpochProof = {};
+        if (report != nullptr) report->epochReused = epochReused && ok;
+        if (profile && epochReused) {
+            if (ok) Revalidations().epochHits[!drawBuild ? 1 : DrawPipelineEnabled() ? 2 : 0].fetch_add(1, std::memory_order_relaxed);
+            else Revalidations().epochRefusals[static_cast<std::size_t>(EpochRefusal::PerUse)].fetch_add(1, std::memory_order_relaxed);
+        }
         if (profile) countRevalidate(fast, ok, start);
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
         return ok;
@@ -3649,75 +3738,82 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         captureValidation();
         return true;
     };
-    thread_local std::vector<PendingOverlap>* overlappingSlot = nullptr;
-    auto& overlapping = ShaderRecompiler::ThreadOwned(overlappingSlot);
-    thread_local std::vector<PendingOverlap>* refreshedSlot = nullptr;
-    auto& refreshed = ShaderRecompiler::ThreadOwned(refreshedSlot);
-    refreshed.clear();
-    FastFail reason = FastFail::Count;
-    bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
-    // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
-    // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
-    // them) and the fast proof run again, which is then authoritative (it accepts what stays
-    // pending over the refreshed surfaces, see fastRevalidate); a fallback, or a second failure,
-    // takes the full walk as before.
-    bool ownRefreshed = false;
-    if (!fast && !overlapping.empty()) {
-        auto fallback = OwnRefreshFallback::Count;
-        if (!OwnImageRefreshEnabled()) fallback = OwnRefreshFallback::Disabled;
-        else {
-            refreshed = overlapping;
-            fallback = refreshOwnObjects(shaders, refreshed);
-        }
-        if (fallback == OwnRefreshFallback::Count) {
-            fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
-            if (fast) ownRefreshed = true;
-            else fallback = OwnRefreshFallback::Rerun;
-        }
-        if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
+    bool fast = epochReused;
+    if (epochReused && report != nullptr) report->path = ProofPath::Fast;
+    if (epochReused) {
+        for (const auto& entry : epochImages) entry.image->NoteProved();
     }
-    if (fast && TemplateAuditDue(lastFullWalk)) {
-        fast = false;
-        ownRefreshed = false;
-        reason = FastFail::Audit;
-    }
-    if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
-    if (!fast) {
-        countFullWalk(reason);
-        if (!fullWalk()) {
-            const auto failure = [&] {
-                switch (reason) {
-                    case FastFail::Pending: return ProofFailure::Pending;
-                    case FastFail::Evicted: case FastFail::Replaced: return ProofFailure::Evicted;
-                    case FastFail::Changed: return ProofFailure::Changed;
-                    case FastFail::Keys: case FastFail::ClearedView: case FastFail::StorageKeys: return ProofFailure::Keys;
-                    default: return ProofFailure::Other;
+    if (!epochReused) {
+        thread_local std::vector<PendingOverlap>* overlappingSlot = nullptr;
+        auto& overlapping = ShaderRecompiler::ThreadOwned(overlappingSlot);
+        thread_local std::vector<PendingOverlap>* refreshedSlot = nullptr;
+        auto& refreshed = ShaderRecompiler::ThreadOwned(refreshedSlot);
+        refreshed.clear();
+        FastFail reason = FastFail::Count;
+        bool accepted = false;
+        fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+        // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
+        // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
+        // them) and the fast proof run again, which is then authoritative (it accepts what stays
+        // pending over the refreshed surfaces, see fastRevalidate); a fallback, or a second failure,
+        // takes the full walk as before.
+        bool ownRefreshed = false;
+        if (!fast && !overlapping.empty()) {
+            auto fallback = OwnRefreshFallback::Count;
+            if (!OwnImageRefreshEnabled()) fallback = OwnRefreshFallback::Disabled;
+            else {
+                refreshed = overlapping;
+                fallback = refreshOwnObjects(shaders, refreshed);
+            }
+            if (fallback == OwnRefreshFallback::Count) {
+                fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+                if (fast) ownRefreshed = true;
+                else fallback = OwnRefreshFallback::Rerun;
+            }
+            if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
+        }
+        if (fast && TemplateAuditDue(lastFullWalk)) {
+            fast = false;
+            ownRefreshed = false;
+            reason = FastFail::Audit;
+        }
+        if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
+        if (!fast) {
+            countFullWalk(reason);
+            if (!fullWalk()) {
+                const auto failure = [&] {
+                    switch (reason) {
+                        case FastFail::Pending: return ProofFailure::Pending;
+                        case FastFail::Evicted: case FastFail::Replaced: return ProofFailure::Evicted;
+                        case FastFail::Changed: return ProofFailure::Changed;
+                        case FastFail::Keys: case FastFail::ClearedView: case FastFail::StorageKeys: return ProofFailure::Keys;
+                        default: return ProofFailure::Other;
+                    }
+                }();
+                return finish(false, false, failure);
+            }
+        } else if (ownRefreshed || accepted) {
+            if (profile && ownRefreshed) Revalidations().ownRefreshed.fetch_add(1, std::memory_order_relaxed);
+            if (VerifyProofs()) {
+                // The walk after the refresh, or beside a proof that accepted a foreign overlap, must
+                // find every object in place and current: another object, or an upload (a moved
+                // content version), is a decision the proof got wrong.
+                thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>>* versionsSlot = nullptr;
+                auto& versions = ShaderRecompiler::ThreadOwned(versionsSlot);
+                versions.clear();
+                for (const auto& surface : validatedTextures) {
+                    if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
                 }
-            }();
-            return finish(false, false, failure);
-        }
-    } else if (ownRefreshed || accepted) {
-        if (profile && ownRefreshed) Revalidations().ownRefreshed.fetch_add(1, std::memory_order_relaxed);
-        if (VerifyProofs()) {
-            // The walk after the refresh, or beside a proof that accepted a foreign overlap, must
-            // find every object in place and current: another object, or an upload (a moved
-            // content version), is a decision the proof got wrong.
-            thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>>* versionsSlot = nullptr;
-            auto& versions = ShaderRecompiler::ThreadOwned(versionsSlot);
-            versions.clear();
-            for (const auto& surface : validatedTextures) {
-                if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
+                for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
+                const bool same = fullWalk();
+                const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
+                if (!same || moved != versions.end()) {
+                    std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the T1 proof (%s) disagrees with the full walk (%s)\n", ownRefreshed ? "own-object refresh" : "accepted overlap", !same ? "another object" : "an upload");
+                    std::fflush(stderr);
+                    std::abort();
+                }
+                if (profile) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
             }
-            for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
-            const bool same = fullWalk();
-            const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
-            if (!same || moved != versions.end()) {
-                std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the T1 proof (%s) disagrees with the full walk (%s)\n", ownRefreshed ? "own-object refresh" : "accepted overlap", !same ? "another object" : "an upload");
-                std::fflush(stderr);
-                std::abort();
-            }
-            if (profile) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
         }
     }
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
@@ -3778,6 +3874,24 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+    }
+    if (epochProofs) {
+        if (GuestMemory::GpuMutex().HeldByThisThread() && epochBefore.epoch != 0 && (epochBefore.forgotten & 1u) == 0 && (epochReused || canRememberResourceEpoch()) && currentResourceEpochProof() == epochBefore && HostImportsIdentity(context, false) == importsBefore) {
+            if (!epochReused) {
+                epochImages.clear();
+                const auto remember = [&](const StorageTexture* image) {
+                    if (image != nullptr) epochImages.push_back({image, image->Version(), image->Descriptor().dccAddress});
+                };
+                for (const auto& surface : validatedTextures) remember(surface.source);
+                for (const auto& image : storageTextures) remember(image.get());
+                if (profile) Revalidations().epochRemembered.fetch_add(1, std::memory_order_relaxed);
+            }
+            resourceEpochProof = epochBefore;
+            epochImports = importsBefore;
+        } else {
+            resourceEpochProof = {};
+            if (profile) Revalidations().epochUnstable.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     return finish(fast, true);
 }

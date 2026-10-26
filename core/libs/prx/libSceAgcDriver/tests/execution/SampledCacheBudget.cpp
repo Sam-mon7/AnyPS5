@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -31,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -549,6 +551,231 @@ ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address) {
     ShaderRecompiler::RecompileResult program;
     program.bindings.push_back(std::move(binding));
     return program;
+}
+
+bool resourceEpochTests(Context context, bool draw) {
+    namespace Memory = AgcDriver::GuestMemory;
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    const bool enabled = Memory::ResourceEpochProofsEnabled();
+    const auto stage = draw ? ShaderRecompiler::ShaderStage::Vertex : ShaderRecompiler::ShaderStage::Compute;
+    std::unique_lock gpu(Memory::GpuMutex());
+    const auto create = [&](const CompiledShader& shader) {
+        if (draw) return std::make_shared<ShaderResources>(context, std::span(&shader, 1), ColorTarget{}, 0, 0, 0);
+        return std::make_shared<ShaderResources>(context, shader);
+    };
+    const auto warm = [&](ShaderResources& resources, const CompiledShader& shader) {
+        ShaderResources::ProofReport report;
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            Require(resources.Revalidate(shader, &report), "the epoch fixture did not prove current");
+            if (report.epochReused) break;
+        }
+        Require(report.epochReused == enabled, "the epoch fixture did not exercise the selected proof mode");
+    };
+    for (const auto mutation : {0, 1, 2}) {
+        WatchedSurface surface(context);
+        const auto program = SampledProgram(surface.Address());
+        const CompiledShader shader{stage, &program, 0};
+        auto resources = create(shader);
+        Require(!resources->SampledTextures().front()->ViewsStorageImage(), "the epoch mutation fixture must bind a snapshot");
+        Memory::BumpCollectEpoch();
+        warm(*resources, shader);
+        const auto epoch = Memory::CollectEpoch();
+        const auto writes = Memory::ResourceProofSerial();
+        gpu.unlock();
+        gpu.lock();
+        ShaderResources::ProofReport report;
+        Require(resources->Revalidate(shader, &report) && report.epochReused == enabled, "reacquiring the GPU lock discarded an unchanged epoch proof");
+        Require(Memory::ResourceProofSerial() == writes, "an ordinary GPU lock acquisition changed the resource write serial");
+        if (mutation == 0) {
+            std::memset(reinterpret_cast<void*>(surface.Address()), 0x37, SurfaceBytes);
+            Memory::BumpCollectEpoch();
+            Require(Memory::CollectEpoch() != epoch, "the simulated wait did not advance the collect epoch");
+        } else if (mutation == 1) {
+            gpu.unlock();
+            std::exception_ptr error;
+            std::thread otherQueue([&] {
+                try {
+                    std::lock_guard lock(Memory::GpuMutex());
+                    Recorder recorder(context);
+                    recorder.Activate();
+                    recorder.NotePendingWrite(surface.Address(), SurfaceBytes);
+                    Memory::MarkWritten(surface.Address(), SurfaceBytes);
+                    recorder.OnComplete([&] {
+                        const std::byte value{0x37};
+                        Memory::StoreOwnBytes(surface.Address(), std::span(&value, 1));
+                    });
+                    recorder.Sync();
+                } catch (...) {
+                    error = std::current_exception();
+                }
+            });
+            otherQueue.join();
+            gpu.lock();
+            if (error != nullptr) std::rethrow_exception(error);
+            Require(Memory::CollectEpoch() == epoch, "the other queue changed the consumer's collect epoch");
+            Require(!enabled || Memory::ResourceProofSerial() != writes, "the other queue's write did not break the resource proof");
+        } else {
+            std::memset(reinterpret_cast<void*>(surface.Address()), 0x37, SurfaceBytes);
+            Memory::CollectWritesUncached(surface.Address(), SurfaceBytes);
+            Require(Memory::CollectEpoch() == epoch, "an uncached collect changed the consumer's epoch");
+            Require(Memory::ResourceProofSerial() == writes, "the collected CPU-write test did not isolate tracker invalidation");
+        }
+        Require(!resources->Revalidate(shader, &report) && !report.epochReused, "a changed snapshot was accepted through an epoch proof");
+    }
+    {
+        WatchedSurface surface(context);
+        WatchedSurface metadata(context, 65536);
+        std::memset(reinterpret_cast<void*>(metadata.Address()), 0xff, 65536);
+        auto program = SampledProgram(surface.Address());
+        auto& words = program.bindings.front().guestDescriptor;
+        words[6] = (1u << 21u) | (static_cast<std::uint32_t>((metadata.Address() >> 8u) & 0xffu) << 24u);
+        words[7] = static_cast<std::uint32_t>(metadata.Address() >> 16u);
+        const CompiledShader shader{stage, &program, 0};
+        auto resources = create(shader);
+        Memory::BumpCollectEpoch();
+        warm(*resources, shader);
+        const auto epoch = Memory::CollectEpoch();
+        std::memset(reinterpret_cast<void*>(metadata.Address()), 0, 65536);
+        Memory::CollectWritesUncached(metadata.Address(), 65536);
+        ShaderResources::ProofReport report;
+        Require(!resources->Revalidate(shader, &report) && !report.epochReused, "a DCC key change was accepted through an epoch proof");
+        Require(Memory::CollectEpoch() == epoch, "the key test changed the consumer's epoch");
+    }
+    {
+        WatchedSurface surface(context);
+        const auto program = SampledProgram(surface.Address());
+        const CompiledShader shader{stage, &program, 0};
+        auto resources = create(shader);
+        Memory::BumpCollectEpoch();
+        warm(*resources, shader);
+        ClearDepthSurfaces(context.device);
+        ShaderResources::ProofReport report;
+        Require(resources->Revalidate(shader, &report) && !report.epochReused, "a changed depth registry reused its old proof");
+        warm(*resources, shader);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        Require(resources->Revalidate(shader, &report) && !report.epochReused && report.path == ShaderResources::ProofPath::Full, "epoch reuse postponed the lookup audit");
+        warm(*resources, shader);
+        ClearCachedTextures(context.device);
+        Require(!resources->Revalidate(shader, &report) && !report.epochReused, "an evicted sampled texture reused its old proof");
+    }
+    {
+        WatchedSurface surface(context);
+        Context copied = context;
+        copied.hostImportAlignment = 0;
+        auto program = SampledProgram(surface.Address());
+        auto& binding = program.bindings.front();
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+        binding.binding = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + PlaceholderDimensionsPerClass + 2u;
+        const CompiledShader shader{stage, &program, 0};
+        auto resources = draw ? std::make_shared<ShaderResources>(copied, std::span(&shader, 1), ColorTarget{}, 0, 0, 0) : std::make_shared<ShaderResources>(copied, shader);
+        Memory::BumpCollectEpoch();
+        warm(*resources, shader);
+        const auto image = StorageTexture::FindLive(surface.Address(), SurfaceBytes);
+        Require(image != nullptr && image->Cached(), "the storage epoch fixture is not cached");
+        ClearCachedTextures(context.device);
+        Require(!image->Cached(), "the storage epoch fixture was not evicted");
+        ShaderResources::ProofReport report;
+        Require(!resources->Revalidate(shader, &report) && !report.epochReused, "an evicted storage image reused its old proof");
+    }
+    {
+        WatchedSurface surface(context);
+        const auto program = SampledProgram(surface.Address());
+        const CompiledShader shader{stage, &program, 0};
+        auto resources = create(shader);
+        Memory::BumpCollectEpoch();
+        warm(*resources, shader);
+        Recorder recorder(context);
+        recorder.Activate();
+        recorder.NotePendingWrite(surface.Address(), 4);
+        const std::uint32_t value = 0x37373737;
+        recorder.AfterCompletions(surface.Address(), std::as_bytes(std::span(&value, 1)), 1, 0, false);
+        ShaderResources::ProofReport report;
+        Require(!resources->Revalidate(shader, &report) && !report.epochReused, "a pending completion store reused the old image proof");
+        Require(*reinterpret_cast<const std::uint32_t*>(surface.Address()) == value, "revalidation skipped its per-use completion store");
+        recorder.Sync();
+    }
+    if (context.hostImportAlignment == 0) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "epoch pending/import tests require host imports");
+        std::puts("skipped, epoch pending/import tests require host imports");
+        return false;
+    }
+    {
+        WatchedSurface surface(context);
+        const auto program = SampledProgram(surface.Address());
+        const CompiledShader shader{stage, &program, 0};
+        auto resources = create(shader);
+        Memory::BumpCollectEpoch();
+        warm(*resources, shader);
+        const auto pending = StorageTexture::PendingSerial();
+        auto image = CachedStorageSurface(context, Resource(surface.Address()));
+        image->MarkDirty();
+        Require(StorageTexture::PendingSerial() != pending && StorageTexture::FindPending(surface.Address(), SurfaceBytes) == image, "the pending-image test did not register its image");
+        ShaderResources::ProofReport report;
+        resources->Revalidate(shader, &report);
+        Require(!report.epochReused, "a newly pending image was accepted through the old epoch proof");
+        image->Flush();
+    }
+    {
+        WatchedSurface surface(context);
+        if (HostImportFor(context, surface.Address(), SurfaceBytes) == nullptr) {
+            Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "the epoch fixture's host import was refused");
+            return false;
+        }
+        ShaderRecompiler::DescriptorBinding binding{};
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(surface.Address()), static_cast<std::uint32_t>(surface.Address() >> 32u) & 0xffffu, 1024, 0x31000000u};
+        { auto flags = binding.Flags(); flags.bufferWritten = {false}; binding.SetFlags(std::move(flags)); }
+        ShaderRecompiler::RecompileResult program;
+        program.bindings.push_back(std::move(binding));
+        const CompiledShader shader{stage, &program, 0};
+        auto resources = create(shader);
+        Require(resources->Reusable(), "the imported-buffer epoch fixture is not reusable");
+        Memory::BumpCollectEpoch();
+        warm(*resources, shader);
+        const auto serial = HostImportSerial(context, surface.Address(), 1024, false);
+        Require(serial != 0, "the imported-buffer fixture did not bind an import");
+        ClearHostImports(context.device);
+        Require(HostImportFor(context, surface.Address(), SurfaceBytes) != nullptr, "the replacement import was refused");
+        Require(HostImportSerial(context, surface.Address(), 1024, false) != serial, "the replacement import kept its old identity");
+        ShaderResources::ProofReport report;
+        Require(!resources->Revalidate(shader, &report) && !report.epochReused && report.failure == ShaderResources::ProofFailure::Imports, "a replacement import was accepted through an epoch proof");
+    }
+    if (!draw) {
+        WatchedSurface surface(context);
+        Require(HostImportFor(context, surface.Address(), SurfaceBytes) != nullptr, "the staging fixture's import was refused");
+        Recorder recorder(context);
+        recorder.Activate();
+        constexpr std::size_t bytes = 65536;
+        ShaderRecompiler::DescriptorBinding binding{};
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(surface.Address()), static_cast<std::uint32_t>(surface.Address() >> 32u) & 0xffffu, bytes, 0x31000000u};
+        { auto flags = binding.Flags(); flags.bufferWritten = {true}; flags.bufferRead = {true}; binding.SetFlags(std::move(flags)); }
+        ShaderRecompiler::RecompileResult program;
+        program.bindings.push_back(std::move(binding));
+        const CompiledShader shader{stage, &program, 0};
+        auto resources = create(shader);
+        Require(resources->Reusable() && resources->InPlaceReads().empty() && !resources->HasCopiedWrites(), "the staging fixture did not bind a reusable device-local shadow");
+        Memory::BumpCollectEpoch();
+        warm(*resources, shader);
+        recorder.Sync();
+        std::memset(reinterpret_cast<void*>(surface.Address()), 0x37, bytes);
+        ShaderResources::ProofReport report;
+        Require(resources->Revalidate(shader, &report) && report.epochReused == enabled, "the staged template did not reuse the selected image proof");
+        resources->MarkGpuWrites(recorder);
+        recorder.Sync();
+        const auto* data = reinterpret_cast<const std::uint8_t*>(surface.Address());
+        Require(std::all_of(data, data + bytes, [](std::uint8_t value) { return value == 0x37; }), "an epoch hit skipped the new staging copy and copied old bytes back");
+    }
+    return true;
 }
 
 void replacedEntryTests(Context context) {
@@ -1315,6 +1542,11 @@ int main(int argc, char** argv) {
         }
         TextureDetiler detiler(context);
         context.detiler = &detiler;
+        if (mode == "resource-epoch-draw" || mode == "resource-epoch-dispatch") {
+            if (!resourceEpochTests(context, mode == "resource-epoch-draw")) return VulkanTestSkipped;
+            std::puts("resource epoch proof tests passed");
+            return 0;
+        }
         if (resources) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (!resourceCacheTests(context, mode)) return VulkanTestSkipped;
