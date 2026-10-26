@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferFill.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -18,6 +19,16 @@
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+void ReadFillInput(std::uint64_t address, std::span<std::byte> bytes) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) {
+        GuestMemory::Read(address, bytes, 4);
+        return;
+    }
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::FillInput);
+    GuestMemory::Read(address, bytes, 4);
+}
 
 bool matchesBufferPatternFillKernel(std::span<const std::uint32_t> code) {
     static constexpr std::array<std::uint32_t, 12> kernel{0xd7460004u, 0x04010c08u, 0xf4280302u, 0xfa000000u, 0xbf8cc07fu, 0x7e00020cu, 0x7e02020du, 0x7e04020eu, 0x7e06020fu, 0xe01c2000u, 0x80000004u, 0xbf810000u};
@@ -271,7 +282,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         inputLock.lock();
         recordLabelsForPacket(localDevice.get(), queueId);
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(memoryFill->valueAddress), 4)) return false;
-        GuestMemory::Read(memoryFill->valueAddress, std::as_writable_bytes(std::span(pattern).first(1)), 4);
+        ReadFillInput(memoryFill->valueAddress, std::as_writable_bytes(std::span(pattern).first(1)));
         std::fill(pattern.begin() + 1, pattern.end(), pattern[0]);
         base = memoryFill->address;
         bytes = memoryFill->bytes;
@@ -285,12 +296,12 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         recordLabelsForPacket(localDevice.get(), queueId);
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->control), 8)) return false;
         std::array<std::uint32_t, 2> control;
-        GuestMemory::Read(range->control, std::as_writable_bytes(std::span(control)), 4);
+        ReadFillInput(range->control, std::as_writable_bytes(std::span(control)));
         const auto count = range->UniformBytes(control[0], control[1]);
         if (!count) return false;
         if (*count == 0) return true;
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->source), 4)) return false;
-        GuestMemory::Read(range->source, std::as_writable_bytes(std::span(pattern).first(1)), 4);
+        ReadFillInput(range->source, std::as_writable_bytes(std::span(pattern).first(1)));
         std::fill(pattern.begin() + 1, pattern.end(), pattern[0]);
         base = range->destination;
         bytes = *count;
@@ -314,7 +325,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             inputLock.lock();
             recordLabelsForPacket(localDevice.get(), queueId);
             if (!GuestMemory::Accessible(reinterpret_cast<const void*>(source), sizeof(pattern))) return false;
-            GuestMemory::Read(source, std::as_writable_bytes(std::span(pattern)), 4);
+            ReadFillInput(source, std::as_writable_bytes(std::span(pattern)));
         } else {
             pattern = {userData[4], userData[5], userData[6], userData[7]};
         }
@@ -324,6 +335,18 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     return true;
 }
 
+
+void Driver::noteFillWriter(std::uint32_t queue, std::uint64_t base, std::size_t bytes, const std::array<std::uint32_t, 4>& pattern, std::uint64_t generation) {
+    static const bool enabled = std::getenv("APS5_NO_FILL_KNOWN_VALUES") == nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!enabled || !writeEvidenceEnabled() || generation == 0 || bytes == 0 || bytes > KnownValueMaxBytes || bytes % sizeof(pattern) != 0) return;
+    auto value = std::make_shared<std::vector<std::byte>>(bytes);
+    for (std::size_t offset = 0; offset < bytes; offset += sizeof(pattern)) std::memcpy(value->data() + offset, pattern.data(), sizeof(pattern));
+    std::lock_guard lock(writtenBuffersMutex);
+    writtenBuffers.push_back({0, base, base + bytes, ++writtenBufferSerial, queue, false, std::move(value), generation, true});
+    while (writtenBuffers.size() > WrittenBufferRing) writtenBuffers.pop_front();
+    if (profile) fillKnownEntries.fetch_add(1, std::memory_order_relaxed);
+}
 
 void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::size_t bytes, const std::array<std::uint32_t, 4>& pattern, const std::shared_ptr<VulkanDevice>& localDevice, bool memoryValueFill, bool noteMetadata) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -398,10 +421,12 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
         if (Graphics::StorageTexture::FlushPending(base, bytes, nullptr, "buffer fill", Graphics::PublishScope::PartialUnits)) ++flushed;
     }
     phase(FillFlush);
-    const bool stored = cleared || absorbed || localDevice->FillBuffer(base, bytes, pattern);
+    std::uint64_t generation = 0;
+    const bool stored = cleared || absorbed || localDevice->FillBuffer(base, bytes, pattern, &generation);
     phase(FillDevice);
     if (stored && !cleared && !absorbed) {
         if (const auto filled = KeysFillMemo(pattern, uniformKeysFill, memoryValueFill)) Graphics::NoteKeysFillOnGpu(base, bytes, *filled);
+        if (coverage.cover == Graphics::StorageTexture::FillCover::None) noteFillWriter(queueId, base, bytes, pattern, generation);
     }
     if (profile && stored && !cleared && !absorbed) {
         ++(uniform ? uniformFills : patternFills);

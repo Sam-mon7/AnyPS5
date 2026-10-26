@@ -1,15 +1,33 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
+
+namespace AgcDriver::DriverDetail {
+
+struct DriverTestAccess {
+    static void Fill(const std::shared_ptr<VulkanDevice>& device, std::uint64_t address, std::size_t bytes, const std::array<std::uint32_t, 4>& pattern) {
+        Driver::Get().storeBufferFill(0x20, address, bytes, pattern, device, false, false);
+    }
+    static bool Stable(std::span<const ShaderRecompiler::MemoryRegion> captured) { return Driver::Get().captureStable(captured); }
+    static void Foreign(std::uint64_t address, std::size_t bytes) { Driver::Get().noteForeignWriter(address, address + bytes, 0x28); }
+};
+
+}
 
 namespace {
 
@@ -165,10 +183,110 @@ void ExecuteTests() {
     }
 }
 
+void KnownCaptureTests(const std::shared_ptr<AgcDriver::VulkanDevice>& device) {
+    using Access = AgcDriver::DriverDetail::DriverTestAccess;
+    using Memory = AgcDriver::ShaderMemory;
+    namespace Guest = AgcDriver::GuestMemory;
+    constexpr std::size_t HeapBytes = 65536;
+    auto* heap = static_cast<std::uint32_t*>(GuestArena::GuestArenaAllocate_nid_postfix(HeapBytes, HeapBytes));
+    Require(heap != nullptr, "known fill: cannot allocate guest memory");
+    GuestArena::GuestArenaCommit_nid_postfix(heap, HeapBytes, 0x04u, HeapBytes);
+#ifndef _WIN32
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(heap, HeapBytes);
+#endif
+    std::fill_n(heap, HeapBytes / 4, Untouched);
+    const auto base = reinterpret_cast<std::uint64_t>(heap);
+    const bool enabled = std::getenv("APS5_NO_FILL_KNOWN_VALUES") == nullptr;
+    const bool verify = std::getenv("APS5_VERIFY_KNOWN_VALUES") != nullptr;
+    const auto expectedPolicy = !enabled ? Memory::PendingWrite::Sync : verify ? Memory::PendingWrite::VerifyKnownValue : Memory::PendingWrite::KnownValue;
+    alignas(256) constexpr std::array<std::uint32_t, 13> reader{0xf4000200u, 0xfa000000u, 0x34020082u, 0xdc308000u, 0x03020001u, 0xbf8cc07fu, 0x7e040208u, 0x4a040481u, 0xbf8c3f70u, 0x4a040503u, 0xe0701000u, 0x80010201u, 0xbf810000u};
+    const auto capture = [&](std::uint64_t address, std::uint32_t expected) {
+        const auto output = base + 8192;
+        const std::array<std::uint32_t, 8> data{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), static_cast<std::uint32_t>(base + 4096), static_cast<std::uint32_t>((base + 4096) >> 32u), static_cast<std::uint32_t>(output), static_cast<std::uint32_t>((output >> 32u) & 0xffffu), 128, 0x31016facu};
+        ShaderRecompiler::RecompileRequest request{};
+        request.shader = {ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uint64_t>(reader.data()), reader, 0, {}};
+        request.context.waveSize = 64;
+        request.context.userData = data;
+        request.context.compute = ShaderRecompiler::ShaderComputeStageInfo{{32, 1, 1}, 0, {false, false, false}, false, 1};
+        request.target = device->ComputeTarget(64);
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = false;
+        auto memory = std::make_shared<Memory>(std::span<const ShaderRecompiler::MemoryRegion>{}, &AgcDriver::DriverDetail::Driver::QueryPendingSpan);
+        static_cast<void>(memory->Capture(request));
+        const auto regions = memory->Regions();
+        const auto found = std::find_if(regions.begin(), regions.end(), [&](const auto& region) { return region.guestAddress <= address && address + 4 <= region.guestAddress + region.bytes.size(); });
+        Require(found != regions.end(), "known fill: the scalar input was not captured");
+        std::uint32_t actual = 0;
+        std::memcpy(&actual, found->bytes.data() + (address - found->guestAddress), sizeof(actual));
+        Require(actual == expected, "known fill: captured a stale scalar input");
+        return memory;
+    };
+    std::unique_lock lock(Guest::GpuMutex());
+    Guest::CollectWritesUncached(base, HeapBytes);
+    Access::Fill(device, base, 64, Pattern);
+    Require(AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(base, 64), "known fill: no pending producer");
+    Require(heap[0] == Untouched, "known fill: the producer ran before capture");
+    Require(AgcDriver::DriverDetail::Driver::QueryPendingSpan(base + 4, 4, {}) == expectedPolicy, "known fill: wrong subrange read policy");
+    Require(AgcDriver::DriverDetail::Driver::QueryPendingSpan(base + 60, 8, {}) == Memory::PendingWrite::Sync, "known fill: a crossing read was served from a partial value");
+    const auto knownBefore = Memory::KnownValues();
+    auto first = capture(base, Pattern[0]);
+    Require((Memory::KnownValues().served > knownBefore.served) == enabled, "known fill: capture did not follow the switch");
+    if (enabled && !verify) Require(heap[0] == Untouched && AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(base, 64), "known fill: capture submitted or waited for its producer");
+    static_cast<void>(capture(base + 4, Pattern[1]));
+    static_cast<void>(capture(base + 64, Untouched));
+    device->WaitIdle();
+
+    const std::array<std::uint32_t, 4> later{0x55667788u, 0x10203040u, 0x99aabbccu, 0xddeeff00u};
+    Access::Fill(device, base, 64, later);
+    Require(!Access::Stable(first->Regions()), "known fill: stale capture validated after an overlapping fill");
+    static_cast<void>(capture(base, later[0]));
+    device->WaitIdle();
+
+    Access::Fill(device, base, 64, Pattern);
+    Require(device->FillBuffer(base, 16, later), "known fill: cannot record a later GPU writer");
+    Require(AgcDriver::DriverDetail::Driver::QueryPendingSpan(base, 4, {}) == Memory::PendingWrite::Sync, "known fill: a later GPU write did not invalidate the known value");
+    static_cast<void>(capture(base, later[0]));
+    device->WaitIdle();
+
+    if (device->CanWaitUnlocked()) {
+        Access::Fill(device, base, 64, Pattern);
+        const auto serial = device->SubmitAndEpoch();
+        lock.unlock();
+        device->WaitRecorded(serial);
+        lock.lock();
+        Require(AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(base, 64), "known fill: the submitted producer was reaped");
+        heap[0] = later[0];
+        Require(AgcDriver::DriverDetail::Driver::QueryPendingSpan(base, 4, {}) == Memory::PendingWrite::Sync, "known fill: a later CPU write did not invalidate the known value");
+        static_cast<void>(capture(base, later[0]));
+        device->WaitIdle();
+    } else {
+        std::puts("known fill: CPU mutation subcase requires timeline semaphores");
+    }
+
+    Access::Fill(device, base, 64, Pattern);
+    Access::Foreign(base, 4);
+    Require(AgcDriver::DriverDetail::Driver::QueryPendingSpan(base, 4, {}) == Memory::PendingWrite::Sync, "known fill: a foreign writer did not invalidate the known value");
+    static_cast<void>(capture(base, Pattern[0]));
+    device->WaitIdle();
+
+    Access::Fill(device, base, 8192, Pattern);
+    Require(AgcDriver::DriverDetail::Driver::QueryPendingSpan(base, 4, {}) == Memory::PendingWrite::Sync, "known fill: an oversized producer retained a known value");
+    device->WaitIdle();
+    Require(Memory::KnownValues().mismatches == knownBefore.mismatches, "known fill: verification found a stale known value");
+    std::puts("known fill capture tests passed");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--known-capture") {
+            auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            KnownCaptureTests(std::shared_ptr<AgcDriver::VulkanDevice>(std::move(device)));
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
         if (std::getenv("APS5_NO_FILL_HLE") == nullptr) {
             MatchTests();
             SwappedComparesTests();
