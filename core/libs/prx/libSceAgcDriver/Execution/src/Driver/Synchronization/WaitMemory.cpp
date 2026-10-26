@@ -161,7 +161,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         finishProfile(Graphics::Recorder::WaitEnd::Held);
         return;
     }
-    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+    std::optional<std::uint64_t> historyGeneration;
+    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
         submitWriter(writer);
         if (writer != queue) notePendingWait(packet, queue, received);
         else epochPoint.bump = false;
@@ -362,7 +363,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::uint32_t polls = 0;
     StallWatch stall(queue);
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
-        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
             submitWriter(writer);
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;

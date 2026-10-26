@@ -714,8 +714,14 @@ if(BUILD_TESTING)
             ENVIRONMENT_MODIFICATION "APS5_NO_COLLECT_MEMO=unset:")
     set_property(TEST agc_driver_wait_epochs APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_HELD_WAIT_EPOCH=unset:")
     set_tests_properties(agc_driver_wait_epochs_legacy PROPERTIES ENVIRONMENT "APS5_NO_HELD_WAIT_EPOCH=1")
+    add_test(NAME agc_driver_wait_history COMMAND agc_driver_wait_shutdown_tests --wait-history)
+    add_test(NAME agc_driver_wait_history_legacy COMMAND agc_driver_wait_shutdown_tests --wait-history)
+    set_tests_properties(agc_driver_wait_history agc_driver_wait_history_legacy PROPERTIES
+            TIMEOUT 10 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_property(TEST agc_driver_wait_history APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_WAIT_HISTORY_REUSE=unset:")
+    set_tests_properties(agc_driver_wait_history_legacy PROPERTIES ENVIRONMENT "APS5_NO_WAIT_HISTORY_REUSE=1")
     if(WIN32)
-        set_property(TEST agc_driver_wait_shutdown agc_driver_resolution_shutdown agc_driver_wait_epochs agc_driver_wait_epochs_legacy APPEND PROPERTY ENVIRONMENT_MODIFICATION
+        set_property(TEST agc_driver_wait_shutdown agc_driver_resolution_shutdown agc_driver_wait_epochs agc_driver_wait_epochs_legacy agc_driver_wait_history agc_driver_wait_history_legacy APPEND PROPERTY ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
