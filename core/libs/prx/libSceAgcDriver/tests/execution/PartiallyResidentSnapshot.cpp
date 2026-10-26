@@ -1,8 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -216,6 +219,140 @@ std::array<std::uint32_t, 8> Descriptor(std::uint64_t address, std::uint32_t sid
     };
 }
 
+ShaderRecompiler::RecompileResult SampledProgram(const std::array<std::uint32_t, 8>& words) {
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + PlaceholderDimensionsPerClass + 2u;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    { auto flags = binding.Flags(); flags.imageWritten.assign(1, false); binding.SetFlags(std::move(flags)); }
+    binding.imageSamplers.assign(1, 0u);
+    binding.guestDescriptor.assign(words.begin(), words.end());
+    ShaderRecompiler::RecompileResult program;
+    program.bindings.push_back(std::move(binding));
+    return program;
+}
+
+void ExpectProof(ShaderResources& resources, const CompiledShader& shader, bool fast, const std::string& when) {
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    surfaceReads = 0;
+    ShaderResources::ProofReport report;
+    Require(resources.Revalidate(std::span(&shader, 1), &report), "partial resources did not revalidate " + when);
+    const bool enabled = std::getenv("APS5_NO_PARTIAL_SNAPSHOT_PROOF") == nullptr;
+    Require(report.path == (fast && enabled ? ShaderResources::ProofPath::Fast : ShaderResources::ProofPath::Full), "partial resources took the wrong proof path " + when);
+    if (fast && enabled) Require(surfaceReads.load() == 0, "partial fast proof read the snapshot " + when);
+}
+
+void ResourceProof(Context context, ReservedSurface& surface) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    surface.Commit(0, BlockBytes);
+    std::memset(surface.Data(), 0x5a, BlockBytes);
+    const auto address = surface.Address();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    Require(AgcDriver::GuestMemory::CollectWrites(address, SurfaceBytes) == 0 && AgcDriver::GuestMemory::CollectCommittedWrites(address, SurfaceBytes, ranges) != 0 && ranges == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{address, address + BlockBytes}}, "the resource proof fixture is not a nonempty partial surface");
+    auto program = SampledProgram(Descriptor(address));
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_unique<ShaderResources>(context, shader);
+    Require(resources->Reusable() && !resources->SampledTextures().front()->ViewsStorageImage(), "the partial resource is not a reusable snapshot");
+    surfaceBegin = address;
+    surfaceEnd = address + SurfaceBytes;
+    AgcDriver::GuestMemory::SetFlushHook(&CountReads);
+    struct ResetHook { ~ResetHook() { AgcDriver::GuestMemory::SetFlushHook(nullptr); } } resetHook;
+    const auto reject = [&](const char* when) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(!resources->Revalidate(shader), std::string("partial resources reused stale bytes ") + when);
+        resources = std::make_unique<ShaderResources>(context, shader);
+        ExpectProof(*resources, shader, true, std::string("after rebuilding ") + when);
+    };
+    ExpectProof(*resources, shader, true, "without a write");
+    ExpectProof(*resources, shader, true, "on a second epoch");
+    const std::byte changed{0x77};
+    AgcDriver::GuestMemory::Write(address + 32, std::span(&changed, 1));
+    reject("after a CPU write");
+    surface.Commit(BlockBytes, BlockBytes);
+    ExpectProof(*resources, shader, false, "after zero-filled commitment");
+    ExpectProof(*resources, shader, true, "after accepting commitment");
+    AgcDriver::GuestMemory::Write(address + BlockBytes + 32, std::span(&changed, 1));
+    reject("after a write in the new block");
+    surface.Decommit(BlockBytes, BlockBytes);
+    surface.Commit(BlockBytes, BlockBytes);
+    reject("after decommit and recommit");
+    surface.Decommit(BlockBytes, BlockBytes);
+    ExpectProof(*resources, shader, false, "after removing a zero-filled block");
+    ExpectProof(*resources, shader, true, "after accepting decommitment");
+    AgcDriver::GuestMemory::MarkWritten(address + 64, 4);
+    ExpectProof(*resources, shader, false, "after a same-byte driver stamp");
+    ExpectProof(*resources, shader, true, "after accepting the driver stamp");
+    ClearCachedTextures(context.device);
+    reject("after cache eviction");
+    AgcDriver::GuestMemory::Unwatch(address, BlockBytes);
+    ExpectProof(*resources, shader, false, "after excluding the committed run");
+    ExpectProof(*resources, shader, false, "while the committed run remains excluded");
+    resources.reset();
+    {
+        ReservedSurface empty(SurfaceBytes);
+        auto emptyProgram = SampledProgram(Descriptor(empty.Address()));
+        const CompiledShader emptyShader{ShaderRecompiler::ShaderStage::Compute, &emptyProgram, 0};
+        ShaderResources emptyResources(context, emptyShader);
+        ExpectProof(emptyResources, emptyShader, true, "with no committed pages");
+        empty.Commit(0, BlockBytes);
+        ExpectProof(emptyResources, emptyShader, false, "after the first empty-surface commitment");
+        ExpectProof(emptyResources, emptyShader, true, "after accepting the first commitment");
+    }
+}
+
+void DepthTransition(Context context, ReservedSurface& surface, bool partial = false) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    const auto committedBytes = partial ? BlockBytes : SurfaceBytes;
+    surface.Commit(0, committedBytes);
+    std::memset(surface.Data(), 0, committedBytes);
+    const auto address = surface.Address();
+    auto words = Descriptor(address);
+    constexpr std::uint32_t Format32Float = 22;
+    words[1] = (words[1] & ~(0x3ffu << 20u)) | (Format32Float << 20u);
+    auto program = SampledProgram(words);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    const auto generation = partial ? AgcDriver::GuestMemory::CollectCommittedWrites(address, SurfaceBytes, ranges) : AgcDriver::GuestMemory::CollectWrites(address, SurfaceBytes);
+    Require(generation != 0, "the depth transition surface is not write-tracked");
+    ShaderResources resources(context, shader);
+    Require(resources.Reusable() && resources.Revalidate(shader), "the ordinary sampled resources did not reuse before depth registration");
+    if (partial) {
+        Require(ranges == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{address, address + BlockBytes}}, "the depth transition is not partial");
+        ExpectProof(resources, shader, true, "before partial depth registration");
+    }
+    const auto before = resources.SampledTextures().front();
+    try {
+        const DepthTarget target{address, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        Require(DepthSurfaceView(context, target, false) != VK_NULL_HANDLE, "the depth owner was not registered");
+        Require(FlushDepthPlanes(address, SurfaceBytes).empty(), "the depth registration unexpectedly made the guest bytes stale");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        if (partial) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> current;
+            Require(AgcDriver::GuestMemory::CollectCommittedWrites(address, SurfaceBytes, current) != 0 && current == ranges && AgcDriver::GuestMemory::UnchangedCommittedSince(ranges, generation), "the depth registration changed partial guest bytes");
+        } else Require(AgcDriver::GuestMemory::CollectWrites(address, SurfaceBytes) != 0 && AgcDriver::GuestMemory::UnchangedSince(address, SurfaceBytes, generation), "the depth registration changed the guest bytes");
+        Require(!resources.Revalidate(shader), "sampled resources reused a stale texture after depth registration without a guest write");
+        ShaderResources rebuilt(context, shader);
+        const auto after = rebuilt.SampledTextures().front();
+        Require(after != before && DepthSurfaceHolds(context, DecodeTextureResource(words), after.get()), "the new depth owner did not replace the ordinary sampled texture");
+        Require(rebuilt.Revalidate(shader), "the rebuilt depth resources did not reuse");
+    } catch (...) {
+        ClearDepthSurfaces(context.device);
+        throw;
+    }
+    ClearDepthSurfaces(context.device);
+}
+
 void Run(const Context& context, ReservedSurface& surface) {
     const auto address = surface.Address();
     const auto words = Descriptor(address);
@@ -353,7 +490,11 @@ void UntrackedHint(const Context& context, ReservedSurface& surface) {
 }
 #endif
 
-void PendingStores(const Context& context, ReservedSurface& surface) {
+void PendingStores(Context context, ReservedSurface& surface) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
     const auto address = surface.Address();
     const auto words = Descriptor(address);
     surface.Commit(0, BlockBytes);
@@ -367,6 +508,10 @@ void PendingStores(const Context& context, ReservedSurface& surface) {
     auto previous = lookup();
     Require(previous != nullptr && !previous->ViewsStorageImage(), "the pending-store surface did not produce a snapshot");
     Require(lookup() == previous, "the unchanged pending-store surface did not reuse its snapshot");
+    auto program = SampledProgram(words);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_unique<ShaderResources>(context, shader);
+    ExpectProof(*resources, shader, true, "before pending stores");
     for (const bool submitted : {false, true}) {
         const auto landed = std::make_shared<bool>(false);
         const auto value = submitted ? std::byte{0x99} : std::byte{0x77};
@@ -378,21 +523,90 @@ void PendingStores(const Context& context, ReservedSurface& surface) {
             *landed = true;
         });
         if (submitted) recorder.Submit();
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(!resources->Revalidate(shader), "partial resources accepted a pending copied store");
         const auto next = lookup();
         Require(*landed, "the partially resident lookup returned before its pending copied store completed");
         Require(next != previous, "the partially resident lookup reused the snapshot from before its pending copied store");
         Require(surface.Data()[0] == std::to_integer<std::uint8_t>(value), "the pending copied store did not update guest memory");
         Require(lookup() == next, "the partially resident lookup did not reuse the snapshot after its pending copied store");
         previous = next;
+        resources = std::make_unique<ShaderResources>(context, shader);
+        ExpectProof(*resources, shader, true, "after a pending store completed");
     }
     const auto unrelated = std::make_shared<bool>(false);
     recorder.NotePendingWrite(address + SurfaceBytes, BlockBytes);
     recorder.OnComplete([unrelated] { *unrelated = true; });
+    ExpectProof(*resources, shader, true, "with an unrelated pending store");
     Require(lookup() == previous, "an unrelated pending write replaced the partially resident snapshot");
     Require(!*unrelated, "a partially resident lookup waited for an unrelated pending write");
     recorder.Sync();
     Require(*unrelated, "the unrelated pending completion did not run when synchronized");
 }
+
+#ifdef _WIN32
+void KeySynchronization(Context context, ReservedSurface& partial) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    ReservedSurface ordinary(SurfaceBytes);
+    ReservedSurface metadata(BlockBytes);
+    ordinary.Commit(0, SurfaceBytes);
+    partial.Commit(0, BlockBytes);
+    metadata.Commit(0, BlockBytes);
+    std::memset(ordinary.Data(), 0x5a, SurfaceBytes);
+    std::memset(partial.Data(), 0x5a, BlockBytes);
+    std::memset(metadata.Data(), 0xff, BlockBytes);
+    auto program = SampledProgram(Descriptor(ordinary.Address()));
+    auto words = Descriptor(partial.Address());
+    words[6] = (1u << 21u) | (static_cast<std::uint32_t>((metadata.Address() >> 8u) & 0xffu) << 24u);
+    words[7] = static_cast<std::uint32_t>(metadata.Address() >> 16u);
+    auto& binding = program.bindings.front();
+    binding.count = 2;
+    binding.imageSamplers.assign(2, 0u);
+    { auto flags = binding.Flags(); flags.imageWritten.assign(2, false); binding.SetFlags(std::move(flags)); }
+    binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    Recorder recorder(context);
+    recorder.Activate();
+    for (const bool grow : {false, true}) {
+        ShaderResources resources(context, shader);
+        ExpectProof(resources, shader, true, "before DCC synchronization");
+        bool landed = false;
+        const auto forget = AgcDriver::GuestMemory::ForgetSerial();
+        recorder.NotePendingWrite(metadata.Address(), SurfaceBytes / 256);
+        AgcDriver::GuestMemory::MarkWritten(metadata.Address(), SurfaceBytes / 256);
+        if (!grow) {
+            recorder.NotePendingWrite(ordinary.Address() + 32, 1);
+            AgcDriver::GuestMemory::MarkWritten(ordinary.Address() + 32, 1);
+        }
+        recorder.OnComplete([&] {
+            const std::byte changed{0x77};
+            if (grow) {
+                GuestArena::GuestArenaCommit_nid_postfix(partial.Data() + BlockBytes, BlockBytes, PAGE_READWRITE, BlockBytes);
+                AgcDriver::GuestMemory::Write(partial.Address() + BlockBytes + 32, std::span(&changed, 1));
+            } else {
+                AgcDriver::GuestMemory::Write(ordinary.Address() + 32, std::span(&changed, 1));
+            }
+            landed = true;
+        });
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const bool accepted = resources.Revalidate(shader);
+        const bool landedDuringValidation = landed;
+        recorder.Sync();
+        Require(landedDuringValidation, "DCC synchronization did not run its completion during validation");
+        Require(AgcDriver::GuestMemory::ForgetSerial() == forget, "the key-synchronization fixture changed the forget serial");
+        Require(!accepted, grow ? "partial proof missed commitment during key synchronization" : "partial proof missed a write to an earlier ordinary resource");
+        if (grow) Require(partial.Data()[BlockBytes + 32] == 0x77, "the newly committed block was not populated");
+        ShaderResources rebuilt(context, shader);
+        recorder.Sync();
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(rebuilt.Revalidate(shader), "the rebuilt key-synchronization resources did not settle");
+        ExpectProof(rebuilt, shader, true, grow ? "after key-synchronization growth rebuild" : "after key-synchronization write rebuild");
+    }
+}
+#endif
 
 }
 
@@ -421,6 +635,17 @@ int main(int argc, char** argv) {
                 LargeTracked(context, surface, LargeSurfaceBytes);
                 LargeTracked(context, surface, BlockBytes);
             } else if (argc == 2 && std::string_view(argv[1]) == "--pending-stores") PendingStores(context, surface);
+            else if (argc == 2 && std::string_view(argv[1]) == "--depth-transition") DepthTransition(context, surface);
+            else if (argc == 2 && std::string_view(argv[1]) == "--partial-depth-transition") DepthTransition(context, surface, true);
+            else if (argc == 2 && std::string_view(argv[1]) == "--resource-proof") ResourceProof(context, surface);
+            else if (argc == 2 && std::string_view(argv[1]) == "--key-synchronization") {
+#ifdef _WIN32
+                KeySynchronization(context, surface);
+#else
+                std::puts("skipped, the commit-observer regression uses the Windows guest arena");
+                return Skipped;
+#endif
+            }
             else if (argc == 2 && std::string_view(argv[1]) == "--untracked-hint") {
 #ifdef _WIN32
                 UntrackedHint(context, surface);
