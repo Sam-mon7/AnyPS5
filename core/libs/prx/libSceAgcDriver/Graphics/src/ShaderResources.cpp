@@ -3118,6 +3118,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
+        if (DepthSurfaceOverlaps(context.device, address, bytes)) return fail(FastFail::Depth);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
@@ -3247,6 +3248,7 @@ bool ShaderResources::fastRevalidateEach() {
         if (textures[i]->Released()) return false;
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
+        if (DepthSurfaceOverlaps(context.device, address, bytes)) return false;
         if (!FlushDepthPlanes(address, bytes).empty()) return false;
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return false;
