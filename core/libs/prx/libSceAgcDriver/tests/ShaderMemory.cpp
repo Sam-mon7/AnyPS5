@@ -1348,6 +1348,7 @@ void verifyPureFlatSlots() {
     source.dwordCount = 1;
     source.dwords[0] = &readConst(2);
     plan.descriptorSources.push_back(source);
+    plan.materializationSources = {0u};
     using Pure = std::vector<std::uint8_t>;
     require(Detail::ComputePureFlatSlots(plan) == Pure{1, 0, 0, 1}, "pure flat slots: the address cone or the descriptor source was not excluded");
     plan.controlFlow.push_back({&readConst(3), {}, {}});
@@ -1366,6 +1367,82 @@ void verifyPureFlatSlots() {
     plan.uniformFill.values[0] = &readConst(3);
     require(Detail::ComputePureFlatSlots(plan) == Pure{1, 0, 0, 0}, "pure flat slots: a uniform-fill value was not excluded");
     plan.uniformFill = {};
+    DescriptorSource unused;
+    unused.dwordCount = 1;
+    unused.dwords[0] = &readConst(3);
+    plan.descriptorSources.push_back(unused);
+    const char* refinedValue = std::getenv("APS5_SRT_MATERIALIZED_PURE_SLOTS");
+    const bool refined = refinedValue != nullptr && std::string_view(refinedValue) == "1";
+    require(Detail::ComputeFlatSlotReasons(plan) == std::vector<std::uint16_t>{0u, Detail::ReadAddress, Detail::MaterializedDescriptor, Detail::UnusedDescriptor}, "flat slot diagnostics lost a use or conflated unused and materialized descriptors");
+    require(Detail::ComputePureFlatSlots(plan) == Pure{1, 0, 0, static_cast<std::uint8_t>(refined)}, "an unused descriptor did not follow the pure-slot switch");
+    plan.descriptorSources[1].dwords[1] = &b;
+    plan.descriptorSources[1].dwordCount = 2;
+    require(Detail::ComputeFlatSlotReasons(plan)[1] == (Detail::UnusedDescriptor | Detail::ReadAddress), "an unused descriptor's raw pointer lost its address dependency");
+    require(Detail::ComputePureFlatSlots(plan) == Pure{1, 0, 0, static_cast<std::uint8_t>(refined)}, "an unused descriptor's pointer became pure");
+    plan.descriptorSources[1].dwords[1] = &c;
+    require(Detail::ComputeFlatSlotReasons(plan)[2] == (Detail::UnusedDescriptor | Detail::MaterializedDescriptor), "a raw read shared with a materialized descriptor lost its dependency");
+    require(Detail::ComputePureFlatSlots(plan) == Pure{1, 0, 0, static_cast<std::uint8_t>(refined)}, "a materialized descriptor shared with an unused source became pure");
+    plan.descriptorSources[1].dwordCount = 1;
+    plan.controlFlow.push_back({&readConst(3), {}, {}});
+    require(Detail::ComputePureFlatSlots(plan) == Pure{1, 0, 0, 0}, "an unused descriptor's branch dependency became pure");
+    require(Detail::ComputeFlatSlotReasons(plan)[3] == (Detail::UnusedDescriptor | Detail::BranchCondition), "flat slot diagnostics lost overlapping reasons");
+    plan.controlFlow.clear();
+    plan.uniformFill.fill.kind = UniformFillKind::Buffer;
+    plan.uniformFill.fill.words = 1;
+    plan.uniformFill.values[0] = unused.dwords[0];
+    require(Detail::ComputePureFlatSlots(plan) == Pure{1, 0, 0, 0}, "an unused descriptor's uniform-fill dependency became pure");
+    plan.uniformFill = {};
+    plan.descriptorSources[1].dwords[0] = &d;
+    require(Detail::ComputePureFlatSlots(plan) == Pure{1, 0, 0, static_cast<std::uint8_t>(refined)}, "an unused source naming a raw read bypassed the switch");
+    plan.uniformFill.fill.kind = UniformFillKind::Buffer;
+    plan.uniformFill.fill.words = 5;
+    require(Detail::ComputePureFlatSlots(plan) == Pure{0, 0, 0, 0}, "an invalid uniform fill allowed pure slots");
+    require(Detail::ComputeFlatSlotReasons(plan) == std::vector<std::uint16_t>(4, Detail::InvalidUniformFill), "an invalid uniform fill was not diagnosed");
+    plan.uniformFill = {};
+    plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
+    plan.memoryInfo.emplace_back().kind = ResourceKind::ScalarAddress;
+    std::array<std::uint32_t, 8> payload{11, 12, 13, 14, 15, 16, 17, 18};
+    const auto payloadAddress = reinterpret_cast<std::uintptr_t>(payload.data());
+    std::uint32_t pointer = static_cast<std::uint32_t>(payloadAddress);
+    const auto pointerAddress = reinterpret_cast<std::uintptr_t>(&pointer);
+    const std::array<std::uint32_t, 7> userWords{
+        static_cast<std::uint32_t>(pointerAddress), static_cast<std::uint32_t>(pointerAddress >> 32u),
+        static_cast<std::uint32_t>(payloadAddress), static_cast<std::uint32_t>(payloadAddress >> 32u),
+        static_cast<std::uint32_t>(payloadAddress >> 32u), static_cast<std::uint32_t>(payloadAddress), static_cast<std::uint32_t>(payloadAddress >> 32u)
+    };
+    SrtReadTrace trace;
+    trace.profile = true;
+    SrtRuntime runtime;
+    runtime.userData = userWords;
+    runtime.readTrace = &trace;
+    std::vector<DescriptorValue> descriptors;
+    std::vector<std::uint32_t> flat;
+    std::vector<std::uint8_t> active;
+    SrtWalker{}.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, descriptors, flat, plan.cleanFlatSlots, active);
+    require(flat == std::vector<std::uint32_t>{13, pointer, 12, 14} && descriptors.size() == 1 && descriptors[0].dwords[0] == 12u, "unused descriptor refinement changed materialized answers");
+    require(trace.leaves.size() == (refined ? 2u : 1u), "unused descriptor refinement did not trace the pure reads");
+    require(trace.slotReads.size() == 4u, "flat slot diagnostics did not observe descriptor, address and data reads");
+    std::map<std::uint64_t, std::uint32_t> captured;
+    for (const auto& [value, address] : trace.slotReads) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+        captured[address] = word;
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    std::vector<std::uint32_t> words;
+    for (const auto& [address, word] : captured) {
+        runs.emplace_back(address, address + sizeof(word));
+        words.push_back(word);
+    }
+    std::sort(trace.otherReads.begin(), trace.otherReads.end());
+    std::vector<std::uint32_t> positions, slots;
+    static_cast<void>(AgcDriver::DataWordPositions(runs, trace.leaves, trace.otherReads, words, flat, positions, slots));
+    require(slots.size() == (refined ? 2u : 1u) && std::find(slots.begin(), slots.end(), 1u) == slots.end() && std::find(slots.begin(), slots.end(), 2u) == slots.end(), "a pointer or materialized descriptor became refreshable data");
+    trace.otherReads.push_back(payloadAddress + 12u);
+    std::sort(trace.otherReads.begin(), trace.otherReads.end());
+    static_cast<void>(AgcDriver::DataWordPositions(runs, trace.leaves, trace.otherReads, words, flat, positions, slots));
+    require(slots == std::vector<std::uint32_t>{0u}, "a newly pure read aliased with a non-pure read became refreshable data");
+    plan.descriptorSources.pop_back();
     plan.descriptorSources[0].tableColumn = TableColumn{};
     require(Detail::ComputePureFlatSlots(plan) == Pure{0, 0, 0, 0}, "pure flat slots: a table column did not disqualify the plan");
     plan.descriptorSources[0].tableColumn.reset();
@@ -8789,6 +8866,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--type-zero-image-materialization") {
             verifyTypeZeroImageMaterialization();
             std::cout << "TYPE=0 image descriptor materialization passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pure-flat-slots") {
+            verifyPureFlatSlots();
             return 0;
         }
         require(argc == 1, "unknown shader memory test arguments");

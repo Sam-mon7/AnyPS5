@@ -51,7 +51,15 @@ void Driver::classifyDiffering(std::uint64_t program, std::uint64_t key, const D
         const bool isLeaf = capture != nullptr && leaf != capture->readTrace.leaves.end();
         const bool other = capture != nullptr && std::binary_search(capture->readTrace.otherReads.begin(), capture->readTrace.otherReads.end(), address);
         const auto role = masked ? 0u : isLeaf && other ? 2u : isLeaf ? 1u : other ? 3u : 4u;
-        const auto slot = isLeaf ? leaf->first : DispatchVariant::NoFlatBinding;
+        auto slot = isLeaf ? leaf->first : DispatchVariant::NoFlatBinding;
+        if (!isLeaf && capture != nullptr && capture->plan != nullptr) {
+            const auto observed = std::find_if(capture->readTrace.slotReads.begin(), capture->readTrace.slotReads.end(), [&](const auto& item) { return item.second == address; });
+            if (observed != capture->readTrace.slotReads.end()) {
+                const auto& reads = capture->plan->srtReads;
+                const auto read = std::find_if(reads.begin(), reads.end(), [&](const auto& item) { return item.value != nullptr && item.value->Resolve() == observed->first; });
+                if (read != reads.end()) slot = read->flatOffset;
+            }
+        }
         ++counters.differingWordRoles[program][{i, address, role, slot}];
         ++words;
         counters.differingPositions.insert(i);
@@ -99,6 +107,10 @@ void Driver::reportDispatchCache(EntryCounters& counters) {
     }
     AgcDriver::ProfilePrint_nid_no_patch("[dispatch-cache] data hits (10 s): %llu (%llu words refreshed; by rank 1..k %s; %llu data variants missed on pending runs), verified %llu; inserts with data positions %llu of %llu (%.1f positions each), leaves skipped: unmapped %llu, mismatched %llu, aliased %llu\n", count(counters.dataHits), count(counters.dataWordsRefreshed), dataRanks.c_str(), count(dataPendingMisses.exchange(0, std::memory_order_relaxed)), count(counters.dataVerified), count(counters.dataInserts), count(counters.inserts), counters.dataInserts != 0 ? static_cast<double>(counters.dataPositionsInserted) / static_cast<double>(counters.dataInserts) : 0.0, count(counters.dataLeavesUnmapped), count(counters.dataLeavesMismatched), count(counters.dataLeavesAliased));
     AgcDriver::ProfilePrint_nid_no_patch("[dispatch-cache] data insert reasons (10 s): positions %llu, disabled %llu, stamp validation %llu, no capture %llu, no leaves %llu, no flat binding %llu, leaves rejected %llu; no-leaf plan flags (overlap): incomplete %llu, specialization memory %llu, table columns %llu, no pure slots %llu\n", count(counters.dataInsertReasons[0]), count(counters.dataInsertReasons[1]), count(counters.dataInsertReasons[2]), count(counters.dataInsertReasons[3]), count(counters.dataInsertReasons[4]), count(counters.dataInsertReasons[5]), count(counters.dataInsertReasons[6]), count(counters.dataNoLeafReasons[0]), count(counters.dataNoLeafReasons[1]), count(counters.dataNoLeafReasons[2]), count(counters.dataNoLeafReasons[3]));
+    AgcDriver::ProfilePrint_nid_no_patch("[dispatch-cache] refined data inserts (10 s): %llu with %llu newly pure positions\n", count(counters.refinedDataInserts), count(counters.refinedDataPositions));
+    for (const auto& [program, slots] : counters.flatSlotReasonsByProgram) {
+        AgcDriver::ProfilePrint_nid_no_patch("[dispatch-cache] flat slot reasons program 0x%llx (first insert this 10 s; address 0 = not read; reasons overlap):%s\n", count(program), slots.c_str());
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[dispatch-cache] data differing reasons (10 s, first variant versus recapture): layout changed %llu, no recorded positions %llu, outside recorded positions %llu, all changes covered or no byte change %llu; validation failures (variant attempts, including draw stages): masked non-data/unmapped %llu, known pending %llu, raw pending %llu, synced pending %llu, legacy/nonpending %llu; sync prefilter failures (all variants) %llu\n", count(counters.dataDifferingReasons[0]), count(counters.dataDifferingReasons[1]), count(counters.dataDifferingReasons[2]), count(counters.dataDifferingReasons[3]), count(dataMissReasons[0].exchange(0, std::memory_order_relaxed)), count(dataMissReasons[1].exchange(0, std::memory_order_relaxed)), count(dataMissReasons[2].exchange(0, std::memory_order_relaxed)), count(dataMissReasons[3].exchange(0, std::memory_order_relaxed)), count(dataMissReasons[4].exchange(0, std::memory_order_relaxed)), count(dataMissReasons[5].exchange(0, std::memory_order_relaxed)));
     for (const auto& [site, counts] : counters.dataLookupsBySite) {
         AgcDriver::ProfilePrint_nid_no_patch("[dispatch-cache] data site queue 0x%x %s (10 s): %llu entry lookups, %llu hits, %llu data hits\n", site.first, site.second ? "indirect" : "direct", count(counts[0]), count(counts[1]), count(counts[2]));

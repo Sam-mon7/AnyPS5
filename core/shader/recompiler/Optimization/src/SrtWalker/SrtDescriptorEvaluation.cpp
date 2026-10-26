@@ -267,8 +267,9 @@ bool sameUserDataUse(const SrtUserDataUse& tape, const SrtUserDataUse& interpret
     return tapeReads == interpretedReads;
 }
 
-void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads, std::size_t leavesBefore, std::size_t readsBefore, const SrtUserDataUse* useBefore) {
+void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads, std::size_t leavesBefore, std::size_t readsBefore, std::size_t slotsBefore, const SrtUserDataUse* useBefore) {
     SrtReadTrace expectedTrace;
+    expectedTrace.profile = runtime.readTrace != nullptr && runtime.readTrace->profile;
     SrtUserDataUse expectedUse = useBefore != nullptr ? *useBefore : SrtUserDataUse {};
     SrtRuntime interpreted = runtime;
     interpreted.readTrace = runtime.readTrace != nullptr ? &expectedTrace : nullptr;
@@ -303,6 +304,8 @@ void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::v
             trace->otherReads.resize(readsBefore);
             trace->leaves.insert(trace->leaves.end(), expectedTrace.leaves.begin(), expectedTrace.leaves.end());
             trace->otherReads.insert(trace->otherReads.end(), expectedTrace.otherReads.begin(), expectedTrace.otherReads.end());
+            trace->slotReads.resize(slotsBefore);
+            trace->slotReads.insert(trace->slotReads.end(), expectedTrace.slotReads.begin(), expectedTrace.slotReads.end());
         }
     }
     if (difference.empty() && runtime.userDataUse != nullptr && !sameUserDataUse(*runtime.userDataUse, expectedUse)) difference = "user-data use";
@@ -333,12 +336,13 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
         if (const auto* tape = SrtTape::For(program); tape != nullptr) {
             const auto leavesBefore = runtime.readTrace != nullptr ? runtime.readTrace->leaves.size() : 0;
             const auto readsBefore = runtime.readTrace != nullptr ? runtime.readTrace->otherReads.size() : 0;
+            const auto slotsBefore = runtime.readTrace != nullptr ? runtime.readTrace->slotReads.size() : 0;
             std::optional<SrtUserDataUse> useBefore;
             if (SrtTape::Verified() && runtime.userDataUse != nullptr) useBefore = *runtime.userDataUse;
             if (tape->Run(program, runtime, results, flat, activeSources)) {
                 if (poison != nullptr) poison->clear();
                 if (nullRootReads != nullptr) *nullRootReads = 0;
-                if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, poison, nullRootReads, leavesBefore, readsBefore, useBefore ? &*useBefore : nullptr);
+                if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, poison, nullRootReads, leavesBefore, readsBefore, slotsBefore, useBefore ? &*useBefore : nullptr);
                 return true;
             }
         }

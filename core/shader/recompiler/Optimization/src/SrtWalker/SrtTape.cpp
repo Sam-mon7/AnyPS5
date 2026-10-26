@@ -434,6 +434,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
             if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
+                if (trace->profile) trace->slotReads.emplace_back(node.source, address);
                 if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
                 else trace->otherReads.push_back(address);
             }
@@ -541,6 +542,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     auto* trace = runtime.readTrace;
     const auto leavesBefore = trace != nullptr ? trace->leaves.size() : 0;
     const auto readsBefore = trace != nullptr ? trace->otherReads.size() : 0;
+    const auto slotsBefore = trace != nullptr ? trace->slotReads.size() : 0;
     auto* use = runtime.userDataUse;
     const auto baseBefore = use != nullptr ? use->asBase : 0;
     const auto valueBefore = use != nullptr ? use->asValue : 0;
@@ -549,6 +551,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         if (trace != nullptr) {
             trace->leaves.resize(leavesBefore);
             trace->otherReads.resize(readsBefore);
+            trace->slotReads.resize(slotsBefore);
             trace->leaf = nullptr;
         }
         if (use != nullptr) {

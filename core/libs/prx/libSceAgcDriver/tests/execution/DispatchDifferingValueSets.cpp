@@ -87,15 +87,17 @@ void Dispatch(const GuestBlock& block) {
 }
 
 struct Totals {
-    std::uint64_t classified = 0, matched = 0;
-    std::uint64_t lastClassified = 0, lastMatched = 0;
+    std::uint64_t classified = 0, matched = 0, dataHits = 0;
+    std::uint64_t lastClassified = 0, lastMatched = 0, lastDataHits = 0;
 
     void Add() {
         const auto counters = Driver::Get().DispatchCacheCounters();
         classified += counters.differingClassified >= lastClassified ? counters.differingClassified - lastClassified : counters.differingClassified;
         matched += counters.differingMatchedPrior >= lastMatched ? counters.differingMatchedPrior - lastMatched : counters.differingMatchedPrior;
+        dataHits += counters.dataHits >= lastDataHits ? counters.dataHits - lastDataHits : counters.dataHits;
         lastClassified = counters.differingClassified;
         lastMatched = counters.differingMatchedPrior;
+        lastDataHits = counters.dataHits;
     }
 };
 
@@ -110,6 +112,7 @@ void AlternatingValueSets(const GuestBlock& block) {
     std::printf("alternating value sets: %llu differing dispatches classified, %llu matched one of the last 3 value sets\n", static_cast<unsigned long long>(totals.classified), static_cast<unsigned long long>(totals.matched));
     Require(totals.classified == 4, "the four dispatches after the first were not all classified as differing (" + std::to_string(totals.classified) + ")");
     Require(totals.matched == 3, "the three dispatches bringing a value set seen before did not all match it (" + std::to_string(totals.matched) + ")");
+    Require(totals.dataHits == 0, "a changing buffer descriptor word was refreshed as pure data");
 }
 
 }

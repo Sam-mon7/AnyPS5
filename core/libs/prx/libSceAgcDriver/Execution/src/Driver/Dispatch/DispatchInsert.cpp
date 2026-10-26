@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "ImageTableAbi.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -81,6 +82,42 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         if (profile && missedEntry != nullptr && missedDiffering) classifyDiffering(address, key, *missedEntry->variants.front(), *fresh, capture.get(), entryCounters);
         if (stable) {
             if (profile) {
+                if (capture != nullptr && capture->plan != nullptr) {
+                    const auto& plan = *capture->plan;
+                    auto [classified, inserted] = entryCounters.flatSlotReasonsByPlan.try_emplace(capture->plan);
+                    if (inserted) classified->second = ShaderRecompiler::Detail::ComputeFlatSlotReasons(plan);
+                    const auto& reasons = classified->second;
+                    std::size_t refined = 0;
+                    for (const auto slot : fresh->dataSlots) {
+                        if (slot < reasons.size() && reasons[slot] == ShaderRecompiler::Detail::UnusedDescriptor) ++refined;
+                    }
+                    if (refined != 0u) {
+                        ++entryCounters.refinedDataInserts;
+                        entryCounters.refinedDataPositions += refined;
+                    }
+                    if (!entryCounters.flatSlotReasonsByProgram.contains(address)) {
+                        std::string details;
+                        constexpr std::array<std::pair<std::uint16_t, const char*>, 9> names{{
+                            {1u, "incomplete"}, {2u, "specialization"}, {4u, "table-column"}, {8u, "invalid-fill"},
+                            {16u, "descriptor"}, {32u, "unused-descriptor"}, {64u, "branch"}, {128u, "uniform-fill"}, {256u, "address"}
+                        }};
+                        for (std::size_t slot = 0; slot < reasons.size(); ++slot) {
+                            const auto* raw = plan.srtReads[slot].value;
+                            const auto found = std::find_if(capture->readTrace.slotReads.begin(), capture->readTrace.slotReads.end(), [&](const auto& item) { return raw != nullptr && item.first == raw->Resolve(); });
+                            const auto readAddress = found == capture->readTrace.slotReads.end() ? 0ull : static_cast<unsigned long long>(found->second);
+                            std::string uses;
+                            for (const auto& [flag, name] : names) {
+                                if ((reasons[slot] & flag) == 0u) continue;
+                                if (!uses.empty()) uses += "|";
+                                uses += name;
+                            }
+                            char item[256];
+                            std::snprintf(item, sizeof(item), " slot=%u@0x%llx:%s:selected=%s", plan.srtReads[slot].flatOffset, readAddress, uses.empty() ? "pure" : uses.c_str(), slot < plan.pureFlatSlots.size() && plan.pureFlatSlots[slot] != 0u ? "pure" : "impure");
+                            details += item;
+                        }
+                        entryCounters.flatSlotReasonsByProgram.emplace(address, std::move(details));
+                    }
+                }
                 const auto reason = !fresh->dataPositions.empty() ? 0u : !dataHits() ? 1u : stampValidate() ? 2u : capture == nullptr ? 3u : capture->readTrace.leaves.empty() ? 4u : fresh->flatBinding == DispatchVariant::NoFlatBinding ? 5u : 6u;
                 ++entryCounters.dataInsertReasons[reason];
                 auto& program = entryCounters.dataInsertsByProgram[address];

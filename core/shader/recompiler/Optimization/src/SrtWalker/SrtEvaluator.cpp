@@ -247,6 +247,7 @@ bool BasicEvaluator<TNode>::EvaluateRawRead(const TNode& inst, std::uint64_t& re
         return false;
     }
     if (auto* trace = _runtime.readTrace; trace != nullptr) {
+        if (trace->profile) trace->slotReads.emplace_back(inst.Value(), address);
         if (inst.Value() == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
         else trace->otherReads.push_back(address);
     }
