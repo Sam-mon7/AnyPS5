@@ -5,6 +5,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <string_view>
 
 struct BdaTestAccess {
     std::function<std::span<std::byte>(VkBuffer)> bytes;
@@ -20,6 +21,7 @@ bool RunSparseBufferHoleTests(const AgcDriver::Graphics::Context& context, const
 void RunHeapMirrorUnwatchTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access, bool throughImport);
 void RunSparseHeapMirrorUnwatchTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access);
 void RunHeapMirrorRunUnwatchTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access);
+bool RunDispatchHeapRefreshTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access, std::string_view mode);
 void RunGuestAllocationTests();
 void RunGuestLeaseWaitTests();
 void RunUnmappedGapTests();

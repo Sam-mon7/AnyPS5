@@ -131,6 +131,8 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
 // re-checks with HostImportFor when it binds the import.
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> AddressMirrorSurfaces(const Context& context);
+void PrecollectAddressMirrors(const Context& context);
 struct RegisteredPiece {
     std::uint64_t address;
     std::uint64_t bytes;

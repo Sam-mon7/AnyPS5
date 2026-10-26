@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "ThreadOwned.hpp"
@@ -155,6 +157,14 @@ AddressSpaceCache& Spaces() {
 bool addressSpaceCacheEnabled() {
     static const bool disabled = std::getenv("APS5_NO_ADDRESS_SPACE_CACHE") != nullptr;
     return !disabled;
+}
+
+bool dispatchHeapRefreshEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_DISPATCH_HEAP_REFRESH");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
 }
 
 struct ImportFailure {
@@ -2589,14 +2599,19 @@ void planSpaceMirrors(GuestBufferMemory::AddressSpace& space) {
 }
 
 std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
+    std::optional<PerformanceTimer> timing;
+    if (dispatchHeapRefreshEnabled()) timing.emplace("AddressHeap.Refresh");
     std::vector<std::pair<std::size_t, std::uint64_t>> checked;
     checked.reserve(space.heapRuns.size());
     for (std::size_t index = 0; index < space.heapRuns.size(); ++index) {
         const auto& run = space.heapRuns[index];
         prepareRange(run.begin, run.bytes);
+        if (timing) timing->Mark("prepare");
         const auto generation = GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
+        if (timing) timing->Mark("collect", run.bytes);
         const auto since = space.verified[index].load(std::memory_order_relaxed);
         if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since)) appendHeapRun(std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), generation, blocks);
+        if (timing) timing->Mark("check");
         checked.emplace_back(index, generation);
     }
     return checked;
@@ -3583,6 +3598,28 @@ bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t
     // Imports of a replaced device are not this device's; a stale registry only means an import
     // may be dropped at the next reconcile, which the binding path handles.
     return state.device == context.device && peekImport(state, address, address + bytes) != nullptr;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> AddressMirrorSurfaces(const Context& context) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> surfaces;
+    if (!dispatchHeapRefreshEnabled() || !addressSpaceCacheEnabled()) return surfaces;
+    const auto space = Spaces().current.load();
+    if (space == nullptr || space->device != context.device || space->generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return surfaces;
+    for (const auto& run : space->heapRuns) surfaces.emplace_back(run.begin, run.bytes);
+    for (const auto* mirror : space->sparseMirrors) surfaces.emplace_back(mirror->base, mirror->bytes);
+    for (const auto index : space->writableMirrors) {
+        const auto& region = space->base[index];
+        surfaces.emplace_back(region.begin, region.end - region.begin);
+    }
+    return surfaces;
+}
+
+void PrecollectAddressMirrors(const Context& context) {
+    if (!dispatchHeapRefreshEnabled() || !addressSpaceCacheEnabled() || GuestMemory::ThreadCollectEpoch() == 0 || GuestMemory::GpuMutex().HeldByThisThread()) return;
+    const auto space = Spaces().current.load();
+    if (space == nullptr || space->device != context.device || space->generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return;
+    PerformanceTimer timing("AddressHeap.Precollect");
+    for (const auto& run : space->heapRuns) GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
 }
 
 GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) {}

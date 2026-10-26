@@ -2731,6 +2731,101 @@ bool RunSparseBufferHoleTests(const Context& context, const BdaTestAccess& acces
     return passed;
 }
 
+bool RunDispatchHeapRefreshTests(const Context& context, const BdaTestAccess& access, std::string_view mode) {
+    namespace Memory = AgcDriver::GuestMemory;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 4 * block;
+#ifdef _WIN32
+    if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) return false;
+    auto* guest = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    Require(guest != nullptr, "cannot allocate the dispatch heap run");
+    GuestArena::GuestArenaCommit_nid_postfix(guest, bytes, PAGE_READWRITE, bytes);
+#else
+    if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) return false;
+    void* mapping = mmap(nullptr, bytes + block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(mapping != MAP_FAILED, "cannot map the dispatch heap run");
+    auto* guest = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(mapping) + block - 1) & ~std::uintptr_t{block - 1});
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(guest, bytes);
+#endif
+    std::memset(guest, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uintptr_t>(guest);
+    const auto registry = [&](bool add) {
+        GuestAllocations::Mutation mutation;
+        for (auto* piece : {guest, guest + 2 * block}) {
+            if (add) mutation.Add(piece, 2 * block, true, false, true);
+            else mutation.Remove(piece);
+        }
+    };
+    registry(true);
+    const auto build = [&] {
+        std::lock_guard gpu(Memory::GpuMutex());
+        GuestBufferMemory memory(context);
+        memory.AcquireRegistered();
+        memory.Upload(true);
+        const auto ranges = memory.AddressRanges();
+        for (const auto base : {address, address + 2 * block}) {
+            const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == base; });
+            Require(found != ranges.end() && found->deviceAddress != 0, "dispatch heap is missing from the address table");
+            Require(std::memcmp(access.addressBytes(found->deviceAddress).data(), reinterpret_cast<const void*>(base), 2 * block) == 0, "dispatch would read stale heap bytes");
+        }
+        memory.WriteBack();
+    };
+    build();
+    build();
+    const auto before = MirrorCounters();
+    Require(before.heapMirrors == 2, "the dispatch test did not create two heap mirrors");
+    if (mode != "no-epoch") Memory::BumpCollectEpoch();
+    if (mode != "unchanged") guest[2 * block + 7] = std::byte{0x29};
+    const auto collectedBefore = Memory::ThreadCollectedBytes();
+    Require(collectedBefore != 0, "dispatch heap tests require APS5_PROFILE_DRAW");
+    ShaderRecompiler::RecompileResult shader;
+    shader.bindings = {binding(Role::BdaPagetable, 4)};
+    const CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
+    Require(!Memory::GpuMutex().HeldByThisThread(), "dispatch stage A must run outside the GPU mutex");
+    {
+        ShaderResources prepared(context, compiled, {}, true);
+        const auto surfaces = prepared.PresyncSurfaces();
+        const bool enabled = mode != "off";
+        Require(surfaces.size() == (enabled ? 1u : 0u), "dispatch mirror pre-sync did not respect the exact-1 switch");
+        if (enabled) Require(surfaces.front().address == address && surfaces.front().bytes == bytes && !surfaces.front().dccKeys, "pre-sync does not cover the whole heap run");
+    }
+    const auto collectedPrepared = Memory::ThreadCollectedBytes();
+    const bool precollected = mode != "off" && mode != "no-epoch";
+    Require(collectedPrepared - collectedBefore == (precollected ? bytes : 0), "dispatch stage A collected the wrong heap extent or ignored the switch");
+    const auto prepared = MirrorCounters();
+    Require(prepared.blocksCopied == before.blocksCopied && prepared.heapChecks == before.heapChecks, "dispatch stage A changed a mirror");
+    if (mode == "epoch") {
+        guest[9] = std::byte{0x37};
+        Memory::BumpCollectEpoch();
+    } else if (mode == "driver-write") {
+        std::lock_guard gpu(Memory::GpuMutex());
+        const std::array<std::byte, 1> value{std::byte{0x48}};
+        Memory::StoreOwnBytes(address + 9, value);
+    } else if (mode == "unwatch") {
+        Memory::Unwatch(address, bytes);
+        guest[9] = std::byte{0x59};
+    }
+    const auto collectedLocked = Memory::ThreadCollectedBytes();
+    build();
+    const auto after = MirrorCounters();
+    if (mode == "unchanged") Require(after.blocksCopied == before.blocksCopied && after.heapChecks == before.heapChecks, "an unchanged run was compared or copied again");
+    else Require(after.blocksCopied > before.blocksCopied, "CPU writes were not uploaded before the dispatch read");
+    if (precollected && mode != "epoch" && mode != "unwatch") Require(Memory::ThreadCollectedBytes() == collectedLocked, "stage B walked a precollected heap run again");
+    if (!precollected || mode == "epoch") Require(Memory::ThreadCollectedBytes() - collectedLocked == bytes, "the fallback did not collect the heap run under the GPU mutex");
+    registry(false);
+    ClearImageMirrors(context.device);
+    ClearSnapshotCopies(context.device);
+#ifdef _WIN32
+    GuestArena::GuestArenaReset_nid_postfix(guest, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(guest, bytes);
+#else
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(guest, bytes);
+    munmap(mapping, bytes + block);
+#endif
+    std::cout << "dispatch heap refresh " << mode << " passed\n";
+    return true;
+}
+
 void RunHeapMirrorUnwatchTests(const Context& context, const BdaTestAccess& access, bool throughImport) {
     constexpr std::size_t block = 65536;
     constexpr std::size_t heapBytes = 32 * block;

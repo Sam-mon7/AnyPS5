@@ -1611,7 +1611,10 @@ ShaderResources::ShaderResources(const Context& context, const CompiledShader& c
     // device-lock work, so their whole build waits for Complete(). Without tables the call only
     // checks the bindings.
     lockedBuild = UsesAddressTables(compute);
-    if (lockedBuild) return;
+    if (lockedBuild) {
+        PrecollectAddressMirrors(context);
+        return;
+    }
     unlockedPrepare = true;
     prepareAddressBindings(shaders, snapshots);
     buildPrepare(shaders, nullptr, 0, 0, 0);
@@ -5312,6 +5315,9 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
         return surfaces;
     }
     // Stage A has not run (an address-based build, or the pass is off): decoded from the shader.
+    if (lockedBuild) {
+        for (const auto& [address, bytes] : AddressMirrorSurfaces(context)) surfaces.push_back({address, bytes, false});
+    }
     if (deferredCompute.program == nullptr) return surfaces;
     forEachImageElement(*deferredCompute.program, [&](const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t, std::span<const std::uint32_t> words) {
         if (IsNullTextureResource(words)) return;
