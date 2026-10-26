@@ -24,7 +24,10 @@ struct WrittenBuffer {
     bool atomic;
     std::shared_ptr<const std::vector<std::byte>> value;
     std::uint64_t generation = 0;
+    bool fill = false;
 };
+
+inline std::atomic<std::uint64_t> fillKnownEntries{0}, fillKnownReads{0}, fillKnownInvalidated{0};
 
 struct DwordEvidence {
     std::uint32_t streak = 0;

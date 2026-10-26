@@ -25,6 +25,10 @@ namespace AgcDriver {
 namespace {
 
 struct CaptureProfile {
+    struct Reads {
+        std::atomic<std::uint64_t> fetched{0}, sync{0}, known{0}, raw{0}, waits{0}, waitNanoseconds{0};
+    };
+    std::array<std::array<Reads, 4>, 3> purposes;
     std::atomic<std::uint64_t> captures{0};
     std::atomic<std::uint64_t> reads{0};
     std::atomic<std::uint64_t> pages{0};
@@ -77,6 +81,11 @@ bool WordwisePages() {
 bool CaptureProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
+}
+
+std::size_t ProfileQueue() {
+    const auto packet = GuestMemory::CurrentPacket();
+    return packet.queue == 0 ? packet.opcode == 0x16 ? 0 : 1 : 2;
 }
 
 template<typename TSnapshots>
@@ -264,9 +273,19 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
             return page;
         }
         const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto waitedBefore = CaptureProfiled() ? WaitedMs() : 0.0;
         GuestMemory::GuardRead(base, PageBytes);
         GuestMemory::FlushGpuWrites(base, PageBytes);
-        if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
+        if (CaptureProfiled()) {
+            CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
+            auto& counts = CaptureTotals().purposes[ProfileQueue()][3];
+            ++counts.fetched;
+            const auto waited = WaitedMs() - waitedBefore;
+            if (waited > 0) {
+                ++counts.waits;
+                counts.waitNanoseconds += static_cast<std::uint64_t>(waited * 1e6);
+            }
+        }
         page.lazy = true;
     }
     return page;
@@ -313,6 +332,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             else ++CaptureTotals().observationsSkipped;
         };
         const auto fetchStarted = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto waitedBefore = CaptureProfiled() ? WaitedMs() : 0.0;
         if (policy == PendingWrite::KnownValue || policy == PendingWrite::VerifyKnownValue) {
             // The query stored the known dword in `word`.
             ++CaptureTotals().wordsKnown;
@@ -355,7 +375,19 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             }
             if (observed) report(waitsBefore, before == word);
         }
-        if (CaptureProfiled()) CaptureTotals().wordReadNanoseconds += NanosecondsSince(fetchStarted);
+        if (CaptureProfiled()) {
+            CaptureTotals().wordReadNanoseconds += NanosecondsSince(fetchStarted);
+            auto& counts = CaptureTotals().purposes[ProfileQueue()][self.readPurpose];
+            ++counts.fetched;
+            if (policy == PendingWrite::KnownValue || policy == PendingWrite::VerifyKnownValue) ++counts.known;
+            else if (policy == PendingWrite::Raw || policy == PendingWrite::VerifyRaw) ++counts.raw;
+            else if (policy == PendingWrite::Sync) ++counts.sync;
+            const auto waited = WaitedMs() - waitedBefore;
+            if (waited > 0) {
+                ++counts.waits;
+                counts.waitNanoseconds += static_cast<std::uint64_t>(waited * 1e6);
+            }
+        }
         page.words[index] = word;
         page.valid.Set(index);
     }
@@ -365,11 +397,32 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     return true;
 }
 
+bool ShaderMemory::readSpecialization(void* context, std::uint64_t address, std::uint32_t* value) {
+    if (!CaptureProfiled()) return read(context, address, value);
+    auto& self = *static_cast<ShaderMemory*>(context);
+    struct Scope {
+        std::size_t& purpose;
+        std::size_t previous;
+        ~Scope() { purpose = previous; }
+    } scope{self.readPurpose, std::exchange(self.readPurpose, 2)};
+    return read(context, address, value);
+}
+
 bool ShaderMemory::overlapsInitial(std::uint64_t begin, std::uint64_t end) const {
     if (initial.empty()) return false;
     const auto after = std::lower_bound(initial.begin(), initial.end(), begin, [](const auto& entry, std::uint64_t value) { return entry.first < value; });
     if (after != initial.end() && after->first < end) return true;
     return after != initial.begin() && std::prev(after)->first + std::prev(after)->second.size() > begin;
+}
+
+bool ShaderMemory::readTableWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
+    auto& self = *static_cast<ShaderMemory*>(context);
+    struct Scope {
+        std::size_t& purpose;
+        std::size_t previous;
+        ~Scope() { purpose = previous; }
+    } scope{self.readPurpose, std::exchange(self.readPurpose, 1)};
+    return readWords(context, address, values, count);
 }
 
 bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
@@ -637,10 +690,10 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.shaderBase = request.shader.codeAddress;
     runtime.userContext = this;
     runtime.readMemory = &read;
-    runtime.readSpecializationMemory = &read;
+    runtime.readSpecializationMemory = profile ? &readSpecialization : &read;
     runtime.accessible = &accessible;
     runtime.pendingWrite = &pending;
-    runtime.readWords = &readWords;
+    runtime.readWords = profile ? &readTableWords : &readWords;
     runtime.stampWrites = &stampWrites;
     runtime.unchangedSince = &unchangedSince;
     runtime.supplyWords = &supplyWords;
@@ -656,6 +709,14 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
         const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         auto due = nextReport.load(std::memory_order_relaxed);
         if (now >= due && nextReport.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count(), std::memory_order_relaxed)) {
+            static constexpr std::array<const char*, 4> purposes{"srt-word", "image-table-bulk", "specialization", "page-probe"};
+            static constexpr std::array<const char*, 3> queues{"queue-0-indirect", "queue-0-other", "other-queues"};
+            for (std::size_t queue = 0; queue < queues.size(); ++queue) {
+                for (std::size_t purpose = 0; purpose < purposes.size(); ++purpose) {
+                    const auto& reads = totals.purposes[queue][purpose];
+                    AgcDriver::ProfilePrint_nid_no_patch("[capture-read] %s %s (cumulative): %llu fetched, %llu sync, %llu known, %llu raw, %llu GPU waits %.3f ms\n", queues[queue], purposes[purpose], static_cast<unsigned long long>(reads.fetched.load()), static_cast<unsigned long long>(reads.sync.load()), static_cast<unsigned long long>(reads.known.load()), static_cast<unsigned long long>(reads.raw.load()), static_cast<unsigned long long>(reads.waits.load()), reads.waitNanoseconds.load() / 1e6);
+                }
+            }
             const auto captures = static_cast<double>(totals.captures.load());
             const auto captureNs = totals.captureNanoseconds.load();
             const auto resolveNs = totals.resolveNanoseconds.load();
