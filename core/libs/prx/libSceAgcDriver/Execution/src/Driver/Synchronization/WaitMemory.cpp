@@ -105,7 +105,7 @@ void Driver::landPendingWaits(std::uint32_t queue) {
     }
 }
 
-void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
+void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory, bool epochCovered) {
 
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();
@@ -130,11 +130,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool warned = false;
 
     struct EpochPoint {
-        bool bump = true;
+        bool bump;
         ~EpochPoint() {
             if (bump) bumpEpoch(&EpochBumps::waits);
         }
-    } epochPoint;
+    } epochPoint{!heldAtSubmit || requireMemory || !epochCovered};
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;

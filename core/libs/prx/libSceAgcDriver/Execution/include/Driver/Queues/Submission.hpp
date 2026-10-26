@@ -37,6 +37,7 @@ struct Submission {
     std::uint64_t received = 0;
     std::vector<std::uint64_t> labelWrites;
     std::set<std::size_t> heldAtSubmit;
+    std::chrono::steady_clock::time_point heldAtSubmitAt{};
     std::chrono::steady_clock::time_point receivedAt{};
     std::chrono::steady_clock::time_point copiedAt{};
     std::chrono::steady_clock::time_point validatedAt{};

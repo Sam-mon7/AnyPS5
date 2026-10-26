@@ -37,6 +37,13 @@ void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
     ++(epochBumps().*counter);
 }
 
+bool Driver::skipHeldWaitEpoch(const Submission& submission, std::size_t cursor) {
+    static const bool enabled = std::getenv("APS5_NO_HELD_WAIT_EPOCH") == nullptr;
+    if (!enabled || !submission.heldAtSubmit.contains(cursor) || submission.heldAtSubmitAt == std::chrono::steady_clock::time_point{} || submission.heldAtSubmitAt >= lastEpochBump()) return false;
+    ++waitOutcomes().heldEpochsSkipped;
+    return true;
+}
+
 bool Driver::packetEpoch() {
     static const bool packet = std::getenv("APS5_PACKET_EPOCH") != nullptr;
     return packet;

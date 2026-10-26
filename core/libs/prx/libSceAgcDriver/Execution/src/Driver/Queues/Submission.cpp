@@ -316,6 +316,7 @@ void Driver::reserveOutputs(Submission& submission) {
         }
         cursor += Pm4::PacketWords(words[0]);
     }
+    if (!submission.heldAtSubmit.empty()) submission.heldAtSubmitAt = std::chrono::steady_clock::now();
     for (const auto token : eopTokens) eopFlips.erase(token);
 }
 

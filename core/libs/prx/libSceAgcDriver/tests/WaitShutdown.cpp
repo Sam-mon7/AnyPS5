@@ -2,15 +2,59 @@
 #include "prx/libSceAgcDriver/Submit/include/CommandBuffer.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <mutex>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+namespace AgcDriver::DriverDetail {
+
+struct DriverTestAccess {
+    static Submission CaptureWait(std::span<const std::uint32_t> packet) {
+        Submission submission{};
+        submission.commands.assign(packet.begin(), packet.end());
+        auto& driver = Driver::Get();
+        std::lock_guard lock(driver.mutex);
+        driver.reserveOutputs(submission);
+        submission.received = ++driver.eventSerial;
+        return submission;
+    }
+
+    static void Bump() {
+        Driver::bumpEpoch(&EpochBumps::submissions);
+    }
+
+    static void Wait(const Submission& submission) {
+        Driver::Get().waitMemory(submission.commands, submission.queue, PacketHistory{}, submission.received, submission.heldAtSubmit.contains(0), false, Driver::skipHeldWaitEpoch(submission, 0));
+    }
+
+    static void RecordLabel(std::uint64_t address, std::uint32_t value, std::uint32_t queue) {
+        auto& driver = Driver::Get();
+        driver.noteLabelStore(address, std::as_bytes(std::span(&value, 1)), ++driver.eventSerial, queue);
+    }
+};
+
+}
 
 namespace {
 
@@ -23,6 +67,102 @@ struct alignas(64) LabelState {
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+bool CheckWaitEpochs() {
+    using namespace AgcDriver::GuestMemory;
+    using Access = AgcDriver::DriverDetail::DriverTestAccess;
+    if (!WriteWatched()) return false;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 2 * block;
+#ifdef _WIN32
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, block));
+    GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+#else
+    auto* memory = static_cast<std::uint8_t*>(mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    Require(memory != MAP_FAILED, "cannot allocate the wait-epoch fixture");
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory, bytes);
+#endif
+    struct Release {
+        std::uint8_t* memory;
+        ~Release() {
+#ifdef _WIN32
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+#else
+            GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
+            munmap(memory, bytes);
+#endif
+        }
+    } release{memory};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto address = base + block;
+    auto* label = reinterpret_cast<volatile std::uint32_t*>(address);
+    const std::array<std::uint32_t, 7> packet{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 1, 0xffffffffu, 0x19u};
+    Require(Watched(base, bytes), "the wait-epoch fixture is not watched");
+    memory[0] = 1;
+    *label = 0;
+    auto submission = Access::CaptureWait(packet);
+    Require(submission.heldAtSubmit.empty(), "an unsatisfied wait was captured as satisfied");
+    Access::Bump();
+    auto generation = CollectWrites(base, 4096);
+    Require(generation != 0, "the wait-epoch fixture could not be collected");
+    auto epoch = CollectEpoch();
+    Access::RecordLabel(address, 1, 0x20);
+    memory[0] = 2;
+    *label = 1;
+    Access::Wait(submission);
+    Require(CollectEpoch() != epoch, "a CPU-signalled wait reused its collect epoch despite a GPU label history");
+    CollectWrites(base, 4096);
+    Require(!UnchangedSince(base, 4096, generation), "a CPU write before a CPU-signalled label was missed");
+
+    *label = 0;
+    submission = Access::CaptureWait(packet);
+    Access::Bump();
+    generation = CollectWrites(base, 4096);
+    epoch = CollectEpoch();
+    memory[0] = 3;
+    std::thread producer([&] {
+        Access::Bump();
+        Access::RecordLabel(address, 1, 0x20);
+    });
+    producer.join();
+    Access::Wait(submission);
+    Require(CollectEpoch() != epoch, "another queue's recorded label reused the consumer's collect epoch");
+    CollectWrites(base, 4096);
+    Require(!UnchangedSince(base, 4096, generation), "a producer's epoch bump hid a CPU write from the consumer");
+
+    Access::Bump();
+    generation = CollectWrites(base, 4096);
+    epoch = CollectEpoch();
+    memory[0] = 4;
+    *label = 1;
+    submission = Access::CaptureWait(packet);
+    Require(submission.heldAtSubmit.contains(0), "a satisfied wait was not captured");
+    Access::Wait(submission);
+    Require(CollectEpoch() != epoch, "a held wait observed after the epoch bump reused that epoch");
+    CollectWrites(base, 4096);
+    Require(!UnchangedSince(base, 4096, generation), "a CPU write before a newly captured held label was missed");
+
+    generation = CollectWrites(base, 4096);
+    memory[0] = 5;
+    *label = 1;
+    submission = Access::CaptureWait(packet);
+    while (std::chrono::steady_clock::now() <= submission.heldAtSubmitAt) std::this_thread::yield();
+    Access::Bump();
+    const auto capturedGeneration = CollectWrites(base, 4096);
+    Require(!UnchangedSince(base, 4096, generation), "the epoch covering a captured CPU signal missed its preceding write");
+    generation = capturedGeneration;
+    const bool disabled = std::getenv("APS5_NO_HELD_WAIT_EPOCH") != nullptr;
+    for (const auto value : {1u, 0u}) {
+        *label = value;
+        epoch = CollectEpoch();
+        Access::Wait(submission);
+        Require((CollectEpoch() != epoch) == disabled, "a covered held wait did not obey APS5_NO_HELD_WAIT_EPOCH");
+        CollectWrites(base, 4096);
+        Require(UnchangedSince(base, 4096, generation), "a label store changed the separate data block");
+    }
+    return true;
 }
 
 void DelayExit() {
@@ -133,6 +273,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--wait-epochs") == 0) {
+            const bool watched = CheckWaitEpochs();
+            LibcRunShutdown_nid_postfix();
+            std::puts(watched ? "wait epoch tests passed" : "no write watching: skipped");
+            return watched ? 0 : 77;
+        }
         CheckCommandBufferSubmission();
         CheckShutdownCancellation();
         std::puts("unsatisfied label waits cancelled cleanly at shutdown");
