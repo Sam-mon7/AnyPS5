@@ -360,7 +360,7 @@ std::shared_ptr<ShaderResources> ImageResources(const Context& context, const Bl
     binding.binding = (sampled ? ShaderRecompiler::RuntimeAbi::FirstImageBinding : ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding) + PlaceholderDimensionsPerClass + 2u;
     binding.count = count;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageWritten.assign(count, false);
+    { auto flags = binding.Flags(); flags.imageWritten.assign(count, false); binding.SetFlags(std::move(flags)); }
     binding.imageSamplers.assign(count, 0u);
     for (std::uint32_t element = 0; element < count; ++element) {
         const auto words = Descriptor(block.Surface(first + element));
@@ -542,7 +542,7 @@ ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address) {
     binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + PlaceholderDimensionsPerClass + 2u;
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageWritten.assign(1, false);
+    { auto flags = binding.Flags(); flags.imageWritten.assign(1, false); binding.SetFlags(std::move(flags)); }
     binding.imageSamplers.assign(1, 0u);
     const auto words = Descriptor(address);
     binding.guestDescriptor.assign(words.begin(), words.end());

@@ -3170,7 +3170,7 @@ void verifyImageTables() {
     const auto& result = *compiled.result;
     const auto* images = TableBinding(result, DescriptorRole::ImageTable);
     require(images != nullptr && images->kind == DescriptorKind::SampledImage && images->count == 2u && images->guestDescriptor.size() == 16u && images->imageShapes.size() == 2u, "image tables: the image table binding is wrong");
-    require(std::none_of(images->imageWritten.begin(), images->imageWritten.end(), [](bool written) { return written; }), "image tables: a table element is marked written");
+    require(std::none_of(images->Flags().imageWritten.begin(), images->Flags().imageWritten.end(), [](bool written) { return written; }), "image tables: a table element is marked written");
     require(TableBinding(result, DescriptorRole::FaultBuffer) != nullptr && TableBinding(result, DescriptorRole::GuestImages) == nullptr, "image tables: the bindings lack the fault buffer or hold table slots");
     const auto& map = TableMap(result);
     require(map[Abi::HeaderVersion] == Abi::Version && map[Abi::HeaderTableCount] == 1u && map[Abi::HeaderElementCount] == 2u && map[Abi::HeaderSamplerCount] == 0u, "image tables: the map header is wrong");
@@ -3597,7 +3597,7 @@ void verifyImageTableRegistration() {
     const auto& storeMap = TableMap(*store.result);
     const auto storeFault = storeMap[Abi::TableHeader(0) + Abi::TableFault];
     const auto* storeTable = TableBinding(*store.result, DescriptorRole::ImageStorageTable);
-    require((storeFault & Abi::PoisonFlag) == 0u && storeTable != nullptr && storeTable->count != 0u && std::all_of(storeTable->imageWritten.begin(), storeTable->imageWritten.end(), [](bool written) { return written; }), "image table registration: the store's table was not bound as written storage elements");
+    require((storeFault & Abi::PoisonFlag) == 0u && storeTable != nullptr && storeTable->count != 0u && std::all_of(storeTable->Flags().imageWritten.begin(), storeTable->Flags().imageWritten.end(), [](bool written) { return written; }), "image table registration: the store's table was not bound as written storage elements");
     require(TableBinding(*store.result, DescriptorRole::ImageTable) == nullptr || TableBinding(*store.result, DescriptorRole::ImageTable)->count == 0u, "image table registration: a store-only table bound sampled elements");
     auto atomicCode = storeCode;
     atomicCode[8] = 0xf0440108u;
@@ -6781,7 +6781,7 @@ void verifySpecializedBufferAtomicBindings(bool finalAbiOnly = false) {
     for (const auto& binding : result.bindings) {
         if (binding.role == DescriptorRole::BdaPagetable) ++tables;
         if (binding.role == DescriptorRole::FaultBuffer) ++faults;
-        atomicElements += static_cast<std::size_t>(std::count(binding.bufferAtomic.begin(), binding.bufferAtomic.end(), true));
+        atomicElements += static_cast<std::size_t>(std::count(binding.Flags().bufferAtomic.begin(), binding.Flags().bufferAtomic.end(), true));
     }
     require(tables == 0, "specialized buffer atomic: a buffer_atomic_inc through a V# the program specializes binds the address tables");
     require(faults == 1 && result.bdaAbiVersion == BdaAbi::Version, "specialized buffer atomic: the program has no fault buffer for its unaligned atomic");
@@ -6992,7 +6992,7 @@ void verifyUnnormalizedSamplers() {
     };
     const auto flags = [](const RecompileResult& result, DescriptorRole role) {
         for (const auto& binding : result.bindings) {
-            if (binding.role == role) return role == DescriptorRole::GuestSamplers ? binding.samplerUnnormalized : binding.imageUnnormalized;
+            if (binding.role == role) return role == DescriptorRole::GuestSamplers ? binding.Flags().samplerUnnormalized : binding.Flags().imageUnnormalized;
         }
         throw std::runtime_error("unnormalized samplers: the program has no sampler or image binding");
     };
@@ -7217,10 +7217,10 @@ void verifyNullVolumeUnnormalizedSampler() {
         return allocation.bindings.back();
     };
     const auto nullOnly = populate({volume}, {nullDescriptor});
-    require(nullOnly.samplerUnnormalized == std::vector<bool>{false} && nullOnly.samplerCoordinatesIgnored == std::vector<bool>{true}, "unnormalized samplers: an S# paired only with a null 3D T# was refused or kept its unnormalized coordinates");
+    require(nullOnly.Flags().samplerUnnormalized == std::vector<bool>{false} && nullOnly.Flags().samplerCoordinatesIgnored == std::vector<bool>{true}, "unnormalized samplers: an S# paired only with a null 3D T# was refused or kept its unnormalized coordinates");
     const DescriptorValue zeroSwizzle{{0x00003000u, 0x00100000u, 0u, 0xa0000000u, 0u, 0u, 0u, 0u}, 8u};
     const auto constantAndNull = populate({volume, volume}, {zeroSwizzle, nullDescriptor});
-    require(constantAndNull.samplerUnnormalized == std::vector<bool>{false} && constantAndNull.samplerCoordinatesIgnored == std::vector<bool>{true}, "unnormalized samplers: an S# paired with a null 3D T# and a 3D T# whose channels all select constants was refused or kept its unnormalized coordinates");
+    require(constantAndNull.Flags().samplerUnnormalized == std::vector<bool>{false} && constantAndNull.Flags().samplerCoordinatesIgnored == std::vector<bool>{true}, "unnormalized samplers: an S# paired with a null 3D T# and a 3D T# whose channels all select constants was refused or kept its unnormalized coordinates");
     expectFailure([&] { static_cast<void>(populate({volume}, {volumeDescriptor})); }, "samples a 1D-array, 2D-array, 3D, cube or multisampled image", "unnormalized samplers: a 3D T# was accepted");
     expectFailure([&] { static_cast<void>(populate({volume, plane}, {nullDescriptor, planeDescriptor})); }, "samples a 1D-array, 2D-array, 3D, cube or multisampled image", "unnormalized samplers: an S# shared by a null 3D T# and a 2D T# was accepted");
 }
@@ -7258,13 +7258,13 @@ void verifyUnusedUnnormalizedSampler() {
     const auto tableModes = ResourceMaterializer::RuntimeImageModes(tableImage);
     require(std::none_of(tableModes.begin(), tableModes.end(), [](const auto& mode) { return mode.constantSwizzle; }), "constant image selectors: a table gained a direct-only constant mode");
     const auto bindings = populate(info);
-    require(bindings.size() == 2u && bindings[0].imageUnnormalized == std::vector<bool>{true} && bindings[1].samplerUnnormalized == std::vector<bool>{true}, "unnormalized samplers: an S# without live uses was not flagged");
+    require(bindings.size() == 2u && bindings[0].Flags().imageUnnormalized == std::vector<bool>{true} && bindings[1].Flags().samplerUnnormalized == std::vector<bool>{true}, "unnormalized samplers: an S# without live uses was not flagged");
     auto selected = info;
     selected.images[0].table = 0u;
     expectFailure([&] { static_cast<void>(populate(selected)); }, "unnormalized guest sampler samples an image selected at run time, which is not implemented", "unnormalized samplers: an image table root was accepted");
     snapshot.images[0].dwords[3] = 0xa0000041u;
     const auto constant = populate(info);
-    require(constant.size() == 1u && constant[0].samplerUnnormalized == std::vector<bool>{true}, "unnormalized samplers: a 3D view whose channels select constants was bound or refused");
+    require(constant.size() == 1u && constant[0].Flags().samplerUnnormalized == std::vector<bool>{true}, "unnormalized samplers: a 3D view whose channels select constants was bound or refused");
     expectFailure([&] { static_cast<void>(populate(selected)); }, "unnormalized guest sampler samples an image selected at run time, which is not implemented", "unnormalized samplers: an image table root whose channels select constants was accepted");
     snapshot.images[0].dwords[3] = 0x90000facu;
     auto compared = info;
@@ -7273,7 +7273,7 @@ void verifyUnusedUnnormalizedSampler() {
     auto offset = info;
     offset.samplers[0].uses = SamplerUseExplicitLod | SamplerUseOffset;
     const auto folded = populate(offset);
-    require(folded[0].imageUnnormalized == std::vector<bool>{true} && folded[1].samplerUnnormalized == std::vector<bool>{true}, "unnormalized samplers: an offset use was not flagged");
+    require(folded[0].Flags().imageUnnormalized == std::vector<bool>{true} && folded[1].Flags().samplerUnnormalized == std::vector<bool>{true}, "unnormalized samplers: an offset use was not flagged");
     auto gathered = offset;
     gathered.samplers[0].uses |= SamplerUseGather;
     expectFailure([&] { static_cast<void>(populate(gathered)); }, "unnormalized guest sampler is used by a gather, which is not implemented", "unnormalized samplers: an offset gather was accepted");
@@ -7285,11 +7285,11 @@ void verifyUnusedUnnormalizedSampler() {
     foldVolume.images[0].foldTexelOffsetsOnly = true;
     snapshot.images[0].dwords[3] = 0xa0000041u;
     const auto foldedConstant = populate(foldVolume);
-    require(foldedConstant.size() == 1u && foldedConstant[0].samplerUnnormalized == std::vector<bool>{true}, "unnormalized texel offsets: a 3D view whose channels select constants was bound or refused");
+    require(foldedConstant.size() == 1u && foldedConstant[0].Flags().samplerUnnormalized == std::vector<bool>{true}, "unnormalized texel offsets: a 3D view whose channels select constants was bound or refused");
     snapshot.images[0].dwords[3] = 0xa0000facu;
     expectFailure([&] { static_cast<void>(populate(foldVolume)); }, "takes only images an unnormalized S# can sample", "unnormalized texel offsets: an ordinary 3D view matched a constant-only mode");
     snapshot.images[0].dwords[3] = 0x90000facu;
-    const auto atBaseLevel = [&](const ShaderInfo& shader) { return populate(shader)[0].imageUnnormalizedBaseLevel; };
+    const auto atBaseLevel = [&](const ShaderInfo& shader) { return populate(shader)[0].Flags().imageUnnormalizedBaseLevel; };
     auto levelZero = info;
     levelZero.samplers[0].uses = SamplerUseExplicitLod;
     require(atBaseLevel(levelZero) == std::vector<bool>{true}, "unnormalized samplers: an image read only by image_sample_lz was not flagged as exact at its base level");
@@ -7316,7 +7316,7 @@ void verifyUnusedUnnormalizedSampler() {
     snapshot.samplers[0].dwords[2] = 0x05500000u;
     snapshot.samplers[0].dwords[0] = 0x00000092u;
     const auto normalized = populate(info);
-    require(normalized[0].imageUnnormalized == std::vector<bool>{false} && normalized[1].samplerUnnormalized == std::vector<bool>{false}, "unnormalized samplers: a normalized S# was flagged");
+    require(normalized[0].Flags().imageUnnormalized == std::vector<bool>{false} && normalized[1].Flags().samplerUnnormalized == std::vector<bool>{false}, "unnormalized samplers: a normalized S# was flagged");
     static_cast<void>(populate(offset));
     expectFailure([&] { static_cast<void>(populate(foldOnly)); }, "normalized guest sampler is used with a texel offset that is not a constant", "unnormalized samplers: a normalized S# was accepted for an offset that only folds");
     ImageResource msaaArrayImage{};

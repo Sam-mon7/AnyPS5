@@ -445,6 +445,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if ((imageHeap || samplerHeap) && compact.resources.empty()) continue;
         PreparedDescriptorBinding entry{};
         auto& physical = entry.descriptor;
+        DescriptorFlags flags;
         physical.descriptorSet = fragmentDescriptorSet && stage == IrShaderStage::Pixel ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet;
         physical.binding = NativeBinding(stage, compact.kind);
         physical.count = compact.resources.empty() ? 1u : static_cast<std::uint32_t>(compact.resources.size());
@@ -453,9 +454,9 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (physical.role == DescriptorRole::GuestBuffers) {
             for (const auto resource : compact.resources) {
                 const auto& buffer = info.buffers.at(resource);
-                physical.bufferAtomic.push_back(buffer.atomic);
-                physical.bufferWritten.push_back(buffer.written || buffer.atomic);
-                physical.bufferRead.push_back(buffer.read);
+                flags.bufferAtomic.push_back(buffer.atomic);
+                flags.bufferWritten.push_back(buffer.written || buffer.atomic);
+                flags.bufferRead.push_back(buffer.read);
                 physical.bufferExtent.push_back(buffer.maxByteExtent);
                 if (buffer.written || buffer.atomic) ++entry.writtenBuffers;
                 else ++entry.readOnlyBuffers;
@@ -470,24 +471,24 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 const auto& image = info.images.at(resource);
                 const auto& mode = info.runtimeImageModes.at(resource).at(imageModes[resource]);
                 entry.identityImageSwizzle.push_back(mode.conversionFormat != IrBufferFormat::Invalid || mode.depthBits);
-                physical.imageWritten.push_back(image.written || image.atomic);
-                physical.imageDepthCompare.push_back(mode.depthCompare);
-                physical.imageAtomic.push_back(image.atomic);
-                physical.imageUnnormalized.push_back(unnormalized.images.at(resource));
-                physical.imageUnnormalizedBaseLevel.push_back(unnormalized.imagesAtBaseLevel.at(resource));
+                flags.imageWritten.push_back(image.written || image.atomic);
+                flags.imageDepthCompare.push_back(mode.depthCompare);
+                flags.imageAtomic.push_back(image.atomic);
+                flags.imageUnnormalized.push_back(unnormalized.images.at(resource));
+                flags.imageUnnormalizedBaseLevel.push_back(unnormalized.imagesAtBaseLevel.at(resource));
                 physical.imageSamplers.push_back(0u);
-                physical.imageAtomic64.push_back(image.atomic64);
+                flags.imageAtomic64.push_back(image.atomic64);
             }
         } else if (physical.role == DescriptorRole::GuestSamplers) {
             for (std::uint32_t element = 0; element < compact.resources.size(); ++element) {
                 const auto resource = compact.resources[element];
                 bool compare = false;
                 for (const auto& pair : info.sampledPairs) if (pair.sampler == resource) compare |= info.images.at(pair.image).depthCompare && compareStates.at(pair.image) == 0u;
-                physical.samplerDepthCompare.push_back(compare);
-                physical.samplerUnnormalized.push_back(unnormalized.samplers.at(resource));
-                physical.samplerCoordinatesIgnored.push_back(unnormalized.samplersIgnoreCoordinates.at(resource));
+                flags.samplerDepthCompare.push_back(compare);
+                flags.samplerUnnormalized.push_back(unnormalized.samplers.at(resource));
+                flags.samplerCoordinatesIgnored.push_back(unnormalized.samplersIgnoreCoordinates.at(resource));
                 const auto mode = 1u << (originals[element] & 1u);
-                physical.samplerIntegerBorder.push_back((samplerIntegerModes.at(resource) & mode) != 0u && (samplerFloatModes.at(resource) & mode) == 0u);
+                flags.samplerIntegerBorder.push_back((samplerIntegerModes.at(resource) & mode) != 0u && (samplerFloatModes.at(resource) & mode) == 0u);
                 const auto& words = snapshot.samplers.at(resource).dwords;
                 const bool tablePointOnly = (directSamplerModes.at(resource) & 2u) == 0u;
                 if ((originals[element] & 1u) != 0u && !inactive[element] && !(tablePointOnly && ReducesBetweenTexels(words[0], words[2]))) entry.samplerFilterElements.push_back(element);
@@ -495,6 +496,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         } else if (physical.role == DescriptorRole::ShaderData && layout.UsesPushData()) {
             fail("DescriptorBindingBuilder::Populate shader-data binding must not exist when push data is used");
         }
+        physical.SetFlags(std::move(flags));
         plan.storageData |= physical.role == DescriptorRole::ShaderData;
         entry.resources = std::move(compact.resources);
         if (registrationModules && (imageHeap || samplerHeap)) entry.inactive = std::move(inactive);
@@ -604,7 +606,8 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             }
             break;
         case DescriptorRole::ImageTable:
-        case DescriptorRole::ImageStorageTable:
+        case DescriptorRole::ImageStorageTable: {
+            auto flags = physical.Flags();
             if (tables == nullptr) fail("DescriptorBindingBuilder::Populate image table elements were not resolved");
             physical.guestDescriptor.reserve(tables->elements.size() * 8u);
             for (const auto& element : tables->elements) {
@@ -612,10 +615,10 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
                 ImageResource shape;
                 shape.dimension = element.dimension;
                 physical.imageShapes.push_back(ImageShapeForResource(shape));
-                physical.imageDepthCompare.push_back(element.depthCompare);
-                physical.imageWritten.push_back(ImageBindingResourceClass(element.kind) == ImageResourceClass::Storage);
-                physical.imageAtomic.push_back(element.atomic);
-                physical.imageAtomic64.push_back(element.atomic64);
+                flags.imageDepthCompare.push_back(element.depthCompare);
+                flags.imageWritten.push_back(ImageBindingResourceClass(element.kind) == ImageResourceClass::Storage);
+                flags.imageAtomic.push_back(element.atomic);
+                flags.imageAtomic64.push_back(element.atomic64);
                 std::uint32_t samplers = 0;
                 for (std::uint32_t sampler = 0; sampler < entry.tableSamplerMasks.size(); ++sampler) {
                     if ((element.samplers & (1u << sampler)) != 0u) samplers |= entry.tableSamplerMasks[sampler];
@@ -623,18 +626,23 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
                 physical.imageSamplers.push_back(samplers);
             }
             physical.count = static_cast<std::uint32_t>(tables->elements.size());
+            physical.SetFlags(std::move(flags));
             break;
-        case DescriptorRole::SamplerTable:
+        }
+        case DescriptorRole::SamplerTable: {
+            auto flags = physical.Flags();
             if (tables == nullptr) fail("DescriptorBindingBuilder::Populate sampler table elements were not resolved");
             physical.guestDescriptor.reserve(tables->samplers.size() * 4u);
             for (const auto& element : tables->samplers) {
                 const auto first = physical.guestDescriptor.size();
                 physical.guestDescriptor.insert(physical.guestDescriptor.end(), element.words.begin(), element.words.end());
                 if (element.point) physical.guestDescriptor[first + 2u] = PointFilteredSamplerWord(physical.guestDescriptor[first], physical.guestDescriptor[first + 2u]);
-                physical.samplerDepthCompare.push_back(element.compare);
+                flags.samplerDepthCompare.push_back(element.compare);
             }
             physical.count = static_cast<std::uint32_t>(tables->samplers.size());
+            physical.SetFlags(std::move(flags));
             break;
+        }
         case DescriptorRole::ImageTableMap:
             if (tables == nullptr || tables->map.empty()) fail("DescriptorBindingBuilder::Populate image table map was not resolved");
             physical.guestDescriptor = tables->map;

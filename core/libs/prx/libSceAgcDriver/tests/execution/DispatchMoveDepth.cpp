@@ -313,8 +313,8 @@ void Totals(const std::string& what) {
 void DescribeBindings(const ShaderRecompiler::RecompileResult& program) {
     for (const auto& binding : program.bindings) {
         std::string written;
-        for (const bool bit : binding.bufferWritten) written += bit ? '1' : '0';
-        std::printf("dispatch move depth: binding role %d kind %d count %u, %zu descriptor words, buffers written [%s], images written %zu\n", static_cast<int>(binding.role), static_cast<int>(binding.kind), binding.count, binding.guestDescriptor.size(), written.c_str(), binding.imageWritten.size());
+        for (const bool bit : binding.Flags().bufferWritten) written += bit ? '1' : '0';
+        std::printf("dispatch move depth: binding role %d kind %d count %u, %zu descriptor words, buffers written [%s], images written %zu\n", static_cast<int>(binding.role), static_cast<int>(binding.kind), binding.count, binding.guestDescriptor.size(), written.c_str(), binding.Flags().imageWritten.size());
     }
 }
 

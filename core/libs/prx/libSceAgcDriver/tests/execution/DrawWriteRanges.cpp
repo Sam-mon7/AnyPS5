@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -42,10 +44,106 @@ std::array<std::uint32_t, 8> ImageWords(std::uint64_t base, std::uint32_t width,
     return words;
 }
 
+void ConservativeWrites() {
+    using namespace AgcDriver::DriverDetail;
+    using Role = ShaderRecompiler::DescriptorRole;
+    constexpr std::uint64_t base = 0x100000000ull;
+    ShaderRecompiler::RecompileResult program;
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Fragment, &program, 0}}};
+    const auto unknown = [&](const char* what) {
+        bool bounded = true;
+        static_cast<void>(DispatchWriteRanges(program, bounded));
+        Require(!bounded, std::string(what) + " was reported as a bounded dispatch");
+        for (const bool exact : {false, true}) Require(Contains(DrawWriteRanges({}, stages, exact), 0, std::numeric_limits<std::uint64_t>::max()), std::string(what) + " was not conservative for a draw");
+    };
+    program.bdaAbiVersion = 1;
+    unknown("BDA writes");
+    program.bdaAbiVersion = 0;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.count = 1;
+    for (const auto role : {Role::Gds, Role::BdaPagetable, Role::FaultBuffer}) {
+        binding.role = role;
+        program.bindings = {binding};
+        unknown("an unbounded shader write domain");
+    }
+    binding.role = Role::GuestBuffers;
+    program.bindings = {binding};
+    unknown("a truncated written buffer");
+    { auto flags = program.bindings[0].Flags(); flags.bufferWritten = {false}; program.bindings[0].SetFlags(std::move(flags)); }
+    bool bounded = false;
+    Require(DispatchWriteRanges(program, bounded).empty() && bounded, "a read-only buffer was treated as written");
+    { auto flags = program.bindings[0].Flags(); flags.bufferWritten = {true}; program.bindings[0].SetFlags(std::move(flags)); }
+    program.bindings[0].guestDescriptor = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u), 256, 0x71016facu};
+    unknown("an invalid written buffer type");
+    program.bindings[0].guestDescriptor[3] = 0x31016facu;
+    for (const bool otherFlag : {false, true}) {
+        ShaderRecompiler::DescriptorFlags flags;
+        if (otherFlag) flags.bufferRead = {true};
+        program.bindings[0].SetFlags(flags);
+        Require(Contains(DispatchWriteRanges(program, bounded), base, base + 256) && bounded, "absent buffer-written flags omitted a valid buffer");
+        Require(Contains(DrawWriteRanges({}, stages, true), base, base + 256), "absent buffer-written flags omitted a valid draw buffer");
+        for (const bool written : {false, true}) {
+            flags.bufferWritten = {written};
+            program.bindings[0].SetFlags(flags);
+            const auto ranges = DispatchWriteRanges(program, bounded);
+            Require(bounded && (written ? Contains(ranges, base, base + 256) : ranges.empty()), "explicit buffer-written flag was confused with an absent flag");
+            const auto drawRanges = DrawWriteRanges({}, stages, true);
+            Require(written ? Contains(drawRanges, base, base + 256) : drawRanges.empty(), "draw confused explicit buffer-written flags with absent flags");
+        }
+    }
+    const auto words = ImageWords(base, 128, 128);
+    for (const auto role : {Role::GuestImages, Role::ImageTable, Role::ImageStorageTable}) {
+        binding.role = role;
+        binding.kind = role == Role::ImageTable ? ShaderRecompiler::DescriptorKind::SampledImage : ShaderRecompiler::DescriptorKind::StorageImage;
+        binding.guestDescriptor.assign(words.begin(), words.end());
+        { auto flags = binding.Flags(); flags.imageWritten = {true}; binding.SetFlags(std::move(flags)); }
+        program.bindings = {binding};
+        const auto ranges = DispatchWriteRanges(program, bounded);
+        Require(bounded && Contains(ranges, base, base + 128 * 128 * 4), "a written image table entry was omitted");
+        Require(Contains(DrawWriteRanges({}, stages, true), base, base + 128 * 128 * 4), "a draw image table entry was omitted");
+        { auto flags = program.bindings[0].Flags(); flags.imageWritten = {false}; program.bindings[0].SetFlags(std::move(flags)); }
+        Require(DispatchWriteRanges(program, bounded).empty() && bounded, "a read-only image table entry was treated as written");
+        { auto flags = program.bindings[0].Flags(); flags.imageWritten.clear(); program.bindings[0].SetFlags(std::move(flags)); }
+        program.bindings[0].guestDescriptor.pop_back();
+        unknown("a truncated written image");
+    }
+    AgcDriver::Graphics::State state{};
+    state.hasColorTarget = true;
+    state.color.address = base;
+    state.color.extent = {128, 128};
+    state.color.bytes = 65536;
+    state.color.layers = 3;
+    Require(Contains(DrawWriteRanges(state, {}, true), base, base + 3 * state.color.bytes), "a layered target omitted later slices");
+    state.color.layers = 1;
+    state.color.samples = 4;
+    Require(Contains(DrawWriteRanges(state, {}, true), 0, std::numeric_limits<std::uint64_t>::max()), "an unsupported multisampled target was bounded");
+    state.color.samples = 1;
+    state.color.bytes = 0;
+    Require(Contains(DrawWriteRanges(state, {}, true), 0, std::numeric_limits<std::uint64_t>::max()), "an unknown target size was guessed");
+    state.color.bytes = 65536;
+    state.color.extent = {1920, 1080};
+    Require(Contains(DrawWriteRanges(state, {}, true), 0, std::numeric_limits<std::uint64_t>::max()), "a target smaller than its layout was bounded");
+    state.color.extent = {128, 128};
+    state.color.address = std::numeric_limits<std::uint64_t>::max() - 16;
+    for (const bool exact : {false, true}) Require(Contains(DrawWriteRanges(state, {}, exact), 0, std::numeric_limits<std::uint64_t>::max()), "an overflowing target was bounded");
+    state = {};
+    state.depth = AgcDriver::Graphics::DepthTarget{};
+    state.depth->address = base;
+    state.depth->extent = {256, 256};
+    state.depth->format = VK_FORMAT_D32_SFLOAT;
+    state.depth->samples = 4;
+    const auto bytes = AgcDriver::Graphics::MultisampledDepthBytes_nid_no_patch(state.depth->extent, 4, 4);
+    Require(Contains(DrawWriteRanges(state, {}, true), base, base + bytes), "multisampled depth omitted samples");
+    state.depth->samples = 1;
+    state.depth->htileAddress = base + 0x40000000;
+    Require(Contains(DrawWriteRanges(state, {}, true), state.depth->htileAddress, state.depth->htileAddress + 4096), "HTILE was omitted");
+}
+
 }
 
 int main() {
     try {
+        ConservativeWrites();
         using AgcDriver::DriverDetail::DrawWriteRanges;
         constexpr std::uint64_t written = 0x100000000ull;
         constexpr std::uint64_t readOnly = 0x200000000ull;
@@ -58,7 +156,7 @@ int main() {
             const auto words = ImageWords(base, 256, 128);
             images.guestDescriptor.insert(images.guestDescriptor.end(), words.begin(), words.end());
         }
-        images.imageWritten = {true, false};
+        { auto flags = images.Flags(); flags.imageWritten = {true, false}; images.SetFlags(std::move(flags)); }
         program.bindings.push_back(images);
         const std::array<AgcDriver::Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Fragment, &program, 0}}};
         AgcDriver::Graphics::State state{};
@@ -70,13 +168,13 @@ int main() {
             Require(Contains(ranges, written, written + surfaceBytes), "a storage image the draw stores to is not a write range");
             Require(!Touches(ranges, readOnly, readOnly + surfaceBytes), "a storage image the draw only reads is a write range");
         }
-        program.bindings[0].imageWritten.clear();
+        { auto flags = program.bindings[0].Flags(); flags.imageWritten.clear(); program.bindings[0].SetFlags(std::move(flags)); }
         Require(Contains(DrawWriteRanges(state, stages, true), readOnly, readOnly + surfaceBytes), "an image without written flags is not a write range");
         auto nullImage = ImageWords(0, 256, 128);
         nullImage[0] = 0;
         nullImage[1] &= ~0xffu;
         std::copy(nullImage.begin(), nullImage.end(), program.bindings[0].guestDescriptor.begin() + 8);
-        program.bindings[0].imageWritten = {true, true};
+        { auto flags = program.bindings[0].Flags(); flags.imageWritten = {true, true}; program.bindings[0].SetFlags(std::move(flags)); }
         for (const bool exact : {false, true}) {
             const auto ranges = DrawWriteRanges(state, stages, exact);
             Require(Contains(ranges, written, written + surfaceBytes), "a written image next to a null one is not a write range");
@@ -127,6 +225,11 @@ int main() {
         Require(Contains(exact, depth.address, depth.address + depthBytes) && !Touches(exact, depth.address + depthBytes, depth.address + depthBytes + 1), "the exact depth range is not DepthSliceBytes");
         Require(Contains(exact, depth.stencilAddress, depth.stencilAddress + stencilBytes) && !Touches(exact, depth.stencilAddress + stencilBytes, depth.stencilAddress + stencilBytes + 1), "the exact stencil range is not DepthSliceBytes");
         for (const auto& [begin, end] : exact) Require(Contains(estimated, begin, end), "an exact range is not inside the estimates");
+        targets.depth.reset();
+        color.dccPipeAligned = true;
+        const auto keyBytes = AgcDriver::Graphics::DccKeyCount(AgcDriver::Graphics::ColorTextureTileMode(color.tileMode), color.elementBytes, color.extent.width, color.extent.height, color.bytes);
+        Require(keyBytes > color.bytes / 256, "the DCC regression does not exercise padded metadata");
+        for (const bool precise : {false, true}) Require(Contains(DrawWriteRanges(targets, none, precise), color.dccAddress, color.dccAddress + keyBytes), "pipe-aligned DCC metadata was truncated");
         std::printf("draw write ranges: color %zu bytes (estimate %llu), depth %llu, stencil %llu\n", color.bytes, static_cast<unsigned long long>(2 * color.bytes + 65536), static_cast<unsigned long long>(depthBytes), static_cast<unsigned long long>(stencilBytes));
         std::puts("draw write ranges tests passed");
         return 0;

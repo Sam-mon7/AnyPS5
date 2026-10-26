@@ -490,22 +490,13 @@ enum class DescriptorRole {
     ImageStorageTable
 };
 
-struct DescriptorBinding {
-    DescriptorKind kind;
-    DescriptorRole role;
-    std::uint32_t descriptorSet;
-    std::uint32_t binding;
-    std::uint32_t count;
-    std::vector<std::uint32_t> guestDescriptor;
-    bool readOnly = false;
-    std::optional<DescriptorImageShape> imageShape;
+struct DescriptorFlags {
     std::vector<bool> samplerDepthCompare;
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
     std::vector<bool> imageWritten;
     std::vector<bool> imageDepthCompare;
     std::vector<bool> imageAtomic;
     std::vector<bool> imageAtomic64;
-    std::vector<DescriptorImageShape> imageShapes;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.
@@ -521,9 +512,37 @@ struct DescriptorBinding {
     std::vector<bool> samplerCoordinatesIgnored;
     std::vector<bool> imageUnnormalized;
     std::vector<bool> imageUnnormalizedBaseLevel;
-    std::vector<std::uint32_t> imageSamplers;
     std::vector<bool> bufferRead;
+
+    [[nodiscard]] bool Empty() const {
+        return samplerDepthCompare.empty() && imageWritten.empty() && imageDepthCompare.empty() && imageAtomic.empty() && imageAtomic64.empty() && bufferAtomic.empty() && bufferWritten.empty() && samplerUnnormalized.empty() && samplerIntegerBorder.empty() && samplerCoordinatesIgnored.empty() && imageUnnormalized.empty() && imageUnnormalizedBaseLevel.empty() && bufferRead.empty();
+    }
+
+    bool operator==(const DescriptorFlags&) const = default;
+};
+
+struct DescriptorBinding {
+    DescriptorKind kind;
+    DescriptorRole role;
+    std::uint32_t descriptorSet;
+    std::uint32_t binding;
+    std::uint32_t count;
+    std::vector<std::uint32_t> guestDescriptor;
+    bool readOnly = false;
+    std::optional<DescriptorImageShape> imageShape;
+    std::vector<DescriptorImageShape> imageShapes;
+    std::vector<std::uint32_t> imageSamplers;
     std::vector<std::uint32_t> bufferExtent;
+    std::shared_ptr<const DescriptorFlags> flags;
+
+    [[nodiscard]] const DescriptorFlags& Flags() const {
+        static const DescriptorFlags empty;
+        return flags ? *flags : empty;
+    }
+
+    void SetFlags(DescriptorFlags value) {
+        flags = value.Empty() ? nullptr : std::make_shared<const DescriptorFlags>(std::move(value));
+    }
 };
 
 struct ImageTableEntryPoison {

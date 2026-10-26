@@ -2943,7 +2943,7 @@ void stridedOverhangTests(const Context& context, const BdaTestAccess& access) {
     ShaderRecompiler::RecompileResult shader;
     auto buffer = binding(Role::GuestBuffers, 6);
     buffer.guestDescriptor = {static_cast<std::uint32_t>(address), (static_cast<std::uint32_t>(address >> 32) & 0xffffu) | (stride << 16u), records, 0x31000000u};
-    buffer.bufferWritten = {false};
+    { auto flags = buffer.Flags(); flags.bufferWritten = {false}; buffer.SetFlags(std::move(flags)); }
     shader.bindings = {buffer};
     CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
     {

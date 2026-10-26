@@ -150,9 +150,9 @@ void Run(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResul
     std::size_t elements = 0;
     for (auto& binding : result.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
-        Require(binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u && binding.bufferWritten.size() == binding.count, "dispatch move: the program's buffer bindings have another shape");
+        Require(binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u && binding.Flags().bufferWritten.size() == binding.count, "dispatch move: the program's buffer bindings have another shape");
         for (std::uint32_t element = 0; element < binding.count; ++element, ++elements) {
-            const auto words = binding.bufferWritten[element] ? BufferDescriptor(output, Bytes) : BufferDescriptor(input, inputBytes);
+            const auto words = binding.Flags().bufferWritten[element] ? BufferDescriptor(output, Bytes) : BufferDescriptor(input, inputBytes);
             std::copy(words.begin(), words.end(), binding.guestDescriptor.begin() + static_cast<std::ptrdiff_t>(element) * 4);
         }
     }

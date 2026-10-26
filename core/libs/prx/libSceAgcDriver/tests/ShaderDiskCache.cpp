@@ -129,7 +129,7 @@ void removeCacheDirectory(const std::filesystem::path& directory) {
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.Flags().samplerDepthCompare == right.Flags().samplerDepthCompare && left.Flags().imageWritten == right.Flags().imageWritten && left.Flags().imageDepthCompare == right.Flags().imageDepthCompare && left.Flags().imageAtomic == right.Flags().imageAtomic && left.Flags().imageAtomic64 == right.Flags().imageAtomic64 && left.imageShapes == right.imageShapes && left.Flags().bufferAtomic == right.Flags().bufferAtomic && left.Flags().bufferWritten == right.Flags().bufferWritten && left.Flags().bufferRead == right.Flags().bufferRead && left.bufferExtent == right.bufferExtent && left.Flags().samplerUnnormalized == right.Flags().samplerUnnormalized && left.Flags().samplerIntegerBorder == right.Flags().samplerIntegerBorder && left.Flags().samplerCoordinatesIgnored == right.Flags().samplerCoordinatesIgnored && left.Flags().imageUnnormalized == right.Flags().imageUnnormalized && left.Flags().imageUnnormalizedBaseLevel == right.Flags().imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -208,6 +208,7 @@ void requireSameVariant(const CompiledVariant& left, const CompiledVariant& righ
 
 DescriptorBinding sampleBinding(std::uint32_t seed) {
     DescriptorBinding binding{};
+    DescriptorFlags flags;
     binding.kind = DescriptorKind::StorageImage;
     binding.role = DescriptorRole::GuestImages;
     binding.descriptorSet = 0;
@@ -216,21 +217,23 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.guestDescriptor = {0x11111111u * seed, 0xdeadbeefu, 0x80000000u, 7u, 0u, 0xffffffffu, 42u, seed};
     binding.readOnly = seed % 2 == 0;
     binding.imageShape = DescriptorImageShape::Image2DArray;
-    binding.samplerDepthCompare = {true, false, true};
-    binding.imageDepthCompare = {false, true, false};
-    binding.imageWritten = {false, true, true};
-    binding.imageAtomic = {false, true, false};
+    flags.samplerDepthCompare = {true, false, true};
+    flags.imageDepthCompare = {false, true, false};
+    flags.imageWritten = {false, true, true};
+    flags.imageAtomic = {false, true, false};
+    flags.imageAtomic64 = {true, false, false, true};
     binding.imageShapes = {DescriptorImageShape::Image2D, DescriptorImageShape::Image3D};
-    binding.bufferAtomic = {true};
-    binding.bufferWritten = {false, false, true, true, false};
-    binding.samplerUnnormalized = {false, true, true};
-    binding.samplerIntegerBorder = {true, false, seed % 2 == 1};
-    binding.samplerCoordinatesIgnored = {false, seed % 2 == 0, true};
-    binding.imageUnnormalized = {true, false, seed % 2 == 0};
-    binding.imageUnnormalizedBaseLevel = {false, true, seed % 3 == 0};
+    flags.bufferAtomic = {true};
+    flags.bufferWritten = {false, false, true, true, false};
+    flags.samplerUnnormalized = {false, true, true};
+    flags.samplerIntegerBorder = {true, false, seed % 2 == 1};
+    flags.samplerCoordinatesIgnored = {false, seed % 2 == 0, true};
+    flags.imageUnnormalized = {true, false, seed % 2 == 0};
+    flags.imageUnnormalizedBaseLevel = {false, true, seed % 3 == 0};
     binding.imageSamplers = {0x5u, 0u, 0x80000000u};
-    binding.bufferRead = {true, false, false, true, true, false};
+    flags.bufferRead = {true, false, false, true, true, false};
     binding.bufferExtent = {32, 0, 16, 4096, 8, 0};
+    binding.SetFlags(std::move(flags));
     return binding;
 }
 
@@ -438,6 +441,35 @@ void verifyResultRoundTrip() {
     bytes.clear();
     ShaderDiskCache::EncodeResult(incompatible, bytes);
     require(!ShaderDiskCache::DecodeResult(bytes, decoded), "an incompatible runtime ABI result decodes");
+    RecompileResult flagCases;
+    flagCases.bindings = {DescriptorBinding{}, DescriptorBinding{}, sampleBinding(3)};
+    flagCases.bindings[1].SetFlags({.bufferWritten = {false}});
+    bytes.clear();
+    ShaderDiskCache::EncodeResult(flagCases, bytes);
+    require(ShaderDiskCache::DecodeResult(bytes, decoded), "flag ownership cases do not decode");
+    requireSameResult(flagCases, decoded, "flag ownership round trip");
+    require(!decoded.bindings[0].flags && decoded.bindings[1].flags && decoded.bindings[1].Flags().bufferWritten == std::vector<bool>{false}, "codec confused absent flags with explicit false");
+}
+
+void verifyDescriptorFlagOwnership() {
+    DescriptorBinding original{};
+    original.SetFlags({});
+    require(!original.flags, "empty flags allocate storage");
+    DescriptorFlags values;
+    values.bufferWritten = {false};
+    values.imageAtomic64 = {true, false};
+    original.SetFlags(values);
+    values.bufferWritten[0] = true;
+    values.imageAtomic64.clear();
+    require(original.Flags().bufferWritten == std::vector<bool>{false} && original.Flags().imageAtomic64 == std::vector<bool>{true, false}, "freezing flags retained mutable source storage");
+    auto copy = original;
+    require(copy.flags && copy.flags == original.flags, "copying a binding did not share immutable flags");
+    auto changed = copy.Flags();
+    changed.bufferWritten[0] = true;
+    copy.SetFlags(std::move(changed));
+    require(copy.flags != original.flags && copy.Flags().bufferWritten[0] && !original.Flags().bufferWritten[0] && copy.Flags().imageAtomic64 == original.Flags().imageAtomic64, "replacing flags changed a sibling binding or lost other flags");
+    copy.SetFlags({});
+    require(!copy.flags && !original.Flags().bufferWritten[0], "clearing flags changed a sibling binding");
 }
 
 void verifyEntryRoundTrip() {
@@ -1373,7 +1405,7 @@ void verifyBindingPlanSelection() {
     BindingAllocationResult full;
     builder.Populate(full, compiled, plan, 0u, snapshot, {});
     require(full.bindings.size() == 4u, "binding plan lost a descriptor before module selection");
-    require(full.bindings[0].bufferAtomic == std::vector<bool>{true, false} && full.bindings[0].bufferWritten == std::vector<bool>{true, false} && full.bindings[0].bufferRead == std::vector<bool>{false, true}, "binding plan lost buffer access metadata");
+    require(full.bindings[0].Flags().bufferAtomic == std::vector<bool>{true, false} && full.bindings[0].Flags().bufferWritten == std::vector<bool>{true, false} && full.bindings[0].Flags().bufferRead == std::vector<bool>{false, true}, "binding plan lost buffer access metadata");
     const std::array liveBindings{full.bindings[0].binding, full.bindings[0].binding, full.bindings[3].binding};
     const auto selected = builder.Select(plan, liveBindings);
     snapshot.userData.clear();
@@ -1387,6 +1419,8 @@ void verifyBindingPlanSelection() {
     expected.guestDescriptor[0] += 0x10000u;
     expected.guestDescriptor[6] = 128u;
     require(sameBinding(expected, populated.bindings[0]) && sameBinding(full.bindings[3], populated.bindings[1]), "selected plan changed binding order or reused stale buffer data");
+    require(plan.bindings[0].descriptor.flags && plan.bindings[0].descriptor.flags == selected.bindings[0].descriptor.flags && plan.bindings[0].descriptor.flags == full.bindings[0].flags && full.bindings[0].flags == populated.bindings[0].flags, "direct binding flags were copied instead of shared");
+    require(!plan.bindings[3].descriptor.flags && !populated.bindings[1].flags, "GDS acquired a flag allocation");
     bool rejected = false;
     try { static_cast<void>(builder.Select(plan, std::array{UINT32_MAX})); }
     catch (const std::runtime_error&) { rejected = true; }
@@ -1422,6 +1456,71 @@ void verifyBindingPlanSelection() {
     static_cast<void>(builder.Prepare(compiled.layout, info, IrShaderStage::Compute, snapshot));
     snapshot.buffers[1].dwords[3] = 0x31014facu;
     rejectsAlignment("base is not aligned to its element");
+}
+
+void verifyImageFlagOwnership() {
+    ImageResource image{};
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.numericClass = IrTextureNumericClass::Float;
+    image.dimension = RdnaImageDimension::Dim2D;
+    image.read = true;
+    ShaderInfo info{};
+    info.images = {image};
+    info.runtimeImageModes = {ResourceMaterializer::RuntimeImageModes(image)};
+    info.samplers = {SamplerResource{}};
+    info.sampledPairs = {{0u, 0u, 0u}};
+    ResourceSnapshot snapshot;
+    snapshot.images = {DescriptorValue{{0x00001000u, 0x03800000u, 0x0000c000u, 0x90000facu, 0u, 0u, 0u, 0u}, 8u}};
+    snapshot.samplers = {DescriptorValue{{0x00008092u, 0x00fff000u, 0x05500000u, 0u}, 4u}};
+    CompiledBindingLayout compiled{};
+    compiled.layout.descriptors = {{DescriptorBindingForImage(image), {0u}}, {DescriptorBindingKind::Samplers, {0u}}};
+    const DescriptorBindingBuilder builder;
+    const auto plan = builder.Prepare(compiled.layout, info, IrShaderStage::Compute, snapshot);
+    require(plan.bindings.size() == 2u, "image flag fixture lost a direct binding");
+    const auto selected = builder.Select(plan, std::array{plan.bindings[0].descriptor.binding, plan.bindings[1].descriptor.binding});
+    BindingAllocationResult first, second;
+    builder.Populate(first, compiled, selected, 0u, snapshot, {});
+    snapshot.images[0].dwords[0] += 0x1000u;
+    builder.Populate(second, compiled, selected, 0u, snapshot, {});
+    for (std::size_t i = 0; i < 2u; ++i) {
+        require(plan.bindings[i].descriptor.flags && plan.bindings[i].descriptor.flags == selected.bindings[i].descriptor.flags && first.bindings[i].flags == selected.bindings[i].descriptor.flags && second.bindings[i].flags == first.bindings[i].flags, "direct image or sampler flags were not shared");
+    }
+    require(first.bindings[0].guestDescriptor[0] != second.bindings[0].guestDescriptor[0] && first.bindings[0].Flags().imageUnnormalized == std::vector<bool>{true} && first.bindings[1].Flags().samplerUnnormalized == std::vector<bool>{true}, "direct sharing changed image data or sampler modes");
+}
+
+void verifyTableFlagOwnership() {
+    CompiledBindingLayout compiled{};
+    compiled.layout.descriptors = {{DescriptorBindingKind::ImageTable, {}}, {DescriptorBindingKind::ImageStorageTable, {}}, {DescriptorBindingKind::SamplerTable, {}}};
+    const DescriptorBindingBuilder builder;
+    const ResourceSnapshot snapshot;
+    const auto plan = builder.Prepare(compiled.layout, {}, IrShaderStage::Compute, snapshot);
+    require(plan.bindings.size() == 3u, "table flag fixture lost a binding");
+    ResolvedImageTables tables;
+    ImageResource image{};
+    image.dimension = RdnaImageDimension::Dim2D;
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.numericClass = IrTextureNumericClass::Float;
+    tables.elements.resize(2);
+    tables.elements[0].dimension = tables.elements[1].dimension = image.dimension;
+    tables.elements[0].kind = DescriptorBindingForImage(image);
+    tables.elements[0].depthCompare = true;
+    image.resourceClass = ImageResourceClass::Storage;
+    tables.elements[1].kind = DescriptorBindingForImage(image);
+    tables.samplers.resize(2);
+    tables.samplers[0].compare = true;
+    BindingAllocationResult first, second;
+    builder.Populate(first, compiled, plan, 0u, snapshot, {}, &tables);
+    tables.elements.erase(tables.elements.begin());
+    tables.samplers.erase(tables.samplers.begin());
+    builder.Populate(second, compiled, plan, 0u, snapshot, {}, &tables);
+    for (std::size_t i = 0; i < 3u; ++i) {
+        require(!plan.bindings[i].descriptor.flags && first.bindings[i].flags && second.bindings[i].flags && first.bindings[i].flags != second.bindings[i].flags && first.bindings[i].count == 2u && second.bindings[i].count == 1u, "table flags leaked between populated bindings or the plan");
+        if (i < 2u) {
+            require(first.bindings[i].Flags().imageDepthCompare == std::vector<bool>{true, false} && first.bindings[i].Flags().imageWritten == std::vector<bool>{false, true} && first.bindings[i].Flags().imageAtomic == std::vector<bool>{false, false}, "first table flags were changed by another invocation");
+            require(second.bindings[i].Flags().imageDepthCompare == std::vector<bool>{false} && second.bindings[i].Flags().imageWritten == std::vector<bool>{true} && second.bindings[i].Flags().imageAtomic == std::vector<bool>{false}, "second table flags retained stale elements");
+        }
+    }
+    require(first.bindings[2].Flags().samplerDepthCompare == std::vector<bool>{true, false} && second.bindings[2].Flags().samplerDepthCompare == std::vector<bool>{false}, "sampler table flags leaked between invocations");
 }
 
 void verifyVertexTypeSpecialization() {
@@ -2560,6 +2659,9 @@ int main(int argc, char** argv) {
         verifyInvocationIsolation();
         verifyBufferAlignmentSpecialization();
         verifyBindingPlanSelection();
+        verifyDescriptorFlagOwnership();
+        verifyImageFlagOwnership();
+        verifyTableFlagOwnership();
         verifyVertexTypeSpecialization();
         verifyBuiltinSpecialization();
         verifySpecializationLiveness();

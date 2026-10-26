@@ -159,9 +159,9 @@ void AttachNullImages(ShaderRecompiler::RecompileResult& result, const ShaderRec
     ShaderRecompiler::DescriptorBinding images{ShaderRecompiler::DescriptorKind::StorageImage, ShaderRecompiler::DescriptorRole::GuestImages, set, binding, ImageElements, std::vector<std::uint32_t>(ImageElements * words.size())};
     std::copy(words.begin(), words.end(), images.guestDescriptor.begin());
     images.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    images.imageWritten = {false, false};
-    images.imageAtomic = {false, false};
-    images.imageAtomic64 = {false, false};
+    { auto flags = images.Flags(); flags.imageWritten = {false, false}; images.SetFlags(std::move(flags)); }
+    { auto flags = images.Flags(); flags.imageAtomic = {false, false}; images.SetFlags(std::move(flags)); }
+    { auto flags = images.Flags(); flags.imageAtomic64 = {false, false}; images.SetFlags(std::move(flags)); }
     result.bindings.push_back(std::move(images));
     auto module = result.spirv.Copy();
     DeclareImageHeap(module, set, binding, ImageElements);
