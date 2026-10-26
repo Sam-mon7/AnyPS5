@@ -27,6 +27,24 @@ static inline void APS5_VABI Wait() {
     Sleep(1);
 }
 
+inline constexpr std::size_t CaveBytes = 86;
+
+static inline std::uint8_t* ImageSlack(std::uint8_t* image) {
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+    const auto* section = IMAGE_FIRST_SECTION(headers);
+    for (unsigned index = 0; index < headers->FileHeader.NumberOfSections; ++index, ++section) {
+        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+        const auto begin = (reinterpret_cast<std::uintptr_t>(image) + section->VirtualAddress + section->Misc.VirtualSize + 15u) & ~std::uintptr_t{15};
+        const auto end = (reinterpret_cast<std::uintptr_t>(image) + section->VirtualAddress + section->Misc.VirtualSize + 0xfffu) & ~std::uintptr_t{0xfff};
+        if (end < begin + CaveBytes) continue;
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(begin);
+        bool empty = true;
+        for (std::size_t offset = 0; offset < CaveBytes && empty; ++offset) empty = bytes[offset] == 0 || bytes[offset] == 0xcc;
+        if (empty) return reinterpret_cast<std::uint8_t*>(begin);
+    }
+    return nullptr;
+}
+
 static inline const char* Install(std::uint8_t* image, std::uintptr_t imageSize) {
     if (PollRva + PollBytes.size() > imageSize) return "code signature differs";
     for (const auto rva : {CallRva, PollRva}) {
@@ -42,10 +60,18 @@ static inline const char* Install(std::uint8_t* image, std::uintptr_t imageSize)
     LONG64 expected = 0;
     std::memcpy(&expected, reinterpret_cast<const void*>(word), sizeof(expected));
     std::uint8_t* cave = nullptr;
+    const auto callAt = reinterpret_cast<std::uintptr_t>(call);
     const auto first = (reinterpret_cast<std::uintptr_t>(image) + imageSize + 0xffff) & ~std::uintptr_t{0xffff};
-    for (auto at = first; cave == nullptr && at < reinterpret_cast<std::uintptr_t>(call) + 0x70000000; at += 0x10000)
+    for (auto at = first; cave == nullptr && at < callAt + 0x70000000; at += 0x10000)
         cave = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(at), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    const auto lowest = callAt > 0x70010000 ? callAt - 0x70000000 : std::uintptr_t{0x10000};
+    for (auto at = (reinterpret_cast<std::uintptr_t>(image) & ~std::uintptr_t{0xffff}) - 0x10000; cave == nullptr && at >= lowest; at -= 0x10000)
+        cave = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(at), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    const bool ownCave = cave != nullptr;
+    if (!ownCave) cave = ImageSlack(image);
     if (cave == nullptr) return "no code cave within a call's reach";
+    DWORD previous = 0;
+    if (!ownCave && !VirtualProtect(cave, CaveBytes, PAGE_EXECUTE_READWRITE, &previous)) return "cannot unprotect the image slack";
     std::uint8_t code[] = {
         0x48, 0x83, 0xec, 0x08,
         0xe8, 0, 0, 0, 0,
@@ -62,22 +88,21 @@ static inline const char* Install(std::uint8_t* image, std::uintptr_t imageSize)
         0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58, 0x9d,
         0xc3,
     };
-    static_assert(sizeof(code) == 86);
+    static_assert(sizeof(code) == CaveBytes);
     const auto pollDisplacement = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(poll) - reinterpret_cast<std::intptr_t>(cave + 9));
     std::memcpy(code + 5, &pollDisplacement, sizeof(pollDisplacement));
     const auto wait = reinterpret_cast<std::uint64_t>(&Wait);
     std::memcpy(code + 49, &wait, sizeof(wait));
     std::memcpy(cave, code, sizeof(code));
-    DWORD previous = 0;
-    if (!VirtualProtect(cave, 0x1000, PAGE_EXECUTE_READ, &previous) || !FlushInstructionCache(GetCurrentProcess(), cave, sizeof(code))) {
-        VirtualFree(cave, 0, MEM_RELEASE);
+    if (!VirtualProtect(cave, ownCave ? 0x1000 : CaveBytes, PAGE_EXECUTE_READ, &previous) || !FlushInstructionCache(GetCurrentProcess(), cave, sizeof(code))) {
+        if (ownCave) VirtualFree(cave, 0, MEM_RELEASE);
         return "cannot make the code cave executable";
     }
     std::uint8_t patch[5] = {0xe8};
     const auto caveDisplacement = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(cave) - reinterpret_cast<std::intptr_t>(call + 5));
     std::memcpy(patch + 1, &caveDisplacement, sizeof(caveDisplacement));
     if (!VirtualProtect(reinterpret_cast<void*>(word), 8, PAGE_EXECUTE_READWRITE, &previous)) {
-        VirtualFree(cave, 0, MEM_RELEASE);
+        if (ownCave) VirtualFree(cave, 0, MEM_RELEASE);
         return "cannot unprotect the call site";
     }
     LONG64 desired = expected;
@@ -85,7 +110,7 @@ static inline const char* Install(std::uint8_t* image, std::uintptr_t imageSize)
     const bool swapped = InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(word), desired, expected) == expected;
     VirtualProtect(reinterpret_cast<void*>(word), 8, previous, &previous);
     FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(word), 8);
-    if (!swapped) VirtualFree(cave, 0, MEM_RELEASE);
+    if (!swapped && ownCave) VirtualFree(cave, 0, MEM_RELEASE);
     return swapped ? nullptr : "the call site changed while it was patched";
 }
 
