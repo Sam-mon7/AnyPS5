@@ -80,6 +80,22 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         std::lock_guard cacheLock(dispatchCacheMutex);
         if (profile && missedEntry != nullptr && missedDiffering) classifyDiffering(address, key, *missedEntry->variants.front(), *fresh, capture.get(), entryCounters);
         if (stable) {
+            if (profile) {
+                const auto reason = !fresh->dataPositions.empty() ? 0u : !dataHits() ? 1u : stampValidate() ? 2u : capture == nullptr ? 3u : capture->readTrace.leaves.empty() ? 4u : fresh->flatBinding == DispatchVariant::NoFlatBinding ? 5u : 6u;
+                ++entryCounters.dataInsertReasons[reason];
+                auto& program = entryCounters.dataInsertsByProgram[address];
+                ++program[reason];
+                if (reason == 4u && capture->plan != nullptr) {
+                    const auto& plan = *capture->plan;
+                    const std::array<bool, 4> flags{!plan.srtPlanComplete, plan.requiresSpecializationMemory, std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const auto& source) { return source.tableColumn.has_value(); }), std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](auto pure) { return pure != 0u; })};
+                    for (std::size_t flag = 0; flag < flags.size(); ++flag) {
+                        if (flags[flag]) {
+                            ++entryCounters.dataNoLeafReasons[flag];
+                            ++program[7 + flag];
+                        }
+                    }
+                }
+            }
             ++entryCounters.inserts;
             entryCounters.runsInserted += fresh->runs.size();
             if (!fresh->dataPositions.empty()) {

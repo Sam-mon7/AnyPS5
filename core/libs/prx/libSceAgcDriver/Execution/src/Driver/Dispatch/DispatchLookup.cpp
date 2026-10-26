@@ -96,6 +96,12 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             const auto again = dispatchCache.find(key);
             const bool untouched = again != dispatchCache.end() && again->second == entry && variants.front()->generation.load(std::memory_order_acquire) == generation;
             auto& counters = entryCounters;
+            if (profile) {
+                auto& site = counters.dataLookupsBySite[{submission.queue, indirectSource().arguments != 0}];
+                ++site[0];
+                if (current) ++site[1];
+                if (dataHit) ++site[2];
+            }
             counters.validateUs += phaseMs[PhaseValidate] * 1000;
             counters.imagesFlushed += imagesFlushed;
             counters.runsSynced += runsSynced;

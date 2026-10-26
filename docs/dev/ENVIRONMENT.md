@@ -307,6 +307,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_PARTIAL_SNAPSHOT_PROOF` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | leaves snapshots with partially committed backing memory on full resource revalidation |
 | `APS5_NO_PATTERN_FILL_HLE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/BufferFill.cpp` |  | disables the dword-pattern fill HLE |
 | `APS5_NO_PAUSE_SPIN` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/WaitMemory.cpp` |  | disables the CPU pause-spin in a blocked memory wait |
+| `APS5_NO_PENDING_DATA_HITS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/CaptureValidation.cpp` |  | restores exact comparisons for pending cache runs with known copy bytes; the default refreshes only recorded pure data positions from those authoritative bytes, while changed unsynchronized reads still miss; known-value verification and legacy validation keep exact comparisons |
 | `APS5_NO_PENDING_HTILE_FILLS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp` |  | reads the HTILE words of a depth target bind even when recorded fills are pending over them, instead of working the words out from the fills |
 | `APS5_NO_PERF_FRONTEND_PAIR` | presence | `core/libs/prx/libSceAgcDriver/tests/ShaderMemory.cpp` |  | disables frontend-pair reuse in the shader-memory test |
 | `APS5_NO_PERF_LAYOUT_PAIR` | presence | `core/libs/prx/libSceAgcDriver/tests/ShaderMemory.cpp` |  | disables layout-pair reuse in the shader-memory test |
@@ -386,7 +387,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_PREBUILD_THREADS` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp` | 1 | number of threads in the one-thread pool that prebuilds registration-form shader libraries |
 | `APS5_PRESENT_POLL_FENCE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | polls the present fence every 50 us instead of blocking on it |
 | `APS5_PROBE_DISPATCH` | string | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/Dispatch.cpp` |  | probes one dispatch at a hex program address (optionally `:index`) with debug output |
-| `APS5_PROFILE_DRAW` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/Dispatch.cpp` |  | prints the per-phase driver and draw timing totals |
+| `APS5_PROFILE_DRAW` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/Dispatch.cpp` |  | prints the per-phase driver and draw timing totals, dispatch data-position insertion and differing reasons, validation failure reasons, hits by queue and dispatch kind, and differing word addresses, positions and roles for the top eight programs |
 | `APS5_PROFILE_GPU` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | records the GPU time of recorded work by key from batch timestamps |
 | `APS5_REAP_EACH_PACKET` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/DeferredLabels.cpp` |  | reaps deferred labels after every packet |
 | `APS5_RELEASE_ON_UNLOCK` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | destroys deferred batches on the unlocking thread instead of a release thread |

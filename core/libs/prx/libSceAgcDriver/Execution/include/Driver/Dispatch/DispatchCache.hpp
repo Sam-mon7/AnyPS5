@@ -15,6 +15,7 @@
 #include <memory>
 #include <set>
 #include <span>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
@@ -76,6 +77,12 @@ struct EntryCounters {
 
     std::uint64_t dataHits = 0, dataWordsRefreshed = 0, dataVerified = 0, dataInserts = 0, dataPositionsInserted = 0, dataLeavesUnmapped = 0, dataLeavesMismatched = 0, dataLeavesAliased = 0;
     std::array<std::uint64_t, MaxDispatchVariants> dataHitsByRank{};
+    std::array<std::uint64_t, 7> dataInsertReasons{};
+    std::array<std::uint64_t, 4> dataNoLeafReasons{};
+    std::array<std::uint64_t, 4> dataDifferingReasons{};
+    std::map<std::uint64_t, std::array<std::uint64_t, 11>> dataInsertsByProgram;
+    std::map<std::pair<std::uint32_t, bool>, std::array<std::uint64_t, 3>> dataLookupsBySite;
+    std::map<std::uint64_t, std::map<std::tuple<std::size_t, std::uint64_t, std::uint32_t, std::uint32_t>, std::uint64_t>> differingWordRoles;
     std::set<std::size_t> differingPositions;
     std::size_t differingFirstPosition = std::numeric_limits<std::size_t>::max(), differingLastPosition = 0;
     std::map<std::uint64_t, std::uint64_t> differingByProgram;
