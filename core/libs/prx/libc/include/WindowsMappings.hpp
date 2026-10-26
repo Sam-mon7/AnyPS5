@@ -445,11 +445,6 @@ public:
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
-        static const bool rangeSkip = std::getenv("APS5_NO_COLLECT_RANGE_SKIP") == nullptr;
-        if (rangeSkip && collection != Collection::Fresh) {
-            const auto clean = cleanRanges.upper_bound(address);
-            if (clean != cleanRanges.begin() && std::prev(clean)->second >= end) return true;
-        }
         if (collection == Collection::Fresh) {
             const auto fresh = freshRanges.upper_bound(address);
             if ((fresh == freshRanges.begin() || std::prev(fresh)->second <= address) && (fresh == freshRanges.end() || fresh->first >= end)) return true;
@@ -465,6 +460,11 @@ public:
                 }
             }
         } else if (clear && !collectable(address, end)) return false;
+        static const bool rangeSkip = std::getenv("APS5_NO_COLLECT_RANGE_SKIP") == nullptr;
+        if (rangeSkip && collection != Collection::Fresh) {
+            const auto clean = cleanRanges.upper_bound(address);
+            if (clean != cleanRanges.begin() && std::prev(clean)->second >= end) return true;
+        }
         auto position = views.lower_bound(address & ~(pageBytes - 1));
         std::uintptr_t cleanStart = 0;
         std::uintptr_t cleanEnd = 0;
