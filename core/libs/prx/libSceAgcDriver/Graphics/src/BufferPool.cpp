@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <new>
 
 namespace AgcDriver::Graphics {
 
@@ -149,7 +150,8 @@ bool BufferPool::heapOverBudget() {
 VkDeviceMemory BufferPool::TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage) {
     const auto type = allocation.memoryTypeIndex;
     if (imagePooled(allocation.allocationSize, type)) {
-        std::lock_guard lock(mutex);
+        std::unique_lock lock(mutex);
+        trimIdle(lock);
         ++clock;
         const auto found = deviceTier.free.find({static_cast<std::size_t>(allocation.allocationSize), 0, memoryProperties.memoryTypes[type].propertyFlags, type});
         if (found != deviceTier.free.end() && !found->second.empty()) {
@@ -393,7 +395,8 @@ BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlag
 std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto capacity = Capacity(bytes, properties);
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
+    trimIdle(lock);
     ++clock;
     if (profile) {
         static auto lastReport = std::chrono::steady_clock::now();
@@ -515,6 +518,33 @@ std::size_t BufferPool::MaxSlots() {
         return parsed != 0 ? static_cast<std::size_t>(parsed) : defaultSlots;
     }();
     return slots;
+}
+
+void BufferPool::trimIdle(std::unique_lock<std::mutex>& lock) {
+    static const bool enabled = std::getenv("APS5_NO_IDLE_POOL_TRIM") == nullptr;
+    if (!enabled || (++idleChecks & 4095u) != 0) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < idleTrimAt) return;
+    idleTrimAt = now + std::chrono::seconds(1);
+    const auto cutoff = now - std::chrono::seconds(10);
+    std::vector<BufferAllocation> evicted;
+    try {
+        for (auto* tier : {&largeTier, &deviceTier, &scratchDeviceTier, &scratchHostTier}) {
+            for (;;) {
+                const Slot* oldest = nullptr;
+                for (const auto& [key, slots] : tier->free) {
+                    if (!slots.empty() && (oldest == nullptr || slots.front().lastUse < oldest->lastUse)) oldest = &slots.front();
+                }
+                if (oldest == nullptr || oldest->releasedAt > cutoff) break;
+                evictOldest(*tier, evicted);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+    }
+    if (evicted.empty()) return;
+    lock.unlock();
+    for (const auto& allocation : evicted) destroy(allocation);
+    lock.lock();
 }
 
 VkDeviceSize BufferPool::trim() {

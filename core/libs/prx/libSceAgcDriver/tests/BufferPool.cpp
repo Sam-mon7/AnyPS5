@@ -1146,8 +1146,69 @@ void IdleReclaimPreservesImages() {
 }
 
 
+void IdleTrim(bool failAllocation) {
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        const auto pool = GetBufferPool(context);
+        constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        DeviceBuffer live(context, 8 * MiB, usage);
+        const auto liveMemory = MemoryOf(live.Handle());
+        std::vector<VkDeviceMemory> idle;
+        {
+            Buffer host(context, 2 * MiB, usage);
+            DeviceBuffer device(context, 4 * MiB, usage);
+            Buffer scratchHost(context, 128 * 1024, usage, HostVisible, true);
+            DeviceBuffer scratchDevice(context, 256 * 1024, usage, true);
+            for (const auto buffer : {host.Handle(), device.Handle(), scratchHost.Handle(), scratchDevice.Handle()}) idle.push_back(MemoryOf(buffer));
+        }
+        VkMemoryAllocateInfo image{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        image.allocationSize = 6 * MiB;
+        image.memoryTypeIndex = 0;
+        const auto imageMemory = pool->TakeImageMemory(image, "idle trim test");
+        pool->PutImageMemory(imageMemory, image.allocationSize, image.memoryTypeIndex);
+        idle.push_back(imageMemory);
+        for (const auto memory : idle) Expect(mock.memoryBytes.contains(memory), "a released allocation was not retained before idle trimming");
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10100));
+        VkDeviceMemory recentMemory;
+        {
+            DeviceBuffer recent(context, 16 * MiB, usage);
+            recentMemory = MemoryOf(recent.Handle());
+        }
+        bool threw = false;
+        SetAllocationFailureCountdown(failAllocation ? 1 : -1);
+        try {
+            for (int i = 0; i < 4096; ++i) static_cast<void>(pool->Take(32 * MiB, usage));
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        SetAllocationFailureCountdown(-1);
+        Expect(!threw, "idle trimming propagated a bookkeeping allocation failure");
+        const bool enabled = std::getenv("APS5_NO_IDLE_POOL_TRIM") == nullptr;
+        const auto removed = std::count_if(idle.begin(), idle.end(), [&](auto memory) { return !mock.memoryBytes.contains(memory); });
+        Expect(removed == (enabled ? (failAllocation ? 1 : static_cast<int>(idle.size())) : 0), "idle trimming did not free the expected retained allocations");
+        Expect(pool->RetainedImages() == (enabled && !failAllocation ? 0u : 1u), "idle trimming left incorrect image retention accounting");
+        if (enabled && !failAllocation) {
+            for (const bool device : {false, true}) {
+                const auto stats = pool->ScratchCounters(device);
+                Expect(stats.slots == 0 && stats.retained == 0 && stats.evictions == 1, "idle trimming left incorrect scratch retention accounting");
+            }
+        }
+        Expect(mock.memoryBytes.contains(liveMemory), "idle trimming freed an allocation still in use");
+        Expect(mock.memoryBytes.contains(recentMemory), "idle trimming freed a recently released allocation");
+        DeviceBuffer reused(context, 16 * MiB, usage);
+        Expect(MemoryOf(reused.Handle()) == recentMemory, "idle trimming prevented reuse of a recently released allocation");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "idle trimming leaked an allocation");
+}
+
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]).starts_with("--idle-trim")) {
+            IdleTrim(std::string_view(argv[1]) == "--idle-trim-failure");
+            return failures == 0 ? 0 : 1;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--small-device-retention") {
             SmallDeviceRetention();
             if (std::getenv("APS5_STAGING_POOL_MIB") == nullptr) {

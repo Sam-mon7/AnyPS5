@@ -100,6 +100,7 @@ private:
         BufferAllocation allocation;
         std::uint64_t lastUse;
         std::list<Slot*>::iterator order;
+        std::chrono::steady_clock::time_point releasedAt = std::chrono::steady_clock::now();
     };
     struct SlotKey {
         std::size_t bytes;
@@ -134,6 +135,9 @@ private:
     static std::size_t NextCapacity(std::size_t capacity);
     VkDeviceSize destroy(const BufferAllocation& allocation) noexcept;
     VkDeviceSize trim();
+    void trimIdle(std::unique_lock<std::mutex>& lock);
+    std::uint32_t idleChecks = 0;
+    std::chrono::steady_clock::time_point idleTrimAt{};
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the
     // caller destroys those after releasing the mutex, so builds taking buffers on other threads
     // do not wait behind the Vulkan destroy calls. Nothing changes when the vector cannot grow.
