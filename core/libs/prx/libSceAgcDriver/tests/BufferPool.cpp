@@ -1189,12 +1189,6 @@ void IdleTrim(bool failAllocation) {
         const auto removed = std::count_if(idle.begin(), idle.end(), [&](auto memory) { return !mock.memoryBytes.contains(memory); });
         Expect(removed == (enabled ? (failAllocation ? 1 : static_cast<int>(idle.size())) : 0), "idle trimming did not free the expected retained allocations");
         Expect(pool->RetainedImages() == (enabled && !failAllocation ? 0u : 1u), "idle trimming left incorrect image retention accounting");
-        if (enabled && !failAllocation) {
-            for (const bool device : {false, true}) {
-                const auto stats = pool->ScratchCounters(device);
-                Expect(stats.slots == 0 && stats.retained == 0 && stats.evictions == 1, "idle trimming left incorrect scratch retention accounting");
-            }
-        }
         Expect(mock.memoryBytes.contains(liveMemory), "idle trimming freed an allocation still in use");
         Expect(mock.memoryBytes.contains(recentMemory), "idle trimming freed a recently released allocation");
         DeviceBuffer reused(context, 16 * MiB, usage);

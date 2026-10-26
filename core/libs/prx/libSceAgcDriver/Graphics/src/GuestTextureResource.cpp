@@ -331,6 +331,8 @@ std::array<std::uint32_t, 8> EncodeTextureResource(const GuestTextureResource& r
     words[3] = resource.dstSelX | (resource.dstSelY << 3u) | (resource.dstSelZ << 6u) | (resource.dstSelW << 9u) | (sampleLevel << 16u) | (tileMode << 20u) | ((multisampled ? 14u : 9u) << 28u);
     words[5] = sampleLevel << 4u;
     return words;
+}
+
 namespace {
 
 struct DescriptorWordsHash {

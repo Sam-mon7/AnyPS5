@@ -1518,8 +1518,14 @@ std::uint64_t vectorBytes(const std::vector<bool>& values) {
     return static_cast<std::uint64_t>(values.capacity() + 7u) / 8u;
 }
 
+std::uint64_t descriptorFlagsBytes(const DescriptorFlags& flags) {
+    return sizeof(DescriptorFlags) + vectorBytes(flags.samplerDepthCompare) + vectorBytes(flags.imageWritten) + vectorBytes(flags.imageDepthCompare) + vectorBytes(flags.imageAtomic) + vectorBytes(flags.imageAtomic64) + vectorBytes(flags.bufferAtomic) + vectorBytes(flags.bufferWritten) + vectorBytes(flags.samplerUnnormalized) + vectorBytes(flags.samplerIntegerBorder) + vectorBytes(flags.samplerCoordinatesIgnored) + vectorBytes(flags.imageUnnormalized) + vectorBytes(flags.imageUnnormalizedBaseLevel) + vectorBytes(flags.bufferRead);
+}
+
 std::uint64_t descriptorBindingBytes(const DescriptorBinding& binding) {
-    return vectorBytes(binding.guestDescriptor) + vectorBytes(binding.imageShapes) + vectorBytes(binding.imageSamplers) + vectorBytes(binding.bufferExtent) + vectorBytes(binding.samplerDepthCompare) + vectorBytes(binding.imageWritten) + vectorBytes(binding.imageDepthCompare) + vectorBytes(binding.imageAtomic) + vectorBytes(binding.imageAtomic64) + vectorBytes(binding.bufferAtomic) + vectorBytes(binding.bufferWritten) + vectorBytes(binding.samplerUnnormalized) + vectorBytes(binding.samplerIntegerBorder) + vectorBytes(binding.samplerCoordinatesIgnored) + vectorBytes(binding.imageUnnormalized) + vectorBytes(binding.imageUnnormalizedBaseLevel) + vectorBytes(binding.bufferRead);
+    auto total = vectorBytes(binding.guestDescriptor) + vectorBytes(binding.imageShapes) + vectorBytes(binding.imageSamplers) + vectorBytes(binding.bufferExtent);
+    if (binding.flags != nullptr) total += descriptorFlagsBytes(*binding.flags) / static_cast<std::uint64_t>(std::max<long>(binding.flags.use_count(), 1));
+    return total;
 }
 
 std::uint64_t resultBytes(const RecompileResult& result) {

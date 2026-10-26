@@ -41,14 +41,14 @@ void IrValue::ReplaceArgument(std::size_t index, IrValue* argument) {
     auto* uses = argument != nullptr ? &argument->MutableUses() : nullptr;
     IrValue* previous = arguments[index];
     if (previous != nullptr && previous->operandUses != nullptr) {
-        auto& uses = *previous->operandUses;
-        const auto operandIt = !uses.empty() && uses.back() == IrUse{this, index}
-            ? uses.end() - 1
-            : std::find_if(uses.begin(), uses.end(), [this, index](const IrUse& use) {
+        auto& previousUses = *previous->operandUses;
+        const auto operandIt = !previousUses.empty() && previousUses.back() == IrUse{this, index}
+            ? previousUses.end() - 1
+            : std::find_if(previousUses.begin(), previousUses.end(), [this, index](const IrUse& use) {
                 return use.user == this && use.operand == index;
             });
-        if (operandIt != uses.end()) {
-            uses.erase(operandIt);
+        if (operandIt != previousUses.end()) {
+            previousUses.erase(operandIt);
         }
     }
     arguments[index] = argument;

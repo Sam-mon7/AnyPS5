@@ -135,7 +135,7 @@ private:
     static std::size_t NextCapacity(std::size_t capacity);
     VkDeviceSize destroy(const BufferAllocation& allocation) noexcept;
     VkDeviceSize trim();
-    void trimIdle(std::unique_lock<std::mutex>& lock);
+    void trimIdle(std::unique_lock<AgcDriver::Mutex>& lock);
     std::uint32_t idleChecks = 0;
     std::chrono::steady_clock::time_point idleTrimAt{};
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the

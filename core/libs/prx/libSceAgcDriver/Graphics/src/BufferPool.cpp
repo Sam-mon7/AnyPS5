@@ -520,7 +520,7 @@ std::size_t BufferPool::MaxSlots() {
     return slots;
 }
 
-void BufferPool::trimIdle(std::unique_lock<std::mutex>& lock) {
+void BufferPool::trimIdle(std::unique_lock<AgcDriver::Mutex>& lock) {
     static const bool enabled = std::getenv("APS5_NO_IDLE_POOL_TRIM") == nullptr;
     if (!enabled || (++idleChecks & 4095u) != 0) return;
     const auto now = std::chrono::steady_clock::now();
@@ -529,7 +529,7 @@ void BufferPool::trimIdle(std::unique_lock<std::mutex>& lock) {
     const auto cutoff = now - std::chrono::seconds(10);
     std::vector<BufferAllocation> evicted;
     try {
-        for (auto* tier : {&largeTier, &deviceTier, &scratchDeviceTier, &scratchHostTier}) {
+        for (auto* tier : {&largeTier, &deviceTier}) {
             for (;;) {
                 const Slot* oldest = nullptr;
                 for (const auto& [key, slots] : tier->free) {

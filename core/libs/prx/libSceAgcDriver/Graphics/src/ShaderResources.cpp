@@ -5230,7 +5230,7 @@ void ShaderResources::resolveImageTables() {
             try {
                 resource = *decoded;
                 shape = binding.imageShapes.at(element);
-                const bool depthCompare = element < binding.imageDepthCompare.size() && binding.imageDepthCompare[element];
+                const bool depthCompare = element < binding.Flags().imageDepthCompare.size() && binding.Flags().imageDepthCompare[element];
                 firstLayer = shape == ShaderRecompiler::DescriptorImageShape::Image2D && (resource.dimension == TextureDimension::k2DArray || (depthCompare && resource.dimension == TextureDimension::k1DArray));
                 const bool depth1D = depthCompare && ((shape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k1D) || (shape == ShaderRecompiler::DescriptorImageShape::Image2DArray && resource.dimension == TextureDimension::k1DArray));
                 if (!firstLayer && !depth1D && !MatchesGuestDimension(shape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the table entry's image shape (shape " + std::to_string(static_cast<int>(shape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
@@ -5270,8 +5270,8 @@ void ShaderResources::resolveImageTables() {
                 storageKeys.push_back(resource.dccAddress);
                 storageFirstLayer.push_back(firstLayer);
                 storageWritten.push_back(true);
-                storageAtomic.push_back(element < binding.imageAtomic.size() && binding.imageAtomic[element]);
-                storageAtomic64.push_back(element < binding.imageAtomic64.size() && binding.imageAtomic64[element]);
+                storageAtomic.push_back(element < binding.Flags().imageAtomic.size() && binding.Flags().imageAtomic[element]);
+                storageAtomic64.push_back(element < binding.Flags().imageAtomic64.size() && binding.Flags().imageAtomic64[element]);
                 describedRanges.push_back({"storage", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress, true});
                 bindings[storageBinding].imageAllocations[absolute] = storageTextures.size() - 1u;
                 continue;
