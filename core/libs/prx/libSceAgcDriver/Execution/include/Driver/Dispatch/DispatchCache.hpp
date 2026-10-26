@@ -15,10 +15,15 @@
 #include <memory>
 #include <set>
 #include <span>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
+
+namespace ShaderRecompiler {
+struct IrResourcePlan;
+}
 
 namespace AgcDriver::DriverDetail {
 
@@ -81,6 +86,9 @@ struct EntryCounters {
     std::array<std::uint64_t, 4> dataNoLeafReasons{};
     std::array<std::uint64_t, 4> dataDifferingReasons{};
     std::map<std::uint64_t, std::array<std::uint64_t, 11>> dataInsertsByProgram;
+    std::map<std::uint64_t, std::string> flatSlotReasonsByProgram;
+    std::map<std::shared_ptr<const ShaderRecompiler::IrResourcePlan>, std::vector<std::uint16_t>> flatSlotReasonsByPlan;
+    std::uint64_t refinedDataInserts = 0, refinedDataPositions = 0;
     std::map<std::pair<std::uint32_t, bool>, std::array<std::uint64_t, 3>> dataLookupsBySite;
     std::map<std::uint64_t, std::map<std::tuple<std::size_t, std::uint64_t, std::uint32_t, std::uint32_t>, std::uint64_t>> differingWordRoles;
     std::set<std::size_t> differingPositions;

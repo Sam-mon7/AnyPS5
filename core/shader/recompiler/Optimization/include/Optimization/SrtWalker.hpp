@@ -71,6 +71,8 @@ struct SrtReadTrace {
     std::uint32_t leafSlot = 0;
     std::vector<std::pair<std::uint32_t, std::uint64_t>> leaves;
     std::vector<std::uint64_t> otherReads;
+    bool profile = false;
+    std::vector<std::pair<const IrValue*, std::uint64_t>> slotReads;
 };
 
 struct SrtRuntime {

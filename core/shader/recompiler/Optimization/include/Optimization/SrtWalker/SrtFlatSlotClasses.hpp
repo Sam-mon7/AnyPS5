@@ -8,13 +8,19 @@
 
 namespace ShaderRecompiler::Detail {
 
-// One byte per srtReads slot, 1 when the slot is pure: its value is consumed by nothing the CPU
-// walk evaluates (no descriptor source dword, no control-flow condition, no uniform-fill value, no
-// address argument of any raw read reaches it through the plan's use-def edges), so the shader
-// reads it only through the FlattenedSrt binding at run time. A plan the walk cannot classify
-// statically (an incomplete SRT plan, specialization memory, an indirect image, an invalid uniform
-// fill) has no pure slot. Reachability over-approximates what the evaluators consume, so an
-// unknown opcode only makes more slots impure.
+enum FlatSlotReason : std::uint16_t {
+    IncompletePlan = 1u,
+    SpecializationMemory = 2u,
+    TableColumnSource = 4u,
+    InvalidUniformFill = 8u,
+    MaterializedDescriptor = 16u,
+    UnusedDescriptor = 32u,
+    BranchCondition = 64u,
+    UniformFillValue = 128u,
+    ReadAddress = 256u
+};
+
+std::vector<std::uint16_t> ComputeFlatSlotReasons(const IrResourcePlan& plan);
 std::vector<std::uint8_t> ComputePureFlatSlots(const IrResourcePlan& plan);
 std::vector<std::uint32_t> ComputeGuardedFlatSlots(const IrResourcePlan& plan);
 
