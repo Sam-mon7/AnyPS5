@@ -1928,6 +1928,35 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
+void CheckFailedCollectMemo() {
+    PartlyCommitted range;
+    range.Commit(0);
+    const auto base = range.Address();
+    BumpCollectEpoch();
+    for (int repeat = 0; repeat < 3; ++repeat) Require(CollectWrites(base, PartlyCommitted::Bytes) == 0, "a repeated partial collection manufactured a generation");
+    const auto first = CollectWrites(base, Block);
+    Require(first != 0 && UnchangedSince(base, Block, first), "a failed full collection poisoned its committed subset");
+    Require(MarkWritten(base, 4) != 0 && CollectWrites(base, PartlyCommitted::Bytes) == 0 && !UnchangedSince(base, Block, first), "a driver write turned a failed collection into a proof or lost its stamp");
+    const auto afterDriver = CollectWrites(base, Block);
+    Require(afterDriver != 0 && UnchangedSince(base, Block, afterDriver), "the committed subset did not collect after a driver write");
+    range.Data()[8] = 0x22;
+    BumpCollectEpoch();
+    Require(CollectWrites(base, PartlyCommitted::Bytes) == 0 && CollectWrites(base, Block) != 0 && !UnchangedSince(base, Block, afterDriver), "a failed full collection hid a CPU store from its subset");
+    for (std::size_t block = 1; block < PartlyCommitted::Bytes / Block; ++block) range.Commit(block);
+    Require(CollectWrites(base, PartlyCommitted::Bytes) != 0, "committing the missing pages did not invalidate a failed collection in the same epoch");
+    range.Decommit(1);
+    Require(CollectWrites(base, PartlyCommitted::Bytes) == 0 && CollectWritesUncached(base, PartlyCommitted::Bytes) == 0, "decommitting pages retained a successful collection");
+    range.Commit(1);
+    Require(CollectWrites(base, PartlyCommitted::Bytes) != 0, "recommitting pages retained a failed collection");
+    Unwatch(base, Block);
+    Require(CollectWrites(base, PartlyCommitted::Bytes) == 0, "unwatching pages retained a successful collection");
+#ifdef _WIN32
+    const Runs restored{{base, base + Block}};
+    Rewatch(restored);
+    Require(CollectWrites(base, PartlyCommitted::Bytes) != 0, "rewatching pages retained a failed collection");
+#endif
+}
+
 void CheckAdoptLatestEpoch() {
     std::uint64_t bumped = 0;
     std::thread([&] {
@@ -1952,7 +1981,7 @@ void CheckAdoptLatestEpoch() {
     Require(keptOwn, "adopting the newest collect epoch moved a thread off its own");
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
         if (std::wstring_view(GetCommandLineW()).ends_with(L"--metadata-commit")) {
@@ -1962,6 +1991,10 @@ int main() {
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--failed-collect-memo") {
+            CheckFailedCollectMemo();
+            return 0;
         }
 #ifdef _WIN32
         if (std::wstring_view(GetCommandLineW()).ends_with(HostHoleMode)) {

@@ -4683,7 +4683,48 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
 }
 
 void ShaderResources::PrecollectSurfaces() const {
-    for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) {
+        for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
+        return;
+    }
+    struct Counts {
+        std::uint64_t calls = 0;
+        std::uint64_t ranges = 0;
+        std::uint64_t failed = 0;
+        std::uint64_t requested = 0;
+        std::uint64_t walked = 0;
+        double succeededMs = 0;
+        double failedMs = 0;
+    };
+    static thread_local std::array<Counts, 3> counts{};
+    static thread_local auto reportedAt = std::chrono::steady_clock::now();
+    const auto packet = GuestMemory::CurrentPacket();
+    auto& count = counts[packet.opcode == 0x15 ? 0 : packet.opcode == 0x16 ? 1 : 2];
+    ++count.calls;
+    const auto walked = GuestMemory::ThreadCollectedBytes();
+    for (const auto& range : describedRanges) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto generation = GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        ++count.ranges;
+        count.requested += range.bytes;
+        if (generation == 0) {
+            ++count.failed;
+            count.failedMs += ms;
+        } else count.succeededMs += ms;
+    }
+    count.walked += GuestMemory::ThreadCollectedBytes() - walked;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reportedAt < std::chrono::seconds(10)) return;
+    reportedAt = now;
+    constexpr std::array<const char*, 3> names{"direct", "indirect", "other"};
+    for (std::size_t kind = 0; kind < counts.size(); ++kind) {
+        const auto& total = counts[kind];
+        if (total.calls == 0) continue;
+        std::fprintf(stderr, "[precollect] queue 0x%x %s (10 s, %llu calls): %llu ranges (%llu unavailable), requested %.1f MiB, walked %.1f MiB; us per call: succeeded %.1f unavailable %.1f\n", packet.queue, names[kind], static_cast<unsigned long long>(total.calls), static_cast<unsigned long long>(total.ranges), static_cast<unsigned long long>(total.failed), static_cast<double>(total.requested) / 1048576.0, static_cast<double>(total.walked) / 1048576.0, total.succeededMs * 1000.0 / static_cast<double>(total.calls), total.failedMs * 1000.0 / static_cast<double>(total.calls));
+    }
+    counts = {};
 }
 
 void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags) {
