@@ -4975,7 +4975,7 @@ void verifyPixelRequestSerialization() {
     minimal.context.pixel->layerExported = true;
     minimal.context.pixel->ditheredAlphaToCoverage = true;
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQScAAAA=", "new requests did not use serialization version 39");
+    require(requestPrefix(encoded, 8u) == "NVNQQSgAAAA=", "new requests did not use serialization version 40");
     const std::array<std::uint32_t, 2> fallbacks{0x40u, 0x1ac4u};
     auto withFallbacks = minimal;
     withFallbacks.context.linkedCallFallbacks = fallbacks;
@@ -5093,7 +5093,7 @@ void verifyPixelRequestSerialization() {
     for (std::size_t bytes = 0; bytes < 45u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export, dither or front-face flag, quad pixel mask or quad sample mask was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQSgAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQSkAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
     static constexpr std::string_view version18Request{
@@ -5399,6 +5399,9 @@ void verifyMergedHullConfiguration() {
     require(replay.request.graphics.has_value() && replay.request.graphics->tessellation.has_value() && replay.request.graphics->tessellation->mergedHull, "a merged hull configuration was lost in serialization");
     require(!serializer.Deserialize(separate).request.graphics->tessellation->mergedHull, "a separate hull configuration was read as merged");
     auto legacy = decodeBase64(merged);
+    constexpr std::array<std::uint8_t, 10> drawParameters{0xffu, 0xffu, 0xffu, 0xffu, 0u, 0u, 0xffu, 0xffu, 0xffu, 0xffu};
+    require(legacy.size() > 40u && std::ranges::equal(std::span(legacy).subspan(legacy.size() - 40u, 10u), drawParameters), "the graphics draw parameters do not have their version 40 defaults");
+    legacy.erase(legacy.end() - 40, legacy.end() - 30);
     require(legacy.size() > 52u && legacy[legacy.size() - 52u] == 1u, "the merged hull flag is not the last byte of the tessellation configuration");
     legacy.erase(legacy.end() - 52);
     for (const auto version : {30u, 31u, 32u, 34u, 35u, 36u, 37u, 38u}) {

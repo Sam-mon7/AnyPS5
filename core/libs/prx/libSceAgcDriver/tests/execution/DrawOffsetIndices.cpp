@@ -357,7 +357,7 @@ public:
         return info;
     }
 
-    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, std::int32_t vertexSgpr = BaseVertexSgpr, std::int32_t instanceSgpr = StartInstanceSgpr) const {
+    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, std::int32_t vertexSgpr = BaseVertexSgpr, std::int32_t instanceSgpr = StartInstanceSgpr, bool fromBase = false) const {
         const auto info = VertexInfo();
         const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
             {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
@@ -370,6 +370,14 @@ public:
             {0, 0, 0, 64}
         };
         request.useCache = false;
+        if (fromBase) {
+            request.graphics = ShaderRecompiler::GraphicsCompileContext{};
+            request.graphics->firstUserSgpr = 8;
+            request.graphics->instanceFromBase = true;
+            request.graphics->baseInstanceSgpr = static_cast<std::int32_t>(StartInstanceSgpr);
+            request.graphics->vertexFromBase = true;
+            request.graphics->baseVertexSgpr = static_cast<std::int32_t>(BaseVertexSgpr);
+        }
         auto result = ShaderRecompiler::Recompile(request);
         Require(result.vertexOffsetSgpr == vertexSgpr && result.instanceOffsetSgpr == instanceSgpr, "the program folded vertex " + std::to_string(result.vertexOffsetSgpr) + ", instance " + std::to_string(result.instanceOffsetSgpr) + " into the draw, expected " + std::to_string(vertexSgpr) + ", " + std::to_string(instanceSgpr));
         return result;
@@ -718,6 +726,19 @@ std::string Run(Fixture& fixture) {
             fixture.Draw(vertex, draw);
             failures += fixture.Check(what + ", drawn in place on the GPU", bufferIndices, indexedRecord[3], indexedRecord[4], false);
             if (code == &NoCarryCode) std::cout << "no-carry indexed indirect GPU readback checked\n";
+        }
+        if (fixture.device->DrawIndirectSupport().drawParameters) {
+            const std::string what = "indexed indirect record whose program copies v5/v8 before its fetch adds, s16 and s17 its base vertex and start instance registers, vertex offset 700, start instance 59455";
+            AgcDriver::Pm4::DrawParameters draw{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+            draw.indirect = indexedIndirect;
+            draw.indirect->instanceFromBase = true;
+            draw.indirect->vertexFromBase = true;
+            const auto vertex = fixture.Vertex(VertexCode, staleUserData, -1, -1, true);
+            const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(), Program(staleUserData), Fixture::VertexInfo(), fixture.device, draw, false);
+            if (path || draw.indirect->vertexRule != Rule::InPlace || draw.indirect->instanceRule != Rule::InPlace) failures += what + ", offsets read from the draw parameters: classified to " + PathName(path) + ", expected the GPU with both offsets in place\n";
+            fixture.Place(indexedRecord[3], bufferIndices, indexedRecord[4]);
+            fixture.Draw(vertex, draw);
+            failures += fixture.Check(what + ", offsets read from the draw parameters on the GPU", bufferIndices, indexedRecord[3], indexedRecord[4], true);
         }
         {
             const std::string what = "indexed indirect record whose program never reads the registers its packet writes the offsets to, vertex offset 700, start instance 59455";
