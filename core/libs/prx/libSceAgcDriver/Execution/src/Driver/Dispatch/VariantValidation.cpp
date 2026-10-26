@@ -48,6 +48,7 @@ bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const S
                 std::lock_guard lock(validateMutex);
                 ++validateCounters.pending;
                 ++validateCounters.unsyncedMisses;
+                dataMissReasons[5].fetch_add(1, std::memory_order_relaxed);
             }
             return false;
         }

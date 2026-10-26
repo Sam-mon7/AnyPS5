@@ -413,6 +413,7 @@ private:
     EntryCounters entryCounters;
 
     std::atomic<std::uint64_t> dataPendingMisses{0};
+    std::array<std::atomic<std::uint64_t>, 6> dataMissReasons{};
 
     std::unordered_map<std::uint64_t, std::deque<std::uint64_t>> priorValueSets;
 

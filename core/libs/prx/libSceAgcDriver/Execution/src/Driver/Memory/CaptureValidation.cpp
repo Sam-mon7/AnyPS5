@@ -59,6 +59,8 @@ bool Driver::captureStable(std::span<const ShaderRecompiler::MemoryRegion> captu
 
 bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderRecompiler::RecompileResult& compiled, bool inPlace, const PendingView& view, bool* unmapped, std::optional<SampledReadScope>* sampling, const DataMask* data, std::span<const VouchedRegions> vouched) {
     using Policy = ShaderMemory::PendingWrite;
+    static const bool pendingDataHits = std::getenv("APS5_NO_PENDING_DATA_HITS") == nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
     thread_local std::vector<std::size_t>* pendingSlot = nullptr;
     auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
@@ -78,17 +80,20 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
         if (view.Overlaps(region.guestAddress, region.bytes.size())) pending.push_back(i);
     }
 
-    const auto compareMasked = [&](const ShaderRecompiler::MemoryRegion& region, std::size_t first) {
+    const auto compareMasked = [&](const ShaderRecompiler::MemoryRegion& region, std::size_t first, std::span<const std::byte> supplied = {}) {
         thread_local std::vector<std::byte>* liveSlot = nullptr;
         auto& live = ShaderRecompiler::ThreadOwned(liveSlot);
-        live.resize(region.bytes.size());
-        const auto copied = GuestMemory::CopyMapped(region.guestAddress, live);
-        if (copied != GuestMemory::Compare::Equal) return copied;
+        if (supplied.empty()) {
+            live.resize(region.bytes.size());
+            const auto copied = GuestMemory::CopyMapped(region.guestAddress, live);
+            if (copied != GuestMemory::Compare::Equal) return copied;
+            supplied = live;
+        }
         const auto count = region.bytes.size() / sizeof(std::uint32_t);
         for (std::size_t i = 0; i < count; ++i) {
             std::uint32_t stored = 0, fresh = 0;
             std::memcpy(&stored, region.bytes.data() + i * sizeof(std::uint32_t), sizeof(stored));
-            std::memcpy(&fresh, live.data() + i * sizeof(std::uint32_t), sizeof(fresh));
+            std::memcpy(&fresh, supplied.data() + i * sizeof(std::uint32_t), sizeof(fresh));
             if (stored == fresh) continue;
             const auto position = static_cast<std::uint32_t>(first + i);
             if (!std::binary_search(data->positions.begin(), data->positions.end(), position)) return GuestMemory::Compare::Differs;
@@ -131,7 +136,10 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
             bool same = false;
             bool masked = false;
             if (known) {
-                same = std::memcmp(knownBytes.data() + knownOffsets[next - 1], region.bytes.data(), region.bytes.size()) == 0;
+                const auto bytes = std::span<const std::byte>(knownBytes).subspan(knownOffsets[next - 1], region.bytes.size());
+                masked = pendingDataHits && !validateLegacy() && data != nullptr && policies[next - 1] == Policy::KnownValue;
+                same = std::memcmp(bytes.data(), region.bytes.data(), region.bytes.size()) == 0;
+                if (!same && masked) same = compareMasked(region, first, bytes) == GuestMemory::Compare::Equal;
                 if (!rawPending && policies[next - 1] == Policy::VerifyKnownValue) {
                     const bool synced = GuestMemory::EqualsCommitted(region.guestAddress, region.bytes);
                     if (synced != same) ++knownMismatches;
@@ -152,14 +160,17 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
                 if (Graphics::Recorder::ThreadHookWaits() != hookWaitsAtCopy) observable.push_back(next - 1);
             }
             if (!same) {
-                if (data != nullptr && !masked) dataPendingMisses.fetch_add(1, std::memory_order_relaxed);
+                if (profile && data != nullptr) {
+                    if (!masked) dataPendingMisses.fetch_add(1, std::memory_order_relaxed);
+                    const auto reason = masked ? 0u : known ? 1u : isPending && rawPending ? 2u : isPending ? 3u : 4u;
+                    dataMissReasons[reason].fetch_add(1, std::memory_order_relaxed);
+                }
                 return false;
             }
         }
         return true;
     };
     if (pending.empty()) return compare(false);
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const bool verify = validateSkipVerify();
     std::optional<SampledReadScope> ownSampling;
     auto& sample = sampling != nullptr ? *sampling : ownSampling;
