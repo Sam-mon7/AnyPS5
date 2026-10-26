@@ -586,6 +586,100 @@ void replacedEntryTests(Context context) {
     std::puts("template over a replaced sampled cache entry passed");
 }
 
+void pendingScanTests(Context context) {
+    context.hostImportAlignment = 0;
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context, BlockBytes);
+    const auto base = surface.Address();
+    struct Discard {
+        std::uint64_t base;
+        ~Discard() { StorageTexture::DiscardPendingInside(base, BlockBytes); }
+    } discard{base};
+    const auto make = [&](std::size_t offset, std::uint32_t side = Side) {
+        return StorageTexture::Create(context, *context.detiler, Resource(base + offset * SurfaceBytes, side), 0);
+    };
+    auto left = make(0);
+    auto wide = make(2, 512);
+    auto narrow = make(2);
+    auto nested = make(3, 128);
+    auto right = make(10);
+    auto late = make(8);
+    std::vector<std::shared_ptr<StorageTexture>> registered{right, wide, narrow, left, nested};
+    for (const auto& image : registered) image->MarkDirty();
+    std::vector<StorageTexture::PendingQuery> queries;
+    const auto add = [&](std::uint64_t begin, std::uint64_t end, const StorageTexture* except = nullptr, const StorageTexture* pending = nullptr) {
+        queries.push_back({begin, end, except, pending, true, right.get()});
+    };
+    add(base, base);
+    add(base + 32, base);
+    add(base - 64, base);
+    add(base + BlockBytes, base + BlockBytes + 64);
+    add(base, base + SurfaceBytes, left.get(), left.get());
+    add(base + SurfaceBytes, base + 2 * SurfaceBytes);
+    add(base + 2 * SurfaceBytes, base + 3 * SurfaceBytes, wide.get(), wide.get());
+    add(base + 2 * SurfaceBytes, base + 3 * SurfaceBytes, narrow.get(), narrow.get());
+    add(base + 3 * SurfaceBytes + 16, base + 3 * SurfaceBytes + 32);
+    add(base + 5 * SurfaceBytes, base + 5 * SurfaceBytes + 64);
+    add(base + 6 * SurfaceBytes, base + 8 * SurfaceBytes);
+    add(base + 8 * SurfaceBytes, base + 9 * SurfaceBytes, nullptr, late.get());
+    add(base + 10 * SurfaceBytes, base + 11 * SurfaceBytes, right.get(), right.get());
+    add(base, base + BlockBytes);
+    const auto check = [&] {
+        auto expected = queries;
+        bool identities = true;
+        for (auto& query : expected) {
+            query.overlaps = false;
+            query.found = nullptr;
+            if (query.end <= query.begin) continue;
+            for (const auto& image : registered) {
+                const auto begin = image->Descriptor().baseAddress;
+                const auto end = begin + image->GuestBytes();
+                if (query.found == nullptr && begin == query.begin && end >= query.end) query.found = image.get();
+                if (image.get() != query.except && begin < query.end && query.begin < end) query.overlaps = true;
+            }
+            if (query.pending != nullptr && query.pending != query.found) identities = false;
+        }
+        Require(StorageTexture::ScanPending(queries) == identities, "the pending scan accepted a changed image identity");
+        for (std::size_t i = 0; i < queries.size(); ++i) {
+            Require(queries[i].overlaps == expected[i].overlaps, "the pending scan missed an overlap for query " + std::to_string(i));
+            Require(queries[i].found == expected[i].found, "the pending scan changed registration order for query " + std::to_string(i));
+        }
+        for (auto& query : expected) query.pending = query.found;
+        Require(StorageTexture::ScanPending(expected), "the pending scan rejected unchanged image identities");
+    };
+    check();
+    check();
+    late->MarkDirty();
+    registered.push_back(late);
+    check();
+    Require(StorageTexture::DiscardPendingInside(base + 2 * SurfaceBytes, SurfaceBytes) >= 1 && !narrow->Dirty() && wide->Dirty(), "the pending scan fixture did not remove its narrow image while retaining the wider one");
+    std::erase(registered, narrow);
+    check();
+    StorageTexture::DiscardPendingInside(base, BlockBytes);
+    registered.clear();
+    check();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto program = SampledProgram(base + 8 * SurfaceBytes);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_unique<ShaderResources>(context, shader);
+    Require(resources->Reusable() && !resources->SampledTextures().front()->ViewsStorageImage(), "the pending scan resource fixture is not a reusable snapshot");
+    Require(resources->Revalidate(shader), "the pending scan resource fixture did not prove current");
+    late->MarkDirty();
+    Require(!resources->Revalidate(shader), "a cached snapshot accepted newly pending storage results");
+    StorageTexture::DiscardPendingInside(base, BlockBytes);
+    ClearCachedTextures(context.device);
+    resources = std::make_unique<ShaderResources>(context, shader);
+    Require(resources->Revalidate(shader), "the rebuilt pending scan resource fixture did not prove current");
+    const std::byte changed{0x77};
+    AgcDriver::GuestMemory::Write(base + 8 * SurfaceBytes + 32, std::span(&changed, 1));
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Require(!resources->Revalidate(shader), "a cached snapshot accepted changed guest bytes after a pending scan");
+    std::puts("pending image scan and resource invalidation tests passed");
+}
+
 bool lookupChangedTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -1231,6 +1325,11 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             replacedEntryTests(context);
             std::puts("resource cache replaced entry tests passed");
+            return 0;
+        }
+        if (mode == "pending-scan") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            pendingScanTests(context);
             return 0;
         }
         if (mode == "resource-lookup-changed") {

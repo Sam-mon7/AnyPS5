@@ -117,6 +117,7 @@ std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, sta
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
+std::atomic<std::uint64_t> pendingScanCalls{0}, pendingScanQueries{0}, pendingScanCandidates{0}, pendingScanSkipped{0}, pendingIndexBuilds{0};
 
 struct StorageTraffic {
     AgcDriver::Mutex mutex;
@@ -173,6 +174,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] pending scan (10 s): %llu calls, %llu queries, %llu candidate images examined, %llu image visits skipped by index, %llu index rebuilds\n", take(pendingScanCalls), take(pendingScanQueries), take(pendingScanCandidates), take(pendingScanSkipped), take(pendingIndexBuilds));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.drawnStores.clear();
@@ -1490,12 +1492,29 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
 
 namespace {
 
+bool PendingImageIndexEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_PENDING_IMAGE_INDEX") == nullptr;
+    return enabled;
+}
+
 class PendingList {
 public:
     using iterator = std::vector<StorageTexture*>::iterator;
     using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     iterator begin() { return textures.begin(); }
     iterator end() { return textures.end(); }
+    std::size_t size() const { return textures.size(); }
+    struct Candidate {
+        StorageTexture* texture;
+        std::size_t order;
+        std::uint64_t prefixEnd;
+    };
+    std::span<const Candidate> Candidates(std::uint64_t begin, std::uint64_t end) {
+        if (indexed != version) rebuild();
+        const auto first = std::upper_bound(candidates.begin(), candidates.end(), begin, [](std::uint64_t address, const Candidate& candidate) { return address < candidate.prefixEnd; });
+        const auto last = std::lower_bound(first, candidates.end(), end, [](const Candidate& candidate, std::uint64_t address) { return candidate.texture->Descriptor().baseAddress < address; });
+        return {first, last};
+    }
     void push_back(StorageTexture* texture) {
         textures.push_back(texture);
         changed();
@@ -1537,8 +1556,25 @@ private:
 
     void rebuild() {
         ranges.clear();
-        for (const auto* texture : textures) ranges.emplace_back(texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
-        std::sort(ranges.begin(), ranges.end());
+        if (PendingImageIndexEnabled()) {
+            candidates.clear();
+            for (std::size_t i = 0; i < textures.size(); ++i) candidates.push_back({textures[i], i, 0});
+            std::sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) {
+                return left.texture->Descriptor().baseAddress < right.texture->Descriptor().baseAddress;
+            });
+            std::uint64_t prefixEnd = 0;
+            for (auto& candidate : candidates) {
+                const auto begin = candidate.texture->Descriptor().baseAddress;
+                const auto end = begin + candidate.texture->GuestBytes();
+                ranges.emplace_back(begin, end);
+                prefixEnd = std::max(prefixEnd, end);
+                candidate.prefixEnd = prefixEnd;
+            }
+            if (LookupOutcomes::Profiled()) pendingIndexBuilds.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            for (const auto* texture : textures) ranges.emplace_back(texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
+            std::sort(ranges.begin(), ranges.end());
+        }
         std::size_t merged = 0;
         for (const auto& range : ranges) {
             if (merged != 0 && range.first <= ranges[merged - 1].second) ranges[merged - 1].second = std::max(ranges[merged - 1].second, range.second);
@@ -1549,6 +1585,7 @@ private:
         published.store(std::make_shared<const Snapshot>(Snapshot{version, ranges}), std::memory_order_release);
     }
     std::vector<StorageTexture*> textures;
+    std::vector<Candidate> candidates;
     Ranges ranges;
     std::uint64_t version = 0;
     std::uint64_t indexed = ~std::uint64_t{0};
@@ -4995,13 +5032,35 @@ void StorageTexture::BumpPendingSerial() {
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
+    const bool indexed = PendingImageIndexEnabled();
+    const bool profile = LookupOutcomes::Profiled();
+    if (profile) {
+        pendingScanCalls.fetch_add(1, std::memory_order_relaxed);
+        pendingScanQueries.fetch_add(queries.size(), std::memory_order_relaxed);
+    }
     bool identities = true;
     for (auto& query : queries) {
         query.overlaps = false;
         query.found = nullptr;
         if (query.end <= query.begin) continue;
         const auto bytes = static_cast<std::size_t>(query.end - query.begin);
-        if (pending.textures.MayOverlap(query.begin, bytes)) {
+        if (indexed) {
+            const auto candidates = pending.textures.Candidates(query.begin, query.end);
+            auto foundOrder = pending.textures.size();
+            for (const auto& candidate : candidates) {
+                const auto* texture = candidate.texture;
+                if (candidate.order < foundOrder && texture->descriptor.baseAddress == query.begin && texture->guestBytes >= bytes) {
+                    query.found = texture;
+                    foundOrder = candidate.order;
+                }
+                if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
+            }
+            if (profile) {
+                pendingScanCandidates.fetch_add(candidates.size(), std::memory_order_relaxed);
+                if (!candidates.empty()) pendingScanSkipped.fetch_add(pending.textures.size() - candidates.size(), std::memory_order_relaxed);
+            }
+        } else if (pending.textures.MayOverlap(query.begin, bytes)) {
+            if (profile) pendingScanCandidates.fetch_add(pending.textures.size(), std::memory_order_relaxed);
             for (const auto* texture : pending.textures) {
                 if (query.found == nullptr && texture->descriptor.baseAddress == query.begin && texture->guestBytes >= bytes) query.found = texture;
                 if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
