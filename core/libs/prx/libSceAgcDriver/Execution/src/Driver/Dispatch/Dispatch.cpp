@@ -63,7 +63,7 @@ void notePrologueSplit(bool indirect, const std::array<std::chrono::steady_clock
         const auto count = reported.dispatches.exchange(0, std::memory_order_relaxed);
         std::array<double, 6> us{};
         for (std::size_t index = 0; index < us.size(); ++index) us[index] = count == 0 ? 0.0 : static_cast<double>(reported.nanoseconds[index].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(count);
-        std::fprintf(stderr, "[dispatch] prologue split %s (10 s, %llu dispatches), us per dispatch: before the handler %.1f, shader lookup %.1f, state decode %.1f, resolve and fill-ahead %.1f, kernel matchers %.1f, request %.1f\n", kind == 0 ? "direct" : "indirect", static_cast<unsigned long long>(count), us[0], us[1], us[2], us[3], us[4], us[5]);
+        std::fprintf(stderr, "[dispatch] prologue split queue 0 %s (10 s, %llu dispatches), us per dispatch: before the handler %.1f, shader lookup %.1f, state decode %.1f, resolve and fill-ahead %.1f, kernel matchers %.1f, request %.1f\n", kind == 0 ? "direct" : "indirect", static_cast<unsigned long long>(count), us[0], us[1], us[2], us[3], us[4], us[5]);
     }
 }
 
@@ -234,7 +234,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     auto phaseLap = lap;
     DispatchPhaseTiming phaseTiming{profile, lap, phaseMs, phaseLap};
     if (profile && packetStartedAt() != std::chrono::steady_clock::time_point{}) phaseMs[PhasePrologue] = std::chrono::duration<double, std::milli>(lap - packetStartedAt()).count();
-    if (profileSplit && packetStartedAt() != std::chrono::steady_clock::time_point{} && packetStartedAt() <= splitMarks[1]) {
+    if (profileSplit && submission.queue == 0 && !resolving && !fromAhead && packetStartedAt() != std::chrono::steady_clock::time_point{} && packetStartedAt() <= splitMarks[1]) {
         splitMarks[0] = packetStartedAt();
         splitMarks[6] = lap;
         notePrologueSplit(indirectAtEntry, splitMarks);
