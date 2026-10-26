@@ -18,11 +18,18 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <span>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+}
 
 namespace {
 
@@ -62,12 +69,17 @@ std::string Hex(std::uint32_t value) {
 
 class GuestBlock {
 public:
-    explicit GuestBlock(bool watched) {
+    explicit GuestBlock(bool watched, bool resident = false) {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
+        if (block != nullptr && resident) {
+            section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, BlockBytes, nullptr);
+            Require(section != nullptr, "one-slice alias: cannot create the resident backing");
+            GuestArena::GuestArenaMapDirect_nid_postfix(block, BlockBytes, section, 0, PAGE_READWRITE);
+        } else if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
         static_cast<void>(watched);
 #else
+        static_cast<void>(resident);
         constexpr std::uintptr_t alignment = 65536;
         void* mapped = mmap(nullptr, BlockBytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
@@ -89,6 +101,10 @@ public:
 #ifdef _WIN32
         GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
         GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
+        if (section != nullptr) {
+            GuestArena::GuestArenaForgetSection_nid_postfix(section);
+            CloseHandle(section);
+        }
 #else
         munmap(block, BlockBytes);
         GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes);
@@ -102,6 +118,9 @@ public:
 
 private:
     std::uint8_t* block = nullptr;
+#ifdef _WIN32
+    HANDLE section = nullptr;
+#endif
 };
 
 std::array<std::uint32_t, 8> TextureDescriptor(const std::uint8_t* texels, std::uint32_t type) {
@@ -162,6 +181,35 @@ void RequireOutput(std::uint32_t expected, const std::string& what) {
     }
 }
 
+void CheckCpuRefresh(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
+    using namespace AgcDriver::GuestMemory;
+    const std::lock_guard gpu(GpuMutex());
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    BumpCollectEpoch();
+    const auto resource = AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(texels, Type2D));
+    auto image = AgcDriver::Graphics::CachedStorageSurface(AgcDriver::VulkanDeviceTestAccess::ContextOf(device), resource);
+    BumpCollectEpoch();
+    Require(image->Refresh(), "a newly uploaded target did not refresh unchanged");
+    const auto generation = WriteGeneration();
+    for (int epoch = 0; epoch < 3; ++epoch) {
+        BumpCollectEpoch();
+        Require(image->Refresh(), "a clean target changed across refresh epochs");
+    }
+#ifdef _WIN32
+    if (std::getenv("APS5_TARGET_CLEAN_PROOF") != nullptr) Require(WriteGeneration() == generation, "the clean target still walked its pages on refresh");
+#else
+    static_cast<void>(generation);
+#endif
+    const auto version = image->Version();
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, 0x34343434u);
+    BumpCollectEpoch();
+    Require(!image->Refresh() && image->Version() != version, "a CPU write was missed by the target refresh proof");
+    LoadArray(device, texels);
+    RequireOutput(0x34343434u, "CPU-written texels after a clean target proof");
+    image.reset();
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+}
+
 void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool watched) {
     const auto surface = AddressOf(texels);
     std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
@@ -198,6 +246,10 @@ int main() {
         if (!device) return VulkanTestSkipped;
         if (!watched) std::puts("guest memory has no write watch: only the texels read through the array are checked");
         Run(*device, block.Data(), watched);
+        if (watched) {
+            GuestBlock resident(true, true);
+            CheckCpuRefresh(*device, resident.Data());
+        }
         std::puts("storage one-slice alias tests passed");
         return 0;
     } catch (const std::exception& error) {

@@ -1957,6 +1957,86 @@ void CheckFailedCollectMemo() {
 #endif
 }
 
+#ifdef _WIN32
+void CheckTargetCleanProof() {
+    constexpr std::size_t bytes = 4 * Block;
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * bytes, Block));
+    struct Cleanup {
+        std::uint8_t* memory;
+        HANDLE section = nullptr;
+        ~Cleanup() {
+            GuestArena::GuestArenaReset_nid_postfix(memory, 2 * bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, 2 * bytes);
+            if (section != nullptr) {
+                GuestArena::GuestArenaForgetSection_nid_postfix(section);
+                CloseHandle(section);
+            }
+        }
+    } cleanup{memory};
+    Require(memory != nullptr, "cannot reserve the clean proof fixture");
+    cleanup.section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(cleanup.section != nullptr, "cannot create the clean proof backing");
+    GuestArena::GuestArenaMapDirect_nid_postfix(memory, bytes, cleanup.section, 0, PAGE_READWRITE);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::array<UnchangedQuery, 2> queries{{{base + 1, 3 * Block - 2, 0}, {base + 3 * Block, Block, 0}}};
+    const auto baseline = [&] {
+        const auto generation = CollectWritesUncached(base, bytes);
+        Require(generation != 0, "the clean proof fixture is not collected");
+        for (auto& query : queries) query.generation = generation;
+    };
+    Require(!UnchangedSinceClean(queries), "a new target without a generation was proved clean");
+    baseline();
+    const auto unchanged = WriteGeneration();
+    for (int epoch = 0; epoch < 3; ++epoch) {
+        BumpCollectEpoch();
+        Require(UnchangedSinceClean(queries), "a resident clean target was not proved across epochs");
+    }
+    Require(WriteGeneration() == unchanged, "a clean proof performed a resetting collect");
+    for (const auto offset : {std::size_t{1}, Block + 4097, 3 * Block - 2, 3 * Block + 17}) {
+        static_cast<volatile std::uint8_t*>(memory)[offset] = 0x31;
+        BumpCollectEpoch();
+        Require(!UnchangedSinceClean(queries) && !UnchangedSinceClean(queries), "a target or DCC CPU write was missed or consumed by the clean query");
+        const auto collected = CollectWritesUncached(base, bytes);
+        Require(collected != 0 && !UnchangedSinceClean(queries), "a CPU write consumed by another collector was missed");
+        for (auto& query : queries) query.generation = collected;
+        Require(UnchangedSinceClean(queries), "the refreshed target was not clean after its CPU write");
+    }
+    for (std::size_t offset = 0; offset < bytes; offset += 4096) static_cast<volatile std::uint8_t*>(memory)[offset] = 0x42;
+    Require(!UnchangedSinceClean(queries), "a full write-watch result buffer was interpreted as clean");
+    baseline();
+    std::thread([&] { MarkWritten(base + Block, 4); }).join();
+    Require(!UnchangedSinceClean(queries), "a GPU or DMA write stamp from another thread was missed");
+    baseline();
+    MarkPossiblyWritten(base + 3 * Block, 4);
+    Require(!UnchangedSinceClean(queries), "a possible DCC write was missed");
+    baseline();
+    GuestArena::GuestArenaMapDirect_nid_postfix(memory, bytes, cleanup.section, 0, PAGE_READWRITE);
+    Require(!UnchangedSinceClean(queries), "a remapped target retained its clean proof");
+    baseline();
+    GuestArena::GuestArenaMapDirect_nid_postfix(memory + bytes, bytes, cleanup.section, 0, PAGE_READWRITE);
+    baseline();
+    Require(UnchangedSinceClean(queries), "an armed shared target was not clean");
+    Require(GuestArena::GuestArenaHandleWrite_nid_postfix(base + bytes + Block), "the writable alias was not armed");
+    static_cast<volatile std::uint8_t*>(memory)[bytes + Block] = 0x53;
+    Require(memory[Block] == 0x53 && !UnchangedSinceClean(queries), "a CPU store through a different guest alias was missed");
+    baseline();
+    {
+        GuestArena::HostWrite write(memory, bytes);
+        Require(write.Open() && !UnchangedSinceClean(queries), "an open host write was proved clean");
+    }
+    baseline();
+    GuestArena::GuestArenaPinWritable_nid_postfix(memory, bytes);
+    Require(!UnchangedSinceClean(queries), "a pinned writable alias was proved clean");
+    GuestArena::GuestArenaUnpinWritable_nid_postfix(memory, bytes);
+    baseline();
+    Unwatch(base, Block);
+    Require(!UnchangedSinceClean(queries), "an unwatched target was proved clean");
+    Require(!UnchangedSinceClean({}), "an empty clean proof was accepted");
+    const std::array<UnchangedQuery, 1> overflow{{{UINT64_MAX - 1, 4, 1}}};
+    Require(!UnchangedSinceClean(overflow), "an overflowing clean proof was accepted");
+}
+#endif
+
 void CheckAdoptLatestEpoch() {
     std::uint64_t bumped = 0;
     std::thread([&] {
@@ -1997,6 +2077,10 @@ int main(int argc, char** argv) {
             return 0;
         }
 #ifdef _WIN32
+        if (std::wstring_view(GetCommandLineW()).ends_with(L"--target-clean-proof")) {
+            CheckTargetCleanProof();
+            return 0;
+        }
         if (std::wstring_view(GetCommandLineW()).ends_with(HostHoleMode)) {
             CheckHostHole();
             return 0;

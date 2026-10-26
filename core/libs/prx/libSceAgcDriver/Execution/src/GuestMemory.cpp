@@ -1924,6 +1924,28 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     return true;
 }
 
+bool UnchangedSinceClean(std::span<const UnchangedQuery> queries) {
+#ifdef _WIN32
+    if (queries.empty()) return false;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return false;
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto committed = GuestArena::GuestArenaCommitGeneration_nid_postfix();
+    const auto forgotten = ForgetSerial();
+    if ((forgotten & 1) != 0) return false;
+    for (const auto& [address, bytes, generation] : queries) {
+        if (generation == 0 || bytes == 0 || bytes > UINT64_MAX - address || !tracker.covers(address, bytes)) return false;
+        if (!tracker.rangeUnchanged(address, bytes, generation) || !GuestArena::GuestArenaWritesClean_nid_no_patch(static_cast<std::uintptr_t>(address), bytes)) return false;
+    }
+    return mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && committed == GuestArena::GuestArenaCommitGeneration_nid_postfix() && forgotten == ForgetSerial();
+#else
+    static_cast<void>(queries);
+    return false;
+#endif
+}
+
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
     ranges.clear();
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !WriteWatched()) return 0;

@@ -2,9 +2,12 @@
 #define CORE_LIBS_PRX_LIBC_INCLUDE_WINDOWSMAPPINGS_HPP
 
 #ifdef _WIN32
+#include "prx/libc/include/GuestArena.hpp"
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
 #endif
@@ -440,7 +443,41 @@ public:
         return true;
     }
 
+    static WriteWatchTiming ThreadTiming() {
+        return timing;
+    }
+
+    bool WritesClean(std::uintptr_t address, std::size_t bytes) {
+        const CollectTimer timer;
+        std::lock_guard lock(mutex);
+        if (bytes == 0 || address + bytes < address || address + bytes > UINTPTR_MAX - 4095) return false;
+        const auto end = (address + bytes + 4095) & ~std::uintptr_t{4095};
+        address &= ~std::uintptr_t{4095};
+        const auto fresh = freshRanges.upper_bound(address);
+        if ((fresh != freshRanges.begin() && std::prev(fresh)->second > address) || (fresh != freshRanges.end() && fresh->first < end)) return false;
+        for (auto cursor = address; cursor < end;) {
+            const auto clean = cleanRanges.upper_bound(cursor);
+            if (clean != cleanRanges.begin() && std::prev(clean)->second > cursor) {
+                cursor = std::min(end, std::prev(clean)->second);
+                continue;
+            }
+            if (!watchResident) return false;
+            const auto next = residentRuns.upper_bound(cursor);
+            if (next == residentRuns.begin()) return false;
+            const auto run = std::prev(next);
+            if (run->second.end <= cursor) return false;
+            const auto stop = std::min(end, run->second.end);
+            void* page = nullptr;
+            ULONG_PTR count = 1;
+            DWORD granularity = 0;
+            if (queryWrites(0, reinterpret_cast<void*>(cursor), stop - cursor, &page, &count, &granularity) != 0 || count != 0) return false;
+            cursor = stop;
+        }
+        return true;
+    }
+
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
+        const CollectTimer timer;
         std::lock_guard lock(mutex);
         const auto capacity = *count;
         *count = 0;
@@ -587,7 +624,7 @@ public:
                 const auto touched = (((stop + 4095) & ~static_cast<std::uintptr_t>(4095)) - (cursor & ~static_cast<std::uintptr_t>(4095))) / 4096;
                 ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, touched);
                 DWORD granularity = 0;
-                if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect private guest writes");
+                if (queryWrites(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect private guest writes");
                 *count += available;
                 if (*count == capacity) return true;
                 cursor = stop;
@@ -706,12 +743,37 @@ private:
         return (run.collected[bit >> 6] >> (bit & 63) & 1) != 0;
     }
 
+    static bool profileWrites() {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        return profile;
+    }
+
+    static inline thread_local WriteWatchTiming timing;
+
+    struct CollectTimer {
+        bool profile = profileWrites();
+        std::chrono::steady_clock::time_point start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        double queryBefore = profile ? timing.queryUs : 0;
+
+        ~CollectTimer() {
+            if (profile) timing.walkUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() - (timing.queryUs - queryBefore);
+        }
+    };
+
+    static UINT queryWrites(DWORD flags, void* address, SIZE_T bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
+        if (!profileWrites()) return GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        const auto start = std::chrono::steady_clock::now();
+        const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        timing.queryUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        return result;
+    }
+
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         const auto first = from & ~std::uintptr_t{4095};
         if (run.fresh == 0 && collection != Collection::Fresh) {
             ULONG_PTR reported = (stop - first + 4095) / 4096;
             DWORD granularity = 0;
-            if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, pages + *count, &reported, &granularity) != 0) fail("collect resident guest writes");
+            if (queryWrites(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, pages + *count, &reported, &granularity) != 0) fail("collect resident guest writes");
             for (ULONG_PTR index = 0; index < reported; ++index) pages[*count + index] = reinterpret_cast<void*>(std::max(from, reinterpret_cast<std::uintptr_t>(pages[*count + index])));
             *count += reported;
             return;
@@ -721,7 +783,7 @@ private:
             std::vector<void*> found((stop - first + 4095) / 4096);
             ULONG_PTR reported = found.size();
             DWORD granularity = 0;
-            if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, found.data(), &reported, &granularity) != 0) fail("collect resident guest writes");
+            if (queryWrites(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, found.data(), &reported, &granularity) != 0) fail("collect resident guest writes");
             for (ULONG_PTR index = 0; index < reported; ++index) written.push_back(reinterpret_cast<std::uintptr_t>(found[index]));
         }
         auto next = written.begin();

@@ -20,6 +20,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include "ThreadOwned.hpp"
@@ -605,8 +606,24 @@ struct DrawOutcome {
 enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindCount };
 constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA"};
 
+struct TargetLookupProfile {
+    ColorTarget color{};
+    GuestTextureResource storage{};
+    std::uint64_t storageBytes = 0;
+    std::uint32_t storageLayers = 0;
+    std::uint64_t lookups = 0;
+    std::uint64_t slow = 0;
+    std::uint64_t pages = 0;
+    std::uint64_t clean = 0;
+    double us = 0;
+    double slowUs = 0;
+    std::array<double, 9> steps{};
+    std::array<double, 9> slowSteps{};
+};
+
 struct DrawProfile {
     AgcDriver::Mutex mutex;
+    std::map<std::array<std::uint64_t, 13>, TargetLookupProfile> targets;
     std::array<double, KindCount> kindUs{};
     std::array<std::uint64_t, KindCount> kindCounts{};
     std::uint64_t fullScissorLookups = 0;
@@ -782,6 +799,17 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+    std::vector<const TargetLookupProfile*> targets;
+    for (const auto& [key, target] : profile.targets) targets.push_back(&target);
+    std::sort(targets.begin(), targets.end(), [](const auto* left, const auto* right) { return left->us > right->us; });
+    for (std::size_t i = 0; i < std::min<std::size_t>(targets.size(), 8); ++i) {
+        const auto& target = *targets[i];
+        const auto& color = target.color;
+        AgcDriver::ProfilePrint_nid_no_patch("[resident-target] rank %zu/%zu 0x%llx+0x%zx %ux%u format %u tile %u xor %u DCC 0x%llx layers %u slice %u depth %u mip %u samples %u: %llu lookups %.3f ms, >=1ms %llu %.3f ms, pages %llu, clean proofs %llu; ms wait %.3f proof %.3f collect %.3f DCC %.3f flush %.3f validate %.3f other %.3f; nested write-watch query %.3f map/walk %.3f\n", i + 1, targets.size(), static_cast<unsigned long long>(color.address), color.bytes, color.extent.width, color.extent.height, static_cast<unsigned>(color.format), static_cast<unsigned>(color.tileMode), color.pipeBankXor, static_cast<unsigned long long>(color.dccAddress), color.layers, color.arraySlice, color.depth, color.mip, color.samples, static_cast<unsigned long long>(target.lookups), target.us / 1000, static_cast<unsigned long long>(target.slow), target.slowUs / 1000, static_cast<unsigned long long>(target.pages), static_cast<unsigned long long>(target.clean), target.steps[0], target.steps[1], target.steps[2], target.steps[3], target.steps[4], target.steps[5], target.steps[8], target.steps[6], target.steps[7]);
+        if (target.storageBytes != 0) AgcDriver::ProfilePrint_nid_no_patch("[resident-target] storage for 0x%llx: 0x%llx+0x%llx %ux%ux%u guest format %u tile %u DCC 0x%llx mips %u\n", static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(target.storage.baseAddress), static_cast<unsigned long long>(target.storageBytes), target.storage.width, target.storage.height, target.storageLayers, target.storage.format, static_cast<unsigned>(target.storage.tileMode), static_cast<unsigned long long>(target.storage.dccAddress), target.storage.mipCount);
+        if (target.slow != 0) AgcDriver::ProfilePrint_nid_no_patch("[resident-target] slow 0x%llx: ms wait %.3f proof %.3f collect %.3f DCC %.3f flush %.3f validate %.3f other %.3f; nested write-watch query %.3f map/walk %.3f\n", static_cast<unsigned long long>(color.address), target.slowSteps[0], target.slowSteps[1], target.slowSteps[2], target.slowSteps[3], target.slowSteps[4], target.slowSteps[5], target.slowSteps[8], target.slowSteps[6], target.slowSteps[7]);
+    }
+    profile.targets.clear();
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
@@ -1632,8 +1660,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
-    const auto lookupStart = std::chrono::steady_clock::now();
+    const auto lookupStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
+    std::optional<LookupOutcomes> before;
+    if (profile) before = ThreadLookupOutcomes();
+#ifdef _WIN32
+    const auto watchBefore = profile ? GuestArena::GuestArenaWriteWatchTiming_nid_no_patch() : GuestArena::WriteWatchTiming{};
+#endif
     std::shared_ptr<StorageTexture> resident;
     try {
         resident = lookup();
@@ -1653,7 +1686,42 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             outcome.slowLookupUs += lookupUs;
         }
         outcome.lookupUs += lookupUs;
-        outcome.pagesWalked += (GuestMemory::ThreadCollectedBytes() - walkedBefore) / 4096;
+        const auto pages = (GuestMemory::ThreadCollectedBytes() - walkedBefore) / 4096;
+        outcome.pagesWalked += pages;
+        const auto& after = ThreadLookupOutcomes();
+        constexpr std::array<LookupOutcomes::Kind, 6> kinds{LookupOutcomes::RefreshWait, LookupOutcomes::RefreshProofCheck, LookupOutcomes::RefreshCollect, LookupOutcomes::DccScan, LookupOutcomes::RefreshFlush, LookupOutcomes::RefreshValidate};
+        std::array<double, 9> steps{};
+        steps[8] = lookupUs / 1000;
+        for (std::size_t i = 0; i < kinds.size(); ++i) {
+            steps[i] = after.ms[kinds[i]] - before->ms[kinds[i]];
+            steps[8] -= steps[i];
+        }
+#ifdef _WIN32
+        const auto watchAfter = GuestArena::GuestArenaWriteWatchTiming_nid_no_patch();
+        steps[6] = (watchAfter.queryUs - watchBefore.queryUs) / 1000;
+        steps[7] = (watchAfter.walkUs - watchBefore.walkUs) / 1000;
+#endif
+        auto& stats = Profile();
+        {
+            const std::lock_guard lock(stats.mutex);
+            auto& target = stats.targets[{color.address, color.bytes, static_cast<std::uint64_t>(color.format), static_cast<std::uint64_t>(color.tileMode), color.dccAddress, color.layers, color.arraySlice, color.depth, color.mip, color.samples, color.extent.width, color.extent.height, color.pipeBankXor}];
+            target.color = color;
+            if (resident != nullptr) {
+                target.storage = resident->Descriptor();
+                target.storageBytes = resident->GuestBytes();
+                target.storageLayers = resident->ImageLayers();
+            }
+            ++target.lookups;
+            target.us += lookupUs;
+            target.pages += pages;
+            target.clean += after.counts[LookupOutcomes::CleanProof] - before->counts[LookupOutcomes::CleanProof];
+            for (std::size_t i = 0; i < steps.size(); ++i) target.steps[i] += steps[i];
+            if (lookupUs >= 1000) {
+                ++target.slow;
+                target.slowUs += lookupUs;
+                for (std::size_t i = 0; i < steps.size(); ++i) target.slowSteps[i] += steps[i];
+            }
+        }
         const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
         ++(fullScissor ? outcome.fullScissorLookups : outcome.partialLookups);
     }
