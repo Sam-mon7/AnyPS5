@@ -283,6 +283,10 @@ void Driver::execute(const Submission& submission) {
             const std::uint64_t awaited = (packet[2] & (awaitedBytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
             const auto value = DrawPipeline::Queue0().PendingLabel(awaited, awaitedBytes);
             if (value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
+                if (profilePackets) {
+                    Graphics::Recorder::WaitProfile sample(submission.queue, awaited, awaitedBytes);
+                    sample.end = Graphics::Recorder::WaitEnd::Recorder;
+                }
                 ++waitOutcomes().fromRecorderSameQueue;
                 gateOpened() = true;
                 recent.Record(cursor);
@@ -290,6 +294,10 @@ void Driver::execute(const Submission& submission) {
                 continue;
             }
             if (!DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet)) {
+                if (profilePackets) {
+                    Graphics::Recorder::WaitProfile sample(submission.queue, awaited, awaitedBytes);
+                    sample.end = Graphics::Recorder::WaitEnd::Entry;
+                }
                 if (!skipHeldWaitEpoch(submission, cursor)) bumpEpoch(&EpochBumps::waits);
                 ++waitOutcomes().atEntry;
                 gateOpened() = true;

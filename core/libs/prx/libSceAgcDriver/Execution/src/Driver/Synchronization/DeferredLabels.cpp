@@ -18,6 +18,11 @@ DeferredLabels& deferredLabels() {
     return *deferred;
 }
 
+std::vector<std::uint32_t>& deferredLabelOpcodes() {
+    static thread_local std::vector<std::uint32_t>* opcodes = nullptr;
+    return ShaderRecompiler::ThreadOwned(opcodes);
+}
+
 bool DeferLabels() {
 
     static const bool defer = std::getenv("APS5_LABEL_LOCK_EACH") == nullptr && std::getenv("APS5_DRAIN_COMPLETION_LABELS") == nullptr;
@@ -98,6 +103,8 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
     auto& deferred = deferredLabels();
     if (deferred.labels.empty()) return;
 
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto* opcodes = profile ? &deferredLabelOpcodes() : nullptr;
     static thread_local std::vector<DeferredLabel>* recording = nullptr;
     auto& labels = ShaderRecompiler::ThreadOwned(recording);
     labels.clear();
@@ -105,19 +112,28 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
     struct Clear {
         std::vector<DeferredLabel>& labels;
         std::uint32_t queue;
+        std::vector<std::uint32_t>* opcodes;
         ~Clear() {
             const bool failed = std::uncaught_exceptions() != 0;
             if (failed) std::fprintf(stderr, "[gpu] queue 0x%x dropped %zu queued labels: their record failed\n", queue, labels.size());
             labels.clear();
+            if (opcodes != nullptr) opcodes->clear();
 
             Graphics::Recorder::CloseLabelGroup(failed ? 0 : GuestMemory::TrackerGeneration());
 
             Graphics::Recorder::ForgetQueuedLabels();
             queuedLabelsNoted() = 0;
         }
-    } clear{labels, queue};
+    } clear{labels, queue, opcodes};
     bool first = true;
     for (const auto& label : labels) {
+        const auto packet = profile ? GuestMemory::CurrentPacket() : GuestMemory::PacketTag{};
+        if (profile) GuestMemory::SetCurrentPacket(opcodes->at(static_cast<std::size_t>(&label - labels.data())), queue);
+        struct RestorePacket {
+            bool enabled;
+            GuestMemory::PacketTag packet;
+            ~RestorePacket() { if (enabled) GuestMemory::SetCurrentPacket(packet.opcode, packet.queue); }
+        } restorePacket{profile, packet};
         const auto bytes = std::span<const std::byte>(label.bytes).first(label.size);
         const auto stamp = ++eventSerial;
         const int reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label.address, bytes, stamp, queue, first) : 4;
@@ -130,8 +146,6 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         noteLabelStore(label.address, bytes, stamp, queue);
     }
     ++labelGroups;
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-
     if (profile && (labelGroups.load(std::memory_order_relaxed) & 63u) == 0 && std::chrono::steady_clock::now() - lastSyncReport > std::chrono::seconds(10)) {
         lastSyncReport = std::chrono::steady_clock::now();
         reportSync();

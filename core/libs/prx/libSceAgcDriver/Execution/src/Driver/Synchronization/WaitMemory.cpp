@@ -136,14 +136,36 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     } epochPoint{!heldAtSubmit || requireMemory || !epochCovered};
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::optional<Graphics::Recorder::WaitProfile> waitProfile;
+    if (profile) waitProfile.emplace(queue, awaited, awaitedBytes);
+    const auto finishProfile = [&](Graphics::Recorder::WaitEnd end) {
+        if (profile) waitProfile->end = end;
+    };
+    static const bool submitLabels = std::getenv("APS5_NO_WAIT_LABEL_SUBMIT") == nullptr;
+    const auto submitWriter = [&](std::uint32_t writer, bool locked = false) {
+        if (!submitLabels || writer == queue) return;
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (!locked && !gpuLock.try_lock()) return;
+        if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
+            localDevice->SubmitRecorded(false);
+            ++outcomes.shortcutSubmits;
+        }
+    };
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
+        finishProfile(Graphics::Recorder::WaitEnd::Entry);
         return;
     }
-    if (heldAtSubmit) return;
+    if (heldAtSubmit) {
+        finishProfile(Graphics::Recorder::WaitEnd::Held);
+        return;
+    }
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+        submitWriter(writer);
         if (writer != queue) notePendingWait(packet, queue, received);
         else epochPoint.bump = false;
+        finishProfile(Graphics::Recorder::WaitEnd::History);
         return;
     }
 
@@ -188,6 +210,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         } else {
             notePendingWait(packet, queue, received);
         }
+        submitWriter(hit->queue, !unlockedHit);
+        finishProfile(Graphics::Recorder::WaitEnd::Recorder);
         return true;
     };
 
@@ -310,6 +334,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (reap) {
             const auto withWorkBefore = pollProfile ? Graphics::Recorder::ReapsWithWork() : 0;
             localDevice->ReapRecorded();
+            if (profile && Pm4::WaitSatisfiedUnchecked(packet)) finishProfile(Graphics::Recorder::WaitEnd::Fence);
             ++outcomes.pollReaps;
             if (pollProfile) {
                 ++poll.reaps;
@@ -338,8 +363,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     StallWatch stall(queue);
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+            submitWriter(writer);
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
+            finishProfile(Graphics::Recorder::WaitEnd::History);
             return;
         }
         ++polls;
@@ -354,12 +381,19 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         CheckFailure();
         if (pollService(!spinning)) return;
-        if (storeHeldResults && !spinning && (polls & 31u) == 0) GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
+        if (storeHeldResults && !spinning && (polls & 31u) == 0) {
+            const bool pending = profile && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
+            GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
+            if (pending && Pm4::WaitSatisfiedUnchecked(packet)) finishProfile(Graphics::Recorder::WaitEnd::Fence);
+        }
         noteAwaitingTitle(queue, awaited);
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    finishProfile(Graphics::Recorder::WaitEnd::Fence);
+                    return;
+                }
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
@@ -406,6 +440,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
     ++outcomes.polled;
+    if (!profile || waitProfile->end != Graphics::Recorder::WaitEnd::Fence) finishProfile(Graphics::Recorder::WaitEnd::Polled);
 }
 
 }

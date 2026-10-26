@@ -26,6 +26,8 @@ struct DeferredLabels {
 
 DeferredLabels& deferredLabels();
 
+std::vector<std::uint32_t>& deferredLabelOpcodes();
+
 bool DeferLabels();
 
 bool QueuedLabelTable();

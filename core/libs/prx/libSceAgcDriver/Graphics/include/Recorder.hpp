@@ -45,6 +45,41 @@ class Buffer;
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
 class Recorder {
 public:
+    enum class WaitStage : std::uint8_t { Unknown, Deferred, Recorded, Submitted, GpuComplete, Retired, Cpu, Discarded };
+    enum class WaitEnd : std::uint8_t { Entry, Polled, Recorder, Fence, History, Held, Aborted };
+    struct WaitBatch {
+        WaitStage stage = WaitStage::Recorded;
+        VkDevice device = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        PFN_vkGetFenceStatus status = nullptr;
+    };
+    struct WaitWriter {
+        std::uint32_t queue;
+        std::uint32_t opcode;
+        WaitStage stage;
+        bool cpu;
+        std::chrono::steady_clock::time_point recorded;
+        std::shared_ptr<WaitBatch> batch;
+    };
+    struct WaitWriterSnapshot {
+        std::shared_ptr<const WaitWriter> writer;
+        WaitStage stage = WaitStage::Unknown;
+    };
+    struct WaitProfile {
+        WaitProfile(std::uint32_t queue, std::uint64_t address, std::size_t bytes);
+        ~WaitProfile();
+        WaitProfile(const WaitProfile&) = delete;
+        WaitProfile& operator=(const WaitProfile&) = delete;
+        std::uint32_t queue;
+        std::uint64_t address;
+        std::size_t bytes;
+        std::chrono::steady_clock::time_point started;
+        WaitWriterSnapshot entry;
+        WaitEnd end = WaitEnd::Aborted;
+    };
+    static void ProfileStore(std::uint64_t address, std::size_t bytes, std::uint32_t queue, std::uint32_t opcode, WaitStage stage, std::shared_ptr<WaitBatch> batch = {}, bool cpu = false);
+    static WaitWriterSnapshot ProfileWriter(std::uint64_t address, std::size_t bytes);
+    static void ReportWaitLabels(bool force = false);
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
     explicit Recorder(const Context& context, bool timelineSemaphores = false);
     ~Recorder();
