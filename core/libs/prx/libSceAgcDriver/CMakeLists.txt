@@ -2522,6 +2522,9 @@ target_link_libraries(agc_driver_guest_memory_lifetime_tests PRIVATE libkernel)
 target_include_directories(agc_driver_prepared_shaders_tests PRIVATE
         $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
+target_include_directories(agc_driver_queued_shader_calls_tests PRIVATE
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
+)
 
 if(BUILD_TESTING)
     set_target_properties(agc_shader_mode_register_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
@@ -2718,7 +2721,16 @@ if(BUILD_TESTING)
             set_tests_properties(${agcTestName}_draw_pipeline PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    set_tests_properties(agc_driver_queued_shader_calls PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=8" TIMEOUT 30)
     add_test(NAME agc_driver_partially_resident_pending_stores COMMAND agc_driver_partially_resident_snapshot_tests --pending-stores)
+    add_test(NAME agc_driver_sampled_depth_transition COMMAND agc_driver_partially_resident_snapshot_tests --depth-transition)
+    add_test(NAME agc_driver_partial_snapshot_proof COMMAND agc_driver_partially_resident_snapshot_tests --resource-proof)
+    add_test(NAME agc_driver_partial_snapshot_depth_transition COMMAND agc_driver_partially_resident_snapshot_tests --partial-depth-transition)
+    add_test(NAME agc_driver_partial_snapshot_key_sync COMMAND agc_driver_partially_resident_snapshot_tests --key-synchronization)
+    set_tests_properties(agc_driver_partial_snapshot_proof agc_driver_partial_snapshot_depth_transition agc_driver_partial_snapshot_key_sync PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=60000" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_driver_partial_snapshot_proof agc_driver_partial_snapshot_depth_transition agc_driver_partial_snapshot_key_sync PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_driver_multisample_readback PROPERTIES TIMEOUT 20)
     foreach(agcReadbackCase IN ITEMS uint8 uint16 uint64 uint128 depth upload retile depth_retile)
         add_test(NAME agc_driver_multisample_readback_${agcReadbackCase} COMMAND agc_driver_multisample_readback_tests ${agcReadbackCase})
