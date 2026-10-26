@@ -13,7 +13,7 @@ std::atomic<std::uint64_t> queuedLabels{0}, labelGroups{0}, immediateLabels{0};
 
 std::atomic<std::uint64_t> packetLockRecords{0}, packetLockSubmits{0}, packetLockDeferred{0}, packetSubmitDeferred{0}, captureTryRecords{0}, captureRetries{0}, suspendPoints{0};
 
-std::atomic<std::uint64_t> recordTriesSkipped{0};
+std::atomic<std::uint64_t> recordTriesSkipped{0}, captureTriesBatched{0};
 
 std::atomic<bool> queue0Dormant{false};
 

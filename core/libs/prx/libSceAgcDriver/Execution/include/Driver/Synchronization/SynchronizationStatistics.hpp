@@ -20,7 +20,7 @@ extern std::atomic<std::uint64_t> queuedLabels, labelGroups, immediateLabels;
 
 extern std::atomic<std::uint64_t> packetLockRecords, packetLockSubmits, packetLockDeferred, packetSubmitDeferred, captureTryRecords, captureRetries, suspendPoints;
 
-extern std::atomic<std::uint64_t> recordTriesSkipped;
+extern std::atomic<std::uint64_t> recordTriesSkipped, captureTriesBatched;
 
 extern std::atomic<bool> queue0Dormant;
 
