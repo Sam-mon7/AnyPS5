@@ -2085,7 +2085,7 @@ VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
-    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush"};
+    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "refresh wait", "refresh proof check", "refresh collect", "refresh flush", "refresh validate", "clean proof"};
     return kind < Count ? names[kind] : "?";
 }
 
@@ -2145,9 +2145,17 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     }
     const auto proofBefore = GuestMemory::ProofSerial();
     const auto pendingBefore = PendingSerial();
+    auto stepStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    if (refreshProved()) {
+    if (profile) stepStart = LookupOutcomes::Add(LookupOutcomes::RefreshWait, stepStart);
+    const auto collectBefore = profile ? ThreadLookupOutcomes().ms[LookupOutcomes::RefreshCollect] : 0;
+    const bool proved = refreshProved();
+    if (profile) {
+        LookupOutcomes::Add(LookupOutcomes::RefreshProofCheck, stepStart);
+        ThreadLookupOutcomes().ms[LookupOutcomes::RefreshProofCheck] -= ThreadLookupOutcomes().ms[LookupOutcomes::RefreshCollect] - collectBefore;
+    }
+    if (proved) {
         layerBehind.clear();
         if (epoch != 0) {
             provedEpoch.store(epoch, std::memory_order_relaxed);
@@ -2194,11 +2202,14 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     handedOver.clear();
     handedUnits.clear();
     const auto handOverKeys = alias == nullptr && !scoped ? clearHandOver() : std::nullopt;
+    if (profile) stepStart = std::chrono::steady_clock::now();
     const bool flushed = !handOverKeys.has_value() && FlushPending(scopeBegin, scopeBytes, alias.get(), "storage refresh", PublishScope::None);
+    if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshFlush, stepStart);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
     // since `generation` need no comparison.
+    if (profile) stepStart = std::chrono::steady_clock::now();
     const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto scopedCurrent = current != 0 || !scoped ? current : GuestMemory::CollectWrites(scopeBegin, scopeBytes);
     std::vector<std::uint64_t> collected;
@@ -2206,6 +2217,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         collected.resize(trackedLayers);
         for (auto layer = firstLayer; layer < lastLayer; ++layer) collected[layer] = collectedLayerGeneration(layer, 0);
     }
+    if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshCollect, stepStart);
     const auto currentFor = [&](std::uint32_t layer) {
         if (scoped && (layer < firstLayer || layer >= lastLayer)) return current;
         return scopedCurrent != 0 ? scopedCurrent : collected[layer];
@@ -2259,6 +2271,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = handOverKeys.has_value() ? *handOverKeys : ProvedKeys();
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
+        if (profile) stepStart = std::chrono::steady_clock::now();
         if (keys != uploadedKeys) {
             changed.assign(trackedLayers, true);
             unchanged = false;
@@ -2346,6 +2359,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
             }
         }
     }
+    if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshValidate, stepStart);
     const bool outsideChanged = std::any_of(outside.begin(), outside.end(), [](bool value) { return value; });
     if (scoped) noteLayersBehind(firstLayer, lastLayer, outside);
     else layerBehind.clear();
@@ -2489,12 +2503,27 @@ bool StorageTexture::refreshProved() {
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
+    static const bool cleanProof = std::getenv("APS5_TARGET_CLEAN_PROOF") != nullptr;
+    const bool profile = LookupOutcomes::Profiled();
+    const auto collect = [&](std::uint64_t address, std::size_t count) {
+        const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto current = GuestMemory::CollectWrites(address, count);
+        if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshCollect, start);
+        return current;
+    };
+    bool clean = false;
+    if (cleanProof) {
+        queries[used++] = {descriptor.baseAddress, bytes, generation};
+        if (descriptor.dccAddress != 0 && keyProof.generation == refreshProof.keyGeneration && keyProof.keys == uploadedKeys) queries[used++] = {descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256), keyProof.generation};
+        if (descriptor.dccAddress == 0 || used == 2) clean = GuestMemory::UnchangedSinceClean(std::span(queries.data(), used));
+        used = 0;
+    }
+    if (!clean && collect(descriptor.baseAddress, bytes) == 0) return false;
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
         if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return false;
-        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
+        if (!clean && collect(descriptor.dccAddress, keyCount) == 0) return false;
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
     if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
@@ -2503,6 +2532,7 @@ bool StorageTexture::refreshProved() {
         if (otherPendingOverlaps()) return false;
         refreshProof.pendingSerial = serial;
     }
+    if (profile && clean) ++ThreadLookupOutcomes().counts[LookupOutcomes::CleanProof];
     return true;
 }
 
