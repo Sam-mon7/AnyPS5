@@ -350,6 +350,7 @@ private:
     static bool reapEachPacket();
     static std::uint64_t batchCap();
     void recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue);
+    void flushAwaitedLabels(std::uint32_t queue);
     bool recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queue);
     void recordQueuedLabelsBeforeRead(std::uint32_t queue);
     bool recordQueuedLabelsAfterCapture(std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> regions);

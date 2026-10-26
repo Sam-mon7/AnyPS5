@@ -92,6 +92,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 std::memcpy(entry.bytes.data(), bytes.data(), bytes.size());
                 ++queuedLabels;
                 wroteOnGpu = true;
+                flushAwaitedLabels(submission.queue);
             } else {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());

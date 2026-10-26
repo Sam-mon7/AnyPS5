@@ -1,5 +1,6 @@
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #ifdef _WIN32
@@ -18,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string_view>
 #include <thread>
 
 namespace AgcDriver::DriverDetail {
@@ -30,6 +32,25 @@ struct DriverTestAccess {
     }
     static void Wait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received) {
         Driver::Get().waitMemory(packet, queue, PacketHistory{}, received, false);
+    }
+    static void Await(std::uint32_t queue, std::uint64_t address, std::uint64_t bytes) {
+        auto& slot = Driver::Get().awaitedSlots[queue == 0 ? 0 : queue - 0x20 + 1];
+        slot.shape.store(bytes << 32u, std::memory_order_relaxed);
+        slot.address.store(address, std::memory_order_release);
+    }
+    static bool Label(std::span<const std::uint32_t> packet, std::uint32_t queue) {
+        Submission submission{};
+        submission.queue = queue;
+        QueueState state{};
+        bool wrote = false, interrupt = false, deferred = false, draw = false, sample = false;
+        Driver::Get().preparePacketMemory(submission, state, packet, packet[0], 0x37, wrote, interrupt, deferred, draw, sample);
+        return wrote;
+    }
+    static bool Deferred() { return !deferredLabels().labels.empty(); }
+    static void Record(VulkanDevice& device, std::uint32_t queue) { Driver::Get().recordDeferredLabels(&device, queue); }
+    static std::pair<std::uint64_t, std::uint64_t> FlushCounts() {
+        const auto& outcomes = Driver::waitOutcomes();
+        return {outcomes.awaitedLabelFlushes, outcomes.awaitedLabelBusy};
     }
 };
 
@@ -120,9 +141,66 @@ bool Run(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t w
     return true;
 }
 
+bool RunProducer(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t writer, std::uint32_t waiter,
+                 std::int32_t waitOffset = 0, std::uint64_t waitBytes = 4, bool wide = false, bool contended = false) {
+    constexpr std::uint64_t value = 0x1234567800000001ull;
+    const std::array<std::uint32_t, 4> pattern{1, 2, 3, 4};
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::TagGpuLockThread(writer);
+        AgcDriver::GuestMemory::SetCurrentPacket(0x37, writer);
+        if (!device.FillBuffer(address + 16384, 4096, pattern)) return false;
+    }
+    const auto before = device.SubmittedEpoch();
+    const auto countsBefore = Access::FlushCounts();
+    const std::array<std::uint32_t, 5> earlier{0xc0033700u, 0x00100200u,
+        static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 2};
+    Require(Access::Label(earlier, writer) && Access::Deferred(), "an unawaited store did not remain deferred");
+    Access::Await(waiter, waitOffset < 0 ? address - static_cast<std::uint64_t>(-waitOffset) : address + waitOffset, waitBytes);
+    struct ClearWait {
+        std::uint32_t queue;
+        ~ClearWait() { Access::Await(queue, 0, 0); }
+    } clearWait{waiter};
+    std::promise<void> held;
+    std::jthread holder;
+    if (contended) {
+        auto ready = held.get_future();
+        holder = std::jthread([&](std::stop_token stop) {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            held.set_value();
+            while (!stop.stop_requested()) std::this_thread::yield();
+        });
+        ready.wait();
+    }
+    const std::array<std::uint32_t, 6> packet{wide ? 0xc0043700u : 0xc0033700u, 0x00100200u,
+        static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u),
+        static_cast<std::uint32_t>(value), static_cast<std::uint32_t>(value >> 32u)};
+    Require(Access::Label(std::span(packet).first(wide ? 6 : 5), writer), "producer did not handle WRITE_DATA");
+    if (holder.joinable()) { holder.request_stop(); holder.join(); }
+    const bool overlaps = waitBytes != 0 && (waitOffset < 0 ? static_cast<std::uint64_t>(-waitOffset) < waitBytes : waitOffset < (wide ? 8 : 4));
+    const bool flushed = overlaps && (waitBytes == 4 || waitBytes == 8) && writer != waiter && !contended && !std::getenv("APS5_NO_AWAITED_LABEL_FLUSH");
+    Require(Access::Deferred() != flushed, "producer did not respect the active wait range, queue ownership or opt-out");
+    const auto countsAfter = Access::FlushCounts();
+    const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    Require(countsAfter.first - countsBefore.first == (profiled && flushed ? 1u : 0u), "producer flush profiling count is wrong");
+    Require(countsAfter.second - countsBefore.second == (profiled && contended && !std::getenv("APS5_NO_AWAITED_LABEL_FLUSH") ? 1u : 0u), "producer busy profiling count is wrong");
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Require((device.SubmittedEpoch() > before) == flushed, "producer did not submit exactly when an active cross-queue wait overlapped");
+        Access::Record(device, writer);
+        device.SubmitRecorded(false);
+        device.WaitIdle();
+        std::uint64_t actual = 0;
+        std::memcpy(&actual, reinterpret_cast<const void*>(address), wide ? 8 : 4);
+        Require(actual == (wide ? value : static_cast<std::uint32_t>(value)), "producer label has the wrong value");
+        Require(std::memcmp(reinterpret_cast<const void*>(address + 16384), pattern.data(), sizeof(pattern)) == 0, "work before the producer label did not complete");
+    }
+    return true;
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
         GuestBlock labels;
         std::shared_ptr<AgcDriver::VulkanDevice> device = OpenVulkanTestDevice();
@@ -132,6 +210,23 @@ int main() {
             ~Reset() { Access::Device(nullptr); }
         } reset;
         const auto base = labels.Address();
+        if (argc == 2 && std::string_view(argv[1]) == "--producer") {
+            std::uint64_t address = base;
+            for (const auto queue : {0x20u, 0x28u, 0x30u, 0x38u, 0x40u, 0x48u, 0x50u}) {
+                if (!RunProducer(*device, address, queue, 0) || !RunProducer(*device, address + 256, 0, queue, 4, 4, true)) return VulkanTestSkipped;
+                address += 512;
+            }
+            for (const auto offset : {-8, -4, 4, 8}) {
+                if (!RunProducer(*device, address, 0x38, 0x28, offset, 8)) return VulkanTestSkipped;
+                address += 256;
+            }
+            if (!RunProducer(*device, address, 0x38, 0x38)
+                || !RunProducer(*device, address + 256, 0x38, 0, 0, 0)
+                || !RunProducer(*device, address + 512, 0x38, 0, 0, 4, false, true)) return VulkanTestSkipped;
+            std::puts("awaited label producer flush tests passed");
+            return 0;
+        }
+        Require(argc == 1, "invalid test arguments");
         if (!Run(*device, base, 0, false, false, false) || !Run(*device, base + 256, 0, true, false, false)
             || !Run(*device, base + 512, 0, false, true, false) || !Run(*device, base + 768, 0x20, false, false, false)
             || !Run(*device, base + 1024, 0, false, false, true) || !Run(*device, base + 1280, 0, true, true, false)

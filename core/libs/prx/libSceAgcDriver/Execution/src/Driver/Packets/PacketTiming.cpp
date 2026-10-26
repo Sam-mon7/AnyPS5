@@ -24,6 +24,8 @@ PacketTimer::~PacketTimer() {
     }
     auto& waits = Driver::waitOutcomes();
     auto& epochs = Driver::epochBumps();
+    AgcDriver::ProfilePrint_nid_no_patch("[labels-awaited] queue 0x%x (10 s): producer flushes %llu, mutex busy %llu\n", queue,
+        static_cast<unsigned long long>(waits.awaitedLabelFlushes), static_cast<unsigned long long>(waits.awaitedLabelBusy));
 
     const auto late = Graphics::Recorder::LateCounts();
     auto& lateSeen = Driver::lateCountsSeen();
