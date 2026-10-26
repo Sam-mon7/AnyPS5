@@ -806,7 +806,7 @@ void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarg
                 const auto size = descriptor.GetSize();
                 if (size == 0 || address == 0) continue;
                 const auto element = offset / 4;
-                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                const bool written = element >= binding.Flags().bufferWritten.size() || binding.Flags().bufferWritten[element];
                 Require(!overlap(address, size, target.address, target.bytes), "shader buffer aliases the render target");
                 Require(!written || !overlap(address, size, indexAddress, indexBytes), "writable shader buffer aliases the index buffer");
             }
