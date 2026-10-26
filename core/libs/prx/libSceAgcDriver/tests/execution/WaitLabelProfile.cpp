@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -50,6 +51,7 @@ int main() {
             sample.end = Recorder::WaitEnd::Entry;
         }
         Recorder::ReportWaitLabels(true);
+        AgcDriver::ProfileOutput_nid_no_patch().Flush();
         std::puts("label profiler tests passed");
         return 0;
     } catch (const std::exception& error) {
