@@ -108,7 +108,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
         if (drawParameters.indirect) {
-            const auto location = static_cast<std::uint64_t>(drawParameters.indirect->startInstanceLocation) + 1u;
+            const auto location = (static_cast<std::uint64_t>(drawParameters.indirect->baseVertexLocation) << 32u | drawParameters.indirect->startInstanceLocation) + 1u;
             drawKey = (drawKey ^ location) * 0x9e3779b97f4a7c15ull;
             if (shapeKey != 0) shapeKey = (shapeKey ^ location) * 0x9e3779b97f4a7c15ull;
         }
