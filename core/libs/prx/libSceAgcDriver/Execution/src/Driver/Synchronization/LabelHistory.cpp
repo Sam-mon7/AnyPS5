@@ -17,10 +17,14 @@ void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> by
         history[0].queue = queue;
         std::memcpy(&history[0].value, bytes.data() + offset, 4);
     }
+    labelStoresGeneration.store(labelStoresGeneration.load(std::memory_order_relaxed) + 1, std::memory_order_release);
 }
 
-bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer) {
+bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer, std::optional<std::uint64_t>* seenGeneration) {
+    static const bool reuse = std::getenv("APS5_NO_WAIT_HISTORY_REUSE") == nullptr;
+    if (reuse && seenGeneration != nullptr && *seenGeneration == labelStoresGeneration.load(std::memory_order_acquire)) return false;
     std::lock_guard lock(labelStoresMutex);
+    if (reuse && seenGeneration != nullptr) *seenGeneration = labelStoresGeneration.load(std::memory_order_relaxed);
     const auto low = labelStores.find(address);
     if (low == labelStores.end()) return false;
     const auto high = bytes == 8 ? labelStores.find(address + 4) : labelStores.end();
@@ -34,6 +38,7 @@ bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t ad
             value |= static_cast<std::uint64_t>(upper->value) << 32u;
         }
         if (Pm4::WaitComparesValue(packet, value)) {
+            if (reuse && seenGeneration != nullptr) seenGeneration->reset();
             if (writer != nullptr) *writer = store.queue;
             return true;
         }

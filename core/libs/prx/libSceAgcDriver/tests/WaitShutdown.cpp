@@ -22,6 +22,7 @@
 #include <cstring>
 #include <cstdio>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -52,6 +53,19 @@ struct DriverTestAccess {
         auto& driver = Driver::Get();
         driver.noteLabelStore(address, std::as_bytes(std::span(&value, 1)), ++driver.eventSerial, queue);
     }
+
+    static void History(std::uint64_t address, std::span<const std::uint32_t> words, std::uint64_t stamp, std::uint32_t queue) {
+        Driver::Get().noteLabelStore(address, std::as_bytes(words), stamp, queue);
+    }
+
+    static bool Stored(std::span<const std::uint32_t> packet, std::uint64_t received, std::optional<std::uint64_t>& seen, std::uint32_t& writer, bool holdLock = false) {
+        auto& driver = Driver::Get();
+        std::unique_lock lock(driver.labelStoresMutex, std::defer_lock);
+        if (holdLock) lock.lock();
+        const auto bytes = Pm4::WaitAwaitedBytes(packet);
+        const auto address = (packet[2] & (bytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        return driver.storedSince(packet, address, bytes, received, &writer, &seen);
+    }
 };
 
 }
@@ -67,6 +81,71 @@ struct alignas(64) LabelState {
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void CheckWaitHistory() {
+    using Access = AgcDriver::DriverDetail::DriverTestAccess;
+    constexpr std::uint64_t address = 0x10000;
+    constexpr std::uint32_t producer = 0x38;
+    const bool reuse = std::getenv("APS5_NO_WAIT_HISTORY_REUSE") == nullptr;
+    const std::array<std::uint32_t, 7> packet{0xc0053c00u, 0x13u, address, 0, 7, 0xffffffffu, 0x19u};
+    const auto store = [&](std::uint32_t value, std::uint64_t stamp) {
+        Access::History(address, std::span(&value, 1), stamp, producer);
+    };
+    std::optional<std::uint64_t> seen;
+    std::uint32_t writer = 0;
+    Require(!Access::Stored(packet, 10, seen, writer), "absent label history satisfied a wait");
+    Require(seen.has_value() == reuse, "history reuse did not obey its switch");
+    Require(!Access::Stored(packet, 10, seen, writer, reuse), "unchanged absent history satisfied a wait");
+    store(7, 10);
+    Require(!Access::Stored(packet, 10, seen, writer), "a store at the submission stamp satisfied a wait");
+    store(6, 11);
+    Require(!Access::Stored(packet, 10, seen, writer), "a mismatched history value satisfied a wait");
+    const auto before = seen;
+    const std::uint32_t unrelated = 9;
+    Access::History(address + 32, std::span(&unrelated, 1), 5, 0x20);
+    Require(!Access::Stored(packet, 10, seen, writer), "an unrelated store satisfied a wait");
+    Require(!reuse || seen != before, "a history mutation did not invalidate the inspected generation");
+    Require(!Access::Stored(packet, 10, seen, writer, reuse), "unchanged mismatched history satisfied a wait");
+    std::thread producerThread([&] { store(7, 13); });
+    producerThread.join();
+    Require(Access::Stored(packet, 10, seen, writer) && writer == producer, "a published satisfying store or its queue was missed");
+    Require(Access::Stored(packet, 10, seen, writer), "a successful history lookup was cached as a miss");
+    seen.reset();
+    store(6, 14);
+    Require(Access::Stored(packet, 10, seen, writer), "a retained older satisfying store was ignored");
+    for (std::uint64_t stamp = 15; stamp < 15 + AgcDriver::DriverDetail::LabelStoreHistory; ++stamp) store(6, stamp);
+    seen.reset();
+    Require(!Access::Stored(packet, 10, seen, writer), "an evicted satisfying store was reused");
+
+    constexpr std::uint64_t wideAddress = address + 64;
+    std::array<std::uint32_t, 9> wide{0xc0079300u, 0x13u, wideAddress, 0, 7, 1, 0xffffffffu, 0xffffffffu, 0x19u};
+    const std::array<std::uint32_t, 2> pair{7, 1};
+    seen.reset();
+    Access::History(wideAddress, std::span(pair).first(1), 20, producer);
+    Require(!Access::Stored(wide, 10, seen, writer), "a wide wait accepted a missing upper dword");
+    Access::History(wideAddress + 4, std::span(pair).last(1), 21, producer);
+    Require(!Access::Stored(wide, 10, seen, writer), "a wide wait combined different store stamps");
+    Require(!Access::Stored(wide, 10, seen, writer, reuse), "unchanged partial wide history satisfied a wait");
+    Access::History(wideAddress, pair, 22, 0);
+    Require(Access::Stored(wide, 10, seen, writer) && writer == 0, "a wide store did not invalidate the history miss");
+    wide[2] = static_cast<std::uint32_t>(address + 32);
+    wide[4] = unrelated;
+    wide[5] = 0;
+    wide[7] = 0;
+    seen.reset();
+    Require(Access::Stored(wide, 0, seen, writer) && writer == 0x20, "a zero-high-mask wide wait required an upper dword");
+
+    for (std::uint32_t function = 0; function <= 6; ++function) {
+        auto masked = packet;
+        masked[1] = 0x10u | function;
+        masked[4] = 2;
+        masked[5] = 3;
+        seen.reset();
+        const bool expected = AgcDriver::Pm4::WaitComparesValue(masked, 6);
+        Require(Access::Stored(masked, 10, seen, writer) == expected, "history reuse changed a masked wait comparison");
+        if (!expected) Require(!Access::Stored(masked, 10, seen, writer, reuse), "an unchanged masked comparison was not skipped");
+    }
 }
 
 bool CheckWaitEpochs() {
@@ -273,6 +352,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--wait-history") == 0) {
+            CheckWaitHistory();
+            LibcRunShutdown_nid_postfix();
+            std::puts("wait history tests passed");
+            return 0;
+        }
         if (argc == 2 && std::strcmp(argv[1], "--wait-epochs") == 0) {
             const bool watched = CheckWaitEpochs();
             LibcRunShutdown_nid_postfix();
