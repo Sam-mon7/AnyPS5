@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -223,6 +224,12 @@ bool Driver::recordQueuedLabelsAfterCapture(std::uint32_t queue, std::span<const
                 return true;
             }
         }
+    }
+    static const bool batch = std::getenv("APS5_NO_CAPTURE_LABEL_LOCK_BATCHING") == nullptr;
+    if (batch && !DrawPipeline::Active()) {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile) ++captureTriesBatched;
+        return false;
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
