@@ -92,7 +92,7 @@ void CheckSimpleReplacement() {
     Require(first->Argument(0) == target && first->Argument(1) == target && first->Argument(2) == target);
     Require(second->Argument(0) == target);
     const std::vector<IrUse> expected{{existing, 0}, {first, 2}, {first, 1}, {second, 0}, {first, 0}};
-    Require(target->OperandUses() == expected);
+    Require(std::ranges::equal(target->OperandUses(), expected));
     Require(std::ranges::equal(target->Uses(), std::vector<IrValue*>({existing, first, first, second, first})));
     first->ReplaceArgument(1, source);
     Require(source->UseCount() == 1);
@@ -148,7 +148,7 @@ void CheckPhiAndIdentity() {
 }
 
 void CheckAllocationFailure() {
-    for (std::ptrdiff_t failure = 0; failure < 1; ++failure) {
+    for (std::ptrdiff_t failure = 0; failure < 2; ++failure) {
         Graph graph(12);
         for (std::size_t index = 2; index < 12; ++index) {
             graph.Value(index)->AddArgument(graph.Value(0));
@@ -173,6 +173,49 @@ void CheckAllocationFailure() {
         graph.Value(0)->ReplaceAllUsesWith(graph.Value(1));
         Require(graph.Value(1)->UseCount() == 10);
     }
+}
+
+void CheckDetachedPhi() {
+    IrBlock first{1}, second{2};
+    IrValue input{IrOpcode::UndefU32, IrType::U32, 1};
+    IrValue phi{IrOpcode::Phi, IrType::U32, 2};
+    Require(phi.PhiBlockCount() == 0);
+    bool outOfRange = false;
+    try {
+        static_cast<void>(phi.PhiBlock(0));
+    } catch (const std::out_of_range&) {
+        outOfRange = true;
+    }
+    Require(outOfRange);
+    std::vector<IrValue*> arguments{&input, nullptr};
+    std::vector<IrBlock*> predecessors{&second, &first};
+    bool caught = false;
+    failureAfter = 0;
+    try {
+        phi.SetDetachedOperands(std::move(arguments), std::move(predecessors));
+    } catch (const std::bad_alloc&) {
+        caught = true;
+    } catch (...) {
+        failureAfter = -1;
+        throw;
+    }
+    failureAfter = -1;
+    if (caught) {
+        Require(phi.ArgumentCount() == 0 && phi.PhiBlockCount() == 0 && input.UseCount() == 0);
+        phi.SetDetachedOperands({&input, nullptr}, {&second, &first});
+        std::puts("detached phi allocation failure preserved the node; retry passed");
+    }
+    Require(phi.ArgumentCount() == 2 && phi.PhiBlockCount() == 2);
+    Require(phi.Argument(0) == &input && phi.Argument(1) == nullptr && input.UseCount() == 0);
+    Require(phi.PhiBlock(0) == &second && phi.PhiBlock(1) == &first);
+    phi.Invalidate();
+    Require(phi.Opcode() == IrOpcode::Unreachable && phi.PhiBlockCount() == 2);
+    Require(phi.PhiBlock(0) == &second && phi.PhiBlock(1) == &first);
+    IrValue empty{IrOpcode::Phi, IrType::U32, 3};
+    empty.SetDetachedOperands({}, {});
+    Require(empty.ArgumentCount() == 0 && empty.PhiBlockCount() == 0);
+    empty.AddPhiOperand(&first, &input);
+    Require(empty.PhiBlockCount() == 1 && empty.PhiBlock(0) == &first && input.UseCount() == 1);
 }
 
 void CheckGeometricGrowth() {
@@ -244,6 +287,7 @@ int main() {
             {"self and empty replacement", CheckSelfAndEmpty},
             {"phi and identity rewriting", CheckPhiAndIdentity},
             {"allocation failure integrity", CheckAllocationFailure},
+            {"detached phi failure integrity", CheckDetachedPhi},
             {"geometric use-list growth", CheckGeometricGrowth},
             {"large fan-out", CheckLargeFanOut},
             {"differential use graphs", CheckDifferentialPrograms}

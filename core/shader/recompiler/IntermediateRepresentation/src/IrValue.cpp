@@ -26,40 +26,43 @@ std::uint32_t IrValue::ImmediateU32() const {
 }
 
 void IrValue::AddArgument(IrValue* argument) {
+    auto* uses = argument != nullptr ? &argument->MutableUses() : nullptr;
     arguments.push_back(argument);
-    if (argument == nullptr) {
+    if (uses == nullptr) {
         return;
     }
-    argument->operandUses.push_back(IrUse{this, arguments.size() - 1});
+    uses->push_back(IrUse{this, arguments.size() - 1});
 }
 
 void IrValue::ReplaceArgument(std::size_t index, IrValue* argument) {
     if (index >= arguments.size()) {
         throw std::out_of_range("IrValue::ReplaceArgument index is out of range");
     }
+    auto* uses = argument != nullptr ? &argument->MutableUses() : nullptr;
     IrValue* previous = arguments[index];
-    if (previous != nullptr) {
-        const auto operandIt = !previous->operandUses.empty() && previous->operandUses.back() == IrUse{this, index}
-            ? previous->operandUses.end() - 1
-            : std::find_if(previous->operandUses.begin(), previous->operandUses.end(), [this, index](const IrUse& use) {
+    if (previous != nullptr && previous->operandUses != nullptr) {
+        auto& uses = *previous->operandUses;
+        const auto operandIt = !uses.empty() && uses.back() == IrUse{this, index}
+            ? uses.end() - 1
+            : std::find_if(uses.begin(), uses.end(), [this, index](const IrUse& use) {
                 return use.user == this && use.operand == index;
             });
-        if (operandIt != previous->operandUses.end()) {
-            previous->operandUses.erase(operandIt);
+        if (operandIt != uses.end()) {
+            uses.erase(operandIt);
         }
     }
     arguments[index] = argument;
-    if (argument != nullptr) {
-        argument->operandUses.push_back(IrUse{this, index});
+    if (uses != nullptr) {
+        uses->push_back(IrUse{this, index});
     }
 }
 
 void IrValue::ReplaceAllUsesWith(IrValue* replacement) {
-    if (replacement == this) {
+    if (replacement == this || !HasUses()) {
         return;
     }
     if (replacement != nullptr) {
-        const auto reserveAdditional = [count = operandUses.size()](auto& list) {
+        const auto reserveAdditional = [count = operandUses->size()](auto& list) {
             const auto maximum = list.max_size();
             if (count > maximum - list.size()) {
                 throw std::length_error("IrValue::ReplaceAllUsesWith use list is too large");
@@ -70,15 +73,15 @@ void IrValue::ReplaceAllUsesWith(IrValue* replacement) {
                 list.reserve(std::max(required, grown));
             }
         };
-        reserveAdditional(replacement->operandUses);
+        reserveAdditional(replacement->MutableUses());
     }
-    for (auto use = operandUses.rbegin(); use != operandUses.rend(); ++use) {
+    for (auto use = operandUses->rbegin(); use != operandUses->rend(); ++use) {
         use->user->arguments[use->operand] = replacement;
         if (replacement != nullptr) {
-            replacement->operandUses.push_back(*use);
+            replacement->operandUses->push_back(*use);
         }
     }
-    operandUses.clear();
+    operandUses->clear();
 }
 
 void IrValue::SetImmediateU32(std::uint32_t value) {
@@ -103,26 +106,35 @@ bool IrValue::MayHaveSideEffects() const {
 }
 
 bool IrValue::HasUses() const {
-    return !operandUses.empty();
+    return operandUses != nullptr && !operandUses->empty();
 }
 
 std::size_t IrValue::UseCount() const {
-    return operandUses.size();
+    return operandUses != nullptr ? operandUses->size() : 0;
 }
 
 std::size_t IrValue::PhiBlockCount() const {
-    return phiBlocks.size();
+    return phiBlocks ? phiBlocks->size() : 0;
 }
 
 IrBlock* IrValue::PhiBlock(std::size_t index) const {
-    if (index >= phiBlocks.size()) {
+    if (index >= PhiBlockCount()) {
         throw std::out_of_range("IrValue::PhiBlock index is out of range");
     }
-    return phiBlocks[index];
+    return (*phiBlocks)[index];
 }
 
-const std::vector<IrUse>& IrValue::OperandUses() const {
-    return operandUses;
+std::span<const IrUse> IrValue::OperandUses() const {
+    return operandUses != nullptr ? std::span<const IrUse>(*operandUses) : std::span<const IrUse>{};
+}
+
+std::size_t IrValue::OperandUseCapacity() const {
+    return operandUses != nullptr ? operandUses->capacity() : 0;
+}
+
+std::vector<IrUse>& IrValue::MutableUses() {
+    if (operandUses == nullptr) operandUses = std::make_unique<std::vector<IrUse>>();
+    return *operandUses;
 }
 
 std::uint64_t IrValue::ImmediateU64() const {
@@ -194,19 +206,21 @@ void IrValue::AddPhiOperand(IrBlock* predecessor, IrValue* value) {
     if (predecessor == nullptr) {
         throw std::invalid_argument("IrValue::AddPhiOperand predecessor cannot be null");
     }
-    phiBlocks.push_back(predecessor);
+    if (!phiBlocks) phiBlocks = std::make_unique<std::vector<IrBlock*>>();
+    phiBlocks->push_back(predecessor);
     AddArgument(value);
 }
 
 void IrValue::SetDetachedOperands(std::vector<IrValue*> arguments, std::vector<IrBlock*> phiBlocks) {
-    if (!this->arguments.empty() || !this->phiBlocks.empty()) {
+    if (!this->arguments.empty() || PhiBlockCount() != 0) {
         throw std::runtime_error("IrValue::SetDetachedOperands called on a value with operands");
     }
     if (IsPhi() ? phiBlocks.size() != arguments.size() : !phiBlocks.empty()) {
         throw std::runtime_error("IrValue::SetDetachedOperands phi blocks do not match the arguments");
     }
+    auto predecessors = phiBlocks.empty() ? nullptr : std::make_unique<std::vector<IrBlock*>>(std::move(phiBlocks));
     this->arguments = std::move(arguments);
-    this->phiBlocks = std::move(phiBlocks);
+    this->phiBlocks = std::move(predecessors);
 }
 
 void IrValue::ReplaceOpcode(IrOpcode opcode) {
@@ -214,7 +228,7 @@ void IrValue::ReplaceOpcode(IrOpcode opcode) {
 }
 
 void IrValue::Invalidate() {
-    if (!operandUses.empty()) {
+    if (HasUses()) {
         throw std::runtime_error("IrValue::Invalidate called on a value that still has uses");
     }
     for (std::size_t index = 0; index < arguments.size(); index++) {

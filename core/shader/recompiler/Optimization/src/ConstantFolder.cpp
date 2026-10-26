@@ -741,7 +741,7 @@ bool forwardsWord(const IrUse& use) {
 void collectReaders(IrValue& value, std::vector<IrUse>& readers) {
     std::unordered_set<const IrValue*> visited{&value};
     std::vector<std::pair<std::vector<IrUse>, std::size_t>> pending;
-    pending.emplace_back(value.OperandUses(), 0u);
+    pending.emplace_back(std::vector<IrUse>(value.OperandUses().begin(), value.OperandUses().end()), 0u);
     while (!pending.empty()) {
         auto& [uses, next] = pending.back();
         if (next == uses.size()) {
@@ -752,7 +752,7 @@ void collectReaders(IrValue& value, std::vector<IrUse>& readers) {
         if (!forwardsWord(use)) {
             readers.push_back(use);
         } else if (visited.insert(use.user).second) {
-            pending.emplace_back(use.user->OperandUses(), 0u);
+            pending.emplace_back(std::vector<IrUse>(use.user->OperandUses().begin(), use.user->OperandUses().end()), 0u);
         }
     }
 }
@@ -794,7 +794,7 @@ void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
     if (!isPackedAncillary(ancillary)) {
         return;
     }
-    const std::vector<IrUse> uses = ancillary.OperandUses();
+    const std::vector<IrUse> uses(ancillary.OperandUses().begin(), ancillary.OperandUses().end());
     std::vector<IrUse> direct;
     std::vector<IrUse> forwarded;
     for (const IrUse& use : uses) {

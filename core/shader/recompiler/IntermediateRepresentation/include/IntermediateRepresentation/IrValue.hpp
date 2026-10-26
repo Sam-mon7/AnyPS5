@@ -7,7 +7,9 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <ranges>
+#include <span>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -71,7 +73,8 @@ public:
     [[nodiscard]] std::size_t PhiBlockCount() const;
     [[nodiscard]] IrValue* Argument(std::size_t index) const;
     [[nodiscard]] IrBlock* PhiBlock(std::size_t index) const;
-    [[nodiscard]] const std::vector<IrUse>& OperandUses() const;
+    [[nodiscard]] std::span<const IrUse> OperandUses() const;
+    [[nodiscard]] std::size_t OperandUseCapacity() const;
     [[nodiscard]] std::uint64_t ImmediateU64() const;
     [[nodiscard]] std::uint16_t ImmediateF16Bits() const;
     [[nodiscard]] float ImmediateF32() const;
@@ -94,21 +97,22 @@ public:
     [[nodiscard]] bool operator==(const IrValue& other) const;
 
 private:
+    std::vector<IrUse>& MutableUses();
     IrOpcode opcode;
     IrType type;
     std::uint32_t id;
+    bool hasImmediate;
     std::uint64_t immediateBits = 0;
     GuestRegister registerValue{};
     std::uint64_t flags = 0;
-    std::vector<IrBlock*> phiBlocks;
-    std::vector<IrUse> operandUses;
-    bool hasImmediate;
+    std::unique_ptr<std::vector<IrBlock*>> phiBlocks;
+    std::unique_ptr<std::vector<IrUse>> operandUses;
     std::vector<IrValue*> arguments;
     IrBlock* parent;
 };
 
 inline auto IrValue::Uses() const {
-    return std::views::transform(operandUses, [](const IrUse& use) { return use.user; });
+    return std::views::transform(OperandUses(), [](const IrUse& use) { return use.user; });
 }
 
 inline IrOpcode IrValue::Opcode() const {
