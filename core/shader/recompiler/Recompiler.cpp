@@ -880,6 +880,7 @@ SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, 
         }
         cursor += count;
     }
+    materialized.shrink_to_fit();
     auto spirv = InternSpirv(std::move(materialized));
     module->hash = spirv.ContentHash();
     module->spirv = spirv.Weaken();
