@@ -816,11 +816,27 @@ void testWriteChangedStoresExactlyTheChangedRuns() {
         }
         i += length;
     }
-    for (std::size_t i = 0; i < sizeof(guest); ++i) guest[i] = static_cast<std::uint8_t>(0xa0u ^ i);
+    for (std::size_t i = 0; i < sizeof(guest); ++i) guest[i] = static_cast<std::uint8_t>(original[i]);
     AgcDriver::GuestMemory::WriteChanged(reinterpret_cast<std::uintptr_t>(guest), current, original);
     for (std::size_t i = 0; i < sizeof(guest); ++i) {
-        const auto expected = current[i] != original[i] ? static_cast<std::uint8_t>(current[i]) : static_cast<std::uint8_t>(0xa0u ^ i);
+        const auto expected = static_cast<std::uint8_t>(current[i] != original[i] ? current[i] : original[i]);
         check(guest[i] == expected, "write-back stored a byte the GPU did not change or missed one it did");
+    }
+}
+
+void testWriteChangedKeepsGuestRewrites() {
+    alignas(256) static std::uint8_t guest[300];
+    std::vector<std::byte> original(sizeof(guest)), current(sizeof(guest));
+    for (std::size_t i = 0; i < sizeof(guest); ++i) {
+        original[i] = static_cast<std::byte>(i * 7u);
+        current[i] = static_cast<std::byte>(i * 7u + (i % 3 == 0 ? 1u : 0u));
+        guest[i] = static_cast<std::uint8_t>(original[i]);
+    }
+    for (std::size_t i = 0; i < sizeof(guest); i += 5) guest[i] = static_cast<std::uint8_t>(0xe5u ^ i);
+    AgcDriver::GuestMemory::WriteChanged(reinterpret_cast<std::uintptr_t>(guest), current, original);
+    for (std::size_t i = 0; i < sizeof(guest); ++i) {
+        const auto expected = i % 5 == 0 ? static_cast<std::uint8_t>(0xe5u ^ i) : static_cast<std::uint8_t>(current[i]);
+        check(guest[i] == expected, "write-back overwrote a byte the guest rewrote since the snapshot, or missed a GPU change");
     }
 }
 
@@ -2049,6 +2065,7 @@ int main(int argc, char** argv) {
         testRewindPayloadBits();
         testWriteChangedKeepsUntouchedBytes();
         testWriteChangedStoresExactlyTheChangedRuns();
+        testWriteChangedKeepsGuestRewrites();
         testRegisters();
         testRegisterFile();
         testContextAndBases();
