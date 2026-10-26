@@ -1,14 +1,58 @@
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
+#include "AllocationFailure.hpp"
 #include <iostream>
 #include <limits>
+#include <new>
 #include <stdexcept>
+#include <string_view>
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-int main() {
+void allocationFailures() {
+    using AgcDriver::GuestMemory::WriteWatchCoverage;
+    using AgcDriver::Tests::SetAllocationFailureCountdown;
+    constexpr std::uint64_t base = 0x200000000;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t distant = std::size_t{256} << 20u;
+    WriteWatchCoverage coverage;
+    coverage.Initialize(base, 2 * block);
+    coverage.Exclude(base, block, 10);
+    bool failed = false;
+    SetAllocationFailureCountdown(0);
+    try { coverage.Initialize(base + distant, 3 * distant); }
+    catch (const std::bad_alloc&) { failed = true; }
+    SetAllocationFailureCountdown(-1);
+    require(failed && !coverage.Covers(base, block) && coverage.Covers(base + block, block), "failed initialization changed existing coverage");
+    require(coverage.Restore(base, block, 11), "failed initialization changed exclusion generations");
+    for (int countdown = 0; countdown < 8; ++countdown) {
+        coverage.Initialize(base, 3 * distant + 17);
+        coverage.Exclude(base, block, 20);
+        failed = false;
+        SetAllocationFailureCountdown(countdown);
+        try { coverage.Exclude(base, 2 * distant + block, 100); }
+        catch (const std::bad_alloc&) { failed = true; }
+        SetAllocationFailureCountdown(-1);
+        require(failed, "the exclusion allocation failure was not exercised");
+        require(!coverage.Covers(base, block) && coverage.Covers(base + block, 3 * distant + 17 - block), "failed exclusion changed watched memory");
+        require(coverage.Restore(base, block, 21), "failed exclusion advanced an existing generation");
+        require(coverage.Exclude(base + block, block, 22) && coverage.Restore(base + block, block, 23), "failed exclusion left a future generation on an empty mask");
+        SetAllocationFailureCountdown(0);
+        const bool watched = coverage.Covers(base + 2 * distant, distant + 17);
+        const bool restored = coverage.Restore(base + 2 * distant, distant + 17);
+        SetAllocationFailureCountdown(-1);
+        require(watched && !restored, "reading or restoring absent coverage allocated or changed it");
+    }
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--allocation-failure") {
+            allocationFailures();
+            std::cout << "write watch coverage allocation failures passed\n";
+            return 0;
+        }
         using AgcDriver::GuestMemory::WriteWatchCoverage;
         constexpr std::uint64_t base = 0x200000000;
         constexpr std::size_t block = 65536;
@@ -110,6 +154,17 @@ int main() {
         coverage.Exclude(base + page, tail, 60);
         require(coverage.Restore(base + page, tail, 61) && coverage.Covers(base + page, tail), "an import starting and ending inside blocks is not watched");
         require(!coverage.Covers(base, page) && !coverage.Covers(base, tail) && !coverage.Covers(base + page + tail, page) && !coverage.Covers(base + page, tail + 1), "an import starting and ending inside blocks watched pages outside it");
+        constexpr std::size_t distant = std::size_t{256} << 20u;
+        coverage.Initialize(base, 3 * distant + 17);
+        require(coverage.Exclude(base + distant - 1, 2, 50), "a distant boundary import was not excluded");
+        require(!coverage.Covers(base + distant - block, 2 * block), "a distant boundary import remained watched");
+        require(coverage.Covers(base, distant - block) && coverage.Covers(base + distant + block, 2 * distant - block), "an unrelated distant interval lost coverage");
+        require(coverage.Exclude(base + 3 * distant, 17, 60), "a distant terminal page was not excluded");
+        require(coverage.Restore(base + distant - page, 2 * page, 51), "distant boundary pages were not restored");
+        require(coverage.Covers(base + distant - page, 2 * page) && !coverage.Covers(base + distant - block, block), "distant restoration changed neighbouring pages");
+        require(coverage.Restore(base + 3 * distant, 17, 61) && coverage.Covers(base + distant + block, 2 * distant + 17 - block), "an empty interior interval or partial terminal page stayed excluded");
+        coverage.Initialize(base + distant, 0);
+        require(!coverage.Covers(base + distant, 1) && !coverage.Restore(base, 4 * distant), "empty reinitialization retained coverage");
         std::cout << "write watch coverage passed\n";
         return 0;
     } catch (const std::exception& error) {

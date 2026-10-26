@@ -1594,7 +1594,7 @@ struct DecodeSlot {
 };
 
 constexpr std::size_t DecodeSetWays = 4;
-constexpr std::size_t DecodeSets = std::size_t{1} << 18u;
+constexpr std::size_t DecodeSets = std::size_t{1} << 16u;
 constexpr std::size_t DecodeStripes = 256;
 
 struct FlatDecodeMemo {
