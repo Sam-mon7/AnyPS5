@@ -1466,6 +1466,7 @@ void Recorder::Activate() {
         labelTableOwner = this;
     }
     GuestMemory::SetFlushHook(&FlushForAccess);
+    GuestMemory::SetWriteProfileHook([](std::uint64_t address, std::size_t bytes, std::uint32_t queue, std::uint32_t opcode) { ProfileStore(address, bytes, queue, opcode, WaitStage::Cpu); });
 }
 
 std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) {

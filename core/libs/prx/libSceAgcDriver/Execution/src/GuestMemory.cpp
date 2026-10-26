@@ -1,6 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -2596,12 +2595,17 @@ unsigned long long CodeOffset(const void* address) {
 
 namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
+std::atomic<void (*)(std::uint64_t, std::size_t, std::uint32_t, std::uint32_t)> writeProfileHook{nullptr};
 std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
 
 void PrepareHostRead(std::uintptr_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
     FlushGpuWrites(address, bytes);
 }
+}
+
+void SetWriteProfileHook(void (*hook)(std::uint64_t, std::size_t, std::uint32_t, std::uint32_t)) {
+    writeProfileHook.store(hook, std::memory_order_release);
 }
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
@@ -2841,8 +2845,10 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     else StoreOwnBytes(address, source.size(), [&] { std::memcpy(destination, source.data(), source.size()); });
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profile) {
-        const auto packet = CurrentPacket();
-        Graphics::Recorder::ProfileStore(address, source.size(), packet.queue, packet.opcode, Graphics::Recorder::WaitStage::Cpu);
+        if (const auto hook = writeProfileHook.load(std::memory_order_acquire)) {
+            const auto packet = CurrentPacket();
+            hook(address, source.size(), packet.queue, packet.opcode);
+        }
     }
 }
 
