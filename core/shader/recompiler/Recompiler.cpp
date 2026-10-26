@@ -914,8 +914,12 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
+    materialized.shrink_to_fit();
+    const auto spirvCapacity = materialized.capacity() * sizeof(std::uint32_t);
     module->spirv = std::move(materialized);
     module->specializationId = constants.empty() ? 0u : nextVariantId();
+    static const bool traceMemory = std::getenv("APS5_TRACE_PLAN_MEMORY") != nullptr;
+    if (traceMemory) std::fprintf(stderr, "[module-memory] retain module=%p spirvBytes=%zu spirvCapacityBytes=%zu bindingBytes=%zu bindingCapacityBytes=%zu limit=%zu\n", static_cast<const void*>(module.get()), module->spirv.size() * sizeof(std::uint32_t), spirvCapacity, module->bindings.size() * sizeof(std::uint32_t), module->bindings.capacity() * sizeof(std::uint32_t), ModuleCacheLimit());
     return module;
 }
 
