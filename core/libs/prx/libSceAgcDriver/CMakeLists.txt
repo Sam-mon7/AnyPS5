@@ -1750,8 +1750,10 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_storage_write_back COMMAND agc_driver_recorder_tests --storage-write-back-only)
     set_tests_properties(agc_storage_write_back PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
+    add_test(NAME agc_storage_write_back_no_unit_shadow COMMAND agc_driver_recorder_tests --storage-write-back-only)
+    set_tests_properties(agc_storage_write_back_no_unit_shadow PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000;APS5_NO_UNIT_SHADOW=1")
     if(WIN32)
-        set_tests_properties(agc_storage_write_back PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_storage_write_back agc_storage_write_back_no_unit_shadow PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_copied_direct_ordering COMMAND agc_driver_recorder_tests --copied-direct-only)
@@ -1868,9 +1870,9 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_unit_shadow COMMAND agc_driver_recorder_tests --unit-shadow-only)
     add_test(NAME agc_driver_unit_shadow_budget COMMAND agc_driver_recorder_tests --unit-shadow-only)
     set_tests_properties(agc_driver_unit_shadow PROPERTIES
-        ENVIRONMENT "APS5_PIN_WAIT_MS=2000" SKIP_RETURN_CODE 77 TIMEOUT 30)
+        ENVIRONMENT "APS5_PIN_WAIT_MS=2000;APS5_SHADOW_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
     set_tests_properties(agc_driver_unit_shadow_budget PROPERTIES
-        ENVIRONMENT "APS5_PIN_WAIT_MS=2000;APS5_UNIT_SHADOW_MIB=8" SKIP_RETURN_CODE 77 TIMEOUT 30)
+        ENVIRONMENT "APS5_PIN_WAIT_MS=2000;APS5_UNIT_SHADOW_MIB=8;APS5_SHADOW_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_test(NAME agc_recorder_completion_labels COMMAND agc_driver_recorder_tests --completion-labels-only)
     set_tests_properties(agc_recorder_completion_labels PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_test(NAME agc_recorder_cmask COMMAND agc_driver_recorder_tests --cmask-only)

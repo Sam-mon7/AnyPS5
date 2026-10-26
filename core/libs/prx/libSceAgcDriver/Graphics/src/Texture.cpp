@@ -3461,8 +3461,9 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         const auto parts = std::span<const AddedPiece>(added).subspan(first, last - first);
         const auto sliceBegin = window.tiledBegin - window.window.rangeBegin;
         const auto intoSlabs = std::all_of(parts.begin(), parts.end(), [&](const AddedPiece& part) {
+            if (!part.slab) return false;
             const auto& copy = slabPieces[part.pieces].copies[part.copy];
-            return part.slab && !part.seeded && copy.dstOffset % 4 == 0 && copy.size % 4 == 0 && (part.begin - sliceBegin) % blockBytes == 0 && (part.end - sliceBegin) % blockBytes == 0;
+            return !part.seeded && copy.dstOffset % 4 == 0 && copy.size % 4 == 0 && (part.begin - sliceBegin) % blockBytes == 0 && (part.end - sliceBegin) % blockBytes == 0;
         });
         if (intoSlabs) slabRetiled.push_back({i, first, last});
     }

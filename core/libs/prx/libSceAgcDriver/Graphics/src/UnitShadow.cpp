@@ -91,11 +91,12 @@ struct UnitShadow {
     // The unit's bytes inside the import.
     std::pair<std::uint64_t, std::uint64_t> UnitRange(std::uint64_t unit) const { return {std::max(UnitBegin(unit), importBase), std::min(UnitBegin(unit + 1), ImportEnd())}; }
     bool Live(std::uint64_t unit) const { return generation[unit] != 0 && published[unit] == 0; }
-    void Recount() {
+    std::uint32_t CountLive() const {
         std::uint32_t live = 0;
         for (std::uint64_t unit = 0; unit < Units(); ++unit) live += Live(unit) ? 1u : 0u;
-        liveUnits = live;
+        return live;
     }
+    void Recount() { liveUnits = CountLive(); }
 };
 
 struct Shadows {
@@ -328,12 +329,14 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 // Newer bytes reached the import since the retile: the slab's are dead.
                 shadow->generation[unit] = 0;
                 (cpu[k] != 0 ? Stats().staleDroppedCpu : Stats().staleDroppedDriver).fetch_add(1, std::memory_order_relaxed);
+                --shadow->liveUnits;
                 continue;
             }
             const auto slabIndex = static_cast<std::size_t>(unit / SlabUnits());
             const auto& slab = shadow->slabs[slabIndex];
             if (slab == nullptr) {
                 shadow->generation[unit] = 0;
+                --shadow->liveUnits;
                 continue;
             }
             const auto [begin, end] = shadow->UnitRange(unit);
@@ -348,11 +351,12 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 ranges.emplace_back(begin, end);
             }
             shadow->published[unit] = 1;
+            --shadow->liveUnits;
             slab->lastUse = Recorder::Presents();
             bytes += end - begin;
             ++units;
         }
-        shadow->Recount();
+        if (ShadowVerify() && shadow->liveUnits != shadow->CountLive()) throw std::runtime_error("unit-shadow live count differs after publish");
     }
     if (units == 0) return 0;
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -732,12 +736,13 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                     ++lost;
                     continue;
                 }
+                if (!shadow->Live(unit)) ++shadow->liveUnits;
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
                 current->lastUse = present;
             }
         }
-        shadow->Recount();
+        if (ShadowVerify() && shadow->liveUnits != shadow->CountLive()) throw std::runtime_error("unit-shadow live count differs after mark");
     }
     if (lost != 0) {
         Stats().slabLost.fetch_add(lost, std::memory_order_relaxed);

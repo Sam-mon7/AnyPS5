@@ -5306,7 +5306,8 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
     // retile's; the copy stamps nothing, and a second publish copies nothing.
     const auto pre = CollectWritesUncached(address, bytes);
     Require(PublishShadow(unit3, unit, PublishScope::Whole, PublishReason::Hook) == 1, "the whole publish did not copy the unit");
-    Require(recorder.PendingWriteOverlaps(unit3, unit), "the publish noted no pending write");
+    if (ShadowVerify()) Require(!recorder.PendingWriteOverlaps(unit3, unit), "a verified publish remains pending");
+    else Require(recorder.PendingWriteOverlaps(unit3, unit), "the publish noted no pending write");
     recorder.Sync();
     Require(words[3 * unit] == 0x22 && words[3 * unit + unit / 2 - 1] == 0x22 && words[3 * unit + unit / 2] == 0x11 && words[4 * unit - 1] == 0x11 && words[3 * unit - 1] == 0x11 && words[4 * unit] == 0x11, "the published bytes are wrong");
     Require(!AnyShadowedOverlaps(unit3, unit), "a published unit still counts as shadowed");
@@ -5323,6 +5324,12 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
     auto four = ShadowDestinationFor(context, *import, unit4, unit5);
     Require(four.has_value() && four->seedUnits.empty() && four->slab == half->slab, "unit 4's destination is not in the same slab");
     retile(*four, unit4, unit, 0x44, false);
+    const std::array<ShadowedRange, 3> repeated{{
+        {unit3, unit5, firstSlab},
+        {unit3, unit4, firstSlab},
+        {unit4, unit5, firstSlab},
+    }};
+    MarkShadowed(*import, repeated, TrackerGeneration());
     Require(AnyShadowedOverlaps(unit3, unit) && AnyShadowedOverlaps(unit4, unit), "re-marked units are not shadowed");
     Require(PublishShadow(unit3 + 100, static_cast<std::size_t>(2 * unit - 100), PublishScope::PartialUnits, PublishReason::Fill) == 1, "the partial publish did not copy exactly the partly covered unit");
     Require(!AnyShadowedOverlaps(unit3, unit) && AnyShadowedOverlaps(unit4, unit), "the partial publish copied the wrong unit");
