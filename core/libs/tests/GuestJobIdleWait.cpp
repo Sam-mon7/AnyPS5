@@ -1,16 +1,10 @@
+#include "prx/libkernel/include/Api.hpp"
 #include "prx/libkernel/Pthread/include/DemonsSoulsIdle.hpp"
 #include "SceTypes.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-
-extern "C" {
-int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name);
-int APS5_VABI scePthreadJoin(Pthread thread, void** retval);
-int APS5_VABI scePthreadRename(Pthread thread, const char* name);
-Pthread APS5_VABI scePthreadSelf();
-}
 
 static void Require(bool value, const char* message) {
     if (value) return;
