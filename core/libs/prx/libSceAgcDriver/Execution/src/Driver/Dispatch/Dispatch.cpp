@@ -33,6 +33,40 @@ bool DispatchItemsEnabled() {
     return enabled;
 }
 
+struct PrologueSplit {
+    std::atomic<std::uint64_t> dispatches{0};
+    std::array<std::atomic<std::uint64_t>, 6> nanoseconds{};
+};
+
+std::array<PrologueSplit, 2>& prologueSplits() {
+    static std::array<PrologueSplit, 2> splits;
+    return splits;
+}
+
+void notePrologueSplit(bool indirect, const std::array<std::chrono::steady_clock::time_point, 7>& marks) {
+    auto& split = prologueSplits()[indirect ? 1 : 0];
+    split.dispatches.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t index = 0; index < split.nanoseconds.size(); ++index) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(marks[index + 1] - marks[index]).count();
+        if (elapsed > 0) split.nanoseconds[index].fetch_add(static_cast<std::uint64_t>(elapsed), std::memory_order_relaxed);
+    }
+    static std::atomic<std::int64_t> reportedAt{0};
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = reportedAt.load(std::memory_order_relaxed);
+    if (last == 0) {
+        reportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10000 || !reportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    for (std::size_t kind = 0; kind < 2; ++kind) {
+        auto& reported = prologueSplits()[kind];
+        const auto count = reported.dispatches.exchange(0, std::memory_order_relaxed);
+        std::array<double, 6> us{};
+        for (std::size_t index = 0; index < us.size(); ++index) us[index] = count == 0 ? 0.0 : static_cast<double>(reported.nanoseconds[index].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(count);
+        std::fprintf(stderr, "[dispatch] prologue split %s (10 s, %llu dispatches), us per dispatch: before the handler %.1f, shader lookup %.1f, state decode %.1f, resolve and fill-ahead %.1f, kernel matchers %.1f, request %.1f\n", kind == 0 ? "direct" : "indirect", static_cast<unsigned long long>(count), us[0], us[1], us[2], us[3], us[4], us[5]);
+    }
+}
+
 enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
@@ -79,11 +113,16 @@ bool Driver::pipelineDispatch() {
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
+    static const bool profileSplit = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::array<std::chrono::steady_clock::time_point, 7> splitMarks{};
+    const bool indirectAtEntry = indirectArguments != 0;
+    if (profileSplit) splitMarks[1] = std::chrono::steady_clock::now();
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (SkippedShader(address)) return;
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
+    if (profileSplit) splitMarks[2] = std::chrono::steady_clock::now();
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
     std::vector<std::uint32_t> userData;
@@ -103,6 +142,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         localDevice = device;
     }
+    if (profileSplit) splitMarks[3] = std::chrono::steady_clock::now();
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
@@ -129,6 +169,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         packet = resolved;
         indirectArguments = 0;
     }
+    if (profileSplit) splitMarks[4] = std::chrono::steady_clock::now();
     std::array<std::uint32_t, 3> partialGroups{};
     if (indirectArguments == 0 && (packet[4] & 0x2u) != 0) {
         partialGroups = Pm4::PartialGroupThreads({packet[1], packet[2], packet[3]}, {readRegister(queue.shader, 0x207), readRegister(queue.shader, 0x208), readRegister(queue.shader, 0x209)});
@@ -171,6 +212,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
     }
     if (partialLastGroup) compute.partialThreads = partialGroups;
+    if (profileSplit) splitMarks[5] = std::chrono::steady_clock::now();
     std::array<std::uint32_t, 3> threadGroup{};
     if (indirectArguments != 0 && (packet[4] & 0x20u) != 0) {
         for (std::uint32_t axis = 0; axis < 3; ++axis) threadGroup[axis] = std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u);
@@ -192,6 +234,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     auto phaseLap = lap;
     DispatchPhaseTiming phaseTiming{profile, lap, phaseMs, phaseLap};
     if (profile && packetStartedAt() != std::chrono::steady_clock::time_point{}) phaseMs[PhasePrologue] = std::chrono::duration<double, std::milli>(lap - packetStartedAt()).count();
+    if (profileSplit && packetStartedAt() != std::chrono::steady_clock::time_point{} && packetStartedAt() <= splitMarks[1]) {
+        splitMarks[0] = packetStartedAt();
+        splitMarks[6] = lap;
+        notePrologueSplit(indirectAtEntry, splitMarks);
+    }
 
     static const bool noDispatchCacheEnv = std::getenv("APS5_NO_DISPATCH_CACHE") != nullptr;
 
