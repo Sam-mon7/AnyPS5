@@ -1,10 +1,13 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "FixtureDeviceSelection.hpp"
@@ -561,6 +564,59 @@ void ComparedShared(const Context& context) {
 }
 #endif
 
+ShaderRecompiler::RecompileResult SampledProgram(const std::array<std::uint32_t, 8>& words) {
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + PlaceholderDimensionsPerClass + 2u;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageWritten.assign(1, false);
+    binding.imageSamplers.assign(1, 0u);
+    binding.guestDescriptor.assign(words.begin(), words.end());
+    ShaderRecompiler::RecompileResult program;
+    program.bindings.push_back(std::move(binding));
+    return program;
+}
+
+void DepthTransition(Context context, ReservedSurface& surface) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    surface.Commit(0, SurfaceBytes);
+    std::memset(surface.Data(), 0, SurfaceBytes);
+    const auto address = surface.Address();
+    auto words = Descriptor(address);
+    constexpr std::uint32_t Format32Float = 22;
+    words[1] = (words[1] & ~(0x3ffu << 20u)) | (Format32Float << 20u);
+    auto program = SampledProgram(words);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto generation = AgcDriver::GuestMemory::CollectWrites(address, SurfaceBytes);
+    Require(generation != 0, "the depth transition surface is not write-tracked");
+    ShaderResources resources(context, shader);
+    Require(resources.Reusable() && resources.Revalidate(shader), "the ordinary sampled resources did not reuse before depth registration");
+    const auto before = resources.SampledTextures().front();
+    try {
+        const DepthTarget target{address, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        Require(DepthSurfaceView(context, target, false) != VK_NULL_HANDLE, "the depth owner was not registered");
+        Require(FlushDepthPlanes(address, SurfaceBytes).empty(), "the depth registration unexpectedly made the guest bytes stale");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(AgcDriver::GuestMemory::CollectWrites(address, SurfaceBytes) != 0 && AgcDriver::GuestMemory::UnchangedSince(address, SurfaceBytes, generation), "the depth registration changed the guest bytes");
+        Require(!resources.Revalidate(shader), "sampled resources reused a stale texture after depth registration without a guest write");
+        ShaderResources rebuilt(context, shader);
+        const auto after = rebuilt.SampledTextures().front();
+        Require(after != before && DepthSurfaceHolds(context, DecodeTextureResource(words), after.get()), "the new depth owner did not replace the ordinary sampled texture");
+        Require(rebuilt.Revalidate(shader), "the rebuilt depth resources did not reuse");
+    } catch (...) {
+        ClearDepthSurfaces(context.device);
+        throw;
+    }
+    ClearDepthSurfaces(context.device);
+}
+
 void PendingStores(const Context& context, ReservedSurface& surface) {
     const auto address = surface.Address();
     const auto words = Descriptor(address);
@@ -629,6 +685,7 @@ int main(int argc, char** argv) {
                 LargeTracked(context, surface, LargeSurfaceBytes);
                 LargeTracked(context, surface, BlockBytes);
             } else if (argc == 2 && std::string_view(argv[1]) == "--pending-stores") PendingStores(context, surface);
+            else if (argc == 2 && std::string_view(argv[1]) == "--depth-transition") DepthTransition(context, surface);
             else if (argc == 2 && std::string_view(argv[1]) == "--compared-shared") {
 #ifdef _WIN32
                 ComparedShared(context);
