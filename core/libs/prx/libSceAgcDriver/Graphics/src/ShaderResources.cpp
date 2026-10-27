@@ -6187,6 +6187,26 @@ bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) con
     return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
 }
 
+void ShaderResources::ComputeChainRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes) const {
+    guestMemory.DeviceReads(reads);
+    const auto inPlace = guestMemory.InPlaceReads();
+    reads.insert(reads.end(), inPlace.begin(), inPlace.end());
+    writes = guestMemory.Writes();
+    const auto noteImage = [&](const StorageTexture& image, bool written) {
+        const auto begin = image.Descriptor().baseAddress;
+        Require(image.GuestBytes() <= std::numeric_limits<std::uint64_t>::max() - begin, "compute image guest range overflows");
+        const auto end = begin + image.GuestBytes();
+        reads.emplace_back(begin, end);
+        if (written) writes.emplace_back(begin, end);
+    };
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageTextures[index] != nullptr) noteImage(*storageTextures[index], storageWritten[index]);
+    }
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->StorageSource() != nullptr) noteImage(*texture->StorageSource(), false);
+    }
+}
+
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
     std::vector<std::pair<VkImage, bool>> images;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {

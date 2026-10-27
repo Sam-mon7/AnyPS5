@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -96,6 +97,20 @@ public:
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
     VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    static bool ComputeChainsEnabled();
+    static bool DsComputeChains(std::string_view titleId);
+    static bool ComputeChainPacketBoundary(std::uint32_t header);
+    static void NoteComputeHostAccess();
+    struct ComputeDispatchStart {
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkAccessFlags covered = 0;
+        bool continued = false;
+        bool deferred = false;
+        bool unchecked = false;
+    };
+    ComputeDispatchStart BeginComputeDispatch(const PassAccess& access, bool eligible, std::string_view titleId = {});
+    void DeferComputeBarrier(const PassAccess& access);
+    void EndComputeChain(bool syncPoint = false);
     // After a trailing barrier with ALL_COMMANDS as its destination stage: `access` is its
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
@@ -243,7 +258,7 @@ public:
     std::uint64_t SubmitAndEpoch();
     std::uint64_t OpenBatchSerial();
     bool HasTimeline() const { return timeline != VK_NULL_HANDLE; }
-    bool RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup = nullptr);
+    bool RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup = nullptr, bool chained = false);
     // Waits until every batch up to `serial` completed on the GPU. Called WITHOUT GuestMemory::GpuMutex:
     // it touches only the immutable timeline semaphore (the caller keeps the device alive). Requires
     // HasTimeline(); the debug switch APS5_NO_TIMELINE makes the device create the recorder without one.
@@ -533,6 +548,7 @@ public:
     // (or APS5_NO_BARRIER_ELISION=1) records every leading barrier, as before.
     static bool MergeBarriers();
     static void CountMerged(CommandClass which);
+    static void CountComputeChainAvoided(CommandClass which);
     static bool BarrierBatch();
     static bool ElideCovered(CommandClass which, const BarrierMask& wanted, VkAccessFlags covered);
     // Hazard tracker, counting mode (APS5_BARRIER_VALIDATE=1): every command tells the tracker
@@ -685,6 +701,12 @@ private:
         } run;
         // See Commands(): the accesses the last recorded command's trailing barrier covers.
         VkAccessFlags coveredAccess = 0;
+        PassHazards computeHazards;
+        std::uint32_t computeQueue = 0;
+        std::uint32_t computeDispatches = 0;
+        std::uint64_t computeHostEpoch = 0;
+        bool computeUnchecked = false;
+        bool computeRecording = false;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).
         struct Tracker {
             struct Range {

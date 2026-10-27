@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
@@ -49,6 +50,9 @@ struct MockDevice {
     std::function<void()> duringWait;
     VkResult timelineResult = VK_SUCCESS;
     std::uint64_t timelineWaits = 0;
+    std::string commands;
+    VkPipelineStageFlags barrierSource = 0, barrierDestination = 0;
+    VkAccessFlags barrierWrites = 0, barrierReads = 0;
 };
 
 MockDevice mock;
@@ -148,15 +152,24 @@ VKAPI_ATTR VkResult VKAPI_CALL mockWaitSemaphores(VkDevice, const VkSemaphoreWai
     return mock.timelineResult;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, const void*) {}
-VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, const void*) { mock.commands += 'U'; }
+VKAPI_ATTR void VKAPI_CALL mockCmdEndRenderPass(VkCommandBuffer) { mock.commands += 'E'; }
+VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags source, VkPipelineStageFlags destination, VkDependencyFlags, std::uint32_t count, const VkMemoryBarrier* barriers, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
+    mock.commands += 'B';
+    mock.barrierSource = source;
+    mock.barrierDestination = destination;
+    if (count != 0) {
+        mock.barrierWrites = barriers[0].srcAccessMask;
+        mock.barrierReads = barriers[0].dstAccessMask;
+    }
+}
 VKAPI_ATTR void VKAPI_CALL mockCmdBeginQuery(VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdEndQuery(VkCommandBuffer, VkQueryPool, std::uint32_t) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdResetQueryPool(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdCopyQueryPoolResults(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize, VkDeviceSize, VkQueryResultFlags) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t, const void*) {}
-VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t) { mock.commands += 'D'; }
 
 PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
     static const std::map<std::string_view, PFN_vkVoidFunction> table{
@@ -177,6 +190,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkGetSemaphoreCounterValueKHR", reinterpret_cast<PFN_vkVoidFunction>(mockCounterValue)},
         {"vkCreateQueryPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateQueryPool)},
         {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)},
+        {"vkCmdEndRenderPass", reinterpret_cast<PFN_vkVoidFunction>(mockCmdEndRenderPass)},
         {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPipelineBarrier)},
         {"vkCmdBeginQuery", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBeginQuery)},
         {"vkCmdEndQuery", reinterpret_cast<PFN_vkVoidFunction>(mockCmdEndQuery)},
@@ -196,6 +210,123 @@ Context mockContext() {
     context.queue = reinterpret_cast<VkQueue>(mock.next++);
     context.deviceProc = mockProc;
     return context;
+}
+
+void ComputeChainTests() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::GuestMemory::SetCurrentPacket(0x15, 0);
+    const auto context = mockContext();
+    Recorder recorder(context);
+    const auto* flag = std::getenv("APS5_COMPUTE_CHAINS");
+    const bool tracked = Recorder::ComputeChainsEnabled() && flag != nullptr && std::string_view(flag) == "1";
+    const bool ds = Recorder::DsComputeChains("PPSA01341");
+    Expect(!Recorder::DsComputeChains("") && !Recorder::DsComputeChains("PPSA00000"), "an unknown title enabled unchecked chains");
+    Expect(Recorder::DsComputeChains("PPSA01340") == ds, "the second supported title did not follow the experiment switch");
+    const auto dispatch = [&](const PassAccess& access, bool eligible = true, std::string_view title = {}) {
+        const auto start = recorder.BeginComputeDispatch(access, eligible, title);
+        constexpr VkAccessFlags shader = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        if (!start.continued && (!Recorder::MergeBarriers() || (start.covered & shader) != shader)) RecordMemoryBarrier(context, start.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, shader);
+        mockCmdDispatch(start.commands, 1, 1, 1);
+        if (start.deferred) recorder.DeferComputeBarrier(access);
+        else {
+            RecordMemoryBarrier(context, start.commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, shader | VK_ACCESS_HOST_READ_BIT);
+            recorder.MarkCovered(shader | VK_ACCESS_HOST_READ_BIT);
+        }
+        return start;
+    };
+    const std::pair<std::uint64_t, std::uint64_t> a{0x1000, 0x1100}, b{0x2000, 0x2100}, overlap{0x1080, 0x1200};
+    const PassAccess writeA{{}, std::span(&a, 1), {}, {}}, writeB{{}, std::span(&b, 1), {}, {}}, readA{std::span(&a, 1), {}, {}, {}};
+    const auto reset = [&] { recorder.Sync(); mock.commands.clear(); };
+    Expect(dispatch(writeA).deferred == tracked, "tracked mode admission did not match its switch");
+    Expect(dispatch(writeB).continued == tracked, "disjoint dispatches did not form a chain");
+    const auto beforeDependent = mock.commands.rfind('D');
+    Expect(!dispatch(readA).continued, "a dependent dispatch pair dropped its RAW barrier across a disjoint dispatch");
+    Expect(mock.commands.find('B', beforeDependent + 1) < mock.commands.rfind('D'), "a dependent dispatch was recorded before its barrier");
+    reset();
+    for (const auto& earlier : {readA, writeA}) {
+        dispatch(earlier);
+        const PassAccess later{{}, std::span(&overlap, 1), {}, {}};
+        Expect(!dispatch(later).continued, "a WAR or WAW overlap lost its barrier");
+        reset();
+    }
+    dispatch(readA);
+    Expect(dispatch(readA).continued == tracked, "read/read accesses closed a tracked chain");
+    reset();
+    const auto image = reinterpret_cast<VkImage>(std::uintptr_t{0x1234});
+    const std::pair<VkImage, bool> imageWrite{image, true}, imageRead{image, false};
+    dispatch({{}, {}, std::span(&imageWrite, 1), {}});
+    dispatch(writeB);
+    Expect(!dispatch({{}, {}, std::span(&imageRead, 1), {}}).continued, "an image RAW hazard crossed the chain");
+    reset();
+    dispatch({{}, {}, std::span(&imageRead, 1), {}});
+    Expect(!dispatch({{}, {}, std::span(&imageWrite, 1), {}}).continued, "an image WAR hazard crossed the chain");
+    reset();
+    dispatch({{}, {}, std::span(&imageWrite, 1), {}});
+    Expect(!dispatch({{}, {}, std::span(&imageWrite, 1), {}}).continued, "an image WAW hazard crossed the chain");
+    reset();
+    dispatch({{}, std::span(&a, 1), std::span(&imageWrite, 1), {}});
+    Expect(!dispatch(readA).continued, "an image backing range aliased by a buffer lost its barrier");
+    reset();
+    const std::pair<std::uint64_t, std::uint64_t> arguments{0x1008, 0x1014};
+    dispatch(writeA);
+    Expect(!dispatch({std::span(&arguments, 1), {}, {}, {}}).continued, "indirect arguments written in the chain lost their RAW barrier");
+    reset();
+    dispatch({std::span(&arguments, 1), {}, {}, {}});
+    Expect(!dispatch(writeA).continued, "a host-visible argument range lost its WAR barrier");
+    reset();
+    dispatch(writeA);
+    Recorder::NoteComputeHostAccess();
+    Expect(!dispatch(writeB).continued, "a host access continued a chain");
+    reset();
+    dispatch(writeA);
+    AgcDriver::GuestMemory::SetCurrentPacket(0x15, 1);
+    Expect(!dispatch(writeB).continued, "another queue continued a chain");
+    reset();
+    dispatch(writeA);
+    recorder.Commands();
+    Expect(!dispatch(writeB).continued, "another command continued a chain");
+    reset();
+    dispatch(writeA);
+    Expect(!dispatch(writeB, false).deferred, "an unsupported dispatch deferred its trailing barrier");
+    Expect(!dispatch(writeA).continued, "an unsupported dispatch preserved the previous chain");
+    reset();
+    dispatch(writeA);
+    const PassAccess unknown{{}, {}, {}, {}, true, false};
+    Expect(!dispatch(unknown).deferred, "unknown accesses were admitted to a tracked chain");
+    reset();
+    const std::pair<std::uint64_t, std::uint64_t> invalid{0x2000, 0x1000};
+    Expect(!dispatch({std::span(&invalid, 1), {}, {}, {}}).deferred, "a malformed range was admitted to a chain");
+    reset();
+    dispatch(writeA);
+    const std::uint32_t label = 7;
+    recorder.RecordStore(reinterpret_cast<VkBuffer>(std::uintptr_t{0x1235}), 0, std::as_bytes(std::span(&label, 1)), 0x3000);
+    Expect(!dispatch(writeB).continued, "a queued label continued a chain");
+    recorder.EndComputeChain(true);
+    Expect(mock.commands.find('U') < mock.commands.rfind('B'), "a PM4 sync barrier preceded its queued label store");
+    reset();
+    recorder.Commands();
+    recorder.LeaveRenderPassOpen(1, Recorder::NoTiming, false, {});
+    recorder.EndComputeChain(true);
+    Expect(mock.commands.find('E') < mock.commands.rfind('B'), "a global sync barrier was recorded inside a render pass");
+    reset();
+    for (std::uint32_t opcode = 0; opcode != 256; ++opcode) Expect(Recorder::ComputeChainPacketBoundary(0xc0000000u | (opcode << 8u)) == (opcode != 0x15 && opcode != 0x16), "a non-dispatch PM4 packet did not close the chain");
+    Expect(Recorder::ComputeChainPacketBoundary(0xc0001501u) && Recorder::ComputeChainPacketBoundary(0x00001500u), "a predicated or non-type-3 packet continued a chain");
+    dispatch(writeA, true, "PPSA01341");
+    const auto upper = dispatch(readA, true, "PPSA01341");
+    Expect(upper.continued == ds && upper.unchecked == ds, "the title-gated experiment did not bypass its inter-dispatch hazard");
+    recorder.EndComputeChain();
+    if (upper.deferred) {
+        Expect((mock.barrierSource & VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) != 0 && (mock.barrierDestination & VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) != 0 && (mock.barrierDestination & VK_PIPELINE_STAGE_HOST_BIT) != 0, "chain end did not emit a full barrier to GPU and host readers");
+        Expect((mock.barrierWrites & VK_ACCESS_MEMORY_WRITE_BIT) != 0 && (mock.barrierReads & VK_ACCESS_HOST_READ_BIT) != 0, "chain end did not publish writes to host readers");
+    }
+    reset();
+    for (std::uint32_t i = 0; i != 129; ++i) {
+        const auto start = dispatch({});
+        Expect(start.continued == (tracked && i != 0 && i != 128), "the bounded chain did not close after 128 dispatches");
+    }
+    reset();
+    AgcDriver::GuestMemory::SetCurrentPacket(AgcDriver::GuestMemory::NoPacket, 0xffffffffu);
 }
 
 void OpenBatchUnderBudget() {
@@ -483,6 +614,10 @@ void UnlockedWaitFailure(bool exception) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--compute-chains") {
+            ComputeChainTests();
+            return failures == 0 ? 0 : 1;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--unlocked-waits") {
             const bool enabled = std::getenv("APS5_UNLOCKED_LABEL_WAITS") != nullptr;
             UnlockedWaitFallbacks(enabled);

@@ -13,6 +13,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -255,10 +257,29 @@ void Driver::execute(const Submission& submission) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
         const auto header = submission.commands[cursor];
-        if (Pm4::FillerPacket(header)) { ++cursor; continue; }
+        if (Pm4::FillerPacket(header)) {
+            if (Graphics::Recorder::ComputeChainsEnabled()) {
+                std::lock_guard gpu(GuestMemory::GpuMutex());
+                if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr) recorder->EndComputeChain();
+            }
+            ++cursor;
+            continue;
+        }
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        if (Graphics::Recorder::ComputeChainsEnabled() && Graphics::Recorder::ComputeChainPacketBoundary(header)) {
+            const bool syncPoint = opcode == 0x3c || opcode == 0x42 || opcode == 0x46 || opcode == 0x47 || opcode == 0x48 || opcode == 0x49 || opcode == 0x58 || opcode == 0x93;
+            const bool force = syncPoint && Graphics::Recorder::DsComputeChains(GetAppTitleId_nid_postfix().value);
+            if (force) {
+                if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+                if (DrawFinisher::Busy()) DrawFinisher::Get().Drain();
+            }
+            std::lock_guard gpu(GuestMemory::GpuMutex());
+            if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr) {
+                recorder->EndComputeChain(force);
+            }
+        }
         Timeline::PacketScope timelinePacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.serial, cursor);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;

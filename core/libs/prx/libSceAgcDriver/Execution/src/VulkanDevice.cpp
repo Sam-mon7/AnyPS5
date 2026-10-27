@@ -54,6 +54,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -2607,6 +2608,7 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    if (state->recorder != nullptr) state->recorder->EndComputeChain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct LabelTiming {
         std::chrono::steady_clock::time_point cursor = std::chrono::steady_clock::now();
@@ -2759,6 +2761,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
 }
 
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, std::uint64_t* generation) {
+    if (state->recorder != nullptr) state->recorder->EndComputeChain();
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;
     // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
@@ -3044,6 +3047,7 @@ bool VulkanDevice::GpuCopyPossible(std::uint64_t destination, std::uint64_t sour
 }
 
 VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter) {
+    if (state->recorder != nullptr) state->recorder->EndComputeChain();
     CopyOutcome outcome{2, false, 0, CopyOutcome::None, false, false, 0, 0, 0, 0, false};
     if (!state->recorder || bytes == 0) return outcome;
     auto& recorder = *state->recorder;
@@ -5338,7 +5342,27 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     static_cast<void>(Graphics::StorageTexture::StoreDrawnLinearTouching("dispatch access", touches, resources.HoldsLease()));
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    Graphics::Recorder::ComputeDispatchStart computeStart;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> computeReads, computeWrites;
+    std::vector<std::pair<VkImage, bool>> computeImages;
+    Graphics::PassAccess computeAccess{};
+    if (Graphics::Recorder::ComputeChainsEnabled()) {
+        const auto title = GetAppTitleId_nid_postfix();
+        const bool unchecked = Graphics::Recorder::DsComputeChains(title.value);
+        const bool refresh = record.dataRefresh != RecordedDispatch::DataRefresh::None && (record.dataRefresh != RecordedDispatch::DataRefresh::Hash || resources.DataWordsHash() != record.dataWordsHash);
+        const bool eligible = !PrivateComputeQueue() && !resources.HoldsLease() && !resources.UsesAddressTable() && resources.Reusable() && !resources.NeedsCompletion() && resources.CopiedBytes() == 0 && !refresh && record.threadGroup == std::array<std::uint32_t, 3>{} && record.shader->program->workgroupMemoryDwords == 0 && !record.htileClear.has_value() && record.x <= limit[0] && record.y <= limit[1] && record.z <= limit[2];
+        if (eligible && !unchecked) {
+            resources.ComputeChainRanges(computeReads, computeWrites);
+            if (argumentImport != nullptr) computeReads.emplace_back(arguments, arguments + 12);
+            computeImages = resources.StorageImages();
+            computeAccess = {computeReads, computeWrites, computeImages, {}};
+        }
+        computeStart = recorder.BeginComputeDispatch(computeAccess, eligible, title.value);
+        covered = computeStart.covered;
+    } else {
+        computeStart.commands = recorder.Commands(&covered);
+    }
+    const auto commands = computeStart.commands;
     bool privateReady = false;
     if (PrivateComputeQueue()) {
         const auto& ready = record.privateDispatch;
@@ -5410,15 +5434,19 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (argumentImport != nullptr) {
         // The group counts were stored by earlier recorded work (a dispatch in place, a fill) or the
         // host; the indirect read follows all of it.
-        const auto timing = recorder.BeginGpuTiming(CommandClass::IndirectArguments);
-        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
-        Graphics::Recorder::CountBarriers(CommandClass::IndirectArguments);
-        recorder.EndGpuTiming(timing, 12);
+        if (computeStart.continued && computeStart.unchecked) {
+            Graphics::Recorder::CountComputeChainAvoided(CommandClass::IndirectArguments);
+        } else {
+            const auto timing = recorder.BeginGpuTiming(CommandClass::IndirectArguments);
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+            Graphics::Recorder::CountBarriers(CommandClass::IndirectArguments);
+            recorder.EndGpuTiming(timing, 12);
+        }
         recorder.NotePendingRead(arguments, 12, Graphics::Recorder::ReadKind::Indirect);
     }
     // Results of earlier recorded work are visible to this dispatch, its own to everything after.
     constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    if ((covered & shaderAccess) == shaderAccess && barrierElision) {
+    if (computeStart.continued || ((covered & shaderAccess) == shaderAccess && barrierElision)) {
         ++d.preBarriersSkipped;
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else {
@@ -5437,7 +5465,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     } else if (argumentImport != nullptr && argumentImport->address != 0) {
         const auto checkStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto checked = std::make_shared<Graphics::Buffer>(context, 12, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-        if (recorder.RecordDispatchArguments(commands, argumentImport->address + (arguments - argumentImport->base), checked->DeviceAddress())) {
+        if (recorder.RecordDispatchArguments(commands, argumentImport->address + (arguments - argumentImport->base), checked->DeviceAddress(), nullptr, computeStart.continued)) {
             indirectBuffer = checked->Handle();
             indirectOffset = 0;
             recorder.Keep(std::move(checked));
@@ -5499,12 +5527,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     recorder.EndGpuTiming(gpuTiming);
     if (marker != 0) state->bufferMarker(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, state->markerBuffer, sizeof(std::uint32_t), marker);
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (computeStart.deferred) {
+        recorder.DeferComputeBarrier(computeAccess);
+    } else {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(dispatchedAccess);
+    }
     recordStep(PhaseRecordBind);
     if (record.htileClear.has_value()) Graphics::ArmHtileDepthClear(record.htileClear->first, record.htileClear->second);
     resources.MarkGpuWrites(recorder);
