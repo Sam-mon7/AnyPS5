@@ -246,8 +246,12 @@ PacketTag CurrentPacket();
 // (GuestBufferMemory.cpp: the flush before a writable mirror's compare, a new mirror's fill).
 // DrawCache: a draw entry's per-stage value validation (Driver.cpp drawCache), where a draw
 // capture's hook waits reappear on a hit.
+// DispatchHandler, DispatchPrepare, DispatchDevice: a dispatch packet's handler outside the finer sites,
+// its PrepareRecipe/PrepareDispatch, and its device call (resource proofs, refreshes, recording).
+// Submission, Packet, PacketPrepare, PacketFlush: a queue worker's Driver::execute outside its packets,
+// a packet's body outside the finer sites, preparePacketMemory, and flushBetweenPackets.
 // Every enumerator needs its name in ReadSiteName's table (GuestMemory.cpp).
-enum class ReadSite : std::uint8_t { Unknown = 0, Capture, DispatchCache, TextureCompare, TextureRead, BufferUpload, IndexBuffer, VertexBuffer, Registers, IndirectArguments, Wait, Label, Scanout, Store, MirrorRefresh, DrawCache, FillInput, Count };
+enum class ReadSite : std::uint8_t { Unknown = 0, Capture, DispatchCache, TextureCompare, TextureRead, BufferUpload, IndexBuffer, VertexBuffer, Registers, IndirectArguments, Wait, Label, Scanout, Store, MirrorRefresh, DrawCache, FillInput, DispatchHandler, DispatchPrepare, DispatchDevice, Submission, Packet, PacketPrepare, PacketFlush, Count };
 const char* ReadSiteName(ReadSite site);
 // Sets the calling thread's read site and returns the previous one (nested scopes restore it).
 ReadSite SetReadSite(ReadSite site);

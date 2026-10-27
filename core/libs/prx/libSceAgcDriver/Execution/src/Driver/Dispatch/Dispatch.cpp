@@ -164,6 +164,7 @@ bool Driver::pipelineDispatch() {
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
+    const GuestMemory::ReadSiteScope handlerSite(GuestMemory::ReadSite::DispatchHandler);
     static const bool profileSplit = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::array<std::chrono::steady_clock::time_point, 7> splitMarks{};
     const bool indirectAtEntry = indirectArguments != 0;
@@ -660,6 +661,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     std::shared_ptr<RecipeHit> recipeHit;
     if (cached && keepVariant != nullptr && !stampValidate()) {
+        const GuestMemory::ReadSiteScope prepareSite(GuestMemory::ReadSite::DispatchPrepare);
         recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
         phaseTiming.Phase(PhaseRecipePrecheck);
     }
@@ -690,6 +692,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::shared_ptr<PreparedDispatch> prepared;
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
             try {
+                const GuestMemory::ReadSiteScope prepareSite(GuestMemory::ReadSite::DispatchPrepare);
                 prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads, address);
             } catch (const std::exception& error) {
                 if (rethrow(error)) return;
@@ -727,6 +730,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         auto* const keysRecorder = filledKeys ? Graphics::Recorder::Active() : nullptr;
         const auto keysNoteBefore = keysRecorder != nullptr ? keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes) : 0;
         try {
+            const GuestMemory::ReadSiteScope deviceSite(GuestMemory::ReadSite::DispatchDevice);
             if (recipeHit != nullptr) {
                 VulkanDevice::IndirectOutcome outcome{0, 0};
                 const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, threadGroup, std::move(privateDispatch));

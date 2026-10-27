@@ -10,6 +10,7 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket) {
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::PacketFlush);
     static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
     static const bool ownLock = std::getenv("APS5_LABEL_OWN_LOCK") != nullptr;
     static const bool batchState = std::getenv("APS5_NO_LABEL_STATE_BATCHING") == nullptr;

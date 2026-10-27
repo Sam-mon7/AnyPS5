@@ -140,6 +140,7 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 }
 
 void Driver::execute(const Submission& submission) {
+    const GuestMemory::ReadSiteScope submissionSite(GuestMemory::ReadSite::Submission);
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;
@@ -317,6 +318,7 @@ void Driver::execute(const Submission& submission) {
 
         timing.Mark("device_lock");
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
+        const GuestMemory::ReadSiteScope packetSite(GuestMemory::ReadSite::Packet);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
         if (predicated) {
             landPendingWaits(submission.queue);
@@ -370,7 +372,10 @@ void Driver::execute(const Submission& submission) {
         if (profilePackets) packetProfile.flushMs += std::chrono::duration<double, std::milli>(packetTimer.start - flushStart).count();
 
         bool wroteOnGpu = false, endOfPipeInterrupt = false, interruptDeferred = false, drawPacket = false, sampleDump = false;
-        const bool drains = preparePacketMemory(submission, queue, packet, header, opcode, wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
+        const bool drains = [&] {
+            const GuestMemory::ReadSiteScope prepareSite(GuestMemory::ReadSite::PacketPrepare);
+            return preparePacketMemory(submission, queue, packet, header, opcode, wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
+        }();
         traceLabel(packet, submission.queue);
         timing.Mark("prepare_memory");
 
