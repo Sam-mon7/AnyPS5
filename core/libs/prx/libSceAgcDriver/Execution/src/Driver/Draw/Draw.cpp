@@ -215,6 +215,12 @@ struct DrawLockTiming {
             std::uint64_t unavailable = 0;
             std::uint64_t prelockBytes = 0;
             std::uint64_t lockedBytes = 0;
+            std::uint64_t targetCandidates = 0;
+            std::uint64_t targetReady = 0;
+            std::uint64_t targetAccepted = 0;
+            std::uint64_t targetLookupAccepted = 0;
+            std::uint64_t targetFallbacks = 0;
+            double targetProofUs = 0;
             double prepareMs = 0;
             double heldMs = 0;
             double maxHeldMs = 0;
@@ -232,6 +238,15 @@ struct DrawLockTiming {
         count.unavailable += preparation.unavailable;
         count.prelockBytes += preparation.collectedBytes;
         count.lockedBytes += collected;
+        for (const auto& target : preparation.targets) {
+            if (target.device == VK_NULL_HANDLE) continue;
+            ++count.targetCandidates;
+            count.targetReady += target.ready;
+            count.targetAccepted += target.accepted;
+            count.targetLookupAccepted += target.lookupAccepted;
+            count.targetFallbacks += !target.accepted;
+        }
+        count.targetProofUs += preparation.targetProofUs;
         count.prepareMs += prepareMs;
         count.heldMs += heldMs;
         count.maxHeldMs = std::max(count.maxHeldMs, heldMs);
@@ -242,6 +257,7 @@ struct DrawLockTiming {
             const auto& total = counts[i];
             if (total.draws == 0) continue;
             AgcDriver::ProfilePrint_nid_no_patch("[draw-lock] queue 0x%x %s (10 s): %llu scopes held %.3f ms (max %.3f ms), prelock %.3f ms; keys reused %llu, redo scopes %llu (keys invalidated %llu, cache probe changed %llu, collect invalidated %llu); target ranges %llu (%llu unavailable), walked prelock %.3f MiB, after lock %.3f MiB\n", GuestMemory::GpuLockThreadTag(), i != 0 ? "prelock" : "locked", static_cast<unsigned long long>(total.draws), total.heldMs, total.maxHeldMs, total.prepareMs, static_cast<unsigned long long>(total.keys), static_cast<unsigned long long>(total.redone), static_cast<unsigned long long>(total.keyInvalidated), static_cast<unsigned long long>(total.cacheChanged), static_cast<unsigned long long>(total.collectInvalidated), static_cast<unsigned long long>(total.ranges), static_cast<unsigned long long>(total.unavailable), static_cast<double>(total.prelockBytes) / 1048576.0, static_cast<double>(total.lockedBytes) / 1048576.0);
+            AgcDriver::ProfilePrint_nid_no_patch("[draw-target-prelock] queue 0x%x %s (10 s): %llu draw scopes, hold %.3f us/scope; target-proof %s, candidates %llu, proved before lock %llu, successes %llu (lookup reused %llu), fallbacks/unconsumed %llu; preparation %.3f ms\n", GuestMemory::GpuLockThreadTag(), i != 0 ? "prelock" : "locked", static_cast<unsigned long long>(total.draws), total.heldMs * 1000.0 / total.draws, Graphics::StorageTexture::DrawTargetPrelockEnabled() ? "on" : "off", static_cast<unsigned long long>(total.targetCandidates), static_cast<unsigned long long>(total.targetReady), static_cast<unsigned long long>(total.targetAccepted), static_cast<unsigned long long>(total.targetLookupAccepted), static_cast<unsigned long long>(total.targetFallbacks), total.targetProofUs / 1000.0);
         }
         counts = {};
     }

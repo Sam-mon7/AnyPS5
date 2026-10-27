@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -2181,8 +2183,48 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
-bool StorageTexture::Refresh() {
-    return refresh(0, trackedLayers);
+bool StorageTexture::DrawTargetPrelockEnabled() {
+    static const bool enabled = std::getenv("APS5_DRAW_TARGET_PRELOCK") != nullptr;
+    return enabled;
+}
+
+StorageTexture::RefreshPreparation StorageTexture::PrepareRefresh() {
+    RefreshPreparation prepared;
+    prepared.image = weak_from_this();
+    prepared.device = context.device;
+    if (!DrawTargetPrelockEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return prepared;
+    {
+        std::lock_guard lock(refreshCandidateMutex);
+        prepared.generation = refreshCandidate.generation;
+        prepared.keyGeneration = refreshCandidate.keyGeneration;
+        prepared.keys = refreshCandidate.keys;
+        prepared.dccAddress = refreshCandidateDcc;
+    }
+    prepared.epoch = GuestMemory::ThreadCollectEpoch();
+    if (prepared.generation == 0 || prepared.epoch == 0) return prepared;
+    prepared.mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    prepared.unwatch = GuestMemory::UnwatchSerial();
+#ifdef _WIN32
+    prepared.committed = GuestArena::GuestArenaCommitGeneration_nid_postfix();
+#endif
+    prepared.forgotten = GuestMemory::ForgetSerial();
+    if ((prepared.forgotten & 1) != 0) return prepared;
+    if (GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == 0) return prepared;
+    std::array<GuestMemory::UnchangedQuery, 2> queries{{{descriptor.baseAddress, static_cast<std::size_t>(guestBytes), prepared.generation}}};
+    std::size_t used = 1;
+    if (prepared.dccAddress != 0) {
+        const auto bytes = static_cast<std::size_t>(guestBytes / 256);
+        if (bytes == 0 || prepared.keyGeneration == 0 || GuestMemory::CollectWrites(prepared.dccAddress, bytes) == 0) return prepared;
+        queries[used++] = {prepared.dccAddress, bytes, prepared.keyGeneration};
+    }
+    prepared.tracker = GuestMemory::TrackerGeneration();
+    prepared.pending = PendingSerial();
+    prepared.ready = GuestMemory::UnchangedSinceAll(std::span(queries.data(), used)) && !otherPendingOverlaps();
+    return prepared;
+}
+
+bool StorageTexture::Refresh(RefreshPreparation* preparation) {
+    return refresh(0, trackedLayers, preparation);
 }
 
 bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
@@ -2202,10 +2244,10 @@ bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
     if (pendingAlias() != nullptr) return whole();
     const auto scopeBegin = layerBegin(firstLayer);
     static_cast<void>(FlushDepthPlanes(scopeBegin, static_cast<std::size_t>(layerBegin(lastLayer - 1) + layerBytes(lastLayer - 1) - scopeBegin)));
-    return refresh(firstLayer, lastLayer);
+    return refresh(firstLayer, lastLayer, nullptr);
 }
 
-bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
+bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, RefreshPreparation* preparation) {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
@@ -2224,7 +2266,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
     if (profile) stepStart = LookupOutcomes::Add(LookupOutcomes::RefreshWait, stepStart);
     const auto collectBefore = profile ? ThreadLookupOutcomes().ms[LookupOutcomes::RefreshCollect] : 0;
-    const bool proved = refreshProved();
+    const bool proved = refreshProved(preparation);
     if (profile) {
         LookupOutcomes::Add(LookupOutcomes::RefreshProofCheck, stepStart);
         ThreadLookupOutcomes().ms[LookupOutcomes::RefreshProofCheck] -= ThreadLookupOutcomes().ms[LookupOutcomes::RefreshCollect] - collectBefore;
@@ -2592,7 +2634,54 @@ bool StorageTexture::otherPendingOverlaps() const {
     return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
-bool StorageTexture::refreshProved() {
+bool StorageTexture::preparedRefreshProved(RefreshPreparation& preparation) {
+    bool accepted = preparation.ready && preparation.image.lock().get() == this &&
+        preparation.device == context.device && GuestMemory::GpuMutex().HeldByThisThread() && refreshProof.generation != 0 &&
+        generation == preparation.generation && refreshProof.generation == preparation.generation &&
+        uploadedKeys == preparation.keys && refreshProof.keys == preparation.keys &&
+        descriptor.dccAddress == preparation.dccAddress &&
+        (descriptor.dccAddress == 0 || (keyProof.generation == preparation.keyGeneration &&
+            refreshProof.keyGeneration == preparation.keyGeneration && keyProof.keys == uploadedKeys)) &&
+        preparation.tracker == GuestMemory::TrackerGeneration() &&
+        preparation.epoch == GuestMemory::ThreadCollectEpoch() &&
+        preparation.mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix() &&
+        preparation.unwatch == GuestMemory::UnwatchSerial() &&
+        preparation.forgotten == GuestMemory::ForgetSerial() &&
+        preparation.pending == PendingSerial();
+#ifdef _WIN32
+    accepted = accepted && preparation.committed == GuestArena::GuestArenaCommitGeneration_nid_postfix();
+#endif
+    if (LookupOutcomes::Profiled()) {
+        preparation.accepted |= accepted;
+    }
+    if (accepted) {
+        refreshProof.pendingSerial = preparation.pending;
+        return true;
+    }
+    return false;
+}
+
+bool StorageTexture::TryPreparedRefresh(RefreshPreparation& preparation) {
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    const bool profile = LookupOutcomes::Profiled();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto hold = GuestMemory::GpuHoldSerial();
+    CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
+    const auto proofStart = profile ? LookupOutcomes::Add(LookupOutcomes::RefreshWait, start) : std::chrono::steady_clock::time_point{};
+    if (hold != GuestMemory::GpuHoldSerial()) return false;
+    const bool proved = preparedRefreshProved(preparation);
+    if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProofCheck, proofStart);
+    if (!proved) return false;
+    layerBehind.clear();
+    NoteProved();
+    refreshesProved.fetch_add(1, std::memory_order_relaxed);
+    if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
+    return true;
+}
+
+bool StorageTexture::refreshProved(RefreshPreparation* preparation) {
+    if (preparation != nullptr && preparedRefreshProved(*preparation)) return true;
     if (refreshProof.generation == 0) return false;
     if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
     const auto bytes = static_cast<std::size_t>(guestBytes);
@@ -2638,6 +2727,11 @@ void StorageTexture::takeRefreshProof(bool aliased) {
     const auto serial = PendingSerial();
     if (otherPendingOverlaps()) return;
     refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
+    if (DrawTargetPrelockEnabled()) {
+        std::lock_guard lock(refreshCandidateMutex);
+        refreshCandidate = refreshProof;
+        refreshCandidateDcc = descriptor.dccAddress;
+    }
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {

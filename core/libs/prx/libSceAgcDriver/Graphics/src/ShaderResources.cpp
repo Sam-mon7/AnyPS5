@@ -518,7 +518,7 @@ void refreshForView(StorageTexture& source, const GuestTextureResource& resource
     else source.Refresh();
 }
 
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0, bool written = false, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers = std::nullopt);
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0, bool written = false, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers = std::nullopt, StorageTexture::RefreshPreparation* preparation = nullptr);
 
 std::uint64_t heldBytes(const StorageTexture& image) {
     return image.BudgetBytes();
@@ -1161,6 +1161,7 @@ struct ExtendedSurfaces {
     AgcDriver::Mutex mutex;
     std::map<std::array<std::uint32_t, 8>, std::uint32_t> levels;
     std::atomic<bool> any{false};
+    std::atomic<std::uint64_t> serial{1};
 };
 
 ExtendedSurfaces& ExtendedChains() {
@@ -1182,7 +1183,10 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
     std::lock_guard lock(surfaces.mutex);
     if (extended) {
         auto& levels = surfaces.levels[identity];
-        levels = std::max(levels, viewed.mipCount);
+        if (levels < viewed.mipCount) {
+            levels = viewed.mipCount;
+            surfaces.serial.fetch_add(1, std::memory_order_release);
+        }
         surfaces.any.store(true, std::memory_order_release);
         surface.mipCount = levels;
     } else if (const auto it = surfaces.levels.find(identity); it != surfaces.levels.end()) {
@@ -1220,7 +1224,7 @@ static WrittenStorage WrittenStorageBytes(const GuestTextureResource& viewed, st
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, std::uint32_t mip, std::uint64_t guestBytes, bool written, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers) {
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, std::uint32_t mip, std::uint64_t guestBytes, bool written, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers, StorageTexture::RefreshPreparation* preparation) {
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (viewed.baseAddress != requested.baseAddress) guestBytes = 0;
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
@@ -1268,7 +1272,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         }
         if (it != cache.entries.end()) {
             if (layers) it->texture->RefreshLayers(layers->first, layers->second);
-            else it->texture->Refresh();
+            else it->texture->Refresh(preparation);
             cache.entries.splice(cache.entries.begin(), cache.entries, it);
             texture = it->texture;
             counters.storageHits.fetch_add(1, std::memory_order_relaxed);
@@ -1567,8 +1571,52 @@ bool StorageImagesCached(const Context& context, std::span<const StorageTexture*
 
 }
 
-std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource) {
-    return cachedStorageTexture(context, {}, resource, 0);
+StorageTexture::RefreshPreparation PrepareStorageSurface(const Context& context, const GuestTextureResource& resource) {
+    static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (disabled || !StorageTexture::DrawTargetPrelockEnabled() || GuestMemory::GpuMutex().HeldByThisThread() || resource.dimension != TextureDimension::k2D || resource.mipCount != 1 || resource.depthOrLastArray != 0 || resource.baseArray != 0) return {};
+    const auto serial = ExtendedChains().serial.load(std::memory_order_acquire);
+    const auto viewed = ArrayLayerWindow(resource, context.limits.maxImageArrayLayers);
+    const StorageKey key{context.device, SurfaceKey(context, StorageSurface(context, viewed))};
+    auto& cache = StorageTextures();
+    std::shared_ptr<StorageTexture> image;
+    {
+        std::lock_guard lock(cache.mutex);
+        const auto found = findStorage(cache, key);
+        if (found == cache.entries.end()) return {};
+        image = found->texture;
+    }
+    auto prepared = image->PrepareRefresh();
+    prepared.device = context.device;
+    prepared.lookupKey = SurfaceKey(context, resource);
+    prepared.storageSerial = serial;
+    return prepared;
+}
+
+std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource, StorageTexture::RefreshPreparation* preparation) {
+    if (preparation != nullptr && preparation->ready && preparation->device == context.device &&
+        resource.dimension == TextureDimension::k2D && resource.mipCount == 1 && resource.depthOrLastArray == 0 && resource.baseArray == 0 &&
+        preparation->storageSerial == ExtendedChains().serial.load(std::memory_order_acquire) &&
+        preparation->lookupKey == SurfaceKey(context, resource) && !DepthPlanesStale() && GuestMemory::GpuMutex().HeldByThisThread()) {
+        const bool profile = LookupOutcomes::Profiled();
+        const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto hold = GuestMemory::GpuHoldSerial();
+        const auto image = preparation->image.lock();
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
+        if (image != nullptr && !DepthSurfaceOverlaps(context.device, image->Descriptor().baseAddress, image->GuestBytes()) &&
+            StorageImageServesKeys(*image, resource.dccAddress) && StorageImageCached(context, image.get())) {
+            RequireNoMultisampleTarget(image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()), "a storage image access");
+            if (image->TryPreparedRefresh(*preparation) && hold == GuestMemory::GpuHoldSerial() &&
+                preparation->storageSerial == ExtendedChains().serial.load(std::memory_order_acquire) && !DepthPlanesStale()) {
+                TextureCounts().storageHits.fetch_add(1, std::memory_order_relaxed);
+                if (profile) {
+                    preparation->lookupAccepted = true;
+                    LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
+                }
+                return image;
+            }
+        }
+    }
+    return cachedStorageTexture(context, {}, resource, 0, 0, false, std::nullopt, preparation);
 }
 
 std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, const GuestTextureResource& resource, std::uint32_t firstLayer, std::uint32_t layerCount) {

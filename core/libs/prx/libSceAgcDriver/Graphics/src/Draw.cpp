@@ -1279,12 +1279,46 @@ struct DrawTimer {
     bool profile;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
-    explicit DrawTimer(bool profile) : profile(profile), phaseStart(profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    std::array<std::uint64_t, PhaseCount> heldNs;
+    std::uint64_t heldStart;
+    std::uint64_t phaseHeldStart;
+    explicit DrawTimer(bool profile) : profile(profile), phaseStart(profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {
+        if (!profile) return;
+        heldNs.fill(0);
+        heldStart = phaseHeldStart = GuestMemory::ThreadGpuHeldNs();
+    }
     void phase(DrawPhase which) {
         if (!profile) return;
         const auto now = std::chrono::steady_clock::now();
+        const auto held = GuestMemory::ThreadGpuHeldNs();
+        heldNs[which] += held - phaseHeldStart;
+        phaseHeldStart = held;
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         phaseStart = now;
+    }
+    ~DrawTimer() {
+        if (!profile) return;
+        struct Totals {
+            std::uint64_t scopes = 0;
+            std::uint64_t held = 0;
+            std::uint64_t tail = 0;
+            std::array<std::uint64_t, PhaseCount> phases{};
+            std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+        };
+        static thread_local Totals totals;
+        const auto held = GuestMemory::ThreadGpuHeldNs();
+        ++totals.scopes;
+        totals.held += held - heldStart;
+        totals.tail += held - phaseHeldStart;
+        for (std::size_t i = 0; i < PhaseCount; ++i) totals.phases[i] += heldNs[i];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - totals.reported < std::chrono::seconds(10)) return;
+        char line[1536];
+        int n = std::snprintf(line, sizeof(line), "[draw-hold] queue 0x%x target-proof %s (10 s): %llu Graphics scopes (recipe attempts included), held %.3f ms / %.3f us per scope; held phase ms:", GuestMemory::GpuLockThreadTag(), StorageTexture::DrawTargetPrelockEnabled() ? "on" : "off", static_cast<unsigned long long>(totals.scopes), static_cast<double>(totals.held) / 1e6, static_cast<double>(totals.held) / (1000.0 * totals.scopes));
+        for (std::size_t i = 0; i < PhaseCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.3f", DrawPhaseNames[i], static_cast<double>(totals.phases[i]) / 1e6);
+        if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " tail=%.3f\n", static_cast<double>(totals.tail) / 1e6);
+        AgcDriver::ProfilePrint_nid_no_patch("%s", line);
+        totals = {};
     }
 };
 
@@ -1759,7 +1793,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
-std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
+std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>(StorageTexture::RefreshPreparation*)>& lookup, StorageTexture::RefreshPreparation* preparation) {
     const auto lookupStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::optional<LookupOutcomes> before;
@@ -1795,7 +1829,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             const auto surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
             StorageTexture::ProfilePendingAccess(surface, DescribeSurface(surface).guestBytes, reads ? StorageTexture::PendingAccess::Read : StorageTexture::PendingAccess::Partial, &access);
         }
-        resident = lookup();
+        resident = lookup(preparation);
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
         static AgcDriver::Mutex reportMutex;
@@ -2809,7 +2843,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
-            binding.resident = refreshResidentTarget(context, state, color, draw, shaders, outcome, profile, [&] {
+            auto* targetPreparation = prepared.preparation != nullptr && prepared.preparation->device == context.device && index < prepared.preparation->targets.size() ? &prepared.preparation->targets[index] : nullptr;
+            binding.resident = refreshResidentTarget(context, state, color, draw, shaders, outcome, profile, [&](StorageTexture::RefreshPreparation* targetProof) {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -2822,11 +2857,11 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                     Require(resident->Attachable(), "storage format cannot be a color attachment");
                     return resident;
                 }
-                auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
+                auto resident = CachedStorageSurface(context, SurfaceForTarget(color), targetProof);
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
-            });
+            }, targetPreparation);
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
@@ -3513,6 +3548,21 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         cached = SharedResourceCache().Find(prepared.resourceKey);
     }
     if (cached != nullptr && collect) cached->PrecollectSurfaces();
+    if (collect && residentTargets && context.detiler != nullptr && StorageTexture::DrawTargetPrelockEnabled()) {
+        const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        prepared.targets.resize(state.colors.size());
+        for (std::size_t index = 0; index < state.colors.size(); ++index) {
+            const auto& color = state.colors[index];
+            if (color.samples != 1 || (color.tileMode == ColorTileMode::Linear && !residentLinear)) continue;
+            try {
+                const auto surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
+                prepared.targets[index] = PrepareStorageSurface(context, surface);
+            } catch (const std::runtime_error&) {
+                continue;
+            }
+        }
+        if (profile) prepared.targetProofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
+    }
     if (profile) {
         prepared.cached = cached;
         prepared.collectedBytes = GuestMemory::ThreadCollectedBytes() - collectedBefore;
@@ -3531,7 +3581,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawPreparation* preparation) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
@@ -3576,11 +3626,12 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
-        auto resident = refreshResidentTarget(context, state, state.colors[index], draw, shaders, outcome, profile, [&] {
+        auto* targetPreparation = preparation != nullptr && preparation->device == context.device && index < preparation->targets.size() ? &preparation->targets[index] : nullptr;
+        auto resident = refreshResidentTarget(context, state, state.colors[index], draw, shaders, outcome, profile, [&](StorageTexture::RefreshPreparation* targetProof) {
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
-            else stored->Refresh();
+            else stored->Refresh(targetProof);
             return stored;
-        });
+        }, targetPreparation);
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
         targets.push_back(std::move(resident));

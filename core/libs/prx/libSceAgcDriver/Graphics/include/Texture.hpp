@@ -397,7 +397,30 @@ public:
     // Brings the image up to date with guest memory before another use; returns whether its content
     // was still current (nothing uploaded).
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
-    bool Refresh();
+    struct RefreshPreparation {
+        std::weak_ptr<StorageTexture> image;
+        std::uint64_t generation = 0;
+        std::uint64_t keyGeneration = 0;
+        std::uint64_t dccAddress = 0;
+        DccKeys keys = DccKeys::Uncompressed;
+        std::uint64_t epoch = 0;
+        std::uint64_t mapping = 0;
+        std::uint64_t unwatch = 0;
+        std::uint64_t committed = 0;
+        std::uint64_t forgotten = 0;
+        std::uint64_t tracker = 0;
+        std::uint64_t pending = 0;
+        VkDevice device = VK_NULL_HANDLE;
+        std::array<std::uint32_t, 8> lookupKey{};
+        std::uint64_t storageSerial = 0;
+        bool ready = false;
+        bool accepted = false;
+        bool lookupAccepted = false;
+    };
+    static bool DrawTargetPrelockEnabled();
+    RefreshPreparation PrepareRefresh();
+    bool TryPreparedRefresh(RefreshPreparation& preparation);
+    bool Refresh(RefreshPreparation* preparation = nullptr);
     bool RefreshLayers(std::uint32_t first, std::uint32_t count);
     inline static std::atomic<std::uint64_t> epochRefreshes{0};
     static std::uint64_t SinglePassMoves();
@@ -538,11 +561,12 @@ private:
     // layer generation (the whole-surface fast check), `dirty` whether any layer is pending.
     std::uint64_t layerBegin(std::uint32_t layer) const { return descriptor.baseAddress + static_cast<std::uint64_t>(layer) * trackedLayerBytes; }
     bool anyLayerPending() const;
-    bool refresh(std::uint32_t firstLayer, std::uint32_t lastLayer);
+    bool refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, RefreshPreparation* preparation);
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration();
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
-    bool refreshProved();
+    bool refreshProved(RefreshPreparation* preparation);
+    bool preparedRefreshProved(RefreshPreparation& preparation);
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
@@ -641,6 +665,9 @@ private:
         DccKeys keys = DccKeys::Uncompressed;
     };
     RefreshProof refreshProof;
+    std::mutex refreshCandidateMutex;
+    RefreshProof refreshCandidate;
+    std::uint64_t refreshCandidateDcc = 0;
     struct ForeignKeyProof {
         std::uint64_t dccAddress = 0;
         DccKeyProof proof;

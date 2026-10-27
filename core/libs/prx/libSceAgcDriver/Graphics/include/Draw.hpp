@@ -24,6 +24,8 @@ struct DrawTraceContext {
 
 struct DrawPreparation {
     VkDevice device = VK_NULL_HANDLE;
+    std::vector<StorageTexture::RefreshPreparation> targets;
+    double targetProofUs = 0;
     std::vector<std::uint32_t> resourceKey;
     std::weak_ptr<ShaderResources> cached;
     std::uint64_t epoch = 0;
@@ -120,7 +122,7 @@ struct DrawRecipeOutcome {
 // the template's proof (ProveCurrent) with the alias checks repeated, the pipeline and framebuffer
 // from the recipe, then the record as Draw's (pass continued or begun, Kept, MarkGpuWrites). A
 // miss records nothing.
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr);
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr, DrawPreparation* preparation = nullptr);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
 
