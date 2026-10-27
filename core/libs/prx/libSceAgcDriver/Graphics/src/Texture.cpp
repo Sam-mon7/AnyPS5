@@ -120,11 +120,18 @@ std::atomic<std::uint64_t> untrackedCompares{0};
 std::atomic<std::uint64_t> pendingScanCalls{0}, pendingScanQueries{0}, pendingScanCandidates{0}, pendingScanSkipped{0}, pendingIndexBuilds{0};
 
 struct StorageTraffic {
+    struct FlushSource {
+        std::uint64_t count = 0;
+        double ms = 0;
+        std::array<std::uint64_t, LookupOutcomes::WorkCount> work{};
+    };
     AgcDriver::Mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
     std::array<std::pair<std::uint64_t, std::uint64_t>, 4> uploads{};
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> uploadReasons;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> drawnStores;
+    std::map<std::array<std::uint64_t, 18>, FlushSource> flushSources;
+    std::uint64_t omittedFlushSources = 0;
     std::uint64_t directWriteBacks = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -175,6 +182,18 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] pending scan (10 s): %llu calls, %llu queries, %llu candidate images examined, %llu image visits skipped by index, %llu index rebuilds\n", take(pendingScanCalls), take(pendingScanQueries), take(pendingScanCandidates), take(pendingScanSkipped), take(pendingIndexBuilds));
+    std::vector<decltype(traffic.flushSources)::const_iterator> sources;
+    for (auto it = traffic.flushSources.begin(); it != traffic.flushSources.end(); ++it) sources.push_back(it);
+    std::sort(sources.begin(), sources.end(), [](const auto left, const auto right) { return left->second.ms > right->second.ms; });
+    static constexpr std::array<const char*, 4> writers{"storage/depth", "draw", "fill", "copy"};
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        const auto& [key, source] = *sources[i];
+        const auto n = [&](std::size_t field) { return static_cast<unsigned long long>(key[field]); };
+        const auto w = [&](LookupOutcomes::Work field) { return static_cast<unsigned long long>(source.work[field]); };
+        AgcDriver::ProfilePrint_nid_no_patch("[pending-source] (10 s) target 0x%llx+0x%llx image 0x%llx <- 0x%llx+0x%llx image 0x%llx %llux%llu guest format %llu Vulkan %llu tile %llu xor %llu dimension %llu mips %llu DCC 0x%llx depth/last %llu base %llu; last writer %s: %llu stores %.3f ms, stored %llu bytes (shadow %llu import %llu CPU %llu), %llu windows, %llu image-buffer regions, %llu layout transitions; %llu stores omitted at the 128-pair cap\n", n(0), n(1), n(2), n(3), n(4), n(5), n(6), n(7), n(8), n(9), n(10), n(11), n(12), n(13), n(14), n(15), n(16), writers.at(key[17]), static_cast<unsigned long long>(source.count), source.ms, w(LookupOutcomes::WriteBackBytes), w(LookupOutcomes::ShadowBytes), w(LookupOutcomes::ImportBytes), w(LookupOutcomes::CpuBytes), w(LookupOutcomes::RetileWindows), w(LookupOutcomes::ImageBufferRegions), w(LookupOutcomes::LayoutTransitions), static_cast<unsigned long long>(traffic.omittedFlushSources));
+    }
+    traffic.flushSources.clear();
+    traffic.omittedFlushSources = 0;
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.drawnStores.clear();
@@ -195,6 +214,8 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
 
 void countStorageWriteBack(std::uint64_t bytes, bool direct, bool drawn = false) {
     if (!LookupOutcomes::Profiled()) return;
+    ThreadLookupOutcomes().work[LookupOutcomes::WriteBackBytes] += bytes;
+    if (!direct) ThreadLookupOutcomes().work[LookupOutcomes::CpuBytes] += bytes;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
     auto& totals = traffic.writeBacks[flushReason != nullptr ? flushReason : "other"];
@@ -2122,7 +2143,7 @@ VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
-    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "refresh wait", "refresh proof check", "refresh collect", "refresh flush", "refresh validate", "clean proof"};
+    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "refresh wait", "refresh proof check", "refresh collect", "refresh flush", "refresh validate", "clean proof", "flush depth", "flush GPU wait"};
     return kind < Count ? names[kind] : "?";
 }
 
@@ -2213,21 +2234,31 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     // flush below and the compare through the hook skip it).
     refreshing = this;
     NoteProved();
-    // Results of other images pending in this memory must reach it first, except an alias's: its
-    // units are taken on the device below (borrowUnits), so it stays pending. The keys read for
-    // that decision are read again after the flush, which may store keys itself. The exemption
-    // holds only when every pending unit of the alias is borrowable (tracked, unstamped since its
-    // generation, no results of this image's own there) or dead to its own write-back (tracked and
-    // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
-    // images takes the old order (store, then this image re-uploads it).
     auto alias = scoped ? std::shared_ptr<StorageTexture>{} : pendingAlias();
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
+    bool borrowPending = false;
+    static const bool pendingBorrow = std::getenv("APS5_PENDING_ALIAS_BORROW") != nullptr;
+    if (pendingBorrow && alias != nullptr && descriptor.dccAddress == 0 && alias->descriptor.dccAddress == 0 && descriptor.pipeBankXor == alias->descriptor.pipeBankXor && context.device == alias->context.device && GuestMemory::GpuMutex().HeldByThisThread()) {
+        const auto* recorder = Recorder::Active();
+        if (recorder != nullptr && !Recorder::InCompletion()) {
+            if (recorder->PendingWriterSerial(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == 0) {
+                auto& pending = Pending();
+                std::lock_guard lock(pending.mutex);
+                const auto foreign = [&](const StorageTexture* texture) { return texture != this && texture != alias.get() && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && texture->pendingUnitInside(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
+                borrowPending = std::none_of(pending.textures.begin(), pending.textures.end(), foreign) && std::none_of(pending.flushing.begin(), pending.flushing.end(), [&](const StorageTexture* texture) { return texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); });
+                if (profile && !borrowPending) ++ThreadLookupOutcomes().work[LookupOutcomes::PendingAliasForeign];
+            } else if (profile) {
+                ++ThreadLookupOutcomes().work[LookupOutcomes::PendingAliasWriters];
+            }
+        }
+    }
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
         if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
         for (std::uint32_t unit = 0; alias != nullptr && unit < trackedLayers; ++unit) {
             if (!alias->layerPending[unit]) continue;
-            if (alias->layerGeneration[unit] == 0 || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
+            if (alias->layerGeneration[unit] == 0 || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit] && !borrowPending)) {
+                if (profile && layerPending[unit]) ++ThreadLookupOutcomes().work[LookupOutcomes::PendingAliasRefused];
                 alias = nullptr;
                 break;
             }
@@ -2383,7 +2414,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
             const bool aliasTracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped);
             borrowed.assign(trackedLayers, false);
             for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
-                if (!aliasTracked || !alias->layerPending[unit] || aliasStamped[unit] != 0 || alias->layerGeneration[unit] == 0 || layerPending[unit]) continue;
+                if (!aliasTracked || !alias->layerPending[unit] || aliasStamped[unit] != 0 || alias->layerGeneration[unit] == 0 || (layerPending[unit] && !borrowPending)) continue;
                 if (sameBorrow && borrowedUnits[unit]) continue;
                 borrowed[unit] = true;
                 anyBorrowed = true;
@@ -2496,8 +2527,19 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     if (anyBorrowed) {
         uploadReason = "alias";
         borrowUnits(*alias, borrowed);
+        bool replacedPending = false;
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
-            if (borrowed[unit]) layerGeneration[unit] = currentFor(unit);
+            if (!borrowed[unit]) continue;
+            if (layerPending[unit]) {
+                layerPending[unit] = false;
+                replacedPending = true;
+                if (profile) ++ThreadLookupOutcomes().work[LookupOutcomes::PendingAliasUnits];
+            }
+            layerGeneration[unit] = currentFor(unit);
+        }
+        if (replacedPending) {
+            reconcilePending();
+            BumpPendingSerial();
         }
         refreshGeneration();
     }
@@ -3414,6 +3456,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
 }
 
 std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported, Buffer* save) {
+    const bool profile = LookupOutcomes::Profiled();
     const auto elementBytes = BytesPerElement(descriptor.format);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
     std::uint64_t storedBytes = 0;
@@ -3427,6 +3470,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     // while the slices of a 3D surface taper in depth with the level (HasLayer), so the upper
     // depth slices' higher-level blocks belong to no window. There is no tiled data to retile.
     if (windows.empty()) return 0;
+    if (profile) ThreadLookupOutcomes().work[LookupOutcomes::RetileWindows] += windows.size();
     // The linear rows and the tiled bytes of every window, each at a 256-byte position; the tail
     // levels of a layer retile into one scratch region (their block is shared).
     std::vector<std::uint64_t> linearPositions, scratchPositions;
@@ -3680,6 +3724,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     toSource.image = image;
     toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
     if (!direct) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+    if (profile && !direct) ThreadLookupOutcomes().work[LookupOutcomes::LayoutTransitions] += 2;
     if (!seeds.empty() || !padding.copies.empty() || !holeCopies.empty()) {
         // The seeded units' import bytes (every earlier writer of them, host stores included)
         // precede the seed copies; the previous command's trailing barrier may have covered that.
@@ -3731,6 +3776,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
             }
         }
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        if (profile) ThreadLookupOutcomes().work[LookupOutcomes::ImageBufferRegions] += regions.size();
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
         for (std::size_t i = 0; i < windows.size(); ++i) {
@@ -3770,6 +3816,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, storedAccess};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, direct ? 0u : 1u, &backToGeneral);
     if (batch) {
+        if (profile) ++ThreadLookupOutcomes().work[LookupOutcomes::FlushWaits];
         batch->SubmitAndWait();
     } else {
         recorder->EndGpuTiming(timing, storedBytes);
@@ -3900,6 +3947,7 @@ void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t la
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    if (LookupOutcomes::Profiled()) profiledWriter = drawingTarget ? 1 : 0;
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
@@ -4153,6 +4201,10 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
     region.imageOffset = {static_cast<std::int32_t>(area.left), static_cast<std::int32_t>(area.top), 0};
     region.imageExtent = {width, height, 1u};
     context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scratch->Handle(), 1, &region);
+    if (LookupOutcomes::Profiled()) {
+        ++ThreadLookupOutcomes().work[LookupOutcomes::ImageBufferRegions];
+        ThreadLookupOutcomes().work[LookupOutcomes::LayoutTransitions] += 2;
+    }
     const auto scratchRead = WholeBufferBarrier(scratch->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &scratchRead, 0, nullptr);
     const auto scratchOffset = [&](std::uint64_t address) {
@@ -4246,7 +4298,14 @@ void waitForIdlePublish(const char* reason) {
 }
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool waited) {
-    static_cast<void>(FlushDepthPlanes(address, bytes));
+    const bool profile = LookupOutcomes::Profiled();
+    const auto depthStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto depthRanges = FlushDepthPlanes(address, bytes);
+    if (profile) {
+        LookupOutcomes::Add(LookupOutcomes::FlushDepth, depthStart);
+        ++ThreadLookupOutcomes().work[LookupOutcomes::FlushCalls];
+        ThreadLookupOutcomes().work[LookupOutcomes::FlushDepthRanges] += depthRanges.size();
+    }
     if (published != nullptr) *published = false;
     const auto nothingToStore = [&] {
         auto& pending = Pending();
@@ -4259,7 +4318,10 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         }
         return scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes);
     };
-    if (nothingToStore()) return false;
+    if (nothingToStore()) {
+        if (profile && AnyShadowedOverlaps(address, bytes)) ++ThreadLookupOutcomes().work[LookupOutcomes::FlushShadowOnly];
+        return false;
+    }
     if (AgcDriver::DriverDetail::DrawPipeline::HeldReads(address, bytes)) {
         queuedReadHeld.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -4312,6 +4374,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         }
     }
     if (flush.empty()) {
+        if (profile && AnyShadowedOverlaps(address, bytes)) ++ThreadLookupOutcomes().work[LookupOutcomes::FlushShadowOnly];
         if (drawnHold.owns_lock()) drawnHold.unlock();
         const bool stored = WaitForFlushing(address, bytes, except);
         // Units shadowed over the range (another image's results retiled into the import's unit
@@ -4338,26 +4401,52 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     std::lock_guard gpu(GuestMemory::GpuMutex());
     if (!ownNotes.empty() && (flush.size() != 1 || std::any_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return ExistingHostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) == nullptr; }))) ownNotes.clear();
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes, ownNotes) != 0) {
+        const auto waitBefore = profile ? Recorder::ThreadWaitedMs() : 0;
         try {
             recorder->Reap();
             if (const auto writer = recorder->PendingWriterSerial(address, bytes, ownNotes); writer == recorder->OpenSerial()) {
                 Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
+                if (profile) ++ThreadLookupOutcomes().work[LookupOutcomes::FlushWaits];
                 recorder->Sync();
             } else if (writer != 0) {
+                if (profile) ++ThreadLookupOutcomes().work[LookupOutcomes::FlushWaits];
                 recorder->FinishUpTo(writer);
             }
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
             throw;
         }
+        if (profile) ThreadLookupOutcomes().ms[LookupOutcomes::FlushGpuWait] += Recorder::ThreadWaitedMs() - waitBefore;
     }
     std::exception_ptr failure;
     const auto previousReason = std::exchange(flushReason, reason);
     for (const auto& texture : flush) {
         try {
+            const auto storeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            std::optional<std::array<std::uint64_t, LookupOutcomes::WorkCount>> before;
+            if (profile) {
+                ++ThreadLookupOutcomes().work[LookupOutcomes::FlushImages];
+                ++ThreadLookupOutcomes().work[LookupOutcomes::FlushStorage + texture->profiledWriter];
+                if (refreshing != nullptr) before = ThreadLookupOutcomes().work;
+            }
             // Only the pending layers the access overlaps are stored; the others stay pending (the
             // store re-registers the image for them).
             texture->writeBack(address, bytes);
+            if (before.has_value()) {
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - storeStart).count();
+                const auto& source = texture->descriptor;
+                const std::array<std::uint64_t, 18> key{refreshing->descriptor.baseAddress, refreshing->guestBytes, reinterpret_cast<std::uintptr_t>(refreshing->image), source.baseAddress, texture->guestBytes, reinterpret_cast<std::uintptr_t>(texture->image), source.width, source.height, source.format, static_cast<std::uint64_t>(texture->storageFormat), static_cast<std::uint64_t>(source.tileMode), source.pipeBankXor, static_cast<std::uint64_t>(source.dimension), source.mipCount, source.dccAddress, source.depthOrLastArray, source.baseArray, texture->profiledWriter};
+                auto& traffic = Traffic();
+                std::lock_guard lock(traffic.mutex);
+                if (traffic.flushSources.size() < 128 || traffic.flushSources.contains(key)) {
+                    auto& totals = traffic.flushSources[key];
+                    ++totals.count;
+                    totals.ms += ms;
+                    for (std::size_t i = 0; i < totals.work.size(); ++i) totals.work[i] += ThreadLookupOutcomes().work[i] - (*before)[i];
+                } else {
+                    ++traffic.omittedFlushSources;
+                }
+            }
         } catch (...) {
             if (!failure) failure = std::current_exception();
         }
@@ -5471,6 +5560,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
         refreshGeneration();
         forgetBorrowed(first, count);
         markLayersPending(first, count);
+        if (LookupOutcomes::Profiled()) profiledWriter = 2;
         return true;
     }
     if (!watched) captureGuestBytes(nullptr);
@@ -5479,6 +5569,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     refreshGeneration();
     forgetBorrowed(0, trackedLayers);
     MarkDirty();
+    if (LookupOutcomes::Profiled()) profiledWriter = 2;
     return true;
 }
 
@@ -5579,6 +5670,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &copied);
     recorder->EndGpuTiming(timing, guestBytes);
     MarkWholeWritten();
+    if (LookupOutcomes::Profiled()) profiledWriter = 3;
     return true;
 }
 
@@ -5884,6 +5976,10 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     barriers[1].image = image;
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
     context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    if (LookupOutcomes::Profiled()) {
+        ++ThreadLookupOutcomes().work[LookupOutcomes::AliasCopies];
+        for (const auto& region : regions) ThreadLookupOutcomes().work[LookupOutcomes::AliasBytes] += std::uint64_t{region.extent.width} * region.extent.height * region.extent.depth * region.srcSubresource.layerCount * BytesPerElement(descriptor.format);
+    }
     VkImageMemoryBarrier copied = barriers[1];
     copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -6130,6 +6226,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             const auto storedBytes = writeBackWindows(segments, keep, firstStored, lastStored, shadowed, imported, saveUnits.empty() ? nullptr : savedBytes.get());
+            if (profile) {
+                for (const auto& range : shadowed) ThreadLookupOutcomes().work[LookupOutcomes::ShadowBytes] += range.end - range.begin;
+                for (const auto& [from, to] : imported) ThreadLookupOutcomes().work[LookupOutcomes::ImportBytes] += to - from;
+            }
             countStorageWriteBack(storedBytes, true);
             if (profile) Profile().storageGpu += timer.lap();
             forgetStored();
@@ -6145,6 +6245,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         if (drawn.rect) {
             PublishShadow(stampBegin, static_cast<std::size_t>(stampEnd - stampBegin), PublishScope::PartialUnits, PublishReason::Upload);
             const auto storedBytes = storeDrawnRect(drawn, segments, stores, saveUnits);
+            if (profile) ThreadLookupOutcomes().work[LookupOutcomes::ImportBytes] += storedBytes;
             countStorageWriteBack(storedBytes, true, true);
             if (profile) Profile().storageGpu += timer.lap();
             forgetStored();
@@ -6219,6 +6320,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             for (const auto& [source, copies] : padding.copies) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, source, tiledScratch->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
         }
         const auto regions = CopyRegions(storedLayers);
+        if (profile) {
+            ThreadLookupOutcomes().work[LookupOutcomes::ImageBufferRegions] += regions.size();
+            ThreadLookupOutcomes().work[LookupOutcomes::LayoutTransitions] += 2;
+        }
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
@@ -6264,6 +6369,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             if (drawn.drawn) noteStore(recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
         }
+        if (profile) ThreadLookupOutcomes().work[LookupOutcomes::ImportBytes] += storedBytes;
         countStorageWriteBack(storedBytes, true, drawn.drawn);
         if (profile) Profile().storageGpu += timer.lap();
         // The guest bytes now differ from `original`; other caches of the range see the write.
@@ -6358,6 +6464,11 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
     const auto regions = CopyRegions();
+    if (profile) {
+        ThreadLookupOutcomes().work[LookupOutcomes::ImageBufferRegions] += regions.size();
+        ThreadLookupOutcomes().work[LookupOutcomes::LayoutTransitions] += 2;
+        ++ThreadLookupOutcomes().work[LookupOutcomes::FlushWaits];
+    }
     context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear.Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
     const VkBufferMemoryBarrier toShader[] = {WholeBufferBarrier(linear.Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT), WholeBufferBarrier(tiled.Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, toShader, 0, nullptr);
