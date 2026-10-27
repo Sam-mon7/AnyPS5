@@ -242,8 +242,8 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool watched) {
 constexpr std::uint32_t DrawnValue = 0x3f400000u;
 constexpr std::uint32_t Format32Float = 22;
 
-alignas(256) constexpr std::array<std::uint32_t, 8> StorePairCode{
-    0x7e020280, 0x7e040200, 0xf0201108, 0x00010200, 0x7e040201, 0xf0201108, 0x00030200, 0xbf810000,
+alignas(256) constexpr std::array<std::uint32_t, 7> StorePairCode{
+    0x7e020280, 0x7e040200, 0xf0201108, 0x00010200, 0xf0201108, 0x00030200, 0xbf810000,
 };
 
 alignas(256) constexpr std::array<std::uint32_t, 6> TargetVertexCode{
@@ -320,8 +320,6 @@ void CheckPendingTarget(AgcDriver::VulkanDevice& device, std::uint8_t* texels, b
     BumpCollectEpoch();
     std::lock_guard gpu(GpuMutex());
     std::vector<std::uint32_t> data(20);
-    data[0] = 0x3e800000u;
-    data[1] = 0x3f000000u;
     const auto targetWords = TextureDescriptor(texels, Type2D);
     const auto sourceWords = TextureDescriptor(texels, Type2D, Format32Float);
     std::copy(targetWords.begin(), targetWords.end(), data.begin() + 4);
@@ -329,8 +327,13 @@ void CheckPendingTarget(AgcDriver::VulkanDevice& device, std::uint8_t* texels, b
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     auto target = CachedStorageSurface(context, DecodeTextureResource(targetWords));
     auto source = CachedStorageSurface(context, DecodeTextureResource(sourceWords));
+    Require(target != source && target->Image() != source->Image(), "the pending-unit fixture did not create distinct alias images");
+    ColorTarget color{surface, {Side, Side}, VK_FORMAT_R32_UINT, SurfaceBytes, 0xe4u};
+    color.tileMode = ColorTileMode::RenderTarget;
+    Require(CachedStorageSurface(context, SurfaceForTarget(color)) == target, "the draw's surface key differs from the paired dispatch target");
+    Store(device, texels, 0x3e800000u);
     for (int iteration = 0; iteration < 2; ++iteration) {
-        data[1] = iteration == 0 ? 0x3f000000u : 0x3f800000u;
+        data[0] = iteration == 0 ? 0x3f000000u : 0x3f800000u;
         Dispatch(device, StorePairCode, data, false);
         Require(target->Dirty() && source->Dirty(), "the paired image dispatch did not leave both images pending");
         if (submit) {
@@ -356,18 +359,18 @@ void CheckPendingTarget(AgcDriver::VulkanDevice& device, std::uint8_t* texels, b
         } else if (profiled) {
             Require(ThreadLookupOutcomes().work[LookupOutcomes::PendingAliasUnits] == before, "pending units were borrowed despite a disabled path or a CPU overwrite");
         }
-        const auto computeValue = cpuOverwrite ? 0x45454545u : data[1];
+        const auto computeValue = cpuOverwrite ? 0x45454545u : data[0];
         LoadArray(device, texels, Format32Float);
         for (std::uint32_t x = 0; x < Threads; ++x) {
             const auto expected = x >= 8 && x < 16 ? DrawnValue : computeValue;
-            Require(Output[x] == expected, "pending target lost a compute or draw write at x=" + std::to_string(x) + ": " + Hex(Output[x]) + ", expected " + Hex(expected));
+            Require(Output[x] == expected, std::string("pending target ") + (submit ? "submitted" : "open") + (cpuOverwrite ? " CPU overwrite" : "") + " iteration " + std::to_string(iteration) + " lost a compute or draw write at x=" + std::to_string(x) + ": " + Hex(Output[x]) + ", expected " + Hex(expected));
         }
     }
     StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
     device.WaitIdle();
     const ColorTargetLayout layout(Side, Side, ColorTileMode::RenderTarget, 4);
     for (std::uint32_t x = 0; x < Threads; ++x) {
-        const auto expected = x >= 8 && x < 16 ? DrawnValue : (cpuOverwrite ? 0x45454545u : data[1]);
+        const auto expected = x >= 8 && x < 16 ? DrawnValue : (cpuOverwrite ? 0x45454545u : data[0]);
         Require(*reinterpret_cast<const std::uint32_t*>(texels + layout.Offset(x, 0)) == expected, "the resident result was not published to guest memory");
     }
     std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, 0x34343434u);
