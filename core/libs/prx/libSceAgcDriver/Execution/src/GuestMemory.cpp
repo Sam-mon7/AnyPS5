@@ -2405,7 +2405,7 @@ bool GpuMutexType::tryEnter() {
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
-        Timeline::Emit(Timeline::Kind::LockAcquired);
+        if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         if (!proofThread) proofSerial.fetch_add(1, std::memory_order_acq_rel);
         if (ResourceEpochProofsEnabled()) {
@@ -2419,13 +2419,18 @@ void GpuMutexType::acquired() {
 
 bool GpuMutexType::try_lock() {
     const bool timelineOuter = Timeline::Enabled && !HeldByThisThread();
-    if (timelineOuter) Timeline::Emit(Timeline::Kind::LockBegin, 1);
+    if (timelineOuter) {
+        const auto site = LockStats().nextSite;
+        Timeline::LockSite = static_cast<std::uint32_t>(site == GpuLockSite::Other ? GpuLockSite::Try : site) + 1;
+        Timeline::Emit(Timeline::Kind::LockBegin, 1, 0, 0, 0, 0, Timeline::LockSite);
+    }
     struct TimelineTry {
         bool outer;
         GpuMutexType& mutex;
         ~TimelineTry() { if (outer && !mutex.HeldByThisThread()) Timeline::Emit(Timeline::Kind::LockFailed); }
     } timelineTry{timelineOuter, *this};
     if (!GpuLockProfiled()) {
+        if (timelineOuter) LockStats().nextSite = GpuLockSite::Other;
         if (!tryEnter()) return false;
         acquired();
         return true;
@@ -2469,7 +2474,7 @@ void GpuMutexType::unlock() {
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
-        Timeline::Emit(Timeline::Kind::LockRelease);
+        if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockRelease, 0, 0, 0, 0, 0, Timeline::LockSite);
         mutex.unlock();
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
@@ -2496,10 +2501,14 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
-    if (Timeline::Enabled && !HeldByThisThread()) Timeline::Emit(Timeline::Kind::LockBegin);
+    if (Timeline::Enabled && !HeldByThisThread()) {
+        Timeline::LockSite = static_cast<std::uint32_t>(LockStats().nextSite) + 1;
+        Timeline::Emit(Timeline::Kind::LockBegin, 0, 0, 0, 0, 0, Timeline::LockSite);
+    }
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
+            if (Timeline::Enabled && !HeldByThisThread()) LockStats().nextSite = GpuLockSite::Other;
             enter();
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
@@ -2609,7 +2618,7 @@ void GpuMutexType::lock() {
 
 void TagGpuLockSite(GpuLockSite site) {
     // Off the profiled path the tag is never read, so the thread-local is not touched either.
-    if (!GpuLockProfiled() && !PerformanceTrace::Recording()) return;
+    if (!GpuLockProfiled() && !PerformanceTrace::Recording() && !Timeline::Enabled) return;
     LockStats().nextSite = site;
 }
 

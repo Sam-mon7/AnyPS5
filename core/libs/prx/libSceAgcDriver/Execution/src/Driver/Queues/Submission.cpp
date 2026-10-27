@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -439,6 +440,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
             frame->IncludeSubmission(accepted, now, now, now, true);
             frame->SetFlip(accepted, 0, now, now);
             ++flipsCounted;
+            if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::FrameReady, frame->Id());
             submission.flips.begin()->second->GpuReady(frame);
             lock.unlock();
             AgcDriverDeliverEopInterrupt(0);
