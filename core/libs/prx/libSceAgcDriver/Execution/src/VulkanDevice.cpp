@@ -2473,11 +2473,42 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    struct LabelTiming {
+        std::chrono::steady_clock::time_point cursor = std::chrono::steady_clock::now();
+        std::array<double, 3> us{};
+        std::size_t phase = 0;
+        void Next() {
+            const auto now = std::chrono::steady_clock::now();
+            us[phase++] += std::chrono::duration<double, std::micro>(now - cursor).count();
+            cursor = now;
+        }
+        ~LabelTiming() {
+            Next();
+            struct Totals {
+                std::uint64_t labels = 0;
+                std::array<double, 3> us{};
+                std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+            };
+            static thread_local Totals totals;
+            ++totals.labels;
+            for (std::size_t i = 0; i < us.size(); ++i) totals.us[i] += us[i];
+            if (cursor - totals.since < std::chrono::seconds(10)) return;
+            AgcDriver::ProfilePrint_nid_no_patch("[label-work] thread 0x%x: %llu labels, storage %.0f ms, reap %.0f ms, record %.0f ms (%.2f us/label, %.0f s)\n", GuestMemory::GpuLockThreadTag(), static_cast<unsigned long long>(totals.labels), totals.us[0] / 1000.0, totals.us[1] / 1000.0, totals.us[2] / 1000.0, (totals.us[0] + totals.us[1] + totals.us[2]) / totals.labels, std::chrono::duration<double>(cursor - totals.since).count());
+            totals = {};
+        }
+    };
+    std::optional<LabelTiming> timing;
+    if (profile) {
+        timing.emplace();
+        GuestMemory::NoteGpuLabel();
+    }
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
     if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
     if (queue == 0) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("label"));
     Graphics::StorageTexture::StoreReadbackBeforeLabel("readback before label");
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
+    if (profile) timing->Next();
     auto& recorder = *state->recorder;
     // Batches that already finished are retired before the checks: their completions ran, so they
     // neither keep the recorder busy nor force this label behind a completion. Only for the
@@ -2487,6 +2518,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
+    if (profile) timing->Next();
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();

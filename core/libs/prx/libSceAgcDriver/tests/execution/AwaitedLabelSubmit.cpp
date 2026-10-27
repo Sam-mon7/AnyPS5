@@ -1,7 +1,9 @@
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -43,10 +45,14 @@ struct DriverTestAccess {
         submission.queue = queue;
         QueueState state{};
         bool wrote = false, interrupt = false, deferred = false, draw = false, sample = false;
-        Driver::Get().preparePacketMemory(submission, state, packet, packet[0], 0x37, wrote, interrupt, deferred, draw, sample);
+        Driver::Get().preparePacketMemory(submission, state, packet, packet[0], (packet[0] >> 8u) & 0xffu, wrote, interrupt, deferred, draw, sample);
         return wrote;
     }
     static bool Deferred() { return !deferredLabels().labels.empty(); }
+    static std::size_t DeferredCount() { return deferredLabels().labels.size(); }
+    static void Age(std::chrono::hours age) { deferredLabels().since = std::chrono::steady_clock::now() - age; }
+    static void Flush(std::uint32_t header, std::uint32_t queue) { Driver::Get().flushBetweenPackets(queue, header, false); }
+    static void PacketRecord(VulkanDevice& device, std::uint32_t queue) { Driver::Get().recordLabelsForPacket(&device, queue); }
     static void Record(VulkanDevice& device, std::uint32_t queue) { Driver::Get().recordDeferredLabels(&device, queue); }
     static std::pair<std::uint64_t, std::uint64_t> FlushCounts() {
         const auto& outcomes = Driver::waitOutcomes();
@@ -198,6 +204,69 @@ bool RunProducer(AgcDriver::VulkanDevice& device, std::uint64_t address, std::ui
     return true;
 }
 
+bool RunStateBatching(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t queue) {
+    using namespace AgcDriver::DriverDetail;
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::GuestMemory::TagGpuLockThread(queue);
+    const std::array<std::uint32_t, 4> pattern{1, 2, 3, 4};
+    if (!device.FillBuffer(address + 16384, 4096, pattern)) return false;
+    const bool batched = !std::getenv("APS5_NO_LABEL_STATE_BATCHING") && QueuedLabelTable() && LabelBatchSubmit();
+    const auto write = [&](std::uint32_t value) {
+        const std::array<std::uint32_t, 5> packet{0xc0033700u, 0x00100200u,
+            static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), value};
+        Require(Access::Label(packet, queue) && Access::Deferred(), "state batching: WRITE_DATA did not queue");
+        Access::Age(std::chrono::hours(-1));
+    };
+    const auto groups = labelGroups.load();
+    write(1);
+    for (const auto header : {0xc0017600u, 0xc0001000u, 0xc0018100u, 0xc0004600u, 0xc0055800u, 0xc0016900u, 0xc0017900u}) {
+        Access::Flush(header, queue);
+        Require(Access::Deferred() == batched, "state batching: state packet flushed at the wrong boundary");
+    }
+    const std::array<std::uint32_t, 8> release{0xc0064900u, 0x514u, 2u << 29u,
+        static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 2, 0x12345678u, 0};
+    Require(Access::Label(release, queue), "state batching: RELEASE_MEM was not handled");
+    Access::Age(std::chrono::hours(-1));
+    Access::Flush(0xc0017600u, queue);
+    Require(Access::DeferredCount() == (batched ? 2u : 0u), "state batching: labels separated by registers did not join");
+    write(3);
+    Access::Flush(0xc0031500u, queue);
+    Require(Access::Deferred(), "state batching: a dispatch did not leave labels to its own lock");
+    Access::PacketRecord(device, queue);
+    Require(labelGroups.load() - groups == (batched ? 1u : 3u), "state batching: wrong number of recorded groups");
+    device.SubmitRecorded(false);
+    device.WaitIdle();
+    std::uint64_t actual = 0;
+    std::memcpy(&actual, reinterpret_cast<const void*>(address), sizeof(actual));
+    Require(actual == 0x1234567800000003ull, "state batching: overlapping 32/64-bit labels lost their order");
+    Require(std::memcmp(reinterpret_cast<const void*>(address + 16384), pattern.data(), sizeof(pattern)) == 0, "state batching: work before the labels did not complete");
+    for (const auto header : {0xc0053c00u, 0xc0032200u, 0xc0044000u, AgcDriver::RenderingWaitPacketHeader}) {
+        write(header);
+        Access::Flush(header, queue);
+        Require(!Access::Deferred(), "state batching: a memory or rendering-wait boundary retained queued labels");
+        device.WaitIdle();
+        std::memcpy(&actual, reinterpret_cast<const void*>(address), 4);
+        Require(static_cast<std::uint32_t>(actual) == header, "state batching: a boundary lost its label");
+    }
+    write(4);
+    Access::Age(std::chrono::hours(1));
+    Access::Flush(0xc0017600u, queue);
+    Require(!Access::Deferred(), "state batching: state packets suppressed the label deadline");
+    device.WaitIdle();
+    std::memcpy(&actual, reinterpret_cast<const void*>(address), 4);
+    Require(static_cast<std::uint32_t>(actual) == 4, "state batching: overdue label was not published");
+    if (!device.FillBuffer(address + 16384, 4096, pattern)) return false;
+    write(5);
+    auto interrupt = release;
+    interrupt[2] |= 2u << 24u;
+    interrupt[5] = 6;
+    Require(Access::Label(interrupt, queue) && !Access::Deferred(), "state batching: interrupt label overtook queued labels");
+    device.WaitIdle();
+    std::memcpy(&actual, reinterpret_cast<const void*>(address), sizeof(actual));
+    Require(actual == 0x1234567800000006ull, "state batching: interrupt label lost its value");
+    return true;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -210,6 +279,13 @@ int main(int argc, char** argv) {
             ~Reset() { Access::Device(nullptr); }
         } reset;
         const auto base = labels.Address();
+        if (argc == 2 && std::string_view(argv[1]) == "--state-batching") {
+            for (const auto queue : {0u, 0x28u, 0x40u}) {
+                if (!RunStateBatching(*device, base, queue)) return VulkanTestSkipped;
+            }
+            std::puts("label state batching tests passed");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--producer") {
             std::uint64_t address = base;
             for (const auto queue : {0x20u, 0x28u, 0x30u, 0x38u, 0x40u, 0x48u, 0x50u}) {
