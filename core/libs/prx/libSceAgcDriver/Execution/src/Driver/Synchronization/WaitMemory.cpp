@@ -82,27 +82,38 @@ void Driver::landPendingWaits(std::uint32_t queue) {
     if (waits.empty()) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct LandStats {
-        std::uint64_t lands = 0, waited = 0;
-        double waitedMs = 0, maxMs = 0;
+        std::uint64_t lands = 0, waited = 0, fenceWaits = 0;
+        double waitedMs = 0, gpuMs = 0, maxMs = 0;
         std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
     };
-    static thread_local LandStats stats;
+    LandStats* stats = nullptr;
+    if (profile) {
+        static thread_local LandStats counts;
+        stats = &counts;
+    }
     const PacketHistory none{};
     for (const auto& wait : waits) {
         const auto packet = std::span<const std::uint32_t>(wait.words).first(wait.count);
-        ++stats.lands;
+        if (profile) ++stats->lands;
         if (Pm4::WaitSatisfiedUnchecked(packet)) continue;
-        const auto started = std::chrono::steady_clock::now();
+        const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto gpuBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
         waitMemory(packet, queue, none, wait.received, false, true);
-        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-        ++stats.waited;
-        stats.waitedMs += ms;
-        stats.maxMs = std::max(stats.maxMs, ms);
+        if (profile) {
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            const auto gpuMs = Graphics::Recorder::ThreadWaitedMs() - gpuBefore;
+            ++stats->waited;
+            if (gpuMs > 0.0) ++stats->fenceWaits;
+            stats->waitedMs += ms;
+            stats->gpuMs += gpuMs;
+            stats->maxMs = std::max(stats->maxMs, ms);
+        }
     }
     waits.clear();
-    if (profile && std::chrono::steady_clock::now() - stats.reported > std::chrono::seconds(10)) {
-        AgcDriver::ProfilePrint_nid_no_patch("[landwait] queue 0x%x (10 s): %llu waits landed before a guest read, %llu had to wait for the GPU: %.1f ms in total, max %.2f ms\n", queue, static_cast<unsigned long long>(stats.lands), static_cast<unsigned long long>(stats.waited), stats.waitedMs, stats.maxMs);
-        stats = LandStats{};
+    if (profile && std::chrono::steady_clock::now() - stats->reported > std::chrono::seconds(10)) {
+        AgcDriver::ProfilePrint_nid_no_patch("[landwait] queue 0x%x (10 s): %llu waits landed before a guest read, %llu required memory polling: %.1f ms in total, max %.2f ms\n", queue, static_cast<unsigned long long>(stats->lands), static_cast<unsigned long long>(stats->waited), stats->waitedMs, stats->maxMs);
+        AgcDriver::ProfilePrint_nid_no_patch("[landwait-detail] queue 0x%x (10 s): skipped memory-satisfied %llu; kept with fence/timeline waits %llu, without %llu; measured fence/timeline waits %.1f ms, other landing wall time %.1f ms\n", queue, static_cast<unsigned long long>(stats->lands - stats->waited), static_cast<unsigned long long>(stats->fenceWaits), static_cast<unsigned long long>(stats->waited - stats->fenceWaits), stats->gpuMs, std::max(0.0, stats->waitedMs - stats->gpuMs));
+        *stats = LandStats{};
     }
 }
 
