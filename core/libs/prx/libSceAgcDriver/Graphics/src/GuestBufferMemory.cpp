@@ -5280,7 +5280,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         if (profile) copyUs += microsecondsSince(copyStart);
     }
     if (heapsEnd > heapsBegin) {
-        if (ShadowAddressEnabled() && shadowAddressReads && context.bufferDeviceAddress && recorder != nullptr && !Recorder::InCompletion()) bindShadowAddresses();
+        if (ShadowAddressEnabled() && shadowAddressReads && context.bufferDeviceAddress && recorder != nullptr && !Recorder::InCompletion() && GuestMemory::GpuMutex().HeldByThisThread()) bindShadowAddresses();
         else StorageTexture::PublishShadowsOnly(heapsBegin, static_cast<std::size_t>(heapsEnd - heapsBegin), PublishScope::Whole, profile && ShadowAddressEnabled() && !shadowAddressReads ? "writable address-based heaps" : "address-based heaps");
     }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
