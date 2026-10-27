@@ -2306,6 +2306,8 @@ struct GpuLockStats {
     std::array<std::uint64_t, GpuLockSiteCount> siteHolds{};
     std::array<double, GpuLockSiteCount> siteHeldMs{};
     std::array<double, GpuLockSiteCount> siteMaxHeldMs{};
+    std::array<std::uint64_t, GpuLockSiteCount> siteLabels{};
+    std::uint64_t labelsInHold = 0;
     std::size_t holdSite = 0;
     std::chrono::steady_clock::time_point holdStart;
     // This thread's column of the holder matrix (-1 until its first hold), and what its contended
@@ -2339,6 +2341,7 @@ bool GpuHoldProfiled() {
 void BeginHold(std::size_t site) {
     auto& stats = LockStats();
     stats.holdSite = site;
+    stats.labelsInHold = 0;
     stats.holdStart = std::chrono::steady_clock::now();
 }
 
@@ -2347,6 +2350,7 @@ void EndHold() {
     const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stats.holdStart).count();
     const auto heldMs = static_cast<double>(heldNs) / 1e6;
     ++stats.siteHolds[stats.holdSite];
+    stats.siteLabels[stats.holdSite] += stats.labelsInHold;
     stats.siteHeldMs[stats.holdSite] += heldMs;
     stats.siteMaxHeldMs[stats.holdSite] = std::max(stats.siteMaxHeldMs[stats.holdSite], heldMs);
     if (stats.holderColumn < 0) stats.holderColumn = static_cast<int>(HolderColumnFor(stats.tag));
@@ -2513,6 +2517,7 @@ void GpuMutexType::lock() {
         if (depth == 1 && holders) {
             stats.holdSite = site;
             stats.holdStart = now;
+            stats.labelsInHold = 0;
         }
         const auto waitedMs = std::chrono::duration<double, std::milli>(now - start).count();
         stats.waitedMs += waitedMs;
@@ -2554,6 +2559,13 @@ void GpuMutexType::lock() {
         holds += counts;
         if (stats.tag == 0xffffffffu) AgcDriver::ProfilePrint_nid_no_patch("[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         else AgcDriver::ProfilePrint_nid_no_patch("[lock] queue 0x%x waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.tag, stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
+        if (GpuHoldProfiled()) {
+            for (std::size_t i = 0; i < GpuLockSiteCount; ++i) {
+                const auto count = stats.siteHolds[i];
+                if (count == 0 || (stats.siteLabels[i] == 0 && i != static_cast<std::size_t>(GpuLockSite::Label))) continue;
+                AgcDriver::ProfilePrint_nid_no_patch("[label-holds] thread 0x%x site %s: %llu holds, %llu labels, %.2f labels/hold, %.2f us/hold, %.0f ms total (%.0f s)\n", stats.tag, GpuLockSiteNames[i], static_cast<unsigned long long>(count), static_cast<unsigned long long>(stats.siteLabels[i]), static_cast<double>(stats.siteLabels[i]) / count, stats.siteHeldMs[i] * 1000.0 / count, stats.siteHeldMs[i], interval);
+            }
+        }
         stats.waitedMs = 0;
         stats.waits = 0;
         stats.acquisitions = 0;
@@ -2563,6 +2575,7 @@ void GpuMutexType::lock() {
         stats.siteHolds.fill(0);
         stats.siteHeldMs.fill(0);
         stats.siteMaxHeldMs.fill(0);
+        stats.siteLabels.fill(0);
         for (auto& row : stats.waitedBehindNs) row.fill(0);
         stats.tries = 0;
         stats.triesFailed = 0;
@@ -2578,6 +2591,10 @@ void TagGpuLockSite(GpuLockSite site) {
     // Off the profiled path the tag is never read, so the thread-local is not touched either.
     if (!GpuLockProfiled() && !PerformanceTrace::Recording()) return;
     LockStats().nextSite = site;
+}
+
+void NoteGpuLabel() {
+    if (GpuHoldProfiled() && GpuMutex().HeldByThisThread()) ++LockStats().labelsInHold;
 }
 
 void MarkPresenterThread() {

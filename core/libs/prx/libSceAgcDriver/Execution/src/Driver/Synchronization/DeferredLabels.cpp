@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "ThreadOwned.hpp"
 #include <algorithm>
@@ -147,7 +148,11 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         std::vector<DeferredLabel>& labels;
         std::uint32_t queue;
         std::vector<std::uint32_t>* opcodes;
+        std::chrono::steady_clock::time_point start;
+        double historyUs = 0;
         ~Clear() {
+            const auto closeStart = opcodes != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto count = labels.size();
             const bool failed = std::uncaught_exceptions() != 0;
             if (failed) std::fprintf(stderr, "[gpu] queue 0x%x dropped %zu queued labels: their record failed\n", queue, labels.size());
             labels.clear();
@@ -157,8 +162,25 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
 
             Graphics::Recorder::ForgetQueuedLabels();
             queuedLabelsNoted() = 0;
+            if (opcodes != nullptr) {
+                struct Totals {
+                    std::uint64_t groups = 0, labels = 0;
+                    double totalUs = 0, historyUs = 0, closeUs = 0;
+                    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+                };
+                static thread_local Totals totals;
+                const auto now = std::chrono::steady_clock::now();
+                ++totals.groups;
+                totals.labels += count;
+                totals.totalUs += std::chrono::duration<double, std::micro>(now - start).count();
+                totals.historyUs += historyUs;
+                totals.closeUs += std::chrono::duration<double, std::micro>(now - closeStart).count();
+                if (now - totals.since < std::chrono::seconds(10)) return;
+                AgcDriver::ProfilePrint_nid_no_patch("[label-groups] thread 0x%x: %llu groups, %llu labels, %.2f labels/group, total %.0f ms, history %.0f ms, close/forget %.0f ms (%.0f s)\n", GuestMemory::GpuLockThreadTag(), static_cast<unsigned long long>(totals.groups), static_cast<unsigned long long>(totals.labels), static_cast<double>(totals.labels) / totals.groups, totals.totalUs / 1000.0, totals.historyUs / 1000.0, totals.closeUs / 1000.0, std::chrono::duration<double>(now - totals.since).count());
+                totals = {};
+            }
         }
-    } clear{labels, queue, opcodes};
+    } clear{labels, queue, opcodes, profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
     bool first = true;
     for (const auto& label : labels) {
         const auto packet = profile ? GuestMemory::CurrentPacket() : GuestMemory::PacketTag{};
@@ -177,7 +199,9 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(label.address, bytes, 4);
         }
+        const auto historyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         noteLabelStore(label.address, bytes, stamp, queue);
+        if (profile) clear.historyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - historyStart).count();
     }
     ++labelGroups;
     if (profile && (labelGroups.load(std::memory_order_relaxed) & 63u) == 0 && std::chrono::steady_clock::now() - lastSyncReport > std::chrono::seconds(10)) {
