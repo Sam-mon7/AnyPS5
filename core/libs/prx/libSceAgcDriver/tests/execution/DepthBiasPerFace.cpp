@@ -1,6 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
@@ -11,6 +14,7 @@
 #include <windows.h>
 #endif
 #include <array>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -268,14 +272,101 @@ void DepthDrawRecipe(AgcDriver::VulkanDevice& device) {
     removedDepthState.depth.reset();
     const auto rejectedDepthOutcome = device.DrawFromRecipe(removedDepthState, draw, shaders, {}, recipe);
     Require(rejectedDepthOutcome == AgcDriver::RecipeOutcome::Rebuild, "a recipe with depth must be rejected when depth target is removed");
+
+    const GuestBlock firstSource;
+    const GuestBlock secondSource;
+    const float firstValue = 0.25f;
+    const float secondValue = 0.75f;
+    std::memcpy(firstSource.Data(), &firstValue, sizeof(firstValue));
+    std::memcpy(secondSource.Data(), &secondValue, sizeof(secondValue));
+    alignas(256) static constexpr std::array<std::uint32_t, 8> readPixelCode{0xe0300000u, 0x80000000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+    const auto firstDescriptor = BufferDescriptor(firstSource.Data(), 4u, 1u);
+    const std::vector<std::uint32_t> readUserData(firstDescriptor.begin(), firstDescriptor.end());
+    const std::array<ShaderRecompiler::MemoryRegion, 1> readMemory{{{reinterpret_cast<std::uintptr_t>(readPixelCode.data()), std::as_bytes(std::span(readPixelCode))}}};
+    auto readRequest = fragment;
+    readRequest.shader = {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(readPixelCode.data()), readPixelCode, 0, {}};
+    readRequest.context.userData = readUserData;
+    readRequest.context.memory = readMemory;
+    const auto firstPixel = ShaderRecompiler::Recompile(readRequest);
+    auto secondPixel = firstPixel;
+    const auto secondDescriptor = BufferDescriptor(secondSource.Data(), 4u, 1u);
+    const auto replaceBuffer = [&](auto& program, const auto& descriptor) {
+        std::size_t replaced = 0;
+        for (auto& binding : program.bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            Require(binding.count == 1u && binding.guestDescriptor.size() == descriptor.size(), "the recipe regression needs one read-only buffer");
+            binding.guestDescriptor.assign(descriptor.begin(), descriptor.end());
+            ++replaced;
+        }
+        Require(replaced == 1u, "the recipe regression did not replace its buffer descriptor");
+    };
+    replaceBuffer(secondPixel, secondDescriptor);
+    auto readShaders = shaders;
+    readShaders[1].program = &firstPixel;
+    auto readState = state;
+    readState.depth.reset();
+    readState.depthTest = false;
+    readState.depthBias = false;
+    std::shared_ptr<const AgcDriver::DrawRecipe> firstRecipe;
+    device.Draw(readState, draw, readShaders, {}, &firstRecipe);
+    device.WaitIdle();
+    Require(firstRecipe != nullptr, "the first buffer draw did not create a recipe");
+    readShaders[1].program = &secondPixel;
+    std::shared_ptr<const AgcDriver::DrawRecipe> movedRecipe;
+    device.Draw(readState, draw, readShaders, {}, &movedRecipe);
+    device.WaitIdle();
+    const bool movedEnabled = std::getenv("APS5_NO_DRAW_MOVED_RECIPES") == nullptr;
+    Require((movedRecipe != nullptr) == movedEnabled, "moved draw recipe creation did not follow its switch");
+    const auto checkRed = [&](std::uint32_t x, std::uint32_t y, unsigned expected) {
+        std::vector<std::byte> texels(TargetWidth * TargetHeight * 4u);
+        AgcDriver::Graphics::ReadColorTarget(readState.color, texels);
+        const auto actual = static_cast<unsigned>(texels[(y * TargetWidth + x) * 4u]);
+        Require(actual + 1u >= expected && actual <= expected + 1u, "a moved recipe used stale target or buffer bytes: " + std::to_string(actual) + ", expected " + std::to_string(expected));
+    };
+    checkRed(4, 4, 191u);
+    if (!movedEnabled) return;
+    Require(firstRecipe->templateRef.lock() == movedRecipe->templateRef.lock(), "the moved recipe did not reuse the original resource template");
+    const auto replay = [&](const auto& selected) {
+        Require(device.DrawFromRecipe(readState, draw, readShaders, {}, selected) == AgcDriver::RecipeOutcome::Recorded, "the moved draw recipe did not record");
+        device.WaitIdle();
+    };
+    replay(movedRecipe);
+    checkRed(4, 4, 191u);
+    const float changedValue = 0.5f;
+    AgcDriver::GuestMemory::Write(secondSource.Address(), std::as_bytes(std::span(&changedValue, 1)));
+    const std::vector<std::byte> cleared(GuestBlock::BlockBytes, Kept);
+    AgcDriver::GuestMemory::Write(guestTarget.Address(), cleared);
+    readState.scissor.extent.width = 16;
+    replay(movedRecipe);
+    checkRed(4, 4, 128u);
+    checkRed(20, 4, static_cast<unsigned>(Kept));
+    readShaders[1].program = &firstPixel;
+    replay(firstRecipe);
+    checkRed(4, 4, 64u);
+    readShaders[1].program = &secondPixel;
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    Require(recorder != nullptr, "the moved recipe test has no recorder");
+    static_cast<void>(recorder->Commands());
+    recorder->NotePendingWrite(secondSource.Address(), sizeof(float));
+    Require(recorder->PendingWriteOverlaps(secondSource.Address(), sizeof(float)), "the moved recipe test did not leave a pending buffer write");
+    Require(device.DrawFromRecipe(readState, draw, readShaders, {}, movedRecipe) == AgcDriver::RecipeOutcome::Rebuild, "a recipe snapshotted a moved buffer behind a pending GPU write");
+    device.WaitIdle();
+    auto emptyDescriptor = secondDescriptor;
+    emptyDescriptor[2] = 0;
+    replaceBuffer(secondPixel, emptyDescriptor);
+    Require(device.DrawFromRecipe(readState, draw, readShaders, {}, movedRecipe) == AgcDriver::RecipeOutcome::Rebuild, "a recipe reused the original resource after its moved buffer was emptied");
 }
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--moved-recipes") {
+            DepthDrawRecipe(*device);
+            return 0;
+        }
         Draw(*device, -Bias, Bias);
         Check(true, false, "front faces pulled closer, back faces pushed away");
         Draw(*device, Bias, -Bias);

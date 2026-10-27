@@ -83,6 +83,16 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
     }();
     timing.Mark("prepared_invocation");
+    const auto capturePhase = [&](DrawDriverPhase phase, double waitedAt) {
+        if (!profile) return;
+        const auto previous = phaseMs[phase];
+        phaseTiming.Phase(phase);
+        const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedAt, phaseMs[phase] - previous);
+        phaseMs[phase] -= waited;
+        phaseMs[DrawRowCaptureHookWaits] += waited;
+    };
+    capturePhase(DrawRowCaptureInvocation, waitedBefore);
+    const auto captureWaitedBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
@@ -111,6 +121,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
     }();
 
+    capturePhase(DrawRowCapture, captureWaitedBefore);
+    const auto exportWaitedBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     stageCapture.supplied = shaderMemory.SuppliedBlocks();
     stageCapture.userDataUse = capture->userDataUse;
@@ -121,15 +134,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         if (matched[j] != nullptr && !recompiled[j] && (drawHit || j < i)) memory.insert(memory.end(), matchedRegions[j].begin(), matchedRegions[j].end());
     }
     request.context.memory = memory;
+    capturePhase(DrawRowCaptureExport, exportWaitedBefore);
     if (traceCapSync()) traceCapture("draw-capture", program.binary.codeAddress, submission.queue, memory, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
-    if (profile) {
-        ++captures;
-        phaseTiming.Phase(DrawRowCapture);
-
-            const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBefore, phaseMs[DrawRowCapture]);
-            phaseMs[DrawRowCapture] -= waited;
-            phaseMs[DrawRowCaptureHookWaits] += waited;
-        }
+    if (profile) ++captures;
         if (dumpTarget != 0) {
 
         const auto slot0 = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
