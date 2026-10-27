@@ -4067,7 +4067,7 @@ bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
     try {
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
-        result = WaitTimeline(device, semaphore, waitSemaphores, serial);
+        result = WaitTimeline(device, semaphore, waitSemaphores, serial, myId);
     } catch (...) {
         GuestMemory::TagGpuLockSite(lockSite);
         mutex.lock();
