@@ -2308,6 +2308,7 @@ struct GpuLockStats {
     std::array<double, GpuLockSiteCount> siteMaxHeldMs{};
     std::size_t holdSite = 0;
     std::chrono::steady_clock::time_point holdStart;
+    std::uint64_t heldNs = 0;
     // This thread's column of the holder matrix (-1 until its first hold), and what its contended
     // acquisitions waited behind: holds by (holder, site) that ended during the waits.
     int holderColumn = -1;
@@ -2346,6 +2347,7 @@ void EndHold() {
     auto& stats = LockStats();
     const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stats.holdStart).count();
     const auto heldMs = static_cast<double>(heldNs) / 1e6;
+    stats.heldNs += static_cast<std::uint64_t>(heldNs);
     ++stats.siteHolds[stats.holdSite];
     stats.siteHeldMs[stats.holdSite] += heldMs;
     stats.siteMaxHeldMs[stats.holdSite] = std::max(stats.siteMaxHeldMs[stats.holdSite], heldMs);
@@ -2439,6 +2441,13 @@ void SetGpuUnlockHook(void (*hook)()) {
 
 std::uint64_t GpuHoldSerial() {
     return gpuHoldSerial.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ThreadGpuHeldNs() {
+    if (!GpuHoldProfiled()) return 0;
+    const auto& stats = LockStats();
+    const auto current = GpuMutex().HeldByThisThread() ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stats.holdStart).count() : 0;
+    return stats.heldNs + static_cast<std::uint64_t>(current);
 }
 
 void GpuMutexType::unlock() {

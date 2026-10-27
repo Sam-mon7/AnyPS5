@@ -22,10 +22,30 @@ struct DrawTraceContext {
     std::uint64_t target = 0;
 };
 
+struct DrawPreparation {
+    VkDevice device = VK_NULL_HANDLE;
+    std::vector<std::uint32_t> resourceKey;
+    std::weak_ptr<ShaderResources> cached;
+    std::uint64_t epoch = 0;
+    std::uint64_t mapping = 0;
+    std::uint64_t unwatch = 0;
+    std::uint64_t collectedBytes = 0;
+    std::uint64_t ranges = 0;
+    std::uint64_t unavailable = 0;
+    bool keyUsed = false;
+    bool keyInvalidated = false;
+    bool cacheChanged = false;
+    bool collectInvalidated = false;
+};
+
+bool DrawPrelockEnabled();
+DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe = nullptr);
+void RecheckDrawPreparation(const Context& context, DrawPreparation& preparation);
+
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, DrawPreparation* preparation = nullptr);
 
 struct PixelFunctionLdsLayouts {
     VkDescriptorSetLayout empty = VK_NULL_HANDLE;
