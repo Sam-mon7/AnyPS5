@@ -1131,6 +1131,12 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     return key;
 }
 
+bool DrawResourcesCacheable(std::span<const CompiledShader> shaders) {
+    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
+    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    return !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+}
+
 // The alias checks the build makes for every guest buffer descriptor (ShaderResources::
 // addGuestBuffer), repeated for a cached build whose own checks compared the buffers against
 // another draw's render target and index buffer. The same conditions and messages, so a draw that
@@ -1156,6 +1162,19 @@ void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarg
     }
 }
 
+}
+
+bool DrawPrelockEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_PRELOCK") == nullptr;
+    return enabled;
+}
+
+void RecheckDrawPreparation(const Context& context, DrawPreparation& preparation) {
+    if (preparation.device == VK_NULL_HANDLE) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile && preparation.device != context.device && !preparation.resourceKey.empty()) preparation.keyInvalidated = true;
+    if (preparation.device != context.device) preparation.resourceKey.clear();
+    if (profile) preparation.collectInvalidated |= preparation.device != context.device || preparation.epoch != GuestMemory::ThreadCollectEpoch() || preparation.mapping != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || preparation.unwatch != GuestMemory::UnwatchSerial();
 }
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw) {
@@ -1822,7 +1841,7 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, DrawPreparation* preparation) {
     ResolvedResources resolved;
     auto lookupLap = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lookupPhase = [&](LookupPhase phase) {
@@ -1838,15 +1857,18 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // object must never do. Revalidate proves a hit by texture identity, which needs the texture
     // caches. Push constants still come from this draw's stages. APS5_NO_DRAW_RESOURCE_CACHE=1
     // builds every draw's resources as before.
-    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
-    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     // The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    resolved.cacheable = recordable && DrawResourcesCacheable(shaders);
     if (resolved.cacheable) {
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        if (preparation != nullptr && preparation->device == context.device && !preparation->resourceKey.empty()) {
+            resolved.contentKey = std::exchange(preparation->resourceKey, {});
+            if (timer.profile) preparation->keyUsed = true;
+        } else resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        auto cached = SharedResourceCache().Find(resolved.contentKey);
+        if (timer.profile && preparation != nullptr && preparation->device != VK_NULL_HANDLE) preparation->cacheChanged |= cached.owner_before(preparation->cached) || preparation->cached.owner_before(cached);
+        if (cached != nullptr) {
             lookupPhase(LookupKeyFind);
             const bool valid = cached->Revalidate(shaders);
             lookupPhase(LookupProof);
@@ -2633,6 +2655,7 @@ struct TargetBinding {
 };
 
 struct PreparedDraw {
+    DrawPreparation* preparation = nullptr;
     explicit PreparedDraw(bool profile) : timer(profile), outcome(profile) {}
     PreparedDraw(const PreparedDraw&) = delete;
     PreparedDraw& operator=(const PreparedDraw&) = delete;
@@ -2831,7 +2854,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
-    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.preparation);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {
@@ -3418,10 +3441,65 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace) {
+DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe) {
+    DrawPreparation prepared;
+    if (!DrawPrelockEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return prepared;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    prepared.device = context.device;
+    const auto collectedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
+    if (profile) {
+        prepared.epoch = GuestMemory::ThreadCollectEpoch();
+        prepared.mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        prepared.unwatch = GuestMemory::UnwatchSerial();
+    }
+    const bool collect = GuestMemory::ThreadCollectEpoch() != 0;
+    static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
+    static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
+    if (collect && residentTargets && context.detiler != nullptr) {
+        for (const auto& color : state.colors) {
+            if (color.samples != 1 || (color.tileMode == ColorTileMode::Linear && !residentLinear)) continue;
+            std::optional<std::pair<GuestTextureResource, std::uint64_t>> described;
+            try {
+                const auto requested = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
+                const auto surface = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
+                described.emplace(surface, DescribeSurface(surface).guestBytes);
+            } catch (const std::runtime_error&) {
+                continue;
+            }
+            const auto& [surface, bytes] = *described;
+            const auto precollect = [&](std::uint64_t address, std::uint64_t count) {
+                const auto generation = GuestMemory::CollectWrites(address, static_cast<std::size_t>(count));
+                if (profile) {
+                    ++prepared.ranges;
+                    prepared.unavailable += generation == 0;
+                }
+            };
+            precollect(surface.baseAddress, bytes);
+            if (surface.dccAddress != 0) precollect(surface.dccAddress, DccKeyBytes(bytes));
+        }
+    }
+    std::shared_ptr<ShaderResources> cached;
+    if (recipe != nullptr && recipe->device == context.device) {
+        cached = recipe->templateRef.lock();
+    } else if (RecordDraws() && DumpTargetLimit() == 0 && DrawResourcesCacheable(shaders)) {
+        static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+        prepared.resourceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
+        cached = SharedResourceCache().Find(prepared.resourceKey);
+    }
+    if (cached != nullptr && collect) cached->PrecollectSurfaces();
+    if (profile) {
+        prepared.cached = cached;
+        prepared.collectedBytes = GuestMemory::ThreadCollectedBytes() - collectedBefore;
+    }
+    return prepared;
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, DrawPreparation* preparation) {
+    if (preparation != nullptr) RecheckDrawPreparation(context, *preparation);
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PreparedDraw prepared(profile);
+    prepared.preparation = preparation;
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);

@@ -185,6 +185,68 @@ struct DrawTail {
 
 namespace {
 
+struct DrawLockTiming {
+    bool profile;
+    Graphics::DrawPreparation preparation;
+    double prepareMs = 0;
+    std::uint64_t heldBefore = 0;
+    std::uint64_t collectedBefore = 0;
+    bool started = false;
+
+    void Start() {
+        if (!profile || started) return;
+        heldBefore = GuestMemory::ThreadGpuHeldNs();
+        collectedBefore = GuestMemory::ThreadCollectedBytes();
+        started = true;
+    }
+
+    ~DrawLockTiming() {
+        if (!profile || !started) return;
+        const auto heldMs = static_cast<double>(GuestMemory::ThreadGpuHeldNs() - heldBefore) / 1e6;
+        const auto collected = GuestMemory::ThreadCollectedBytes() - collectedBefore;
+        struct Counts {
+            std::uint64_t draws = 0;
+            std::uint64_t keys = 0;
+            std::uint64_t keyInvalidated = 0;
+            std::uint64_t cacheChanged = 0;
+            std::uint64_t collectInvalidated = 0;
+            std::uint64_t redone = 0;
+            std::uint64_t ranges = 0;
+            std::uint64_t unavailable = 0;
+            std::uint64_t prelockBytes = 0;
+            std::uint64_t lockedBytes = 0;
+            double prepareMs = 0;
+            double heldMs = 0;
+            double maxHeldMs = 0;
+        };
+        static thread_local std::array<Counts, 2> counts{};
+        static thread_local auto reportedAt = std::chrono::steady_clock::now();
+        auto& count = counts[preparation.device != VK_NULL_HANDLE ? 1 : 0];
+        ++count.draws;
+        count.keys += preparation.keyUsed;
+        count.keyInvalidated += preparation.keyInvalidated;
+        count.cacheChanged += preparation.cacheChanged;
+        count.collectInvalidated += preparation.collectInvalidated;
+        count.redone += preparation.keyInvalidated || preparation.cacheChanged || preparation.collectInvalidated;
+        count.ranges += preparation.ranges;
+        count.unavailable += preparation.unavailable;
+        count.prelockBytes += preparation.collectedBytes;
+        count.lockedBytes += collected;
+        count.prepareMs += prepareMs;
+        count.heldMs += heldMs;
+        count.maxHeldMs = std::max(count.maxHeldMs, heldMs);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - reportedAt < std::chrono::seconds(10)) return;
+        reportedAt = now;
+        for (std::size_t i = 0; i < counts.size(); ++i) {
+            const auto& total = counts[i];
+            if (total.draws == 0) continue;
+            AgcDriver::ProfilePrint_nid_no_patch("[draw-lock] queue 0x%x %s (10 s): %llu scopes held %.3f ms (max %.3f ms), prelock %.3f ms; keys reused %llu, redo scopes %llu (keys invalidated %llu, cache probe changed %llu, collect invalidated %llu); target ranges %llu (%llu unavailable), walked prelock %.3f MiB, after lock %.3f MiB\n", GuestMemory::GpuLockThreadTag(), i != 0 ? "prelock" : "locked", static_cast<unsigned long long>(total.draws), total.heldMs, total.maxHeldMs, total.prepareMs, static_cast<unsigned long long>(total.keys), static_cast<unsigned long long>(total.redone), static_cast<unsigned long long>(total.keyInvalidated), static_cast<unsigned long long>(total.cacheChanged), static_cast<unsigned long long>(total.collectInvalidated), static_cast<unsigned long long>(total.ranges), static_cast<unsigned long long>(total.unavailable), static_cast<double>(total.prelockBytes) / 1048576.0, static_cast<double>(total.lockedBytes) / 1048576.0);
+        }
+        counts = {};
+    }
+};
+
 void noteFinisherHandOff(bool handed) {
     static std::atomic<std::uint64_t> handedOff{0}, kept{0};
     static std::atomic<std::int64_t> reportedAt{0};
@@ -1066,12 +1128,23 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     };
     snapshot();
     timing.Mark("post_compile_prepare");
+    DrawLockTiming lockTiming{profile};
+    const auto prepareForDraw = [&](const Pm4::DrawParameters& parameters, const DrawRecipe* recipe = nullptr) {
+        if (gpuLock.owns_lock() || !Graphics::DrawPrelockEnabled()) return;
+        const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        lockTiming.preparation = localDevice->PrepareDraw(graphics, parameters, stages, recipe);
+        if (profile) lockTiming.prepareMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
     const auto lockForDraw = [&] {
         require(tail.queue != nullptr, "the draw finisher reached a draw it cannot commit through the pipeline");
-        if (gpuLock.owns_lock()) return;
+        if (gpuLock.owns_lock()) {
+            lockTiming.Start();
+            return;
+        }
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
+        lockTiming.Start();
         timing.Mark("gpu_mutex_wait");
         phaseTiming.Phase(DrawRowLockWait);
 
@@ -1188,10 +1261,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 return drawn();
             }
             drainBeforeInline();
+            prepareForDraw(direct);
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
             phaseTiming.Phase(DrawRowVectors);
-            localDevice->Draw(graphics, direct, stages, snapshots, nullptr, tracePtr);
+            localDevice->Draw(graphics, direct, stages, snapshots, nullptr, tracePtr, &lockTiming.preparation);
             phaseTiming.Phase(DrawRowGraphics);
         }
         timing.Mark("draw_and_resource_release");
@@ -1234,11 +1308,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return drawn();
     }
     if (drawParameters.indirect) drainBeforeInline();
+    prepareForDraw(drawParameters, recipe.get());
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) {
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, &lockTiming.preparation) == RecipeOutcome::Recorded) {
             phaseTiming.Phase(DrawRowGraphics);
             timing.Mark("draw_and_resource_release");
             return drawn();
@@ -1247,7 +1322,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, &lockTiming.preparation);
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
@@ -1256,8 +1331,16 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
 
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    DrawLockTiming lockTiming{profile};
+    if (Graphics::DrawPrelockEnabled()) {
+        const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        lockTiming.preparation = localDevice->PrepareDraw(graphics, drawParameters, stages, recipe.get());
+        if (profile) lockTiming.prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    lockTiming.Start();
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     struct SubmitDue {
         Driver& driver;
@@ -1269,11 +1352,11 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(stages, queue);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, &lockTiming.preparation) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, &lockTiming.preparation);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 

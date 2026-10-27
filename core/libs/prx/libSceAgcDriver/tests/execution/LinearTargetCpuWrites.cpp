@@ -26,8 +26,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace AgcDriver {
@@ -162,11 +164,93 @@ AgcDriver::Graphics::ColorTarget DecodeTarget(const Block& block) {
     return color;
 }
 
-void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> pixelCode, std::uint32_t scissorWidth) {
+void PreparedDraws(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::State state, const AgcDriver::Pm4::DrawParameters& draw, std::span<const AgcDriver::Graphics::CompiledShader> shaders) {
+    const bool enabled = AgcDriver::Graphics::DrawPrelockEnabled();
+    const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    auto& cache = AgcDriver::Graphics::SharedResourceCache();
+    std::shared_ptr<const AgcDriver::DrawRecipe> recipe;
+    unsigned kept = 0xff;
+    for (unsigned step = 0; step != 7; ++step) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(!AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "draw preparation started with the GPU mutex held");
+        auto prepared = device.PrepareDraw(state, draw, shaders, step == 6 ? recipe.get() : nullptr);
+        Require((prepared.device != VK_NULL_HANDLE) == enabled, "draw preparation ignored its switch");
+        if (enabled && profile && context.detiler != nullptr) Require(prepared.ranges != 0, "draw preparation did not collect the target surface");
+        if (enabled && step != 6) Require(!prepared.resourceKey.empty(), "draw preparation did not make the resource key");
+        if (step != 0 && step != 6 && enabled) Require(cache.Find(prepared.resourceKey) != nullptr, "draw preparation regression did not start from a cached template");
+        if (step == 1) {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            cache.Clear();
+        }
+        if (step == 2 || step == 6) {
+            kept = step == 2 ? 0x42 : 0x44;
+            const std::vector<std::byte> bytes(TargetBytes, static_cast<std::byte>(kept));
+            AgcDriver::GuestMemory::Write(state.color.address, bytes);
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+        }
+        if (step == 3) {
+            kept = 0x43;
+            const std::array<std::uint32_t, 4> pattern{0x43434343u, 0x43434343u, 0x43434343u, 0x43434343u};
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Require(device.FillBuffer(state.color.address, TargetBytes, pattern), "draw preparation regression could not record its intervening GPU fill");
+            Require(AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(state.color.address, TargetBytes), "the intervening GPU fill has no pending write");
+        }
+        if (step == 4 && enabled) {
+            prepared.device = reinterpret_cast<VkDevice>(std::uintptr_t{1});
+            prepared.resourceKey = {0u};
+        }
+        std::unique_ptr<Block> mapping;
+        if (step == 5) mapping = std::make_unique<Block>(BlockBytes, false);
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            if (step == 6) {
+                Require(device.DrawFromRecipe(state, draw, shaders, {}, recipe, nullptr, &prepared) == AgcDriver::RecipeOutcome::Recorded, "the prepared draw recipe did not revalidate and record");
+            } else {
+                device.Draw(state, draw, shaders, {}, &recipe, nullptr, &prepared);
+                Require(recipe != nullptr, "the prepared draw did not build a reusable recipe");
+                Require(!enabled || prepared.resourceKey.empty(), "the prepared resource key was not consumed or invalidated");
+                if (enabled && profile) {
+                    Require(prepared.keyUsed == (step != 4), "the draw reused a key from another device or rebuilt a current key");
+                    Require(prepared.keyInvalidated == (step == 4), "draw preparation did not count a discarded device key");
+                    if (step == 1) Require(prepared.cacheChanged, "cache eviction between preparation and recording was not detected");
+                }
+            }
+            if (enabled && profile && (step == 2 || step == 4 || step == 5 || step == 6)) Require(prepared.collectInvalidated, "the draw preparation did not detect an invalidated collection");
+        }
+        device.WaitIdle();
+        std::vector<std::byte> stored(TargetBytes);
+        AgcDriver::GuestMemory::Read(state.color.address, stored);
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                const auto offset = static_cast<std::size_t>(y) * RowBytes + x * 16u;
+                if (x < state.scissor.extent.width) {
+                    std::array<float, 4> actual{};
+                    std::memcpy(actual.data(), stored.data() + offset, sizeof(actual));
+                    const std::array<float, 4> expected{static_cast<float>(x), static_cast<float>(y), 0.0f, 1.0f};
+                    Require(actual == expected, "the prepared draw used stale inputs or lost its GPU pixels at step " + std::to_string(step));
+                } else {
+                    Require(std::all_of(stored.begin() + offset, stored.begin() + offset + 16u, [&](std::byte byte) { return byte == static_cast<std::byte>(kept); }), "the prepared draw lost CPU or GPU target bytes outside its scissor at step " + std::to_string(step));
+                }
+            }
+        }
+    }
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Require(device.PrepareDraw(state, draw, shaders).device == VK_NULL_HANDLE, "draw preparation ran inside an existing GPU hold");
+    }
+}
+
+void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> pixelCode, std::uint32_t scissorWidth, bool prelock = false) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
-    const auto vertexBuffer = BufferDescriptor(Triangle.data(), 16u, static_cast<std::uint32_t>(Triangle.size()));
+    std::unique_ptr<Block> vertexBlock;
+    if (prelock) {
+        vertexBlock = std::make_unique<Block>(BlockBytes, false);
+        std::memcpy(vertexBlock->data, Triangle.data(), sizeof(Triangle));
+    }
+    const auto vertexBuffer = BufferDescriptor(prelock ? vertexBlock->data : static_cast<const void*>(Triangle.data()), 16u, static_cast<std::uint32_t>(Triangle.size()));
     std::copy(vertexBuffer.begin(), vertexBuffer.end(), vertexUserData.begin());
     const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
     ShaderRecompiler::RecompileRequest vertex{
@@ -217,6 +301,10 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     state.blend = blend;
     state.blendConstants = {};
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+    if (prelock) {
+        PreparedDraws(device, state, draw, shaders);
+        return;
+    }
     device.Draw(state, draw, shaders);
 }
 
@@ -281,10 +369,19 @@ Outcome Run(AgcDriver::VulkanDevice& device, bool watched, bool seeded, bool hoo
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-prelock") {
+            Block block(BlockBytes, true);
+            std::fill(block.data, block.data + block.bytes, std::uint8_t{0xff});
+            const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+            if (AgcDriver::Graphics::HostImportFor(context, block.Address(), block.bytes) == nullptr) return VulkanTestSkipped;
+            Draw(*device, DecodeTarget(block), Program(0, false), Drawn, true);
+            std::puts("draw preparation tests passed");
+            return 0;
+        }
         bool kept = true;
         bool ran = false;
         for (const bool watched : {true, false}) {
