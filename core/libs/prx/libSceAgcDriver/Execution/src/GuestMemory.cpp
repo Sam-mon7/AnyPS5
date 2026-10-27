@@ -2320,6 +2320,8 @@ struct GpuLockStats {
     std::uint64_t triesFailed = 0;
     std::uint64_t lockedGpuWaits = 0;
     double lockedGpuWaitMs = 0;
+    std::array<std::uint64_t, GpuLockSiteCount> siteLockedGpuWaits{}, siteUnlockedGpuWaits{};
+    std::array<double, GpuLockSiteCount> siteLockedGpuWaitMs{}, siteUnlockedGpuWaitMs{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -2440,7 +2442,10 @@ bool GpuMutexType::try_lock() {
         return false;
     }
     acquired();
-    if (depth == 1 && GpuHoldProfiled()) BeginHold(static_cast<std::size_t>(tagged == GpuLockSite::Other ? GpuLockSite::Try : tagged));
+    if (depth == 1) {
+        stats.holdSite = static_cast<std::size_t>(tagged == GpuLockSite::Other ? GpuLockSite::Try : tagged);
+        if (GpuHoldProfiled()) BeginHold(stats.holdSite);
+    }
     return true;
 }
 
@@ -2525,6 +2530,7 @@ void GpuMutexType::lock() {
         const auto start = std::chrono::steady_clock::now();
         LockSpinning(mutex, HandoffSpinWindow());
         acquired();
+        if (depth == 1) stats.holdSite = site;
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
         if (holders) {
@@ -2577,6 +2583,13 @@ void GpuMutexType::lock() {
         char counts[160];
         std::snprintf(counts, sizeof(counts), "; lock() %llu / try %llu / try failed %llu; locked GPU waits %llu / %.0f ms", static_cast<unsigned long long>(stats.acquisitions), static_cast<unsigned long long>(stats.tries), static_cast<unsigned long long>(stats.triesFailed), static_cast<unsigned long long>(stats.lockedGpuWaits), stats.lockedGpuWaitMs);
         holds += counts;
+        holds += "; GPU waits by site (locked count/ms, unlocked count/ms):";
+        for (std::size_t i = 0; i < GpuLockSiteCount; ++i) {
+            if (stats.siteLockedGpuWaits[i] == 0 && stats.siteUnlockedGpuWaits[i] == 0) continue;
+            char text[160];
+            std::snprintf(text, sizeof(text), " %s %llu/%.1f %llu/%.1f", GpuLockSiteNames[i], static_cast<unsigned long long>(stats.siteLockedGpuWaits[i]), stats.siteLockedGpuWaitMs[i], static_cast<unsigned long long>(stats.siteUnlockedGpuWaits[i]), stats.siteUnlockedGpuWaitMs[i]);
+            holds += text;
+        }
         if (stats.tag == 0xffffffffu) AgcDriver::ProfilePrint_nid_no_patch("[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         else AgcDriver::ProfilePrint_nid_no_patch("[lock] queue 0x%x waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.tag, stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         if (GpuHoldProfiled()) {
@@ -2601,9 +2614,14 @@ void GpuMutexType::lock() {
         stats.triesFailed = 0;
         stats.lockedGpuWaits = 0;
         stats.lockedGpuWaitMs = 0;
+        stats.siteLockedGpuWaits.fill(0);
+        stats.siteLockedGpuWaitMs.fill(0);
+        stats.siteUnlockedGpuWaits.fill(0);
+        stats.siteUnlockedGpuWaitMs.fill(0);
         return;
     }
     acquired();
+    if (depth == 1) stats.holdSite = site;
     if (depth == 1 && GpuHoldProfiled()) BeginHold(site);
 }
 
@@ -2626,6 +2644,20 @@ void NoteLockedGpuWait(double ms) {
     auto& stats = LockStats();
     ++stats.lockedGpuWaits;
     stats.lockedGpuWaitMs += ms;
+    ++stats.siteLockedGpuWaits[stats.holdSite];
+    stats.siteLockedGpuWaitMs[stats.holdSite] += ms;
+}
+
+GpuLockSite GpuLockHoldSite() {
+    return GpuLockProfiled() && GpuMutex().HeldByThisThread() ? static_cast<GpuLockSite>(LockStats().holdSite) : GpuLockSite::Other;
+}
+
+void NoteUnlockedGpuWait(GpuLockSite site, double ms) {
+    if (!GpuLockProfiled()) return;
+    auto& stats = LockStats();
+    const auto index = static_cast<std::size_t>(site);
+    ++stats.siteUnlockedGpuWaits[index];
+    stats.siteUnlockedGpuWaitMs[index] += ms;
 }
 
 std::uint64_t ThreadCollectedBytes() {

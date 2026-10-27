@@ -23,12 +23,15 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 namespace {
 
 using AgcDriver::Graphics::Require;
+
+bool deferredLabelTest = false;
 
 constexpr std::uint32_t Threads = 32;
 constexpr std::uint32_t Width = 32;
@@ -163,7 +166,11 @@ std::vector<std::uint32_t> Commands(std::span<const std::uint32_t> code, std::ui
     registers(0x240, userData);
     words.insert(words.end(), {0xc0031500u, 1, 1, 1, 0x41u | 0x8000u});
     const auto at = reinterpret_cast<std::uintptr_t>(label);
-    words.insert(words.end(), {0xc0064900u, 0x514u, (1u << 29u) | (2u << 24u), static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u), LabelValue, 0, 0});
+    if (deferredLabelTest) {
+        words.insert(words.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u), LabelValue, 0xc0001000u, 0});
+    } else {
+        words.insert(words.end(), {0xc0064900u, 0x514u, (1u << 29u) | (2u << 24u), static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u), LabelValue, 0, 0});
+    }
     return words;
 }
 
@@ -217,8 +224,9 @@ void ReadTiledAfterLabel(std::uint8_t* block) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        deferredLabelTest = argc == 2 && std::string_view(argv[1]) == "--deferred-label";
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;

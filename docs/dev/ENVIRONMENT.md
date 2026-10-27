@@ -487,6 +487,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_TRACE_UPLOAD` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | names why a storage image is uploaded again |
 | `APS5_UNIT_SHADOW_MIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/UnitShadow.cpp` | 1024 | budget in MiB of the unit shadow's slabs |
 | `APS5_UNIT_SHADOW_SLAB_MIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/UnitShadow.cpp` | 8 | size in MiB of one unit-shadow slab |
+| `APS5_UNLOCKED_LABEL_WAITS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | submits pending readback-image writers and waits outside the GPU mutex at standalone label flushes between packets, for awaited labels and before CPU reads, then rescans pending images before recording labels; requires timeline semaphores and an outermost hold |
 | `APS5_VALIDATE_LEGACY` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/WriteEvidence.cpp` |  | uses the legacy snapshot and full-compare path for pending-write validation |
 | `APS5_VALIDATE_SYNC_SKIP` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/WriteEvidence.cpp` |  | reads skipped dwords through the hook too and counts a mismatch |
 | `APS5_VERIFY_BDA_TABLES` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | checks a reused BDA page table against the one just built |

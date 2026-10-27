@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "ThreadOwned.hpp"
 #include <algorithm>
@@ -126,6 +127,7 @@ void Driver::flushAwaitedLabels(std::uint32_t queue) {
             if (profile) ++waitOutcomes().awaitedLabelBusy;
             return;
         }
+        Graphics::StorageTexture::PrepareReadbackBeforeLabel();
         const auto localDevice = device.Load();
         if (localDevice == nullptr) return;
         recordDeferredLabels(localDevice.get(), queue);
@@ -236,6 +238,7 @@ void Driver::recordQueuedLabelsBeforeRead(std::uint32_t queue) {
     if (deferredLabels().labels.empty()) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    Graphics::StorageTexture::PrepareReadbackBeforeLabel();
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
 }
