@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -121,7 +122,9 @@ void ReportDispatchItems(bool profile) {
 
 void NoteMissingRecipe(std::uint32_t queue, bool indirect, RecipeBuildFailure failure) {
     constexpr std::array<const char*, static_cast<std::size_t>(RecipeBuildFailure::Count)> names{"not attempted", "built", "disabled", "uncacheable", "overlay", "address table", "lease", "copied writes", "not reusable", "completion", "objects", "key"};
-    static thread_local std::map<std::pair<std::uint32_t, bool>, std::array<std::uint64_t, names.size()>> counts;
+    using Counts = std::map<std::pair<std::uint32_t, bool>, std::array<std::uint64_t, names.size()>>;
+    thread_local Counts* countsSlot = nullptr;
+    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
     static thread_local auto reportedAt = std::chrono::steady_clock::now();
     ++counts[{queue, indirect}][static_cast<std::size_t>(failure)];
     const auto now = std::chrono::steady_clock::now();
