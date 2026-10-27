@@ -276,7 +276,7 @@ void Driver::noteQueuedLabels(std::uint32_t queue) {
     const auto& labels = deferredLabels().labels;
     for (auto& noted = queuedLabelsNoted(); noted < labels.size(); ++noted) {
         const auto& label = labels[noted];
-        const auto origin = Timeline::Enabled && noted < Timeline::DeferredOrigins.size() ? Timeline::DeferredOrigins[noted] : Timeline::Origin{};
+        const auto origin = Timeline::Enabled && noted < Timeline::DeferredOrigins().size() ? Timeline::DeferredOrigins()[noted] : Timeline::Origin{};
         Timeline::ContextScope timelineContext(origin.packet, origin.opcode);
         Graphics::Recorder::NoteQueuedLabel(label.address, std::span<const std::byte>(label.bytes).first(label.size), ++eventSerial, queue);
     }

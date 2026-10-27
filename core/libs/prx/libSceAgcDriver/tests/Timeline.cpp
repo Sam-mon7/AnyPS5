@@ -70,19 +70,19 @@ int main() {
             for (const auto& entry : std::filesystem::recursive_directory_iterator(Directory)) previous.push_back(entry.path());
         }
         Bind(0x38);
-        DeferredOrigins.push_back({42, 0x37});
+        DeferredOrigins().push_back({42, 0x37});
         {
             DeferredScope origins;
-            Check(DeferredOrigins.empty());
+            Check(DeferredOrigins().empty());
             {
                 auto context = origins.At(0);
                 Check(Packet == 42 && Opcode == 0x37);
             }
             Check(Packet == 0 && Opcode == 0);
-            DeferredOrigins.push_back({43, 0x49});
+            DeferredOrigins().push_back({43, 0x49});
         }
-        Check(DeferredOrigins.size() == 1 && DeferredOrigins[0].packet == 43);
-        DeferredOrigins.clear();
+        Check(DeferredOrigins().size() == 1 && DeferredOrigins()[0].packet == 43);
+        DeferredOrigins().clear();
         {
             PacketScope packet(0x15, 5, 9);
             Emit(Kind::Flip);

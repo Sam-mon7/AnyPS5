@@ -86,7 +86,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 auto& entry = deferred.labels.emplace_back();
                 entry.address = label->address;
                 if (Timeline::Enabled) {
-                    Timeline::DeferredOrigins.push_back({Timeline::Packet, Timeline::Opcode});
+                    Timeline::DeferredOrigins().push_back({Timeline::Packet, Timeline::Opcode});
                     Timeline::Store(Timeline::Kind::LabelDeferred, label->address, bytes, 0);
                 }
                 entry.size = bytes.size();

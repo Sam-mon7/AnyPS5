@@ -161,7 +161,11 @@ struct Origin {
     std::uint64_t packet;
     std::uint32_t opcode;
 };
-inline thread_local std::vector<Origin> DeferredOrigins;
+inline std::vector<Origin>& DeferredOrigins() {
+    thread_local std::vector<Origin>* slot = nullptr;
+    if (slot == nullptr) slot = new std::vector<Origin>();
+    return *slot;
+}
 
 inline void Bind(std::uint32_t queue) {
     if (!Enabled) return;
@@ -221,11 +225,11 @@ private:
 
 class DeferredScope {
 public:
-    DeferredScope() { if (Enabled) origins.swap(DeferredOrigins); }
+    DeferredScope() { if (Enabled) origins.swap(DeferredOrigins()); }
     ~DeferredScope() {
-        if (Enabled && DeferredOrigins.empty()) {
+        if (Enabled && DeferredOrigins().empty()) {
             origins.clear();
-            origins.swap(DeferredOrigins);
+            origins.swap(DeferredOrigins());
         }
     }
     ContextScope At(std::size_t index) const {
