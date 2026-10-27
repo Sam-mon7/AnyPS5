@@ -19,8 +19,6 @@
 
 namespace AgcDriver::DriverDetail {
 
-struct DispatchAheadBatch;
-
 struct Submission {
     std::uint64_t serial;
     std::uint32_t queue;
@@ -28,7 +26,6 @@ struct Submission {
     std::shared_ptr<SubmissionProgress> progress;
 
     std::shared_ptr<const ShaderRegistry> shaders;
-    std::shared_ptr<DispatchAheadBatch> dispatchAhead;
     std::map<std::size_t, std::shared_ptr<IFlipRequest>> flips;
     std::map<std::size_t, std::shared_ptr<IRenderingWait>> renderingWaits;
     std::map<std::size_t, std::size_t> conditionalEnds;

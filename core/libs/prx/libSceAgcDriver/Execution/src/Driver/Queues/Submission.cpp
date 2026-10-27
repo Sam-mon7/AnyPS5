@@ -446,7 +446,6 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
         }
         submission.shaders = shaders;
         submission.serial = accepted + 1;
-        if (queue == 0 && dispatchAheadAtSubmit()) prepareSubmissionDispatches(submission);
 
         submission.received = ++eventSerial;
         const auto now = std::chrono::steady_clock::now();
