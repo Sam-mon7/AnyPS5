@@ -7,10 +7,12 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <utility>
 
 namespace ShaderRecompiler::Detail {
@@ -24,6 +26,19 @@ std::uint64_t float32Bits(float value) { return std::bit_cast<std::uint32_t>(val
 constexpr std::uint32_t MainContext = 0;
 constexpr std::uint32_t CleanContext = 1;
 constexpr std::uint32_t MaxDepth = 512;
+
+void profileWalk(bool fast, bool pooled, bool grew, bool success, std::size_t activityEntries) {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!enabled) return;
+    static std::atomic<std::uint64_t> walks{0}, fastWalks{0}, pooledWalks{0}, growths{0}, refusals{0}, skippedEntries{0};
+    if (fast) ++fastWalks;
+    if (pooled) ++pooledWalks;
+    if (grew) ++growths;
+    if (!success) ++refusals;
+    skippedEntries += activityEntries;
+    const auto count = ++walks;
+    if (count % 10000u == 0u) std::fprintf(stderr, "[srt-walk] %llu walks: %llu fast, %llu refused, %llu pooled large frames, %llu capacity growths, %llu static activity entries skipped (cumulative)\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(fastWalks.load()), static_cast<unsigned long long>(refusals.load()), static_cast<unsigned long long>(pooledWalks.load()), static_cast<unsigned long long>(growths.load()), static_cast<unsigned long long>(skippedEntries.load()));
+}
 
 }
 
@@ -52,6 +67,35 @@ public:
         tape.conditionRoots.assign(plan.controlFlow.size(), SrtTape::NoNode);
         for (std::size_t block = 0; block < plan.controlFlow.size(); ++block) {
             if (plan.controlFlow[block].condition != nullptr) tape.conditionRoots[block] = compile(plan.controlFlow[block].condition, CleanContext, 0);
+        }
+        if (SrtTape::FastEnabled()) {
+            tape.needsCleanMemory = std::any_of(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end(), [](std::uint8_t clean) { return clean != 0u; });
+            tape.initialActive.assign(plan.descriptorSources.size() + plan.info.images.size(), 1u);
+            tape.initialActiveFlat.assign(plan.srtReads.size(), 1u);
+            for (const auto& block : plan.controlFlow) {
+                for (const auto source : block.sources) {
+                    if (source >= tape.initialActive.size()) return false;
+                    tape.initialActive[source] = 0u;
+                }
+                for (const auto image : block.images) {
+                    if (image >= plan.info.images.size()) return false;
+                    tape.initialActive[plan.descriptorSources.size() + image] = 0u;
+                }
+                for (const auto slot : block.flatSlots) {
+                    if (slot >= tape.initialActiveFlat.size()) return false;
+                    tape.initialActiveFlat[slot] = 0u;
+                }
+                tape.activityEntries += block.sources.size() + block.images.size() + block.flatSlots.size();
+            }
+            for (auto& node : tape.nodes) {
+                if (node.op == Op::LogicalAnd || node.op == Op::LogicalOr || node.op == Op::ULessThan32 || node.op == Op::UGreaterThan32) continue;
+                for (std::uint8_t index = 0; index < node.argumentCount; ++index) {
+                    const auto& argument = tape.nodes[node.arguments[index]];
+                    if (argument.op != Op::Const || argument.immediate > 0xffffffffu) continue;
+                    node.literalArguments |= 1u << index;
+                    node.arguments[index] = static_cast<std::uint32_t>(argument.immediate);
+                }
+            }
         }
         return !malformed;
     }
@@ -295,6 +339,14 @@ bool SrtTape::Verified() {
     return verified;
 }
 
+bool SrtTape::FastEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_SRT_FAST_WALK");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan) {
     if (!plan.srtPlanComplete) return nullptr;
     auto tape = std::make_shared<SrtTape>();
@@ -323,6 +375,7 @@ struct SrtTape::Frame {
     const SrtRuntime& runtime;
     std::uint64_t* values;
     std::uint8_t* states;
+    bool fast = false;
     bool nullRoot = false;
 };
 
@@ -345,6 +398,10 @@ bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result)
 }
 
 bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) const {
+    if (frame.fast && node.op == Op::Const) {
+        result = node.immediate;
+        return true;
+    }
     if (node.op == Op::LogicalAnd || node.op == Op::LogicalOr) {
         const bool decisive = node.op == Op::LogicalOr;
         std::uint64_t first = 0;
@@ -390,6 +447,10 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
             origin = node.baseWord;
             operand[0] = frame.runtime.userData[static_cast<std::size_t>(origin)];
             frame.runtime.userDataUse->asBase |= std::uint64_t {1} << origin;
+            continue;
+        }
+        if ((node.literalArguments & (1u << index)) != 0u) {
+            operand[index] = node.arguments[index];
             continue;
         }
         if (!evaluate(frame, node.arguments[index], operand[index])) return false;
@@ -538,7 +599,10 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
 
 bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const {
     if (!plan.srtPlanComplete) return false;
-    if (std::any_of(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end(), [](std::uint8_t clean) { return clean != 0u; }) && runtime.readSpecializationMemory == nullptr) return false;
+    const bool fast = FastEnabled();
+    if ((fast ? needsCleanMemory : std::any_of(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end(), [](std::uint8_t clean) { return clean != 0u; })) && runtime.readSpecializationMemory == nullptr) return false;
+    bool pooled = false;
+    bool grew = false;
     auto* trace = runtime.readTrace;
     const auto leavesBefore = trace != nullptr ? trace->leaves.size() : 0;
     const auto readsBefore = trace != nullptr ? trace->otherReads.size() : 0;
@@ -559,8 +623,30 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             use->asValue = valueBefore;
             use->reads.resize(useReadsBefore);
         }
+        profileWalk(fast, pooled, grew, false, fast ? activityEntries : 0u);
         return false;
     };
+    struct Scratch {
+        std::vector<std::uint64_t> values;
+        std::vector<std::uint8_t> states;
+        std::vector<std::uint8_t> active;
+        std::vector<std::uint8_t> activeFlat;
+        std::vector<std::uint8_t> visited;
+        std::vector<std::uint32_t> pending;
+        std::vector<DescriptorValue> evaluated;
+        std::vector<std::uint32_t> flattened;
+        bool busy = false;
+    };
+    struct ScratchStorage {};
+    auto& sharedScratch = HostThreadLocal<Scratch, ScratchStorage>();
+    std::optional<Scratch> localScratch;
+    if (fast && sharedScratch.busy) localScratch.emplace();
+    auto& scratch = localScratch ? *localScratch : sharedScratch;
+    struct Scope {
+        bool& busy;
+        bool previous;
+        ~Scope() { busy = previous; }
+    } scope{scratch.busy, std::exchange(scratch.busy, true)};
     constexpr std::size_t InlineNodes = 512;
     std::array<std::uint64_t, InlineNodes> inlineValues;
     std::array<std::uint8_t, InlineNodes> inlineStates;
@@ -569,32 +655,27 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     std::uint64_t* values = inlineValues.data();
     std::uint8_t* states = inlineStates.data();
     if (nodes.size() > InlineNodes) {
-        heapValues.resize(nodes.size());
-        heapStates.assign(nodes.size(), 0u);
-        values = heapValues.data();
-        states = heapStates.data();
+        auto& largeValues = fast ? scratch.values : heapValues;
+        auto& largeStates = fast ? scratch.states : heapStates;
+        pooled = fast;
+        grew = fast && (largeValues.capacity() < nodes.size() || largeStates.capacity() < nodes.size());
+        if (largeValues.size() < nodes.size()) largeValues.resize(nodes.size());
+        largeStates.assign(nodes.size(), 0u);
+        values = largeValues.data();
+        states = largeStates.data();
     } else {
         std::fill_n(states, nodes.size(), std::uint8_t {0});
     }
-    Frame frame {runtime, values, states};
-
-    struct Scratch {
-        std::vector<std::uint8_t> active;
-        std::vector<std::uint8_t> activeFlat;
-        std::vector<std::uint8_t> visited;
-        std::vector<std::uint32_t> pending;
-        std::vector<DescriptorValue> evaluated;
-        std::vector<std::uint32_t> flattened;
-    };
-    struct ScratchStorage {};
-    auto& scratch = HostThreadLocal<Scratch, ScratchStorage>();
+    Frame frame {runtime, values, states, fast};
     auto& active = scratch.active;
     const auto imageBase = plan.descriptorSources.size();
-    active.assign(imageBase + plan.info.images.size(), 1u);
+    if (fast) active.assign(initialActive.begin(), initialActive.end());
+    else active.assign(imageBase + plan.info.images.size(), 1u);
     auto& activeFlat = scratch.activeFlat;
-    activeFlat.assign(plan.srtReads.size(), 1u);
+    if (fast) activeFlat.assign(initialActiveFlat.begin(), initialActiveFlat.end());
+    else activeFlat.assign(plan.srtReads.size(), 1u);
     if (!plan.controlFlow.empty()) {
-        for (const auto& block : plan.controlFlow) {
+        if (!fast) for (const auto& block : plan.controlFlow) {
             for (const auto source : block.sources) {
                 if (source >= active.size()) return refuse();
                 active[source] = 0u;
@@ -670,6 +751,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     results.swap(evaluated);
     activeSources.swap(active);
     flat.assign(flattened.begin(), flattened.end());
+    profileWalk(fast, pooled, grew, true, fast ? activityEntries : 0u);
     return true;
 }
 

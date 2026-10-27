@@ -1680,6 +1680,252 @@ bool readDirect(void*, std::uint64_t address, std::uint32_t* value) {
     return true;
 }
 
+struct SrtWalkFixture {
+    ShaderRecompiler::IrResourcePlan plan;
+    std::vector<std::unique_ptr<ShaderRecompiler::IrValue>> values;
+    std::vector<std::uint32_t> words;
+    std::array<std::uint32_t, 2> pointer{};
+    std::array<std::uint32_t, 6> userData{};
+
+    ShaderRecompiler::IrValue& Make(ShaderRecompiler::IrOpcode opcode, ShaderRecompiler::IrType type) {
+        values.push_back(std::make_unique<ShaderRecompiler::IrValue>(opcode, type, static_cast<std::uint32_t>(values.size())));
+        return *values.back();
+    }
+
+    ShaderRecompiler::IrValue& Constant(std::uint32_t value) {
+        auto& result = Make(ShaderRecompiler::IrOpcode::Void, ShaderRecompiler::IrType::U32);
+        result.SetImmediateU32(value);
+        return result;
+    }
+
+    ShaderRecompiler::IrValue& UserData(std::uint32_t index) {
+        using namespace ShaderRecompiler;
+        auto& reg = Make(IrOpcode::Void, IrType::ScalarReg);
+        reg.SetRegister({RegisterBank::Scalar, index});
+        auto& result = Make(IrOpcode::GetUserData, IrType::U32);
+        result.AddArgument(&reg);
+        return result;
+    }
+
+    ShaderRecompiler::IrValue& Binary(ShaderRecompiler::IrOpcode opcode, ShaderRecompiler::IrType type, ShaderRecompiler::IrValue& a, ShaderRecompiler::IrValue& b) {
+        auto& result = Make(opcode, type);
+        result.AddArgument(&a);
+        result.AddArgument(&b);
+        return result;
+    }
+
+    explicit SrtWalkFixture(std::uint32_t count, bool branches) : words(count + 8u) {
+        using namespace ShaderRecompiler;
+        const auto address = reinterpret_cast<std::uintptr_t>(words.data());
+        pointer = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
+        const auto nested = reinterpret_cast<std::uintptr_t>(pointer.data());
+        userData = {pointer[0], pointer[1], static_cast<std::uint32_t>(nested), static_cast<std::uint32_t>(nested >> 32u), 0u, 0u};
+        plan.srtPlanComplete = true;
+        plan.resourceTrackingComplete = true;
+        plan.memoryInfo.emplace_back().kind = ResourceKind::ScalarAddress;
+        auto& direct = Binary(IrOpcode::CompositeConstructU64, IrType::U64, UserData(0), UserData(1));
+        auto& root = Binary(IrOpcode::CompositeConstructU64, IrType::U64, UserData(2), UserData(3));
+        auto& low = Binary(IrOpcode::LoadAddressU32, IrType::U32, root, Constant(0u));
+        auto& high = Binary(IrOpcode::LoadAddressU32, IrType::U32, root, Constant(4u));
+        auto& indirect = Binary(IrOpcode::CompositeConstructU64, IrType::U64, low, high);
+        auto& offset = UserData(4);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            auto& at = Binary(IrOpcode::IAdd32, IrType::U32, offset, Constant(i * 4u));
+            auto& read = Binary(IrOpcode::LoadAddressU32, IrType::U32, i % 2u == 0u ? direct : indirect, at);
+            plan.srtReads.push_back({&read, count - i - 1u});
+        }
+        plan.cleanFlatSlots.assign(count, 0u);
+        if (count != 0u) {
+            plan.cleanFlatSlots.back() = 1u;
+            for (std::uint32_t source = 0; source < 2u; ++source) {
+                DescriptorSource descriptor;
+                descriptor.dwordCount = 4u;
+                for (auto& dword : descriptor.dwords) dword = &Constant(0u);
+                descriptor.dwords[0] = plan.srtReads[source % count].value;
+                descriptor.dwords[1] = &Constant(0xffffffffu);
+                auto& wide = Make(IrOpcode::Void, IrType::U64);
+                wide.SetImmediateU64(0x123456789abcdef0ull);
+                descriptor.dwords[2] = &Binary(IrOpcode::CompositeExtractU64, IrType::U32, wide, Constant(source));
+                descriptor.dwords[3] = &Binary(IrOpcode::LogicalAnd, IrType::Bool, Constant(0u), UserData(99u));
+                plan.descriptorSources.push_back(descriptor);
+                plan.materializationSources.push_back(source);
+            }
+        }
+        if (branches) {
+            auto& condition = Binary(IrOpcode::IEqual32, IrType::Bool, UserData(5), Constant(1u));
+            plan.controlFlow = {{&condition, {1u, 2u}, {}, {}, {}}, {nullptr, {3u}, {}, {}, {}}, {nullptr, {3u}, {}, {}, {}}, {}};
+            if (count != 0u) {
+                plan.controlFlow[1].sources = {0u};
+                plan.controlFlow[2].sources = {1u};
+            }
+            for (std::uint32_t i = 0; i < count; ++i) plan.controlFlow[1u + i % 2u].flatSlots.push_back(i);
+        }
+        const auto pure = Detail::ComputePureFlatSlots(plan);
+        plan.pureFlatSlots.resize(count);
+        for (std::uint32_t i = 0; i < count; ++i) plan.pureFlatSlots[plan.srtReads[i].flatOffset] = pure[i];
+    }
+};
+
+void verifyFastSrtWalk(bool benchmark) {
+    using namespace ShaderRecompiler;
+    struct Captured {
+        std::vector<DescriptorValue> descriptors;
+        std::vector<std::uint32_t> flat;
+        std::vector<std::uint8_t> active;
+        std::map<std::uint64_t, std::uint32_t> memory;
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> leaves;
+        std::vector<std::uint64_t> otherReads;
+        std::uint64_t asBase = 0;
+        std::uint64_t asValue = 0;
+        std::vector<std::pair<std::uint64_t, std::int32_t>> origins;
+        bool operator==(const Captured&) const = default;
+    };
+    const auto capture = [](SrtWalkFixture& fixture, bool compiled) {
+        Captured out;
+        SrtRuntime runtime{fixture.userData};
+        runtime.userContext = &out.memory;
+        runtime.readMemory = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+            readDirect(nullptr, address, value);
+            static_cast<std::map<std::uint64_t, std::uint32_t>*>(context)->emplace(address, *value);
+            return true;
+        };
+        runtime.readSpecializationMemory = runtime.readMemory;
+        runtime.accessible = +[](void*, std::uint64_t, std::uint64_t) { return true; };
+        SrtReadTrace trace;
+        SrtUserDataUse use;
+        runtime.readTrace = &trace;
+        runtime.userDataUse = &use;
+        const auto& plan = fixture.plan;
+        auto sources = plan.materializationSources;
+        auto clean = plan.cleanFlatSlots;
+        sources.reserve(sources.size() + 1u);
+        clean.reserve(clean.size() + 1u);
+        const bool ok = compiled ? Detail::SrtTape::For(plan)->Run(plan, runtime, out.descriptors, out.flat, out.active) : Detail::EvaluateRuntimeSourcesImpl(plan, sources, runtime, out.descriptors, out.flat, true, clean, out.active);
+        require(ok, "SRT fast walk: a valid synthetic plan was refused");
+        out.leaves = std::move(trace.leaves);
+        out.otherReads = std::move(trace.otherReads);
+        out.asBase = use.asBase;
+        out.asValue = use.asValue;
+        out.origins = std::move(use.reads);
+        std::sort(out.leaves.begin(), out.leaves.end());
+        std::sort(out.otherReads.begin(), out.otherReads.end());
+        out.otherReads.erase(std::unique(out.otherReads.begin(), out.otherReads.end()), out.otherReads.end());
+        std::sort(out.origins.begin(), out.origins.end());
+        out.origins.erase(std::unique(out.origins.begin(), out.origins.end()), out.origins.end());
+        return out;
+    };
+    for (const auto count : {0u, 1u, 7u, 129u, 300u}) {
+        for (const bool branches : {false, true}) {
+            SrtWalkFixture fixture(count, branches);
+            require(Detail::SrtTape::For(fixture.plan) != nullptr, "SRT fast walk: no synthetic tape");
+            for (std::uint32_t iteration = 0; iteration < 6u; ++iteration) {
+                fixture.userData[4] = iteration % 2u * 4u;
+                fixture.userData[5] = iteration % 3u;
+                for (std::size_t i = 0; i < fixture.words.size(); ++i) fixture.words[i] = static_cast<std::uint32_t>(i * 0x9e3779b9u + iteration);
+                const auto compiled = capture(fixture, true);
+                require(compiled == capture(fixture, false), "SRT fast walk: captured words, flattened values, descriptors, activity or read origins differ from the evaluator");
+                std::vector<MemoryRegion> regions;
+                for (const auto& [address, word] : compiled.memory) regions.push_back({address, std::as_bytes(std::span(&word, 1))});
+                RequestMemoryView memory(regions);
+                const auto replay = memory.MakeRuntime(fixture.userData, 0u);
+                auto sources = fixture.plan.materializationSources;
+                sources.reserve(sources.size() + 1u);
+                std::vector<DescriptorValue> descriptors;
+                std::vector<std::uint32_t> flat;
+                std::vector<std::uint8_t> active;
+                require(Detail::EvaluateRuntimeSourcesImpl(fixture.plan, sources, replay, descriptors, flat, true, fixture.plan.cleanFlatSlots, active) && descriptors == compiled.descriptors && flat == compiled.flat && active == compiled.active, "SRT fast walk: captured regions do not reproduce the old path's values");
+            }
+        }
+    }
+    SrtWalkFixture fixture(300u, true);
+    const auto* tape = Detail::SrtTape::For(fixture.plan);
+    require(tape != nullptr && tape->Nodes() > 512u, "SRT fast walk: the large-frame test fits inline");
+    SrtRuntime runtime{fixture.userData};
+    runtime.readMemory = readDirect;
+    runtime.readSpecializationMemory = readDirect;
+    std::vector<DescriptorValue> descriptors;
+    std::vector<std::uint32_t> flat;
+    std::vector<std::uint8_t> active;
+    const auto run = [&] { return tape->Run(fixture.plan, runtime, descriptors, flat, active); };
+    for (unsigned i = 0; i < 3u; ++i) require(run(), "SRT fast walk: warm-up failed");
+    const auto before = allocationCount;
+    const auto started = std::chrono::steady_clock::now();
+    const unsigned iterations = benchmark ? 2000u : 32u;
+    for (unsigned i = 0; i < iterations; ++i) require(run(), "SRT fast walk: warmed walk failed");
+    const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+    const auto allocations = allocationCount - before;
+    if (Detail::SrtTape::FastEnabled()) require(allocations == 0u, "SRT fast walk: a warmed large walk allocated scratch storage");
+    else require(allocations >= iterations * 2u, "SRT fast walk: the reference did not exercise its two large-frame allocations");
+    if (benchmark) std::cout << "SRT walk: fast=" << Detail::SrtTape::FastEnabled() << " nodes=" << tape->Nodes() << " walks=" << iterations << " ns/walk=" << nanoseconds / iterations << " allocations/walk=" << allocations / iterations << '\n';
+    const auto oldDescriptors = descriptors;
+    const auto oldFlat = flat;
+    const auto oldActive = active;
+    SrtReadTrace trace;
+    trace.leaves.emplace_back(99u, 123u);
+    trace.otherReads.push_back(456u);
+    trace.profile = true;
+    trace.slotReads.emplace_back(nullptr, 789u);
+    SrtUserDataUse use;
+    use.asBase = 8u;
+    use.asValue = 16u;
+    use.reads.emplace_back(12u, 0);
+    runtime.readTrace = &trace;
+    runtime.userDataUse = &use;
+    runtime.readMemory = +[](void*, std::uint64_t, std::uint32_t*) { return false; };
+    runtime.readSpecializationMemory = runtime.readMemory;
+    require(!run(), "SRT fast walk: a failing reader was accepted");
+    require(descriptors == oldDescriptors && flat == oldFlat && active == oldActive && trace.leaves == std::vector<std::pair<std::uint32_t, std::uint64_t>>{{99u, 123u}} && trace.otherReads == std::vector<std::uint64_t>{456u} && trace.slotReads == std::vector<std::pair<const IrValue*, std::uint64_t>>{{nullptr, 789u}} && trace.leaf == nullptr && use.asBase == 8u && use.asValue == 16u && use.reads == std::vector<std::pair<std::uint64_t, std::int32_t>>{{12u, 0}}, "SRT fast walk: refusal changed outputs or retained trace/use observations");
+    runtime.readMemory = readDirect;
+    runtime.readSpecializationMemory = readDirect;
+    runtime.readTrace = nullptr;
+    runtime.userDataUse = nullptr;
+    require(run() && descriptors == oldDescriptors && flat == oldFlat && active == oldActive, "SRT fast walk: a refused walk poisoned reused scratch");
+    runtime.readSpecializationMemory = nullptr;
+    require(!run() && descriptors == oldDescriptors && flat == oldFlat && active == oldActive, "SRT fast walk: missing specialization memory changed outputs or was accepted");
+    runtime.readSpecializationMemory = readDirect;
+    runtime.readMemory = +[](void*, std::uint64_t, std::uint32_t*) -> bool { throw std::runtime_error("SRT walk throwing reader"); };
+    expectFailure([&] { static_cast<void>(run()); }, "SRT walk throwing reader", "SRT fast walk: a reader exception did not propagate");
+    runtime.readMemory = readDirect;
+    require(run() && descriptors == oldDescriptors && flat == oldFlat && active == oldActive, "SRT fast walk: an exception poisoned reused scratch");
+    if (Detail::SrtTape::FastEnabled()) {
+        struct Nested {
+            SrtWalkFixture& fixture;
+            const Detail::SrtTape& tape;
+            bool entered = false;
+        } nested{fixture, *tape};
+        runtime.userContext = &nested;
+        runtime.readMemory = +[](void* context, std::uint64_t address, std::uint32_t* word) {
+            auto& nested = *static_cast<Nested*>(context);
+            if (!std::exchange(nested.entered, true)) {
+                SrtRuntime inner{nested.fixture.userData};
+                inner.readMemory = readDirect;
+                inner.readSpecializationMemory = readDirect;
+                std::vector<DescriptorValue> innerDescriptors;
+                std::vector<std::uint32_t> innerFlat;
+                std::vector<std::uint8_t> innerActive;
+                require(nested.tape.Run(nested.fixture.plan, inner, innerDescriptors, innerFlat, innerActive), "SRT fast walk: a reentrant walk failed");
+            }
+            return readDirect(nullptr, address, word);
+        };
+        runtime.readSpecializationMemory = runtime.readMemory;
+        require(run() && nested.entered && descriptors == oldDescriptors && flat == oldFlat && active == oldActive, "SRT fast walk: reentrancy corrupted the outer frame");
+        std::array<std::future<bool>, 4> concurrent;
+        for (auto& task : concurrent) task = std::async(std::launch::async, [&] {
+            SrtRuntime threaded{fixture.userData};
+            threaded.readMemory = readDirect;
+            threaded.readSpecializationMemory = readDirect;
+            std::vector<DescriptorValue> threadDescriptors;
+            std::vector<std::uint32_t> threadFlat;
+            std::vector<std::uint8_t> threadActive;
+            for (unsigned i = 0; i < 16u; ++i) {
+                if (!tape->Run(fixture.plan, threaded, threadDescriptors, threadFlat, threadActive) || threadDescriptors != oldDescriptors || threadFlat != oldFlat || threadActive != oldActive) return false;
+            }
+            return true;
+        });
+        for (auto& task : concurrent) require(task.get(), "SRT fast walk: concurrent walks shared scratch or changed outputs");
+    }
+}
+
 void verifySrtTape() {
     using namespace ShaderRecompiler;
     struct Walk {
@@ -8759,6 +9005,12 @@ int main(int argc, char** argv) {
         setenv("ANYPS5_NO_SHADER_CACHE", "1", 1);
 #endif
         using namespace ShaderRecompiler;
+        if (argc == 2 && (std::string_view(argv[1]) == "--srt-fast-walk" || std::string_view(argv[1]) == "--srt-walk-bench")) {
+            verifySrtTape();
+            verifyFastSrtWalk(std::string_view(argv[1]) == "--srt-walk-bench");
+            std::cout << "SRT walks preserve captured words, descriptors, activity, flattened values and read origins\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--specialized-bda-abi") {
             verifySpecializedBufferAtomicBindings(true);
             std::cout << "Specialized programs retain the BDA ABI only while a fault buffer remains\n";
