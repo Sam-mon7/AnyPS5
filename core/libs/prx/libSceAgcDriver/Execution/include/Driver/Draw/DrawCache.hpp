@@ -90,6 +90,8 @@ struct StageDataHit {
 
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
 
+enum class IndirectCacheRefusal : std::size_t { None, Disabled, EntriesDisabled, Path, Capture, Plan, CaptureRead, VertexDecode, PushMapping, Admission, Count };
+
 struct DrawEntryCounters {
     std::uint64_t lookups = 0, absent = 0, hits = 0, stageValidations = 0, stageEqual = 0, variantsCompared = 0, inserts = 0, shapeUpdates = 0, variantsInserted = 0, variantsEvicted = 0, present = 0, unstable = 0, touches = 0, verifyHits = 0, verifyMismatches = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrawMiss::Count)> misses{};
@@ -100,6 +102,8 @@ struct DrawEntryCounters {
     double keyUs = 0;
     std::uint64_t absentNewRegisters = 0, absentUserWords = 0, absentEvicted = 0, absentNeverInserted = 0, evictions = 0;
     std::uint64_t skippedIndirectCpu = 0, skippedNotAdmitted = 0;
+    std::uint64_t indirectCpuHits = 0, indirectCpuMisses = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(IndirectCacheRefusal::Count)> indirectCpuRefused{};
     std::array<std::uint64_t, 6> registerKeyMissChanges{};
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
     std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;

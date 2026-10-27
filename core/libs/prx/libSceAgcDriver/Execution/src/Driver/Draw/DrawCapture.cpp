@@ -214,12 +214,39 @@ void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderReco
 }
 
 void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry) {
-    const bool cacheable = useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu);
+    const bool cpuIndirect = drawParameters.indirect && indirectCpu;
+    static const bool cpuIndirectCache = std::getenv("APS5_NO_CPU_INDIRECT_DRAW_CACHE") == nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto refusal = IndirectCacheRefusal::None;
+    if (cpuIndirect && !drawHit) {
+        if (!cpuIndirectCache) refusal = IndirectCacheRefusal::Disabled;
+        else if (!useDrawEntries) refusal = IndirectCacheRefusal::EntriesDisabled;
+        else if (decode->state.stages.path != Graphics::ShaderPath::Vertex || decode->state.stages.mesh || decode->state.stages.tessellation || decode->state.rectList) refusal = IndirectCacheRefusal::Path;
+        else {
+            const auto& indirect = *drawParameters.indirect;
+            std::vector<std::vector<std::size_t>> patchedWords(programs.size());
+            for (const auto location : {indirect.baseVertexLocation, indirect.startInstanceLocation, indirect.drawIndexEnabled ? indirect.drawIndexLocation : 0x280u}) {
+                for (const auto& [program, word] : UserDataWords(programs, decode->roles, location)) patchedWords[program].push_back(word);
+            }
+            for (std::size_t i = 0; i < programs.size() && refusal == IndirectCacheRefusal::None; ++i) {
+                const auto& capture = stageCaptures[i];
+                if ((programs[i].binary.stage != ShaderRecompiler::ShaderStage::Vertex && programs[i].binary.stage != ShaderRecompiler::ShaderStage::Fragment) || programs[i].merged || programs[i].hiddenUserWords != 0 || capture.compiled == nullptr || !CacheableResult(*capture.compiled)) refusal = IndirectCacheRefusal::Path;
+                else if (!patchedWords[i].empty()) refusal = IndirectStageCacheRefusal(*capture.compiled, capture.capture.get(), programs[i], vertexInfos[i], patchedWords[i]);
+            }
+        }
+    }
+    const bool cacheable = useDrawEntries && !drawHit && refusal == IndirectCacheRefusal::None;
     const bool admitted = cacheable && (verifyHit || admitDrawKey(drawKey, registerKey && drawDataHits() ? shapeKey : 0));
     const bool replaceShape = cacheable && !admitted && shapeNeedsEntry;
+    if (cpuIndirect && profile) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        if (drawHit || verifyHit) ++drawEntryCounters.indirectCpuHits;
+        else ++drawEntryCounters.indirectCpuMisses;
+        if (!drawHit && !verifyHit && !admitted) ++drawEntryCounters.indirectCpuRefused[static_cast<std::size_t>(refusal != IndirectCacheRefusal::None ? refusal : IndirectCacheRefusal::Admission)];
+    }
     if (traceDrawCache() && useDrawEntries && !drawHit && !admitted) {
         std::lock_guard cacheLock(drawCacheMutex);
-        ++(drawParameters.indirect && indirectCpu ? drawEntryCounters.skippedIndirectCpu : drawEntryCounters.skippedNotAdmitted);
+        ++(cpuIndirect && refusal != IndirectCacheRefusal::None ? drawEntryCounters.skippedIndirectCpu : drawEntryCounters.skippedNotAdmitted);
     }
     if (admitted || replaceShape) {
         phaseTiming.Phase(DrawRowVectors);
@@ -240,6 +267,14 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             variant->forgetSerial = stageCapture.forgetSerial;
             variant->pushOffset = stageCapture.pushOffset;
             variant->userDataMask = stageCapture.userDataMask;
+            if (cpuIndirect && stageCapture.capture != nullptr) {
+                auto proof = std::make_shared<ShaderRecompiler::ResourceCapture>();
+                proof->plan = stageCapture.capture->plan;
+                proof->snapshot.userData = stageCapture.capture->snapshot.userData;
+                proof->userDataUse.asBase = stageCapture.capture->userDataUse.asBase;
+                proof->userDataUse.asValue = stageCapture.capture->userDataUse.asValue;
+                variant->indirectCapture = std::move(proof);
+            }
             if (vertexInfos[i]) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfos[i]);
 
             std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
