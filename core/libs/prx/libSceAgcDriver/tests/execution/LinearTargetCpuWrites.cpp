@@ -204,6 +204,7 @@ void PreparedDraws(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::State s
         if (step == 5) mapping = std::make_unique<Block>(BlockBytes, false);
         {
             std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Require(AgcDriver::Graphics::HostImportFor(context, state.color.address, TargetBytes) != nullptr, "draw preparation regression could not refresh its target host import");
             if (step == 6) {
                 Require(device.DrawFromRecipe(state, draw, shaders, {}, recipe, nullptr, &prepared) == AgcDriver::RecipeOutcome::Recorded, "the prepared draw recipe did not revalidate and record");
             } else {
