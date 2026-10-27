@@ -457,7 +457,7 @@ bool UnitShadowEnabled() {
 }
 
 bool ShadowAddressEnabled() {
-    static const bool enabled = std::getenv("APS5_SHADOW_BDA") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_SHADOW_BDA") == nullptr;
     return enabled && UnitShadowEnabled();
 }
 
