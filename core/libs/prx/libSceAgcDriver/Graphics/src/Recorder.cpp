@@ -45,6 +45,9 @@ namespace AgcDriver::Graphics {
 namespace {
 
 Recorder* activeRecorder = nullptr;
+std::atomic<std::uint64_t> computeHostEpoch{0};
+std::atomic<std::uint64_t> computeChains{0}, computeChainDispatches{0}, computeChainBarriers{0}, computeChainHazards{0}, computeChainBoundaries{0}, computeChainRejected{0};
+std::array<std::atomic<std::uint64_t>, 3> computeChainAvoided{};
 
 bool DrawProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -1186,6 +1189,7 @@ private:
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
+    Recorder::NoteComputeHostAccess();
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
@@ -1606,7 +1610,111 @@ std::uint64_t Recorder::ReapsWithWork() {
     return holdCounters.reapsWithWork;
 }
 
+bool Recorder::ComputeChainsEnabled() {
+    static const bool enabled = [] {
+        const auto one = [](const char* name) { const auto* value = std::getenv(name); return value != nullptr && std::string_view(value) == "1"; };
+        return one("APS5_COMPUTE_CHAINS") || one("APS5_DS_COMPUTE_CHAINS");
+    }();
+    return enabled && MergeBarriers();
+}
+
+bool Recorder::DsComputeChains(std::string_view titleId) {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_DS_COMPUTE_CHAINS"); return value != nullptr && std::string_view(value) == "1"; }();
+    return enabled && ComputeChainsEnabled() && (titleId == "PPSA01340" || titleId == "PPSA01341");
+}
+
+bool Recorder::ComputeChainPacketBoundary(std::uint32_t header) {
+    if ((header >> 30u) != 3 || (header & 1u) != 0) return true;
+    const auto opcode = (header >> 8u) & 0xffu;
+    return opcode != 0x15 && opcode != 0x16;
+}
+
+void Recorder::NoteComputeHostAccess() {
+    if (ComputeChainsEnabled()) computeHostEpoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+Recorder::ComputeDispatchStart Recorder::BeginComputeDispatch(const PassAccess& access, bool eligible, std::string_view titleId) {
+    static const bool tracked = [] { const auto* value = std::getenv("APS5_COMPUTE_CHAINS"); return value != nullptr && std::string_view(value) == "1"; }();
+    ComputeDispatchStart result;
+    result.unchecked = DsComputeChains(titleId);
+    const auto valid = [](GuestRangeList ranges) { return std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
+    if (!ComputeChainsEnabled() || (!tracked && !result.unchecked) || !eligible || access.anyReads || access.anyWrites || !valid(access.reads) || !valid(access.writes)) {
+        if (ComputeChainsEnabled() && DrawProfiled()) computeChainRejected.fetch_add(1, std::memory_order_relaxed);
+        result.commands = Commands(&result.covered);
+        return result;
+    }
+    ensureOpen();
+    const auto queue = GuestMemory::CurrentPacket().queue;
+    const auto epoch = computeHostEpoch.load(std::memory_order_relaxed);
+    if (open->computeDispatches != 0) {
+        if (open->computeQueue != queue || open->computeHostEpoch != epoch || open->computeUnchecked != result.unchecked || open->computeDispatches >= 128) {
+            if (DrawProfiled()) computeChainBoundaries.fetch_add(1, std::memory_order_relaxed);
+            EndComputeChain();
+        } else if (!result.unchecked && open->computeHazards.Check(access, false) != PassHazard::None) {
+            if (DrawProfiled()) computeChainHazards.fetch_add(1, std::memory_order_relaxed);
+            EndComputeChain();
+        }
+    }
+    result.continued = open->computeDispatches != 0;
+    if (result.continued) {
+        result.commands = open->commands;
+        CountComputeChainAvoided(CommandClass::DispatchTrailing);
+    } else {
+        result.commands = Commands(&result.covered);
+    }
+    open->computeQueue = queue;
+    open->computeHostEpoch = epoch;
+    open->computeUnchecked = result.unchecked;
+    open->computeRecording = true;
+    result.deferred = true;
+    return result;
+}
+
+void Recorder::DeferComputeBarrier(const PassAccess& access) {
+    Require(open != nullptr && open->computeRecording, "compute chain has no dispatch recording");
+    open->computeRecording = false;
+    ++open->computeDispatches;
+    open->coveredAccess = 0;
+    if (open->computeUnchecked) return;
+    try {
+        open->computeHazards.Add(access);
+    } catch (...) {
+        EndComputeChain();
+        throw;
+    }
+}
+
+void Recorder::EndComputeChain(bool syncPoint) {
+    if (open == nullptr) return;
+    if (syncPoint && (open->renderPass.open || !open->keyStores.empty() || open->run.open || !open->run.queued.empty())) {
+        EndComputeChain();
+        if (open->renderPass.open) endOpenRenderPass();
+        if (!open->keyStores.empty()) recordKeyStores(false);
+        if (open->run.open || !open->run.queued.empty()) closeStoreRun(false);
+    }
+    open->computeRecording = false;
+    const auto count = open->computeDispatches;
+    if (count == 0 && !syncPoint) return;
+    GuestMemory::AssertGpuLockHeld("Recorder::EndComputeChain");
+    const auto timing = beginTiming(ClassKey(CommandClass::DispatchTrailing));
+    constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, access | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    CountBarriers(CommandClass::DispatchTrailing);
+    EndGpuTiming(timing);
+    open->coveredAccess = access;
+    open->computeDispatches = 0;
+    open->computeHazards.Clear();
+    if (DrawProfiled()) {
+        computeChainBarriers.fetch_add(1, std::memory_order_relaxed);
+        if (count > 1) {
+            computeChains.fetch_add(1, std::memory_order_relaxed);
+            computeChainDispatches.fetch_add(count, std::memory_order_relaxed);
+        }
+    }
+}
+
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+    EndComputeChain();
     ensureOpen();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
@@ -1635,6 +1743,7 @@ void Recorder::MarkCovered(VkAccessFlags access) {
 }
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
+    EndComputeChain();
     ensureOpen();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
@@ -1689,6 +1798,7 @@ void Recorder::endOpenRenderPass(bool barrier) {
 }
 
 void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
+    EndComputeChain();
     ensureOpen();
     // A queued label store over the keys lands first (program order: the key store is later).
     FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
@@ -1807,6 +1917,7 @@ void Recorder::ensureOpen() {
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
+    EndComputeChain();
     ensureOpen();
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
@@ -2098,6 +2209,11 @@ void reportBarriers() {
         AgcDriver::ProfilePrint_nid_no_patch("; validate: would emit %llu (%s) + %llu batch ends, would skip %llu; emitted/skipped by class:%s", static_cast<unsigned long long>(emitted), kinds.c_str() + 1, static_cast<unsigned long long>(validateBatchEnds.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(skipped), classes.c_str());
     }
     AgcDriver::ProfilePrint_nid_no_patch("\n");
+    if (Recorder::ComputeChainsEnabled() && DrawProfiled()) {
+        const auto chains = computeChains.exchange(0, std::memory_order_relaxed);
+        const auto dispatches = computeChainDispatches.exchange(0, std::memory_order_relaxed);
+        AgcDriver::ProfilePrint_nid_no_patch("[compute-chains] %llu chains, %llu dispatches, average %.2f; %llu end barriers; avoided dispatch-lead %llu dispatch-trail %llu indirect-args %llu; %llu hazards, %llu queue/host/limit boundaries, %llu ineligible (10 s)\n", static_cast<unsigned long long>(chains), static_cast<unsigned long long>(dispatches), chains != 0 ? static_cast<double>(dispatches) / chains : 0.0, static_cast<unsigned long long>(computeChainBarriers.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(computeChainAvoided[0].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(computeChainAvoided[1].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(computeChainAvoided[2].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(computeChainHazards.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(computeChainBoundaries.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(computeChainRejected.exchange(0, std::memory_order_relaxed)));
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[samples] occlusion dumps (cumulative): %llu queued (%llu inside an open pass), %llu recorded at once; %llu segments closed; %llu folds of queued dumps\n", static_cast<unsigned long long>(dumpsQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsQueuedInPass.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsAtOnce.load(std::memory_order_relaxed)), static_cast<unsigned long long>(segmentsClosed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpFolds.load(std::memory_order_relaxed)));
 }
 
@@ -2136,6 +2252,12 @@ bool Recorder::ElideCovered(CommandClass which, const BarrierMask& wanted, VkAcc
 void Recorder::CountMerged(CommandClass which) {
     if (!DrawOrGpuProfiled()) return;
     classMerged[static_cast<std::size_t>(which)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void Recorder::CountComputeChainAvoided(CommandClass which) {
+    CountMerged(which);
+    const auto index = static_cast<std::size_t>(which);
+    if (DrawProfiled() && index < computeChainAvoided.size()) computeChainAvoided[index].fetch_add(1, std::memory_order_relaxed);
 }
 
 bool Recorder::BarrierValidate() {
@@ -2206,7 +2328,7 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
 
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     if (!GpuTimingEnabled()) return NoTiming;
-    Commands();
+    if (open == nullptr || !open->computeRecording) Commands();
     return beginTiming(key);
 }
 
@@ -2249,7 +2371,7 @@ void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
 }
 
-bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup) {
+bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup, bool chained) {
     constexpr std::uint32_t PushBytes = 48;
     if (dispatchArgumentState == 0) {
         dispatchArgumentState = -1;
@@ -2276,7 +2398,7 @@ bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress
         }
     }
     if (dispatchArgumentState < 0) return false;
-    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    if (!chained) recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, dispatchArgumentPipeline);
     const auto* limit = context.limits.maxComputeWorkGroupCount;
     struct {
@@ -2292,7 +2414,10 @@ bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress
     const VkPipelineStageFlags readers = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | (threadGroup != nullptr ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0u);
     const VkAccessFlags reads = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | (threadGroup != nullptr ? VK_ACCESS_TRANSFER_READ_BIT : 0u);
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, readers, VK_ACCESS_SHADER_WRITE_BIT, reads);
-    CountBarriers(CommandClass::DispatchLeading, 2);
+    CountBarriers(CommandClass::DispatchLeading, chained ? 1 : 2);
+    if (chained) {
+        CountComputeChainAvoided(CommandClass::DispatchLeading);
+    }
     return true;
 }
 
@@ -3713,6 +3838,7 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 }
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
+    EndComputeChain();
     Require(open != nullptr || !inFlight.empty(), "no batch to append a completion label to");
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     std::vector<std::byte> copy(bytes.begin(), bytes.end());
@@ -3821,11 +3947,13 @@ bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std
 }
 
 void Recorder::HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value) {
+    EndComputeChain();
     submitHold = semaphore;
     submitHoldValue = value;
 }
 
 void Recorder::Submit() {
+    EndComputeChain();
     PerformanceTimer frameTiming("Recorder.Submit");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
@@ -4100,6 +4228,7 @@ void Recorder::FlushDeferredReleases() {
 }
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
+    EndComputeChain();
     if (bytes == 0) return;
     const auto end = address + bytes;
     if (completionDepth != 0 && !CompletionStoreSyncs()) {
@@ -4462,6 +4591,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         WaitLabels().batches.at(batch.get())->stage = WaitStage::GpuComplete;
     }
     readSamples(*batch);
+    if (!batch->completions.empty()) EndComputeChain();
     if (batch->serial != 0) {
         std::lock_guard ringLock(completedMutex);
         auto& entry = completed[batch->serial % completed.size()];

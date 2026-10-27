@@ -570,7 +570,7 @@ private:
 
 using Kind = Recorder::ReadKind;
 
-void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
+void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool computeChains = false) {
     auto context = device.GetContext();
     context.nullDescriptors = device.NullDescriptors();
     if (context.hostImportAlignment == 0 || !context.nullDescriptors || !AgcDriver::GuestMemory::WriteWatched()) {
@@ -646,6 +646,41 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, release.module, "main", nullptr};
     pipelineInfo.layout = release.layout;
     Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &release.pipeline), "ordering pipeline");
+    if (computeChains) {
+        auto otherProgram = program;
+        otherProgram.bindings[0].guestDescriptor[0] += 4096;
+        const CompiledShader otherCompute{ShaderRecompiler::ShaderStage::Compute, &otherProgram, 0};
+        auto other = std::make_shared<ShaderResources>(context, otherCompute);
+        const auto dispatch = [&](const std::shared_ptr<ShaderResources>& resources, std::uint64_t target, std::uint32_t delta) {
+            const std::pair<std::uint64_t, std::uint64_t> range{target, target + 4};
+            const PassAccess access{std::span(&range, 1), std::span(&range, 1), {}, {}};
+            const auto start = recorder.BeginComputeDispatch(access, true);
+            constexpr VkAccessFlags shader = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            if (!start.continued && (!Recorder::MergeBarriers() || (start.covered & shader) != shader)) RecordMemoryBarrier(context, start.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, shader);
+            recorder.Keep(resources);
+            context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(start.commands, VK_PIPELINE_BIND_POINT_COMPUTE, release.pipeline);
+            resources->Bind(start.commands, VK_PIPELINE_BIND_POINT_COMPUTE, release.layout);
+            context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(start.commands, release.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(delta), &delta);
+            context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(start.commands, 1, 1, 1);
+            if (start.deferred) recorder.DeferComputeBarrier(access);
+            else {
+                RecordMemoryBarrier(context, start.commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+                recorder.MarkCovered(shader | VK_ACCESS_HOST_READ_BIT);
+            }
+            resources->MarkGpuWrites(recorder);
+            return start;
+        };
+        const auto* flag = std::getenv("APS5_COMPUTE_CHAINS");
+        const bool enabled = Recorder::ComputeChainsEnabled() && flag != nullptr && std::string_view(flag) == "1";
+        *block = 10;
+        block[1024] = 20;
+        Require(dispatch(direct, address, 1).deferred == enabled, "compute chain switch did not control the GPU producer");
+        Require(dispatch(other, address + 4096, 2).continued == enabled, "disjoint GPU dispatches did not chain");
+        Require(!dispatch(direct, address, 2).continued, "a dependent GPU dispatch crossed an unresolved RAW/WAW hazard");
+        recorder.Sync();
+        Require(*block == 13 && block[1024] == 22, "chained GPU dispatch results or the dependent consumer were reordered");
+        return;
+    }
     const auto update = [&](const std::shared_ptr<ShaderResources>& resources, std::uint32_t delta, std::uint32_t count = 1) {
         const auto commands = recorder.Commands();
         recorder.Keep(resources);
@@ -11779,6 +11814,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--compute-chains-only") {
+            if (device.GetContext().hostImportAlignment == 0 || !device.NullDescriptors() || !AgcDriver::GuestMemory::WriteWatched()) return 77;
+            copiedDirectOrderingTests(device, recorder, true);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {
