@@ -337,6 +337,7 @@ private:
     enum class AheadRejection : std::size_t { NotReady, NoEntry, NoInvocation, Footprint, State, Key, Epoch, Layout, Generation, Pending, Memory, Cancelled, Label, Device, Count };
     struct DispatchSpeculation {
         std::atomic<bool> ready{false}, cancelled{false};
+        std::chrono::steady_clock::time_point queuedAt{};
         ResolvedDispatch result;
         AheadRejection rejection = AheadRejection::NoEntry;
     };
