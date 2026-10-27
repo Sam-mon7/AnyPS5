@@ -6273,6 +6273,25 @@ std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, st
     return entry.serial;
 }
 
+bool RecordWithHostImports(const Context& context, std::span<const std::array<std::uint64_t, 3>> ranges, const std::function<void()>& record, HostImportsProof& proof) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (!ranges.empty() && state.device != context.device) return false;
+    for (const auto& range : ranges) {
+        const auto* entry = findImport(state, range[0], range[1]);
+        if (entry == nullptr || entry->serial != range[2]) return false;
+    }
+    record();
+    proof = {state.device, state.epoch, state.refreshedGeneration};
+    return true;
+}
+
+bool HostImportEpochUnchanged(const HostImportsProof& proof) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return state.device == proof.device && state.epoch == proof.epoch;
+}
+
 bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof) {
     if (proof.device == VK_NULL_HANDLE || proof.device != context.device) return false;
     auto& state = Imports();

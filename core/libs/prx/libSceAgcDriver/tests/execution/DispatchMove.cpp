@@ -16,15 +16,27 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -38,6 +50,39 @@ constexpr std::uint32_t Constant = 0x00010000u;
 constexpr std::uint32_t Sentinel = 0xdeadbeefu;
 constexpr std::size_t Piece = 65536;
 constexpr std::size_t BlockBytes = 5 * Piece;
+
+class SubmissionGate {
+public:
+    explicit SubmissionGate(AgcDriver::VulkanDevice& device) : device(device), context(AgcDriver::VulkanDeviceTestAccess::ContextOf(device)) {
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        AgcDriver::Graphics::Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &semaphore), "vkCreateSemaphore private compute gate");
+    }
+    ~SubmissionGate() {
+        try {
+            Release();
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            device.WaitIdle();
+        } catch (...) {
+        }
+        context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, semaphore, nullptr);
+    }
+    void Arm() { AgcDriver::Graphics::Recorder::Active()->HoldNextSubmit(semaphore, 1); }
+    void Release() {
+        if (released) return;
+        VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        info.semaphore = semaphore;
+        info.value = 1;
+        AgcDriver::Graphics::Check(context.Function<PFN_vkSignalSemaphore>("vkSignalSemaphoreKHR")(context.device, &info), "vkSignalSemaphore private compute gate");
+        released = true;
+    }
+private:
+    AgcDriver::VulkanDevice& device;
+    AgcDriver::Graphics::Context context;
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    bool released = false;
+};
 
 alignas(256) std::array<std::uint32_t, 8> Table{};
 
@@ -297,19 +342,24 @@ bool RunCompletionRecipe(AgcDriver::VulkanDevice& device, const GuestBlock& gues
     Require(recipe != nullptr && recipe->needsCompletion && !recipe->holdsLease, "completion recipe: a reusable fault-only template produced no recipe");
     auto resources = recipe->templateRef.lock();
     Require(resources != nullptr && resources->NeedsCompletion() && !resources->HasCopiedWrites() && !resources->UsesAddressTable(), "completion recipe: the recipe is not over a fault-only template");
+    const auto privateBefore = AgcDriver::VulkanDevice::PrivateComputeCounts();
     for (std::uint32_t round = 0; round < 3; ++round) {
         auto hit = device.PrepareRecipe(recipe, false);
         Require(hit != nullptr, "completion recipe: the pre-check rejected a live recipe");
         auto verify = AgcDriver::VulkanDevice::VerifyRecipes() ? device.PrepareDispatch(compiled, {}) : nullptr;
+        auto privateDispatch = device.PreparePrivateDispatch(compiled, 1, 1, 1, verify, hit);
         Fill(guest.InputA(), 0xb000u + round * 0x1000u);
         Reset(guest.OutputO());
         AgcDriver::VulkanDevice::IndirectOutcome outcome{};
         {
             std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-            Require(device.DispatchRecipe(compiled, 1, 1, 1, 0, 0, hit, outcome, verify) == AgcDriver::RecipeOutcome::Recorded, "completion recipe: the live recipe was not recorded");
+            Require(device.DispatchRecipe(compiled, 1, 1, 1, 0, 0, hit, outcome, verify, false, {}, std::move(privateDispatch)) == AgcDriver::RecipeOutcome::Recorded, "completion recipe: the live recipe was not recorded");
         }
         device.WaitIdle();
         Expect(guest.InputA(), guest.OutputO(), Constant, "a completion recipe hit after changing the input");
+    }
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_PRIVATE_COMPUTE") != nullptr && std::string(std::getenv("APS5_PRIVATE_COMPUTE")) == "1") {
+        Require(AgcDriver::VulkanDevice::PrivateComputeCounts().recorded > privateBefore.recorded, "completion recipe: no private recording ran its completion");
     }
     auto stale = device.PrepareRecipe(recipe, false);
     Require(stale != nullptr, "completion recipe: the stale-resource pre-check rejected live imports");
@@ -329,6 +379,89 @@ bool RunCompletionRecipe(AgcDriver::VulkanDevice& device, const GuestBlock& gues
     return true;
 }
 
+void RunPrivateRecording(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+    AgcDriver::GuestMemory::TagGpuLockThread(0x28);
+    Fill(guest.InputA(), 0x1000u);
+    const auto compiled = Compile(device, guest.InputA(), Bytes, guest.OutputO());
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        device.Dispatch(compiled, 1, 1, 1);
+        device.WaitIdle();
+    }
+    const auto before = AgcDriver::VulkanDevice::PrivateComputeCounts();
+    auto prepared = device.PrepareDispatch(compiled, {});
+    std::promise<void> acquired;
+    auto acquiredFuture = acquired.get_future();
+    std::atomic<bool> held{false};
+    std::jthread holder([&](std::stop_token stop) {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        held.store(true);
+        acquired.set_value();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        held.store(false);
+    });
+    acquiredFuture.wait();
+    auto ready = device.PreparePrivateDispatch(compiled, 1, 1, 1, prepared);
+    const bool recordedWhileHeld = held.load();
+    holder.request_stop();
+    holder.join();
+    Require(recordedWhileHeld, "private compute: recording waited for the global GPU mutex");
+    auto gate = device.CanWaitUnlocked() ? std::make_unique<SubmissionGate>(device) : nullptr;
+    bool completed = false;
+    guest.OutputP()[0] = 0;
+    for (std::uint32_t round = 0; round < 3; ++round) {
+        Fill(guest.InputA(), 0x2000u + round * 0x1000u);
+        Reset(guest.OutputO());
+        if (round != 0) prepared = device.PrepareDispatch(compiled, {});
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            device.Dispatch(compiled, round == 2 ? 0 : 1, 1, 1, {}, 0, prepared, nullptr, std::nullopt, nullptr, ready);
+            if (round == 0 && gate != nullptr) {
+                auto* recorder = AgcDriver::Graphics::Recorder::Active();
+                recorder->OnComplete([&] { completed = true; });
+                const std::uint32_t value = 7;
+                const auto address = reinterpret_cast<std::uintptr_t>(guest.OutputP());
+                const auto reason = device.WriteLabelOnGpu(address, std::as_bytes(std::span(&value, 1)), 1, 0x28, false);
+                Require(reason == 0 || reason == 5, "private compute: the gated label did not remain recorded");
+                gate->Arm();
+                device.SubmitRecorded(false);
+                device.ReapRecorded();
+                Require(!completed && *static_cast<volatile std::uint32_t*>(guest.OutputP()) == 0, "private compute: the label or completion became visible before the gated dispatch");
+                Require(recorder->PendingWriteOverlaps(reinterpret_cast<std::uintptr_t>(guest.OutputO()), Bytes), "private compute: the gated dispatch lost its pending writes");
+                gate->Release();
+            }
+            device.WaitIdle();
+        }
+        if (round == 0 && gate != nullptr) Require(completed && guest.OutputP()[0] == 7, "private compute: the gated label or completion was lost after retirement");
+        if (round == 2) Require(std::all_of(guest.OutputO(), guest.OutputO() + Words, [](auto word) { return word == Sentinel; }), "private compute: stale group counts executed a prepared dispatch");
+        else Expect(guest.InputA(), guest.OutputO(), Constant, "private compute recording and single-use fallback");
+    }
+    ready.reset();
+    prepared = device.PrepareDispatch(compiled, {});
+    auto stale = device.PreparePrivateDispatch(compiled, 1, 1, 1, prepared);
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::Graphics::ClearHostImports(device.Device());
+    }
+    const auto beforeInvalid = AgcDriver::VulkanDevice::PrivateComputeCounts();
+    auto invalid = device.PreparePrivateDispatch(compiled, 1, 1, 1, prepared);
+    Require(AgcDriver::VulkanDevice::PrivateComputeCounts().prepared == beforeInvalid.prepared, "private compute: a stale imported buffer was used to populate private descriptors");
+    Reset(guest.OutputO());
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        device.Dispatch(compiled, 1, 1, 1, {}, 0, prepared, nullptr, std::nullopt, nullptr, stale);
+        device.WaitIdle();
+    }
+    Expect(guest.InputA(), guest.OutputO(), Constant, "private compute import-epoch fallback");
+    const auto after = AgcDriver::VulkanDevice::PrivateComputeCounts();
+    const auto* enabled = std::getenv("APS5_PRIVATE_COMPUTE");
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        if (enabled != nullptr && std::string(enabled) == "1") Require(after.recorded == before.recorded + 1 && after.fallbacks[5] >= before.fallbacks[5] + 2, "private compute: speculative reuse was not rejected");
+        else Require(after.prepared == before.prepared && after.recorded == before.recorded, "private compute: disabled recording changed counters");
+    }
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -336,7 +469,13 @@ int main(int argc, char** argv) {
         GuestBlock guest;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string(argv[1]) == "--private-compute") {
+            RunPrivateRecording(*device, guest);
+            std::puts("private compute recording and fallback tests passed");
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--completion-recipe") {
+            AgcDriver::GuestMemory::TagGpuLockThread(0x28);
             if (!RunCompletionRecipe(*device, guest)) return VulkanTestSkipped;
             std::puts("completion recipe tests passed");
             return 0;
