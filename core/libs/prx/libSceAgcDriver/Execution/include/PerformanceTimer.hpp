@@ -33,6 +33,8 @@ public:
 
     explicit FrameTiming(std::uint64_t id, bool localMetrics = false) : localMetrics(localMetrics), id(id), workerStart(Clock::now()) {}
 
+    std::uint64_t Id() const { return id; }
+
     static FrameTiming* Preparation() {
         if (!APS5_ENABLE_TIMING_LOG) return nullptr;
         static FrameTiming timing(0);

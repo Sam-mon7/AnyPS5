@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -71,6 +72,11 @@ void Driver::AttachWindow(const PresentationWindow& window) {
 }
 
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool opaque, void (*gpuReady)(void*), void* context) {
+    const auto timelineBegin = Timeline::Enabled ? Timeline::Emit(Timeline::Kind::PresentBegin, window.timing ? window.timing->Id() : 0) : 0;
+    struct TimelinePresent {
+        std::uint64_t begin;
+        ~TimelinePresent() { if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::PresentEnd, begin); }
+    } timelinePresent{timelineBegin};
     if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");

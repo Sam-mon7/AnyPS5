@@ -27,7 +27,8 @@ enum class Kind : std::uint32_t {
     SubmissionBegin = 1, SubmissionEnd, PacketBegin, PacketEnd, WaitBegin, WaitEnd,
     WaitSource, LabelRecord, LabelHistory, LabelDeferred, LockBegin, LockAcquired,
     LockRelease, LockFailed, BatchOpen, SubmitBegin, SubmitEnd, Complete, Retire,
-    Lost, Flip, GpuTime, Clock, LabelVisible, BatchDiscard, GpuWaitBegin, GpuWaitEnd
+    Lost, Flip, GpuTime, Clock, LabelVisible, BatchDiscard, GpuWaitBegin, GpuWaitEnd,
+    FrameReady, PresentBegin, PresentEnd, Present
 };
 
 struct Event {
@@ -124,13 +125,17 @@ public:
 
 private:
     void run() {
+        auto lastFlush = std::chrono::steady_clock::now();
         for (;;) {
             std::unique_lock lock(mutex);
-            changed.wait_for(lock, std::chrono::seconds(1), [&] { return stopping.load(std::memory_order_acquire); });
+            changed.wait_for(lock, std::chrono::milliseconds(10), [&] { return stopping.load(std::memory_order_acquire); });
+            const auto now = std::chrono::steady_clock::now();
+            const bool flush = stopping.load(std::memory_order_acquire) || now - lastFlush >= std::chrono::seconds(1);
             for (auto& [buffer, file] : buffers) {
                 if (!buffer->Drain(*file)) std::fprintf(stderr, "[timeline] output failed on thread %u\n", buffer->Thread());
-                file->flush();
+                if (flush) file->flush();
             }
+            if (flush) lastFlush = now;
             if (stopping.load(std::memory_order_acquire)) return;
         }
     }
@@ -155,6 +160,7 @@ inline thread_local std::uint32_t Queue = 0xffffffffu;
 inline thread_local std::uint32_t Opcode = 0;
 inline thread_local std::uint64_t Packet = 0;
 inline thread_local std::uint64_t Serial = 0;
+inline thread_local std::uint32_t LockSite = 0;
 inline thread_local std::array<std::uint64_t, 2> LabelStamps{};
 inline thread_local std::array<std::uint32_t, 2> LabelQueues{};
 struct Origin {

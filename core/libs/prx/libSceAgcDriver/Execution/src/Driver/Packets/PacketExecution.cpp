@@ -432,6 +432,7 @@ void Driver::execute(const Submission& submission) {
             frame->NoteFlipBatches(batchesAtFlip, unsignaledAtFlip);
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial.load()), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             flipHold.Release();
+            if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::FrameReady, frame->Id());
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
             packetCounters.CountDispatch();
