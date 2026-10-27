@@ -644,9 +644,6 @@ struct TargetLookupProfile {
     double slowUs = 0;
     std::array<double, 9> steps{};
     std::array<double, 9> slowSteps{};
-    std::array<std::uint64_t, LookupOutcomes::WorkCount> work{};
-    double flushGpuMs = 0;
-    double flushDepthMs = 0;
 };
 
 struct DrawProfile {
@@ -874,14 +871,6 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         const auto& color = target.color;
         AgcDriver::ProfilePrint_nid_no_patch("[resident-target] rank %zu/%zu 0x%llx+0x%zx %ux%u format %u tile %u xor %u DCC 0x%llx layers %u slice %u depth %u mip %u samples %u: %llu lookups %.3f ms, >=1ms %llu %.3f ms, pages %llu, clean proofs %llu; ms wait %.3f proof %.3f collect %.3f DCC %.3f flush %.3f validate %.3f other %.3f; nested write-watch query %.3f map/walk %.3f\n", i + 1, targets.size(), static_cast<unsigned long long>(color.address), color.bytes, color.extent.width, color.extent.height, static_cast<unsigned>(color.format), static_cast<unsigned>(color.tileMode), color.pipeBankXor, static_cast<unsigned long long>(color.dccAddress), color.layers, color.arraySlice, color.depth, color.mip, color.samples, static_cast<unsigned long long>(target.lookups), target.us / 1000, static_cast<unsigned long long>(target.slow), target.slowUs / 1000, static_cast<unsigned long long>(target.pages), static_cast<unsigned long long>(target.clean), target.steps[0], target.steps[1], target.steps[2], target.steps[3], target.steps[4], target.steps[5], target.steps[8], target.steps[6], target.steps[7]);
         if (target.storageBytes != 0) AgcDriver::ProfilePrint_nid_no_patch("[resident-target] storage for 0x%llx: 0x%llx+0x%llx %ux%ux%u guest format %u tile %u DCC 0x%llx mips %u\n", static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(target.storage.baseAddress), static_cast<unsigned long long>(target.storageBytes), target.storage.width, target.storage.height, target.storageLayers, target.storage.format, static_cast<unsigned>(target.storage.tileMode), static_cast<unsigned long long>(target.storage.dccAddress), target.storage.mipCount);
-        static constexpr std::array<const char*, LookupOutcomes::WorkCount> workNames{"calls", "images", "storage/depth", "draw", "fill", "copy", "shadow-only", "depth-ranges", "waits", "writeback-bytes", "shadow-bytes", "import-bytes", "CPU-bytes", "retile-windows", "image-buffer-regions", "layout-transitions", "alias-copies", "alias-bytes", "pending-alias-units", "pending-alias-refused", "alias-writer-refused", "alias-foreign-refused"};
-        std::string work;
-        char field[96];
-        for (std::size_t j = 0; j < workNames.size(); ++j) {
-            std::snprintf(field, sizeof(field), " %s=%llu", workNames[j], static_cast<unsigned long long>(target.work[j]));
-            work += field;
-        }
-        AgcDriver::ProfilePrint_nid_no_patch("[resident-target] reconciliation 0x%llx:%s; nested pre-store GPU wait %.3f ms, depth %.3f ms\n", static_cast<unsigned long long>(color.address), work.c_str(), target.flushGpuMs, target.flushDepthMs);
         if (target.slow != 0) AgcDriver::ProfilePrint_nid_no_patch("[resident-target] slow 0x%llx: ms wait %.3f proof %.3f collect %.3f DCC %.3f flush %.3f validate %.3f other %.3f; nested write-watch query %.3f map/walk %.3f\n", static_cast<unsigned long long>(color.address), target.slowSteps[0], target.slowSteps[1], target.slowSteps[2], target.slowSteps[3], target.slowSteps[4], target.slowSteps[5], target.slowSteps[8], target.slowSteps[6], target.slowSteps[7]);
     }
     profile.targets.clear();
@@ -1796,9 +1785,6 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             target.us += lookupUs;
             target.pages += pages;
             target.clean += after.counts[LookupOutcomes::CleanProof] - before->counts[LookupOutcomes::CleanProof];
-            for (std::size_t i = 0; i < target.work.size(); ++i) target.work[i] += after.work[i] - before->work[i];
-            target.flushGpuMs += after.ms[LookupOutcomes::FlushGpuWait] - before->ms[LookupOutcomes::FlushGpuWait];
-            target.flushDepthMs += after.ms[LookupOutcomes::FlushDepth] - before->ms[LookupOutcomes::FlushDepth];
             for (std::size_t i = 0; i < steps.size(); ++i) target.steps[i] += steps[i];
             if (lookupUs >= 1000) {
                 ++target.slow;

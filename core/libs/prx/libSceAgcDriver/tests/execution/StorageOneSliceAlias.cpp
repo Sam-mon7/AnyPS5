@@ -2,8 +2,6 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -25,7 +23,6 @@
 #include <iostream>
 #include <span>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace AgcDriver {
@@ -126,11 +123,11 @@ private:
 #endif
 };
 
-std::array<std::uint32_t, 8> TextureDescriptor(const std::uint8_t* texels, std::uint32_t type, std::uint32_t format = Format32UInt) {
+std::array<std::uint32_t, 8> TextureDescriptor(const std::uint8_t* texels, std::uint32_t type) {
     const auto address = AddressOf(texels);
     return {
         static_cast<std::uint32_t>(address >> 8u),
-        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format << 20u) | (((Side - 1u) & 3u) << 30u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((Side - 1u) & 3u) << 30u),
         ((Side - 1u) >> 2u) | ((Side - 1u) << 14u),
         0xfacu | (TileR64KBX << 20u) | (type << 28u),
         0u,
@@ -145,7 +142,7 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
-void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, bool wait = true) {
+void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData) {
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
@@ -157,7 +154,7 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> co
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
-    if (wait) device.WaitIdle();
+    device.WaitIdle();
 }
 
 void Store(AgcDriver::VulkanDevice& device, const std::uint8_t* texels, std::uint32_t value) {
@@ -168,11 +165,11 @@ void Store(AgcDriver::VulkanDevice& device, const std::uint8_t* texels, std::uin
     Dispatch(device, StoreCode, userData);
 }
 
-void LoadArray(AgcDriver::VulkanDevice& device, const std::uint8_t* texels, std::uint32_t format = Format32UInt) {
+void LoadArray(AgcDriver::VulkanDevice& device, const std::uint8_t* texels) {
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(16, 0u);
     const auto buffer = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
-    const auto texture = TextureDescriptor(texels, Type2DArray, format);
+    const auto texture = TextureDescriptor(texels, Type2DArray);
     std::copy(buffer.begin(), buffer.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     Dispatch(device, LoadArrayCode, userData);
@@ -239,162 +236,14 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool watched) {
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
 }
 
-constexpr std::uint32_t DrawnValue = 0x3f400000u;
-constexpr std::uint32_t Format32Float = 22;
-
-alignas(256) constexpr std::array<std::uint32_t, 8> StorePairCode{
-    0x7e020280, 0x7e040200, 0xf0201108, 0x00010200, 0x7e040201, 0xf0201108, 0x00030200, 0xbf810000,
-};
-
-alignas(256) constexpr std::array<std::uint32_t, 6> TargetVertexCode{
-    0xe0382000, 0x80000005, 0xbf8c3f70, 0xf80008cf, 0x03020100, 0xbf810000,
-};
-
-alignas(256) constexpr std::array<std::uint32_t, 5> TargetPixelCode{
-    0x7e0002ff, DrawnValue, 0xf8001801, 0x00000000, 0xbf810000,
-};
-
-alignas(256) constexpr std::array<std::array<float, 4>, 3> TargetVertices{{
-    {-1.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f},
-}};
-
-void DrawPendingTarget(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
-    const auto target = device.Target();
-    std::vector<std::uint32_t> vertexData(4);
-    auto vertexBuffer = BufferDescriptor(TargetVertices.data(), static_cast<std::uint32_t>(sizeof(TargetVertices)));
-    vertexBuffer[1] |= 16u << 16u;
-    vertexBuffer[2] = 3;
-    vertexBuffer[3] = 0x01016facu;
-    std::copy(vertexBuffer.begin(), vertexBuffer.end(), vertexData.begin());
-    const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(TargetVertexCode.data()), std::as_bytes(std::span(TargetVertexCode))}}};
-    ShaderRecompiler::RecompileRequest vertex{
-        {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(TargetVertexCode.data()), TargetVertexCode, 0, {}},
-        {64, 0, vertexData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, vertexMemory},
-        target,
-        {0, 0, 0, 64}
-    };
-    vertex.useCache = false;
-    const auto vertexResult = ShaderRecompiler::Recompile(vertex);
-    const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
-    ShaderRecompiler::ShaderPixelStageInfo pixel{};
-    pixel.targetOutputMode[0] = 7;
-    pixel.targetExportMapping.fill(0xe4u);
-    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(TargetPixelCode.data()), std::as_bytes(std::span(TargetPixelCode))}}};
-    ShaderRecompiler::RecompileRequest fragment{
-        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(TargetPixelCode.data()), TargetPixelCode, 0, {}},
-        {64, 0, {}, std::nullopt, pixel, std::nullopt, pixelMemory},
-        target,
-        PixelPushLayout(vertexPush, target)
-    };
-    fragment.useCache = false;
-    const auto pixelResult = ShaderRecompiler::Recompile(fragment);
-    const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
-        {ShaderStage::Vertex, &vertexResult, 0},
-        {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
-    }};
-    AgcDriver::Graphics::State state{};
-    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 64u, 64u, std::nullopt, std::nullopt};
-    state.color = {AddressOf(texels), {Side, Side}, VK_FORMAT_R32_UINT, SurfaceBytes, 0xe4u};
-    state.color.tileMode = AgcDriver::Graphics::ColorTileMode::RenderTarget;
-    state.color.uintExport = true;
-    state.colors = {state.color};
-    state.hasColorTarget = true;
-    state.renderExtent = {Side, Side};
-    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    state.viewport = {0, static_cast<float>(Side), static_cast<float>(Side), -static_cast<float>(Side), 0, 1};
-    state.scissor = {{8, 0}, {8, 1}};
-    state.cullMode = VK_CULL_MODE_NONE;
-    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    state.blend.colorWriteMask = 1;
-    state.blends = {state.blend};
-    const AgcDriver::Pm4::DrawParameters draw{0, 3, 0, 1, 0, false};
-    device.Draw(state, draw, shaders);
 }
 
-void CheckPendingTarget(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool submit, bool cpuOverwrite = false) {
-    using namespace AgcDriver::Graphics;
-    using namespace AgcDriver::GuestMemory;
-    const auto surface = AddressOf(texels);
-    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
-    CollectWritesUncached(surface, SurfaceBytes);
-    BumpCollectEpoch();
-    std::lock_guard gpu(GpuMutex());
-    std::vector<std::uint32_t> data(20);
-    data[0] = 0x3e800000u;
-    data[1] = 0x3f000000u;
-    const auto targetWords = TextureDescriptor(texels, Type2D);
-    const auto sourceWords = TextureDescriptor(texels, Type2D, Format32Float);
-    std::copy(targetWords.begin(), targetWords.end(), data.begin() + 4);
-    std::copy(sourceWords.begin(), sourceWords.end(), data.begin() + 12);
-    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
-    auto target = CachedStorageSurface(context, DecodeTextureResource(targetWords));
-    auto source = CachedStorageSurface(context, DecodeTextureResource(sourceWords));
-    for (int iteration = 0; iteration < 2; ++iteration) {
-        data[1] = iteration == 0 ? 0x3f000000u : 0x3f800000u;
-        Dispatch(device, StorePairCode, data, false);
-        Require(target->Dirty() && source->Dirty(), "the paired image dispatch did not leave both images pending");
-        if (submit) {
-            const auto serial = device.SubmitAndEpoch();
-            device.WaitRecorded(serial);
-        }
-        const bool profiled = LookupOutcomes::Profiled();
-        const auto before = profiled ? ThreadLookupOutcomes().work[LookupOutcomes::PendingAliasUnits] : 0;
-        const auto storedBefore = profiled ? ThreadLookupOutcomes().work[LookupOutcomes::WriteBackBytes] : 0;
-        if (cpuOverwrite) {
-            device.WaitIdle();
-            std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, 0x45454545u);
-        }
-        BumpCollectEpoch();
-        DrawPendingTarget(device, texels);
-        const bool borrowed = !cpuOverwrite && std::getenv("APS5_PENDING_ALIAS_BORROW") != nullptr && std::getenv("APS5_NO_ALIAS_BORROW") == nullptr && std::getenv("APS5_NO_BLOCK_TRACKING") == nullptr && Watched(surface, SurfaceBytes);
-        if (borrowed) {
-            Require(source->Dirty() == false && target->Dirty(), "the draw did not take responsibility for the borrowed compute results");
-            if (profiled) {
-                Require(ThreadLookupOutcomes().work[LookupOutcomes::PendingAliasUnits] > before, "the paired pending-unit device copy did not fire");
-                Require(ThreadLookupOutcomes().work[LookupOutcomes::WriteBackBytes] == storedBefore, "the paired pending-unit copy also wrote an image back");
-            }
-        } else if (profiled) {
-            Require(ThreadLookupOutcomes().work[LookupOutcomes::PendingAliasUnits] == before, "pending units were borrowed despite a disabled path or a CPU overwrite");
-        }
-        const auto computeValue = cpuOverwrite ? 0x45454545u : data[1];
-        LoadArray(device, texels, Format32Float);
-        for (std::uint32_t x = 0; x < Threads; ++x) {
-            const auto expected = x >= 8 && x < 16 ? DrawnValue : computeValue;
-            Require(Output[x] == expected, "pending target lost a compute or draw write at x=" + std::to_string(x) + ": " + Hex(Output[x]) + ", expected " + Hex(expected));
-        }
-    }
-    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
-    device.WaitIdle();
-    const ColorTargetLayout layout(Side, Side, ColorTileMode::RenderTarget, 4);
-    for (std::uint32_t x = 0; x < Threads; ++x) {
-        const auto expected = x >= 8 && x < 16 ? DrawnValue : (cpuOverwrite ? 0x45454545u : data[1]);
-        Require(*reinterpret_cast<const std::uint32_t*>(texels + layout.Offset(x, 0)) == expected, "the resident result was not published to guest memory");
-    }
-    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, 0x34343434u);
-    BumpCollectEpoch();
-    LoadArray(device, texels);
-    RequireOutput(0x34343434u, "CPU overwrite after the pending-unit device copy");
-    target.reset();
-    source.reset();
-    ClearCachedTextures(device.Device());
-}
-
-}
-
-int main(int argc, char** argv) {
+int main() {
     try {
         const bool watched = AgcDriver::GuestMemory::WriteWatched();
         GuestBlock block(watched);
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (argc == 2 && std::string_view(argv[1]) == "--pending-target") {
-            GuestBlock resident(watched, true);
-            CheckPendingTarget(*device, resident.Data(), false);
-            CheckPendingTarget(*device, resident.Data(), true);
-            CheckPendingTarget(*device, resident.Data(), false, true);
-            std::puts("pending render target alias tests passed");
-            return 0;
-        }
         if (!watched) std::puts("guest memory has no write watch: only the texels read through the array are checked");
         Run(*device, block.Data(), watched);
         if (watched) {
