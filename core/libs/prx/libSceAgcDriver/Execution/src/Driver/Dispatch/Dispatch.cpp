@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -143,11 +144,20 @@ void NoteMissingRecipe(std::uint32_t queue, bool indirect, RecipeBuildFailure fa
     counts.clear();
 }
 
-bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
+bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code, bool pin = false) {
+    std::vector<std::shared_ptr<const GuestAllocations::Range>> leases;
     for (const auto& region : captured) {
         const auto address = region.guestAddress;
         const auto bytes = region.bytes.size();
         if (bytes == 0 || (address >= code.codeAddress && address < code.codeAddress + code.code.size() * sizeof(std::uint32_t)) || (!code.header.empty() && address >= code.headerAddress && address < code.headerAddress + code.header.size())) continue;
+        if (pin) {
+            for (auto cursor = address; cursor < address + bytes;) {
+                auto lease = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(cursor), false);
+                if (lease == nullptr || !lease->readable || cursor < lease->address || cursor - lease->address >= lease->bytes) return false;
+                cursor = std::min(address + bytes, lease->address + lease->bytes);
+                leases.push_back(std::move(lease));
+            }
+        }
         if (Driver::QueryPendingSpan(address, bytes, {}) != ShaderMemory::PendingWrite::None || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return false;
         GuestMemory::GuardRead(address, bytes);
         GuestMemory::FlushGpuWrites(address, bytes);
@@ -198,6 +208,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
     bool fromAhead = false;
+    double aheadValidationMs = 0;
     auto& groupStats = groupCaptureStats();
     if (!resolving) {
         auto& parked = resolvedAhead();
@@ -206,6 +217,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             parked.erase(found);
             fromAhead = ahead.address == address;
             if (!fromAhead) ++groupStats.addressMismatches;
+            if (fromAhead && ahead.speculative) {
+                if (ahead.registeredShader != registeredShader || ahead.indirectArguments != indirectArguments || !std::ranges::equal(ahead.packet, packet)) {
+                    fromAhead = false;
+                    rejectDispatchAhead(AheadRejection::State);
+                } else if (ahead.preparedDevice != localDevice) {
+                    fromAhead = false;
+                    rejectDispatchAhead(AheadRejection::Device);
+                }
+            }
         }
     }
     if (fromAhead) {
@@ -315,29 +335,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         ~ProbeScope() { if (active) ShaderRecompiler::SetDebugProbeActive(false); }
     } probeScope{probeThis};
     const bool noDispatchCache = noDispatchCacheEnv || probeThis;
-    std::uint64_t key = 0xcbf29ce484222325ull;
-    const auto mix = [&](std::uint64_t value) {
-        key ^= value;
-        key *= 0x100000001b3ull;
-    };
-    mix(address);
-    mix(packet[4] & 0x8000u);
-    for (const auto threads : compute.partialThreads) mix(threads);
-    for (const auto word : userData) mix(word);
-
-    static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
-    if (keyHygiene) {
-        for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
-            const auto found = queue.shader.find(offset);
-
-            mix(found == queue.shader.end() ? (1ull << 32u) : found->second);
-        }
-    } else {
-        for (const auto& [offset, value] : queue.shader) {
-            mix(offset);
-            mix(value);
-        }
-    }
+    const auto key = dispatchKey(address, packet[4], userData, compute, queue.shader, registeredShader.get());
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
 
     std::shared_ptr<DispatchVariant> keepVariant;
@@ -388,17 +386,24 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         previous.key = key;
     }
 
-    mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
+        if (ahead.speculative) rejectDispatchAhead(AheadRejection::Key);
     }
     if (fromAhead) {
+        const auto validationStarted = profile && ahead.speculative ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (const auto hook = aheadAdoptHook.load(std::memory_order_acquire)) hook();
-        if (!CapturedCurrent(ahead.captured, snapshot)) {
+        auto rejection = ahead.speculative ? validateDispatchAhead(ahead) : std::nullopt;
+        if (!rejection && !CapturedCurrent(ahead.captured, snapshot, ahead.speculative)) rejection = AheadRejection::Memory;
+        if (!rejection && ahead.speculative) rejection = validateDispatchAhead(ahead);
+        if (rejection) {
             fromAhead = false;
             ++dispatchesRejectedAhead;
             ++groupStats.memoryMismatches;
+            if (ahead.speculative) rejectDispatchAhead(*rejection);
+        } else if (ahead.speculative) {
+            if (profile) aheadValidationMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - validationStarted).count();
         }
     }
     phaseTiming.Phase(PhaseKey);
@@ -437,9 +442,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         validated = ahead.validated;
         ++groupStats.adopted;
         ++dispatchesAdoptedAhead;
-        const auto age = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ahead.resolvedAt).count();
-        groupStats.ageMs += age;
-        groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
+        if (!ahead.speculative || profile) {
+            const auto age = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ahead.resolvedAt).count();
+            groupStats.ageMs += age;
+            groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
+        }
         phaseTiming.Phase(PhaseLookup);
     } else {
         lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
@@ -554,9 +561,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
+        if (fromAhead && ahead.speculative) rejectDispatchAhead(AheadRejection::Label);
         dispatch(queue, packet, submission, indirectArguments);
         return;
     }
+    if (fromAhead && ahead.speculative) adoptDispatchAhead(ahead.preparationMs, aheadValidationMs, ahead.cached);
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
@@ -586,6 +595,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     const auto rethrow = [&](const std::exception& error) {
         if (fromAhead) {
+            if (ahead.speculative) rejectDispatchAhead(AheadRejection::Device);
             ++groupStats.deviceRejects;
             dispatch(queue, packet, submission, indirectArguments);
             return true;
