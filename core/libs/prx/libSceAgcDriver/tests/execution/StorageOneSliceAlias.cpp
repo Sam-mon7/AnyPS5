@@ -47,7 +47,7 @@ constexpr std::uint32_t TileR64KBX = 0x1b;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type2DArray = 13;
 constexpr std::size_t SurfaceBytes = 65536;
-constexpr std::size_t BlockBytes = 65536;
+constexpr std::size_t BlockBytes = 2 * SurfaceBytes;
 constexpr std::uint32_t Initial = 0x5a5a5a5au;
 
 alignas(256) constexpr std::array<std::uint32_t, 5> StoreCode{
@@ -258,7 +258,7 @@ alignas(256) constexpr std::array<std::array<float, 4>, 3> TargetVertices{{
     {-1.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f},
 }};
 
-void DrawPendingTarget(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
+void DrawPendingTarget(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool fullScissor = false) {
     const auto target = device.Target();
     std::vector<std::uint32_t> vertexData(4);
     auto vertexBuffer = BufferDescriptor(TargetVertices.data(), static_cast<std::uint32_t>(sizeof(TargetVertices)));
@@ -302,7 +302,7 @@ void DrawPendingTarget(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
     state.renderExtent = {Side, Side};
     state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     state.viewport = {0, static_cast<float>(Side), static_cast<float>(Side), -static_cast<float>(Side), 0, 1};
-    state.scissor = {{8, 0}, {8, 1}};
+    state.scissor = fullScissor ? VkRect2D{{0, 0}, {Side, Side}} : VkRect2D{{8, 0}, {8, 1}};
     state.cullMode = VK_CULL_MODE_NONE;
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     state.blend.colorWriteMask = 1;
@@ -382,6 +382,72 @@ void CheckPendingTarget(AgcDriver::VulkanDevice& device, std::uint8_t* texels, b
     ClearCachedTextures(device.Device());
 }
 
+enum class ForeignFirstAccess { Fill, Read, FullScissor, PartialScissor };
+
+void CheckForeignFirstAccess(AgcDriver::VulkanDevice& device, std::uint8_t* texels, ForeignFirstAccess firstAccess) {
+    using namespace AgcDriver::Graphics;
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::uint32_t produced = 0x12345678u;
+    constexpr std::uint32_t filled = 0x23456789u;
+    const auto base = AddressOf(texels);
+    auto* targetBytes = texels + SurfaceBytes;
+    const auto targetAddress = AddressOf(targetBytes);
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), BlockBytes / 4, Initial);
+    CollectWritesUncached(base, BlockBytes);
+    BumpCollectEpoch();
+    std::lock_guard gpu(GpuMutex());
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    auto targetResource = DecodeTextureResource(TextureDescriptor(targetBytes, Type2D));
+    auto sourceResource = DecodeTextureResource(TextureDescriptor(texels, Type2D));
+    sourceResource.height = 2 * Side;
+    auto target = CachedStorageSurface(context, targetResource);
+    auto source = CachedStorageSurface(context, sourceResource);
+    Require(source->GuestBytes() == BlockBytes && source->BlockUnits() && source->TrackedUnits() == 2, "the foreign-shape fixture needs two tracked source blocks");
+    const char* refusal = nullptr;
+    const std::array<std::uint32_t, 4> produce{produced, produced, produced, produced};
+    Require(source->FillClear(produce, StorageTexture::WholeImage, refusal), refusal != nullptr ? refusal : "the foreign producer clear failed");
+    Require(source->Dirty(), "the foreign producer did not remain pending");
+    const auto before = ThreadLookupOutcomes().work;
+    if (firstAccess == ForeignFirstAccess::Read) {
+        LoadArray(device, targetBytes);
+        RequireOutput(produced, "a read before overwriting the foreign result");
+    } else if (firstAccess != ForeignFirstAccess::Fill) {
+        DrawPendingTarget(device, targetBytes, firstAccess == ForeignFirstAccess::FullScissor);
+        LoadArray(device, targetBytes);
+        for (std::uint32_t x = 0; x < Threads; ++x) Require(Output[x] == (firstAccess == ForeignFirstAccess::FullScissor || (x >= 8 && x < 16) ? DrawnValue : produced), "the foreign-shape draw lost preserved or drawn texels");
+    }
+    if (LookupOutcomes::Profiled() && firstAccess != ForeignFirstAccess::Fill) Require(ThreadLookupOutcomes().work[LookupOutcomes::WriteBackBytes] > before[LookupOutcomes::WriteBackBytes], "a read or unproven draw skipped the foreign store");
+    StorageTexture::ProfilePendingFill(targetAddress, SurfaceBytes);
+    static_cast<void>(StorageTexture::DiscardPendingInside(targetAddress, SurfaceBytes));
+    StorageTexture::FlushPending(targetAddress, SurfaceBytes, target.get(), "buffer fill", PublishScope::PartialUnits);
+    const std::array<std::uint32_t, 4> fill{filled, filled, filled, filled};
+    Require(target->FillClear(fill, StorageTexture::WholeImage, refusal), refusal != nullptr ? refusal : "the dead-overwrite clear failed");
+    Require(source->Dirty(), "overwriting the target discarded the producer's result outside the target");
+    if (LookupOutcomes::Profiled()) {
+        const auto& after = ThreadLookupOutcomes().work;
+        if (firstAccess == ForeignFirstAccess::Fill) {
+            Require(after[LookupOutcomes::WriteBackBytes] == before[LookupOutcomes::WriteBackBytes], "the exact dead overwrite stored foreign bytes");
+            Require(after[LookupOutcomes::ForeignClearFill] == before[LookupOutcomes::ForeignClearFill] + 1, "the first foreign access was not counted as a full fill");
+        } else {
+            Require(after[LookupOutcomes::ForeignClearFill] == before[LookupOutcomes::ForeignClearFill], "a later fill replaced the first-access classification");
+            const auto kind = firstAccess == ForeignFirstAccess::Read ? LookupOutcomes::ForeignRead : LookupOutcomes::ForeignPartial;
+            Require(after[kind] == before[kind] + 1, "the first foreign read or draw was counted more than once or misclassified");
+            Require(after[LookupOutcomes::ForeignFullScissor] == before[LookupOutcomes::ForeignFullScissor] + (firstAccess == ForeignFirstAccess::FullScissor ? 1 : 0), "a scissor was mistaken for a coverage proof");
+        }
+        Require(after[LookupOutcomes::ForeignOverwrite] == before[LookupOutcomes::ForeignOverwrite], "a draw was classified as a proven full overwrite");
+    }
+    source->Refresh();
+    source->WriteBack();
+    StorageTexture::FlushPending(base, BlockBytes, nullptr, "test");
+    device.WaitIdle();
+    const auto* words = reinterpret_cast<const std::uint32_t*>(texels);
+    Require(std::all_of(words, words + SurfaceBytes / 4, [](auto word) { return word == produced; }), "a later producer read lost its pending result outside the overwritten range");
+    Require(std::all_of(words + SurfaceBytes / 4, words + BlockBytes / 4, [](auto word) { return word == filled; }), "a later producer read resurrected superseded target bytes");
+    target.reset();
+    source.reset();
+    ClearCachedTextures(device.Device());
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -390,6 +456,12 @@ int main(int argc, char** argv) {
         GuestBlock block(watched);
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--foreign-first-access") {
+            GuestBlock resident(watched, true);
+            for (const auto firstAccess : {ForeignFirstAccess::Fill, ForeignFirstAccess::Read, ForeignFirstAccess::FullScissor, ForeignFirstAccess::PartialScissor}) CheckForeignFirstAccess(*device, resident.Data(), firstAccess);
+            std::puts("foreign pending first-access tests passed");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-target") {
             GuestBlock resident(watched, true);
             CheckPendingTarget(*device, resident.Data(), false);
