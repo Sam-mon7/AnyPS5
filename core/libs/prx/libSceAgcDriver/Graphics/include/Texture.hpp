@@ -647,6 +647,7 @@ private:
     // (the resource cache's serial memo) hold only while this image's version does, so the next
     // write here bumps the pending serial although the image was pending already.
     bool lent = false;
+    std::uint8_t profiledWriter = 0;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize memoryBytes = 0;
@@ -710,13 +711,15 @@ private:
 // element (a fast miss is followed by a full lookup); the refresh, upload, DCC scan and pending
 // flush rows lie inside the storage and sampled rows.
 struct LookupOutcomes {
-    enum Kind : std::size_t { SampledFast, SampledFastMiss, SampledHitView, SampledHitClearedView, SampledHitSnapshot, SampledMadeView, SampledMadeSnapshot, StorageHit, StorageMade, RefreshUnchanged, RefreshCompared, RefreshProved, UploadDirect, UploadCpu, UploadClear, DccScan, PendingFlush, RefreshWait, RefreshProofCheck, RefreshCollect, RefreshFlush, RefreshValidate, CleanProof, Count };
+    enum Kind : std::size_t { SampledFast, SampledFastMiss, SampledHitView, SampledHitClearedView, SampledHitSnapshot, SampledMadeView, SampledMadeSnapshot, StorageHit, StorageMade, RefreshUnchanged, RefreshCompared, RefreshProved, UploadDirect, UploadCpu, UploadClear, DccScan, PendingFlush, RefreshWait, RefreshProofCheck, RefreshCollect, RefreshFlush, RefreshValidate, CleanProof, FlushDepth, FlushGpuWait, Count };
+    enum Work : std::size_t { FlushCalls, FlushImages, FlushStorage, FlushDraw, FlushFill, FlushCopy, FlushShadowOnly, FlushDepthRanges, FlushWaits, WriteBackBytes, ShadowBytes, ImportBytes, CpuBytes, RetileWindows, ImageBufferRegions, LayoutTransitions, AliasCopies, AliasBytes, PendingAliasUnits, PendingAliasRefused, PendingAliasWriters, PendingAliasForeign, WorkCount };
     static const char* Name(Kind kind);
     static bool Profiled();
     // Charges the time since `start` to `kind` on this thread and returns now.
     static std::chrono::steady_clock::time_point Add(Kind kind, std::chrono::steady_clock::time_point start);
     std::array<std::uint64_t, Count> counts{};
     std::array<double, Count> ms{};
+    std::array<std::uint64_t, WorkCount> work{};
 };
 LookupOutcomes& ThreadLookupOutcomes();
 
