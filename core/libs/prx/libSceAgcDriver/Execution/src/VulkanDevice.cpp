@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -2403,6 +2404,18 @@ void VulkanDevice::StoreIdleResults(bool reapFirst) {
 
 void VulkanDevice::SubmitRecorded(bool reapFirst) {
     if (!state->recorder) return;
+    if (Timeline::Enabled) {
+        static auto last = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(1)) {
+            last = now;
+            double gpuNs = 0;
+            std::chrono::steady_clock::time_point cpu;
+            std::uint64_t deviation = 0;
+            if (CalibrateClock(gpuNs, cpu, &deviation)) Timeline::Emit(Timeline::Kind::Clock, static_cast<std::uint64_t>(gpuNs),
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(cpu.time_since_epoch()).count()), deviation);
+        }
+    }
     // Finished batches are retired first (a non-blocking fence status check on the front of the
     // in-flight list), so PendingWriteOverlaps/HasCompletions scans stay short and a label recorded
     // after a completing batch already finished can go to the GPU instead of behind a completion.
@@ -3896,7 +3909,7 @@ std::string VulkanDevice::DriverInfo() const {
     return state->driverInfo.empty() ? std::to_string(state->properties.driverVersion) : state->driverInfo;
 }
 
-bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const {
+bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu, std::uint64_t* maximumDeviation) const {
     if (state->calibratedTimestamps == nullptr) return false;
     const std::array<VkCalibratedTimestampInfoKHR, 2> domains{VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR}, VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, state->hostTimeDomain}};
     std::array<std::uint64_t, 2> stamps{};
@@ -3915,6 +3928,7 @@ bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time
     const auto now = std::chrono::steady_clock::now();
     const double sinceNs = static_cast<double>(static_cast<std::uint64_t>(monotonic.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(monotonic.tv_nsec) - stamps[1]);
 #endif
+    if (maximumDeviation != nullptr) *maximumDeviation = deviation;
     gpuNs = static_cast<double>(stamps[0]) * state->properties.limits.timestampPeriod;
     cpu = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::nano>(sinceNs));
     return true;

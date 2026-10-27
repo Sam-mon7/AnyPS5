@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -8,6 +9,7 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    Timeline::Store(Timeline::Kind::LabelHistory, address, bytes, stamp);
     if (!KeepsLabelStore(address, bytes.size())) return;
     std::lock_guard lock(labelStoresMutex);
     for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
@@ -39,6 +41,10 @@ bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t ad
         }
         if (Pm4::WaitComparesValue(packet, value)) {
             if (reuse && seenGeneration != nullptr) seenGeneration->reset();
+            if (Timeline::Enabled) {
+                for (std::size_t offset = 0; offset < bytes; offset += 4) Timeline::Emit(Timeline::Kind::WaitSource,
+                    address + offset, (value >> (offset * 8u)) & 0xffffffffu, store.stamp, 4, 0, store.queue);
+            }
             if (writer != nullptr) *writer = store.queue;
             return true;
         }

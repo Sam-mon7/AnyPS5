@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -2404,6 +2405,7 @@ bool GpuMutexType::tryEnter() {
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
+        Timeline::Emit(Timeline::Kind::LockAcquired);
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         if (!proofThread) proofSerial.fetch_add(1, std::memory_order_acq_rel);
         if (ResourceEpochProofsEnabled()) {
@@ -2416,6 +2418,13 @@ void GpuMutexType::acquired() {
 }
 
 bool GpuMutexType::try_lock() {
+    const bool timelineOuter = Timeline::Enabled && !HeldByThisThread();
+    if (timelineOuter) Timeline::Emit(Timeline::Kind::LockBegin, 1);
+    struct TimelineTry {
+        bool outer;
+        GpuMutexType& mutex;
+        ~TimelineTry() { if (outer && !mutex.HeldByThisThread()) Timeline::Emit(Timeline::Kind::LockFailed); }
+    } timelineTry{timelineOuter, *this};
     if (!GpuLockProfiled()) {
         if (!tryEnter()) return false;
         acquired();
@@ -2460,6 +2469,7 @@ void GpuMutexType::unlock() {
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
+        Timeline::Emit(Timeline::Kind::LockRelease);
         mutex.unlock();
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
@@ -2486,6 +2496,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    if (Timeline::Enabled && !HeldByThisThread()) Timeline::Emit(Timeline::Kind::LockBegin);
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {

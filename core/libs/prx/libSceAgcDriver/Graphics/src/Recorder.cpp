@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -1524,6 +1525,7 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
 }
 
 void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    Timeline::Store(Timeline::Kind::LabelDeferred, address, bytes, stamp);
     if (bytes.size() < 4 || address % 4 != 0) return;
     // The range before the table: the hook covers the group whether or not a table exists to
     // enter it in (no owner: the callback records it outright, by a CPU store when need be).
@@ -1783,6 +1785,7 @@ void Recorder::ensureOpen() {
             static std::atomic<std::uint64_t> traceIds{0};
             open->traceId = traceIds.fetch_add(1, std::memory_order_relaxed) + 1;
         }
+        if (Timeline::Enabled) open->timelineId = Timeline::Emit(Timeline::Kind::BatchOpen);
         TraceBatchTag = open->traceId;
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
@@ -2094,7 +2097,7 @@ bool Recorder::GpuTimingEnabled() {
 }
 
 bool Recorder::BatchStampsEnabled() {
-    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured();
+    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured() || Timeline::Enabled;
 }
 
 void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
@@ -2804,6 +2807,12 @@ void Recorder::readGpuTiming(Batch& batch) {
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
     if (result != VK_SUCCESS) return;
     const auto period = context.limits.timestampPeriod;
+    if (Timeline::Enabled && batch.batchTiming < batch.timedKeys.size()) {
+        const auto index = batch.batchTiming * 2;
+        if (stamps[index + 1] >= stamps[index]) Timeline::Emit(Timeline::Kind::GpuTime,
+            static_cast<std::uint64_t>(static_cast<double>(stamps[index]) * period),
+            static_cast<std::uint64_t>(static_cast<double>(stamps[index + 1]) * period), 0, 0, batch.timelineId);
+    }
     if (!GpuTimingEnabled()) {
         if (batch.batchTiming == 0 && stamps[1] >= stamps[0]) {
             batch.gpuStartNs = static_cast<double>(stamps[0]) * period;
@@ -3552,6 +3561,7 @@ bool Recorder::HasCompletions() const {
 }
 
 void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion) {
+    Timeline::Store(Timeline::Kind::LabelRecord, address, bytes, stamp, batch.timelineId, behindCompletion ? 1u : 0u);
     if (DrawProfiled()) ProfileStore(address, bytes.size(), queue, GuestMemory::CurrentPacket().opcode, WaitStage::Recorded, WaitBatchFor(&batch), behindCompletion);
     // One entry per dword; a label overlapping older entries (a 4-byte store inside an 8-byte one or
     // the reverse) replaces exactly the dwords it stores, so a lookup composes what memory will hold.
@@ -3668,6 +3678,10 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
             hit.late = true;
             hit.generation = std::min(hit.generation, entry->generation);
         }
+        if (Timeline::Enabled) {
+            Timeline::LabelStamps[offset / 4] = entry->stamp;
+            Timeline::LabelQueues[offset / 4] = entry->queue;
+        }
         hit.value |= static_cast<std::uint64_t>(entry->value) << (offset * 8u);
         if (offset == 0) {
             hit.queue = entry->queue;
@@ -3698,7 +3712,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         std::lock_guard ringLock(writtenBackMutex);
         return writtenBackSequence;
     }();
-    batch.completions.push_back([this, address, copy = std::move(copy), sequence, storedOnGpu] {
+    auto store = [this, address, copy = std::move(copy), sequence, storedOnGpu](auto&& visible) {
         if (storedOnGpu && !always && !writtenBackSince(sequence, address, address + copy.size())) {
             completionStoresSkipped.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -3706,7 +3720,15 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         completionStoresRun.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(address), copy.size(), 4, true);
         GuestMemory::StoreOwnBytes(address, copy);
-    });
+        visible(copy);
+    };
+    if (Timeline::Enabled) {
+        batch.completions.push_back([store = std::move(store), address, stamp, timelineId = batch.timelineId] {
+            store([&](const auto& value) { Timeline::Store(Timeline::Kind::LabelVisible, address, value, stamp, timelineId); });
+        });
+    } else {
+        batch.completions.push_back([store = std::move(store)] { store([](const auto&) {}); });
+    }
     // Counted per batch and counted down when the batch finishes, on every exit path of finish()
     // (a label whose range became unmapped is reported there, and a lost device throws before the
     // completions run): a label that will never land must not leave the workers reaping forever.
@@ -3865,7 +3887,9 @@ void Recorder::Submit() {
     if (hold != VK_NULL_HANDLE || timeline != VK_NULL_HANDLE) submission.pNext = &timelineInfo;
     DestroyDeferredAtIdle(context);
     const auto submitStart = std::chrono::steady_clock::now();
+    Timeline::Emit(Timeline::Kind::SubmitBegin, serial, id, 0, 0, batch->timelineId);
     const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    Timeline::Emit(Timeline::Kind::SubmitEnd, serial, id, 0, 0, batch->timelineId, static_cast<std::uint32_t>(result));
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
@@ -3935,7 +3959,8 @@ struct RestoreSyncSite {
 // The timeline wait itself, on handles copied out of the recorder: the caller holds no mutex, and
 // the recorder may be torn down meanwhile (its destructor waits for the registered waiters to
 // leave after completing every batch, so the handles stay valid until this returns).
-VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial) {
+VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial, std::uint64_t recorderId) {
+    Timeline::GpuWaitScope timelineWait(serial, recorderId);
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
@@ -3946,6 +3971,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
         std::fprintf(stderr, "[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait)\n", static_cast<unsigned long long>(serial), waited);
         result = waitSemaphores(device, &wait, 5'000'000'000ull);
     }
+    timelineWait.result = static_cast<std::uint32_t>(result);
     return result;
 }
 
@@ -3957,7 +3983,7 @@ void Recorder::WaitSerial(std::uint64_t serial) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
-    const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
+    const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial, id);
     if (profile) {
         unlockedWaits.fetch_add(1, std::memory_order_relaxed);
         unlockedWaitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
@@ -3973,7 +3999,9 @@ bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
     wait.pValues = &serial;
+    Timeline::GpuWaitScope timelineWait(serial, id);
     const auto result = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR")(context.device, &wait, timeoutNanos);
+    timelineWait.result = static_cast<std::uint32_t>(result);
     if (result == VK_TIMEOUT) return false;
     Check(result, "vkWaitSemaphoresKHR submission progress");
     return true;
@@ -4210,7 +4238,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         // Registered before the release: a teardown can only start once the mutex is free.
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
-        result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
+        result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial, myId);
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
     }
@@ -4352,6 +4380,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
+        Timeline::GpuWaitScope timelineWait(batch->serial, id, batch->timelineId);
         const auto waitFences = function(waitForFences, "vkWaitForFences");
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
@@ -4359,6 +4388,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
+        timelineWait.result = static_cast<std::uint32_t>(result);
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
@@ -4368,6 +4398,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             Check(result, "vkWaitForFences recorder");
         }
     }
+    Timeline::Emit(Timeline::Kind::Complete, batch->serial, 0, 0, 0, batch->timelineId);
     readGpuTiming(*batch);
     if (DrawProfiled()) {
         std::lock_guard lock(WaitLabels().mutex);
@@ -4449,11 +4480,13 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         std::lock_guard lock(WaitLabels().mutex);
         WaitLabels().batches.at(batch.get())->stage = WaitStage::Retired;
     }
+    Timeline::Emit(Timeline::Kind::Retire, batch->serial, 0, 0, 0, batch->timelineId);
     removeLabels(*batch);
     release(*batch);
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
+    Timeline::Emit(Timeline::Kind::BatchDiscard, batch->serial, 0, 0, 0, batch->timelineId);
     removeLabels(*batch);
     if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
     if (batch->completionStoreCount != 0) completionStores.fetch_sub(batch->completionStoreCount, std::memory_order_acq_rel);

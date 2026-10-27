@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
@@ -116,6 +117,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     const std::size_t awaitedBytes = Pm4::WaitAwaitedBytes(packet);
     const auto alignMask = awaitedBytes == 8 ? ~7ull : ~3ull;
     const std::uint64_t awaited = (packet[2] & static_cast<std::uint32_t>(alignMask)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    Timeline::WaitScope timelineWait(packet, awaited, awaitedBytes);
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(awaited), packet[4],
                                *reinterpret_cast<const volatile std::uint32_t*>(awaited));
@@ -140,6 +142,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::optional<Graphics::Recorder::WaitProfile> waitProfile;
     if (profile) waitProfile.emplace(queue, awaited, awaitedBytes);
     const auto finishProfile = [&](Graphics::Recorder::WaitEnd end) {
+        timelineWait.end = static_cast<std::uint32_t>(end);
         if (profile) waitProfile->end = end;
     };
     static const bool submitLabels = std::getenv("APS5_NO_WAIT_LABEL_SUBMIT") == nullptr;
@@ -210,6 +213,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (!hit->late) epochPoint.bump = false;
         } else {
             notePendingWait(packet, queue, received);
+        }
+        if (Timeline::Enabled) {
+            for (std::size_t offset = 0; offset < awaitedBytes; offset += 4) Timeline::Emit(Timeline::Kind::WaitSource,
+                awaited + offset, (hit->value >> (offset * 8u)) & 0xffffffffu, Timeline::LabelStamps[offset / 4], 4, 0, Timeline::LabelQueues[offset / 4]);
         }
         submitWriter(hit->queue, !unlockedHit);
         finishProfile(Graphics::Recorder::WaitEnd::Recorder);
@@ -335,7 +342,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (reap) {
             const auto withWorkBefore = pollProfile ? Graphics::Recorder::ReapsWithWork() : 0;
             localDevice->ReapRecorded();
-            if (profile && Pm4::WaitSatisfiedUnchecked(packet)) finishProfile(Graphics::Recorder::WaitEnd::Fence);
+            if ((profile || Timeline::Enabled) && Pm4::WaitSatisfiedUnchecked(packet)) finishProfile(Graphics::Recorder::WaitEnd::Fence);
             ++outcomes.pollReaps;
             if (pollProfile) {
                 ++poll.reaps;
@@ -383,7 +390,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         CheckFailure();
         if (pollService(!spinning)) return;
         if (storeHeldResults && !spinning && (polls & 31u) == 0) {
-            const bool pending = profile && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
+            const bool pending = (profile || Timeline::Enabled) && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
             GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
             if (pending && Pm4::WaitSatisfiedUnchecked(packet)) finishProfile(Graphics::Recorder::WaitEnd::Fence);
         }
@@ -441,7 +448,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
     ++outcomes.polled;
-    if (!profile || waitProfile->end != Graphics::Recorder::WaitEnd::Fence) finishProfile(Graphics::Recorder::WaitEnd::Polled);
+    if (timelineWait.end != static_cast<std::uint32_t>(Graphics::Recorder::WaitEnd::Fence)) finishProfile(Graphics::Recorder::WaitEnd::Polled);
 }
 
 }

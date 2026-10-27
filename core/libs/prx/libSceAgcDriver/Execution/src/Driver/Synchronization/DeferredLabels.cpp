@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -144,6 +145,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
     auto& labels = ShaderRecompiler::ThreadOwned(recording);
     labels.clear();
     labels.swap(deferred.labels);
+    Timeline::DeferredScope timelineOrigins;
     struct Clear {
         std::vector<DeferredLabel>& labels;
         std::uint32_t queue;
@@ -183,6 +185,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
     } clear{labels, queue, opcodes, profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
     bool first = true;
     for (const auto& label : labels) {
+        auto timelineContext = timelineOrigins.At(static_cast<std::size_t>(&label - labels.data()));
         const auto packet = profile ? GuestMemory::CurrentPacket() : GuestMemory::PacketTag{};
         if (profile) GuestMemory::SetCurrentPacket(opcodes->at(static_cast<std::size_t>(&label - labels.data())), queue);
         struct RestorePacket {
@@ -273,6 +276,8 @@ void Driver::noteQueuedLabels(std::uint32_t queue) {
     const auto& labels = deferredLabels().labels;
     for (auto& noted = queuedLabelsNoted(); noted < labels.size(); ++noted) {
         const auto& label = labels[noted];
+        const auto origin = Timeline::Enabled && noted < Timeline::DeferredOrigins.size() ? Timeline::DeferredOrigins[noted] : Timeline::Origin{};
+        Timeline::ContextScope timelineContext(origin.packet, origin.opcode);
         Graphics::Recorder::NoteQueuedLabel(label.address, std::span<const std::byte>(label.bytes).first(label.size), ++eventSerial, queue);
     }
 }

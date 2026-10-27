@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -84,6 +85,10 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 if (deferred.labels.empty()) deferred.since = std::chrono::steady_clock::now();
                 auto& entry = deferred.labels.emplace_back();
                 entry.address = label->address;
+                if (Timeline::Enabled) {
+                    Timeline::DeferredOrigins.push_back({Timeline::Packet, Timeline::Opcode});
+                    Timeline::Store(Timeline::Kind::LabelDeferred, label->address, bytes, 0);
+                }
                 entry.size = bytes.size();
                 if (profile) {
                     deferredLabelOpcodes().push_back(opcode);

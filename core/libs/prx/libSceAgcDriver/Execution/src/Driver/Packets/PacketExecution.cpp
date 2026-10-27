@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
@@ -257,6 +258,7 @@ void Driver::execute(const Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        Timeline::PacketScope timelinePacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.serial, cursor);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
@@ -424,6 +426,7 @@ void Driver::execute(const Submission& submission) {
             require(frame != nullptr, "flip has no frame timing");
             const auto now = FrameTiming::Clock::now();
             if (!queueTiming) frame->IncludeSubmission(submission.serial, now, now, now, true);
+            Timeline::Emit(Timeline::Kind::Flip, submission.serial, cursor, batchesAtFlip, unsignaledAtFlip);
             frame->SetFlip(submission.serial, cursor, queueTiming ? submission.receivedAt : now, now);
             if (queueTiming) frame->CollectBackground();
             frame->NoteFlipBatches(batchesAtFlip, unsignaledAtFlip);
