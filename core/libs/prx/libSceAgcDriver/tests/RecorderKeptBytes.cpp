@@ -2,14 +2,20 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using namespace AgcDriver::Graphics;
@@ -38,9 +44,15 @@ struct MockDevice {
     bool lostSubmissionPending = false;
     std::uint64_t idleWaits = 0;
     VkResult idleResult = VK_ERROR_DEVICE_LOST;
+    std::map<VkFence, std::uint64_t> serials;
+    std::thread::id waitingThread;
+    std::function<void()> duringWait;
+    VkResult timelineResult = VK_SUCCESS;
+    std::uint64_t timelineWaits = 0;
 };
 
 MockDevice mock;
+std::atomic<bool> timelineWaitInProgress{false};
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer* commands) {
     *commands = reinterpret_cast<VkCommandBuffer>(mock.next++);
@@ -62,6 +74,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateFence(VkDevice, const VkFenceCreateInfo
 VKAPI_ATTR void VKAPI_CALL mockDestroyFence(VkDevice, VkFence fence, const VkAllocationCallbacks*) {
     Expect(!mock.lostSubmissionPending, "a fence was destroyed before the lost submission finished");
     mock.signaled.erase(fence);
+    mock.serials.erase(fence);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockGetFenceStatus(VkDevice, VkFence fence) {
@@ -88,8 +101,9 @@ VKAPI_ATTR VkResult VKAPI_CALL mockEndCommandBuffer(VkCommandBuffer) {
     return mock.endResult;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) {
+VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence fence) {
     ++mock.submits;
+    mock.serials[fence] = mock.submits;
     if (mock.submitResult == VK_ERROR_DEVICE_LOST) mock.lostSubmissionPending = true;
     return mock.submitResult;
 }
@@ -98,6 +112,40 @@ VKAPI_ATTR VkResult VKAPI_CALL mockDeviceWaitIdle(VkDevice) {
     ++mock.idleWaits;
     mock.lostSubmissionPending = false;
     return mock.idleResult;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateSemaphore(VkDevice, const VkSemaphoreCreateInfo*, const VkAllocationCallbacks*, VkSemaphore* semaphore) {
+    *semaphore = reinterpret_cast<VkSemaphore>(mock.next++);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockDestroySemaphore(VkDevice, VkSemaphore, const VkAllocationCallbacks*) {
+    Expect(!timelineWaitInProgress.load(), "a timeline was destroyed during its registered wait");
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCounterValue(VkDevice, VkSemaphore, std::uint64_t* value) {
+    *value = 0;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateQueryPool(VkDevice, const VkQueryPoolCreateInfo*, const VkAllocationCallbacks*, VkQueryPool*) {
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockWaitSemaphores(VkDevice, const VkSemaphoreWaitInfo* info, std::uint64_t) {
+    if (std::this_thread::get_id() != mock.waitingThread) return VK_SUCCESS;
+    Expect(!AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "the timeline wait retained the GPU mutex");
+    if (AgcDriver::GuestMemory::GpuMutex().HeldByThisThread()) return VK_ERROR_UNKNOWN;
+    ++mock.timelineWaits;
+    timelineWaitInProgress.store(true);
+    struct EndWait {
+        ~EndWait() { timelineWaitInProgress.store(false); }
+    } endWait;
+    for (const auto& [fence, serial] : mock.serials) {
+        if (serial <= info->pValues[0]) mock.signaled.at(fence) = true;
+    }
+    if (auto action = std::exchange(mock.duringWait, {})) action();
+    return mock.timelineResult;
 }
 
 VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, const void*) {}
@@ -123,6 +171,11 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkEndCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockEndCommandBuffer)},
         {"vkQueueSubmit", reinterpret_cast<PFN_vkVoidFunction>(mockQueueSubmit)},
         {"vkDeviceWaitIdle", reinterpret_cast<PFN_vkVoidFunction>(mockDeviceWaitIdle)},
+        {"vkCreateSemaphore", reinterpret_cast<PFN_vkVoidFunction>(mockCreateSemaphore)},
+        {"vkDestroySemaphore", reinterpret_cast<PFN_vkVoidFunction>(mockDestroySemaphore)},
+        {"vkWaitSemaphoresKHR", reinterpret_cast<PFN_vkVoidFunction>(mockWaitSemaphores)},
+        {"vkGetSemaphoreCounterValueKHR", reinterpret_cast<PFN_vkVoidFunction>(mockCounterValue)},
+        {"vkCreateQueryPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateQueryPool)},
         {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)},
         {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPipelineBarrier)},
         {"vkCmdBeginQuery", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBeginQuery)},
@@ -300,10 +353,149 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
     Expect(mock.signaled.empty() && mock.allocatedCommands == mock.freedCommands, "a failed submission leaked its fence or command buffer");
 }
 
+void UnlockedWaitMutation(bool retire, bool submitNew) {
+    mock = MockDevice{};
+    mock.waitingThread = std::this_thread::get_id();
+    AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Label);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext(), true);
+    std::vector<int> completions;
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto epoch = AgcDriver::GuestMemory::ThreadCollectEpoch();
+    recorder.Keep(std::make_shared<int>(1));
+    recorder.NotePendingWrite(0x1000, 4);
+    recorder.OnComplete([&] {
+        if (!retire && epoch != 0) Expect(AgcDriver::GuestMemory::ThreadCollectEpoch() > epoch, "the waiter's completion reused collections from before the unlocked wait");
+        completions.push_back(1);
+    });
+    const auto target = recorder.OpenSerial();
+    const auto allocated = mock.allocatedCommands;
+    mock.duringWait = [&] {
+        std::thread producer([&] {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Expect(mock.submits == 1, "the unlocked waiter did not submit its open batch first");
+            if (retire) recorder.Reap();
+            recorder.Keep(std::make_shared<int>(2));
+            recorder.NotePendingWrite(0x1000, 4);
+            recorder.OnComplete([&] { completions.push_back(2); });
+            if (retire) Expect(mock.allocatedCommands == allocated, "the retired batch's command buffer was not reused during the wait");
+            if (submitNew) {
+                recorder.Submit();
+                recorder.Keep(std::make_shared<int>(3));
+                recorder.NotePendingWrite(0x2000, 4);
+                recorder.OnComplete([&] { completions.push_back(3); });
+                recorder.Submit();
+            }
+        });
+        producer.join();
+    };
+    Expect(recorder.FinishUpToUnlocked(target), "an eligible wait did not unlock");
+    Expect(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 1, "the unlocked wait did not restore the outer hold");
+    if (epoch != 0) Expect(AgcDriver::GuestMemory::ThreadCollectEpoch() > epoch, "the unlocked wait reused its pre-wait collect epoch");
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr) Expect(AgcDriver::GuestMemory::GpuLockHoldSite() == AgcDriver::GuestMemory::GpuLockSite::Label, "the unlocked wait changed its profile site");
+    Expect(mock.timelineWaits == 1 && mock.submits == (submitNew ? 3u : 1u), "the unlocked wait did not allow another producer or submitted new work");
+    Expect(completions == std::vector<int>{1}, "the waiter reran an old completion or finished newly submitted work");
+    Expect(recorder.InFlightBatches() == (submitNew ? 2u : 0u) && recorder.PendingWriterSerial(0x1000, 4) == 2, "the waiter lost the new writer of the same range");
+    recorder.SyncThrough(0x1000, 4);
+    Expect(completions == std::vector<int>({1, 2}), "revalidation did not finish the new overlapping writer before publication");
+    Expect(recorder.PendingWriterSerial(0x1000, 4) == 0, "revalidation left the new overlapping writer pending");
+    Expect(recorder.InFlightBatches() == (submitNew ? 1u : 0u), "revalidation finished unrelated later work");
+    recorder.Sync();
+    Expect(completions == (submitNew ? std::vector<int>{1, 2, 3} : std::vector<int>{1, 2}), "completion order changed across the unlocked wait");
 }
 
-int main() {
+void UnlockedWaitReplacement() {
+    mock = MockDevice{};
+    mock.waitingThread = std::this_thread::get_id();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto context = mockContext();
+    std::optional<Recorder> recorder;
+    recorder.emplace(context, true);
+    recorder->Activate();
+    recorder->Keep(std::make_shared<int>(1));
+    const auto target = recorder->OpenSerial();
+    std::thread replacement;
+    std::atomic<bool> teardown{false};
+    recorder->OnComplete([&] { teardown.store(true); });
+    bool newCompletion = false;
+    mock.duringWait = [&] {
+        replacement = std::thread([&] {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            recorder.reset();
+            recorder.emplace(context, true);
+            recorder->Activate();
+            recorder->Keep(std::make_shared<int>(2));
+            recorder->OnComplete([&] { newCompletion = true; });
+            recorder->Submit();
+        });
+        while (!teardown.load()) std::this_thread::yield();
+    };
+    auto* original = &*recorder;
+    Expect(original->FinishUpToUnlocked(target), "the teardown wait did not unlock");
+    replacement.join();
+    Expect(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 1, "replacement lost the waiter's mutex hold");
+    Expect(Recorder::Active() == &*recorder && recorder->InFlightBatches() == 1 && !newCompletion, "the waiter touched the replacement recorder at the same address");
+    recorder->Sync();
+    Expect(newCompletion, "the replacement's completion was lost");
+}
+
+void UnlockedWaitFallbacks(bool enabled) {
+    mock = MockDevice{};
+    mock.waitingThread = std::this_thread::get_id();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    for (const bool timeline : {false, true}) {
+        Recorder recorder(mockContext(), timeline);
+        recorder.Keep(std::make_shared<int>(1));
+        {
+            std::lock_guard nested(AgcDriver::GuestMemory::GpuMutex());
+            Expect(!recorder.FinishUpToUnlocked(recorder.OpenSerial()), "a nested hold was released");
+            Expect(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 2, "the nested hold's depth changed");
+        }
+        if (!enabled || !timeline) Expect(!recorder.FinishUpToUnlocked(recorder.OpenSerial()), "a disabled or timeline-free wait unlocked");
+        Expect(recorder.Recording() && mock.timelineWaits == 0, "a fallback changed the recorder before returning");
+        recorder.OnComplete([&] {
+            Expect(!recorder.FinishUpToUnlocked(0), "a completion action was allowed to unlock");
+            Expect(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 1, "a completion action changed its hold depth");
+        });
+        recorder.Sync();
+    }
+}
+
+void UnlockedWaitFailure(bool exception) {
+    mock = MockDevice{};
+    mock.waitingThread = std::this_thread::get_id();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext(), true);
+    recorder.Keep(std::make_shared<int>(1));
+    if (exception) mock.duringWait = [] { throw std::runtime_error("injected timeline failure"); };
+    else mock.timelineResult = VK_ERROR_DEVICE_LOST;
+    bool failed = false;
     try {
+        recorder.FinishUpToUnlocked(recorder.OpenSerial());
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    Expect(failed && AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 1, "a failed wait did not restore the mutex before throwing");
+    Expect(recorder.InFlightBatches() == 1, "a failed wait retired work before reporting the error");
+}
+
+}
+
+int main(int argc, char** argv) {
+    try {
+        if (argc == 2 && std::string_view(argv[1]) == "--unlocked-waits") {
+            const bool enabled = std::getenv("APS5_UNLOCKED_LABEL_WAITS") != nullptr;
+            UnlockedWaitFallbacks(enabled);
+            if (enabled) {
+                for (const bool retire : {false, true}) {
+                    for (const bool submitNew : {false, true}) UnlockedWaitMutation(retire, submitNew);
+                }
+                UnlockedWaitReplacement();
+                UnlockedWaitFailure(false);
+                UnlockedWaitFailure(true);
+            }
+            return failures == 0 ? 0 : 1;
+        }
         OpenBatchUnderBudget();
         InFlightWithinTwiceTheBudget();
         SyncedWithinTwiceTheBudget();

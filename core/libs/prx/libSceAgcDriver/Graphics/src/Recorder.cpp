@@ -3959,6 +3959,9 @@ void Recorder::WaitSerial(std::uint64_t serial) {
     const UnlockedWaiter waiter{id};
     const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
     if (profile) {
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (GuestMemory::GpuMutex().HeldByThisThread()) GuestMemory::NoteLockedGpuWait(ms);
+        else GuestMemory::NoteUnlockedGpuWait(GuestMemory::GpuLockSite::Flush, ms);
         unlockedWaits.fetch_add(1, std::memory_order_relaxed);
         unlockedWaitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     }
@@ -3968,12 +3971,19 @@ void Recorder::WaitSerial(std::uint64_t serial) {
 bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     PerformanceTimer frameTiming("Recorder.WaitSerialFor");
     if (timeline == VK_NULL_HANDLE || serial == 0) return false;
+    const bool profile = DrawProfiled();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
     wait.pValues = &serial;
     const auto result = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR")(context.device, &wait, timeoutNanos);
+    if (profile) {
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (GuestMemory::GpuMutex().HeldByThisThread()) GuestMemory::NoteLockedGpuWait(ms);
+        else GuestMemory::NoteUnlockedGpuWait(GuestMemory::GpuLockSite::Wait, ms);
+    }
     if (result == VK_TIMEOUT) return false;
     Check(result, "vkWaitSemaphoresKHR submission progress");
     return true;
@@ -4009,6 +4019,39 @@ void Recorder::Sync() {
         finish(std::move(batch), true, source);
     }
     activeSyncSite = previousSite;
+}
+
+bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
+    static const bool enabled = std::getenv("APS5_UNLOCKED_LABEL_WAITS") != nullptr;
+    auto& mutex = GuestMemory::GpuMutex();
+    if (!enabled || timeline == VK_NULL_HANDLE || mutex.DepthOnThisThread() != 1 || completionDepth != 0) return false;
+    if (serial == 0) return true;
+    if (serial > submissions) Submit();
+    if (serial > submissions) throw std::runtime_error("AGC recorder: unlocked wait for an unrecorded batch");
+    const auto myId = id;
+    const auto device = context.device;
+    const auto semaphore = timeline;
+    const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+    const bool profile = DrawProfiled();
+    const auto lockSite = profile ? GuestMemory::GpuLockHoldSite() : GuestMemory::GpuLockSite::Other;
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    VkResult result = VK_SUCCESS;
+    try {
+        const UnlockedWaiter waiter{myId};
+        mutex.unlock();
+        result = WaitTimeline(device, semaphore, waitSemaphores, serial);
+    } catch (...) {
+        GuestMemory::TagGpuLockSite(lockSite);
+        mutex.lock();
+        throw;
+    }
+    if (profile) GuestMemory::NoteUnlockedGpuWait(lockSite, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    GuestMemory::TagGpuLockSite(lockSite);
+    mutex.lock();
+    Check(result, "vkWaitSemaphoresKHR label readback");
+    GuestMemory::BumpCollectEpoch();
+    if (RecorderAlive(myId)) FinishUpTo(serial);
+    return true;
 }
 
 void Recorder::FlushDeferredReleases() {
@@ -4177,6 +4220,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     // appended, never removed, so the index stays valid across the release).
     const RestoreSyncSite restoreSite{BeginSyncSite(source, site)};
     const bool profile = DrawProfiled();
+    const auto lockSite = profile ? GuestMemory::GpuLockHoldSite() : GuestMemory::GpuLockSite::Hook;
     const bool trace = TraceCapSync();
     const auto readSite = GuestMemory::CurrentReadSite();
     const auto newestSerial = submissions;
@@ -4214,7 +4258,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
     }
-    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+    GuestMemory::TagGpuLockSite(lockSite);
     mutex.lock();
     const auto ms = std::chrono::duration<double, std::milli>(waited - start).count();
     if (profile) {
@@ -4232,6 +4276,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
             holdCounters.hookUnlockedWaitMsBySource[source] += ms;
         }
         holdCounters.hookRelockMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waited).count();
+        GuestMemory::NoteUnlockedGpuWait(lockSite, ms);
         auto& stats = SyncWaits();
         auto& siteStats = stats.bySite[static_cast<std::size_t>(readSite)];
         ++siteStats.count;

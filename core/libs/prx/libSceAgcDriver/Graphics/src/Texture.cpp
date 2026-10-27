@@ -4698,6 +4698,41 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
     return stored;
 }
 
+void StorageTexture::PrepareReadbackBeforeLabel() {
+    static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
+    if (disabled) return;
+    static const bool unlocked = std::getenv("APS5_UNLOCKED_LABEL_WAITS") != nullptr;
+    if (!unlocked || GuestMemory::GpuMutex().DepthOnThisThread() != 1 || Recorder::InCompletion()) return;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || !recorder->HasTimeline()) return;
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        for (const auto* texture : pending.textures) {
+            if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
+        }
+    }
+    std::uint64_t target = 0;
+    for (const auto& [address, bytes] : ranges) {
+        std::vector<std::shared_ptr<StorageTexture>> flush;
+        std::vector<std::uint64_t> ownNotes;
+        {
+            auto& pending = Pending();
+            std::lock_guard lock(pending.mutex);
+            for (auto* texture : pending.textures) {
+                if (texture == refreshing || !texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
+                if (auto alive = texture->weak_from_this().lock()) flush.push_back(std::move(alive));
+                if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
+            }
+        }
+        if (flush.empty()) continue;
+        if (flush.size() != 1 || ExistingHostImportFor(flush.front()->context, flush.front()->descriptor.baseAddress, static_cast<std::size_t>(flush.front()->guestBytes)) == nullptr) ownNotes.clear();
+        target = std::max(target, recorder->PendingWriterSerial(address, bytes, ownNotes));
+    }
+    if (target != 0) static_cast<void>(recorder->FinishUpToUnlocked(target));
+}
+
 void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
     static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
     if (disabled) return;

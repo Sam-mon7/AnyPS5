@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -83,6 +84,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         else if (selfLocking && submit) ++packetSubmitDeferred;
         return;
     }
+    if (record || recordAtLock) Graphics::StorageTexture::PrepareReadbackBeforeLabel();
     const auto localDevice = device.Load();
     if (record || recordAtLock) {
         recordDeferredLabels(localDevice.get(), queue);
