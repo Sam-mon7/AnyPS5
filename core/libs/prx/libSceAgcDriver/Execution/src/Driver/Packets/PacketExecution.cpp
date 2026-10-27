@@ -239,6 +239,7 @@ void Driver::execute(const Submission& submission) {
         bumpEpoch(&EpochBumps::submissions);
     }
     clearResolvedAhead();
+    if (submission.queue == 0 && dispatchAheadAtSubmit()) activateSubmissionDispatches(submission);
     gateOpened() = true;
     struct ClearAhead {
         ~ClearAhead() { clearResolvedAhead(); }
