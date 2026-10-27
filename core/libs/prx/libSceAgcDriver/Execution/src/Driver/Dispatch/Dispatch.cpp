@@ -196,10 +196,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (fromAhead && ahead.speculative) {
                 if (ahead.registeredShader != registeredShader || ahead.indirectArguments != indirectArguments || !std::ranges::equal(ahead.packet, packet)) {
                     fromAhead = false;
-                    rejectDispatchAhead(AheadRejection::State);
+                    rejectDispatchAhead(AheadRejection::State, ahead.atSubmit);
                 } else if (ahead.preparedDevice != localDevice) {
                     fromAhead = false;
-                    rejectDispatchAhead(AheadRejection::Device);
+                    rejectDispatchAhead(AheadRejection::Device, ahead.atSubmit);
                 }
             }
         }
@@ -365,7 +365,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
-        if (ahead.speculative) rejectDispatchAhead(AheadRejection::Key);
+        if (ahead.speculative) rejectDispatchAhead(AheadRejection::Key, ahead.atSubmit);
     }
     if (fromAhead) {
         const auto validationStarted = profile && ahead.speculative ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -377,7 +377,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             fromAhead = false;
             ++dispatchesRejectedAhead;
             ++groupStats.memoryMismatches;
-            if (ahead.speculative) rejectDispatchAhead(*rejection);
+            if (ahead.speculative) rejectDispatchAhead(*rejection, ahead.atSubmit);
         } else if (ahead.speculative) {
             if (profile) aheadValidationMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - validationStarted).count();
         }
@@ -537,11 +537,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
-        if (fromAhead && ahead.speculative) rejectDispatchAhead(AheadRejection::Label);
+        if (fromAhead && ahead.speculative) rejectDispatchAhead(AheadRejection::Label, ahead.atSubmit);
         dispatch(queue, packet, submission, indirectArguments);
         return;
     }
-    if (fromAhead && ahead.speculative) adoptDispatchAhead(ahead.preparationMs, aheadValidationMs, ahead.cached);
+    if (fromAhead && ahead.speculative) adoptDispatchAhead(ahead.preparationMs, aheadValidationMs, ahead.cached, ahead.atSubmit);
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
@@ -571,7 +571,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     const auto rethrow = [&](const std::exception& error) {
         if (fromAhead) {
-            if (ahead.speculative) rejectDispatchAhead(AheadRejection::Device);
+            if (ahead.speculative) rejectDispatchAhead(AheadRejection::Device, ahead.atSubmit);
             ++groupStats.deviceRejects;
             dispatch(queue, packet, submission, indirectArguments);
             return true;

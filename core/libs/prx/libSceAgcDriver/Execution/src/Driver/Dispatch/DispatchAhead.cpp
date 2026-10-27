@@ -18,6 +18,14 @@
 
 namespace AgcDriver::DriverDetail {
 
+struct DispatchAheadBatch {
+    std::map<std::size_t, std::shared_ptr<Driver::DispatchSpeculation>> pending;
+
+    ~DispatchAheadBatch() {
+        for (const auto& [offset, work] : pending) work->cancelled.store(true, std::memory_order_release);
+    }
+};
+
 namespace {
 
 bool ProfileAhead() {
@@ -39,6 +47,9 @@ static_assert(std::is_trivially_destructible_v<SpeculationCounts>);
 struct HelperCounts {
     std::mutex mutex;
     std::uint64_t completed = 0, prepared = 0, queueNs = 0, workNs = 0, preparationNs = 0;
+    std::uint64_t submitQueued = 0, submitStarted = 0, submitFinishedBeforeUse = 0, submitTaken = 0, submitAdopted = 0;
+    std::array<std::uint64_t, 14> submitRejected{};
+    double submitLeadMs = 0, submitReadyLeadMs = 0;
 };
 
 HelperCounts& HelperStats() {
@@ -71,7 +82,18 @@ void ReportSpeculation() {
         stats.rejected[0] != 0 ? stats.notReadyLeadMs * 1000.0 / static_cast<double>(stats.rejected[0]) : 0.0,
         static_cast<unsigned long long>(helpers.completed), static_cast<unsigned long long>(helpers.prepared),
         static_cast<double>(helpers.queueNs) * perJob, static_cast<double>(helpers.workNs) * perJob, static_cast<double>(helpers.preparationNs) * perPrepared);
+    ProfilePrint_nid_no_patch("[dispatch-ahead] submit (10 s): queued %llu started %llu finished-before-use %llu adopted %llu; rejected: not-ready %llu no-entry %llu no-invocation %llu footprint %llu state %llu key %llu epoch %llu layout %llu generation %llu pending %llu memory %llu cancelled %llu label %llu device %llu; lead %.1f us/take (%llu takes), ready lead %.1f us/use\n",
+        static_cast<unsigned long long>(helpers.submitQueued), static_cast<unsigned long long>(helpers.submitStarted), static_cast<unsigned long long>(helpers.submitFinishedBeforeUse), static_cast<unsigned long long>(helpers.submitAdopted),
+        static_cast<unsigned long long>(helpers.submitRejected[0]), static_cast<unsigned long long>(helpers.submitRejected[1]), static_cast<unsigned long long>(helpers.submitRejected[2]), static_cast<unsigned long long>(helpers.submitRejected[3]),
+        static_cast<unsigned long long>(helpers.submitRejected[4]), static_cast<unsigned long long>(helpers.submitRejected[5]), static_cast<unsigned long long>(helpers.submitRejected[6]), static_cast<unsigned long long>(helpers.submitRejected[7]),
+        static_cast<unsigned long long>(helpers.submitRejected[8]), static_cast<unsigned long long>(helpers.submitRejected[9]), static_cast<unsigned long long>(helpers.submitRejected[10]), static_cast<unsigned long long>(helpers.submitRejected[11]),
+        static_cast<unsigned long long>(helpers.submitRejected[12]), static_cast<unsigned long long>(helpers.submitRejected[13]),
+        helpers.submitTaken != 0 ? helpers.submitLeadMs * 1000.0 / static_cast<double>(helpers.submitTaken) : 0.0, static_cast<unsigned long long>(helpers.submitTaken),
+        helpers.submitFinishedBeforeUse != 0 ? helpers.submitReadyLeadMs * 1000.0 / static_cast<double>(helpers.submitFinishedBeforeUse) : 0.0);
     helpers.completed = helpers.prepared = helpers.queueNs = helpers.workNs = helpers.preparationNs = 0;
+    helpers.submitQueued = helpers.submitStarted = helpers.submitFinishedBeforeUse = helpers.submitTaken = helpers.submitAdopted = 0;
+    helpers.submitRejected = {};
+    helpers.submitLeadMs = helpers.submitReadyLeadMs = 0;
     stats = {};
 }
 
@@ -108,7 +130,7 @@ struct FrozenMemory {
 bool Driver::dispatchAheadEnabled() {
     static const bool enabled = [] {
         const auto* text = std::getenv("APS5_DISPATCH_AHEAD");
-        return text != nullptr && std::string_view(text) == "1" && std::getenv("APS5_NO_DISPATCH_CACHE") == nullptr && std::getenv("APS5_DISPATCH_STAMP_VALIDATE") == nullptr && std::getenv("APS5_PROBE_DISPATCH") == nullptr;
+        return text != nullptr && (std::string_view(text) == "1" || std::string_view(text) == "2") && std::getenv("APS5_NO_DISPATCH_CACHE") == nullptr && std::getenv("APS5_DISPATCH_STAMP_VALIDATE") == nullptr && std::getenv("APS5_PROBE_DISPATCH") == nullptr;
     }();
     return enabled;
 }
@@ -117,24 +139,42 @@ void Driver::SetAheadScheduleHook(void (*hook)()) {
     aheadScheduleHook.store(hook, std::memory_order_release);
 }
 
+bool Driver::dispatchAheadAtSubmit() {
+    static const bool enabled = [] {
+        const auto* text = std::getenv("APS5_DISPATCH_AHEAD");
+        return text != nullptr && std::string_view(text) == "2";
+    }();
+    return enabled && dispatchAheadEnabled();
+}
+
 std::map<std::size_t, std::shared_ptr<Driver::DispatchSpeculation>>& Driver::dispatchSpeculations() {
     static thread_local std::map<std::size_t, std::shared_ptr<DispatchSpeculation>>* slot = nullptr;
     return ShaderRecompiler::ThreadOwned(slot);
 }
 
-void Driver::rejectDispatchAhead(AheadRejection reason) {
+void Driver::rejectDispatchAhead(AheadRejection reason, bool atSubmit) {
     if (!ProfileAhead()) return;
     ++SpeculationStats().rejected[static_cast<std::size_t>(reason)];
+    if (atSubmit) {
+        auto& helpers = HelperStats();
+        std::lock_guard lock(helpers.mutex);
+        ++helpers.submitRejected[static_cast<std::size_t>(reason)];
+    }
     ReportSpeculation();
 }
 
-void Driver::adoptDispatchAhead(double preparationMs, double validationMs, bool cached) {
+void Driver::adoptDispatchAhead(double preparationMs, double validationMs, bool cached, bool atSubmit) {
     if (!ProfileAhead()) return;
     auto& stats = SpeculationStats();
     ++stats.adopted;
     if (!cached) ++stats.recaptured;
     stats.preparationMs += preparationMs;
     stats.validationMs += validationMs;
+    if (atSubmit) {
+        auto& helpers = HelperStats();
+        std::lock_guard lock(helpers.mutex);
+        ++helpers.submitAdopted;
+    }
     ReportSpeculation();
 }
 
@@ -167,19 +207,48 @@ std::uint64_t Driver::dispatchKey(std::uint64_t address, std::uint32_t initiator
 
 void Driver::scheduleDispatchAhead(const Submission& submission, const QueueState& live, std::size_t from) {
     if (!dispatchAheadEnabled() || submission.queue != 0 || !dispatchSpeculations().empty() || submission.shaders == nullptr || DrawPipeline::Active()) return;
+    scanDispatchAhead(submission, live, from, dispatchSpeculations(), false);
+}
+
+void Driver::prepareSubmissionDispatches(Submission& submission) {
+    if (submission.shaders == nullptr || DrawPipeline::Active()) return;
+    auto batch = std::make_shared<DispatchAheadBatch>();
+    try {
+        scanDispatchAhead(submission, QueueState{}, 0, batch->pending, true);
+    } catch (const std::exception&) {
+        return;
+    }
+    if (!batch->pending.empty()) submission.dispatchAhead = std::move(batch);
+}
+
+void Driver::activateSubmissionDispatches(const Submission& submission) {
+    if (submission.dispatchAhead == nullptr) return;
+    auto& pending = dispatchSpeculations();
+    pending.swap(submission.dispatchAhead->pending);
+    for (const auto& [offset, work] : pending) work->epoch = GuestMemory::ThreadCollectEpoch();
+}
+
+void Driver::scanDispatchAhead(const Submission& submission, const QueueState& live, std::size_t from, std::map<std::size_t, std::shared_ptr<DispatchSpeculation>>& pending, bool atSubmit) {
     const auto localDevice = device.Load();
     if (localDevice == nullptr) return;
     QueueState scratch = live;
-    auto& pending = dispatchSpeculations();
     for (std::size_t cursor = from, packets = 0; cursor < submission.commands.size() && pending.size() < 8 && packets < 128; ++packets) {
         const auto header = submission.commands[cursor];
         if (Pm4::FillerPacket(header)) { ++cursor; continue; }
         const auto count = Pm4::PacketWords(header);
-        if (count > submission.commands.size() - cursor || Pm4::Predicated(header)) break;
+        if (count > submission.commands.size() - cursor || Pm4::Predicated(header) || cursor - from + count > 16384) break;
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         if (opcode == 0x15 || opcode == 0x16) {
             if (opcode == 0x15 ? count != 5u : count != 3u && count != 4u) break;
+            if (atSubmit && opcode == 0x16 && count != 4u) break;
+            if (atSubmit) {
+                bool complete = true;
+                for (const auto offset : {0x207u, 0x208u, 0x209u, 0x20cu, 0x20du, 0x212u, 0x213u}) complete = complete && scratch.shader.contains(offset);
+                const auto userCount = (readRegister(scratch.shader, 0x213) >> 1u) & 0x1fu;
+                for (std::uint32_t index = 0; index < userCount; ++index) complete = complete && scratch.shader.contains(0x240u + index);
+                if (!complete) break;
+            }
             std::array<std::uint32_t, 5> direct{};
             std::uint64_t arguments = 0;
             try {
@@ -190,20 +259,25 @@ void Driver::scheduleDispatchAhead(const Submission& submission, const QueueStat
                     direct = {0xc0031500u, 0, 0, 0, packet.back()};
                 }
             } catch (const std::exception&) { break; }
-            if (dispatchAheadOutstanding.fetch_add(1, std::memory_order_acq_rel) >= 16) {
-                dispatchAheadOutstanding.fetch_sub(1, std::memory_order_release);
-                break;
-            }
+            auto budget = std::make_shared<DispatchAheadBudget>(dispatchAheadOutstanding);
+            if (!budget->admitted) break;
             auto work = std::make_shared<DispatchSpeculation>();
-            work->result.epoch = GuestMemory::ThreadCollectEpoch();
+            work->epoch = atSubmit ? 0 : GuestMemory::ThreadCollectEpoch();
+            work->result.atSubmit = atSubmit;
+            work->result.budget = std::move(budget);
             work->result.shader = scratch.shader;
             pending.emplace(cursor, work);
             if (ProfileAhead()) {
-                ++SpeculationStats().speculated;
+                if (!atSubmit) ++SpeculationStats().speculated;
                 work->queuedAt = std::chrono::steady_clock::now();
             }
             const bool submitted = SubmitDispatchPreparation([this, work, shaders = submission.shaders, localDevice, direct, arguments] {
                 const auto started = ProfileAhead() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                if (ProfileAhead() && work->result.atSubmit) {
+                    auto& stats = HelperStats();
+                    std::lock_guard lock(stats.mutex);
+                    ++stats.submitStarted;
+                }
                 try {
                     if (!work->cancelled.load(std::memory_order_acquire)) speculateDispatch(work, shaders, localDevice, direct, arguments);
                 } catch (const std::exception&) {
@@ -211,6 +285,7 @@ void Driver::scheduleDispatchAhead(const Submission& submission, const QueueStat
                 }
                 if (ProfileAhead()) {
                     const auto finished = std::chrono::steady_clock::now();
+                    work->finishedAt = finished;
                     auto& stats = HelperStats();
                     std::lock_guard lock(stats.mutex);
                     stats.queueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(started - work->queuedAt).count());
@@ -222,11 +297,13 @@ void Driver::scheduleDispatchAhead(const Submission& submission, const QueueStat
                     ++stats.completed;
                 }
                 work->ready.store(true, std::memory_order_release);
-                dispatchAheadOutstanding.fetch_sub(1, std::memory_order_release);
             });
             if (!submitted) {
-                dispatchAheadOutstanding.fetch_sub(1, std::memory_order_release);
                 work->ready.store(true, std::memory_order_release);
+            } else if (ProfileAhead() && atSubmit) {
+                auto& stats = HelperStats();
+                std::lock_guard lock(stats.mutex);
+                ++stats.submitQueued;
             }
             Pm4::NoteDispatchRegisters(packet, scratch);
         } else if (opcode == 0x76) {
@@ -253,13 +330,27 @@ void Driver::takeDispatchAhead(const QueueState& live, std::size_t from) {
         const auto leadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - work->queuedAt).count();
         stats.leadMs += leadMs;
         if (!ready) stats.notReadyLeadMs += leadMs;
+        if (work->result.atSubmit) {
+            auto& helpers = HelperStats();
+            std::lock_guard lock(helpers.mutex);
+            ++stats.speculated;
+            ++helpers.submitTaken;
+            helpers.submitLeadMs += leadMs;
+            if (ready && work->result.compiledResult != nullptr) {
+                ++helpers.submitFinishedBeforeUse;
+                helpers.submitReadyLeadMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - work->finishedAt).count();
+            }
+        }
     }
     if (!ready) {
         work->cancelled.store(true, std::memory_order_release);
-        rejectDispatchAhead(AheadRejection::NotReady);
-    } else if (work->result.compiledResult == nullptr) rejectDispatchAhead(work->rejection);
-    else if (work->result.shader != live.shader) rejectDispatchAhead(AheadRejection::State);
-    else resolvedAhead().insert_or_assign(from, std::move(work->result));
+        rejectDispatchAhead(AheadRejection::NotReady, work->result.atSubmit);
+    } else if (work->result.compiledResult == nullptr) rejectDispatchAhead(work->rejection, work->result.atSubmit);
+    else if (work->result.shader != live.shader) rejectDispatchAhead(AheadRejection::State, work->result.atSubmit);
+    else {
+        work->result.epoch = work->epoch;
+        resolvedAhead().insert_or_assign(from, std::move(work->result));
+    }
 }
 
 void Driver::speculateDispatch(const std::shared_ptr<DispatchSpeculation>& work, const std::shared_ptr<const ShaderRegistry>& shaders, const std::shared_ptr<VulkanDevice>& localDevice, std::array<std::uint32_t, 5> packet, std::uint64_t arguments) {
@@ -286,6 +377,10 @@ void Driver::speculateDispatch(const std::shared_ptr<DispatchSpeculation>& work,
     if (entry == nullptr || entry->variants.empty()) return;
     const auto& variant = entry->variants.front();
     if (variant->shader != shader) return;
+    if (variant->words.size() > 65536 || variant->runs.size() > 4096) {
+        work->rejection = AheadRejection::Footprint;
+        return;
+    }
     result.layout = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     result.forget = GuestMemory::ForgetSerial();
     if (variant->forgetSerial != result.forget) {
@@ -299,13 +394,15 @@ void Driver::speculateDispatch(const std::shared_ptr<DispatchSpeculation>& work,
     std::vector<std::shared_ptr<const GuestAllocations::Range>> leases;
     work->rejection = AheadRejection::Footprint;
     for (const auto& [begin, end] : variant->runs) {
+        if (end < begin || end - begin > result.ownedWords.size() * sizeof(std::uint32_t) - at) return;
+        const auto bytes = static_cast<std::size_t>(end - begin);
         for (auto address = begin; address < end;) {
             auto lease = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(address), false);
             if (lease == nullptr || !lease->readable || address < lease->address || address - lease->address >= lease->bytes) return;
             address = std::min(end, lease->address + lease->bytes);
+            if (leases.size() == 4096) return;
             leases.push_back(std::move(lease));
         }
-        const auto bytes = static_cast<std::size_t>(end - begin);
         const auto pendingWrites = Graphics::Recorder::PendingWriteSnapshot();
         if (Graphics::Recorder::SnapshotOverlaps(pendingWrites.get(), begin, bytes)) {
             work->rejection = AheadRejection::Pending;
@@ -318,6 +415,7 @@ void Driver::speculateDispatch(const std::shared_ptr<DispatchSpeculation>& work,
         result.captured.push_back({begin, destination});
         at += bytes;
     }
+    if (at != result.ownedWords.size() * sizeof(std::uint32_t)) return;
     leases.clear();
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
     if (result.ownedWords == variant->words) {
@@ -425,7 +523,7 @@ void Driver::clearResolvedAhead() {
     if (dispatchAheadEnabled()) {
         for (const auto& [offset, work] : dispatchSpeculations()) {
             work->cancelled.store(true, std::memory_order_release);
-            rejectDispatchAhead(AheadRejection::Cancelled);
+            rejectDispatchAhead(AheadRejection::Cancelled, work->result.atSubmit);
         }
         dispatchSpeculations().clear();
     }

@@ -46,6 +46,8 @@ enum class Window { None, CpuStore, QueuedGpuStore, Epoch, Recapture, Indirect, 
 
 std::atomic<Window> Armed{Window::None};
 std::atomic<std::uint64_t> AheadWaits{0};
+std::atomic<std::uint64_t> SubmitWaits{0};
+std::thread::id Submitter;
 std::uint32_t SpinDispatches = 16;
 std::vector<std::uint32_t> OtherWords;
 bool SawPending = false;
@@ -119,6 +121,7 @@ void BeforeAdoption() {
 void AwaitAhead() {
     AgcDriver::DriverDetail::AwaitDispatchPreparation();
     ++AheadWaits;
+    if (std::this_thread::get_id() == Submitter) ++SubmitWaits;
 }
 
 void WaitIdle() {
@@ -196,6 +199,49 @@ void MappingChange() {
     Require(AgcDriverDispatchesRejectedAhead_nid_postfix() == rejected + 1, "a helper result crossed a mapping invalidation");
 }
 
+bool WaitingOnGate() {
+    for (const auto& wait : AgcDriver::DriverDetail::Driver::Get().AwaitedWaits()) {
+        if (wait.address == reinterpret_cast<std::uintptr_t>(&Gate)) return true;
+    }
+    return false;
+}
+
+void SubmissionPreparation(bool replaceDescriptor, bool inheritedState = false, Window window = Window::None) {
+    Reset();
+    Gate = 0;
+    struct ReleaseGate {
+        ~ReleaseGate() { Gate = 1; }
+    } release;
+    std::vector<std::uint32_t> earlier{0xc0053c00u, 0x13u, Low(&Gate), High(&Gate), 1u, 0xffffffffu, 0x19u};
+    if (inheritedState) SetShaderRegister(earlier, 0x250, 7);
+    WriteData(earlier, &Done, 1);
+    Submit(Compute, earlier);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!WaitingOnGate() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    Require(WaitingOnGate() && Done == 0, "the earlier submission did not remain executing on its wait");
+    std::vector<std::uint32_t> later;
+    SetShaderRegister(later, 0x200, 0x8041u);
+    for (const auto offset : {0x201u, 0x202u, 0x203u}) SetShaderRegister(later, offset, 1);
+    Dispatch(later, CounterCode.data(), {Low(Target.data()), High(Target.data())});
+    const auto submitWaits = SubmitWaits.load();
+    const auto adopted = AgcDriverDispatchesAdoptedAhead_nid_postfix();
+    const auto rejected = AgcDriverDispatchesRejectedAhead_nid_postfix();
+    Submit(Compute, later);
+    Require(SubmitWaits.load() == submitWaits + 1, "the queued dispatch was not prepared on receipt");
+    Require(WaitingOnGate() && Done == 0, "the earlier submission finished before preparation completed");
+    Require(AgcDriverDispatchesAdoptedAhead_nid_postfix() == adopted, "the queued dispatch executed before the gate opened");
+    if (replaceDescriptor) reinterpret_cast<volatile std::uint32_t&>(Target[0]) = Low(Fresh.data());
+    Armed = window;
+    Gate = 1;
+    WaitIdle();
+    Armed = Window::None;
+    Require(Done == 1, "the earlier submission did not complete");
+    Require(Stale[0] == (replaceDescriptor ? 0u : 1u) && Fresh[0] == (replaceDescriptor ? 1u : 0u), "the submission helper used stale input " + Counts());
+    Require(AgcDriverDispatchesAdoptedAhead_nid_postfix() == adopted + (replaceDescriptor || inheritedState || window != Window::None ? 0u : 1u), "the submission helper adoption count was wrong");
+    if (replaceDescriptor || window != Window::None) Require(AgcDriverDispatchesRejectedAhead_nid_postfix() == rejected + 1, "the submission helper missed the intervening guest store or epoch change");
+    std::cout << "submission preparation " << (inheritedState ? "inherited state rejected" : replaceDescriptor ? "intervening guest store rejected" : window != Window::None ? "epoch change rejected" : "adopted behind executing submission") << ": passed\n";
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -204,7 +250,9 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         device.reset();
         const bool helperCore = argc == 2 && std::string(argv[1]) == "--helper-core";
-        const bool helper = helperCore || (argc == 2 && std::string(argv[1]) == "--helper");
+        const bool helperSubmit = argc == 2 && std::string(argv[1]) == "--helper-submit";
+        const bool helper = helperCore || helperSubmit || (argc == 2 && std::string(argv[1]) == "--helper");
+        Submitter = std::this_thread::get_id();
         Shader shader{};
         if (helper) {
             Compute = 0;
@@ -234,6 +282,17 @@ int main(int argc, char** argv) {
         Submit(OtherCompute, otherWarmUp);
         WaitIdle();
         Require(Done == 1 && Target[0] == Low(Fresh.data()), "the warm-up dispatches did not run");
+
+        if (helperSubmit) {
+            SubmissionPreparation(false);
+            SubmissionPreparation(true);
+            SubmissionPreparation(false, false, Window::Epoch);
+            SubmissionPreparation(false, true);
+            AgcDriverSetAheadAdoptHook_nid_postfix(nullptr);
+            AgcDriver::DriverDetail::Driver::Get().SetAheadScheduleHook(nullptr);
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
 
         Gated(Window::None);
         Require(Stale[0] == 1 && Fresh[0] == 0, "the gated dispatch without a store in the window did not count into the stale buffer " + Counts());

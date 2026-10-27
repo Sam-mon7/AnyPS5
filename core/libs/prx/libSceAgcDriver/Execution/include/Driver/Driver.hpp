@@ -113,6 +113,7 @@ public:
     std::shared_ptr<const ShaderRegistry> RegisteredShaders();
 
 private:
+    friend struct DispatchAheadBatch;
     friend class SampledReadScope;
     friend struct PendingView;
     friend struct PacketTimer;
@@ -310,7 +311,14 @@ private:
     static std::vector<PendingWait>& pendingWaits();
     static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received);
     void landPendingWaits(std::uint32_t queue);
+    struct DispatchAheadBudget {
+        std::atomic<unsigned>& outstanding;
+        bool admitted;
+        explicit DispatchAheadBudget(std::atomic<unsigned>& outstanding) : outstanding(outstanding), admitted(outstanding.fetch_add(1, std::memory_order_acq_rel) < 16) {}
+        ~DispatchAheadBudget() { outstanding.fetch_sub(1, std::memory_order_release); }
+    };
     struct ResolvedDispatch {
+        std::shared_ptr<DispatchAheadBudget> budget;
         std::uint64_t address = 0, key = 0, indirectArguments = 0;
         std::array<std::uint32_t, 5> packet{};
         std::shared_ptr<const ShaderSnapshot> registeredShader;
@@ -331,24 +339,30 @@ private:
         std::vector<Stamp> stamps;
         Registers shader;
         std::uint64_t epoch = 0, layout = 0, forget = 0;
-        bool speculative = false;
+        bool speculative = false, atSubmit = false;
         double preparationMs = 0;
     };
     enum class AheadRejection : std::size_t { NotReady, NoEntry, NoInvocation, Footprint, State, Key, Epoch, Layout, Generation, Pending, Memory, Cancelled, Label, Device, Count };
     struct DispatchSpeculation {
         std::atomic<bool> ready{false}, cancelled{false};
         std::chrono::steady_clock::time_point queuedAt{};
+        std::chrono::steady_clock::time_point finishedAt{};
+        std::uint64_t epoch = 0;
         ResolvedDispatch result;
         AheadRejection rejection = AheadRejection::NoEntry;
     };
     static bool dispatchAheadEnabled();
+    static bool dispatchAheadAtSubmit();
     static std::map<std::size_t, std::shared_ptr<DispatchSpeculation>>& dispatchSpeculations();
     void scheduleDispatchAhead(const Submission& submission, const QueueState& live, std::size_t from);
+    void prepareSubmissionDispatches(Submission& submission);
+    static void activateSubmissionDispatches(const Submission& submission);
+    void scanDispatchAhead(const Submission& submission, const QueueState& live, std::size_t from, std::map<std::size_t, std::shared_ptr<DispatchSpeculation>>& pending, bool atSubmit);
     void takeDispatchAhead(const QueueState& live, std::size_t from);
     void speculateDispatch(const std::shared_ptr<DispatchSpeculation>& work, const std::shared_ptr<const ShaderRegistry>& shaders, const std::shared_ptr<VulkanDevice>& localDevice, std::array<std::uint32_t, 5> packet, std::uint64_t arguments);
     static std::uint64_t dispatchKey(std::uint64_t address, std::uint32_t initiator, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const Registers& registers, const ShaderSnapshot* shader);
-    static void rejectDispatchAhead(AheadRejection reason);
-    static void adoptDispatchAhead(double preparationMs, double validationMs, bool cached);
+    static void rejectDispatchAhead(AheadRejection reason, bool atSubmit = false);
+    static void adoptDispatchAhead(double preparationMs, double validationMs, bool cached, bool atSubmit);
     static void noteDispatchAheadQueueMs(double ms);
     static std::optional<AheadRejection> validateDispatchAhead(const ResolvedDispatch& ahead);
     struct GroupCaptureStats {
