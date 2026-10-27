@@ -242,7 +242,112 @@ void PreparedDraws(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::State s
     }
 }
 
-void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> pixelCode, std::uint32_t scissorWidth, bool prelock = false) {
+void PreparedTargetDraws(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::State& state, const AgcDriver::Pm4::DrawParameters& draw, std::span<const AgcDriver::Graphics::CompiledShader> shaders, void* vertices) {
+    using namespace AgcDriver;
+    using namespace AgcDriver::Graphics;
+    const auto context = VulkanDeviceTestAccess::ContextOf(device);
+    const auto surface = SurfaceForTarget(state.color);
+    const bool enabled = StorageTexture::DrawTargetPrelockEnabled() && DrawPrelockEnabled();
+    const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::shared_ptr<const DrawRecipe> recipe;
+    {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        device.Draw(state, draw, shaders, {}, &recipe);
+        device.WaitIdle();
+    }
+    for (unsigned step = 0; step != 11; ++step) {
+        unsigned kept = 0x45;
+        GuestMemory::Write(state.color.address, std::vector<std::byte>(TargetBytes, static_cast<std::byte>(kept)));
+        GuestMemory::BumpCollectEpoch();
+        std::shared_ptr<StorageTexture> image;
+        {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            image = CachedStorageSurface(context, surface);
+            Require(image->Refresh(), "the target preparation fixture did not establish a clean refresh proof");
+        }
+        auto prepared = device.PrepareDraw(state, draw, shaders, step == 8 ? recipe.get() : nullptr);
+        const bool memo = GuestMemory::ThreadCollectEpoch() != 0;
+        if (enabled && memo) Require(prepared.targets.size() == 1 && prepared.targets[0].ready, "the target preparation fixture did not prove a clean resident target before locking");
+        else Require(prepared.targets.empty(), "target proofs ignored the opt-in, preparation or collect-memo switch");
+        if (step == 0) {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            auto* proof = prepared.targets.empty() ? nullptr : &prepared.targets[0];
+            Require(CachedStorageSurface(context, surface, proof) == image, "a clean prepared lookup changed image identity");
+            if (enabled && memo && profile) Require(proof->lookupAccepted && proof->accepted, "the clean target lookup did not use its pre-lock proof");
+        }
+        if (step == 1 || step == 8) {
+            kept = 0x46 + step;
+            std::memset(reinterpret_cast<void*>(state.color.address), kept, TargetBytes);
+            GuestMemory::BumpCollectEpoch();
+        }
+        if (step == 2) {
+            kept = 0x47;
+            const std::array<std::uint32_t, 4> pattern{0x47474747u, 0x47474747u, 0x47474747u, 0x47474747u};
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            Require(device.FillBuffer(state.color.address, TargetBytes, pattern), "the target proof fixture could not record an intervening GPU fill");
+        }
+        std::shared_ptr<StorageTexture> foreign;
+        if (step == 3 || step == 9) {
+            kept = 0x48;
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            auto alias = surface;
+            alias.width /= 2;
+            alias.height *= 2;
+            foreign = CachedStorageSurface(context, alias);
+            Require(foreign != image && foreign->GuestBytes() == image->GuestBytes(), "the target proof fixture has no distinct equal-span foreign image");
+            const std::array<std::uint32_t, 4> pattern{0x48484848u, 0x48484848u, 0x48484848u, 0x48484848u};
+            const char* refusal = nullptr;
+            Require(foreign->FillClear(pattern, StorageTexture::WholeImage, refusal), refusal != nullptr ? refusal : "the foreign image clear failed");
+        }
+        if (step == 9) {
+            prepared = device.PrepareDraw(state, draw, shaders);
+            if (enabled && memo) Require(!prepared.targets[0].ready, "a foreign pending image passed the pre-lock proof");
+        }
+        if (step == 4) {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            ClearCachedTextures(context.device);
+            Require(!StorageImageCached(context, image.get()), "the target proof fixture did not evict its image");
+        }
+        std::unique_ptr<Block> mapping;
+        if (step == 5) mapping = std::make_unique<Block>(BlockBytes, false);
+        if (step == 6) GuestMemory::Unwatch(state.color.address, TargetBytes);
+        if (step == 7) GuestMemory::BumpCollectEpoch();
+        if (step == 10) {
+            auto moved = Triangle;
+            for (auto& vertex : moved) vertex[0] += 4.0f;
+            GuestMemory::Write(reinterpret_cast<std::uintptr_t>(vertices), std::as_bytes(std::span(moved)));
+            GuestMemory::BumpCollectEpoch();
+        }
+        {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            if (step == 8) Require(device.DrawFromRecipe(state, draw, shaders, {}, recipe, nullptr, &prepared) == RecipeOutcome::Recorded, "the stale-target recipe did not refresh and record");
+            else device.Draw(state, draw, shaders, {}, &recipe, nullptr, &prepared);
+            if (enabled && memo && profile && step != 0) Require(!prepared.targets[0].lookupAccepted && !prepared.targets[0].accepted, "a changed target or resource input reused a stale pre-lock proof at step " + std::to_string(step));
+            device.WaitIdle();
+        }
+        std::vector<std::byte> stored(TargetBytes);
+        GuestMemory::Read(state.color.address, stored);
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                const auto offset = static_cast<std::size_t>(y) * RowBytes + x * 16u;
+                if (step != 10 && x < state.scissor.extent.width) {
+                    std::array<float, 4> actual{};
+                    std::memcpy(actual.data(), stored.data() + offset, sizeof(actual));
+                    Require(actual == std::array<float, 4>{static_cast<float>(x), static_cast<float>(y), 0.0f, 1.0f}, "a prepared draw used stale resources at step " + std::to_string(step));
+                } else {
+                    Require(std::all_of(stored.begin() + offset, stored.begin() + offset + 16u, [&](std::byte byte) { return byte == static_cast<std::byte>(kept); }), "a prepared draw used stale target contents or stale vertices at step " + std::to_string(step));
+                }
+            }
+        }
+        if (step == 6) {
+            const std::pair<std::uint64_t, std::uint64_t> range{state.color.address, state.color.address + TargetBytes};
+            GuestMemory::Rewatch(std::span(&range, 1));
+        }
+    }
+    GuestMemory::Write(reinterpret_cast<std::uintptr_t>(vertices), std::as_bytes(std::span(Triangle)));
+}
+
+void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> pixelCode, std::uint32_t scissorWidth, bool prelock = false, bool targetPrelock = false) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
@@ -303,7 +408,8 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     state.blendConstants = {};
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
     if (prelock) {
-        PreparedDraws(device, state, draw, shaders);
+        if (targetPrelock) PreparedTargetDraws(device, state, draw, shaders, vertexBlock->data);
+        else PreparedDraws(device, state, draw, shaders);
         return;
     }
     device.Draw(state, draw, shaders);
@@ -374,12 +480,14 @@ int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (argc == 2 && std::string_view(argv[1]) == "--draw-prelock") {
+        if (argc == 2 && (std::string_view(argv[1]) == "--draw-prelock" || std::string_view(argv[1]) == "--draw-target-prelock")) {
             Block block(BlockBytes, true);
             std::fill(block.data, block.data + block.bytes, std::uint8_t{0xff});
             const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
             if (AgcDriver::Graphics::HostImportFor(context, block.Address(), block.bytes) == nullptr) return VulkanTestSkipped;
-            Draw(*device, DecodeTarget(block), Program(0, false), Drawn, true);
+            const bool targetPrelock = std::string_view(argv[1]) == "--draw-target-prelock";
+            if (targetPrelock && !AgcDriver::GuestMemory::Watched(block.Address(), TargetBytes)) return VulkanTestSkipped;
+            Draw(*device, DecodeTarget(block), Program(0, false), Drawn, true, targetPrelock);
             std::puts("draw preparation tests passed");
             return 0;
         }
