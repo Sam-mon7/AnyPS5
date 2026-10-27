@@ -434,17 +434,9 @@ void Driver::execute(const Submission& submission) {
             packetCounters.CountDispatch();
             landPendingWaits(submission.queue);
             currentPacketOffset() = cursor;
-            if (submission.queue == 0 && dispatchAheadEnabled()) {
-                timed(&WorkerProfile::dispatchMs, [&] {
-                    const auto aheadStarted = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                    scheduleDispatchAhead(submission, queue, cursor);
-                    takeDispatchAhead(queue, cursor);
-                    if (profilePackets) noteDispatchAheadQueueMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - aheadStarted).count());
-                });
-            }
             if (gateOpened()) {
                 gateOpened() = false;
-                if ((!pipelineDispatch() || submission.queue != 0) && (submission.queue != 0 || !dispatchAheadEnabled())) {
+                if (!pipelineDispatch() || submission.queue != 0) {
                     if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
                 }

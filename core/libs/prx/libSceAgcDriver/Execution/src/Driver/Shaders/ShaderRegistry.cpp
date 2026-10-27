@@ -1501,30 +1501,19 @@ public:
         return PrebuildSlot().load();
     }
 
-    static RegistrationPreparePool& Dispatch() {
-        static auto* pool = [] {
-            std::lock_guard lifecycle(Lifecycle());
-            auto* created = new RegistrationPreparePool(Closing() ? 0u : 2u, "dispatch prepare");
-            DispatchSlot().store(created);
-            return created;
-        }();
-        return *pool;
-    }
-
     static unsigned LiveWorkers() {
         return liveWorkers.load(std::memory_order_acquire);
     }
 
     static void CloseAll() {
-        std::array<RegistrationPreparePool*, 3> pools{};
+        std::array<RegistrationPreparePool*, 2> pools{};
         {
             std::lock_guard lifecycle(Lifecycle());
             Closing() = true;
-            pools = {Existing(), ExistingPrebuild(), DispatchSlot().load()};
+            pools = {Existing(), ExistingPrebuild()};
         }
         if (pools[0] != nullptr) pools[0]->Close(false);
         if (pools[1] != nullptr) pools[1]->Close(true);
-        if (pools[2] != nullptr) pools[2]->Close(false);
     }
 
 private:
@@ -1548,18 +1537,9 @@ private:
         return slot;
     }
 
-    static std::atomic<RegistrationPreparePool*>& DispatchSlot() {
-        static std::atomic<RegistrationPreparePool*> slot{nullptr};
-        return slot;
-    }
-
 public:
 
-    static RegistrationPreparePool* ExistingDispatch() {
-        return DispatchSlot().load();
-    }
-
-    bool Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr, bool inlineFallback = true) {
+    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr) {
         {
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
@@ -1569,12 +1549,10 @@ public:
                 unfinished.insert(sequence);
                 lock.unlock();
                 ready.notify_one();
-                return true;
+                return;
             }
         }
-        if (!inlineFallback) return false;
         task();
-        return true;
     }
 
     void Prioritize(const PreparedShaders& prepared) {
@@ -1630,7 +1608,7 @@ private:
     }
 #endif
 
-    explicit RegistrationPreparePool(unsigned count, const char* traceName = "shader prepare") : traceName(traceName) {
+    explicit RegistrationPreparePool(unsigned count) {
 #ifdef _WIN32
         for (unsigned index = 0; index < count; ++index) {
             unsigned id = 0;
@@ -1666,7 +1644,7 @@ private:
 
     static void* Main(void* argument) {
         auto& pool = *static_cast<RegistrationPreparePool*>(argument);
-        if (PerformanceTrace::Configured()) PerformanceTrace::BindThread(pool.traceName, TraceThread::DefaultCapacity / 8);
+        if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("shader prepare", TraceThread::DefaultCapacity / 8);
         for (;;) {
             Task task;
             {
@@ -1710,7 +1688,6 @@ private:
     std::deque<Task> tasks;
     std::vector<Worker> workers;
     unsigned threads = 0;
-    const char* traceName;
     inline static std::atomic<unsigned> liveWorkers{0};
     unsigned running = 0;
     std::uint64_t submitted = 0;
@@ -1762,14 +1739,6 @@ void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {
 
 void AwaitRegistrationPreparation() {
     if (auto* pool = RegistrationPreparePool::Existing()) pool->AwaitSubmitted();
-}
-
-bool SubmitDispatchPreparation(std::function<void()> task) {
-    return RegistrationPreparePool::Dispatch().Submit(std::move(task), nullptr, false);
-}
-
-void AwaitDispatchPreparation() {
-    if (auto* pool = RegistrationPreparePool::ExistingDispatch()) pool->AwaitSubmitted();
 }
 
 void SubmitLibraryPrebuild(std::function<void()> task) {
