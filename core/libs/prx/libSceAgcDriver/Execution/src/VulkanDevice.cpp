@@ -4420,6 +4420,7 @@ constexpr std::array<const char*, static_cast<std::size_t>(Graphics::ShaderResou
 struct RecipeCounters {
     struct Kind {
         std::atomic<std::uint64_t> hits{0};
+        std::atomic<std::uint64_t> completionBuilt{0}, completionHits{0}, completionQueue0Hits{0};
         std::array<std::atomic<std::uint64_t>, RecipeMissCount> precheckMisses{};
         std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Graphics::ShaderResources::ProofPath::Count)> proofPaths{};
         std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Graphics::ShaderResources::ProofFailure::Count)> rebuilds{};
@@ -4525,6 +4526,7 @@ void reportRecipes() {
         const auto proofUs = perHit(counters.proofNs);
         const auto recordUs = perHit(counters.recordNs);
         AgcDriver::ProfilePrint_nid_no_patch("[recipe] %s (10 s): hits %llu; pre-check misses: %s; proofs: %s; rebuilds: %s; presyncs from the recipe %llu (recomputed %llu, waited %llu); data refreshes recorded %llu / skipped by hash %llu (%llu decided by words: data hits); restarts %llu, attaches %llu; us per hit: pre-check %.1f, proof %.1f, record %.1f; verified %llu (object replaced %llu)\n", kind == 0 ? "dispatch" : kind == 1 ? "indirect" : "draw", hits, misses.c_str(), proofs.c_str(), rebuilds.c_str(), take(counters.presyncsFromRecipe), take(counters.presyncsRecomputed), take(counters.presyncWaits), take(counters.dataRefreshed), take(counters.dataSkipped), take(counters.refreshByWords), take(counters.restarts), take(counters.attaches), precheckUs, proofUs, recordUs, take(counters.verified), take(counters.verifyReplaced));
+        if (kind != 2) AgcDriver::ProfilePrint_nid_no_patch("[recipe-completion] %s (10 s): built %llu, hits %llu (queue 0 %llu)\n", kind == 0 ? "dispatch" : "indirect", take(counters.completionBuilt), take(counters.completionHits), take(counters.completionQueue0Hits));
     }
 }
 
@@ -4932,12 +4934,12 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
     return hit;
 }
 
-void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) {
-    static_cast<void>(dispatch(shader, x, y, z, 0, snapshots, programAddress, std::move(prepared), recipe, {}, htileClear));
+void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, RecipeBuildFailure* recipeFailure) {
+    static_cast<void>(dispatch(shader, x, y, z, 0, snapshots, programAddress, std::move(prepared), recipe, {}, htileClear, recipeFailure));
 }
 
-VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe, const std::array<std::uint32_t, 3>& threadGroup) {
-    return dispatch(shader, 0, 0, 0, arguments, snapshots, programAddress, std::move(prepared), recipe, threadGroup);
+VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe, const std::array<std::uint32_t, 3>& threadGroup, RecipeBuildFailure* recipeFailure) {
+    return dispatch(shader, 0, 0, 0, arguments, snapshots, programAddress, std::move(prepared), recipe, threadGroup, std::nullopt, recipeFailure);
 }
 
 void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText) {
@@ -5356,7 +5358,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
     return finish(std::move(objects), nullptr);
 }
 
-VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) {
+VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, RecipeBuildFailure* recipeFailure) {
     startJournalReplay();
     for (const auto& binding : shader.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -5605,10 +5607,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         timer.phase(PhasePipeline);
     }
     DispatchCompletion completion{context, shaders, pushStages, pushBytes, objects, resources, contentKey, cacheable, fromCache, revalidateMs, overlay, lookupsBefore, timer, timing, groupsText};
-    return recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion);
+    return recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion, recipeFailure);
 }
 
-VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, DispatchCompletion& completion) {
+VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, DispatchCompletion& completion, RecipeBuildFailure* recipeFailure) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto& context = completion.context;
     const auto& shaders = completion.shaders;
@@ -5682,11 +5684,24 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     }
     if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
     WatchMemory(programAddress);
-    // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
-    // object the resource cache serves under this content key (reusable: no lease, no copied
-    // writes, every direct region import- or mirror-served), so a hit's proof is the template's
-    // Revalidate and nothing needs completion work.
-    if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
+    static const bool completionRecipes = std::getenv("APS5_NO_COMPLETION_RECIPE") == nullptr;
+    if (recipeFailure != nullptr) {
+        *recipeFailure = [&] {
+            if (recipeOut == nullptr) return RecipeBuildFailure::NotAttempted;
+            if (!DispatchRecipes()) return RecipeBuildFailure::Disabled;
+            if (!cacheable) return RecipeBuildFailure::Uncacheable;
+            if (overlay != nullptr) return RecipeBuildFailure::Overlay;
+            if (resources->UsesAddressTable()) return RecipeBuildFailure::AddressTable;
+            if (resources->HoldsLease()) return RecipeBuildFailure::Lease;
+            if (resources->HasCopiedWrites()) return RecipeBuildFailure::CopiedWrites;
+            if (!resources->Reusable()) return RecipeBuildFailure::NotReusable;
+            if (resources->NeedsCompletion() && !completionRecipes) return RecipeBuildFailure::Completion;
+            if (objects == nullptr) return RecipeBuildFailure::Objects;
+            if (contentKey.empty()) return RecipeBuildFailure::Key;
+            return RecipeBuildFailure::None;
+        }();
+    }
+    if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && resources->Reusable() && (completionRecipes || !resources->NeedsCompletion()) && objects != nullptr && !contentKey.empty()) {
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
         recipe->templateRef = resources;
@@ -5701,6 +5716,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
         }
         recipe->needsCompletion = resources->NeedsCompletion();
         recipe->holdsLease = resources->HoldsLease();
+        if (profile && recipe->needsCompletion) Recipes().kinds[arguments != 0 ? 1 : 0].completionBuilt.fetch_add(1, std::memory_order_relaxed);
         *recipeOut = std::move(recipe);
     }
     timer.finish(lookupsBefore, groupsText, indirect);
@@ -5720,7 +5736,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     auto& d = Dispatches();
     const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
     const auto context = graphicsContext();
-    if (recipe.needsCompletion || recipe.holdsLease || !hit->resources->Reusable()) throw std::runtime_error("Vulkan dispatch: recipe over a non-reusable template");
+    if (recipe.needsCompletion != hit->resources->NeedsCompletion() || recipe.holdsLease || !hit->resources->Reusable() || hit->resources->HasCopiedWrites() || hit->resources->UsesAddressTable()) throw std::runtime_error("Vulkan dispatch: recipe over a non-reusable template");
     // Without the refresh the template holds the words it was keyed with: a data-only hit takes
     // the ordinary path, whose word-keyed lookup serves or builds the object for the live words.
     if (refreshByWords && !TemplateDataRefresh()) return RecipeOutcome::Rebuild;
@@ -5811,6 +5827,10 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     if (profile) counters.recordNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - recordStart).count()), std::memory_order_relaxed);
     timing.Mark("command_record");
     timer.phase(PhaseRecord);
+    if (profile && recipe.needsCompletion) {
+        counters.completionHits.fetch_add(1, std::memory_order_relaxed);
+        if (GuestMemory::CurrentPacket().queue == 0) counters.completionQueue0Hits.fetch_add(1, std::memory_order_relaxed);
+    }
     counters.hits.fetch_add(1, std::memory_order_relaxed);
     if (record.dataRefresh != RecordedDispatch::DataRefresh::None) (record.refreshed ? counters.dataRefreshed : counters.dataSkipped).fetch_add(1, std::memory_order_relaxed);
     APS5_LOG_OUT_DEBUG("Dispatch recorded from recipe groups=%s", groupsText);

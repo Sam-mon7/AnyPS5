@@ -41,6 +41,7 @@ struct DispatchVariant {
     std::shared_ptr<const ShaderSnapshot> shader;
 
     AtomicSharedPtr<const Recipe> recipe;
+    std::atomic<RecipeBuildFailure> recipeFailure{RecipeBuildFailure::NotAttempted};
 
     static constexpr std::uint32_t NoFlatBinding = std::numeric_limits<std::uint32_t>::max();
     std::vector<std::uint32_t> dataPositions;

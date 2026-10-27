@@ -3353,6 +3353,25 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_pipelined_dispatch_item PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    foreach(agcCompletionRecipeMode IN ITEMS on off)
+        add_test(NAME agc_driver_dispatch_completion_recipe_${agcCompletionRecipeMode} COMMAND agc_driver_dispatch_move_tests --completion-recipe)
+        set_tests_properties(agc_driver_dispatch_completion_recipe_${agcCompletionRecipeMode} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_RECIPE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(agcCompletionRecipeMode STREQUAL "off")
+            set_property(TEST agc_driver_dispatch_completion_recipe_${agcCompletionRecipeMode} APPEND PROPERTY ENVIRONMENT "APS5_NO_COMPLETION_RECIPE=1")
+        endif()
+        if(WIN32)
+            set_tests_properties(agc_driver_dispatch_completion_recipe_${agcCompletionRecipeMode} PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    add_test(NAME agc_driver_pipelined_dispatch_completion_recipe COMMAND agc_driver_pipelined_dispatch_tests)
+    set_tests_properties(agc_driver_pipelined_dispatch_completion_recipe PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINE_DISPATCH=1;APS5_VERIFY_RECIPE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_pipelined_dispatch_completion_recipe PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_driver_queued_index_read_order PROPERTIES TIMEOUT 60)
 
     foreach(agcTest IN ITEMS agc_spirv_narrow_constant_store_tests agc_spirv13_image_tests agc_spirv_optimizer_tests agc_driver_constant_store_tests)
