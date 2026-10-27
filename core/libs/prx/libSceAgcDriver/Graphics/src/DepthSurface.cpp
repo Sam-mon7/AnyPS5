@@ -2705,9 +2705,9 @@ bool DepthSurfaceAt(std::uint64_t address) {
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && (surface->target.address == address || surface->target.stencilAddress == address); });
 }
 
-bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
+bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes, bool multisampledOnly) {
     std::lock_guard lock(surfacesMutex());
-    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && surface->context.device == device && surface->Overlaps(address, bytes); });
+    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && surface->context.device == device && (!multisampledOnly || surface->target.samples > 1u) && surface->Overlaps(address, bytes); });
 }
 
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes) {

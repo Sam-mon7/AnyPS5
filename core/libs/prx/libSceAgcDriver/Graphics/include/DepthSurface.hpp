@@ -54,7 +54,7 @@ struct WrittenStorageExtent {
 };
 void RetireCoveredDepthSurfaces(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::span<const WrittenStorageExtent> extents);
 bool DepthSurfaceAt(std::uint64_t address);
-bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes);
+bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes, bool multisampledOnly = false);
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource);
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);
 std::size_t HtileDepthClearBytes_nid_no_patch(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);

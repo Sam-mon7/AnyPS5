@@ -617,6 +617,43 @@ void DepthTransition(Context context, ReservedSurface& surface) {
     ClearDepthSurfaces(context.device);
 }
 
+void DepthOverlap(Context context, ReservedSurface& surface) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    surface.Commit(0, SurfaceBytes);
+    std::memset(surface.Data(), 0, SurfaceBytes);
+    const auto address = surface.Address() + BlockBytes;
+    const auto words = Descriptor(address, Side / 2u);
+    const auto bytes = DescribeSurface(DecodeTextureResource(words)).guestBytes;
+    auto program = SampledProgram(words);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    try {
+        const DepthTarget target{surface.Address(), 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        Require(DepthSurfaceView(context, target, false) != VK_NULL_HANDLE, "the overlapping depth owner was not registered");
+        Require(DepthSurfaceOverlaps(context.device, address, bytes) && !DepthSurfaceAt(address), "the sampled texture does not overlap a depth surface at a different base");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        ShaderResources resources(context, shader);
+        Require(resources.Reusable(), "the overlapping sampled resources are not reusable");
+        const auto texture = resources.SampledTextures().front();
+        Require(texture != nullptr && !texture->ViewsStorageImage() && !DepthSurfaceHolds(context, DecodeTextureResource(words), texture.get()), "the overlapping sampled texture did not remain an ordinary snapshot");
+        Require(CachedSampledTexture(context, words) == texture, "the full lookup replaced the overlapping sampled texture");
+        for (std::size_t use = 0; use < 3; ++use) {
+            Require(DepthSurfaceAt(target.address) && DepthSurfaceOverlaps(context.device, address, bytes), "the overlapping depth surface did not stay live");
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            ShaderResources::ProofReport report;
+            Require(resources.Revalidate(shader, &report), "the overlapping sampled resources failed revalidation");
+            Require(report.path == ShaderResources::ProofPath::Fast, "the overlapping sampled texture left the fast proof for the full walk");
+            Require(resources.SampledTextures().front() == texture, "the fast proof replaced the overlapping sampled texture");
+        }
+    } catch (...) {
+        ClearDepthSurfaces(context.device);
+        throw;
+    }
+    ClearDepthSurfaces(context.device);
+}
+
 void PendingStores(const Context& context, ReservedSurface& surface) {
     const auto address = surface.Address();
     const auto words = Descriptor(address);
@@ -686,6 +723,7 @@ int main(int argc, char** argv) {
                 LargeTracked(context, surface, BlockBytes);
             } else if (argc == 2 && std::string_view(argv[1]) == "--pending-stores") PendingStores(context, surface);
             else if (argc == 2 && std::string_view(argv[1]) == "--depth-transition") DepthTransition(context, surface);
+            else if (argc == 2 && std::string_view(argv[1]) == "--depth-overlap") DepthOverlap(context, surface);
             else if (argc == 2 && std::string_view(argv[1]) == "--compared-shared") {
 #ifdef _WIN32
                 ComparedShared(context);
