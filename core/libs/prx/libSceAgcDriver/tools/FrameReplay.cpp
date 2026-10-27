@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -13,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -22,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <map>
 #include <set>
 #include <memory>
@@ -736,23 +739,6 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
     return check;
 }
 
-bool readable(std::uint64_t address, std::uint64_t bytes) {
-#ifdef _WIN32
-    for (auto at = address; at < address + bytes;) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) return false;
-        const auto access = info.Protect & 0xffu;
-        if ((info.Protect & PAGE_GUARD) != 0 || access == PAGE_NOACCESS || access == PAGE_EXECUTE) return false;
-        at = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
-    }
-    return true;
-#else
-    static_cast<void>(address);
-    static_cast<void>(bytes);
-    return false;
-#endif
-}
-
 std::uint64_t contentHash(const std::byte* bytes, std::size_t size) {
     std::uint64_t hash = 0xcbf29ce484222325ull;
     for (std::size_t index = 0; index < size; ++index) {
@@ -775,6 +761,7 @@ public:
     }
 
     std::optional<std::vector<std::byte>> Read(std::uint64_t address, std::uint64_t bytes) {
+        if (bytes > std::numeric_limits<std::size_t>::max() || bytes > std::numeric_limits<std::uint64_t>::max() - address) return std::nullopt;
         std::vector<std::byte> result(static_cast<std::size_t>(bytes));
         for (auto at = address; at < address + bytes;) {
             const auto* range = covering(ranges, at);
@@ -865,8 +852,15 @@ int listShaders(const Options& options) {
         if (copy == 1 && !options.shaderCode.empty()) {
             char name[64];
             std::snprintf(name, sizeof(name), "type%u-%016llx.bin", static_cast<unsigned>(fields.type), static_cast<unsigned long long>(hash));
-            std::ofstream file(options.shaderCode / name, std::ios::binary | std::ios::trunc);
+            const auto path = options.shaderCode / name;
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            if (!file.is_open()) throw std::runtime_error("frame replay: cannot open " + path.string());
             file.write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
+            if (!file) throw std::runtime_error("frame replay: cannot write " + path.string());
+            file.flush();
+            if (!file) throw std::runtime_error("frame replay: cannot flush " + path.string());
+            file.close();
+            if (!file) throw std::runtime_error("frame replay: cannot close " + path.string());
         }
         const bool window = frameStart != calls.end() && call > frameStart;
         ++listed;
@@ -901,24 +895,30 @@ std::string_view packetName(std::uint32_t opcode) {
     }
 }
 
-void describeSubmission(const FrameCall& call) {
-    const auto* words = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(call.address));
-    if (!readable(call.address, call.size * sizeof(std::uint32_t))) {
+void describeSubmission(const FrameCall& call, CapturedMemory& memory) {
+    const auto bytes = call.size <= std::numeric_limits<std::uint64_t>::max() / sizeof(std::uint32_t) ? memory.Read(call.address, call.size * sizeof(std::uint32_t)) : std::nullopt;
+    if (!bytes) {
         std::printf("    (command buffer not readable)\n");
         return;
     }
+    std::vector<std::uint32_t> words(static_cast<std::size_t>(call.size));
+    if (!bytes->empty()) std::memcpy(words.data(), bytes->data(), bytes->size());
     std::map<std::string, std::size_t> counts;
     for (std::size_t at = 0; at < call.size;) {
         const auto header = words[at];
         const auto type = header >> 30u;
-        const auto length = type == 3u ? static_cast<std::size_t>((header >> 16u) & 0x3fffu) + 2u : 1u;
-        if (type == 3u) {
+        const auto length = AgcDriver::Pm4::PacketWords(header);
+        if (length > words.size() - at) {
+            std::printf("    @%zu (truncated packet: %zu dwords, %zu available)\n", at, length, words.size() - at);
+            break;
+        }
+        if (type == 3u && !AgcDriver::Pm4::FillerPacket(header)) {
             const auto opcode = (header >> 8u) & 0xffu;
             const auto name = packetName(opcode);
             char label[24];
             std::snprintf(label, sizeof(label), "0x%02x", opcode);
             const std::string key = name.empty() ? std::string(label) : std::string(name);
-            const auto word = [&](std::size_t index) { return at + index < call.size ? words[at + index] : 0u; };
+            const auto word = [&](std::size_t index) { return index < length ? words[at + index] : 0u; };
             if (opcode == 0x3c) {
                 std::printf("    @%zu WAIT_REG_MEM function %u space %u address 0x%llx reference 0x%x mask 0x%x\n", at, word(1) & 7u, (word(1) >> 4u) & 3u,
                             static_cast<unsigned long long>(word(2)) | (static_cast<unsigned long long>(word(3)) << 32u), word(4), word(5));
@@ -938,7 +938,7 @@ void describeSubmission(const FrameCall& call) {
 
 int listSubmits(const Options& options) {
     const FrameCaptureReader reader(options.directory);
-    const auto skipped = restoreMemory(reader);
+    CapturedMemory memory(reader);
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind == FrameMemoryKind::Delta) groups[chunk.group].push_back(&chunk);
@@ -946,21 +946,18 @@ int listSubmits(const Options& options) {
     const auto& calls = reader.Calls();
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
     std::size_t listed = 0;
-    for (auto call = frameStart; call != calls.end() && listed < options.submits; ++call) {
+    for (auto call = calls.begin(); call != calls.end() && listed < options.submits; ++call) {
         if (call->kind == FrameCallKind::Memory) {
-            if (const auto found = groups.find(call->values.at(0)); found != groups.end()) {
-                for (const auto* chunk : found->second) {
-                    if (!skipped.Overlaps(*chunk)) restore(reader, *chunk);
-                }
-            }
+            if (const auto found = groups.find(call->values.at(0)); found != groups.end()) memory.Apply(found->second);
             continue;
         }
+        if (call < frameStart) continue;
         if (call->kind != FrameCallKind::Submit && call->kind != FrameCallKind::Flip && call->kind != FrameCallKind::ReserveEopFlip) continue;
         ++listed;
         std::printf("#%zu ordinal %llu %s thread %llu queue 0x%x serials %llu/%llu address 0x%llx dwords %llu\n", listed, static_cast<unsigned long long>(call->ordinal), std::string(AgcDriver::FrameCallName(call->kind)).c_str(),
                     static_cast<unsigned long long>(call->thread), call->queue, static_cast<unsigned long long>(call->completed), static_cast<unsigned long long>(call->accepted),
                     static_cast<unsigned long long>(call->address), static_cast<unsigned long long>(call->size));
-        if (call->kind == FrameCallKind::Submit) describeSubmission(*call);
+        if (call->kind == FrameCallKind::Submit) describeSubmission(*call, memory);
     }
     std::fflush(stdout);
     return 0;
@@ -1077,6 +1074,17 @@ int run(const Options& options) {
     return replay.unfinished == 0 ? 0 : 3;
 }
 
+void configureEnvironment(const Options& options) {
+#ifdef _WIN32
+    _putenv_s("APS5_FRAME_CAPTURE", "");
+    _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", options.coldPipelines ? "" : "1");
+#else
+    unsetenv("APS5_FRAME_CAPTURE");
+    if (options.coldPipelines) unsetenv("APS5_HEADLESS_PIPELINE_CACHE");
+    else setenv("APS5_HEADLESS_PIPELINE_CACHE", "1", 1);
+#endif
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1095,9 +1103,9 @@ int main(int argc, char** argv) {
             options.shaderCode = argv[++index];
         }
         else if (argument == "--submits" && index + 1 < argc) {
-            char* end = nullptr;
-            options.submits = std::strtoull(argv[++index], &end, 10);
-            if (options.submits == 0 || end == argv[index] || *end != '\0') return usage();
+            const std::string_view value = argv[++index];
+            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), options.submits);
+            if (error != std::errc{} || end != value.data() + value.size() || options.submits == 0) return usage();
         } else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
@@ -1106,14 +1114,7 @@ int main(int argc, char** argv) {
         else return usage();
     }
     if (options.directory.empty()) return usage();
-#ifdef _WIN32
-    _putenv_s("APS5_FRAME_CAPTURE", "");
-    _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", options.coldPipelines ? "" : "1");
-#else
-    unsetenv("APS5_FRAME_CAPTURE");
-    if (options.coldPipelines) unsetenv("APS5_HEADLESS_PIPELINE_CACHE");
-    else setenv("APS5_HEADLESS_PIPELINE_CACHE", "1", 1);
-#endif
+    configureEnvironment(options);
     int code = 2;
     try {
         const bool listing = options.shaders || options.submits != 0;
