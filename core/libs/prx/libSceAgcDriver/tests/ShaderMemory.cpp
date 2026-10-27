@@ -6101,7 +6101,7 @@ void verifyPixelRequestSerialization() {
     minimal.context.pixel->layerExported = true;
     minimal.context.pixel->ditheredAlphaToCoverage = true;
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQS4AAAA=", "new requests did not use serialization version 46");
+    require(requestPrefix(encoded, 8u) == "NVNQQS8AAAA=", "new requests did not use serialization version 47");
     const std::array<std::uint32_t, 2> fallbacks{0x40u, 0x1ac4u};
     auto withFallbacks = minimal;
     withFallbacks.context.linkedCallFallbacks = fallbacks;
@@ -6219,7 +6219,7 @@ void verifyPixelRequestSerialization() {
     for (std::size_t bytes = 0; bytes < 45u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export, dither or front-face flag, quad pixel mask or quad sample mask was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQS8AAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQTAAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
     static constexpr std::string_view version18Request{
@@ -6584,6 +6584,31 @@ void verifyDepthRemapRequests() {
     require(key != other, "the depth remap mode did not change the shader cache key");
 }
 
+void verifyIndirectBuiltinCacheKeys() {
+    using namespace ShaderRecompiler;
+    RecompileRequest request{};
+    request.shader.stage = ShaderStage::Vertex;
+    std::vector<std::uint64_t> plain, plainInterfaceKey;
+    RecompileCacheKey::Build(request, plain);
+    RecompileCacheKey::BuildInterface(request, plainInterfaceKey);
+    const auto plainContext = RecompileCacheKey::ContextHash(request);
+    request.graphics = GraphicsCompileContext{};
+    for (std::uint32_t field = 0; field < 4u; ++field) {
+        auto other = request;
+        if (field == 0u) other.graphics->instanceFromBase = true;
+        if (field == 1u) other.graphics->baseInstanceSgpr = 8;
+        if (field == 2u) other.graphics->vertexFromBase = true;
+        if (field == 3u) other.graphics->baseVertexSgpr = 9;
+        std::vector<std::uint64_t> key, interfaceKey;
+        RecompileCacheKey::Build(other, key);
+        RecompileCacheKey::BuildInterface(other, interfaceKey);
+        require(key != plain && interfaceKey != plainInterfaceKey && RecompileCacheKey::ContextHash(other) != plainContext, "an indirect builtin offset field did not change every shader cache identity");
+    }
+    std::vector<std::uint64_t> key;
+    RecompileCacheKey::Build(request, key);
+    require(key == plain && RecompileCacheKey::ContextHash(request) == plainContext, "default graphics draw parameters changed the vertex shader identity");
+}
+
 void verifyMergedHullConfiguration() {
     using namespace ShaderRecompiler;
     static constexpr std::array<std::uint32_t, 1> code{0xbf810000u};
@@ -6605,9 +6630,12 @@ void verifyMergedHullConfiguration() {
     require(!serializer.Deserialize(separate).request.graphics->tessellation->mergedHull, "a separate hull configuration was read as merged");
     constexpr std::size_t pointTailBytes = 13u;
     auto legacy = decodeBase64(merged);
-    require(legacy.size() > 54u + pointTailBytes && legacy[4] == 46u, "a merged hull request did not use serialization version 46");
+    require(legacy.size() > 54u + pointTailBytes && legacy[4] == 47u, "a merged hull request did not use serialization version 47");
     legacy.resize(legacy.size() - sizeof(std::uint32_t) - 2u - pointTailBytes);
     legacy.pop_back();
+    constexpr std::array<std::uint8_t, 10> drawParameters{0xffu, 0xffu, 0xffu, 0xffu, 0u, 0u, 0xffu, 0xffu, 0xffu, 0xffu};
+    require(legacy.size() > 50u && std::ranges::equal(std::span(legacy).subspan(legacy.size() - 40u, 10u), drawParameters), "the graphics draw parameters do not have their version 47 defaults");
+    legacy.erase(legacy.end() - 40, legacy.end() - 30);
     require(legacy[legacy.size() - 52u] == 1u, "the merged hull flag is not the last byte of the tessellation configuration");
     legacy.erase(legacy.end() - 52);
     for (const auto version : {30u, 31u, 32u, 34u, 35u, 36u, 37u, 38u}) {
@@ -9190,6 +9218,7 @@ int main(int argc, char** argv) {
         verifyVertexInfoVersion19();
         verifyDepthRemapRequests();
         verifyMergedHullConfiguration();
+        verifyIndirectBuiltinCacheKeys();
         verifyPositionExportComponents();
         verifyLegacyPixelRequests();
         verifyPixelExportReplay();

@@ -183,6 +183,8 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const auto* fetch = options.embeddedFetch;
         const std::int32_t folded = fetch == nullptr ? -1 : kind == StageInputKind::VertexIndex ? fetch->vertexOffsetSgpr : fetch->instanceOffsetSgpr;
         IrValue& index = builtin(kind);
+        if (kind == StageInputKind::InstanceIndex && options.instanceFromBase) return entryIr.ISub(index, builtin(StageInputKind::BaseInstance));
+        if (kind == StageInputKind::VertexIndex && options.vertexFromBase) return entryIr.ISub(index, builtin(StageInputKind::BaseVertex));
         return folded < 0 ? index : entryIr.ISub(index, entryIr.GetUserData(static_cast<ScalarReg>(folded)));
     };
     const auto tessellationBase = [&entryIr](TessellationBaseKind kind) -> IrValue& {
@@ -195,7 +197,8 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
 
     for (std::uint32_t index = 0; index < options.userDataCount; index++) {
         const auto reg = static_cast<ScalarReg>(options.userDataBaseRegister + index);
-        IrValue& value = entryIr.GetUserData(reg);
+        const auto sgpr = static_cast<std::int32_t>(options.userDataBaseRegister + index);
+        IrValue& value = options.instanceFromBase && sgpr == options.baseInstanceSgpr ? builtin(StageInputKind::BaseInstance) : options.vertexFromBase && sgpr == options.baseVertexSgpr ? builtin(StageInputKind::BaseVertex) : entryIr.GetUserData(reg);
         entryIr.SetScalarReg(reg, value);
         entryIr.SetScalarMaskTag(reg, entryIr.ConstantBool(false));
     }
@@ -535,6 +538,16 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         program.Info().instanceOffsetShared = options.embeddedFetch->instanceOffsetShared || options.embeddedFetch->instanceIndexObserved;
         program.Info().vertexOffsetConflict = options.embeddedFetch->vertexOffsetConflict;
         program.Info().instanceOffsetConflict = options.embeddedFetch->instanceOffsetConflict;
+    }
+    if (options.instanceFromBase) {
+        program.Info().instanceOffsetSgpr = -1;
+        program.Info().instanceOffsetShared = false;
+        program.Info().instanceOffsetConflict = false;
+    }
+    if (options.vertexFromBase) {
+        program.Info().vertexOffsetSgpr = -1;
+        program.Info().vertexOffsetShared = false;
+        program.Info().vertexOffsetConflict = false;
     }
     program.Metadata().cfgFailureKind = cfg.failureKind;
     program.Metadata().failureReason = cfg.unsupportedReason;

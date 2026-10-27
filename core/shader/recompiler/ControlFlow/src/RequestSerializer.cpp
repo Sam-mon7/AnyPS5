@@ -785,6 +785,10 @@ void writeGraphicsCompileContext(Writer& writer, const GraphicsCompileContext& g
             writer.WriteBool(parameter.perVertex);
         }
     }
+    writer.WriteU32(static_cast<std::uint32_t>(graphics.baseInstanceSgpr));
+    writer.WriteBool(graphics.instanceFromBase);
+    writer.WriteBool(graphics.vertexFromBase);
+    writer.WriteU32(static_cast<std::uint32_t>(graphics.baseVertexSgpr));
 }
 
 GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGraphicsCompileContext& storage, std::uint32_t version) {
@@ -839,6 +843,12 @@ GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGr
         }
         graphics.meshBarycentrics = std::move(barycentrics);
     }
+    if (version >= 47u) {
+        graphics.baseInstanceSgpr = static_cast<std::int32_t>(reader.ReadU32());
+        graphics.instanceFromBase = reader.ReadBool();
+        graphics.vertexFromBase = reader.ReadBool();
+        graphics.baseVertexSgpr = static_cast<std::int32_t>(reader.ReadU32());
+    }
     return graphics;
 }
 
@@ -848,7 +858,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(46u);
+    writer.WriteU32(47u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -897,7 +907,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 46u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 47u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);

@@ -59,6 +59,7 @@ public:
         appendFallbacks(key, request);
         appendMesh(key, request);
         appendTessellation(key, request);
+        appendDrawParameters(key, request);
         std::uint64_t hash = 0xcbf29ce484222325ull;
         for (const auto value : key) {
             hash ^= value;
@@ -93,6 +94,7 @@ private:
         appendFallbacks(key, request);
         appendMesh(key, request);
         appendTessellation(key, request);
+        appendDrawParameters(key, request);
         append(key, request.target);
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
@@ -126,6 +128,14 @@ private:
             append(key, parameter.sourceLocation);
             append(key, parameter.perVertex);
         }
+    }
+
+    static void appendDrawParameters(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
+        if (request.shader.stage != ShaderStage::Vertex) return;
+        append(key, request.graphics && request.graphics->instanceFromBase);
+        append(key, request.graphics ? request.graphics->baseInstanceSgpr : -1);
+        append(key, request.graphics && request.graphics->vertexFromBase);
+        append(key, request.graphics ? request.graphics->baseVertexSgpr : -1);
     }
 
     static void appendTessellation(std::vector<std::uint64_t>& key, const RecompileRequest& request) {

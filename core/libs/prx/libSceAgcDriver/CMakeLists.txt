@@ -2390,6 +2390,26 @@ if(BUILD_TESTING)
             SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
     set_property(TEST agc_driver_indirect_push_patch_disabled APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_INDIRECT_PUSH_PATCH=set:1")
     set_property(TEST agc_driver_indirect_push_patch_verify APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VERIFY_INDIRECT_PUSH_PATCH=set:1")
+    add_test(NAME agc_driver_indirect_builtin_offsets COMMAND agc_driver_draw_offset_indices_tests --builtin-offsets)
+    set(indirectBuiltinTests agc_driver_indirect_builtin_offsets)
+    foreach(mode IN ITEMS enabled disabled no_draw_key verify fallback device_fallback no_cpu_cache)
+        set(indirectBuiltinTest agc_driver_indirect_builtin_submission_${mode})
+        if(mode STREQUAL fallback)
+            add_test(NAME ${indirectBuiltinTest} COMMAND agc_driver_indirect_draw_cache_tests --builtin-offsets-fallback)
+        else()
+            add_test(NAME ${indirectBuiltinTest} COMMAND agc_driver_indirect_draw_cache_tests --builtin-offsets)
+        endif()
+        list(APPEND indirectBuiltinTests ${indirectBuiltinTest})
+    endforeach()
+    set_tests_properties(${indirectBuiltinTests} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1"
+            ENVIRONMENT_MODIFICATION "APS5_INDIRECT_BUILTIN_OFFSETS=set:1;APS5_NO_GPU_INDIRECT_DRAW=unset:;APS5_NO_DRAW_KEY=unset:;APS5_NO_CPU_INDIRECT_DRAW_CACHE=unset:;APS5_VERIFY_DRAW_ENTRIES=unset:;APS5_VERIFY_DRAW_DATA_HITS=unset:;APS5_NO_DRAW_SRT_ENTRIES=unset:;APS5_DISPATCH_STAMP_VALIDATE=unset:;APS5_NO_INDIRECT_PUSH_PATCH=unset:;APS5_VERIFY_INDIRECT_PUSH_PATCH=unset:"
+            SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
+    set_property(TEST agc_driver_indirect_builtin_submission_disabled APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_INDIRECT_BUILTIN_OFFSETS=unset:")
+    set_property(TEST agc_driver_indirect_builtin_submission_no_draw_key APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_DRAW_KEY=set:1")
+    set_property(TEST agc_driver_indirect_builtin_submission_verify APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VERIFY_DRAW_ENTRIES=set:1")
+    set_property(TEST agc_driver_indirect_builtin_submission_device_fallback APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_GPU_INDIRECT_DRAW=set:1")
+    set_property(TEST agc_driver_indirect_builtin_submission_no_cpu_cache APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_CPU_INDIRECT_DRAW_CACHE=set:1")
     set(cpuIndirectCacheTests)
     foreach(surface IN ITEMS offsets submission)
         if(surface STREQUAL offsets)
@@ -2402,7 +2422,7 @@ if(BUILD_TESTING)
             add_test(NAME ${cpuIndirectCacheTest} COMMAND ${cpuIndirectCacheExecutable} --cpu-indirect-cache)
             set_tests_properties(${cpuIndirectCacheTest} PROPERTIES
                     ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1"
-                    ENVIRONMENT_MODIFICATION "APS5_NO_CPU_INDIRECT_DRAW_CACHE=unset:;APS5_NO_INDIRECT_PUSH_PATCH=unset:;APS5_VERIFY_INDIRECT_PUSH_PATCH=unset:;APS5_VERIFY_DRAW_ENTRIES=unset:;APS5_VERIFY_DRAW_DATA_HITS=unset:;APS5_NO_DRAW_SRT_ENTRIES=unset:;APS5_DISPATCH_STAMP_VALIDATE=unset:"
+                    ENVIRONMENT_MODIFICATION "APS5_INDIRECT_BUILTIN_OFFSETS=unset:;APS5_NO_CPU_INDIRECT_DRAW_CACHE=unset:;APS5_NO_INDIRECT_PUSH_PATCH=unset:;APS5_VERIFY_INDIRECT_PUSH_PATCH=unset:;APS5_VERIFY_DRAW_ENTRIES=unset:;APS5_VERIFY_DRAW_DATA_HITS=unset:;APS5_NO_DRAW_SRT_ENTRIES=unset:;APS5_DISPATCH_STAMP_VALIDATE=unset:"
                     SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
             if(mode STREQUAL disabled)
                 set_property(TEST ${cpuIndirectCacheTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_CPU_INDIRECT_DRAW_CACHE=set:1")
@@ -2418,6 +2438,7 @@ if(BUILD_TESTING)
     if(WIN32)
         set_property(TEST ${indirectPushPatchTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         set_property(TEST ${cpuIndirectCacheTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_property(TEST ${indirectBuiltinTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
 

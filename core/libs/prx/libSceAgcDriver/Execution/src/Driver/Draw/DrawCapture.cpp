@@ -73,6 +73,13 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         {0, 0, pushOffset, (graphics.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : graphics.stages.tessellation && pushOffset < Graphics::PipelinePushSlotBytes ? ShaderRecompiler::TessellationLevelPushOffsetBytes : graphics.depthRemap.mode != 0u ? ShaderRecompiler::DepthRemapPushOffsetBytes : Graphics::PipelinePushSlotBytes) - pushOffset % Graphics::PipelinePushSlotBytes},
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}, program.binary.stage == Stage::Mesh ? meshBarycentrics : std::nullopt}
     };
+    if (i == 0 && drawParameters.indirect) {
+        const auto& indirect = *drawParameters.indirect;
+        request.graphics->instanceFromBase = indirect.instanceFromBase;
+        request.graphics->baseInstanceSgpr = indirect.instanceFromBase ? indirect.startInstanceSgpr : -1;
+        request.graphics->vertexFromBase = indirect.vertexFromBase;
+        request.graphics->baseVertexSgpr = indirect.vertexFromBase ? indirect.baseVertexSgpr : -1;
+    }
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     auto invocation = [&] {
         try {
