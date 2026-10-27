@@ -15,6 +15,14 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 drawKey ^= value;
                 drawKey *= 0x100000001b3ull;
             };
+            if (drawParameters.indirect) {
+                const auto& indirect = *drawParameters.indirect;
+                mix(drawParameters.indexed);
+                mix(indirect.baseVertexLocation);
+                mix(indirect.startInstanceLocation);
+                mix(indirect.drawIndexEnabled);
+                mix(indirect.drawIndexLocation);
+            }
             mix(localDevice->Serial());
             mix(static_cast<std::uint64_t>(graphics.stages.path));
             mix(graphics.stages.registerValue);

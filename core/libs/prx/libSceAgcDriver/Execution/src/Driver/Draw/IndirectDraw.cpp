@@ -71,15 +71,19 @@ void CountIndirectStage(bool patched, bool verified) {
     ProfilePrint_nid_no_patch("[indirect-push] stages (cumulative): %llu patched, %llu re-materialized, %llu verified\n", static_cast<unsigned long long>(patches.load(std::memory_order_relaxed)), static_cast<unsigned long long>(materializations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verifications.load(std::memory_order_relaxed)));
 }
 
-void CountNotFolded(bool mismatch, bool shared) {
+void CountIndirectFold(std::optional<Graphics::IndirectDrawPath> cpu, bool builtins, bool mismatch, bool shared) {
     static thread_local std::array<std::uint64_t, 4> counts{};
-    ++counts[(mismatch ? 1u : 0u) | (shared ? 2u : 0u)];
+    static thread_local std::array<std::uint64_t, 4> paths{};
+    ++paths[(cpu ? 2u : 0u) | (builtins ? 1u : 0u)];
+    if (cpu == Graphics::IndirectDrawPath::NotFolded) ++counts[(mismatch ? 1u : 0u) | (shared ? 2u : 0u)];
     static thread_local auto reportedAt = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     if (now - reportedAt < std::chrono::seconds(10)) return;
     reportedAt = now;
     ProfilePrint_nid_no_patch("[indirect-fold] queue 0x%x NotFolded (10 s): k != p only %llu, shared/observed only %llu, both %llu\n", GuestMemory::GpuLockThreadTag(), static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]));
+    ProfilePrint_nid_no_patch("[indirect-fold] queue 0x%x classified paths (10 s): GPU %llu (builtin offsets %llu), CPU %llu (builtin offsets %llu)\n", GuestMemory::GpuLockThreadTag(), static_cast<unsigned long long>(paths[0] + paths[1]), static_cast<unsigned long long>(paths[1]), static_cast<unsigned long long>(paths[2] + paths[3]), static_cast<unsigned long long>(paths[3]));
     counts = {};
+    paths = {};
 }
 
 }
@@ -173,8 +177,10 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         } else if (x != 0) fail(Path::IndxOffset);
         else rule = Rule::InPlace;
     };
-    dimension(result.vertexOffsetSgpr, indirect.baseVertexSgpr, result.vertexOffsetShared, result.vertexOffsetConflict, drawParameters.indexed ? 0u : indirect.indxOffset, indirect.vertexRule, indirect.vertexConstant);
-    dimension(result.instanceOffsetSgpr, indirect.startInstanceSgpr, result.instanceOffsetShared, result.instanceOffsetConflict, 0u, indirect.instanceRule, indirect.instanceConstant);
+    if (indirect.vertexFromBase) indirect.vertexRule = Rule::InPlace;
+    else dimension(result.vertexOffsetSgpr, indirect.baseVertexSgpr, result.vertexOffsetShared, result.vertexOffsetConflict, drawParameters.indexed ? 0u : indirect.indxOffset, indirect.vertexRule, indirect.vertexConstant);
+    if (indirect.instanceFromBase) indirect.instanceRule = Rule::InPlace;
+    else dimension(result.instanceOffsetSgpr, indirect.startInstanceSgpr, result.instanceOffsetShared, result.instanceOffsetConflict, 0u, indirect.instanceRule, indirect.instanceConstant);
     if (!support.firstInstance && (indirect.instanceRule == Rule::InPlace || indirect.instanceConstant != 0)) fail(Path::FeatureGap);
     if ((indirect.vertexRule == Rule::Constant || indirect.instanceRule == Rule::Constant) && indirect.count > 256) fail(Path::FeatureGap);
 
@@ -190,7 +196,7 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         std::string decision = indirectCpu ? "cpu (" + std::string(Graphics::IndirectDrawPathName(*indirectCpu)) + ")" : "gpu vertex=" + rule(indirect.vertexRule, indirect.vertexConstant) + " instance=" + rule(indirect.instanceRule, indirect.instanceConstant);
         std::fprintf(stderr, "[draw] indirect 0x%x args 0x%llx stride %u count %u%s locs base=%s inst=%s idx=%s%s analyzer v=%d i=%d shared=%d/%d conflict=%d/%d indx=%u user reads 0x%llx (first %u, hidden %u) -> %s\n", indirect.opcode, static_cast<unsigned long long>(indirect.arguments), indirect.stride, indirect.count, indirect.countIndirect ? " (indirect)" : "", location(indirect.baseVertexLocation, indirect.baseVertexSgpr).c_str(), location(indirect.startInstanceLocation, indirect.startInstanceSgpr).c_str(), location(indirect.drawIndexLocation, indirect.drawIndexSgpr).c_str(), indirect.drawIndexEnabled ? " (enabled)" : "", result.vertexOffsetSgpr, result.instanceOffsetSgpr, result.vertexOffsetShared ? 1 : 0, result.instanceOffsetShared ? 1 : 0, result.vertexOffsetConflict ? 1 : 0, result.instanceOffsetConflict ? 1 : 0, indirect.indxOffset, static_cast<unsigned long long>(result.userDataRegisterReads), static_cast<unsigned>(frontProgram.firstUserSgpr), static_cast<unsigned>(frontProgram.hiddenUserWords), decision.c_str());
     }
-    if (profile && indirectCpu == Path::NotFolded) CountNotFolded(notFoldedMismatch, notFoldedShared);
+    if (profile) CountIndirectFold(indirectCpu, indirect.vertexFromBase || indirect.instanceFromBase, notFoldedMismatch, notFoldedShared);
     return indirectCpu;
 }
 

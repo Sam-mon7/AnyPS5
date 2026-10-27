@@ -491,6 +491,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& decode = tail.decode;
     auto& dataEntry = tail.dataEntry;
     auto& shapeKey = tail.shapeKey;
+    const auto packetKey = [&](std::uint64_t key) {
+        if (key != 0 && drawParameters.indirect) {
+            const auto& indirect = *drawParameters.indirect;
+            for (const auto value : {static_cast<std::uint32_t>(drawParameters.indexed), indirect.baseVertexLocation, indirect.startInstanceLocation, static_cast<std::uint32_t>(indirect.drawIndexEnabled), indirect.drawIndexLocation}) key = (key ^ (static_cast<std::uint64_t>(value) + 1u)) * 0x9e3779b97f4a7c15ull;
+        }
+        return key;
+    };
     std::uint64_t drawIdentity = 0, drawAlias = 0;
     std::vector<DrawUserPatch> userPatches;
     if (registerKey) {
@@ -499,7 +506,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
             if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain();
-            drawIdentity = drawIdentityKey(queue, *submission.shaders);
+            drawIdentity = packetKey(drawIdentityKey(queue, *submission.shaders));
             std::lock_guard cacheLock(drawCacheMutex);
             learnPendingRelocation();
             const auto known = drawRelocations.find(drawIdentity);
@@ -511,6 +518,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
+        drawKey = packetKey(drawKey);
+        shapeKey = packetKey(shapeKey);
+        drawAlias = packetKey(drawAlias);
         if (DrawFinisher::Busy()) {
             bool shapeMatters = false;
             if (DrawFinisher::Overlap() && drawDataHits()) {
@@ -535,6 +545,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (relocation != nullptr && !aliasFirst) {
                 cacheLock.unlock();
                 drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias);
+                drawAlias = packetKey(drawAlias);
                 cacheLock.lock();
             }
             if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
@@ -615,7 +626,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.programs = writesPrograms ? &writablePrograms : &decode->programs;
     const auto& programs = *tail.programs;
     if (std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return SkippedShader(program.binary.codeAddress); })) return drawn();
-    const bool emptyIndirectSkip = EmptyIndirectSkip();
+    static const bool fromBase = std::getenv("APS5_INDIRECT_BUILTIN_OFFSETS") != nullptr;
+    const bool emptyIndirectSkip = EmptyIndirectSkip() && !(fromBase && drawParameters.indexed);
     auto& cpuIndirectPrograms = CpuIndirectPrograms();
     const auto recordDraws = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || !drawParameters.indirect->indexLimitKnown || arguments.firstVertexOrIndex < drawParameters.indexCount); };
     if (emptyIndirectSkip && drawParameters.indirect && !programs.empty()) {
@@ -671,6 +683,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         indirect.baseVertexSgpr = sgprOf(indirect.baseVertexLocation);
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
+        constexpr std::uint32_t NoLocation = 0x280u;
+        const auto& front = programs.front();
+        const bool plain = fromBase && drawParameters.indexed && !indirect.drawIndexEnabled && front.binary.stage == Stage::Vertex && !front.merged && graphics.stages.path == Graphics::ShaderPath::Vertex && !graphics.stages.mesh && !graphics.stages.tessellation && !graphics.rectList &&
+                           localDevice->DrawIndirectSupport().drawParameters && Graphics::DecodeVertexStageInfo(front.binary.header, front.binary.headerAddress, front.userData, nullptr, false, 8u - front.firstUserSgpr).resourcesNum == 0;
+        const auto frontOnly = [&](std::uint32_t location, std::int32_t sgpr) { return location == NoLocation || (sgpr >= 0 && UserDataWords(programs, roles, location).size() == 1); };
+        indirect.instanceFromBase = plain && frontOnly(indirect.startInstanceLocation, indirect.startInstanceSgpr);
+        indirect.vertexFromBase = plain && frontOnly(indirect.baseVertexLocation, indirect.baseVertexSgpr);
     }
     if (DrawFinisher::Busy()) {
         const bool drain = !DrawFinisher::Overlap();
@@ -1290,6 +1309,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
             }
             fold(*programResults[0], direct);
+            if (indirect.instanceFromBase) direct.firstInstance = arguments.firstInstance;
+            if (indirect.vertexFromBase) direct.firstVertex = arguments.vertexOffset;
             if (graphics.rectList && patched.contains(0)) buildRectList();
             snapshot();
             if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {

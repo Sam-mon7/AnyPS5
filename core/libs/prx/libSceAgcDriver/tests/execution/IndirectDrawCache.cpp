@@ -180,21 +180,27 @@ void RepeatedIndirectDrawsStayOnTheGpu() {
     Require(cache.hits - cacheBefore.hits >= (Frames - 1) * Draws, "the repeated indirect draws hit the draw cache " + std::to_string(cache.hits - cacheBefore.hits) + " times");
 }
 
-void CpuIndirectCacheRefreshesPushConstants() {
+void CpuIndirectCacheRefreshesPushConstants(bool builtinTest = false, bool unknownLimit = false) {
+    const bool builtins = builtinTest && std::getenv("APS5_INDIRECT_BUILTIN_OFFSETS") != nullptr;
     const bool enabled = std::getenv("APS5_NO_CPU_INDIRECT_DRAW_CACHE") == nullptr;
-    alignas(256) constexpr std::array<std::uint16_t, 6> indices{0, 1, 2, 0, 0, 0};
+    alignas(256) std::array<std::uint16_t, 6> indices{0, 1, 2, 0, 0, 0};
+    if (builtinTest) indices = {0, 1, 2, 2, 0, 1};
     const auto indexAddress = reinterpret_cast<std::uintptr_t>(indices.data());
     const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
     const auto pathsBefore = AgcDriver::Graphics::IndirectDrawCounts();
-    for (std::uint32_t draw = 0; draw < 5; ++draw) {
+    const auto draws = builtinTest ? 8u : 5u;
+    for (std::uint32_t draw = 0; draw < draws; ++draw) {
         const auto color = std::bit_cast<std::uint32_t>(0.125f * static_cast<float>(draw + 1u));
+        const auto location = BaseVertexLocation + (builtinTest && draw % 2u != 0u ? 1u : 0u);
+        const auto stale = std::bit_cast<std::uint32_t>(0.75f);
         DirectMemory.fill(Kept);
         IndirectMemory.fill(Kept);
         const auto firstIndex = draw % 2u * 3u;
         const auto indexCount = draw == 4 ? 1u : 3u;
         std::vector<std::uint32_t> direct;
         AppendState(direct, DirectMemory, CpuVertexCode.data());
-        Append(direct, 0x76, {BaseVertexLocation, color});
+        if (builtinTest) Append(direct, 0x76, {0x8b, 2u << 1u});
+        Append(direct, 0x76, {BaseVertexLocation, location == BaseVertexLocation ? color : stale});
         Append(direct, 0x2a, {0});
         const auto directIndices = indexAddress + firstIndex * sizeof(std::uint16_t);
         Append(direct, 0x27, {indexCount, static_cast<std::uint32_t>(directIndices), static_cast<std::uint32_t>(directIndices >> 32u), indexCount, 0});
@@ -203,22 +209,37 @@ void CpuIndirectCacheRefreshesPushConstants() {
         std::copy(record.begin(), record.end(), Records);
         std::vector<std::uint32_t> indirect;
         AppendState(indirect, IndirectMemory, CpuVertexCode.data());
+        if (builtinTest) {
+            Append(indirect, 0x76, {0x8b, 2u << 1u});
+            Append(indirect, 0x76, {BaseVertexLocation, stale, 0x51u});
+        }
         const auto address = reinterpret_cast<std::uintptr_t>(Records);
         Append(indirect, 0x11, {1, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)});
         Append(indirect, 0x2a, {0});
         Append(indirect, 0x26, {static_cast<std::uint32_t>(indexAddress), static_cast<std::uint32_t>(indexAddress >> 32u)});
-        Append(indirect, 0x13, {static_cast<std::uint32_t>(indices.size())});
-        Append(indirect, 0x25, {0, BaseVertexLocation, 0, 0});
+        if (!unknownLimit) Append(indirect, 0x13, {static_cast<std::uint32_t>(indices.size())});
+        Append(indirect, 0x25, {0, location, builtinTest ? 0x280u : 0u, 0});
         Submit(indirect);
         Flush(DirectMemory);
         Flush(IndirectMemory);
-        if (firstIndex == 0 && indexCount == 3) Require(std::any_of(DirectMemory.begin(), DirectMemory.end(), [](std::byte value) { return value != Kept; }), "CPU indirect reference draw wrote no pixels");
+        if ((builtinTest || firstIndex == 0) && indexCount == 3) Require(std::any_of(DirectMemory.begin(), DirectMemory.end(), [](std::byte value) { return value != Kept; }), "CPU indirect reference draw wrote no pixels");
         Require(IndirectMemory == DirectMemory, "cached CPU indirect draw reused another record's color or index range");
     }
     const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
     const auto paths = AgcDriver::Graphics::IndirectDrawCounts();
-    Require(paths[static_cast<std::size_t>(Path::NotFolded)] - pathsBefore[static_cast<std::size_t>(Path::NotFolded)] == 5, "CPU indirect cache regression did not take NotFolded");
-    Require(after.indirectCpuHits - before.indirectCpuHits == (enabled ? 4u : 0u), "CPU indirect submission did not exercise the expected cache hits: " + std::to_string(after.indirectCpuHits - before.indirectCpuHits));
+    if (builtinTest) {
+        const auto expected = unknownLimit ? Path::IndexLimitUnknown : builtins ? std::getenv("APS5_NO_GPU_INDIRECT_DRAW") != nullptr ? Path::Disabled : Path::Gpu : Path::NotFolded;
+        const auto expectedCount = !builtins && !unknownLimit ? draws / 2u : draws;
+        Require(paths[static_cast<std::size_t>(expected)] - pathsBefore[static_cast<std::size_t>(expected)] == expectedCount, "builtin submission selected the wrong indirect draw path");
+        if (builtins && !unknownLimit) {
+            Require(after.hits >= before.hits + 2u, "builtin indirect submissions did not reuse warm draw-cache entries");
+            Require(after.indirectCpuHits == before.indirectCpuHits, "GPU builtin draws used the CPU indirect cache");
+        }
+        Require(after.verifyMismatches == before.verifyMismatches, "builtin draw-cache verification disagreed with materialization");
+    } else {
+        Require(paths[static_cast<std::size_t>(Path::NotFolded)] - pathsBefore[static_cast<std::size_t>(Path::NotFolded)] == 5, "CPU indirect cache regression did not take NotFolded");
+        Require(after.indirectCpuHits - before.indirectCpuHits == (enabled ? 3u : 0u), "CPU indirect submission did not exercise the expected cache hits: " + std::to_string(after.indirectCpuHits - before.indirectCpuHits));
+    }
 }
 
 }
@@ -237,7 +258,13 @@ int main(int argc, char** argv) {
         Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
         AllocateRecords();
-        if (argc > 1 && std::string(argv[1]) == "--cpu-indirect-cache") {
+        const std::string mode = argc > 1 ? argv[1] : "";
+        if (mode == "--builtin-offsets" || mode == "--builtin-offsets-fallback") {
+            const auto device = OpenVulkanTestDevice();
+            if (!device || !device->DrawIndirectSupport().drawParameters || !device->DrawIndirectSupport().firstInstance) return VulkanTestSkipped;
+            Registered(CpuVertexHeader, CpuVertexCode.data(), sizeof(CpuVertexCode), 2);
+            CpuIndirectCacheRefreshesPushConstants(true, mode == "--builtin-offsets-fallback");
+        } else if (mode == "--cpu-indirect-cache") {
             Registered(CpuVertexHeader, CpuVertexCode.data(), sizeof(CpuVertexCode), 2);
             CpuIndirectCacheRefreshesPushConstants();
         } else {

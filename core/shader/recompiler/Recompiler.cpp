@@ -247,6 +247,15 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.float32FlushToZero = HardwareFloat32Flush(request);
     translateOptions.inputInfo = inputInfo;
     translateOptions.float32DenormPreserve = request.target.float32DenormPreserve;
+    if (stageKind == ShaderStageKind::Vertex && request.graphics && (request.graphics->instanceFromBase || request.graphics->vertexFromBase)) {
+        if (!supports(spv::CapabilityDrawParameters)) throw std::runtime_error("draw offsets read from the draw parameters need shader draw parameters");
+        const auto inUserData = [&](std::int32_t sgpr) { return sgpr == -1 || (sgpr >= 0 && static_cast<std::uint32_t>(sgpr) >= request.context.userDataBaseRegister && static_cast<std::uint32_t>(sgpr) - request.context.userDataBaseRegister < request.context.userData.size()); };
+        if (!inUserData(request.graphics->baseInstanceSgpr) || !inUserData(request.graphics->baseVertexSgpr)) throw std::runtime_error("a draw offset SGPR is outside the user data");
+        translateOptions.instanceFromBase = request.graphics->instanceFromBase;
+        translateOptions.baseInstanceSgpr = request.graphics->baseInstanceSgpr;
+        translateOptions.vertexFromBase = request.graphics->vertexFromBase;
+        translateOptions.baseVertexSgpr = request.graphics->baseVertexSgpr;
+    }
 
     constexpr InstructionTranslator translator;
 

@@ -406,7 +406,7 @@ public:
         return info;
     }
 
-    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, std::int32_t vertexSgpr = BaseVertexSgpr, std::int32_t instanceSgpr = StartInstanceSgpr) const {
+    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, std::int32_t vertexSgpr = BaseVertexSgpr, std::int32_t instanceSgpr = StartInstanceSgpr, bool fromBase = false) const {
         const auto info = VertexInfo();
         const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
             {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
@@ -419,6 +419,14 @@ public:
             {0, 0, 0, 64}
         };
         request.useCache = false;
+        if (fromBase) {
+            request.graphics = ShaderRecompiler::GraphicsCompileContext{};
+            request.graphics->firstUserSgpr = 8;
+            request.graphics->instanceFromBase = true;
+            request.graphics->baseInstanceSgpr = StartInstanceSgpr;
+            request.graphics->vertexFromBase = true;
+            request.graphics->baseVertexSgpr = BaseVertexSgpr;
+        }
         auto result = ShaderRecompiler::Recompile(request);
         Require(result.vertexOffsetSgpr == vertexSgpr && result.instanceOffsetSgpr == instanceSgpr, "the program folded vertex " + std::to_string(result.vertexOffsetSgpr) + ", instance " + std::to_string(result.instanceOffsetSgpr) + " into the draw, expected " + std::to_string(vertexSgpr) + ", " + std::to_string(instanceSgpr));
         return result;
@@ -815,6 +823,56 @@ std::string CachedIndirectPatches(Fixture& fixture) {
     return failures;
 }
 
+std::string BuiltinOffsets(Fixture& fixture) {
+    const auto stale = fixture.UserData(0x51u, 0x62u);
+    const std::array<std::uint32_t, Vertices> raw{2, 0, 1};
+    std::string failures;
+    for (const auto* code : {&VertexCode, &PostAddCode, &NoCarryCode}) {
+        const auto vertex = fixture.Vertex(*code, stale, -1, -1, true);
+        Require(!vertex.vertexOffsetShared && !vertex.instanceOffsetShared && !vertex.vertexOffsetConflict && !vertex.instanceOffsetConflict, "builtin offsets retained CPU folding metadata");
+        for (const auto& offsets : {std::array<std::uint32_t, 2>{700, 59455}, std::array<std::uint32_t, 2>{31, 19}, std::array<std::uint32_t, 2>{0, 0}}) {
+            const std::array<std::uint32_t, 4> first{Vertices, Instances, 0, offsets[0]};
+            const std::array<std::uint32_t, 4> last{offsets[1], 0, 0, 0};
+            const auto address = reinterpret_cast<std::uintptr_t>(fixture.Records());
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                Require(fixture.device->FillBuffer(address, 16, first) && fixture.device->FillBuffer(address + 16, 16, last), "could not write indirect arguments on the GPU");
+                Require(AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(address, 20), "the indirect record has no pending GPU writer");
+            }
+            AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(Indices.data()), Vertices, 2, 0, 0, true, 0, 0};
+            draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{address, 0x25u, 20u, 20u, 1u, false, 0u, 0x94u, 0x95u, NoLocation, false, 0u};
+            draw.indirect->baseVertexSgpr = BaseVertexSgpr;
+            draw.indirect->startInstanceSgpr = StartInstanceSgpr;
+            draw.indirect->vertexFromBase = true;
+            draw.indirect->instanceFromBase = true;
+            failures += Classified(fixture, "GPU-written builtin offsets", vertex, stale, draw, std::nullopt, Rule::InPlace);
+            fixture.Place(offsets[0], raw, offsets[1]);
+            const auto before = AgcDriver::Graphics::IndirectDrawCounts()[static_cast<std::size_t>(Path::Gpu)];
+            fixture.Draw(vertex, draw);
+            Require(AgcDriver::Graphics::IndirectDrawCounts()[static_cast<std::size_t>(Path::Gpu)] == before + 1u, "the GPU-written builtin record fell back to CPU argument reads");
+            failures += fixture.Check("GPU-written builtin offsets", raw, offsets[0], offsets[1], code == &VertexCode);
+        }
+    }
+    const auto vertex = fixture.Vertex(VertexCode, stale, -1, -1, true);
+    alignas(256) constexpr std::array<std::uint16_t, Vertices> negativeIndices{702, 700, 701};
+    const std::array<std::uint32_t, 5> negative{Vertices, Instances, 0, static_cast<std::uint32_t>(-700), 7};
+    std::copy(negative.begin(), negative.end(), fixture.Records());
+    AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(negativeIndices.data()), Vertices, 2, 0, 0, true, 0, 0};
+    draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(fixture.Records()), 0x25u, 20u, 20u, 1u, false, 0u, 0x94u, 0x95u, NoLocation, false, 0u};
+    draw.indirect->baseVertexSgpr = BaseVertexSgpr;
+    draw.indirect->startInstanceSgpr = StartInstanceSgpr;
+    draw.indirect->vertexFromBase = true;
+    draw.indirect->instanceFromBase = true;
+    failures += Classified(fixture, "negative builtin base vertex", vertex, stale, draw, std::nullopt, Rule::InPlace);
+    fixture.Place(0, raw, 7);
+    fixture.Draw(vertex, draw);
+    const std::array<std::uint32_t, Vertices> negativeRaw{702, 700, 701};
+    failures += fixture.Check("negative builtin base vertex", negativeRaw, negative[3], 7, true);
+    draw.indirect->indexLimitKnown = false;
+    failures += Classified(fixture, "builtin offsets with unknown index limit", vertex, stale, draw, Path::IndexLimitUnknown, Rule::InPlace);
+    return failures;
+}
+
 std::string Run(Fixture& fixture) {
     std::string failures = Analysis(fixture);
     const std::array<std::uint32_t, Vertices> autoIndices{0, 1, 2};
@@ -959,12 +1017,20 @@ std::string Run(Fixture& fixture) {
 }
 
 int main(int argc, char** argv) {
+    const std::string mode = argc > 1 ? argv[1] : "";
+    if (mode == "--builtin-offsets") {
+#ifdef _WIN32
+        _putenv_s("APS5_PROFILE_DRAW", "1");
+#else
+        setenv("APS5_PROFILE_DRAW", "1", 1);
+#endif
+    }
     try {
         std::shared_ptr<AgcDriver::VulkanDevice> device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (mode == "--builtin-offsets" && (!device->DrawIndirectSupport().drawParameters || !device->DrawIndirectSupport().firstInstance)) return VulkanTestSkipped;
         Fixture fixture(device);
-        const std::string mode = argc > 1 ? argv[1] : "";
-        const auto failures = mode == "--cpu-indirect-cache" ? CachedIndirectPatches(fixture) : mode == "--indirect-push-patch" ? IndirectPushPatches(fixture, false) : mode == "--indirect-buffer-base" ? IndirectPushPatches(fixture, true) : Run(fixture);
+        const auto failures = mode == "--builtin-offsets" ? BuiltinOffsets(fixture) : mode == "--cpu-indirect-cache" ? CachedIndirectPatches(fixture) : mode == "--indirect-push-patch" ? IndirectPushPatches(fixture, false) : mode == "--indirect-buffer-base" ? IndirectPushPatches(fixture, true) : Run(fixture);
         if (!failures.empty()) {
             std::cerr << "vertex and instance indices differ from the guest's:\n" << failures;
             return 1;

@@ -4271,7 +4271,7 @@ Graphics::Context VulkanDevice::buildContext() const {
 }
 
 VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
-    return {state->drawIndirectFirstInstance, state->multiDrawIndirect, state->drawIndirectCount};
+    return {state->drawIndirectFirstInstance, state->multiDrawIndirect, state->drawIndirectCount, std::ranges::find(state->capabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) != state->capabilities.end()};
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
