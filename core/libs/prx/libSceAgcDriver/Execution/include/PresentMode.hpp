@@ -13,6 +13,7 @@ namespace AgcDriver {
 
 inline VkPresentModeKHR SelectPresentMode(const char* requested, std::span<const VkPresentModeKHR> supported) {
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    if (requested == nullptr && std::find(supported.begin(), supported.end(), VK_PRESENT_MODE_MAILBOX_KHR) != supported.end()) mode = VK_PRESENT_MODE_MAILBOX_KHR;
     if (requested != nullptr) {
         const std::string_view name(requested);
         if (name == "mailbox") mode = VK_PRESENT_MODE_MAILBOX_KHR;

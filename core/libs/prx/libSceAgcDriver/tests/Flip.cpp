@@ -422,7 +422,8 @@ void testPresentMode() {
     check(AgcDriver::SwapchainImageCount(surface) == 3, "an unlimited surface maximum capped the swapchain");
     const std::array wayland{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR};
     const std::array all{VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR};
-    check(SelectPresentMode(nullptr, wayland) == VK_PRESENT_MODE_FIFO_KHR, "the default present mode is not FIFO");
+    check(SelectPresentMode(nullptr, wayland) == VK_PRESENT_MODE_FIFO_KHR, "the default present mode without mailbox is not FIFO");
+    check(SelectPresentMode(nullptr, all) == VK_PRESENT_MODE_MAILBOX_KHR, "the default present mode did not prefer mailbox");
     check(SelectPresentMode("fifo", wayland) == VK_PRESENT_MODE_FIFO_KHR, "fifo was not selected");
     check(SelectPresentMode("immediate", wayland) == VK_PRESENT_MODE_IMMEDIATE_KHR, "immediate was not selected");
     check(SelectPresentMode("mailbox", all) == VK_PRESENT_MODE_MAILBOX_KHR, "mailbox was not selected");
