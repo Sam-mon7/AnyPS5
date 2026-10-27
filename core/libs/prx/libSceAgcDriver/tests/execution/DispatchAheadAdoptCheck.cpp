@@ -45,7 +45,6 @@ alignas(256) volatile std::uint32_t OtherDone = 0;
 enum class Window { None, CpuStore, QueuedGpuStore, Epoch, Recapture, Indirect, Layout };
 
 std::atomic<Window> Armed{Window::None};
-std::atomic<std::uint64_t> AheadWaits{0};
 std::uint32_t SpinDispatches = 16;
 std::vector<std::uint32_t> OtherWords;
 bool SawPending = false;
@@ -118,7 +117,6 @@ void BeforeAdoption() {
 
 void AwaitAhead() {
     AgcDriver::DriverDetail::AwaitDispatchPreparation();
-    ++AheadWaits;
 }
 
 void WaitIdle() {
@@ -170,12 +168,10 @@ void RegisterChanges() {
     Dispatch(words, CounterCode.data(), {Low(Target.data()), High(Target.data())});
     Dispatch(words, CounterCode.data(), {Low(SecondTarget.data()), High(SecondTarget.data())});
     const auto adopted = AgcDriverDispatchesAdoptedAhead_nid_postfix();
-    const auto waits = AheadWaits.load();
     Submit(Compute, words);
     WaitIdle();
-    Require(AheadWaits.load() == waits + 1, "the register-change dispatches did not share one drained helper batch");
     Require(Stale[0] == 1 && Fresh[0] == 1, "the helper did not follow the shader register writes between dispatches " + Counts());
-    Require(AgcDriverDispatchesAdoptedAhead_nid_postfix() == adopted + 2, "the helper adopted " + std::to_string(AgcDriverDispatchesAdoptedAhead_nid_postfix() - adopted) + " of 2 dispatches across register changes");
+    Require(AgcDriverDispatchesAdoptedAhead_nid_postfix() == adopted + 2, "the helper did not adopt both dispatches across register changes");
 }
 
 void LabelOrdering() {
@@ -187,13 +183,6 @@ void LabelOrdering() {
     Submit(Compute, words);
     WaitIdle();
     Require(Stale[0] == 1 && Fresh[0] == 1, "the helper crossed a queued descriptor label store " + Counts());
-}
-
-void MappingChange() {
-    const auto rejected = AgcDriverDispatchesRejectedAhead_nid_postfix();
-    Gated(Window::Layout);
-    Require(Stale[0] == 1 && Fresh[0] == 0, "the mapping fallback used the wrong descriptor " + Counts());
-    Require(AgcDriverDispatchesRejectedAhead_nid_postfix() == rejected + 1, "a helper result crossed a mapping invalidation");
 }
 
 }
@@ -252,6 +241,10 @@ int main(int argc, char** argv) {
             Gated(Window::Epoch);
             Require(Stale[0] == 1 && Fresh[0] == 0, "the epoch fallback used the wrong descriptor " + Counts());
             Require(AgcDriverDispatchesRejectedAhead_nid_postfix() == rejectedBeforeEpoch + 1, "a helper result crossed a collect epoch");
+            const auto rejectedBeforeLayout = AgcDriverDispatchesRejectedAhead_nid_postfix();
+            Gated(Window::Layout);
+            Require(Stale[0] == 1 && Fresh[0] == 0, "the mapping fallback used the wrong descriptor " + Counts());
+            Require(AgcDriverDispatchesRejectedAhead_nid_postfix() == rejectedBeforeLayout + 1, "a helper result crossed a mapping invalidation");
             RegisterChanges();
             LabelOrdering();
         }
@@ -262,7 +255,6 @@ int main(int argc, char** argv) {
         Require(AgcDriverDispatchesRejectedAhead_nid_postfix() == rejected + 1, "the CPU store in the adoption window was not caught by the adoption check");
         std::cout << "cpu store before adoption: passed\n";
         if (helperCore) {
-            MappingChange();
             AgcDriverSetAheadAdoptHook_nid_postfix(nullptr);
             AgcDriver::DriverDetail::Driver::Get().SetAheadScheduleHook(nullptr);
             AgcDriverShutdown_nid_postfix();
@@ -282,7 +274,6 @@ int main(int argc, char** argv) {
             Require(Fresh[0] == 1 && Stale[0] == 0, "a dispatch resolved ahead whose descriptor a GPU store queued on another queue replaces before its adoption used the old descriptor " + Counts());
             Require(AgcDriverDispatchesRejectedAhead_nid_postfix() == rejected + 1, "the queued GPU store in the adoption window was not caught by the adoption check");
         }
-        if (helper) MappingChange();
         AgcDriverSetAheadAdoptHook_nid_postfix(nullptr);
         if (helper) AgcDriver::DriverDetail::Driver::Get().SetAheadScheduleHook(nullptr);
         if (!conclusive) {

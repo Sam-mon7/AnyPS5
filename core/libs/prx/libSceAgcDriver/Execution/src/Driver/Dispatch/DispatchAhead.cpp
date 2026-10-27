@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
-#include <type_traits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -27,24 +26,10 @@ bool ProfileAhead() {
 
 struct SpeculationCounts {
     std::uint64_t speculated = 0, adopted = 0, recaptured = 0;
-    std::uint64_t taken = 0;
     std::array<std::uint64_t, 14> rejected{};
     double preparationMs = 0, validationMs = 0, queueMs = 0;
-    double leadMs = 0, notReadyLeadMs = 0;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
-
-static_assert(std::is_trivially_destructible_v<SpeculationCounts>);
-
-struct HelperCounts {
-    std::mutex mutex;
-    std::uint64_t completed = 0, prepared = 0, queueNs = 0, workNs = 0, preparationNs = 0;
-};
-
-HelperCounts& HelperStats() {
-    static HelperCounts counts;
-    return counts;
-}
 
 SpeculationCounts& SpeculationStats() {
     static thread_local SpeculationCounts counts;
@@ -62,16 +47,6 @@ void ReportSpeculation() {
         static_cast<unsigned long long>(stats.rejected[8]), static_cast<unsigned long long>(stats.rejected[9]), static_cast<unsigned long long>(stats.rejected[10]), static_cast<unsigned long long>(stats.rejected[11]),
         static_cast<unsigned long long>(stats.rejected[12]), static_cast<unsigned long long>(stats.rejected[13]),
         (stats.preparationMs - stats.validationMs - stats.queueMs) * perAdopt, stats.preparationMs * perAdopt, stats.validationMs * perAdopt, stats.queueMs * perAdopt);
-    auto& helpers = HelperStats();
-    std::lock_guard lock(helpers.mutex);
-    const double perJob = helpers.completed != 0 ? 0.001 / static_cast<double>(helpers.completed) : 0.0;
-    const double perPrepared = helpers.prepared != 0 ? 0.001 / static_cast<double>(helpers.prepared) : 0.0;
-    ProfilePrint_nid_no_patch("[dispatch-ahead] queue 0 timing (10 s): lead %.1f us/take (%llu takes), not-ready lead %.1f us/take; helpers %llu completed (%llu prepared), queue %.1f us/job, work %.1f us/job, preparation %.1f us/prepared\n",
-        stats.taken != 0 ? stats.leadMs * 1000.0 / static_cast<double>(stats.taken) : 0.0, static_cast<unsigned long long>(stats.taken),
-        stats.rejected[0] != 0 ? stats.notReadyLeadMs * 1000.0 / static_cast<double>(stats.rejected[0]) : 0.0,
-        static_cast<unsigned long long>(helpers.completed), static_cast<unsigned long long>(helpers.prepared),
-        static_cast<double>(helpers.queueNs) * perJob, static_cast<double>(helpers.workNs) * perJob, static_cast<double>(helpers.preparationNs) * perPrepared);
-    helpers.completed = helpers.prepared = helpers.queueNs = helpers.workNs = helpers.preparationNs = 0;
     stats = {};
 }
 
@@ -118,8 +93,8 @@ void Driver::SetAheadScheduleHook(void (*hook)()) {
 }
 
 std::map<std::size_t, std::shared_ptr<Driver::DispatchSpeculation>>& Driver::dispatchSpeculations() {
-    static thread_local std::map<std::size_t, std::shared_ptr<DispatchSpeculation>>* slot = nullptr;
-    return ShaderRecompiler::ThreadOwned(slot);
+    static thread_local std::map<std::size_t, std::shared_ptr<DispatchSpeculation>> work;
+    return work;
 }
 
 void Driver::rejectDispatchAhead(AheadRejection reason) {
@@ -198,28 +173,12 @@ void Driver::scheduleDispatchAhead(const Submission& submission, const QueueStat
             work->result.epoch = GuestMemory::ThreadCollectEpoch();
             work->result.shader = scratch.shader;
             pending.emplace(cursor, work);
-            if (ProfileAhead()) {
-                ++SpeculationStats().speculated;
-                work->queuedAt = std::chrono::steady_clock::now();
-            }
+            if (ProfileAhead()) ++SpeculationStats().speculated;
             const bool submitted = SubmitDispatchPreparation([this, work, shaders = submission.shaders, localDevice, direct, arguments] {
-                const auto started = ProfileAhead() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 try {
                     if (!work->cancelled.load(std::memory_order_acquire)) speculateDispatch(work, shaders, localDevice, direct, arguments);
                 } catch (const std::exception&) {
                     work->rejection = AheadRejection::Footprint;
-                }
-                if (ProfileAhead()) {
-                    const auto finished = std::chrono::steady_clock::now();
-                    auto& stats = HelperStats();
-                    std::lock_guard lock(stats.mutex);
-                    stats.queueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(started - work->queuedAt).count());
-                    stats.workNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count());
-                    if (work->result.compiledResult != nullptr) {
-                        stats.preparationNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count());
-                        ++stats.prepared;
-                    }
-                    ++stats.completed;
                 }
                 work->ready.store(true, std::memory_order_release);
                 dispatchAheadOutstanding.fetch_sub(1, std::memory_order_release);
@@ -246,15 +205,7 @@ void Driver::takeDispatchAhead(const QueueState& live, std::size_t from) {
     if (found == pending.end()) return;
     const auto work = found->second;
     pending.erase(found);
-    const bool ready = work->ready.load(std::memory_order_acquire);
-    if (ProfileAhead()) {
-        auto& stats = SpeculationStats();
-        ++stats.taken;
-        const auto leadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - work->queuedAt).count();
-        stats.leadMs += leadMs;
-        if (!ready) stats.notReadyLeadMs += leadMs;
-    }
-    if (!ready) {
+    if (!work->ready.load(std::memory_order_acquire)) {
         work->cancelled.store(true, std::memory_order_release);
         rejectDispatchAhead(AheadRejection::NotReady);
     } else if (work->result.compiledResult == nullptr) rejectDispatchAhead(work->rejection);
@@ -288,10 +239,7 @@ void Driver::speculateDispatch(const std::shared_ptr<DispatchSpeculation>& work,
     if (variant->shader != shader) return;
     result.layout = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     result.forget = GuestMemory::ForgetSerial();
-    if (variant->forgetSerial != result.forget) {
-        work->rejection = AheadRejection::Layout;
-        return;
-    }
+    if (variant->forgetSerial != result.forget) return;
     result.ownedWords.resize(variant->words.size());
     result.captured.push_back({shader->codeAddress, std::as_bytes(std::span(shader->code))});
     if (!shader->header.empty()) result.captured.push_back({shader->headerAddress, shader->header});
