@@ -5814,6 +5814,7 @@ bool addressShadowTests(const Device& device, Recorder& recorder) {
         auto image = StorageTexture::Create(context, detiler, resource, 0);
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         const auto draw = [&](VkClearColorValue value) {
+            image->Refresh();
             const auto commands = recorder.Commands();
             recorder.Keep(image);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
