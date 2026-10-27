@@ -218,8 +218,8 @@ void PreparedDraws(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::State s
                 }
             }
             if (enabled && profile && (step == 2 || step == 4 || step == 5 || step == 6)) Require(prepared.collectInvalidated, "the draw preparation did not detect an invalidated collection");
+            device.WaitIdle();
         }
-        device.WaitIdle();
         std::vector<std::byte> stored(TargetBytes);
         AgcDriver::GuestMemory::Read(state.color.address, stored);
         for (std::uint32_t y = 0; y < Height; ++y) {
