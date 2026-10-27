@@ -286,6 +286,8 @@
 
 ### Opt-in draw paths
 
+- [Staging through unit shadows](../../../core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp) under `APS5_STAGING_UNIT_SHADOW=1` has not been runtime-validated. Complete watched 64 KiB output units are retained on the device; partial units and unavailable slabs copy back immediately. Staging still copies every input byte and every declared written byte because shader store coverage is unknown. Address readers use the existing read-only shadow proof; other import readers publish. Vulkan validation, workload firing and net GPU time including later publication remain to be measured.
+
 - [Resource epoch proofs](../../../core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp) under `APS5_RESOURCE_EPOCH_PROOFS=1` have not been runtime-validated on Windows or against Vulkan validation. Native depth, partially resident snapshots and untracked image memory retain ordinary revalidation. Any tracker-generation change invalidates the proof, including an unrelated clean collection; the resulting hit rate is unmeasured. The separate resource write serial retains explicit write invalidations and GPU mutex handoffs between threads; reacquisition by the same thread does not invalidate it. Per-use imports, completions, staging, depth-copy refresh and the lookup audit remain active.
 
 - [Draw finisher](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp) (`APS5_DRAW_PIPELINE`) - opt-in. The Linux main-image page table it adds matches what Windows already does by default.
