@@ -264,10 +264,11 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
     if (frames.empty()) return 0;
 #ifdef _WIN32
     // Walks the x64 unwind tables, so it needs no frame pointers (unlike __builtin_return_address(n)
-    // for n > 0); frame 0 of the capture is this function's caller.
-    void* raw[16];
-    const auto wanted = static_cast<DWORD>(std::min<std::size_t>(frames.size(), std::size(raw)));
-    const auto captured = RtlCaptureStackBackTrace(1 + skip, wanted, raw, nullptr);
+    // for n > 0); frame 0 of the capture is this function's caller. Frames outside the driver (the
+    // guest memory layer, exception dispatch) are skipped, so the driver code that made the access
+    // fills the slots even when it is several frames up.
+    void* raw[32];
+    const auto captured = RtlCaptureStackBackTrace(1 + skip, static_cast<DWORD>(std::size(raw)), raw, nullptr);
     // The driver's module is resolved once (this function lives in it): a per-frame
     // GetModuleHandleEx would take the loader lock several times per sync under the GpuMutex.
     static const auto module = [] {
@@ -283,11 +284,12 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
         }
         return std::pair(reinterpret_cast<std::uintptr_t>(handle), size);
     }();
-    for (std::size_t i = 0; i < captured; ++i) {
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < captured && kept < frames.size(); ++i) {
         const auto address = reinterpret_cast<std::uintptr_t>(raw[i]);
-        frames[i] = module.first != 0 && address >= module.first && address - module.first < module.second ? address - module.first : 0;
+        if (module.first != 0 && address >= module.first && address - module.first < module.second) frames[kept++] = address - module.first;
     }
-    return captured;
+    return kept;
 #else
     static_cast<void>(skip);
     frames[0] = ModuleOffset(__builtin_return_address(0));
