@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <initializer_list>
 #include <iostream>
@@ -36,6 +37,12 @@ alignas(256) constexpr std::array<std::uint32_t, 20> VertexCode{
     0x7e060280u, 0x7e0802f2u, 0x7e0a02ffu, 0x44800000u, 0xf80000d1u, 0x00000005u, 0xf80008cfu, 0x04030201u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
 };
 alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0x7e000200u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr auto CpuVertexCode = [] {
+    auto code = VertexCode;
+    code[10] = 0x7e0a0208u;
+    code[11] = 0xbf800000u;
+    return code;
+}();
 alignas(256) std::array<std::byte, 1024> DirectMemory{};
 alignas(256) std::array<std::byte, 1024> IndirectMemory{};
 constexpr std::size_t RecordBytes = 65536;
@@ -56,6 +63,7 @@ struct Header {
 
 alignas(8) Header VertexHeader{};
 alignas(8) Header PixelHeader{};
+alignas(8) Header CpuVertexHeader{};
 
 void Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -73,8 +81,8 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-void AppendState(std::vector<std::uint32_t>& commands, std::array<std::byte, 1024>& memory) {
-    const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
+void AppendState(std::vector<std::uint32_t>& commands, std::array<std::byte, 1024>& memory, const std::uint32_t* vertexCode = VertexCode.data()) {
+    const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
     const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
     const auto color = reinterpret_cast<std::uintptr_t>(memory.data());
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
@@ -172,9 +180,50 @@ void RepeatedIndirectDrawsStayOnTheGpu() {
     Require(cache.hits - cacheBefore.hits >= (Frames - 1) * Draws, "the repeated indirect draws hit the draw cache " + std::to_string(cache.hits - cacheBefore.hits) + " times");
 }
 
+void CpuIndirectCacheRefreshesPushConstants() {
+    const bool enabled = std::getenv("APS5_NO_CPU_INDIRECT_DRAW_CACHE") == nullptr;
+    alignas(256) constexpr std::array<std::uint16_t, 6> indices{0, 1, 2, 0, 0, 0};
+    const auto indexAddress = reinterpret_cast<std::uintptr_t>(indices.data());
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto pathsBefore = AgcDriver::Graphics::IndirectDrawCounts();
+    for (std::uint32_t draw = 0; draw < 5; ++draw) {
+        const auto color = std::bit_cast<std::uint32_t>(0.125f * static_cast<float>(draw + 1u));
+        DirectMemory.fill(Kept);
+        IndirectMemory.fill(Kept);
+        const auto firstIndex = draw % 2u * 3u;
+        const auto indexCount = draw == 4 ? 1u : 3u;
+        std::vector<std::uint32_t> direct;
+        AppendState(direct, DirectMemory, CpuVertexCode.data());
+        Append(direct, 0x76, {BaseVertexLocation, color});
+        Append(direct, 0x2a, {0});
+        const auto directIndices = indexAddress + firstIndex * sizeof(std::uint16_t);
+        Append(direct, 0x27, {indexCount, static_cast<std::uint32_t>(directIndices), static_cast<std::uint32_t>(directIndices >> 32u), indexCount, 0});
+        Submit(direct);
+        const std::array<std::uint32_t, 5> record{indexCount, 1, firstIndex, color, 0};
+        std::copy(record.begin(), record.end(), Records);
+        std::vector<std::uint32_t> indirect;
+        AppendState(indirect, IndirectMemory, CpuVertexCode.data());
+        const auto address = reinterpret_cast<std::uintptr_t>(Records);
+        Append(indirect, 0x11, {1, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)});
+        Append(indirect, 0x2a, {0});
+        Append(indirect, 0x26, {static_cast<std::uint32_t>(indexAddress), static_cast<std::uint32_t>(indexAddress >> 32u)});
+        Append(indirect, 0x13, {static_cast<std::uint32_t>(indices.size())});
+        Append(indirect, 0x25, {0, BaseVertexLocation, 0, 0});
+        Submit(indirect);
+        Flush(DirectMemory);
+        Flush(IndirectMemory);
+        if (firstIndex == 0 && indexCount == 3) Require(std::any_of(DirectMemory.begin(), DirectMemory.end(), [](std::byte value) { return value != Kept; }), "CPU indirect reference draw wrote no pixels");
+        Require(IndirectMemory == DirectMemory, "cached CPU indirect draw reused another record's color or index range");
+    }
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto paths = AgcDriver::Graphics::IndirectDrawCounts();
+    Require(paths[static_cast<std::size_t>(Path::NotFolded)] - pathsBefore[static_cast<std::size_t>(Path::NotFolded)] == 5, "CPU indirect cache regression did not take NotFolded");
+    Require(after.indirectCpuHits - before.indirectCpuHits == (enabled ? 4u : 0u), "CPU indirect submission did not exercise the expected cache hits: " + std::to_string(after.indirectCpuHits - before.indirectCpuHits));
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PROFILE_DRAW", "1");
 #else
@@ -188,8 +237,13 @@ int main() {
         Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
         AllocateRecords();
-        IndirectDrawsMatchTheDirectDraw();
-        RepeatedIndirectDrawsStayOnTheGpu();
+        if (argc > 1 && std::string(argv[1]) == "--cpu-indirect-cache") {
+            Registered(CpuVertexHeader, CpuVertexCode.data(), sizeof(CpuVertexCode), 2);
+            CpuIndirectCacheRefreshesPushConstants();
+        } else {
+            IndirectDrawsMatchTheDirectDraw();
+            RepeatedIndirectDrawsStayOnTheGpu();
+        }
         AgcDriverShutdown_nid_postfix();
         std::puts("indirect draw cache tests passed");
         return 0;

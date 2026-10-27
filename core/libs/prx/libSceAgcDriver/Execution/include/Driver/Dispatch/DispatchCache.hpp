@@ -23,6 +23,7 @@
 
 namespace ShaderRecompiler {
 struct IrResourcePlan;
+struct ResourceCapture;
 }
 
 namespace AgcDriver::DriverDetail {
@@ -54,6 +55,7 @@ struct DispatchVariant {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::uint64_t userDataMask = ~std::uint64_t{0};
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> indirectCapture;
 
     std::shared_ptr<ShaderMemory> memory;
     std::vector<ShaderRecompiler::MemoryRegion> captured;

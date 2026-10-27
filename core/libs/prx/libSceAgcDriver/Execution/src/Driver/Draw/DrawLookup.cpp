@@ -6,7 +6,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters) {
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
         if (!registerKey) {
@@ -125,6 +125,17 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     for (std::size_t rank = 0; rank < variants.size(); ++rank) {
                         const auto& variant = variants[rank];
                         if (variant->pushOffset != cursor) continue;
+                        if (drawParameters.indirect && variant->indirectCapture != nullptr) {
+                            const auto& indirect = *drawParameters.indirect;
+                            std::vector<std::size_t> patchedWords;
+                            for (const auto location : {indirect.baseVertexLocation, indirect.startInstanceLocation, indirect.drawIndexEnabled ? indirect.drawIndexLocation : 0x280u}) {
+                                for (const auto& [program, word] : UserDataWords(programs, roles, location)) {
+                                    if (program == i) patchedWords.push_back(word);
+                                }
+                            }
+                            const auto info = variant->vertexInfo != nullptr ? std::optional(*variant->vertexInfo) : std::nullopt;
+                            if (!patchedWords.empty() && IndirectStageCacheRefusal(*variant->compiled, variant->indirectCapture.get(), programs[i], info, patchedWords) != IndirectCacheRefusal::None) continue;
+                        }
                         if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh && !std::equal(variant->meshIndexDescriptor.begin(), variant->meshIndexDescriptor.end(), programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord)) {
                             if (!anyLayout) outcome = EntryOutcome::Differing;
                             anyLayout = true;
