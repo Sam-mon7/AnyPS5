@@ -16,6 +16,7 @@ public:
     static const SrtTape* For(const IrResourcePlan& plan);
     static bool Enabled();
     static bool Verified();
+    static bool FastEnabled();
 
     bool Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const;
 
@@ -39,6 +40,7 @@ private:
         bool loaded = false;
         std::uint8_t component = 0;
         std::uint8_t argumentCount = 0;
+        std::uint8_t literalArguments = 0;
         std::int32_t baseWord = -1;
         std::array<std::uint32_t, 5> arguments{};
         std::uint64_t immediate = 0;
@@ -52,6 +54,10 @@ private:
     std::vector<std::array<std::uint32_t, 8>> sourceDwords;
     std::vector<std::uint32_t> flatRoots;
     std::vector<std::uint32_t> conditionRoots;
+    std::vector<std::uint8_t> initialActive;
+    std::vector<std::uint8_t> initialActiveFlat;
+    std::size_t activityEntries = 0;
+    bool needsCleanMemory = false;
 };
 
 }
