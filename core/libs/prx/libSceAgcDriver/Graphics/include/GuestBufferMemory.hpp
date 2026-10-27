@@ -20,7 +20,6 @@
 namespace AgcDriver::Graphics {
 
 struct ShadowSlabPin;
-struct ShadowSlab;
 
 void ShutdownGuestBufferWorkers();
 
@@ -347,8 +346,7 @@ public:
     bool HasCopiedWrites() const;
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
-    void MarkDirectWrites();
-    void FlushBufferRange(std::uint64_t address, std::size_t bytes, const char* reason) const;
+    void MarkDirectWrites() const;
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
     // wrote lands in guest memory by the GPU, ordered after the recorded work, so the region needs
@@ -443,7 +441,6 @@ private:
         VkBuffer copySource = VK_NULL_HANDLE;
         std::uint64_t copySourceBase = 0;
         bool copiedBack = false;
-        bool shadowCopiedBack = false;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         bool swept = false;
@@ -534,13 +531,6 @@ private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> descriptorRanges;
     std::vector<ShaderRecompiler::BdaAbi::Range> shadowRanges;
     std::vector<std::shared_ptr<ShadowSlabPin>> shadowPins;
-    struct StagingShadow {
-        HostImport import;
-        std::uint64_t begin;
-        std::uint64_t end;
-        std::shared_ptr<ShadowSlab> slab;
-    };
-    std::vector<StagingShadow> stagingShadows;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
     std::vector<std::pair<std::uint64_t, std::shared_ptr<Buffer>>> heapReadbacks;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.

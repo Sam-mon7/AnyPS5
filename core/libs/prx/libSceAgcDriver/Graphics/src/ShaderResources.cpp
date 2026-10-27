@@ -3896,7 +3896,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
             // published by the flush, as one over a pending image is stored.
             for (const auto& region : regions) {
-                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) guestMemory.FlushBufferRange(region.begin, static_cast<std::size_t>(region.end - region.begin), "imported buffer region");
+                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
             }
         }
         if (HostImportsUnchanged(context, importsProof)) {
@@ -3906,8 +3906,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             importsProof = HostImportsIdentity(context);
         }
     } else {
-        for (const auto& region : directRegions) guestMemory.FlushBufferRange(region.begin, static_cast<std::size_t>(region.end - region.begin), "imported buffer region");
-        for (const auto& [begin, end] : guestMemory.Writes()) guestMemory.FlushBufferRange(begin, static_cast<std::size_t>(end - begin), "written buffer range");
+        for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+        for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
