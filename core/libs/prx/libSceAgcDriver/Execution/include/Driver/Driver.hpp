@@ -62,6 +62,7 @@ public:
     std::uint64_t DispatchesAdoptedAhead() const;
     std::uint64_t DispatchesRejectedAhead() const;
     void SetAheadAdoptHook(void (*hook)());
+    void SetAheadScheduleHook(void (*hook)());
     void CheckFailure();
     void ReportFailure(std::exception_ptr error);
     void Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip = false);
@@ -321,7 +322,34 @@ private:
         std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
         bool dataHit = false, cached = false, validated = false;
         std::chrono::steady_clock::time_point resolvedAt{};
+        struct Stamp {
+            std::uint64_t address, generation;
+            std::size_t bytes;
+        };
+        std::vector<std::uint32_t> ownedWords;
+        std::shared_ptr<VulkanDevice> preparedDevice;
+        std::vector<Stamp> stamps;
+        Registers shader;
+        std::uint64_t epoch = 0, layout = 0, forget = 0;
+        bool speculative = false;
+        double preparationMs = 0;
     };
+    enum class AheadRejection : std::size_t { NotReady, NoEntry, NoInvocation, Footprint, State, Key, Epoch, Layout, Generation, Pending, Memory, Cancelled, Label, Device, Count };
+    struct DispatchSpeculation {
+        std::atomic<bool> ready{false}, cancelled{false};
+        ResolvedDispatch result;
+        AheadRejection rejection = AheadRejection::NoEntry;
+    };
+    static bool dispatchAheadEnabled();
+    static std::map<std::size_t, std::shared_ptr<DispatchSpeculation>>& dispatchSpeculations();
+    void scheduleDispatchAhead(const Submission& submission, const QueueState& live, std::size_t from);
+    void takeDispatchAhead(const QueueState& live, std::size_t from);
+    void speculateDispatch(const std::shared_ptr<DispatchSpeculation>& work, const std::shared_ptr<const ShaderRegistry>& shaders, const std::shared_ptr<VulkanDevice>& localDevice, std::array<std::uint32_t, 5> packet, std::uint64_t arguments);
+    static std::uint64_t dispatchKey(std::uint64_t address, std::uint32_t initiator, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const Registers& registers, const ShaderSnapshot* shader);
+    static void rejectDispatchAhead(AheadRejection reason);
+    static void adoptDispatchAhead(double preparationMs, double validationMs, bool cached);
+    static void noteDispatchAheadQueueMs(double ms);
+    static std::optional<AheadRejection> validateDispatchAhead(const ResolvedDispatch& ahead);
     struct GroupCaptureStats {
         std::uint64_t runs = 0, resolved = 0, resolvedHits = 0, adopted = 0, addressMismatches = 0, keyMismatches = 0, memoryMismatches = 0, failures = 0, stale = 0, labelOverlaps = 0, writtenBefore = 0, deviceRejects = 0, argumentMismatches = 0;
         double resolveMs = 0, resolveMaxMs = 0, ageMs = 0, ageMaxMs = 0;
@@ -485,6 +513,8 @@ private:
     std::atomic<std::uint64_t> dispatchesAdoptedAhead{0};
     std::atomic<std::uint64_t> dispatchesRejectedAhead{0};
     std::atomic<void (*)()> aheadAdoptHook{nullptr};
+    std::atomic<void (*)()> aheadScheduleHook{nullptr};
+    std::atomic<unsigned> dispatchAheadOutstanding{0};
 
     AgcDriver::Mutex writtenBuffersMutex;
     std::deque<WrittenBuffer> writtenBuffers;

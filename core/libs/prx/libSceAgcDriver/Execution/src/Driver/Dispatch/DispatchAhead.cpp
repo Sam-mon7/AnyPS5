@@ -1,17 +1,327 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/RequestMemoryView.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+bool ProfileAhead() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+struct SpeculationCounts {
+    std::uint64_t speculated = 0, adopted = 0, recaptured = 0;
+    std::array<std::uint64_t, 14> rejected{};
+    double preparationMs = 0, validationMs = 0, queueMs = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+SpeculationCounts& SpeculationStats() {
+    static thread_local SpeculationCounts counts;
+    return counts;
+}
+
+void ReportSpeculation() {
+    auto& stats = SpeculationStats();
+    if (std::chrono::steady_clock::now() - stats.reported < std::chrono::seconds(10)) return;
+    const double perAdopt = stats.adopted != 0 ? 1000.0 / static_cast<double>(stats.adopted) : 0.0;
+    ProfilePrint_nid_no_patch("[dispatch-ahead] queue 0 (10 s): speculated %llu adopted %llu (recaptured %llu); rejected: not-ready %llu no-entry %llu no-invocation %llu footprint %llu state %llu key %llu epoch %llu layout %llu generation %llu pending %llu memory %llu cancelled %llu label %llu device %llu; estimated queue 0 preparation saved %.1f us/adopt (helper %.1f minus validation %.1f and scheduling %.1f us/adopt)\n",
+        static_cast<unsigned long long>(stats.speculated), static_cast<unsigned long long>(stats.adopted), static_cast<unsigned long long>(stats.recaptured),
+        static_cast<unsigned long long>(stats.rejected[0]), static_cast<unsigned long long>(stats.rejected[1]), static_cast<unsigned long long>(stats.rejected[2]), static_cast<unsigned long long>(stats.rejected[3]),
+        static_cast<unsigned long long>(stats.rejected[4]), static_cast<unsigned long long>(stats.rejected[5]), static_cast<unsigned long long>(stats.rejected[6]), static_cast<unsigned long long>(stats.rejected[7]),
+        static_cast<unsigned long long>(stats.rejected[8]), static_cast<unsigned long long>(stats.rejected[9]), static_cast<unsigned long long>(stats.rejected[10]), static_cast<unsigned long long>(stats.rejected[11]),
+        static_cast<unsigned long long>(stats.rejected[12]), static_cast<unsigned long long>(stats.rejected[13]),
+        (stats.preparationMs - stats.validationMs - stats.queueMs) * perAdopt, stats.preparationMs * perAdopt, stats.validationMs * perAdopt, stats.queueMs * perAdopt);
+    stats = {};
+}
+
+struct FrozenMemory {
+    ShaderRecompiler::RequestMemoryView view;
+    ShaderRecompiler::SrtRuntime runtime;
+
+    FrozenMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, std::span<const std::uint32_t> userData, std::uint64_t address) : view(regions), runtime(view.MakeRuntime(userData, address)) {}
+
+    static bool Read(void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& self = *static_cast<FrozenMemory*>(context);
+        if (!self.runtime.readMemory(self.runtime.userContext, address, value)) throw std::runtime_error("dispatch ahead read outside the copied footprint");
+        return true;
+    }
+
+    static bool Accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
+        auto& self = *static_cast<FrozenMemory*>(context);
+        if (!self.runtime.accessible(self.runtime.userContext, address, bytes)) throw std::runtime_error("dispatch ahead probe outside the copied footprint");
+        return true;
+    }
+
+    ShaderRecompiler::SrtRuntime Runtime() {
+        auto result = runtime;
+        result.userContext = this;
+        result.readMemory = &Read;
+        result.readSpecializationMemory = &Read;
+        result.accessible = &Accessible;
+        return result;
+    }
+};
+
+}
+
+bool Driver::dispatchAheadEnabled() {
+    static const bool enabled = [] {
+        const auto* text = std::getenv("APS5_DISPATCH_AHEAD");
+        return text != nullptr && std::string_view(text) == "1" && std::getenv("APS5_NO_DISPATCH_CACHE") == nullptr && std::getenv("APS5_DISPATCH_STAMP_VALIDATE") == nullptr && std::getenv("APS5_PROBE_DISPATCH") == nullptr;
+    }();
+    return enabled;
+}
+
+void Driver::SetAheadScheduleHook(void (*hook)()) {
+    aheadScheduleHook.store(hook, std::memory_order_release);
+}
+
+std::map<std::size_t, std::shared_ptr<Driver::DispatchSpeculation>>& Driver::dispatchSpeculations() {
+    static thread_local std::map<std::size_t, std::shared_ptr<DispatchSpeculation>> work;
+    return work;
+}
+
+void Driver::rejectDispatchAhead(AheadRejection reason) {
+    if (!ProfileAhead()) return;
+    ++SpeculationStats().rejected[static_cast<std::size_t>(reason)];
+    ReportSpeculation();
+}
+
+void Driver::adoptDispatchAhead(double preparationMs, double validationMs, bool cached) {
+    if (!ProfileAhead()) return;
+    auto& stats = SpeculationStats();
+    ++stats.adopted;
+    if (!cached) ++stats.recaptured;
+    stats.preparationMs += preparationMs;
+    stats.validationMs += validationMs;
+    ReportSpeculation();
+}
+
+void Driver::noteDispatchAheadQueueMs(double ms) {
+    SpeculationStats().queueMs += ms;
+}
+
+std::uint64_t Driver::dispatchKey(std::uint64_t address, std::uint32_t initiator, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const Registers& registers, const ShaderSnapshot* shader) {
+    std::uint64_t key = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) { key = (key ^ value) * 0x100000001b3ull; };
+    mix(address);
+    mix(initiator & 0x8000u);
+    for (const auto threads : compute.partialThreads) mix(threads);
+    for (const auto word : userData) mix(word);
+    static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
+    if (keyHygiene) {
+        for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+            const auto found = registers.find(offset);
+            mix(found == registers.end() ? (1ull << 32u) : found->second);
+        }
+    } else {
+        for (const auto& [offset, value] : registers) {
+            mix(offset);
+            mix(value);
+        }
+    }
+    mix(reinterpret_cast<std::uintptr_t>(shader));
+    return key;
+}
+
+void Driver::scheduleDispatchAhead(const Submission& submission, const QueueState& live, std::size_t from) {
+    if (!dispatchAheadEnabled() || submission.queue != 0 || !dispatchSpeculations().empty() || submission.shaders == nullptr || DrawPipeline::Active()) return;
+    const auto localDevice = device.Load();
+    if (localDevice == nullptr) return;
+    QueueState scratch = live;
+    auto& pending = dispatchSpeculations();
+    for (std::size_t cursor = from, packets = 0; cursor < submission.commands.size() && pending.size() < 8 && packets < 128; ++packets) {
+        const auto header = submission.commands[cursor];
+        if (Pm4::FillerPacket(header)) { ++cursor; continue; }
+        const auto count = Pm4::PacketWords(header);
+        if (count > submission.commands.size() - cursor || Pm4::Predicated(header)) break;
+        const auto packet = std::span(submission.commands).subspan(cursor, count);
+        const auto opcode = (header >> 8u) & 0xffu;
+        if (opcode == 0x15 || opcode == 0x16) {
+            if (opcode == 0x15 ? count != 5u : count != 3u && count != 4u) break;
+            std::array<std::uint32_t, 5> direct{};
+            std::uint64_t arguments = 0;
+            try {
+                if (opcode == 0x15) std::copy(packet.begin(), packet.end(), direct.begin());
+                else {
+                    arguments = Pm4::DispatchArgumentAddress(packet, scratch);
+                    if (indirectArgumentsPath(packet, arguments) != IndirectGpu) break;
+                    direct = {0xc0031500u, 0, 0, 0, packet.back()};
+                }
+            } catch (const std::exception&) { break; }
+            if (dispatchAheadOutstanding.fetch_add(1, std::memory_order_acq_rel) >= 16) {
+                dispatchAheadOutstanding.fetch_sub(1, std::memory_order_release);
+                break;
+            }
+            auto work = std::make_shared<DispatchSpeculation>();
+            work->result.epoch = GuestMemory::ThreadCollectEpoch();
+            work->result.shader = scratch.shader;
+            pending.emplace(cursor, work);
+            if (ProfileAhead()) ++SpeculationStats().speculated;
+            const bool submitted = SubmitDispatchPreparation([this, work, shaders = submission.shaders, localDevice, direct, arguments] {
+                try {
+                    if (!work->cancelled.load(std::memory_order_acquire)) speculateDispatch(work, shaders, localDevice, direct, arguments);
+                } catch (const std::exception&) {
+                    work->rejection = AheadRejection::Footprint;
+                }
+                work->ready.store(true, std::memory_order_release);
+                dispatchAheadOutstanding.fetch_sub(1, std::memory_order_release);
+            });
+            if (!submitted) {
+                dispatchAheadOutstanding.fetch_sub(1, std::memory_order_release);
+                work->ready.store(true, std::memory_order_release);
+            }
+            Pm4::NoteDispatchRegisters(packet, scratch);
+        } else if (opcode == 0x76) {
+            try { Pm4::Execute(packet, scratch); } catch (const std::exception&) { break; }
+        } else break;
+        cursor += count;
+    }
+    if (!pending.empty()) {
+        if (const auto hook = aheadScheduleHook.load(std::memory_order_acquire)) hook();
+    }
+}
+
+void Driver::takeDispatchAhead(const QueueState& live, std::size_t from) {
+    if (!dispatchAheadEnabled()) return;
+    auto& pending = dispatchSpeculations();
+    const auto found = pending.find(from);
+    if (found == pending.end()) return;
+    const auto work = found->second;
+    pending.erase(found);
+    if (!work->ready.load(std::memory_order_acquire)) {
+        work->cancelled.store(true, std::memory_order_release);
+        rejectDispatchAhead(AheadRejection::NotReady);
+    } else if (work->result.compiledResult == nullptr) rejectDispatchAhead(work->rejection);
+    else if (work->result.shader != live.shader) rejectDispatchAhead(AheadRejection::State);
+    else resolvedAhead().insert_or_assign(from, std::move(work->result));
+}
+
+void Driver::speculateDispatch(const std::shared_ptr<DispatchSpeculation>& work, const std::shared_ptr<const ShaderRegistry>& shaders, const std::shared_ptr<VulkanDevice>& localDevice, std::array<std::uint32_t, 5> packet, std::uint64_t arguments) {
+    const auto started = ProfileAhead() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto& result = work->result;
+    const auto& registers = result.shader;
+    const auto address = (static_cast<std::uint64_t>(readRegister(registers, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(registers, 0x20d) & 0xffu) << 40u);
+    auto shader = RegisteredProgram(*shaders, address, {0});
+    if (shader == nullptr) return;
+    const auto offset = static_cast<std::size_t>((address - shader->codeAddress) / sizeof(std::uint32_t));
+    std::vector<std::uint32_t> userData;
+    const auto count = (readRegister(registers, 0x213) >> 1u) & 0x1fu;
+    for (std::uint32_t index = 0; index < count; ++index) userData.push_back(readUserData(registers, 0x240u + index));
+    auto compute = Graphics::DecodeComputeStageInfo(registers, shader->header);
+    if (arguments == 0 && (packet[4] & 0x22u) != 0) return;
+    if (arguments != 0 && (packet[4] & 0x20u) != 0) return;
+    const auto key = dispatchKey(address, packet[4], userData, compute, registers, shader.get());
+    std::shared_ptr<DispatchEntry> entry;
+    {
+        std::lock_guard lock(dispatchCacheMutex);
+        const auto found = dispatchCache.find(key);
+        if (found != dispatchCache.end()) entry = found->second;
+    }
+    if (entry == nullptr || entry->variants.empty()) return;
+    const auto& variant = entry->variants.front();
+    if (variant->shader != shader) return;
+    result.layout = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    result.forget = GuestMemory::ForgetSerial();
+    if (variant->forgetSerial != result.forget) return;
+    result.ownedWords.resize(variant->words.size());
+    result.captured.push_back({shader->codeAddress, std::as_bytes(std::span(shader->code))});
+    if (!shader->header.empty()) result.captured.push_back({shader->headerAddress, shader->header});
+    std::size_t at = 0;
+    std::vector<std::shared_ptr<const GuestAllocations::Range>> leases;
+    work->rejection = AheadRejection::Footprint;
+    for (const auto& [begin, end] : variant->runs) {
+        for (auto address = begin; address < end;) {
+            auto lease = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(address), false);
+            if (lease == nullptr || !lease->readable || address < lease->address || address - lease->address >= lease->bytes) return;
+            address = std::min(end, lease->address + lease->bytes);
+            leases.push_back(std::move(lease));
+        }
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        const auto pendingWrites = Graphics::Recorder::PendingWriteSnapshot();
+        if (Graphics::Recorder::SnapshotOverlaps(pendingWrites.get(), begin, bytes)) {
+            work->rejection = AheadRejection::Pending;
+            return;
+        }
+        const auto generation = GuestMemory::CollectWritesUncached(begin, bytes);
+        const auto destination = std::as_writable_bytes(std::span(result.ownedWords)).subspan(at, bytes);
+        if (GuestMemory::CopyMapped(begin, destination) != GuestMemory::Compare::Equal) return;
+        result.stamps.push_back({begin, generation, bytes});
+        result.captured.push_back({begin, destination});
+        at += bytes;
+    }
+    leases.clear();
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    if (result.ownedWords == variant->words) {
+        compiled = variant->compiled;
+        result.keepVariant = variant;
+        result.cached = true;
+        result.validated = true;
+    } else {
+        work->rejection = AheadRejection::NoInvocation;
+        ShaderRecompiler::RecompileRequest request{
+            {ShaderRecompiler::ShaderStage::Compute, address, std::span(shader->code).subspan(offset), shader->headerAddress, shader->header},
+            {(packet[4] & 0x8000u) != 0 ? 32u : 64u, 0, userData, compute, std::nullopt, std::nullopt, result.captured, DispatchFloatMode(*shader, registers)},
+            localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u), {0, 0, 0, 128}
+        };
+        std::optional<ShaderRecompiler::PreparedShaderInvocation> invocation;
+        {
+            std::unique_lock lock(shader->prepared->mutex, std::try_to_lock);
+            if (!lock.owns_lock() || shader->prepared->pending || shader->prepared->deferredPreparing) return;
+            request.context.convertedSamples = std::ranges::find(shader->prepared->convertedSamples, offset) != shader->prepared->convertedSamples.end();
+            for (const auto& prepared : shader->prepared->entries) {
+                if (prepared.codeOffset != offset || !std::ranges::equal(ShaderRecompiler::GetPreparedCode(*prepared.handle), request.shader.code)) continue;
+                invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, prepared.handle);
+                if (invocation) break;
+            }
+        }
+        if (!invocation || work->cancelled.load(std::memory_order_acquire)) return;
+        FrozenMemory memory(result.captured, userData, address);
+        work->rejection = AheadRejection::Footprint;
+        result.capture = invocation->Capture(memory.Runtime());
+        compiled = invocation->Materialize(*result.capture);
+    }
+    if (work->cancelled.load(std::memory_order_acquire)) return;
+    result.address = address;
+    result.key = key;
+    result.packet = packet;
+    result.indirectArguments = arguments;
+    result.registeredShader = std::move(shader);
+    result.preparedDevice = localDevice;
+    result.speculative = true;
+    if (ProfileAhead()) {
+        result.resolvedAt = std::chrono::steady_clock::now();
+        result.preparationMs = std::chrono::duration<double, std::milli>(result.resolvedAt - started).count();
+    }
+    result.compiledResult = std::move(compiled);
+}
+
+std::optional<Driver::AheadRejection> Driver::validateDispatchAhead(const ResolvedDispatch& ahead) {
+    if (ahead.epoch != GuestMemory::ThreadCollectEpoch()) return AheadRejection::Epoch;
+    if (ahead.layout != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || ahead.forget != GuestMemory::ForgetSerial()) return AheadRejection::Layout;
+    for (const auto& stamp : ahead.stamps) {
+        if (QueryPendingSpan(stamp.address, stamp.bytes, {}) != ShaderMemory::PendingWrite::None) return AheadRejection::Pending;
+        GuestMemory::CollectWritesUncached(stamp.address, stamp.bytes);
+        if (stamp.generation != 0 && !GuestMemory::UnchangedSince(stamp.address, stamp.bytes, stamp.generation)) return AheadRejection::Generation;
+    }
+    return std::nullopt;
+}
 
 std::map<std::size_t, Driver::ResolvedDispatch>& Driver::resolvedAhead() {
     static thread_local std::map<std::size_t, ResolvedDispatch>* resolved = nullptr;
@@ -60,6 +370,13 @@ std::size_t& PreviewedUntil() {
 }
 
 void Driver::clearResolvedAhead() {
+    if (dispatchAheadEnabled()) {
+        for (const auto& [offset, work] : dispatchSpeculations()) {
+            work->cancelled.store(true, std::memory_order_release);
+            rejectDispatchAhead(AheadRejection::Cancelled);
+        }
+        dispatchSpeculations().clear();
+    }
     PreviewedUntil() = 0;
     auto& resolved = resolvedAhead();
     if (resolved.empty()) return;
