@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -268,13 +269,79 @@ bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     return templates;
 }
 
+bool RunCompletionRecipe(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+    Fill(guest.InputA(), 0xa000u);
+    auto compiled = Compile(device, guest.InputA(), Bytes, guest.OutputO());
+    Require(std::none_of(compiled.bindings.begin(), compiled.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }), "completion recipe: the test program uses address tables");
+    if (std::none_of(compiled.bindings.begin(), compiled.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer; })) {
+        std::uint32_t slot = 0;
+        for (const auto& binding : compiled.bindings) slot = std::max(slot, binding.binding + 1u);
+        compiled.bindings.push_back({ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::FaultBuffer, 0, slot, 1, {}});
+    }
+    compiled.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    compiled.windowLaneGuards = 1;
+    std::shared_ptr<const AgcDriver::Recipe> recipe;
+    AgcDriver::RecipeBuildFailure failure = AgcDriver::RecipeBuildFailure::NotAttempted;
+    Reset(guest.OutputO());
+    device.Dispatch(compiled, 1, 1, 1, {}, 0, nullptr, &recipe, std::nullopt, &failure);
+    device.WaitIdle();
+    Expect(guest.InputA(), guest.OutputO(), Constant, "the completion recipe's initial dispatch");
+    if (failure == AgcDriver::RecipeBuildFailure::CopiedWrites) {
+        std::puts("completion recipe skipped: the device copied the guest output instead of importing it");
+        return false;
+    }
+    if (std::getenv("APS5_NO_COMPLETION_RECIPE") != nullptr) {
+        Require(recipe == nullptr && failure == AgcDriver::RecipeBuildFailure::Completion, "completion recipe: the opt-out did not restore the completion refusal");
+        return true;
+    }
+    Require(recipe != nullptr && recipe->needsCompletion && !recipe->holdsLease, "completion recipe: a reusable fault-only template produced no recipe");
+    auto resources = recipe->templateRef.lock();
+    Require(resources != nullptr && resources->NeedsCompletion() && !resources->HasCopiedWrites() && !resources->UsesAddressTable(), "completion recipe: the recipe is not over a fault-only template");
+    for (std::uint32_t round = 0; round < 3; ++round) {
+        auto hit = device.PrepareRecipe(recipe, false);
+        Require(hit != nullptr, "completion recipe: the pre-check rejected a live recipe");
+        auto verify = AgcDriver::VulkanDevice::VerifyRecipes() ? device.PrepareDispatch(compiled, {}) : nullptr;
+        Fill(guest.InputA(), 0xb000u + round * 0x1000u);
+        Reset(guest.OutputO());
+        AgcDriver::VulkanDevice::IndirectOutcome outcome{};
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Require(device.DispatchRecipe(compiled, 1, 1, 1, 0, 0, hit, outcome, verify) == AgcDriver::RecipeOutcome::Recorded, "completion recipe: the live recipe was not recorded");
+        }
+        device.WaitIdle();
+        Expect(guest.InputA(), guest.OutputO(), Constant, "a completion recipe hit after changing the input");
+    }
+    auto stale = device.PrepareRecipe(recipe, false);
+    Require(stale != nullptr, "completion recipe: the stale-resource pre-check rejected live imports");
+    AgcDriver::Graphics::ClearHostImports(device.Device());
+    Reset(guest.OutputO());
+    AgcDriver::VulkanDevice::IndirectOutcome outcome{};
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Require(device.DispatchRecipe(compiled, 1, 1, 1, 0, 0, stale, outcome) == AgcDriver::RecipeOutcome::Rebuild, "completion recipe: recorded a template after its imports were removed between pre-check and proof");
+    }
+    device.WaitIdle();
+    Require(std::all_of(guest.OutputO(), guest.OutputO() + Words, [](auto value) { return value == Sentinel; }), "completion recipe: a rejected recipe recorded stale resources");
+    device.Dispatch(compiled, 1, 1, 1, {}, 0, nullptr, &recipe);
+    device.WaitIdle();
+    Require(recipe != nullptr && recipe->needsCompletion, "completion recipe: the fallback did not rebuild its recipe");
+    Expect(guest.InputA(), guest.OutputO(), Constant, "the rebuilt completion recipe");
+    return true;
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
         GuestBlock guest;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string(argv[1]) == "--completion-recipe") {
+            if (!RunCompletionRecipe(*device, guest)) return VulkanTestSkipped;
+            std::puts("completion recipe tests passed");
+            return 0;
+        }
+        Require(argc == 1, "unknown dispatch move test arguments");
         if (!RunTests(*device, guest)) return VulkanTestSkipped;
         std::puts("dispatch move tests passed");
         return 0;

@@ -119,6 +119,27 @@ void ReportDispatchItems(bool profile) {
     std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
 }
 
+void NoteMissingRecipe(std::uint32_t queue, bool indirect, RecipeBuildFailure failure) {
+    constexpr std::array<const char*, static_cast<std::size_t>(RecipeBuildFailure::Count)> names{"not attempted", "built", "disabled", "uncacheable", "overlay", "address table", "lease", "copied writes", "not reusable", "completion", "objects", "key"};
+    static thread_local std::map<std::pair<std::uint32_t, bool>, std::array<std::uint64_t, names.size()>> counts;
+    static thread_local auto reportedAt = std::chrono::steady_clock::now();
+    ++counts[{queue, indirect}][static_cast<std::size_t>(failure)];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reportedAt < std::chrono::seconds(10)) return;
+    reportedAt = now;
+    for (const auto& [site, reasons] : counts) {
+        std::string text;
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            if (reasons[i] == 0) continue;
+            char item[64];
+            std::snprintf(item, sizeof(item), "%s%s %llu", text.empty() ? "" : ", ", names[i], static_cast<unsigned long long>(reasons[i]));
+            text += item;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[recipe-missing] queue 0x%x %s cache hits (10 s), last build refusal: %s\n", site.first, site.second ? "indirect" : "direct", text.c_str());
+    }
+    counts.clear();
+}
+
 bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
     for (const auto& region : captured) {
         const auto address = region.guestAddress;
@@ -572,6 +593,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     };
     phaseTiming.Phase(PhaseSnapshots);
 
+    if (profile && cached && keepVariant != nullptr && !stampValidate() && keepVariant->recipe.load(std::memory_order_acquire) == nullptr) NoteMissingRecipe(submission.queue, indirectArguments != 0, keepVariant->recipeFailure.load(std::memory_order_relaxed));
+
     if (pipelined) {
         const auto recipe = keepVariant->recipe.load(std::memory_order_acquire);
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
@@ -585,6 +608,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             try {
                 std::shared_ptr<RecipeHit> recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(recipe, false);
                 std::shared_ptr<const Recipe> builtRecipe;
+                RecipeBuildFailure recipeFailure = RecipeBuildFailure::NotAttempted;
                 bool writersNoted = false;
                 for (;;) {
                     std::shared_ptr<PreparedDispatch> prepared;
@@ -606,11 +630,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                             continue;
                         }
                     } else {
-                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : &builtRecipe, htileClearCompletion);
+                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : &builtRecipe, htileClearCompletion, profile ? &recipeFailure : nullptr);
                     }
                     break;
                 }
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
+                if (profile && recipeHit == nullptr) keepVariant->recipeFailure.store(recipeFailure, std::memory_order_relaxed);
                 if (builtRecipe != nullptr) {
                     if (dataHit) {
                         auto own = std::make_shared<Recipe>(*builtRecipe);
@@ -637,6 +662,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     std::shared_ptr<const Recipe> builtRecipe;
+    RecipeBuildFailure recipeFailure = RecipeBuildFailure::NotAttempted;
     auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
@@ -707,10 +733,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 }
                 if (indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else if (indirectArguments != 0) {
-                const auto outcome = localDevice->DispatchIndirect(compiled, indirectArguments, snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr, threadGroup);
+                const auto outcome = localDevice->DispatchIndirect(compiled, indirectArguments, snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr, threadGroup, profile ? &recipeFailure : nullptr);
                 countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else {
-                localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : (attachTo != nullptr ? &builtRecipe : nullptr), htileClearCompletion);
+                localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : (attachTo != nullptr ? &builtRecipe : nullptr), htileClearCompletion, profile ? &recipeFailure : nullptr);
             }
         } catch (const std::exception& error) {
             if (rethrow(error)) return;
@@ -719,6 +745,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto note = keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes);
             if (note != 0 && note != keysNoteBefore) Graphics::NoteKeysFillOnGpu(keysFill->base, keysFill->bytes, *filledKeys);
         }
+        if (profile && attachTo != nullptr && recipeHit == nullptr) attachTo->recipeFailure.store(recipeFailure, std::memory_order_relaxed);
         if (builtRecipe != nullptr) {
             if (dataHit) {
 

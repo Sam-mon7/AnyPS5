@@ -25,6 +25,8 @@ namespace AgcDriver {
 // variant.
 struct ComputePipelineObjects;
 
+enum class RecipeBuildFailure : std::size_t { NotAttempted, None, Disabled, Uncacheable, Overlay, AddressTable, Lease, CopiedWrites, NotReusable, Completion, Objects, Key, Count };
+
 // What a value-equal dispatch-cache hit needs to record its dispatch without preparing, finding or
 // comparing anything again (design_cpu_final M4): the template the resource cache served the
 // entry's compiled result with, the pipeline objects of its variant, the push constants and data
@@ -49,7 +51,6 @@ struct Recipe {
     // computed under (a surface is CPU-read only while its memory has no import).
     std::vector<Graphics::PresyncSurface> presyncSurfaces;
     Graphics::HostImportsProof presyncProof;
-    // Both false for every recipe (only reusable objects get one); kept for the asserts.
     bool needsCompletion = false;
     bool holdsLease = false;
 };
