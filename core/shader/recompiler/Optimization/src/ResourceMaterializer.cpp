@@ -2603,6 +2603,12 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     for (auto& block : plan.controlFlow) {
         if (block.condition != nullptr && !Detail::Evaluator::MayDecide(source, block.condition)) block.condition = nullptr;
     }
+    if (Detail::DropItemFreeConditions()) {
+        const auto guards = Detail::ResourceGuardingConditions(plan);
+        for (std::size_t index = 0; index < plan.controlFlow.size(); ++index) {
+            if (guards[index] == 0u) plan.controlFlow[index].condition = nullptr;
+        }
+    }
     const auto addSource = [&plan](std::uint32_t index) {
         if (index >= plan.descriptorSources.size()) {
             throw std::runtime_error("ResourceMaterializer::ExtractPlan resource references an unknown descriptor source");
@@ -2630,6 +2636,9 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
     ownPlanValues(plan);
+    // The owned values are what the walk evaluates: a condition keeps only the operands the evaluator
+    // reads, so a slot outside them cannot change which successor the walk takes.
+    if (Detail::DropItemFreeConditions()) plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     buildCompactPlan(plan);
     return plan;
 }

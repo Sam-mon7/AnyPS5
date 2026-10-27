@@ -1399,6 +1399,25 @@ void verifyPureFlatSlots() {
     require(Detail::ComputePureFlatSlots(plan) == Pure{0, 0, 0, 0}, "an invalid uniform fill allowed pure slots");
     require(Detail::ComputeFlatSlotReasons(plan) == std::vector<std::uint16_t>(4, Detail::InvalidUniformFill), "an invalid uniform fill was not diagnosed");
     plan.uniformFill = {};
+    // A condition guards resources only through blocks it controls before its paths rejoin.
+    plan.controlFlow = {{&readConst(0), {1u, 2u}, {}}, {nullptr, {2u}, {}}, {nullptr, {}, {}}};
+    require(Detail::ResourceGuardingConditions(plan) == Pure{0, 1, 1}, "a condition guarding no resources was treated as guarding");
+    require((Detail::ComputeFlatSlotReasons(plan)[0] & (Detail::ItemFreeBranch | Detail::BranchCondition)) == Detail::ItemFreeBranch, "an item-free condition was not diagnosed separately");
+    require(Detail::ComputePureFlatSlots(plan)[0] == 0u, "a slot read by an item-free condition became pure while the plan keeps the condition");
+    plan.controlFlow[2].flatSlots = {3u};
+    require(Detail::ResourceGuardingConditions(plan)[0] == 0u, "a flat slot at the join made the condition guarding");
+    plan.controlFlow[1].flatSlots = {3u};
+    require(Detail::ResourceGuardingConditions(plan)[0] == 1u, "a flat slot read under the condition was not guarded");
+    require((Detail::ComputeFlatSlotReasons(plan)[0] & Detail::BranchCondition) != 0u, "a guarding condition lost its branch reason");
+    plan.controlFlow = {{&readConst(0), {1u, 2u}, {}}, {nullptr, {}, {}}, {nullptr, {}, {0u}}};
+    require(Detail::ResourceGuardingConditions(plan)[0] == 1u, "an early return before a descriptor source was not guarded");
+    plan.controlFlow = {{&readConst(0), {1u, 2u}, {}}, {nullptr, {1u}, {}}, {nullptr, {}, {}}};
+    require(Detail::ResourceGuardingConditions(plan)[0] == 1u, "a region that never reaches an exit was not guarded");
+    plan.controlFlow = {{&readConst(0), {1u, 3u}, {}}, {nullptr, {2u}, {}}, {nullptr, {3u}, {}, {0u}}, {nullptr, {}, {}}};
+    require(Detail::ResourceGuardingConditions(plan)[0] == 1u, "an image two blocks under the condition was not guarded");
+    plan.controlFlow = {{&readConst(0), {1u, 5u}, {}}, {nullptr, {2u}, {}}, {nullptr, {2u}, {}}};
+    require(Detail::ResourceGuardingConditions(plan) == Pure{1, 1, 1}, "a malformed successor was not treated as guarding");
+    plan.controlFlow.clear();
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.memoryInfo.emplace_back().kind = ResourceKind::ScalarAddress;
     std::array<std::uint32_t, 8> payload{11, 12, 13, 14, 15, 16, 17, 18};

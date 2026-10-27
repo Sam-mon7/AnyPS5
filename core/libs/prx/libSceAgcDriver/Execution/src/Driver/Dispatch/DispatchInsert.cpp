@@ -97,9 +97,10 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                     }
                     if (!entryCounters.flatSlotReasonsByProgram.contains(address)) {
                         std::string details;
-                        constexpr std::array<std::pair<std::uint16_t, const char*>, 9> names{{
+                        constexpr std::array<std::pair<std::uint16_t, const char*>, 10> names{{
                             {1u, "incomplete"}, {2u, "specialization"}, {4u, "table-column"}, {8u, "invalid-fill"},
-                            {16u, "descriptor"}, {32u, "unused-descriptor"}, {64u, "branch"}, {128u, "uniform-fill"}, {256u, "address"}
+                            {16u, "descriptor"}, {32u, "unused-descriptor"}, {64u, "branch"}, {128u, "uniform-fill"}, {256u, "address"},
+                            {512u, "item-free-branch"}
                         }};
                         for (std::size_t slot = 0; slot < reasons.size(); ++slot) {
                             const auto* raw = plan.srtReads[slot].value;
