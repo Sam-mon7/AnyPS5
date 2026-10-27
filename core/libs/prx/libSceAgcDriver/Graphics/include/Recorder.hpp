@@ -85,6 +85,8 @@ public:
     ~Recorder();
     Recorder(const Recorder&) = delete;
     Recorder& operator=(const Recorder&) = delete;
+    bool CanExecutePrivate() const;
+    void ExecutePrivate(VkCommandBuffer commands, std::shared_ptr<void> owner);
 
     // The open batch's command buffer, starting a batch when none is open. `coveredAccess`, when
     // given, receives the destination access mask of the last recorded command's trailing barrier

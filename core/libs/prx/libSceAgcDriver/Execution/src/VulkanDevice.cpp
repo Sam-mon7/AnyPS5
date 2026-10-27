@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
@@ -329,6 +330,122 @@ struct WorkgroupMemory {
     }
 };
 
+namespace {
+
+bool PrivateComputeQueue() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_PRIVATE_COMPUTE");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    if (!enabled) return false;
+    const auto queue = GuestMemory::GpuLockThreadTag();
+    static const bool all = [] {
+        const auto* value = std::getenv("APS5_PRIVATE_COMPUTE_ALL");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return queue == 0x28 || (all && queue >= 0x20 && queue < DriverDetail::SubmissionQueueEnd);
+}
+
+enum class PrivateFallback : std::size_t { Template, Locked, Indirect, Descriptors, Dimensions, Changed, Bindings, Query, Count };
+
+struct PrivateComputeCounters {
+    std::atomic<std::uint64_t> prepared{0};
+    std::atomic<std::uint64_t> recorded{0};
+    std::atomic<std::uint64_t> recordingNs{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PrivateFallback::Count)> fallbacks{};
+    std::atomic<std::int64_t> reportedAt{0};
+};
+
+PrivateComputeCounters& PrivateCounters() {
+    static PrivateComputeCounters counters;
+    return counters;
+}
+
+void NotePrivateDispatch(std::optional<PrivateFallback> fallback, std::uint64_t recordingNs) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& counters = PrivateCounters();
+    if (fallback) counters.fallbacks[static_cast<std::size_t>(*fallback)].fetch_add(1, std::memory_order_relaxed);
+    else {
+        counters.recorded.fetch_add(1, std::memory_order_relaxed);
+        counters.recordingNs.fetch_add(recordingNs, std::memory_order_relaxed);
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.reportedAt.load(std::memory_order_relaxed);
+    if (now - last < 10000 || !counters.reportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    constexpr std::array<const char*, 8> names{"template", "already locked", "indirect", "descriptor mode", "LDS or split", "changed state or imports", "overlay or thread limits", "active query"};
+    std::string reasons;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        reasons += " ";
+        reasons += names[i];
+        reasons += "=" + std::to_string(counters.fallbacks[i].load(std::memory_order_relaxed));
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[private-compute] cumulative: %llu prepared, %llu private recordings; recording mutex exposure avoided %.3f ms (body CPU time, not acquisition wait); shared fallbacks:%s\n", static_cast<unsigned long long>(counters.prepared.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.recorded.load(std::memory_order_relaxed)), static_cast<double>(counters.recordingNs.load(std::memory_order_relaxed)) / 1e6, reasons.c_str());
+}
+
+struct PrivateComputeSlot {
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkDescriptorPool descriptors = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    std::vector<std::uint32_t> layoutKey;
+};
+
+struct PrivateComputePool {
+    Graphics::Context context;
+    VkCommandPool commands = VK_NULL_HANDLE;
+    std::mutex mutex;
+    std::vector<PrivateComputeSlot> spare;
+
+    explicit PrivateComputePool(const Graphics::Context& context) : context(context) {
+        spare.reserve(64);
+        VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        info.queueFamilyIndex = context.queueFamily;
+        Graphics::Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &info, nullptr, &commands), "vkCreateCommandPool private compute");
+    }
+
+    void Release(PrivateComputeSlot slot) noexcept {
+        std::lock_guard lock(mutex);
+        if (slot.commands == VK_NULL_HANDLE) {
+            if (slot.descriptors != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, slot.descriptors, nullptr);
+            return;
+        }
+        if (spare.size() < 64) spare.push_back(std::move(slot));
+        else {
+            if (slot.descriptors != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, slot.descriptors, nullptr);
+            if (slot.commands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, commands, 1, &slot.commands);
+        }
+    }
+
+    ~PrivateComputePool() {
+        for (const auto& slot : spare) {
+            if (slot.descriptors != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, slot.descriptors, nullptr);
+        }
+        if (commands != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, commands, nullptr);
+    }
+};
+
+}
+
+struct PrivateDispatch {
+    std::shared_ptr<Graphics::ShaderResources> resources;
+    std::shared_ptr<ComputePipelineObjects> objects;
+    std::shared_ptr<PrivateComputePool> pool;
+    PrivateComputeSlot slot;
+    std::array<std::byte, Graphics::PipelinePushConstantBytes> pushBytes{};
+    VkShaderStageFlags pushStages = 0;
+    std::array<std::uint32_t, 3> groups{};
+    Graphics::HostImportsProof imports;
+    std::optional<PrivateFallback> fallback{PrivateFallback::Template};
+    std::uint64_t recordingNs = 0;
+    bool committed = false;
+
+    ~PrivateDispatch() {
+        if (pool != nullptr) pool->Release(std::move(slot));
+    }
+};
+
 struct VulkanDevice::State {
     bool compileOnly = false;
     void* library = nullptr;
@@ -339,6 +456,8 @@ struct VulkanDevice::State {
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
+    std::mutex privateComputeMutex;
+    std::map<std::uint32_t, std::shared_ptr<PrivateComputePool>> privateComputePools;
     void* window = nullptr;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -887,6 +1006,7 @@ struct VulkanDevice::State {
             }
             Graphics::DestroyShadows(device);
             recorder.reset();
+            privateComputePools.clear();
             // Cached graphics pipelines (with their framebuffers, modules, render passes and layouts)
             // belong to this device and must be destroyed while it lives.
             Graphics::ClearCachedPipelines(device);
@@ -4704,6 +4824,7 @@ struct RecordedDispatch {
     int cpuReason = 0;
     std::array<std::uint32_t, 3> threadGroup{};
     std::array<std::uint32_t, 3> threadLimit{};
+    std::shared_ptr<PrivateDispatch> privateDispatch;
 };
 
 struct DispatchCompletion {
@@ -4722,6 +4843,7 @@ struct DispatchCompletion {
     DispatchTimer& timer;
     PerformanceTimer& timing;
     char* groupsText;
+    std::shared_ptr<PrivateDispatch> privateDispatch;
 };
 
 VkDevice VulkanDevice::Device() const {
@@ -4946,6 +5068,115 @@ std::span<const double, 5> VulkanDevice::PreparePhaseMs(const PreparedDispatch& 
     return std::span<const double, 5>(prepared.phaseMs);
 }
 
+VulkanDevice::PrivateComputeStatistics VulkanDevice::PrivateComputeCounts() {
+    const auto& counters = PrivateCounters();
+    PrivateComputeStatistics result{counters.prepared.load(std::memory_order_relaxed), counters.recorded.load(std::memory_order_relaxed), counters.recordingNs.load(std::memory_order_relaxed)};
+    for (std::size_t i = 0; i < result.fallbacks.size(); ++i) result.fallbacks[i] = counters.fallbacks[i].load(std::memory_order_relaxed);
+    return result;
+}
+
+std::shared_ptr<PrivateDispatch> VulkanDevice::PreparePrivateDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, const std::shared_ptr<PreparedDispatch>& prepared, const std::shared_ptr<RecipeHit>& hit) {
+    if (!PrivateComputeQueue()) return nullptr;
+    auto result = std::make_shared<PrivateDispatch>();
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        result->fallback = PrivateFallback::Locked;
+        return result;
+    }
+    result->resources = hit != nullptr ? hit->resources : prepared != nullptr ? prepared->cached : nullptr;
+    result->objects = hit != nullptr ? hit->objects : prepared != nullptr ? prepared->objects : nullptr;
+    if (result->resources == nullptr || result->objects == nullptr) return result;
+    const auto& resources = *result->resources;
+    if (resources.LayoutUpdateAfterBind() || resources.SplitSets() || resources.UsesAddressTable() || std::ranges::any_of(resources.LayoutBindingFlags(), [](auto flags) { return flags != 0; })) {
+        result->fallback = PrivateFallback::Descriptors;
+        return result;
+    }
+    const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
+    if (shader.workgroupMemoryDwords != 0 || x > limit[0] || y > limit[1] || z > limit[2]) {
+        result->fallback = PrivateFallback::Dimensions;
+        return result;
+    }
+    const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
+    result->pushStages = Graphics::PushConstantStages(shaders);
+    result->pushBytes = hit != nullptr ? hit->recipe->pushBytes : Graphics::AssemblePushConstants(shaders);
+    if (hit == nullptr) resources.PatchPushConstants(result->pushBytes);
+    result->groups = {x, y, z};
+    const auto context = graphicsContext();
+    {
+        std::lock_guard lock(state->privateComputeMutex);
+        auto& pool = state->privateComputePools[GuestMemory::GpuLockThreadTag()];
+        if (pool == nullptr) pool = std::make_shared<PrivateComputePool>(context);
+        result->pool = pool;
+    }
+    auto& slot = result->slot;
+    {
+        std::lock_guard lock(result->pool->mutex);
+        if (!result->pool->spare.empty()) {
+            slot = std::move(result->pool->spare.back());
+            result->pool->spare.pop_back();
+            Graphics::Check(context.Function<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(slot.commands, 0), "vkResetCommandBuffer private compute");
+        } else {
+            VkCommandBufferAllocateInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            info.commandPool = result->pool->commands;
+            info.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+            info.commandBufferCount = 1;
+            Graphics::Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &info, &slot.commands), "vkAllocateCommandBuffers private compute");
+        }
+        const auto layouts = resources.SetLayouts();
+        if (slot.layout != resources.Layout() || !std::ranges::equal(slot.layoutKey, layouts.mainKey)) {
+            if (slot.descriptors != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, slot.descriptors, nullptr);
+            slot.descriptors = VK_NULL_HANDLE;
+            slot.set = VK_NULL_HANDLE;
+            slot.layout = VK_NULL_HANDLE;
+            slot.layoutKey.clear();
+            if (resources.Layout() != VK_NULL_HANDLE) {
+                std::vector<VkDescriptorPoolSize> sizes;
+                for (const auto& binding : resources.LayoutBindings()) {
+                    if (binding.descriptorCount == 0) continue;
+                    const auto found = std::ranges::find(sizes, binding.descriptorType, &VkDescriptorPoolSize::type);
+                    if (found == sizes.end()) sizes.push_back({binding.descriptorType, binding.descriptorCount});
+                    else found->descriptorCount += binding.descriptorCount;
+                }
+                VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                info.maxSets = 1;
+                info.poolSizeCount = static_cast<std::uint32_t>(sizes.size());
+                info.pPoolSizes = sizes.data();
+                Graphics::Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &info, nullptr, &slot.descriptors), "vkCreateDescriptorPool private compute");
+                const auto layout = resources.Layout();
+                VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                allocation.descriptorPool = slot.descriptors;
+                allocation.descriptorSetCount = 1;
+                allocation.pSetLayouts = &layout;
+                Graphics::Check(context.Resolved(&Graphics::DeviceFunctions::allocateDescriptorSets, "vkAllocateDescriptorSets")(context.device, &allocation, &slot.set), "vkAllocateDescriptorSets private compute");
+                slot.layoutKey.assign(layouts.mainKey.begin(), layouts.mainKey.end());
+                slot.layout = layout;
+            }
+        }
+    }
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool recorded = resources.RecordPrivateDescriptors(slot.set, [&] {
+        std::lock_guard lock(result->pool->mutex);
+        VkCommandBufferInheritanceInfo inheritance{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        begin.pInheritanceInfo = &inheritance;
+        Graphics::Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(slot.commands, &begin), "vkBeginCommandBuffer private compute");
+        const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(slot.commands, VK_PIPELINE_BIND_POINT_COMPUTE, result->objects->pipeline);
+        if (slot.set != VK_NULL_HANDLE) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(slot.commands, VK_PIPELINE_BIND_POINT_COMPUTE, result->objects->layout, 0, 1, &slot.set, 0, nullptr);
+        if (result->pushStages != 0) context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(slot.commands, result->objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, result->pushBytes.data());
+        context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(slot.commands, x, y, z);
+        if (profile) result->recordingNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        Graphics::Check(context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(slot.commands), "vkEndCommandBuffer private compute");
+    }, result->imports);
+    if (!recorded) {
+        result->fallback = PrivateFallback::Changed;
+        return result;
+    }
+    result->fallback.reset();
+    if (profile) PrivateCounters().prepared.fetch_add(1, std::memory_order_relaxed);
+    return result;
+}
+
 std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<const Recipe>& recipe, bool indirect) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& counters = Recipes().kinds[indirect ? 1 : 0];
@@ -4986,8 +5217,8 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
     return hit;
 }
 
-void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, RecipeBuildFailure* recipeFailure) {
-    static_cast<void>(dispatch(shader, x, y, z, 0, snapshots, programAddress, std::move(prepared), recipe, {}, htileClear, recipeFailure));
+void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, RecipeBuildFailure* recipeFailure, std::shared_ptr<PrivateDispatch> privateDispatch) {
+    static_cast<void>(dispatch(shader, x, y, z, 0, snapshots, programAddress, std::move(prepared), recipe, {}, htileClear, recipeFailure, std::move(privateDispatch)));
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe, const std::array<std::uint32_t, 3>& threadGroup, RecipeBuildFailure* recipeFailure) {
@@ -5107,6 +5338,19 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     static_cast<void>(Graphics::StorageTexture::StoreDrawnLinearTouching("dispatch access", touches, resources.HoldsLease()));
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
+    bool privateReady = false;
+    if (PrivateComputeQueue()) {
+        const auto& ready = record.privateDispatch;
+        std::optional<PrivateFallback> fallback;
+        if (record.arguments != 0 || record.cpuArguments != 0) fallback = PrivateFallback::Indirect;
+        else if (ready == nullptr) fallback = PrivateFallback::Template;
+        else if (ready->fallback) fallback = ready->fallback;
+        else if (record.bindings != nullptr || record.threadGroup != std::array<std::uint32_t, 3>{}) fallback = PrivateFallback::Bindings;
+        else if (ready->committed || record.resources != ready->resources || record.objects != ready->objects || record.pushStages != ready->pushStages || *record.pushBytes != ready->pushBytes || std::array{record.x, record.y, record.z} != ready->groups || !Graphics::HostImportEpochUnchanged(ready->imports)) fallback = PrivateFallback::Changed;
+        else if (!recorder.CanExecutePrivate()) fallback = PrivateFallback::Query;
+        privateReady = !fallback.has_value();
+        if (fallback && timer.profile) NotePrivateDispatch(fallback, 0);
+    }
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     if (record.resources != nullptr) record.resources->KeepStorageImageBytes(recorder);
@@ -5199,23 +5443,29 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
         if (timer.profile) timer.add(PhaseRecordArgumentCheck, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - checkStart).count());
     }
-    context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
-    if (record.bindings != nullptr) Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE, "dispatch overlay has no descriptor set");
-    if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
-    else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
-    if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
-        auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
-        context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
-        recorder.Keep(std::move(memory));
-    }
-    if (record.pushStages != 0) {
-        context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
+    if (!privateReady) {
+        context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
+        if (record.bindings != nullptr) Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE, "dispatch overlay has no descriptor set");
+        if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
+        else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+        if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
+            auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
+            context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
+            recorder.Keep(std::move(memory));
+        }
+        if (record.pushStages != 0) {
+            context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
+        }
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
     const auto marker = state->bufferMarker != nullptr ? state->markerLog.Next(record.programAddress) : 0u;
     if (marker != 0) state->bufferMarker(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, state->markerBuffer, 0, marker);
-    if (argumentImport != nullptr) {
+    if (privateReady) {
+        recorder.ExecutePrivate(record.privateDispatch->slot.commands, record.privateDispatch);
+        record.privateDispatch->committed = true;
+        if (timer.profile) NotePrivateDispatch(std::nullopt, record.privateDispatch->recordingNs);
+    } else if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, indirectBuffer, indirectOffset);
     } else {
         if (record.x <= limit[0] && record.y <= limit[1] && record.z <= limit[2]) {
@@ -5410,7 +5660,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
     return finish(std::move(objects), nullptr);
 }
 
-VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, RecipeBuildFailure* recipeFailure) {
+VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, RecipeBuildFailure* recipeFailure, std::shared_ptr<PrivateDispatch> privateDispatch) {
     startJournalReplay();
     for (const auto& binding : shader.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -5658,7 +5908,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         timing.Mark("pipeline_create");
         timer.phase(PhasePipeline);
     }
-    DispatchCompletion completion{context, shaders, pushStages, pushBytes, objects, resources, contentKey, cacheable, fromCache, revalidateMs, overlay, lookupsBefore, timer, timing, groupsText};
+    DispatchCompletion completion{context, shaders, pushStages, pushBytes, objects, resources, contentKey, cacheable, fromCache, revalidateMs, overlay, lookupsBefore, timer, timing, groupsText, std::move(privateDispatch)};
     return recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion, recipeFailure);
 }
 
@@ -5686,6 +5936,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer, htileClear};
     record.resourceKeyMatched = fromCache;
     record.bindings = overlay;
+    record.privateDispatch = std::move(completion.privateDispatch);
     record.threadGroup = threadGroup;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
@@ -5775,7 +6026,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     return outcome;
 }
 
-RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords, const std::array<std::uint32_t, 3>& threadGroup) {
+RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords, const std::array<std::uint32_t, 3>& threadGroup, std::shared_ptr<PrivateDispatch> privateDispatch) {
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.DispatchRecipe");
@@ -5871,6 +6122,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     if (dataRefresh == RecordedDispatch::DataRefresh::Words) counters.refreshByWords.fetch_add(1, std::memory_order_relaxed);
     RecordedDispatch record{&context, &shaders[0], hit->resources, hit->objects, recipe.pushes ? VkShaderStageFlags{VK_SHADER_STAGE_COMPUTE_BIT} : VkShaderStageFlags{0}, &recipe.pushBytes, x, y, z, arguments, nullptr, programAddress, dataRefresh, recipe.dataWordsHash, 0, &timer};
     record.resourceKeyMatched = verify != nullptr;
+    record.privateDispatch = std::move(privateDispatch);
     record.threadGroup = threadGroup;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;

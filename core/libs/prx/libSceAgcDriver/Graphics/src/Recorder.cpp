@@ -1618,6 +1618,18 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     return open->commands;
 }
 
+bool Recorder::CanExecutePrivate() const {
+    return open == nullptr || (!open->sampleActive && !open->segmentActive);
+}
+
+void Recorder::ExecutePrivate(VkCommandBuffer commands, std::shared_ptr<void> owner) {
+    GuestMemory::AssertGpuLockHeld("Recorder::ExecutePrivate");
+    Require(CanExecutePrivate(), "private compute recording cannot inherit an active query");
+    const auto primary = Commands();
+    Keep(std::move(owner));
+    context.Function<PFN_vkCmdExecuteCommands>("vkCmdExecuteCommands")(primary, 1, &commands);
+}
+
 void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }

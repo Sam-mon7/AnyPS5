@@ -6034,6 +6034,20 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
+bool ShaderResources::RecordPrivateDescriptors(VkDescriptorSet destination, const std::function<void()>& record, HostImportsProof& proof) const {
+    Require(completed && !splitSets && !updateAfterBind, "private compute descriptors require a completed fixed set");
+    std::vector<std::array<std::uint64_t, 3>> imports;
+    for (const auto& region : directRegions) {
+        if ((region.serial >> 63u) == 0) imports.push_back({region.begin, region.end, region.serial});
+    }
+    return RecordWithHostImports(context, imports, [&] {
+        auto writes = descriptorWrites;
+        for (auto& write : writes) write.dstSet = destination;
+        if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        record();
+    }, proof);
+}
+
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
     if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);

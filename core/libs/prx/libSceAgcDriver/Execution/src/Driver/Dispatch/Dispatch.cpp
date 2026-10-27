@@ -711,6 +711,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 phaseMs[PhasePrepareOther] += std::max(0.0, prepareMs - parts);
             }
         }
+        auto privateDispatch = indirectArguments == 0 ? localDevice->PreparePrivateDispatch(compiled, groups[0], groups[1], groups[2], prepared, recipeHit) : nullptr;
+        if (privateDispatch != nullptr) phaseTiming.Phase(PhasePrepareOther);
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         phaseTiming.Phase(PhaseLockWait);
@@ -727,7 +729,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         try {
             if (recipeHit != nullptr) {
                 VulkanDevice::IndirectOutcome outcome{0, 0};
-                const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, threadGroup);
+                const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, threadGroup, std::move(privateDispatch));
                 if (result == RecipeOutcome::Rebuild) {
 
                     recipeHit = nullptr;
@@ -739,7 +741,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 const auto outcome = localDevice->DispatchIndirect(compiled, indirectArguments, snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr, threadGroup, profile ? &recipeFailure : nullptr);
                 countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else {
-                localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : (attachTo != nullptr ? &builtRecipe : nullptr), htileClearCompletion, profile ? &recipeFailure : nullptr);
+                localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : (attachTo != nullptr ? &builtRecipe : nullptr), htileClearCompletion, profile ? &recipeFailure : nullptr, std::move(privateDispatch));
             }
         } catch (const std::exception& error) {
             if (rethrow(error)) return;

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -29,6 +30,7 @@ void Require(bool condition, const std::string& message) {
 }
 
 alignas(256) std::array<std::uint32_t, 15> SpinCode{0xf4080200u, 0xfa000000u, 0xbe840381u, 0x9304ff04u, 0x0019660du, 0x8004ff04u, 0x3c6ef35fu, 0x80828102u, 0xbf078002u, 0xbf85fff9u, 0xbf8cc07fu, 0x7e000204u, 0xe0700000u, 0x80020000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 8> ReadCode{0x34020082u, 0xe0301000u, 0x80000201u, 0xbf8c3f70u, 0x4a060481u, 0xe0701000u, 0x80010301u, 0xbf810000u};
 
 constexpr std::uint32_t SpinIterations = 1u << 20u;
 constexpr std::size_t BlockBytes = 65536;
@@ -39,6 +41,7 @@ struct Slot {
     alignas(256) std::array<std::uint32_t, 4> spinDescriptor{};
     alignas(256) volatile std::uint32_t label = 0;
     alignas(256) volatile std::uint32_t done = 0;
+    alignas(256) std::array<std::uint32_t, 4> readOutput{};
 };
 
 class GuestBlock {
@@ -131,15 +134,66 @@ std::uint64_t Run(Slot& slot, std::uint32_t value, bool wait) {
     return AgcDriver::GuestMemory::CollectEpochBumps() - before;
 }
 
+void RunPrivateCompute(Slot& slot, std::uint32_t queue = 0x28) {
+    slot.label = 0xdeadbeefu;
+    slot.spinDescriptor = {Low(slot.spinOutput.data()), High(slot.spinOutput.data()) & 0xffffu, sizeof(slot.spinOutput), 0x31016facu};
+    std::uint32_t expected = 1;
+    for (std::uint32_t i = 0; i < SpinIterations; ++i) expected = expected * 0x0019660du + 0x3c6ef35fu;
+    const auto before = AgcDriver::VulkanDevice::PrivateComputeCounts();
+    for (const auto value : {1u, 7u, 0u, 1u}) {
+        slot.spinOutput.fill(0xdeadbeefu);
+        slot.readOutput.fill(0xdeadbeefu);
+        slot.done = 0;
+        std::vector<std::uint32_t> producer;
+        Dispatch(producer, SpinCode.data(), {Low(slot.spinDescriptor.data()), High(slot.spinDescriptor.data()), SpinIterations});
+        WriteData(producer, &slot.label, value);
+        std::vector<std::uint32_t> consumer;
+        WaitEqual(consumer, &slot.label, value);
+        Dispatch(consumer, ReadCode.data(), {Low(slot.spinOutput.data()), High(slot.spinOutput.data()) & 0xffffu, sizeof(slot.spinOutput), 0x31016facu,
+            Low(slot.readOutput.data()), High(slot.readOutput.data()) & 0xffffu, sizeof(slot.readOutput), 0x31016facu});
+        WriteData(consumer, &slot.done, 1);
+        Packet compute{producer.data(), static_cast<std::uint32_t>(producer.size()), 0, {}};
+        Packet graphics{consumer.data(), static_cast<std::uint32_t>(consumer.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&graphics) == 0, "private compute: graphics submit failed");
+        Require(sceAgcDriverSubmitAcb(queue, &compute) == 0, "private compute: compute submit failed");
+        const auto start = std::chrono::steady_clock::now();
+        while (slot.done == 0) {
+            Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), "private compute: label handoff timed out");
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        AgcDriverWaitIdle_nid_postfix();
+        Require(slot.label == value && slot.spinOutput[0] == expected && slot.readOutput[0] == expected + 1u, "private compute: queue 0 read before the preceding dispatch completed");
+        Require(slot.readOutput[1] == 0xdeadbeefu, "private compute: the consumer wrote beyond its active lane");
+    }
+    const auto after = AgcDriver::VulkanDevice::PrivateComputeCounts();
+    const auto* enabled = std::getenv("APS5_PRIVATE_COMPUTE");
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        if (enabled != nullptr && std::string(enabled) == "1") Require(after.recorded > before.recorded, "private compute: the handoff never used a private recording");
+        else Require(after.prepared == before.prepared && after.recorded == before.recorded, "private compute: the disabled switch recorded privately");
+    }
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         device.reset();
         GuestBlock block;
         auto& slot = block.Data();
+        if (argc == 2 && std::string(argv[1]) == "--private-compute") {
+            struct Shutdown {
+                ~Shutdown() { AgcDriverShutdown_nid_postfix(); }
+            } shutdown;
+            RunPrivateCompute(slot);
+            if (std::getenv("APS5_PRIVATE_COMPUTE_ALL") != nullptr) {
+                for (const auto queue : {0x30u, 0x38u}) RunPrivateCompute(slot, queue);
+            }
+            std::cout << "private compute buffer and label handoff tests passed\n";
+            return 0;
+        }
+        Require(argc == 1, "unknown same-queue label wait arguments");
         Run(slot, 1, false);
         std::uint64_t extra = ~std::uint64_t{0};
         for (std::uint32_t attempt = 0; attempt < 3; ++attempt) {
