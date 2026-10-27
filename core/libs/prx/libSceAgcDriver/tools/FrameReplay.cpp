@@ -399,7 +399,7 @@ struct Replay {
             std::uint32_t reserved = 0;
             try {
                 reserved = AgcDriverReserveEopFlipAt_nid_postfix(flipInfo(call), token);
-            } catch (const std::exception&) {
+            } catch (const AgcDriver::EopFlipAlreadyReserved&) {
                 if (pass == 0) throw;
                 ++keptReservations;
                 return;
@@ -844,10 +844,11 @@ int main(int argc, char** argv) {
     if (options.directory.empty()) return usage();
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
-    if (!options.coldPipelines) _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", "1");
+    _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", options.coldPipelines ? "" : "1");
 #else
     unsetenv("APS5_FRAME_CAPTURE");
-    if (!options.coldPipelines) setenv("APS5_HEADLESS_PIPELINE_CACHE", "1", 1);
+    if (options.coldPipelines) unsetenv("APS5_HEADLESS_PIPELINE_CACHE");
+    else setenv("APS5_HEADLESS_PIPELINE_CACHE", "1", 1);
 #endif
     int code = 2;
     try {
