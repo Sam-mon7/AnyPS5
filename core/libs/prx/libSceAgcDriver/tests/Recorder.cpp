@@ -42,6 +42,7 @@
 #include "VertexRangeProducer_frag_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "BdaAbi.hpp"
+#include "BdaShader.hpp"
 #include "ShaderCacheSourceVersion.hpp"
 #include <SDL_loadso.h>
 #ifdef _WIN32
@@ -5729,15 +5730,80 @@ bool addressShadowTests(const Device& device, Recorder& recorder) {
     struct Build {
         bool copied;
         bool current;
+        bool importCurrent;
     };
-    const auto build = [&](std::array<std::uint8_t, 4> texel) {
+    const auto build = [&](std::array<std::uint8_t, 4> texel, bool readOnly = true, bool descriptor = false, bool cpuUnit = false) {
         GuestBufferMemory leased(context);
         leased.AcquireRegistered();
+        if (readOnly) leased.AllowShadowAddressReads();
+        if (descriptor) leased.AddReadable(address, 65536);
         leased.Upload(true);
-        Build result{recorder.PendingWriteOverlaps(address, bytes), false};
+        Build result{recorder.PendingWriteOverlaps(address, bytes), false, false};
+        auto readback = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto ranges = leased.AddressRanges();
+        const auto* import = HostImportFor(context, address, bytes);
+        Require(import != nullptr, "the BDA heap lost its import");
+        const std::pair<std::uint64_t, std::uint64_t> whole{0, bytes};
+        const auto sources = ShadowSources(context, *import, address, std::span(&whole, 1), {}, false);
+        const auto commands = recorder.Commands();
+        recorder.Keep(readback);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        std::uint64_t copied = 0;
+        for (const auto& entry : ranges) {
+            const auto from = std::max(entry.begin, address);
+            const auto to = std::min(entry.end, address + bytes);
+            if (from >= to) continue;
+            const auto physical = entry.deviceAddress + (from - entry.begin);
+            if (!readOnly) Require((entry.permissions & ShaderRecompiler::BdaAbi::Write) != 0, "a writable address build lost its import write permission");
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            if (physical == import->address + (from - import->base)) {
+                buffer = import->buffer;
+                offset = HostImportOffset(*import, from);
+            } else {
+                Require((entry.permissions & ShaderRecompiler::BdaAbi::Write) == 0, "a shadow BDA range permits physical stores");
+                Require(!leased.CachedAddressTable().has_value() && !leased.DirectRegions().has_value(), "a shadow BDA mapping exposes a reusable import table");
+                for (const auto& source : sources) {
+                    if (!source.shadow || address + source.begin > from || address + source.end < to) continue;
+                    offset = source.offset + (from - address - source.begin);
+                    if (physical != source.slab->address + offset) continue;
+                    buffer = source.buffer;
+                    break;
+                }
+                Require(buffer != VK_NULL_HANDLE, "the BDA table points at neither the import nor its fresh unit shadow");
+            }
+            const VkBufferCopy copy{offset, from - address, to - from};
+            context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, buffer, readback->Handle(), 1, &copy);
+            copied += to - from;
+        }
+        Require(copied == bytes, "the BDA table does not cover every heap byte exactly once");
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        if (descriptor) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            std::uint32_t adjustment = 0;
+            const auto view = leased.Descriptor(address, 65536, adjustment);
+            Require(view.buffer == import->buffer && adjustment == 0, "an explicit GPU descriptor no longer reads the import");
+            const VkBufferCopy copy{view.offset, 0, 65536};
+            context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, view.buffer, readback->Handle(), 1, &copy);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        }
         recorder.Submit();
         device.WaitQueue();
-        result.current = holds(texel);
+        readback->Invalidate();
+        result.current = true;
+        for (std::size_t i = 0; i < bytes; ++i) {
+            const auto expected = cpuUnit && i < 65536 ? 0x77 : texel[i % 4];
+            if (static_cast<std::uint8_t>(readback->Bytes()[i]) != expected) result.current = false;
+        }
+        result.importCurrent = holds(texel);
+        if (ShadowAddressEnabled()) {
+            for (const auto offset : {std::size_t{65532}, std::size_t{1048572}, bytes - 16}) {
+                const auto actual = ReadBdaRanges(context, ranges, address + offset);
+                std::array<std::uint8_t, 16> expected{};
+                for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = cpuUnit && offset + i < 65536 ? 0x77 : texel[(offset + i) % 4];
+                Require(std::memcmp(actual.data(), expected.data(), expected.size()) == 0, "a physical BDA shader read stale bytes across a unit or slab boundary");
+            }
+        }
         leased.WriteBack();
         recorder.Sync();
         return result;
@@ -5766,11 +5832,45 @@ bool addressShadowTests(const Device& device, Recorder& recorder) {
         static_cast<void>(ShadowReport());
         const auto shadowed = build({255, 0, 0, 255});
         const auto report = ShadowReport();
-        Require(shadowed.current, "an address-based build over a heap left the unit shadow's stored results unpublished: the import held the earlier bytes at its submission");
-        Require(shadowed.copied && !AnyShadowedOverlaps(address, bytes), "an address-based build published the heap's shadowed units without noting the copy, or left some unpublished");
-        Require(report.find(" address 1/") != std::string::npos, "the address-based build's publish was not counted under its own reason:" + report);
+        Require(shadowed.current, "an address-based GPU read saw stale bytes after a shadow write-back");
+        if (ShadowAddressEnabled()) {
+            Require(!shadowed.copied && !shadowed.importCurrent && AnyShadowedOverlaps(address, bytes), "the read-only address handoff published the heap instead of keeping its bytes on the device");
+            if (std::getenv("APS5_PROFILE_DRAW") != nullptr) Require(report.find("publish units avoided 32/2.0 MiB") != std::string::npos, "the avoided unit publishes were not counted once:" + report);
+        } else {
+            Require(shadowed.copied && shadowed.importCurrent && !AnyShadowedOverlaps(address, bytes), "an address-based build published the heap's shadowed units without noting the copy, or left some unpublished");
+            Require(report.find(" address 1/") != std::string::npos, "the address-based build's publish was not counted under its own reason:" + report);
+        }
         const auto again = build({255, 0, 0, 255});
         Require(!again.copied && again.current, "a second address-based build with nothing newly retiled recorded another copy");
+        if (ShadowAddressEnabled() && std::getenv("APS5_PROFILE_DRAW") != nullptr) Require(ShadowReport().find("publish units avoided 0/0.0 MiB") != std::string::npos, "an unchanged shadow handoff counted the same avoided unit publishes again");
+        if (ShadowAddressEnabled()) {
+            std::vector<std::byte> cpu(bytes);
+            AgcDriver::GuestMemory::Read(address, cpu, 4);
+            for (std::size_t i = 0; i < bytes; ++i) Require(static_cast<std::uint8_t>(cpu[i]) == std::array<std::uint8_t, 4>{255, 0, 0, 255}[i % 4], "a CPU read after a device handoff saw stale bytes");
+            Require(!AnyShadowedOverlaps(address, bytes) && holds({255, 0, 0, 255}), "the CPU read did not settle the import");
+            draw({{0.0f, 0.0f, 1.0f, 1.0f}});
+            StorageTexture::FlushPending(address, bytes, nullptr, "storage refresh", PublishScope::None);
+            const auto imported = build({0, 0, 255, 255}, true, true);
+            Require(imported.copied && imported.current && AnyShadowedOverlaps(address + 65536, bytes - 65536), "an explicit import-based GPU read saw stale bytes or published unrelated units");
+            const auto writable = build({0, 0, 255, 255}, false);
+            Require(writable.copied && writable.current && writable.importCurrent && !AnyShadowedOverlaps(address, bytes), "a shader without the read-only proof did not publish the remaining units");
+            draw({{1.0f, 0.0f, 0.0f, 1.0f}});
+            StorageTexture::FlushPending(address, bytes, nullptr, "storage refresh", PublishScope::None);
+            settle();
+            std::memset(block, 0x77, 65536);
+            const auto overwritten = build({255, 0, 0, 255}, true, false, true);
+            Require(overwritten.current && words[0] == 0x77 && words[65535] == 0x77, "a later GPU read used a stale shadow over a CPU overwrite");
+            StorageTexture::FlushPending(address, bytes, nullptr, "memory access");
+            settle();
+            std::memset(block, 0, bytes);
+            AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+            draw({{1.0f, 0.0f, 0.0f, 1.0f}});
+            StorageTexture::FlushPending(address, bytes, nullptr, "storage refresh", PublishScope::None);
+            const auto later = build({255, 0, 0, 255});
+            Require(later.current && !later.copied, "a later retile reused stale import mappings");
+            StorageTexture::FlushPending(address, bytes, nullptr, "memory access");
+            settle();
+        }
         draw({{0.0f, 1.0f, 0.0f, 1.0f}});
         const auto pending = build({255, 0, 0, 255});
         Require(StorageTexture::FindPending(address, bytes) == image, "an address-based build stored the pending results of an image over its heap");

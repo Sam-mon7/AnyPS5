@@ -22,7 +22,7 @@ namespace {
 
 constexpr std::uint64_t UnitBytes = 65536;
 constexpr std::size_t ReasonCount = static_cast<std::size_t>(PublishReason::Count);
-constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown", "address"};
+constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown", "address", "address-write", "sampled", "label-read"};
 
 std::uint64_t BudgetBytes() {
     static const std::uint64_t budget = [] {
@@ -57,6 +57,8 @@ struct Statistics {
     std::atomic<std::uint64_t> retiled{0}, retiledBytes{0}, refused{0}, refusedBytes{0}, seeds{0}, seedBytes{0};
     std::atomic<std::uint64_t> detiledShadow{0}, detiledShadowBytes{0}, detiledImport{0}, detiledImportBytes{0}, tailPublishes{0};
     std::array<std::atomic<std::uint64_t>, ReasonCount> published{}, publishedBytes{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::ReadSite::Count)> hookPublished{}, hookPublishedBytes{};
+    std::atomic<std::uint64_t> addressHandoffs{0}, addressReadBytes{0}, addressPublishUnitsAvoided{0}, addressBytesSaved{0};
     std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
 };
 
@@ -78,6 +80,7 @@ struct UnitShadow {
     // whether a slab -> import copy was recorded at that generation.
     std::vector<std::uint64_t> generation;
     std::vector<std::uint8_t> published;
+    std::vector<std::uint8_t> addressed;
     // Slab k covers units [k * SlabUnits(), (k + 1) * SlabUnits()), made on demand; a failed
     // allocation is not retried before the noted present.
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
@@ -169,6 +172,8 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     const auto units = (import.base + import.bytes - shadow->base + UnitBytes - 1) / UnitBytes;
     shadow->generation.assign(static_cast<std::size_t>(units), 0);
     shadow->published.assign(static_cast<std::size_t>(units), 0);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (ShadowAddressEnabled() && profile) shadow->addressed.assign(static_cast<std::size_t>(units), 0);
     const auto slabs = (units + SlabUnits() - 1) / SlabUnits();
     shadow->slabs.assign(static_cast<std::size_t>(slabs), nullptr);
     shadow->slabFailedUntil.assign(static_cast<std::size_t>(slabs), 0);
@@ -193,12 +198,16 @@ std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t first
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = static_cast<VkDeviceSize>(units) * UnitBytes;
     info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    const bool addressable = ShadowAddressEnabled() && context.bufferDeviceAddress;
+    if (addressable) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkBuffer buffer = VK_NULL_HANDLE;
     if (context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer) != VK_SUCCESS) return nullptr;
     VkMemoryRequirements requirements{};
     context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+    if (addressable) allocation.pNext = &flags;
     allocation.allocationSize = requirements.size;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     try {
@@ -215,7 +224,12 @@ std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t first
         context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
         return nullptr;
     }
-    return std::make_shared<ShadowSlab>(context, buffer, memory, firstUnit, units);
+    auto slab = std::make_shared<ShadowSlab>(context, buffer, memory, firstUnit, units);
+    if (addressable) {
+        const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
+        slab->address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
+    }
+    return slab;
 }
 
 struct SlabCopies {
@@ -361,6 +375,12 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     if (units == 0) return 0;
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     Stats().publishedBytes[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile && reason == PublishReason::Hook) {
+        const auto site = static_cast<std::size_t>(GuestMemory::CurrentReadSite());
+        Stats().hookPublished[site].fetch_add(1, std::memory_order_relaxed);
+        Stats().hookPublishedBytes[site].fetch_add(bytes, std::memory_order_relaxed);
+    }
     if (tracePublishesLeft.load(std::memory_order_relaxed) > 0 && tracePublishesLeft.fetch_sub(1, std::memory_order_relaxed) > 0) {
         const auto packet = GuestMemory::CurrentPacket();
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
@@ -436,6 +456,11 @@ bool UnitShadowEnabled() {
     return enabled;
 }
 
+bool ShadowAddressEnabled() {
+    static const bool enabled = std::getenv("APS5_SHADOW_BDA") != nullptr;
+    return enabled && UnitShadowEnabled();
+}
+
 bool ShadowVerify() {
     static const bool verify = std::getenv("APS5_SHADOW_VERIFY") != nullptr;
     return verify;
@@ -449,6 +474,15 @@ void NoteShadowSeed(std::uint64_t begin, std::uint64_t end) {
 
 PublishReason PublishReasonFor(const char* flushReason) {
     const auto is = [&](const char* name) { return flushReason != nullptr && std::strcmp(flushReason, name) == 0; };
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) {
+        if (is("sampled texture")) return PublishReason::Sampled;
+        if (is("written buffer range") || is("in-place vertex input")) return PublishReason::Region;
+        if (is("label")) return PublishReason::Label;
+        if (is("readback before label")) return PublishReason::LabelRead;
+        if (is("flip")) return PublishReason::Scanout;
+        if (is("writable address-based heaps")) return PublishReason::AddressWrite;
+    }
     if (is("memory access")) return GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Scanout ? PublishReason::Scanout : PublishReason::Hook;
     if (is("imported buffer region") || is("copied buffer region") || is("sampled texture")) return PublishReason::Region;
     if (is("indirect dispatch arguments") || is("indirect draw arguments")) return PublishReason::Indirect;
@@ -715,6 +749,78 @@ std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& i
     return result;
 }
 
+std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end) {
+    std::vector<ShadowAddressRun> result;
+    if (!ShadowAddressEnabled() || !context.bufferDeviceAddress || end <= begin) return result;
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "shadow address sources require the GPU lock");
+    auto& registry = Registry();
+    std::shared_ptr<UnitShadow> shadow;
+    std::uint64_t first = 0, last = 0;
+    {
+        std::lock_guard lock(registry.mutex);
+        shadow = find(registry, import);
+        if (shadow == nullptr || shadow->context.device != context.device || shadow->liveUnits == 0) return result;
+        begin = std::max(begin, shadow->importBase);
+        end = std::min(end, shadow->ImportEnd());
+        if (end <= begin) return result;
+        first = shadow->UnitOf(begin);
+        last = shadow->UnitOf(end - 1);
+        while (first <= last && !shadow->Live(first)) ++first;
+        while (first <= last && !shadow->Live(last)) --last;
+        if (first > last) return result;
+    }
+    const auto walkBegin = shadow->UnitRange(first).first;
+    const auto walkEnd = shadow->UnitRange(last).second;
+    GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+    std::vector<std::uint8_t> fallback(static_cast<std::size_t>(last - first + 1), 0);
+    bool publish = false;
+    std::uint64_t bytes = 0, saved = 0, savedUnits = 0;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    {
+        std::lock_guard lock(registry.mutex);
+        std::vector<std::uint8_t> changed, cpu;
+        changedUnits(*shadow, first, last, changed, cpu);
+        for (auto unit = first; unit <= last; ++unit) {
+            if (!shadow->Live(unit)) continue;
+            const auto k = static_cast<std::size_t>(unit - first);
+            const auto& slab = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
+            if (changed[k] != 0 || slab == nullptr || slab->address == 0) {
+                fallback[k] = 1;
+                publish = true;
+                continue;
+            }
+            const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
+            const auto from = std::max(begin, unitBegin);
+            const auto to = std::min(end, unitEnd);
+            const auto address = slab->address + SlabOffset(import, *slab, from);
+            if (!result.empty() && result.back().end == from && result.back().pin->slab == slab) {
+                result.back().end = to;
+            } else {
+                result.push_back({from, to, address, std::make_shared<ShadowSlabPin>(slab)});
+            }
+            slab->lastUse = Recorder::Presents();
+            if (profile) {
+                bytes += to - from;
+                if (shadow->addressed[unit] == 0) {
+                    saved += unitEnd - unitBegin;
+                    ++savedUnits;
+                    shadow->addressed[unit] = 1;
+                }
+            }
+        }
+    }
+    if (publish) publishUnits(shadow, first, last, fallback, PublishReason::Address);
+    if (profile && bytes != 0) {
+        Stats().addressHandoffs.fetch_add(1, std::memory_order_relaxed);
+        Stats().addressReadBytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (saved != 0) {
+            Stats().addressPublishUnitsAvoided.fetch_add(savedUnits, std::memory_order_relaxed);
+            Stats().addressBytesSaved.fetch_add(saved, std::memory_order_relaxed);
+        }
+    }
+    return result;
+}
+
 void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation) {
     if (!UnitShadowEnabled() || ranges.empty() || generation == 0) return;
     auto& registry = Registry();
@@ -739,6 +845,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 if (!shadow->Live(unit)) ++shadow->liveUnits;
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
+                if (!shadow->addressed.empty()) shadow->addressed[unit] = 0;
                 current->lastUse = present;
             }
         }
@@ -867,8 +974,21 @@ std::string ShadowReport() {
         peakBytes = registry.peakBytes;
         retired = registry.retired;
     }
-    std::snprintf(text, sizeof(text), " %llu/%.1f by reason {%s }, stale-dropped %llu (cpu %llu, driver %llu), skipped-in-completion %llu, slabs %llu live %.1f MiB / peak %.1f MiB, evictions %llu, slab lost %llu, retired %llu, dropped on retire %llu, lost on retire %llu", publishedTotal, mib(publishedBytesTotal), reasons.c_str(), cpuDropped + driverDropped, cpuDropped, driverDropped, take(statistics.skippedInCompletion), liveSlabs, mib(liveBytes), mib(peakBytes), take(statistics.evictions), take(statistics.slabLost), retired, take(statistics.droppedOnRetire), take(statistics.lostOnRetire));
+    std::snprintf(text, sizeof(text), " %llu/%.1f by reason {", publishedTotal, mib(publishedBytesTotal));
     line += text;
+    line += reasons;
+    std::snprintf(text, sizeof(text), " }, stale-dropped %llu (cpu %llu, driver %llu), skipped-in-completion %llu, slabs %llu live %.1f MiB / peak %.1f MiB, evictions %llu, slab lost %llu, retired %llu, dropped on retire %llu, lost on retire %llu", cpuDropped + driverDropped, cpuDropped, driverDropped, take(statistics.skippedInCompletion), liveSlabs, mib(liveBytes), mib(peakBytes), take(statistics.evictions), take(statistics.slabLost), retired, take(statistics.droppedOnRetire), take(statistics.lostOnRetire));
+    line += text;
+    std::snprintf(text, sizeof(text), "; BDA shadow handoffs %llu/%.1f MiB, publish units avoided %llu/%.1f MiB (first handoff per retile); hook consumers {", take(statistics.addressHandoffs), mib(take(statistics.addressReadBytes)), take(statistics.addressPublishUnitsAvoided), mib(take(statistics.addressBytesSaved)));
+    line += text;
+    for (std::size_t i = 0; i < statistics.hookPublished.size(); ++i) {
+        const auto count = take(statistics.hookPublished[i]);
+        const auto bytes = take(statistics.hookPublishedBytes[i]);
+        if (count == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %llu/%.1f", GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(i)), count, mib(bytes));
+        line += text;
+    }
+    line += " }";
     if (ShadowVerify()) {
         std::snprintf(text, sizeof(text), ", verified %llu, mismatches %llu", take(statistics.verified), take(statistics.mismatches));
         line += text;

@@ -18,6 +18,8 @@
 
 namespace AgcDriver::Graphics {
 
+struct ShadowSlabPin;
+
 void ShutdownGuestBufferWorkers();
 
 struct GuestMemorySnapshot {
@@ -278,6 +280,7 @@ public:
     explicit GuestBufferMemory(const Context& context);
     ~GuestBufferMemory();
     void AcquireRegistered();
+    void AllowShadowAddressReads() { shadowAddressReads = true; }
     // APS5_PROFILE_DRAW: the parts of one address-based build ([address] line every 10 s): the
     // registry lease, the imports pass, the mirror preparation and the mirror compare (blocks and
     // copied blocks) are timed by AcquireRegistered on the calling thread; the caller adds the
@@ -498,10 +501,12 @@ private:
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
     void takeHeapReferences();
+    void bindShadowAddresses();
     Context context;
     bool stagingAllowed = false;
     bool addressStaging = true;
     bool adjustedRegions = false;
+    bool shadowAddressReads = false;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).
@@ -520,6 +525,9 @@ private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readsOverBase;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> servedInsideBase;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> descriptorRanges;
+    std::vector<ShaderRecompiler::BdaAbi::Range> shadowRanges;
+    std::vector<std::shared_ptr<ShadowSlabPin>> shadowPins;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
     std::vector<std::pair<std::uint64_t, std::shared_ptr<Buffer>>> heapReadbacks;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.

@@ -43,12 +43,13 @@ struct HostImport;
 // or mutate freshness); the registry's own mutex is a leaf (lock order GpuMutex -> Imports/Pending ->
 // Shadows -> tracker).
 bool UnitShadowEnabled();
+bool ShadowAddressEnabled();
 
 // None: a device-facing caller (a storage upload reads the slab itself); Whole: a reader of every
 // byte of the range; PartialUnits: a writer of the range (only units it covers partly are published,
 // so the neighbours' results in the rest of the unit reach the import before the write stamps it).
 enum class PublishScope : std::uint8_t { None, Whole, PartialUnits };
-enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Address, Count };
+enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Address, AddressWrite, Sampled, LabelRead, Count };
 // The reason for a FlushPending reason string ("memory access" -> Hook, ...).
 PublishReason PublishReasonFor(const char* flushReason);
 
@@ -61,6 +62,7 @@ struct ShadowSlab {
     Context context;
     VkBuffer buffer;
     VkDeviceMemory memory;
+    VkDeviceAddress address = 0;
     std::uint64_t firstUnit;
     std::uint32_t units;
     std::uint64_t lastUse = 0;
@@ -110,6 +112,13 @@ struct ShadowRun {
     bool shadow;
     std::shared_ptr<ShadowSlab> slab;
 };
+struct ShadowAddressRun {
+    std::uint64_t begin;
+    std::uint64_t end;
+    VkDeviceAddress address;
+    std::shared_ptr<ShadowSlabPin> pin;
+};
+std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end);
 std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& import, std::uint64_t surfaceBase, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint64_t, std::uint64_t>> tailBlocks, bool countReads = true);
 
 // The slab destination of a retile copy [begin, end) (guest addresses inside one slab: the caller

@@ -1595,6 +1595,8 @@ add_custom_command(
 
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
+        tests/BdaShader.cpp
+        tests/BdaExecution.cpp
         tests/HostImportLifetime.cpp
         tests/ResidentPresent.cpp
         ${agcTriangleHeaders}
@@ -1606,6 +1608,7 @@ add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
 
 target_include_directories(agc_driver_recorder_tests PRIVATE
         ${LIBS_INCLUDE_DIR}
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
         ${agcTestShaderGeneratedRoot}
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler
         ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
@@ -1849,8 +1852,17 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_bda_reads_shadowed_results_per_build COMMAND agc_driver_recorder_tests --bda-shadowed-results-only)
     set_tests_properties(agc_driver_bda_reads_shadowed_results agc_driver_bda_reads_shadowed_results_per_build PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     set_tests_properties(agc_driver_bda_reads_shadowed_results_per_build PROPERTIES ENVIRONMENT "APS5_NO_ADDRESS_SPACE_CACHE=1")
+    add_test(NAME agc_driver_shadow_bda COMMAND agc_driver_recorder_tests --bda-shadowed-results-only)
+    add_test(NAME agc_driver_shadow_bda_per_build COMMAND agc_driver_recorder_tests --bda-shadowed-results-only)
+    add_test(NAME agc_driver_shadow_bda_profile COMMAND agc_driver_recorder_tests --bda-shadowed-results-only)
+    add_test(NAME agc_driver_shadow_bda_slab_split COMMAND agc_driver_recorder_tests --bda-shadowed-results-only)
+    set_tests_properties(agc_driver_shadow_bda agc_driver_shadow_bda_per_build agc_driver_shadow_bda_profile agc_driver_shadow_bda_slab_split PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_driver_shadow_bda PROPERTIES ENVIRONMENT "APS5_SHADOW_BDA=1")
+    set_tests_properties(agc_driver_shadow_bda_per_build PROPERTIES ENVIRONMENT "APS5_SHADOW_BDA=1;APS5_NO_ADDRESS_SPACE_CACHE=1")
+    set_tests_properties(agc_driver_shadow_bda_profile PROPERTIES ENVIRONMENT "APS5_SHADOW_BDA=1;APS5_PROFILE_DRAW=1")
+    set_tests_properties(agc_driver_shadow_bda_slab_split PROPERTIES ENVIRONMENT "APS5_SHADOW_BDA=1;APS5_UNIT_SHADOW_SLAB_MIB=1")
     if(WIN32)
-        set_tests_properties(agc_driver_bda_reads_shadowed_results agc_driver_bda_reads_shadowed_results_per_build PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_bda_reads_shadowed_results agc_driver_bda_reads_shadowed_results_per_build agc_driver_shadow_bda agc_driver_shadow_bda_per_build agc_driver_shadow_bda_profile agc_driver_shadow_bda_slab_split PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_unit_shadow_completion_store COMMAND agc_driver_recorder_tests --completion-store-shadow-only)

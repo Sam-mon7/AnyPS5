@@ -102,6 +102,28 @@ private:
 
 }
 
+std::array<std::uint32_t, 4> ReadBdaRanges(const Context& context, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t address) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    Buffer table(context, sizeof(Abi::Header) + ranges.size_bytes(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer output(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const Abi::Header header{Abi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(Abi::Range), 0};
+    std::memcpy(table.Bytes().data(), &header, sizeof(header));
+    std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), ranges.size_bytes());
+    std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+    std::memset(output.Bytes().data(), 0x55, output.Bytes().size());
+    Pipeline pipeline(context, MakeBdaDwordReadTestShader(address, 4, false, true), {&table, &fault, &output});
+    pipeline.Run(1);
+    fault.Invalidate();
+    output.Invalidate();
+    Abi::Fault report{};
+    std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+    Require(report.state == Abi::FaultState::Empty, "a shadow/import BDA read faulted");
+    std::array<std::uint32_t, 4> result{};
+    std::memcpy(result.data(), output.Bytes().data(), sizeof(result));
+    return result;
+}
+
 static void RunWrittenRangeDecodeTests() {
     namespace Abi = ShaderRecompiler::BdaAbi;
     std::vector<std::uint32_t> words(Abi::FaultBufferBytes / sizeof(std::uint32_t));

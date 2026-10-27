@@ -3,8 +3,10 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "BdaAbi.hpp"
+#include <array>
 #include <cstdint>
 #include <initializer_list>
+#include <span>
 #include <vector>
 
 std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset = 0);
@@ -34,5 +36,6 @@ std::vector<std::uint32_t> MakeBdaAnchoredReadTestShader(const BdaAnchoredReadPr
 void RunBdaStoreExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaContractTests();
+std::array<std::uint32_t, 4> ReadBdaRanges(const AgcDriver::Graphics::Context& context, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t address);
 
 #endif

@@ -4433,6 +4433,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     validate(address, bytes);
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
+    if (ShadowAddressEnabled()) descriptorRanges.emplace_back(begin, end);
     const Region* inside = nullptr;
     bool overlay = false;
     switch (baseOverlap(begin, end, &inside)) {
@@ -5278,7 +5279,10 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         copyRegion(region, addressable);
         if (profile) copyUs += microsecondsSince(copyStart);
     }
-    if (heapsEnd > heapsBegin) StorageTexture::PublishShadowsOnly(heapsBegin, static_cast<std::size_t>(heapsEnd - heapsBegin), PublishScope::Whole, "address-based heaps");
+    if (heapsEnd > heapsBegin) {
+        if (ShadowAddressEnabled() && shadowAddressReads && context.bufferDeviceAddress && recorder != nullptr && !Recorder::InCompletion()) bindShadowAddresses();
+        else StorageTexture::PublishShadowsOnly(heapsBegin, static_cast<std::size_t>(heapsEnd - heapsBegin), PublishScope::Whole, profile && ShadowAddressEnabled() && !shadowAddressReads ? "writable address-based heaps" : "address-based heaps");
+    }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     takeHeapReferences();
     ResidentBuffer::FlushChanged(context);
@@ -5684,6 +5688,35 @@ std::vector<AddressRange> MergeByBegin(const std::vector<AddressRange>& left, co
 
 }
 
+void GuestBufferMemory::bindShadowAddresses() {
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "shadow address binding requires the GPU lock");
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "shadow address binding requires a recorder");
+    recorder->FlushKeyStores();
+    recorder->FlushStores();
+    StorageTexture::StoreDrawnLinear("address-based heaps");
+    for (const auto& [begin, end] : descriptorRanges) {
+        StorageTexture::PublishShadowsOnly(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, "imported buffer region");
+    }
+    const auto bind = [&](const Region& region) {
+        if (region.direct == nullptr || !region.hostBacked || region.mirror != nullptr) return;
+        auto sources = ShadowAddressSources(context, *region.direct, region.begin, inPlaceEnd(region));
+        for (auto& source : sources) {
+            shadowRanges.push_back({source.begin, source.end, source.address, ShaderRecompiler::BdaAbi::Read, 0});
+            recorder->Keep(source.pin);
+            shadowPins.push_back(std::move(source.pin));
+        }
+    };
+    if (space != nullptr) for (const auto& region : space->base) bind(region);
+    for (const auto& region : regions) bind(region);
+    if (shadowRanges.empty()) return;
+    std::sort(shadowRanges.begin(), shadowRanges.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+    std::vector<AddressRange> disjoint;
+    AppendDisjoint(shadowRanges, disjoint);
+    shadowRanges = std::move(disjoint);
+    RecordMemoryBarrier(context, recorder->Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+}
+
 std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() const {
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
@@ -5717,6 +5750,11 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     } else {
         result.reserve(regions.size());
         for (const auto& region : regions) result.push_back(addressRange(region));
+    }
+    if (!shadowRanges.empty()) {
+        std::vector<AddressRange> cut;
+        AppendUncovered(result, shadowRanges, cut);
+        result = MergeByBegin(cut, shadowRanges);
     }
     if (writes.empty()) return result;
     auto sortedWrites = writes;
@@ -5760,7 +5798,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
-    if (space == nullptr) return std::nullopt;
+    if (space == nullptr || !shadowRanges.empty()) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     if (writes.empty() && regions.empty()) return CachedTable{space->serial, &space->ranges};
     if (tableRanges != nullptr) return CachedTable{tableSerial, tableRanges.get()};
@@ -6020,10 +6058,12 @@ void GuestBufferMemory::WriteBack() {
     space.reset();
     heapReferences.clear();
     heapReadbacks.clear();
+    shadowRanges.clear();
+    shadowPins.clear();
 }
 
 std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions() const {
-    if (!uploaded || committed) return std::nullopt;
+    if (!uploaded || committed || !shadowRanges.empty()) return std::nullopt;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (space != nullptr) {
         for (const auto& region : space->base) {
