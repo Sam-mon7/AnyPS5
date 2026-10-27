@@ -108,10 +108,7 @@ std::vector<std::uint8_t> ResourceGuardingConditions(const IrResourcePlan& plan)
 }
 
 bool DropItemFreeConditions() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("APS5_SRT_BRANCH_PURE_SLOTS");
-        return value != nullptr && std::string_view(value) == "1";
-    }();
+    static const bool enabled = std::getenv("APS5_NO_SRT_BRANCH_PURE_SLOTS") == nullptr;
     return enabled;
 }
 

@@ -206,8 +206,7 @@ void BranchPureDispatches(const GuestBlock& block, std::string_view mode) {
     }
     block.Word(InputOffset) = 0x13579bdfu;
     block.Word(AlternateInputOffset) = 0x2468ace0u;
-    const char* setting = std::getenv("APS5_SRT_BRANCH_PURE_SLOTS");
-    const bool enabled = setting != nullptr && std::string_view(setting) == "1";
+    const bool enabled = std::getenv("APS5_NO_SRT_BRANCH_PURE_SLOTS") == nullptr;
     const bool verify = std::getenv("APS5_VERIFY_DATA_HITS") != nullptr;
     const std::array<std::uint32_t, 6> selectors = itemFree ? std::array<std::uint32_t, 6>{0, 5, 1, 6, 2, 7} : resourceGuard ? std::array<std::uint32_t, 6>{0, 1, 0, 2, 0, 1} : std::array<std::uint32_t, 6>{0, 16, 0, 16, 0, 16};
     constexpr std::uint32_t unwritten = 0xcafebabeu;
