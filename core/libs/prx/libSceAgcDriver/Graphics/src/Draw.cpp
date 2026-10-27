@@ -874,7 +874,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         const auto& color = target.color;
         AgcDriver::ProfilePrint_nid_no_patch("[resident-target] rank %zu/%zu 0x%llx+0x%zx %ux%u format %u tile %u xor %u DCC 0x%llx layers %u slice %u depth %u mip %u samples %u: %llu lookups %.3f ms, >=1ms %llu %.3f ms, pages %llu, clean proofs %llu; ms wait %.3f proof %.3f collect %.3f DCC %.3f flush %.3f validate %.3f other %.3f; nested write-watch query %.3f map/walk %.3f\n", i + 1, targets.size(), static_cast<unsigned long long>(color.address), color.bytes, color.extent.width, color.extent.height, static_cast<unsigned>(color.format), static_cast<unsigned>(color.tileMode), color.pipeBankXor, static_cast<unsigned long long>(color.dccAddress), color.layers, color.arraySlice, color.depth, color.mip, color.samples, static_cast<unsigned long long>(target.lookups), target.us / 1000, static_cast<unsigned long long>(target.slow), target.slowUs / 1000, static_cast<unsigned long long>(target.pages), static_cast<unsigned long long>(target.clean), target.steps[0], target.steps[1], target.steps[2], target.steps[3], target.steps[4], target.steps[5], target.steps[8], target.steps[6], target.steps[7]);
         if (target.storageBytes != 0) AgcDriver::ProfilePrint_nid_no_patch("[resident-target] storage for 0x%llx: 0x%llx+0x%llx %ux%ux%u guest format %u tile %u DCC 0x%llx mips %u\n", static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(target.storage.baseAddress), static_cast<unsigned long long>(target.storageBytes), target.storage.width, target.storage.height, target.storageLayers, target.storage.format, static_cast<unsigned>(target.storage.tileMode), static_cast<unsigned long long>(target.storage.dccAddress), target.storage.mipCount);
-        static constexpr std::array<const char*, LookupOutcomes::WorkCount> workNames{"calls", "images", "storage/depth", "draw", "fill", "copy", "shadow-only", "depth-ranges", "waits", "writeback-bytes", "shadow-bytes", "import-bytes", "CPU-bytes", "retile-windows", "image-buffer-regions", "layout-transitions", "alias-copies", "alias-bytes", "pending-alias-units", "pending-alias-refused", "alias-writer-refused", "alias-foreign-refused"};
+        static constexpr std::array<const char*, LookupOutcomes::WorkCount> workNames{"calls", "images", "storage/depth", "draw", "fill", "copy", "shadow-only", "depth-ranges", "waits", "writeback-bytes", "shadow-bytes", "import-bytes", "CPU-bytes", "retile-windows", "image-buffer-regions", "layout-transitions", "alias-copies", "alias-bytes", "pending-alias-units", "pending-alias-refused", "alias-writer-refused", "alias-foreign-refused", "foreign-clear-fill", "foreign-full-overwrite", "foreign-partial-unknown", "foreign-read-preserve", "foreign-full-scissor-unproven"};
         std::string work;
         char field[96];
         for (std::size_t j = 0; j < workNames.size(); ++j) {
@@ -1759,7 +1759,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
-std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
+std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::optional<LookupOutcomes> before;
@@ -1769,6 +1769,32 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
 #endif
     std::shared_ptr<StorageTexture> resident;
     try {
+        if (profile) {
+            StorageTexture::PendingDrawAccess access;
+            access.fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && std::int64_t{state.scissor.offset.x} + state.scissor.extent.width >= color.extent.width && std::int64_t{state.scissor.offset.y} + state.scissor.extent.height >= color.extent.height;
+            const auto& blend = state.blends.at(color.exportIndex);
+            access.blend = blend.blendEnable != 0;
+            access.writeMask = blend.colorWriteMask;
+            access.partialWriteMask = color.partialWriteMask;
+            access.rop = state.colorRop;
+            access.masked = blend.colorWriteMask != 0xfu || color.partialWriteMask != 0 || PartialSampleMask(state) || state.alphaToCoverage;
+            access.depthStencil = state.depthTest || state.depthBoundsTest || state.stencilTest;
+            access.kill = state.pixelKill;
+            access.dccAddress = color.dccAddress;
+            access.cmaskAddress = color.cmaskAddress;
+            access.cmaskFastClear = color.cmaskFastClear;
+            access.vertices = draw.indexCount;
+            access.topology = static_cast<std::uint32_t>(state.topology);
+            access.scissor = state.scissor;
+            for (const auto& shader : shaders) {
+                if (shader.program == nullptr) continue;
+                if (shader.stage == ShaderRecompiler::ShaderStage::Vertex) access.vertexVariant = shader.program->PipelineVariantId();
+                if (shader.stage == ShaderRecompiler::ShaderStage::Fragment) access.fragmentVariant = shader.program->PipelineVariantId();
+            }
+            const bool reads = access.blend || state.colorRop != CopyRop || color.partialWriteMask != 0;
+            const auto surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
+            StorageTexture::ProfilePendingAccess(surface, DescribeSurface(surface).guestBytes, reads ? StorageTexture::PendingAccess::Read : StorageTexture::PendingAccess::Partial, &access);
+        }
         resident = lookup();
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
@@ -2783,7 +2809,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
-            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            binding.resident = refreshResidentTarget(context, state, color, draw, shaders, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -3550,7 +3576,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
-        auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
+        auto resident = refreshResidentTarget(context, state, state.colors[index], draw, shaders, outcome, profile, [&] {
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
             else stored->Refresh();
             return stored;

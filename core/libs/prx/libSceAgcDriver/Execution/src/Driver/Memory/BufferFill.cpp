@@ -381,6 +381,7 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
     GuestMemory::CheckRange(reinterpret_cast<const void*>(base), bytes, 16, true);
     phase(FillCheck);
     const auto coverage = Graphics::StorageTexture::ClassifyFill(base, bytes);
+    if (profile) Graphics::StorageTexture::ProfilePendingFill(base, bytes);
     phase(FillClassify);
 
     static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;

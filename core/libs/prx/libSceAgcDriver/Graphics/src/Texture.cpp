@@ -125,12 +125,19 @@ struct StorageTraffic {
         double ms = 0;
         std::array<std::uint64_t, LookupOutcomes::WorkCount> work{};
     };
+    struct FirstAccess {
+        std::array<std::uint64_t, static_cast<std::size_t>(StorageTexture::PendingAccess::Count)> counts{};
+        std::uint64_t draws = 0, fullScissor = 0, blend = 0, masked = 0, depthStencil = 0, kill = 0, metadata = 0;
+        StorageTexture::PendingDrawAccess lastDraw{};
+    };
     AgcDriver::Mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
     std::array<std::pair<std::uint64_t, std::uint64_t>, 4> uploads{};
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> uploadReasons;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> drawnStores;
     std::map<std::array<std::uint64_t, 18>, FlushSource> flushSources;
+    std::map<std::array<std::uint64_t, 10>, FirstAccess> firstAccesses;
+    std::uint64_t omittedFirstAccesses = 0;
     std::uint64_t omittedFlushSources = 0;
     std::uint64_t directWriteBacks = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -194,6 +201,15 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     }
     traffic.flushSources.clear();
     traffic.omittedFlushSources = 0;
+    for (const auto& [key, access] : traffic.firstAccesses) {
+        const auto n = [&](std::size_t field) { return static_cast<unsigned long long>(key[field]); };
+        const auto c = [&](StorageTexture::PendingAccess kind) { return static_cast<unsigned long long>(access.counts[static_cast<std::size_t>(kind)]); };
+        const auto& draw = access.lastDraw;
+        AgcDriver::ProfilePrint_nid_no_patch("[pending-access] (10 s) target 0x%llx+0x%llx %llux%llu depth/last %llu tile %llu dimension %llu <- 0x%llx+0x%llx image 0x%llx: first clear/fill %llu full-overwrite %llu partial/unknown %llu read/preserve %llu; draws %llu full-scissor-unproven %llu blend %llu masked %llu depth/stencil %llu kill %llu metadata %llu; last draw VS-variant %llu PS-variant %llu vertices %u topology %u write-mask 0x%x partial-mask 0x%x ROP 0x%x DCC 0x%llx CMASK 0x%llx fast-clear %u scissor %d,%d+%u,%u; omitted %llu at 128-entry caps\n", n(0), n(1), n(2), n(3), n(4), n(5), n(6), n(7), n(8), n(9), c(StorageTexture::PendingAccess::ClearFill), c(StorageTexture::PendingAccess::FullOverwrite), c(StorageTexture::PendingAccess::Partial), c(StorageTexture::PendingAccess::Read), static_cast<unsigned long long>(access.draws), static_cast<unsigned long long>(access.fullScissor), static_cast<unsigned long long>(access.blend), static_cast<unsigned long long>(access.masked), static_cast<unsigned long long>(access.depthStencil), static_cast<unsigned long long>(access.kill), static_cast<unsigned long long>(access.metadata), static_cast<unsigned long long>(draw.vertexVariant), static_cast<unsigned long long>(draw.fragmentVariant), draw.vertices, draw.topology, draw.writeMask, draw.partialWriteMask, draw.rop, static_cast<unsigned long long>(draw.dccAddress), static_cast<unsigned long long>(draw.cmaskAddress), draw.cmaskFastClear ? 1u : 0u, draw.scissor.offset.x, draw.scissor.offset.y, draw.scissor.extent.width, draw.scissor.extent.height, static_cast<unsigned long long>(traffic.omittedFirstAccesses));
+    }
+    traffic.firstAccesses.clear();
+    if (traffic.omittedFirstAccesses != 0) AgcDriver::ProfilePrint_nid_no_patch("[pending-access] (10 s) %llu first accesses omitted at 128-entry caps\n", static_cast<unsigned long long>(traffic.omittedFirstAccesses));
+    traffic.omittedFirstAccesses = 0;
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.drawnStores.clear();
@@ -4422,6 +4438,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     const auto previousReason = std::exchange(flushReason, reason);
     for (const auto& texture : flush) {
         try {
+            if (profile) texture->profilePendingAccess(refreshing != nullptr ? &refreshing->descriptor : nullptr, address, bytes, PendingAccess::Read);
             const auto storeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::optional<std::array<std::uint64_t, LookupOutcomes::WorkCount>> before;
             if (profile) {
@@ -5198,6 +5215,88 @@ bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
     return identities;
 }
 
+void StorageTexture::profilePendingAccess(const GuestTextureResource* target, std::uint64_t address, std::uint64_t bytes, PendingAccess access, const PendingDrawAccess* draw) {
+    if (!LookupOutcomes::Profiled()) return;
+    if (target != nullptr) {
+        const auto oneSlice = [](const GuestTextureResource& resource) { return resource.dimension == TextureDimension::k2D || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray == 0); };
+        const bool sameDimension = target->dimension == descriptor.dimension || (oneSlice(*target) && oneSlice(descriptor));
+        const bool sameShape = target->width == descriptor.width && target->height == descriptor.height && target->depthOrLastArray == descriptor.depthOrLastArray && target->baseArray == descriptor.baseArray && target->mipCount == descriptor.mipCount && target->tileMode == descriptor.tileMode && target->pipeBankXor == descriptor.pipeBankXor && sameDimension && BytesPerElement(target->format) == BytesPerElement(descriptor.format);
+        if (address == descriptor.baseAddress && bytes == guestBytes && sameShape) return;
+    } else if (address == descriptor.baseAddress && bytes == guestBytes) {
+        return;
+    }
+    const auto range = std::pair{address, bytes};
+    if (profiledAccessWrites != nullptr) {
+        if (const auto found = profiledAccessWrites->find(range); found != profiledAccessWrites->end() && found->second == writes) return;
+    }
+    auto& traffic = Traffic();
+    std::lock_guard lock(traffic.mutex);
+    const std::array<std::uint64_t, 10> key{address, bytes, target != nullptr ? target->width : 0, target != nullptr ? target->height : 0, target != nullptr ? target->depthOrLastArray : 0, target != nullptr ? static_cast<std::uint64_t>(target->tileMode) : 0, target != nullptr ? static_cast<std::uint64_t>(target->dimension) : 0, descriptor.baseAddress, guestBytes, reinterpret_cast<std::uintptr_t>(image)};
+    if ((profiledAccessWrites != nullptr && profiledAccessWrites->size() >= 128 && !profiledAccessWrites->contains(range)) || (traffic.firstAccesses.size() >= 128 && !traffic.firstAccesses.contains(key))) {
+        ++traffic.omittedFirstAccesses;
+        return;
+    }
+    if (profiledAccessWrites == nullptr) profiledAccessWrites = std::make_unique<std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>>();
+    (*profiledAccessWrites)[range] = writes;
+    auto& totals = traffic.firstAccesses[key];
+    ++totals.counts[static_cast<std::size_t>(access)];
+    ++ThreadLookupOutcomes().work[LookupOutcomes::ForeignClearFill + static_cast<std::size_t>(access)];
+    if (draw != nullptr) {
+        ++totals.draws;
+        totals.fullScissor += draw->fullScissor;
+        totals.blend += draw->blend;
+        totals.masked += draw->masked;
+        totals.depthStencil += draw->depthStencil;
+        totals.kill += draw->kill;
+        totals.metadata += draw->dccAddress != 0 || draw->cmaskAddress != 0;
+        totals.lastDraw = *draw;
+        if (draw->fullScissor) ++ThreadLookupOutcomes().work[LookupOutcomes::ForeignFullScissor];
+    }
+}
+
+void StorageTexture::ProfilePendingAccess(const GuestTextureResource& target, std::uint64_t bytes, PendingAccess access, const PendingDrawAccess* draw) {
+    if (!LookupOutcomes::Profiled()) return;
+    std::vector<std::shared_ptr<StorageTexture>> sources;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        if (!pending.textures.MayOverlap(target.baseAddress, static_cast<std::size_t>(bytes))) return;
+        for (auto* source : pending.textures) {
+            if (!source->overlaps(target.baseAddress, static_cast<std::size_t>(bytes)) || !source->pendingUnitInside(target.baseAddress, static_cast<std::size_t>(bytes))) continue;
+            if (auto alive = source->weak_from_this().lock()) sources.push_back(std::move(alive));
+        }
+    }
+    for (const auto& source : sources) source->profilePendingAccess(&target, target.baseAddress, bytes, access, draw);
+}
+
+void StorageTexture::ProfilePendingFill(std::uint64_t address, std::size_t bytes) {
+    if (!LookupOutcomes::Profiled()) return;
+    std::vector<std::shared_ptr<StorageTexture>> targets;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (auto* target : live.textures) {
+            if (target->released || !target->overlaps(address, bytes)) continue;
+            if (auto alive = target->weak_from_this().lock()) targets.push_back(std::move(alive));
+        }
+    }
+    for (const auto& target : targets) {
+        const auto begin = std::max(address, target->descriptor.baseAddress);
+        const auto end = std::min(address + bytes, target->descriptor.baseAddress + target->guestBytes);
+        std::vector<std::shared_ptr<StorageTexture>> sources;
+        {
+            auto& pending = Pending();
+            std::lock_guard lock(pending.mutex);
+            for (auto* source : pending.textures) {
+                if (source == target.get() || !source->overlaps(begin, static_cast<std::size_t>(end - begin)) || !source->pendingUnitInside(begin, static_cast<std::size_t>(end - begin))) continue;
+                if (auto alive = source->weak_from_this().lock()) sources.push_back(std::move(alive));
+            }
+        }
+        const bool whole = address <= target->descriptor.baseAddress && address + bytes >= target->descriptor.baseAddress + target->guestBytes;
+        for (const auto& source : sources) source->profilePendingAccess(&target->descriptor, target->descriptor.baseAddress, target->guestBytes, whole ? PendingAccess::ClearFill : PendingAccess::Partial);
+    }
+}
+
 std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::size_t bytes) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
@@ -5647,6 +5746,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     // The source image must hold the surface: a stale one uploads first (and other images'
     // results pending over its memory land first, as the transfer's flush would have them).
     source.Refresh();
+    if (LookupOutcomes::Profiled()) ProfilePendingAccess(descriptor, guestBytes, PendingAccess::FullOverwrite);
     // Results pending over the destination range from before the copy are dead inside it and land
     // first around it; other images over the range hold content the copy supersedes (they
     // re-upload at their next use, behind this image's write-back).

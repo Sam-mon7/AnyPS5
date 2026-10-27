@@ -216,6 +216,27 @@ public:
     // with a pending unit inside the range are stored (APS5_NO_FLUSH_PRETEST=1 lists every
     // overlapping pending image, as before).
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr, bool waited = false);
+    enum class PendingAccess : std::size_t { ClearFill, FullOverwrite, Partial, Read, Count };
+    struct PendingDrawAccess {
+        bool fullScissor = false;
+        bool blend = false;
+        bool masked = false;
+        bool depthStencil = false;
+        bool kill = false;
+        bool cmaskFastClear = false;
+        std::uint64_t dccAddress = 0;
+        std::uint64_t cmaskAddress = 0;
+        std::uint64_t vertexVariant = 0;
+        std::uint64_t fragmentVariant = 0;
+        std::uint32_t vertices = 0;
+        std::uint32_t topology = 0;
+        std::uint32_t writeMask = 0;
+        std::uint32_t partialWriteMask = 0;
+        std::uint32_t rop = 0;
+        VkRect2D scissor{};
+    };
+    static void ProfilePendingAccess(const GuestTextureResource& target, std::uint64_t bytes, PendingAccess access, const PendingDrawAccess* draw = nullptr);
+    static void ProfilePendingFill(std::uint64_t address, std::size_t bytes);
     static void FlushAllPending(const char* reason);
     static bool WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
@@ -409,6 +430,8 @@ private:
     // APS5_BLOCK_WRITEBACK_PIECES within APS5_BLOCK_WRITEBACK_FRAMES presents, defaults 4 and 8;
     // APS5_BLOCK_WRITEBACK_EACH=1 stores the touched units only).
     void writeBack(std::uint64_t address, std::size_t bytes);
+    void profilePendingAccess(const GuestTextureResource* target, std::uint64_t address, std::uint64_t bytes, PendingAccess access, const PendingDrawAccess* draw = nullptr);
+    std::unique_ptr<std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>> profiledAccessWrites;
     void writeBackLayers(const std::vector<bool>& layers);
     bool unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const;
     void saveBeforeUnwatch();
@@ -713,7 +736,7 @@ private:
 // flush rows lie inside the storage and sampled rows.
 struct LookupOutcomes {
     enum Kind : std::size_t { SampledFast, SampledFastMiss, SampledHitView, SampledHitClearedView, SampledHitSnapshot, SampledMadeView, SampledMadeSnapshot, StorageHit, StorageMade, RefreshUnchanged, RefreshCompared, RefreshProved, UploadDirect, UploadCpu, UploadClear, DccScan, PendingFlush, RefreshWait, RefreshProofCheck, RefreshCollect, RefreshFlush, RefreshValidate, CleanProof, FlushDepth, FlushGpuWait, Count };
-    enum Work : std::size_t { FlushCalls, FlushImages, FlushStorage, FlushDraw, FlushFill, FlushCopy, FlushShadowOnly, FlushDepthRanges, FlushWaits, WriteBackBytes, ShadowBytes, ImportBytes, CpuBytes, RetileWindows, ImageBufferRegions, LayoutTransitions, AliasCopies, AliasBytes, PendingAliasUnits, PendingAliasRefused, PendingAliasWriters, PendingAliasForeign, WorkCount };
+    enum Work : std::size_t { FlushCalls, FlushImages, FlushStorage, FlushDraw, FlushFill, FlushCopy, FlushShadowOnly, FlushDepthRanges, FlushWaits, WriteBackBytes, ShadowBytes, ImportBytes, CpuBytes, RetileWindows, ImageBufferRegions, LayoutTransitions, AliasCopies, AliasBytes, PendingAliasUnits, PendingAliasRefused, PendingAliasWriters, PendingAliasForeign, ForeignClearFill, ForeignOverwrite, ForeignPartial, ForeignRead, ForeignFullScissor, WorkCount };
     static const char* Name(Kind kind);
     static bool Profiled();
     // Charges the time since `start` to `kind` on this thread and returns now.
