@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <string_view>
 #include <vector>
 
 namespace AgcDriver::GuestMemory {
@@ -14,6 +15,23 @@ namespace AgcDriver::GuestMemory {
 enum class CopybackPath : std::uint8_t { HostStore, CopiedWriter, Mirror, StagingOut, Storage, Shadow, Image, Depth, CopyHle, Label, Eop, Dcc, Cmask, Htile, DirectGpu, Count };
 inline constexpr std::array CopybackNames{"host-store", "copied-writer", "mirror", "staging-out", "storage", "shadow-publish", "image", "depth", "copy-hle", "label", "eop", "dcc", "cmask", "htile", "direct-gpu"};
 static_assert(CopybackNames.size() == static_cast<std::size_t>(CopybackPath::Count));
+
+constexpr std::uint32_t CopybackDebugMask(std::string_view paths) {
+    std::uint32_t mask = 0;
+    while (!paths.empty()) {
+        const auto end = paths.find(',');
+        const auto name = paths.substr(0, end);
+        for (const auto path : {CopybackPath::Storage, CopybackPath::CopyHle, CopybackPath::StagingOut, CopybackPath::Shadow}) {
+            const auto index = static_cast<std::size_t>(path);
+            if (name == CopybackNames[index]) mask |= std::uint32_t{1} << index;
+        }
+        if (end == std::string_view::npos) break;
+        paths.remove_prefix(end + 1);
+    }
+    return mask;
+}
+
+bool CopybackDebugSkip(CopybackPath path) noexcept;
 
 struct CopybackCounters {
     std::uint64_t bytes = 0, ranges = 0, pages = 0, pageOverflow = 0;
@@ -38,6 +56,16 @@ public:
     static constexpr std::uint64_t SampleEvery = 64, SamplesPerSecond = 128;
     std::array<CopybackCounters, CopybackNames.size()> window{};
     std::vector<CopybackReader> readers;
+    std::map<std::pair<CopybackPath, std::uint32_t>, std::pair<std::uint64_t, std::uint64_t>> cpuScopes;
+    std::uint64_t cpuScopeOverflow = 0;
+
+    void CpuScope(CopybackPath path, std::uint32_t threadTag, std::uint64_t ns) {
+        const auto key = std::pair{path, threadTag};
+        if (!cpuScopes.contains(key) && cpuScopes.size() >= MaxReaders) { ++cpuScopeOverflow; return; }
+        auto& [count, elapsed] = cpuScopes[key];
+        ++count;
+        elapsed += ns;
+    }
 
     std::uint64_t NewPublication() { return ++publication; }
 
@@ -110,6 +138,8 @@ public:
     }
 
     void NextWindow() {
+        cpuScopes.clear();
+        cpuScopeOverflow = 0;
         for (std::size_t index = 0; index < window.size(); ++index) {
             window[index] = {};
             uniquePages[index].clear();

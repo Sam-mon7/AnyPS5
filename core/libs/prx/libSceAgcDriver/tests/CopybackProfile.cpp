@@ -14,6 +14,9 @@ void Require(bool condition, const char* message) {
 }
 
 void Model() {
+    const auto bit = [](CopybackPath path) { return std::uint32_t{1} << static_cast<std::size_t>(path); };
+    Require(CopybackDebugMask("") == 0 && CopybackDebugMask("label,eop,all,storage-extra,copy") == 0, "debug skip accepted a protected or inexact name");
+    Require(CopybackDebugMask(",storage,,storage,copy-hle,staging-out,shadow-publish,label,eop,") == (bit(CopybackPath::Storage) | bit(CopybackPath::CopyHle) | bit(CopybackPath::StagingOut) | bit(CopybackPath::Shadow)), "debug skip list did not select exactly the allowed paths");
     CopybackTracker tracker;
     constexpr auto path = CopybackPath::CopiedWriter;
     constexpr auto other = CopybackPath::Image;
@@ -43,7 +46,12 @@ void Model() {
     merged.Record(path, 0x60000, 1, 100, true, publication);
     merged.Record(path, 0x60010, 1, 200, true, publication);
     Require(merged.Armed() == 1 && merged.window[index].retired == 0, "spans of one merge store overwrote their own sample");
+    tracker.CpuScope(path, 0, 10);
+    tracker.CpuScope(path, 0, 20);
+    tracker.CpuScope(other, 0x28, 40);
+    Require(tracker.cpuScopes.size() == 2 && tracker.cpuScopes.at({path, 0}) == std::pair<std::uint64_t, std::uint64_t>{2, 30}, "CPU scopes lost their path, thread or inclusive time");
     tracker.NextWindow();
+    Require(tracker.cpuScopes.empty(), "CPU scopes crossed report windows");
     Require(tracker.window[index].bytes == 0 && tracker.window[index].pages == 0, "window counters did not reset");
     CopybackTracker lifetime;
     lifetime.Record(path, 0x30000, 4096, 1000000000, true);
@@ -60,6 +68,21 @@ void Model() {
     tracker.Expire(33000000000ull);
     Require(tracker.Armed() == 0 && tracker.window[index].censored != 0, "expired probes were classified as untouched");
     tracker.Record(path, UINT64_MAX, 2, 0, false);
+}
+
+void DebugSkips(std::string_view paths) {
+    const auto mask = CopybackDebugMask(paths);
+    for (std::size_t index = 0; index < CopybackNames.size(); ++index) Require(CopybackDebugSkip(static_cast<CopybackPath>(index)) == ((mask & (std::uint32_t{1} << index)) != 0), "cached debug skip differs from its environment");
+    alignas(8) std::array<std::byte, 8> guest{};
+    const std::array<std::byte, 8> payload{std::byte{0x52}};
+    const auto address = reinterpret_cast<std::uintptr_t>(guest.data());
+    SetFlushHook(nullptr);
+    for (const auto path : {CopybackPath::Label, CopybackPath::Eop}) {
+        const CopybackScope scope(path);
+        Write(address, payload);
+        Require(guest == payload, "debug copy-back skips suppressed a label or EOP store");
+        guest.fill(std::byte{});
+    }
 }
 
 void Runtime(bool enabled, bool reads) {
@@ -101,6 +124,7 @@ int main(int argc, char** argv) {
     try {
         const std::string_view mode = argc > 1 ? argv[1] : "model";
         if (mode == "model") Model();
+        else if (mode == "debug-skip") DebugSkips(argc > 2 ? argv[2] : "");
         else Runtime(mode == "counters" || mode == "reads", mode == "reads");
         return 0;
     } catch (const std::exception& error) {

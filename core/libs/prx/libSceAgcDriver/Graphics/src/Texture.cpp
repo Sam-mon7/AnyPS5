@@ -138,6 +138,8 @@ struct StorageTraffic {
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> uploadReasons;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> drawnStores;
     std::map<std::array<std::uint64_t, 18>, FlushSource> flushSources;
+    std::map<std::pair<std::array<std::uint64_t, 15>, std::string>, FlushSource> copybackSources;
+    std::uint64_t omittedCopybackSources = 0;
     std::map<std::array<std::uint64_t, 10>, FirstAccess> firstAccesses;
     std::uint64_t omittedFirstAccesses = 0;
     std::uint64_t omittedFlushSources = 0;
@@ -195,6 +197,14 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     for (auto it = traffic.flushSources.begin(); it != traffic.flushSources.end(); ++it) sources.push_back(it);
     std::sort(sources.begin(), sources.end(), [](const auto left, const auto right) { return left->second.ms > right->second.ms; });
     static constexpr std::array<const char*, 4> writers{"storage/depth", "draw", "fill", "copy"};
+    for (const auto& [identity, source] : traffic.copybackSources) {
+        const auto& [key, reason] = identity;
+        const auto n = [&](std::size_t field) { return static_cast<unsigned long long>(key[field]); };
+        const auto w = [&](LookupOutcomes::Work field) { return static_cast<unsigned long long>(source.work[field]); };
+        AgcDriver::ProfilePrint_nid_no_patch("[copyback-storage] (10 s) path=%s address=0x%llx bytes=%llu size=%llux%llu guest-format=%llu Vulkan=%llu tile=%llu xor=%llu dimension=%llu mips=%llu depth/last=%llu base=%llu writer-kind=%s thread-tag=0x%llx reason=\"%s\" calls=%llu cpu-ms=%.3f stored=%llu shadow=%llu import=%llu CPU=%llu windows=%llu image-buffer-regions=%llu layout-transitions=%llu omitted=%llu\n", GuestMemory::CopybackNames[key[14]], n(0), n(1), n(2), n(3), n(4), n(5), n(6), n(7), n(8), n(9), n(10), n(11), writers.at(key[12]), n(13), reason.c_str(), static_cast<unsigned long long>(source.count), source.ms, w(LookupOutcomes::WriteBackBytes), w(LookupOutcomes::ShadowBytes), w(LookupOutcomes::ImportBytes), w(LookupOutcomes::CpuBytes), w(LookupOutcomes::RetileWindows), w(LookupOutcomes::ImageBufferRegions), w(LookupOutcomes::LayoutTransitions), static_cast<unsigned long long>(traffic.omittedCopybackSources));
+    }
+    traffic.copybackSources.clear();
+    traffic.omittedCopybackSources = 0;
     for (std::size_t i = 0; i < sources.size(); ++i) {
         const auto& [key, source] = *sources[i];
         const auto n = [&](std::size_t field) { return static_cast<unsigned long long>(key[field]); };
@@ -6299,10 +6309,31 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     struct Account {
-        bool enabled;
         PhaseTimer& timer;
-        ~Account() { if (enabled) Profile().storageWriteBack += timer.lap(); }
-    } account{profile, timer};
+        StorageTexture& texture;
+        std::chrono::steady_clock::time_point started;
+        std::array<std::uint64_t, LookupOutcomes::WorkCount> before;
+        Account(PhaseTimer& timer, StorageTexture& texture) : timer(timer), texture(texture), started(timer.last), before(ThreadLookupOutcomes().work) {}
+        ~Account() {
+            Profile().storageWriteBack += timer.lap();
+            const auto ms = std::chrono::duration<double, std::milli>(timer.last - started).count();
+            try {
+                const auto& descriptor = texture.descriptor;
+                const std::array<std::uint64_t, 15> key{descriptor.baseAddress, texture.guestBytes, descriptor.width, descriptor.height, descriptor.format, static_cast<std::uint64_t>(texture.storageFormat), static_cast<std::uint64_t>(descriptor.tileMode), descriptor.pipeBankXor, static_cast<std::uint64_t>(descriptor.dimension), descriptor.mipCount, descriptor.depthOrLastArray, descriptor.baseArray, texture.profiledWriter, GuestMemory::GpuLockThreadTag(), static_cast<std::uint64_t>(GuestMemory::CopybackCurrentPath())};
+                auto& traffic = Traffic();
+                std::lock_guard lock(traffic.mutex);
+                const auto identity = std::pair{key, std::string(flushReason != nullptr ? flushReason : "other")};
+                if (!traffic.copybackSources.contains(identity) && traffic.copybackSources.size() >= 128) { ++traffic.omittedCopybackSources; return; }
+                auto& source = traffic.copybackSources[identity];
+                ++source.count;
+                source.ms += ms;
+                const auto& work = ThreadLookupOutcomes().work;
+                for (std::size_t index = 0; index < work.size(); ++index) source.work[index] += work[index] - before[index];
+            } catch (...) { GuestMemory::CopybackDropped(); }
+        }
+    };
+    std::optional<Account> account;
+    if (profile) account.emplace(timer, *this);
     // Whatever the outcome, the registration follows the pending flags (a throw leaves the
     // layers pending).
     struct Reconcile {

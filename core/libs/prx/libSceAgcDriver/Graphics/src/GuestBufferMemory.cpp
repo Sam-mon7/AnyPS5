@@ -5553,6 +5553,10 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     }
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
+        if (GuestMemory::CopybackDebugSkip(GuestMemory::CopybackPath::StagingOut)) {
+            region.copiedBack = true;
+            continue;
+        }
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
@@ -5974,6 +5978,7 @@ void GuestBufferMemory::WriteBack() {
         const auto* found = owner(begin, end);
         Require(found != nullptr, "write-back range has no GPU owner");
         const auto& region = *found;
+        if (region.gpuCopy && GuestMemory::CopybackDebugSkip(GuestMemory::CopybackPath::StagingOut)) continue;
         // Every branch below but the direct, copied-back and staged ones stores from the CPU.
         if (region.direct == nullptr && !(region.gpuCopy && (region.copiedBack || region.deviceLocal)) && !(region.mirror != nullptr && !region.mirror->writable)) Recorder::NoteWrittenBack(begin, static_cast<std::size_t>(end - begin));
         if (region.direct != nullptr) {

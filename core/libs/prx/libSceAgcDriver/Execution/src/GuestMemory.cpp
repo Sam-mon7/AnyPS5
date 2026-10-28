@@ -3054,6 +3054,14 @@ bool CopybackEnabled() noexcept {
     return enabled;
 }
 
+bool CopybackDebugSkip(CopybackPath path) noexcept {
+    static const auto mask = [] {
+        const auto* value = std::getenv("APS5_DEBUG_SKIP_COPYBACK");
+        return value != nullptr ? CopybackDebugMask(value) : 0u;
+    }();
+    return (mask & (std::uint32_t{1} << static_cast<std::size_t>(path))) != 0;
+}
+
 bool CopybackReadsEnabled() noexcept {
     static const bool enabled = [] { const auto* value = std::getenv("APS5_PROFILE_COPYBACK_READS"); return CopybackEnabled() && value != nullptr && std::strcmp(value, "1") == 0; }();
     return enabled;
@@ -3081,6 +3089,7 @@ CopybackScope::~CopybackScope() {
         auto& counts = tracker.window[static_cast<std::size_t>(path)];
         counts.ns += elapsed;
         counts.heldNs += heldNs;
+        tracker.CpuScope(path, GpuLockThreadTag(), elapsed);
     });
 }
 
@@ -3148,12 +3157,15 @@ void CopybackReport(std::uint64_t presents) noexcept {
     if (!CopybackEnabled()) return;
     std::array<CopybackCounters, CopybackNames.size()> counts;
     std::vector<CopybackReader> readers;
+    decltype(CopybackTracker::cpuScopes) cpuScopes;
     std::size_t armed = 0;
-    std::uint64_t readerOverflow = 0;
+    std::uint64_t readerOverflow = 0, cpuScopeOverflow = 0;
     WithCopybacks(CopybackPath::HostStore, [&](auto& tracker) {
         tracker.Expire(CopybackNow());
         counts = tracker.window;
         readers = tracker.readers;
+        cpuScopes = tracker.cpuScopes;
+        cpuScopeOverflow = tracker.cpuScopeOverflow;
         armed = tracker.Armed();
         readerOverflow = tracker.ReaderOverflow();
         tracker.NextWindow();
@@ -3163,6 +3175,9 @@ void CopybackReport(std::uint64_t presents) noexcept {
         const auto& value = counts[index];
         const auto fraction = [&](std::uint64_t count) { return value.retired != 0 ? static_cast<double>(count) / value.retired : 0.0; };
         ProfilePrint_nid_no_patch("[copyback] path=%s bytes=%llu ranges=%llu unique-pages=%llu page-overflow=%llu bytes/present=%.1f ranges/present=%.2f pages/present=%.2f cpu-ms=%.3f gpu-held-ms=%.3f profile-lock-ms=%.3f sampled=%llu refused=%llu retired=%llu driver-hook=%llu/%.4f host-hook=%llu/%.4f cpu-write=%llu/%.4f overwritten=%llu no-observed-touch=%llu/%.4f censored=%llu\n", CopybackNames[index], static_cast<unsigned long long>(value.bytes), static_cast<unsigned long long>(value.ranges), static_cast<unsigned long long>(value.pages), static_cast<unsigned long long>(value.pageOverflow), presents ? static_cast<double>(value.bytes) / presents : 0.0, presents ? static_cast<double>(value.ranges) / presents : 0.0, presents ? static_cast<double>(value.pages) / presents : 0.0, value.ns / 1e6, value.heldNs / 1e6, value.lockNs / 1e6, static_cast<unsigned long long>(value.sampled), static_cast<unsigned long long>(value.refused), static_cast<unsigned long long>(value.retired), static_cast<unsigned long long>(value.driver), fraction(value.driver), static_cast<unsigned long long>(value.host), fraction(value.host), static_cast<unsigned long long>(value.cpuWrite), fraction(value.cpuWrite), static_cast<unsigned long long>(value.overwritten), static_cast<unsigned long long>(value.noObservedTouch), fraction(value.noObservedTouch), static_cast<unsigned long long>(value.censored));
+    }
+    for (const auto& [key, value] : cpuScopes) {
+        ProfilePrint_nid_no_patch("[copyback] cpu-scope path=%s thread-tag=0x%x scopes=%llu cpu-ms=%.3f omitted-scopes=%llu\n", CopybackNames[static_cast<std::size_t>(key.first)], key.second, static_cast<unsigned long long>(value.first), value.second / 1e6, static_cast<unsigned long long>(cpuScopeOverflow));
     }
     std::sort(readers.begin(), readers.end(), [](const auto& left, const auto& right) { return left.count > right.count; });
     for (std::size_t index = 0; index < std::min<std::size_t>(readers.size(), 16); ++index) {

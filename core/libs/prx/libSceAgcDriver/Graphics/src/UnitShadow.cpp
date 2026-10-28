@@ -240,6 +240,7 @@ struct SlabCopies {
 // Records the copies as one command group into the active recorder's open batch (a waited batch
 // without one). `ranges` are the guest ranges copied, for the note and the hazard tracker.
 void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes) {
+    if (GuestMemory::CopybackDebugSkip(GuestMemory::CopybackPath::Shadow)) return;
     const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Shadow);
     const auto& context = shadow.context;
     using CommandClass = Recorder::CommandClass;
@@ -389,7 +390,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
     recordCopies(*shadow, copies, ranges, bytes);
-    if (ShadowVerify()) verifyPublished(*shadow, copies);
+    if (ShadowVerify() && !GuestMemory::CopybackDebugSkip(GuestMemory::CopybackPath::Shadow)) verifyPublished(*shadow, copies);
     return units;
 }
 
