@@ -191,7 +191,16 @@ void changedUnits(const UnitShadow& shadow, std::uint64_t first, std::uint64_t l
     const auto begin = std::max(shadow.UnitBegin(first), shadow.importBase);
     const auto end = std::min(shadow.UnitBegin(last + 1), shadow.ImportEnd());
     if (end <= begin) return;
-    GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), std::span(shadow.generation).subspan(static_cast<std::size_t>(first), count), changed, cpu);
+    if (GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), std::span(shadow.generation).subspan(static_cast<std::size_t>(first), count), changed, cpu)) return;
+    for (auto unit = first; unit <= last; ++unit) {
+        if (shadow.generation[unit] == 0) continue;
+        const auto [unitBegin, unitEnd] = shadow.UnitRange(unit);
+        if (unitEnd <= unitBegin) continue;
+        const auto bytes = static_cast<std::size_t>(unitEnd - unitBegin);
+        if (GuestMemory::CollectWritesUncached(unitBegin, bytes) == 0) continue;
+        const auto k = static_cast<std::size_t>(unit - first);
+        GuestMemory::ChangedBlocks(unitBegin, bytes, std::span(shadow.generation).subspan(static_cast<std::size_t>(unit), 1), std::span(changed).subspan(k, 1), std::span(cpu).subspan(k, 1));
+    }
 }
 
 std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t firstUnit, std::uint32_t units) {

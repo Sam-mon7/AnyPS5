@@ -3599,6 +3599,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
 
 std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported, Buffer* save) {
     const bool profile = LookupOutcomes::Profiled();
+    const bool shadowable = UnitShadowEnabled() && GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored));
     const auto elementBytes = BytesPerElement(descriptor.format);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
     std::uint64_t storedBytes = 0;
@@ -3667,7 +3668,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
             const auto& import = *segments[segment].import;
             auto pieceEnd = std::min(guestEnd, segments[segment].end);
             if (UnitShadowEnabled()) pieceEnd = std::min(pieceEnd, SlabBoundary(import, guestBegin));
-            const auto destination = ShadowDestinationFor(context, import, guestBegin, pieceEnd);
+            const auto destination = shadowable ? ShadowDestinationFor(context, import, guestBegin, pieceEnd) : std::nullopt;
             if (destination.has_value()) {
                 if (slabPieces.empty() || slabPieces.back().slab != destination->slab) slabPieces.push_back({destination->slab, destination->pin, {}});
                 slabPieces.back().copies.push_back({scratchOffset, destination->offset, pieceEnd - guestBegin});
@@ -4644,8 +4645,11 @@ void StorageTexture::SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes)
         for (auto* texture : pending.textures) take(texture);
         for (auto* texture : pending.flushing) take(texture);
     }
-    if (overlapping.empty()) return;
+    if (overlapping.empty() && !AnyShadowedOverlaps(address, bytes)) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    if (PublishShadow(address, bytes, PublishScope::Whole, PublishReason::Upload) != 0) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->SyncThrough(address, bytes);
+    }
     for (const auto& texture : overlapping) texture->saveBeforeUnwatch();
 }
 
