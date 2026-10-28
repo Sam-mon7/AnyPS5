@@ -1241,7 +1241,28 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         }
     }
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    if ((DepthPlanesStale() || written) && (written || !layers || disabled)) static_cast<void>(FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), written ? DepthPlaneScope::Whole : DepthPlaneScope::Overlapped));
+    static const bool traceOverlap = std::getenv("APS5_TRACE_DEPTH_STORAGE_OVERLAP") != nullptr;
+    const bool overlapTraced = traceOverlap && DepthSurfaceOverlaps(context.device, viewed.baseAddress, viewedBytes);
+    const bool stalePlanes = DepthPlanesStale();
+    const auto flushStart = overlapTraced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::size_t flushedRanges = 0;
+    if ((stalePlanes || written) && (written || !layers || disabled)) flushedRanges = FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), written ? DepthPlaneScope::Whole : DepthPlaneScope::Overlapped).size();
+    if (overlapTraced) {
+        static std::mutex reportedMutex;
+        static std::map<std::uint64_t, std::uint64_t> reported;
+        const auto key = viewed.baseAddress ^ (static_cast<std::uint64_t>(viewed.format) << 52u) ^ (static_cast<std::uint64_t>(written) << 63u);
+        std::uint64_t seen = 0;
+        {
+            std::lock_guard lock(reportedMutex);
+            if (reported.size() < 256 || reported.contains(key)) seen = ++reported[key];
+        }
+        if (seen == 1 || seen == 100) {
+            std::fprintf(stderr, "[depth-storage-overlap] #%llu storage 0x%llx+0x%llx %ux%u format %u dimension %d tile %d slices %u..%u mip %u base level %u written %d stale planes %d layers %d: flush %.2f ms, %zu ranges stored; overlapping:%s\n", static_cast<unsigned long long>(seen),
+                         static_cast<unsigned long long>(viewed.baseAddress), static_cast<unsigned long long>(viewedBytes), viewed.width, viewed.height, viewed.format, static_cast<int>(viewed.dimension), static_cast<int>(viewed.tileMode), viewed.baseArray, viewed.depthOrLastArray, mip, viewed.baseLevel,
+                         written ? 1 : 0, stalePlanes ? 1 : 0, layers.has_value() ? 1 : 0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - flushStart).count(), flushedRanges,
+                         DescribeDepthOverlaps(context.device, viewed.baseAddress, viewedBytes).c_str());
+        }
+    }
     if (written && DepthSurfaceOverlaps(context.device, viewed.baseAddress, viewedBytes)) {
         const auto storage = WrittenStorageBytes(viewed, mip);
         RetireCoveredDepthSurfaces(context.device, storage.bytes, storage.extents);

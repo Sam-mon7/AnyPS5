@@ -528,6 +528,14 @@ public:
     std::shared_ptr<std::atomic<bool>> hostWritten = std::make_shared<std::atomic<bool>>(false);
     bool retired = false;
 
+    std::string DescribeOverlap() const {
+        char text[384];
+        std::snprintf(text, sizeof(text), " [depth 0x%llx+0x%llx %ux%u vkformat %d samples %u slices %u..%u stencil 0x%llx+0x%llx htile 0x%llx active %d retired %d stale %d]", static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(depthBytes()),
+                      target.extent.width, target.extent.height, static_cast<int>(target.format), target.samples, target.firstSlice, target.lastSlice, static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.stencilAddress != 0 ? stencilBytes() : 0),
+                      static_cast<unsigned long long>(target.htileAddress), active->load(std::memory_order_acquire) ? 1 : 0, retired ? 1 : 0, AnyStale() ? 1 : 0);
+        return text;
+    }
+
     bool Overlaps(std::uint64_t address, std::uint64_t bytes) const {
         const auto end = address + bytes;
         if (address < target.address + depthBytes() && target.address < end) return true;
@@ -2614,6 +2622,15 @@ bool DepthSurfaceStoreBack(const Context& context, const StorageTexture& storage
 bool DepthSurfaceAt(std::uint64_t address) {
     std::lock_guard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && (surface->target.address == address || surface->target.stencilAddress == address); });
+}
+
+std::string DescribeDepthOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
+    std::lock_guard lock(surfacesMutex());
+    std::string text;
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device == device && surface->Overlaps(address, bytes)) text += surface->DescribeOverlap();
+    }
+    return text;
 }
 
 bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
