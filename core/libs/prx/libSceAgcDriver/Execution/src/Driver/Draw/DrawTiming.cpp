@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <numeric>
@@ -55,6 +56,21 @@ void Driver::reportDrawShaders() {
                       static_cast<unsigned long long>(row.draws), static_cast<unsigned long long>(row.drawn), static_cast<unsigned long long>(row.captures), rowMs(&row), row.commitMs, row.draws == 0 ? 0.0 : rowMs(&row) * 1000 / static_cast<double>(row.draws),
                       DrawDriverPhaseNames[order[0]], row.ms[order[0]], DrawDriverPhaseNames[order[1]], row.ms[order[1]], DrawDriverPhaseNames[order[2]], row.ms[order[2]]);
         report += text;
+        report += "; cache";
+        for (std::size_t outcome = 0; outcome < DrawCacheOutcomeCount; ++outcome) {
+            if (row.cache[outcome] == 0) continue;
+            std::snprintf(text, sizeof(text), " %s %llu", DrawCacheOutcomeNames[outcome], static_cast<unsigned long long>(row.cache[outcome]));
+            report += text;
+        }
+        if (row.graphicsDraws != 0) {
+            std::array<std::size_t, DrawProfileGraphicsPhases> graphicsOrder{};
+            std::iota(graphicsOrder.begin(), graphicsOrder.end(), std::size_t{0});
+            std::partial_sort(graphicsOrder.begin(), graphicsOrder.begin() + 4, graphicsOrder.end(), [&](std::size_t a, std::size_t b) { return row.graphicsUs[a] > row.graphicsUs[b]; });
+            std::snprintf(text, sizeof(text), "; Graphics::Draw per draw (%llu timed): %s %.0f, %s %.0f, %s %.0f, %s %.0f us", static_cast<unsigned long long>(row.graphicsDraws),
+                          Graphics::DrawGraphicsPhaseName(graphicsOrder[0]), row.graphicsUs[graphicsOrder[0]] / static_cast<double>(row.graphicsDraws), Graphics::DrawGraphicsPhaseName(graphicsOrder[1]), row.graphicsUs[graphicsOrder[1]] / static_cast<double>(row.graphicsDraws),
+                          Graphics::DrawGraphicsPhaseName(graphicsOrder[2]), row.graphicsUs[graphicsOrder[2]] / static_cast<double>(row.graphicsDraws), Graphics::DrawGraphicsPhaseName(graphicsOrder[3]), row.graphicsUs[graphicsOrder[3]] / static_cast<double>(row.graphicsDraws));
+            report += text;
+        }
     }
     AgcDriver::ProfilePrint_nid_no_patch("[draw-shaders] %.1f s, %llu draw packets of %zu program sets, %.1f ms; slowest:%s\n", seconds, static_cast<unsigned long long>(packets), rows.size(), total, report.c_str());
     drawShaderTotals.clear();
@@ -77,7 +93,7 @@ void Driver::addDrawCommit(const DrawProgramIdentity& identity, double ms) {
     ++row.commits;
 }
 
-void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures, const DrawProgramIdentity& identity) {
+void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures, const DrawProgramIdentity& identity, DrawCacheOutcome cache, const std::array<double, DrawProfileGraphicsPhases>* graphicsUs) {
     std::lock_guard lock(drawPhasesMutex);
     if (DrawShaderProfileEnabled()) {
         auto& row = drawShaderTotals[identity];
@@ -86,6 +102,11 @@ void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, b
         ++row.draws;
         if (drawn) ++row.drawn;
         row.captures += captures;
+        ++row.cache[cache];
+        if (graphicsUs != nullptr) {
+            for (std::size_t i = 0; i < DrawProfileGraphicsPhases; ++i) row.graphicsUs[i] += (*graphicsUs)[i];
+            ++row.graphicsDraws;
+        }
         if (ShaderProfileReportEnabled() && std::chrono::steady_clock::now() - drawShaderReport >= std::chrono::seconds(10)) reportDrawShaders();
     }
     auto& totals = drawPhaseTotals;

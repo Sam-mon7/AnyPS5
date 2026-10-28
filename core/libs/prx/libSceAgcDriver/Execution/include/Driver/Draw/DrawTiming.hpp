@@ -20,6 +20,11 @@ struct DrawPhaseTotals {
 };
 
 inline constexpr std::size_t DrawProfilePrograms = 6;
+inline constexpr std::size_t DrawProfileGraphicsPhases = 13;
+
+enum DrawCacheOutcome : std::uint8_t { CacheNotLookedUp, CacheNoRegisterKey, CacheNoEntry, CacheHit, CacheMissFront, CacheMissFragment, CacheMissOther, CacheMissLayout, CacheMissGate, CacheMissStages, DrawCacheOutcomeCount };
+
+inline constexpr const char* DrawCacheOutcomeNames[DrawCacheOutcomeCount] = {"not looked up", "no register key", "no entry", "hit", "miss front", "miss fragment", "miss other", "miss layout", "miss gate", "miss stage count"};
 
 struct DrawProgramIdentity {
     std::array<std::uint64_t, DrawProfilePrograms> code{};
@@ -45,6 +50,9 @@ struct DrawShaderTotals {
     std::array<double, DrawDriverPhaseCount> ms{};
     double commitMs = 0;
     std::uint64_t draws = 0, drawn = 0, captures = 0, commits = 0;
+    std::array<double, DrawProfileGraphicsPhases> graphicsUs{};
+    std::uint64_t graphicsDraws = 0;
+    std::array<std::uint64_t, DrawCacheOutcomeCount> cache{};
 };
 
 bool DrawShaderProfileEnabled();
@@ -56,6 +64,9 @@ struct PendingDrawPhases {
     std::array<double, DrawDriverPhaseCount> ms{};
     std::chrono::steady_clock::time_point tailAt{};
     DrawProgramIdentity identity;
+    bool graphics = false;
+    std::array<double, DrawProfileGraphicsPhases> graphicsUs{};
+    DrawCacheOutcome cache = CacheNotLookedUp;
 };
 
 struct DrawPhaseTiming {

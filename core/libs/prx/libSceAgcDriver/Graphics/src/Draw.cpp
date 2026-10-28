@@ -1325,8 +1325,19 @@ struct DrawTimer {
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.
 // `waitedBefore` is the thread's GPU waits at the draw's start and `ownWaitedMs` the draw's own
 // syncs (see DrawOutcome::hookWaitUs).
+struct LastDrawPhases {
+    bool set = false;
+    std::array<double, PhaseCount> us{};
+};
+
+LastDrawPhases& lastDrawPhases() {
+    static thread_local LastDrawPhases last;
+    return last;
+}
+
 void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResources::BuildTiming* built, DrawOutcome& outcome, double waitedBefore, double ownWaitedMs, const char* suffix) {
     if (!timer.profile) return;
+    lastDrawPhases() = {true, timer.us};
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     outcome.hookWaitUs = std::max(0.0, Recorder::ThreadWaitedMs() - waitedBefore - ownWaitedMs) * 1000.0;
     outcome.ownSyncUs = ownWaitedMs * 1000.0;
@@ -3800,4 +3811,18 @@ bool CommitTrims() {
     return DrawPipelineEnabled();
 }
 
+
+static_assert(PhaseCount == DrawGraphicsPhaseCount);
+
+const char* DrawGraphicsPhaseName(std::size_t phase) {
+    return phase < PhaseCount ? DrawPhaseNames[phase] : "unknown";
+}
+
+bool TakeLastDrawPhases(std::array<double, DrawGraphicsPhaseCount>& us) {
+    auto& last = lastDrawPhases();
+    if (!last.set) return false;
+    us = last.us;
+    last.set = false;
+    return true;
+}
 }

@@ -124,6 +124,7 @@ std::string_view TrimmedReason(std::string_view reason) {
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
     bool profile = false;
+    DrawCacheOutcome cacheOutcome = CacheNotLookedUp;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
     std::chrono::steady_clock::time_point phaseLap{};
@@ -418,6 +419,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pending.ms = phaseMs;
         pending.tailAt = phaseLap;
         pending.identity = ProgramIdentity(tail.programs);
+        if (DrawShaderProfileEnabled()) {
+            pending.cache = tail.cacheOutcome;
+            pending.graphics = Graphics::TakeLastDrawPhases(pending.graphicsUs);
+        }
         return DrawVerdict::Drawn;
     };
     const std::uint64_t traceToken = TraceShaderCorrelation() ? NextDrawTraceToken().fetch_add(1, std::memory_order_relaxed) + 1 : 0;
@@ -736,11 +741,24 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& verifyHit = tail.verifyHit;
     tail.stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
     const bool stageEntries = tail.stageEntries;
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawMiss::Count)> missesBefore{};
+    if (DrawShaderProfileEnabled()) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        missesBefore = drawEntryCounters.misses;
+    }
     try {
         lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
+    }
+    if (DrawShaderProfileEnabled()) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        tail.cacheOutcome = drawHit ? CacheHit : !registerKey ? CacheNoRegisterKey : entry == nullptr ? CacheNoEntry : CacheMissStages;
+        constexpr std::array<DrawCacheOutcome, static_cast<std::size_t>(DrawMiss::Count)> missOutcomes{CacheMissFront, CacheMissFragment, CacheMissOther, CacheMissLayout, CacheMissGate, CacheMissStages};
+        for (std::size_t reason = 0; reason < missesBefore.size(); ++reason) {
+            if (!drawHit && drawEntryCounters.misses[reason] != missesBefore[reason]) tail.cacheOutcome = missOutcomes[reason];
+        }
     }
     for (std::size_t i = 0; i < matched.size(); ++i) {
         if (matched[i] == nullptr || matched[i]->shaderDataPatches.empty()) continue;
@@ -925,6 +943,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         pending.ms = phaseMs;
         pending.tailAt = phaseLap;
         pending.identity = ProgramIdentity(tail.programs);
+        if (DrawShaderProfileEnabled()) {
+            pending.cache = tail.cacheOutcome;
+            pending.graphics = Graphics::TakeLastDrawPhases(pending.graphicsUs);
+        }
         return DrawVerdict::Drawn;
     };
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {

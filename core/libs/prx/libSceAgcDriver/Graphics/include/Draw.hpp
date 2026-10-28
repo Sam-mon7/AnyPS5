@@ -1,3 +1,5 @@
+#include <array>
+#include <cstddef>
 #include <string>
 #include <optional>
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
@@ -136,6 +138,9 @@ enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVe
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = false);
 std::array<std::uint64_t, static_cast<std::size_t>(IndirectDrawPath::Count)> IndirectDrawCounts();
 void CountEmptyIndirectDraw(double readMs);
+inline constexpr std::size_t DrawGraphicsPhaseCount = 13;
+const char* DrawGraphicsPhaseName(std::size_t phase);
+bool TakeLastDrawPhases(std::array<double, DrawGraphicsPhaseCount>& us);
 std::uint64_t EmptyIndirectDrawCount();
 
 struct DrawPassCounts {

@@ -211,7 +211,7 @@ private:
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
     static PendingDrawPhases& pendingDrawPhases();
-    void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures, const DrawProgramIdentity& identity);
+    void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures, const DrawProgramIdentity& identity, DrawCacheOutcome cache, const std::array<double, DrawProfileGraphicsPhases>* graphicsUs);
     void addDrawCommit(const DrawProgramIdentity& identity, double ms);
     void addDispatchShader(DispatchClass which, const PendingDispatchPhases& pending, double packetMs);
     void reportDrawShaders();
