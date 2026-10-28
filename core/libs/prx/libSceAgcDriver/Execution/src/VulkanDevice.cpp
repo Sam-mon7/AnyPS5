@@ -2614,6 +2614,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         std::chrono::steady_clock::time_point cursor = std::chrono::steady_clock::now();
         std::array<double, 3> us{};
         std::size_t phase = 0;
+        bool emptyReapSkipped = false;
         void Next() {
             const auto now = std::chrono::steady_clock::now();
             us[phase++] += std::chrono::duration<double, std::micro>(now - cursor).count();
@@ -2622,15 +2623,16 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         ~LabelTiming() {
             Next();
             struct Totals {
-                std::uint64_t labels = 0;
+                std::uint64_t labels = 0, emptyReapsSkipped = 0;
                 std::array<double, 3> us{};
                 std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
             };
             static thread_local Totals totals;
             ++totals.labels;
+            if (emptyReapSkipped) ++totals.emptyReapsSkipped;
             for (std::size_t i = 0; i < us.size(); ++i) totals.us[i] += us[i];
             if (cursor - totals.since < std::chrono::seconds(10)) return;
-            AgcDriver::ProfilePrint_nid_no_patch("[label-work] thread 0x%x: %llu labels, storage %.0f ms, reap %.0f ms, record %.0f ms (%.2f us/label, %.0f s)\n", GuestMemory::GpuLockThreadTag(), static_cast<unsigned long long>(totals.labels), totals.us[0] / 1000.0, totals.us[1] / 1000.0, totals.us[2] / 1000.0, (totals.us[0] + totals.us[1] + totals.us[2]) / totals.labels, std::chrono::duration<double>(cursor - totals.since).count());
+            AgcDriver::ProfilePrint_nid_no_patch("[label-work] thread 0x%x: %llu labels, storage %.0f ms, reap %.0f ms, record %.0f ms (%.2f us/label, %.0f s); %llu empty reaps skipped\n", GuestMemory::GpuLockThreadTag(), static_cast<unsigned long long>(totals.labels), totals.us[0] / 1000.0, totals.us[1] / 1000.0, totals.us[2] / 1000.0, (totals.us[0] + totals.us[1] + totals.us[2]) / totals.labels, std::chrono::duration<double>(cursor - totals.since).count(), static_cast<unsigned long long>(totals.emptyReapsSkipped));
             totals = {};
         }
     };
@@ -2653,7 +2655,11 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // against queue 0; its label goes behind a completion instead (reason 5, still no wait).
     // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
-    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
+    static const bool skipEmptyReap = std::getenv("APS5_NO_LABEL_EMPTY_REAP_SKIP") == nullptr;
+    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) {
+        if (!skipEmptyReap || recorder.HasReapWork()) recorder.Reap();
+        else if (profile) timing->emptyReapSkipped = true;
+    }
     if (profile) timing->Next();
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;

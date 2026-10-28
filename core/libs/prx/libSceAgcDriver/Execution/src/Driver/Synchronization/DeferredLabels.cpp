@@ -138,9 +138,9 @@ void Driver::flushAwaitedLabels(std::uint32_t queue) {
 }
 
 void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue) {
-    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Label);
     auto& deferred = deferredLabels();
     if (deferred.labels.empty()) return;
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Label);
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto* opcodes = profile ? &deferredLabelOpcodes() : nullptr;

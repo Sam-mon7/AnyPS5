@@ -29,7 +29,9 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
     const auto interruptSelect = opcode == 0x49 ? (packet[2] >> 24u) & 7u : 0u;
     endOfPipeInterrupt = interruptSelect != 0 && interruptSelect != 3;
-    const GuestMemory::CopybackScope copyback(opcode == 0x49 || opcode == 0x47 ? GuestMemory::CopybackPath::Eop : GuestMemory::CopybackPath::Label);
+    std::optional<GuestMemory::CopybackScope> copyback;
+    if (opcode == 0x49 || opcode == 0x47) copyback.emplace(GuestMemory::CopybackPath::Eop);
+    else if (opcode == 0x37) copyback.emplace(GuestMemory::CopybackPath::Label);
     interruptDeferred = false;
     if (!drainAll && endOfPipeInterrupt) {
         const auto label = Pm4::DecodeLabelWrite(packet);

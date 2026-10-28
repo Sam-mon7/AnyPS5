@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -21,11 +23,18 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
+
+namespace AgcDriver {
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+}
 
 namespace {
 
@@ -40,7 +49,7 @@ constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Format8888Uint = 60;
 constexpr std::uint32_t TexelBytes = 4;
 constexpr std::uint32_t IdentitySwizzle = 0xfacu;
-constexpr std::size_t BlockBytes = 0x20000;
+constexpr std::size_t BlockBytes = 0x80000;
 constexpr std::size_t LabelOffset = 0x8000;
 constexpr std::uint32_t LabelValue = 0x5eedf00du;
 constexpr std::uint32_t TiledThreads = 8;
@@ -128,12 +137,12 @@ std::array<std::uint32_t, 16> UserData(const void* texels) {
     return data;
 }
 
-std::array<std::uint32_t, 8> TiledDescriptor(const void* texels) {
+std::array<std::uint32_t, 8> TiledDescriptor(const void* texels, std::uint32_t side = TiledSide) {
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels));
     return {
         static_cast<std::uint32_t>(address >> 8u),
-        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32Uint << 20u) | (((TiledSide - 1u) & 3u) << 30u),
-        ((TiledSide - 1u) >> 2u) | ((TiledSide - 1u) << 14u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32Uint << 20u) | (((side - 1u) & 3u) << 30u),
+        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
         IdentitySwizzle | (TileR64KBX << 20u) | (Type2D << 28u),
         0u,
         0u,
@@ -222,11 +231,124 @@ void ReadTiledAfterLabel(std::uint8_t* block) {
     Require(written == TiledThreads, "tiled readback label: " + std::to_string(written) + " texels of a small tiled image read after the label hold the value the dispatch before it stored, expected " + std::to_string(TiledThreads));
 }
 
+bool CheckScanProof(AgcDriver::VulkanDevice& device, GuestBlock& block) {
+    using AgcDriver::Graphics::StorageTexture;
+    using AgcDriver::Graphics::Recorder;
+    Require(std::getenv("APS5_PROFILE_DRAW") != nullptr, "label scan proof tests require profiling counters");
+    const bool enabled = std::getenv("APS5_NO_LABEL_SCAN_PROOF") == nullptr;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const auto address = reinterpret_cast<std::uintptr_t>(block.Data());
+    const auto labelAddress = address + LabelOffset;
+    std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+    if (AgcDriver::Graphics::HostImportFor(context, address, BlockBytes) == nullptr) {
+        std::puts("label scan proof tests skipped: no host import on this device");
+        return false;
+    }
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "label scan proof tests require a recorder");
+    std::uint32_t value = 0;
+    const auto label = [&] {
+        ++value;
+        const auto bytes = std::as_bytes(std::span(&value, 1));
+        const auto reason = device.WriteLabelOnGpu(labelAddress, bytes, value, 0);
+        Require(reason == 0 || reason == 1 || reason == 5, "label scan proof: unexpected label fallback");
+        if (reason == 1) AgcDriver::GuestMemory::Write(labelAddress, bytes, 4);
+    };
+    const auto repeat = [&] {
+        StorageTexture::BumpPendingSerial();
+        const auto before = StorageTexture::ReadLabelScanCounts();
+        label();
+        label();
+        const auto after = StorageTexture::ReadLabelScanCounts();
+        Require(after.scans - before.scans == (enabled ? 1u : 2u) && after.skipped - before.skipped == (enabled ? 1u : 0u), "label scan proof: repeated negative scans were not cached or the opt-out did not rescan");
+    };
+    repeat();
+    auto unlocked = StorageTexture::ReadLabelScanCounts();
+    gpu.unlock();
+    StorageTexture::StoreReadbackBeforeLabel("test without GPU hold");
+    gpu.lock();
+    Require(StorageTexture::ReadLabelScanCounts().scans == unlocked.scans + 1 && StorageTexture::ReadLabelScanCounts().skipped == unlocked.skipped, "label scan proof was used outside the GPU mutex");
+    for (const bool tiled : {false, true}) {
+        const auto data = UserData(block.Data());
+        std::array<std::uint32_t, 8> words{};
+        std::copy_n(data.begin() + 4, words.size(), words.begin());
+        if (tiled) words = TiledDescriptor(block.Data() + TiledOffset);
+        const auto descriptor = AgcDriver::Graphics::DecodeTextureResource(words);
+        auto image = AgcDriver::Graphics::CachedStorageSurface(context, descriptor);
+        repeat();
+        const std::array<std::uint32_t, 4> pattern{Written, Written, Written, Written};
+        const char* refusal = nullptr;
+        Require(image->FillClear(pattern, StorageTexture::WholeImage, refusal), std::string("label scan proof clear refused: ") + (refusal != nullptr ? refusal : "unknown"));
+        Require(image->Dirty(), "label scan proof: the image was not registered between labels");
+        const auto before = StorageTexture::ReadLabelScanCounts();
+        label();
+        const auto after = StorageTexture::ReadLabelScanCounts();
+        Require(after.scans == before.scans + 1 && after.skipped == before.skipped && after.flushes > before.flushes && !image->Dirty(), "label scan proof skipped a newly registered linear or small tiled image");
+        device.WaitIdle();
+        Require(*reinterpret_cast<const volatile std::uint32_t*>(block.Data() + LabelOffset) == value, "label scan proof: the label did not become CPU-visible");
+        std::uint32_t written = 0;
+        const auto* texels = reinterpret_cast<const volatile std::uint32_t*>(descriptor.baseAddress);
+        for (std::size_t i = 0; i < image->GuestBytes() / 4; ++i) written += texels[i] == Written ? 1u : 0u;
+        Require(written == descriptor.width * descriptor.height, "label scan proof: image payload read directly after the label is stale");
+        repeat();
+        recorder->Commands();
+        bool completed = false;
+        Require(recorder->AfterRecordedWork([&] { image->MarkDirty(); completed = true; }), "label scan proof: completion was not queued");
+        device.WaitIdle();
+        Require(completed && image->Dirty(), "label scan proof: completion did not register pending results");
+        const auto completion = StorageTexture::ReadLabelScanCounts();
+        label();
+        Require(StorageTexture::ReadLabelScanCounts().scans == completion.scans + 1 && !image->Dirty(), "label scan proof survived a re-entrant completion registration");
+        device.WaitIdle();
+    }
+    const auto largeDescriptor = AgcDriver::Graphics::DecodeTextureResource(TiledDescriptor(block.Data() + 0x40000, 256));
+    auto large = AgcDriver::Graphics::CachedStorageSurface(context, largeDescriptor);
+    const std::array<std::uint32_t, 4> pattern{Written, Written, Written, Written};
+    const char* refusal = nullptr;
+    Require(large->GuestBytes() > StorageTexture::SmallStoreBytes && large->BlockUnits(), "label scan proof: expected a large tiled image with block units");
+    Require(large->FillClear(pattern, StorageTexture::WholeImage, refusal), "label scan proof: large clear refused");
+    repeat();
+    Require(large->Dirty(), "label scan proof: an ineligible large tiled image was flushed");
+    large->MarkDirty();
+    auto before = StorageTexture::ReadLabelScanCounts();
+    label();
+    Require(StorageTexture::ReadLabelScanCounts().scans == before.scans + 1, "label scan proof survived MarkDirty on an already-listed image");
+    Require(StorageTexture::FlushPending(largeDescriptor.baseAddress, 65536) && large->Dirty(), "label scan proof: partial flush did not leave pending units");
+    before = StorageTexture::ReadLabelScanCounts();
+    label();
+    Require(StorageTexture::ReadLabelScanCounts().scans == before.scans + 1, "label scan proof survived a partial flush");
+    repeat();
+    Require(StorageTexture::DiscardPendingInside(largeDescriptor.baseAddress, large->GuestBytes()) != 0, "label scan proof: discard removed no pending units");
+    before = StorageTexture::ReadLabelScanCounts();
+    label();
+    Require(StorageTexture::ReadLabelScanCounts().scans == before.scans + 1, "label scan proof survived pending-image removal");
+    device.WaitIdle();
+    Require(!recorder->HasReapWork(), "label scan proof: an idle recorder reports reap work");
+    auto kept = std::make_shared<int>(1);
+    const std::weak_ptr<int> retained = kept;
+    recorder->KeepThroughHold(std::move(kept));
+    device.WaitIdle();
+    Require(recorder->HasReapWork() && !retained.expired(), "label scan proof: the empty-reap check ignored retained hold objects");
+    gpu.unlock();
+    gpu.lock();
+    label();
+    Require(retained.expired(), "label scan proof: a label skipped releasing stale hold objects");
+    return true;
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         deferredLabelTest = argc == 2 && std::string_view(argv[1]) == "--deferred-label";
+        if (argc == 2 && std::string_view(argv[1]) == "--scan-proof") {
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            GuestBlock block;
+            if (!CheckScanProof(*device, block)) return VulkanTestSkipped;
+            std::puts("label scan proof tests passed");
+            return 0;
+        }
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;

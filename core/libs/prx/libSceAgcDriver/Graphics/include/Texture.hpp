@@ -244,6 +244,10 @@ public:
     static std::size_t StoreSmallPending(const char* reason);
     static void StoreReadbackBeforeLabel(const char* reason);
     static void PrepareReadbackBeforeLabel();
+    struct LabelScanCounts {
+        std::uint64_t scans = 0, skipped = 0, negative = 0, candidates = 0, flushes = 0;
+    };
+    static LabelScanCounts ReadLabelScanCounts();
     static std::size_t StoreDrawnLinear(const char* reason);
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();

@@ -1536,6 +1536,35 @@ bool PendingImageIndexEnabled() {
     return enabled;
 }
 
+bool LabelScanProofEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_LABEL_SCAN_PROOF") == nullptr;
+    return enabled;
+}
+
+enum class LabelScanChange : std::size_t { Registry, Dirty, Reconcile, Flush, Discard, Refresh, Version, Handover, Borrow, Shadow, Count };
+
+struct LabelScanProof {
+    std::atomic<std::uint64_t> serial{0};
+    std::atomic<bool> valid{false};
+    std::uint64_t provedSerial = 0;
+    std::atomic<std::uint64_t> scans{0}, skipped{0}, negative{0}, candidates{0}, flushes{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(LabelScanChange::Count)> invalidated{};
+    double negativeUs = 0, scanUs = 0, avoidedUs = 0;
+    std::chrono::steady_clock::time_point reported{};
+};
+
+LabelScanProof& LabelProof() {
+    static LabelScanProof proof;
+    return proof;
+}
+
+void InvalidateLabelScan(LabelScanChange reason) {
+    if (!LabelScanProofEnabled()) return;
+    auto& proof = LabelProof();
+    proof.serial.fetch_add(1, std::memory_order_release);
+    if (proof.valid.exchange(false, std::memory_order_acq_rel) && LookupOutcomes::Profiled()) proof.invalidated[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
 class PendingList {
 public:
     using iterator = std::vector<StorageTexture*>::iterator;
@@ -1589,6 +1618,7 @@ private:
     }
 
     void changed() {
+        InvalidateLabelScan(LabelScanChange::Registry);
         ++version;
         changes.store(version, std::memory_order_release);
     }
@@ -1651,6 +1681,53 @@ struct PendingWrites {
 PendingWrites& Pending() {
     static PendingWrites pending;
     return pending;
+}
+
+std::vector<std::pair<std::uint64_t, std::size_t>> ReadbackLabelRanges() {
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    auto& proof = LabelProof();
+    const bool enabled = LabelScanProofEnabled() && GuestMemory::GpuMutex().HeldByThisThread();
+    const auto serial = proof.serial.load(std::memory_order_acquire);
+    const bool skip = enabled && proof.valid.load(std::memory_order_acquire) && proof.provedSerial == serial;
+    const bool profile = LookupOutcomes::Profiled();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    if (!skip) {
+        for (const auto* texture : pending.textures) {
+            if (texture->Descriptor().tileMode == TextureTileMode::kLinear || texture->GuestBytes() <= StorageTexture::SmallStoreBytes) ranges.emplace_back(texture->Descriptor().baseAddress, static_cast<std::size_t>(texture->GuestBytes()));
+        }
+        if (enabled && ranges.empty() && pending.flushing.empty()) {
+            proof.provedSerial = serial;
+            proof.valid.store(true, std::memory_order_release);
+        }
+    }
+    if (profile) {
+        if (skip) {
+            proof.skipped.fetch_add(1, std::memory_order_relaxed);
+            proof.avoidedUs += proof.negativeUs;
+        } else {
+            proof.scans.fetch_add(1, std::memory_order_relaxed);
+            proof.candidates.fetch_add(ranges.size(), std::memory_order_relaxed);
+            const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+            proof.scanUs += us;
+            if (ranges.empty()) {
+                proof.negative.fetch_add(1, std::memory_order_relaxed);
+                proof.negativeUs = us;
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (proof.reported == std::chrono::steady_clock::time_point{}) proof.reported = now;
+        if (now - proof.reported >= std::chrono::seconds(10)) {
+            static constexpr std::array<const char*, static_cast<std::size_t>(LabelScanChange::Count)> names{"registry", "dirty", "reconcile", "flush", "discard", "refresh", "version", "handover", "borrow", "shadow"};
+            std::string reasons;
+            for (std::size_t i = 0; i < names.size(); ++i) reasons += " " + std::string(names[i]) + "=" + std::to_string(proof.invalidated[i].load(std::memory_order_relaxed));
+            const auto counts = StorageTexture::ReadLabelScanCounts();
+            AgcDriver::ProfilePrint_nid_no_patch("[label-scan] cumulative: %llu scans, %llu skipped, %llu negative, %llu candidates, %llu flushes, scan %.3f ms, estimated avoided scan %.3f ms; proofs invalidated:%s\n", static_cast<unsigned long long>(counts.scans), static_cast<unsigned long long>(counts.skipped), static_cast<unsigned long long>(counts.negative), static_cast<unsigned long long>(counts.candidates), static_cast<unsigned long long>(counts.flushes), proof.scanUs / 1000.0, proof.avoidedUs / 1000.0, reasons.c_str());
+            proof.reported = now;
+        }
+    }
+    return ranges;
 }
 
 DrawnPending drawnPending() {
@@ -2325,6 +2402,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, 
     const auto scopeBegin = scoped ? layerBegin(firstLayer) : descriptor.baseAddress;
     const auto scopeBytes = scoped ? static_cast<std::size_t>(layerBegin(lastLayer - 1) + layerBytes(lastLayer - 1) - scopeBegin) : static_cast<std::size_t>(guestBytes);
     // No publish: the upload below reads the stored units from the unit shadow itself.
+    InvalidateLabelScan(LabelScanChange::Refresh);
     handedOver.clear();
     handedUnits.clear();
     const auto handOverKeys = alias == nullptr && !scoped ? clearHandOver() : std::nullopt;
@@ -2959,6 +3037,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, guestBytes);
         countStorageUpload(0, guestBytes);
+        InvalidateLabelScan(LabelScanChange::Version);
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
         return;
@@ -2992,6 +3071,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 partialUploadBytes.fetch_add(uploadedBytes, std::memory_order_relaxed);
             }
             ++Profile().storageDirectUploads;
+            InvalidateLabelScan(LabelScanChange::Version);
             ++version;
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
             return;
@@ -3049,6 +3129,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             else recorder->EndGpuTiming(timing, uploadedBytes);
             countStorageUpload(1, uploadedBytes);
             ++Profile().storageDirectUploads;
+            InvalidateLabelScan(LabelScanChange::Version);
             ++version;
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
             return;
@@ -3086,6 +3167,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         else recorder->EndGpuTiming(timing, uploadedBytes);
         countStorageUpload(1, uploadedBytes);
         ++Profile().storageDirectUploads;
+        InvalidateLabelScan(LabelScanChange::Version);
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
         return;
@@ -3167,6 +3249,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             APS5_LOG_CHARS_OUT("StorageTexture upload done");
     }
     countStorageUpload(2, uploadedBytes);
+    InvalidateLabelScan(LabelScanChange::Version);
     ++version;
     if (profile) LookupOutcomes::Add(LookupOutcomes::UploadCpu, start);
 }
@@ -4063,6 +4146,7 @@ void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t la
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    InvalidateLabelScan(LabelScanChange::Dirty);
     if (LookupOutcomes::Profiled()) profiledWriter = drawingTarget ? 1 : 0;
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
@@ -4124,6 +4208,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         }();
         static_cast<void>(hooked);
     }
+    InvalidateLabelScan(LabelScanChange::Version);
     ++version;
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
@@ -4136,6 +4221,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
 }
 
 void StorageTexture::reconcilePending() {
+    InvalidateLabelScan(LabelScanChange::Reconcile);
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     const bool any = anyLayerPending();
@@ -4472,6 +4558,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     ++it;
                     continue;
                 }
+                InvalidateLabelScan(LabelScanChange::Flush);
                 texture->dirty = false;
                 if (const auto skips = texture->hookSkips.exchange(0, std::memory_order_relaxed); skips != 0 && texture->skippedResultsInside(address, bytes)) {
                     flushedAfterSkip.fetch_add(1, std::memory_order_relaxed);
@@ -4506,6 +4593,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         ~Unregister() {
             auto& pending = Pending();
             std::lock_guard lock(pending.mutex);
+            InvalidateLabelScan(LabelScanChange::Flush);
             for (const auto& texture : flush) std::erase(pending.flushing, texture.get());
             pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
             BumpPendingSerial();
@@ -4824,14 +4912,7 @@ void StorageTexture::PrepareReadbackBeforeLabel() {
     if (!unlocked || GuestMemory::GpuMutex().DepthOnThisThread() != 1 || Recorder::InCompletion()) return;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->HasTimeline()) return;
-    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
-    {
-        auto& pending = Pending();
-        std::lock_guard lock(pending.mutex);
-        for (const auto* texture : pending.textures) {
-            if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
-        }
-    }
+    const auto ranges = ReadbackLabelRanges();
     std::uint64_t target = 0;
     for (const auto& [address, bytes] : ranges) {
         std::vector<std::shared_ptr<StorageTexture>> flush;
@@ -4855,15 +4936,16 @@ void StorageTexture::PrepareReadbackBeforeLabel() {
 void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
     static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
     if (disabled) return;
-    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
-    {
-        auto& pending = Pending();
-        std::lock_guard lock(pending.mutex);
-        for (const auto* texture : pending.textures) {
-            if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
-        }
+    const auto ranges = ReadbackLabelRanges();
+    for (const auto& [address, bytes] : ranges) {
+        const bool flushed = FlushPending(address, bytes, nullptr, reason);
+        if (flushed && LookupOutcomes::Profiled()) LabelProof().flushes.fetch_add(1, std::memory_order_relaxed);
     }
-    for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
+}
+
+StorageTexture::LabelScanCounts StorageTexture::ReadLabelScanCounts() {
+    const auto& proof = LabelProof();
+    return {proof.scans.load(std::memory_order_relaxed), proof.skipped.load(std::memory_order_relaxed), proof.negative.load(std::memory_order_relaxed), proof.candidates.load(std::memory_order_relaxed), proof.flushes.load(std::memory_order_relaxed)};
 }
 
 std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
@@ -5269,6 +5351,7 @@ StorageTexture::HookSkipCounts StorageTexture::TakeHookSkipCounts() {
 }
 
 void StorageTexture::BumpPendingSerial() {
+    InvalidateLabelScan(LabelScanChange::Shadow);
     pendingSerial.fetch_add(1, std::memory_order_release);
 }
 
@@ -5444,7 +5527,10 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             ++it;
         }
     }
-    if (discarded != 0) BumpPendingSerial();
+    if (discarded != 0) {
+        InvalidateLabelScan(LabelScanChange::Discard);
+        BumpPendingSerial();
+    }
     return discarded;
 }
 
@@ -5594,6 +5680,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     }
     std::size_t droppedUnits = 0;
     const bool wasDirty = dirty;
+    InvalidateLabelScan(LabelScanChange::Discard);
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
@@ -5640,6 +5727,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) layerGeneration[layer] = collectedLayerGeneration(layer, now);
     refreshGeneration();
+    InvalidateLabelScan(LabelScanChange::Version);
     ++version;
     if (traceKeys) std::fprintf(stderr, "[dcc-keys] key fill %s clears 0x%llx+0x%llx at once (keys 0x%llx, %zu pending units dropped, dirty %d)\n", DccKeysName(keys), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), droppedUnits, wasDirty ? 1 : 0);
     return true;
@@ -6079,6 +6167,7 @@ std::optional<DccKeys> StorageTexture::clearHandOver() {
     const auto keys = ProvedKeys();
     VkClearColorValue clear{};
     if (!IsDccClear(keys) || !ClearColorFor(storageFormat, keys, clear)) return std::nullopt;
+    InvalidateLabelScan(LabelScanChange::Handover);
     if (handedUnits.size() != trackedLayers) handedUnits.assign(trackedLayers, false);
     for (const auto& other : others) {
         for (std::uint32_t unit = 0; unit < other->trackedLayers; ++unit) {
@@ -6094,6 +6183,7 @@ std::optional<DccKeys> StorageTexture::clearHandOver() {
 }
 
 void StorageTexture::supersedeHandedOver(std::uint32_t first, std::uint32_t count) {
+    InvalidateLabelScan(LabelScanChange::Handover);
     const auto begin = layerBegin(first);
     const auto end = first + count >= trackedLayers ? descriptor.baseAddress + guestBytes : layerBegin(first + count);
     for (auto entry = handedOver.begin(); entry != handedOver.end();) {
@@ -6161,6 +6251,7 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
 
 void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
     if (borrowedUnits.empty()) return;
+    InvalidateLabelScan(LabelScanChange::Borrow);
     for (auto unit = first; unit < first + count && unit < borrowedUnits.size(); ++unit) borrowedUnits[unit] = false;
     if (std::none_of(borrowedUnits.begin(), borrowedUnits.end(), [](bool held) { return held; })) {
         borrowedUnits.clear();
@@ -6169,6 +6260,7 @@ void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
 }
 
 std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vector<bool>& units) {
+    InvalidateLabelScan(LabelScanChange::Borrow);
     const auto runs = unitRuns(units);
     const auto windows = sliceWindows(runs);
     Require(!windows.empty(), "storage image borrows no unit");
@@ -6233,6 +6325,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
         if (units[unit]) borrowedUnits[unit] = true;
     }
+    InvalidateLabelScan(LabelScanChange::Version);
     ++version;
     return bytes;
 }
@@ -6294,6 +6387,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    InvalidateLabelScan(LabelScanChange::Flush);
     const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Storage);
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
