@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -34,6 +35,7 @@ struct PendingDispatchPhases {
     std::array<double, DriverPhaseCount> ms{};
     std::chrono::steady_clock::time_point tailAt{};
     std::uint64_t code = 0;
+    std::vector<double> deviceMs;
 };
 
 struct DispatchShaderTotals {
@@ -43,6 +45,8 @@ struct DispatchShaderTotals {
     std::array<std::uint64_t, static_cast<std::size_t>(DispatchOutcome::Count)> packets{};
     std::array<double, static_cast<std::size_t>(DispatchOutcome::Count)> packetMs{};
     std::uint64_t hits = 0;
+    std::vector<double> deviceMs;
+    std::uint64_t deviceCalls = 0;
 };
 
 struct DispatchPhaseTiming {

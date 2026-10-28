@@ -4709,6 +4709,16 @@ void reportRecipes() {
 // The phases of one device call (APS5_PROFILE_DRAW): this call's rows (formatted only for a slow
 // call or a new [indirect] maximum) and the running totals of Dispatches(); `indirect` charges the
 // [indirect] rows too (cleared when a CPU-resolved indirect dispatch continues as a direct one).
+struct LastDispatchPhases {
+    bool set = false;
+    std::array<double, DispatchRows> ms{};
+};
+
+LastDispatchPhases& lastDispatchPhases() {
+    static thread_local LastDispatchPhases last;
+    return last;
+}
+
 struct DispatchTimer {
     bool profile;
     bool indirect;
@@ -4761,6 +4771,7 @@ struct DispatchTimer {
     // accounting (`indirectHold`: the call was an indirect dispatch, CPU-resolved or not) and line.
     void finish(std::uint64_t lookupsBefore, const char* groupsText, bool indirectHold) const {
         if (!profile) return;
+        lastDispatchPhases() = {true, callMs};
         auto& d = Dispatches();
         d.procLookups += Graphics::DeviceProcLookups() - lookupsBefore;
         const auto now = std::chrono::steady_clock::now();
@@ -4797,6 +4808,22 @@ struct DispatchTimer {
     }
 };
 
+}
+
+std::size_t VulkanDevice::DispatchProfileRows() {
+    return DispatchRows;
+}
+
+const char* VulkanDevice::DispatchProfileRowName(std::size_t row) {
+    return DispatchRowName(row);
+}
+
+bool VulkanDevice::TakeLastDispatchPhases(std::vector<double>& ms) {
+    auto& last = lastDispatchPhases();
+    if (!last.set) return false;
+    ms.assign(last.ms.begin(), last.ms.end());
+    last.set = false;
+    return true;
 }
 
 struct RecordedDispatch {

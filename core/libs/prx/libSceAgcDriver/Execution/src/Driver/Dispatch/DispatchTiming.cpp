@@ -46,6 +46,11 @@ void Driver::addDispatchShader(DispatchClass which, const PendingDispatchPhases&
     if (pending.phases) {
         for (std::size_t i = 0; i < DriverPhaseCount; ++i) row.ms[i] += pending.ms[i];
         if (pending.hit) ++row.hits;
+        if (!pending.deviceMs.empty()) {
+            if (row.deviceMs.size() < pending.deviceMs.size()) row.deviceMs.resize(pending.deviceMs.size());
+            for (std::size_t i = 0; i < pending.deviceMs.size(); ++i) row.deviceMs[i] += pending.deviceMs[i];
+            ++row.deviceCalls;
+        }
     }
     if (ShaderProfileReportEnabled() && std::chrono::steady_clock::now() - dispatchShaderReport >= std::chrono::seconds(10)) reportDispatchShaders();
 }
@@ -88,6 +93,19 @@ void Driver::reportDispatchShaders() {
                       packetsOf(DispatchOutcome::Skipped) + packetsOf(DispatchOutcome::SkippedMemo), rowMs(&row), count == 0 ? 0.0 : rowMs(&row) * 1000 / static_cast<double>(count), static_cast<unsigned long long>(row.hits),
                       DriverPhaseNames[order[0]], row.ms[order[0]], DriverPhaseNames[order[1]], row.ms[order[1]], DriverPhaseNames[order[2]], row.ms[order[2]]);
         report += text;
+        if (row.deviceCalls != 0) {
+            std::vector<std::size_t> deviceOrder(row.deviceMs.size());
+            std::iota(deviceOrder.begin(), deviceOrder.end(), std::size_t{0});
+            const auto shown = std::min<std::size_t>(5, deviceOrder.size());
+            std::partial_sort(deviceOrder.begin(), deviceOrder.begin() + static_cast<std::ptrdiff_t>(shown), deviceOrder.end(), [&](std::size_t a, std::size_t b) { return row.deviceMs[a] > row.deviceMs[b]; });
+            std::snprintf(text, sizeof(text), "; device call per dispatch (%llu timed):", static_cast<unsigned long long>(row.deviceCalls));
+            report += text;
+            for (std::size_t index = 0; index < shown; ++index) {
+                if (row.deviceMs[deviceOrder[index]] <= 0) break;
+                std::snprintf(text, sizeof(text), " %s %.0f us", VulkanDevice::DispatchProfileRowName(deviceOrder[index]), row.deviceMs[deviceOrder[index]] * 1000 / static_cast<double>(row.deviceCalls));
+                report += text;
+            }
+        }
     }
     AgcDriver::ProfilePrint_nid_no_patch("[dispatch-shaders] %.1f s, %llu dispatch packets of %zu shaders, %.1f ms; slowest:%s\n", seconds, static_cast<unsigned long long>(packets), rows.size(), total, report.c_str());
     dispatchShaderTotals.clear();
