@@ -309,6 +309,10 @@ public:
         bool epochReused = false;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    struct ProofExtent {
+        std::uint64_t directRegions = 0, directBytes = 0, describedRanges = 0, describedBytes = 0, storageImages = 0, storageBytes = 0;
+    };
+    ProofExtent Extent() const;
     static bool EpochProofs();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.

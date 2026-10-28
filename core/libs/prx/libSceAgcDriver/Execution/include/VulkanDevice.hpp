@@ -341,6 +341,16 @@ public:
     static std::size_t DispatchProfileRows();
     static const char* DispatchProfileRowName(std::size_t row);
     static bool TakeLastDispatchPhases(std::vector<double>& ms);
+    struct DispatchProof {
+        bool proved = false;
+        std::size_t path = 0;
+        std::size_t failure = 0;
+        bool epochReused = false;
+        double ms = 0;
+        double hookWaitMs = 0;
+        std::uint64_t directRegions = 0, directBytes = 0, describedRanges = 0, describedBytes = 0, storageImages = 0, storageBytes = 0;
+    };
+    static bool TakeLastDispatchProof(DispatchProof& proof);
     // Whether compute templates refresh their data buffers with a hit's words instead of keying
     // them (APS5_NO_TEMPLATE_DATA_REFRESH unset); the driver's data-only hits require it.
     static bool TemplateDataRefresh();

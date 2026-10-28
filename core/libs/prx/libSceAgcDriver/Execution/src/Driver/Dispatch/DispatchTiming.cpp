@@ -51,6 +51,15 @@ void Driver::addDispatchShader(DispatchClass which, const PendingDispatchPhases&
             for (std::size_t i = 0; i < pending.deviceMs.size(); ++i) row.deviceMs[i] += pending.deviceMs[i];
             ++row.deviceCalls;
         }
+        if (pending.proofSet) {
+            ++row.proofs;
+            if (!pending.proofProved) ++row.proofsFailed;
+            if (pending.proofPath < row.proofPaths.size()) ++row.proofPaths[pending.proofPath];
+            if (pending.proofFailure < row.proofFailures.size()) ++row.proofFailures[pending.proofFailure];
+            row.proofMs += pending.proofMs;
+            row.proofWaitMs += pending.proofWaitMs;
+            for (std::size_t i = 0; i < row.proofExtent.size(); ++i) row.proofExtent[i] += pending.proofExtent[i];
+        }
     }
     if (ShaderProfileReportEnabled() && std::chrono::steady_clock::now() - dispatchShaderReport >= std::chrono::seconds(10)) reportDispatchShaders();
 }
@@ -105,6 +114,15 @@ void Driver::reportDispatchShaders() {
                 std::snprintf(text, sizeof(text), " %s %.0f us", VulkanDevice::DispatchProfileRowName(deviceOrder[index]), row.deviceMs[deviceOrder[index]] * 1000 / static_cast<double>(row.deviceCalls));
                 report += text;
             }
+        }
+        if (row.proofs != 0) {
+            const auto per = [&](std::uint64_t value) { return static_cast<double>(value) / static_cast<double>(row.proofs); };
+            std::snprintf(text, sizeof(text), "; proofs %llu (%llu failed; fast %llu, own refreshed %llu, full %llu; failures imports %llu evicted %llu pending %llu changed %llu keys %llu other %llu) %.0f us each (hook waits %.0f us), each over %.1f direct regions %.1f KiB, %.1f described ranges %.1f KiB, %.1f storage images %.1f KiB",
+                          static_cast<unsigned long long>(row.proofs), static_cast<unsigned long long>(row.proofsFailed), static_cast<unsigned long long>(row.proofPaths[0]), static_cast<unsigned long long>(row.proofPaths[1]), static_cast<unsigned long long>(row.proofPaths[2]),
+                          static_cast<unsigned long long>(row.proofFailures[1]), static_cast<unsigned long long>(row.proofFailures[2]), static_cast<unsigned long long>(row.proofFailures[3]), static_cast<unsigned long long>(row.proofFailures[4]), static_cast<unsigned long long>(row.proofFailures[5]), static_cast<unsigned long long>(row.proofFailures[6]),
+                          row.proofMs * 1000 / static_cast<double>(row.proofs), row.proofWaitMs * 1000 / static_cast<double>(row.proofs),
+                          per(row.proofExtent[0]), per(row.proofExtent[1]) / 1024, per(row.proofExtent[2]), per(row.proofExtent[3]) / 1024, per(row.proofExtent[4]), per(row.proofExtent[5]) / 1024);
+            report += text;
         }
     }
     AgcDriver::ProfilePrint_nid_no_patch("[dispatch-shaders] %.1f s, %llu dispatch packets of %zu shaders, %.1f ms; slowest:%s\n", seconds, static_cast<unsigned long long>(packets), rows.size(), total, report.c_str());

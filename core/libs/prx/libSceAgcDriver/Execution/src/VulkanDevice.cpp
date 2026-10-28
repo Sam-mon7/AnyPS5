@@ -4719,6 +4719,16 @@ LastDispatchPhases& lastDispatchPhases() {
     return last;
 }
 
+struct LastDispatchProof {
+    bool set = false;
+    VulkanDevice::DispatchProof proof;
+};
+
+LastDispatchProof& lastDispatchProof() {
+    static thread_local LastDispatchProof last;
+    return last;
+}
+
 struct DispatchTimer {
     bool profile;
     bool indirect;
@@ -4816,6 +4826,14 @@ std::size_t VulkanDevice::DispatchProfileRows() {
 
 const char* VulkanDevice::DispatchProfileRowName(std::size_t row) {
     return DispatchRowName(row);
+}
+
+bool VulkanDevice::TakeLastDispatchProof(DispatchProof& proof) {
+    auto& last = lastDispatchProof();
+    if (!last.set) return false;
+    proof = last.proof;
+    last.set = false;
+    return true;
 }
 
 bool VulkanDevice::TakeLastDispatchPhases(std::vector<double>& ms) {
@@ -6158,8 +6176,12 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     Graphics::ShaderResources::ProofReport report;
     const bool proved = hit->resources->ProveCurrent(shaders[0], &report);
     if (profile) {
-        counters.proofNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - proofStart).count()), std::memory_order_relaxed);
+        const auto proofNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - proofStart).count();
+        counters.proofNs.fetch_add(static_cast<std::uint64_t>(proofNs), std::memory_order_relaxed);
         timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
+        const auto extent = hit->resources->Extent();
+        lastDispatchProof() = {true, {proved, static_cast<std::size_t>(report.path), static_cast<std::size_t>(report.failure), report.epochReused, static_cast<double>(proofNs) / 1e6, Graphics::Recorder::ThreadWaitedMs() - waitedBefore,
+                                      extent.directRegions, extent.directBytes, extent.describedRanges, extent.describedBytes, extent.storageImages, extent.storageBytes}};
     }
     timer.phase(PhaseProof);
     if (!proved) {

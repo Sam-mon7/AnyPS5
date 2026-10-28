@@ -3574,6 +3574,23 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 }
 
+ShaderResources::ProofExtent ShaderResources::Extent() const {
+    ProofExtent extent;
+    for (const auto& region : directRegions) {
+        ++extent.directRegions;
+        extent.directBytes += region.end - region.begin;
+    }
+    for (const auto& range : describedRanges) {
+        ++extent.describedRanges;
+        extent.describedBytes += range.bytes;
+    }
+    for (const auto& image : storageTextures) {
+        ++extent.storageImages;
+        extent.storageBytes += image->GuestBytes();
+    }
+    return extent;
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (GuestMemory::ResourceEpochProofsEnabled()) return revalidateFull(shaders, report, true);
     if (EpochProofs()) {

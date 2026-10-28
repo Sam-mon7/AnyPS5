@@ -36,6 +36,11 @@ struct PendingDispatchPhases {
     std::chrono::steady_clock::time_point tailAt{};
     std::uint64_t code = 0;
     std::vector<double> deviceMs;
+    bool proofSet = false;
+    bool proofProved = false;
+    std::size_t proofPath = 0, proofFailure = 0;
+    double proofMs = 0, proofWaitMs = 0;
+    std::array<std::uint64_t, 6> proofExtent{};
 };
 
 struct DispatchShaderTotals {
@@ -47,6 +52,11 @@ struct DispatchShaderTotals {
     std::uint64_t hits = 0;
     std::vector<double> deviceMs;
     std::uint64_t deviceCalls = 0;
+    std::uint64_t proofs = 0, proofsFailed = 0;
+    std::array<std::uint64_t, 3> proofPaths{};
+    std::array<std::uint64_t, 7> proofFailures{};
+    double proofMs = 0, proofWaitMs = 0;
+    std::array<std::uint64_t, 6> proofExtent{};
 };
 
 struct DispatchPhaseTiming {

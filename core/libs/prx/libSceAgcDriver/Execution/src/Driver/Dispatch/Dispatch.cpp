@@ -781,6 +781,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         pending.ms = phaseMs;
         pending.tailAt = phaseLap;
         if (DrawShaderProfileEnabled() && !VulkanDevice::TakeLastDispatchPhases(pending.deviceMs)) pending.deviceMs.clear();
+        if (DrawShaderProfileEnabled()) {
+            VulkanDevice::DispatchProof proof;
+            pending.proofSet = VulkanDevice::TakeLastDispatchProof(proof);
+            if (pending.proofSet) {
+                pending.proofProved = proof.proved;
+                pending.proofPath = proof.path;
+                pending.proofFailure = proof.failure;
+                pending.proofMs = proof.ms;
+                pending.proofWaitMs = proof.hookWaitMs;
+                pending.proofExtent = {proof.directRegions, proof.directBytes, proof.describedRanges, proof.describedBytes, proof.storageImages, proof.storageBytes};
+            }
+        }
     }
     if (profile && ++dispatches % 100 == 0) AgcDriver::ProfilePrint_nid_no_patch( "[gpu] %llu dispatches (%llu dispatch cache hits, %llu evictions, %llu recompile cache hits): capture %.1f s, cache key %.1f s, recompile %.1f s, device %.1f s\n", static_cast<unsigned long long>(dispatches), static_cast<unsigned long long>(dispatchCacheHits), static_cast<unsigned long long>(dispatchCacheEvictions), static_cast<unsigned long long>(cacheHits), captureMs / 1000, keyMs / 1000, recompileMs / 1000, deviceMs / 1000);
 }
