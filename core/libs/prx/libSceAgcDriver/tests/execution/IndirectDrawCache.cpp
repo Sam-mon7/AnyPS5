@@ -181,7 +181,7 @@ void RepeatedIndirectDrawsStayOnTheGpu() {
 }
 
 void CpuIndirectCacheRefreshesPushConstants(bool builtinTest = false, bool unknownLimit = false) {
-    const bool builtins = builtinTest && std::getenv("APS5_INDIRECT_BUILTIN_OFFSETS") != nullptr;
+    const bool builtins = builtinTest && std::getenv("APS5_NO_INDIRECT_BUILTIN_OFFSETS") == nullptr;
     const bool enabled = std::getenv("APS5_NO_CPU_INDIRECT_DRAW_CACHE") == nullptr;
     alignas(256) std::array<std::uint16_t, 6> indices{0, 1, 2, 0, 0, 0};
     if (builtinTest) indices = {0, 1, 2, 2, 0, 1};

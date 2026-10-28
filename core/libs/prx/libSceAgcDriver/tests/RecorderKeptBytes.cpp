@@ -218,13 +218,14 @@ void ComputeChainTests() {
     AgcDriver::GuestMemory::SetCurrentPacket(0x15, 0);
     const auto context = mockContext();
     Recorder recorder(context);
-    const auto* flag = std::getenv("APS5_COMPUTE_CHAINS");
-    const bool tracked = Recorder::ComputeChainsEnabled() && flag != nullptr && std::string_view(flag) == "1";
-    const bool ds = Recorder::DsComputeChains("PPSA01341");
-    Expect(!Recorder::DsComputeChains("") && !Recorder::DsComputeChains("PPSA00000"), "an unknown title enabled unchecked chains");
-    Expect(Recorder::DsComputeChains("PPSA01340") == ds, "the second supported title did not follow the experiment switch");
-    const auto dispatch = [&](const PassAccess& access, bool eligible = true, std::string_view title = {}) {
-        const auto start = recorder.BeginComputeDispatch(access, eligible, title);
+    const auto* flag = std::getenv("APS5_UNSAFE_COMPUTE_CHAINS");
+    const bool requested = flag != nullptr && std::string_view(flag) == "1";
+    const bool enabled = (std::getenv("APS5_COMPUTE_CHAINS") != nullptr || requested) && Recorder::MergeBarriers();
+    const bool unchecked = enabled && requested;
+    Expect(Recorder::ComputeChainsEnabled() == enabled, "compute chain admission did not match its opt-in");
+    Expect(Recorder::UnsafeComputeChains() == unchecked, "unchecked chains did not require the exact debug opt-in");
+    const auto dispatch = [&](const PassAccess& access, bool eligible = true) {
+        const auto start = recorder.BeginComputeDispatch(access, eligible);
         constexpr VkAccessFlags shader = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         if (!start.continued && (!Recorder::MergeBarriers() || (start.covered & shader) != shader)) RecordMemoryBarrier(context, start.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, shader);
         mockCmdDispatch(start.commands, 1, 1, 1);
@@ -238,42 +239,42 @@ void ComputeChainTests() {
     const std::pair<std::uint64_t, std::uint64_t> a{0x1000, 0x1100}, b{0x2000, 0x2100}, overlap{0x1080, 0x1200};
     const PassAccess writeA{{}, std::span(&a, 1), {}, {}}, writeB{{}, std::span(&b, 1), {}, {}}, readA{std::span(&a, 1), {}, {}, {}};
     const auto reset = [&] { recorder.Sync(); mock.commands.clear(); };
-    Expect(dispatch(writeA).deferred == tracked, "tracked mode admission did not match its switch");
-    Expect(dispatch(writeB).continued == tracked, "disjoint dispatches did not form a chain");
+    Expect(dispatch(writeA).deferred == enabled, "compute chain admission did not match its switch");
+    Expect(dispatch(writeB).continued == enabled, "disjoint dispatches did not form a chain");
     const auto beforeDependent = mock.commands.rfind('D');
-    Expect(!dispatch(readA).continued, "a dependent dispatch pair dropped its RAW barrier across a disjoint dispatch");
-    Expect(mock.commands.find('B', beforeDependent + 1) < mock.commands.rfind('D'), "a dependent dispatch was recorded before its barrier");
+    Expect(dispatch(readA).continued == unchecked, "a RAW hazard did not follow the unchecked debug opt-in");
+    Expect((mock.commands.find('B', beforeDependent + 1) < mock.commands.rfind('D')) == !unchecked, "a dependent dispatch barrier did not follow the unchecked debug opt-in");
     reset();
     for (const auto& earlier : {readA, writeA}) {
         dispatch(earlier);
         const PassAccess later{{}, std::span(&overlap, 1), {}, {}};
-        Expect(!dispatch(later).continued, "a WAR or WAW overlap lost its barrier");
+        Expect(dispatch(later).continued == unchecked, "a WAR or WAW hazard did not follow the unchecked debug opt-in");
         reset();
     }
     dispatch(readA);
-    Expect(dispatch(readA).continued == tracked, "read/read accesses closed a tracked chain");
+    Expect(dispatch(readA).continued == enabled, "read/read accesses closed a chain");
     reset();
     const auto image = reinterpret_cast<VkImage>(std::uintptr_t{0x1234});
     const std::pair<VkImage, bool> imageWrite{image, true}, imageRead{image, false};
     dispatch({{}, {}, std::span(&imageWrite, 1), {}});
     dispatch(writeB);
-    Expect(!dispatch({{}, {}, std::span(&imageRead, 1), {}}).continued, "an image RAW hazard crossed the chain");
+    Expect(dispatch({{}, {}, std::span(&imageRead, 1), {}}).continued == unchecked, "an image RAW hazard did not follow the unchecked debug opt-in");
     reset();
     dispatch({{}, {}, std::span(&imageRead, 1), {}});
-    Expect(!dispatch({{}, {}, std::span(&imageWrite, 1), {}}).continued, "an image WAR hazard crossed the chain");
+    Expect(dispatch({{}, {}, std::span(&imageWrite, 1), {}}).continued == unchecked, "an image WAR hazard did not follow the unchecked debug opt-in");
     reset();
     dispatch({{}, {}, std::span(&imageWrite, 1), {}});
-    Expect(!dispatch({{}, {}, std::span(&imageWrite, 1), {}}).continued, "an image WAW hazard crossed the chain");
+    Expect(dispatch({{}, {}, std::span(&imageWrite, 1), {}}).continued == unchecked, "an image WAW hazard did not follow the unchecked debug opt-in");
     reset();
     dispatch({{}, std::span(&a, 1), std::span(&imageWrite, 1), {}});
-    Expect(!dispatch(readA).continued, "an image backing range aliased by a buffer lost its barrier");
+    Expect(dispatch(readA).continued == unchecked, "an image backing alias did not follow the unchecked debug opt-in");
     reset();
     const std::pair<std::uint64_t, std::uint64_t> arguments{0x1008, 0x1014};
     dispatch(writeA);
-    Expect(!dispatch({std::span(&arguments, 1), {}, {}, {}}).continued, "indirect arguments written in the chain lost their RAW barrier");
+    Expect(dispatch({std::span(&arguments, 1), {}, {}, {}}).continued == unchecked, "an indirect argument RAW hazard did not follow the unchecked debug opt-in");
     reset();
     dispatch({std::span(&arguments, 1), {}, {}, {}});
-    Expect(!dispatch(writeA).continued, "a host-visible argument range lost its WAR barrier");
+    Expect(dispatch(writeA).continued == unchecked, "an argument WAR hazard did not follow the unchecked debug opt-in");
     reset();
     dispatch(writeA);
     Recorder::NoteComputeHostAccess();
@@ -312,9 +313,9 @@ void ComputeChainTests() {
     reset();
     for (std::uint32_t opcode = 0; opcode != 256; ++opcode) Expect(Recorder::ComputeChainPacketBoundary(0xc0000000u | (opcode << 8u)) == (opcode != 0x15 && opcode != 0x16), "a non-dispatch PM4 packet did not close the chain");
     Expect(Recorder::ComputeChainPacketBoundary(0xc0001501u) && Recorder::ComputeChainPacketBoundary(0x00001500u), "a predicated or non-type-3 packet continued a chain");
-    dispatch(writeA, true, "PPSA01341");
-    const auto upper = dispatch(readA, true, "PPSA01341");
-    Expect(upper.continued == ds && upper.unchecked == ds, "the title-gated experiment did not bypass its inter-dispatch hazard");
+    dispatch(writeA);
+    const auto upper = dispatch(readA);
+    Expect(upper.continued == unchecked && upper.unchecked == unchecked, "the debug experiment did not follow its inter-dispatch hazard opt-in");
     recorder.EndComputeChain();
     if (upper.deferred) {
         Expect((mock.barrierSource & VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) != 0 && (mock.barrierDestination & VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) != 0 && (mock.barrierDestination & VK_PIPELINE_STAGE_HOST_BIT) != 0, "chain end did not emit a full barrier to GPU and host readers");
@@ -323,7 +324,7 @@ void ComputeChainTests() {
     reset();
     for (std::uint32_t i = 0; i != 129; ++i) {
         const auto start = dispatch({});
-        Expect(start.continued == (tracked && i != 0 && i != 128), "the bounded chain did not close after 128 dispatches");
+        Expect(start.continued == (enabled && i != 0 && i != 128), "the bounded chain did not close after 128 dispatches");
     }
     reset();
     AgcDriver::GuestMemory::SetCurrentPacket(AgcDriver::GuestMemory::NoPacket, 0xffffffffu);

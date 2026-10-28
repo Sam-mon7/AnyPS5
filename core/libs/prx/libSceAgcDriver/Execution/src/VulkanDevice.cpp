@@ -5347,8 +5347,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     std::vector<std::pair<VkImage, bool>> computeImages;
     Graphics::PassAccess computeAccess{};
     if (Graphics::Recorder::ComputeChainsEnabled()) {
-        const auto title = GetAppTitleId_nid_postfix();
-        const bool unchecked = Graphics::Recorder::DsComputeChains(title.value);
+        const bool unchecked = Graphics::Recorder::UnsafeComputeChains();
         const bool refresh = record.dataRefresh != RecordedDispatch::DataRefresh::None && (record.dataRefresh != RecordedDispatch::DataRefresh::Hash || resources.DataWordsHash() != record.dataWordsHash);
         const bool eligible = !PrivateComputeQueue() && !resources.HoldsLease() && !resources.UsesAddressTable() && resources.Reusable() && !resources.NeedsCompletion() && resources.CopiedBytes() == 0 && !refresh && record.threadGroup == std::array<std::uint32_t, 3>{} && record.shader->program->workgroupMemoryDwords == 0 && !record.htileClear.has_value() && record.x <= limit[0] && record.y <= limit[1] && record.z <= limit[2];
         if (eligible && !unchecked) {
@@ -5357,7 +5356,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             computeImages = resources.StorageImages();
             computeAccess = {computeReads, computeWrites, computeImages, {}};
         }
-        computeStart = recorder.BeginComputeDispatch(computeAccess, eligible, title.value);
+        computeStart = recorder.BeginComputeDispatch(computeAccess, eligible);
         covered = computeStart.covered;
     } else {
         computeStart.commands = recorder.Commands(&covered);

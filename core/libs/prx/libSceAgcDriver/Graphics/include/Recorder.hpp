@@ -19,7 +19,6 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <string_view>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -98,7 +97,8 @@ public:
     // records is assumed uncovered until it marks); a new batch starts uncovered.
     VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
     static bool ComputeChainsEnabled();
-    static bool DsComputeChains(std::string_view titleId);
+    static bool UnsafeComputeChainsRequested();
+    static bool UnsafeComputeChains();
     static bool ComputeChainPacketBoundary(std::uint32_t header);
     static void NoteComputeHostAccess();
     struct ComputeDispatchStart {
@@ -108,7 +108,7 @@ public:
         bool deferred = false;
         bool unchecked = false;
     };
-    ComputeDispatchStart BeginComputeDispatch(const PassAccess& access, bool eligible, std::string_view titleId = {});
+    ComputeDispatchStart BeginComputeDispatch(const PassAccess& access, bool eligible);
     void DeferComputeBarrier(const PassAccess& access);
     void EndComputeChain(bool syncPoint = false);
     // After a trailing barrier with ALL_COMMANDS as its destination stage: `access` is its

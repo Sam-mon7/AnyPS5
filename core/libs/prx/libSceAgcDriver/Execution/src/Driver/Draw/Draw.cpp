@@ -626,7 +626,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.programs = writesPrograms ? &writablePrograms : &decode->programs;
     const auto& programs = *tail.programs;
     if (std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return SkippedShader(program.binary.codeAddress); })) return drawn();
-    static const bool fromBase = std::getenv("APS5_INDIRECT_BUILTIN_OFFSETS") != nullptr;
+    static const bool fromBase = std::getenv("APS5_NO_INDIRECT_BUILTIN_OFFSETS") == nullptr;
     const bool emptyIndirectSkip = EmptyIndirectSkip() && !(fromBase && drawParameters.indexed);
     auto& cpuIndirectPrograms = CpuIndirectPrograms();
     const auto recordDraws = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || !drawParameters.indirect->indexLimitKnown || arguments.firstVertexOrIndex < drawParameters.indexCount); };
