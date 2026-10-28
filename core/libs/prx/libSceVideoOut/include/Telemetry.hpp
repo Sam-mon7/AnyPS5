@@ -41,6 +41,7 @@ public:
 
     bool EmitPad(std::uint64_t frame, const PadInputState& state);
     void EmitPresent(std::uint64_t frame, double fps);
+    void EmitPresent(std::uint64_t frame, double fps, std::int64_t timeNanos);
     std::uint64_t Dropped() const;
 
 private:
@@ -68,6 +69,8 @@ bool EmitPadIfChanged(Writer& writer, PadChangeFilter& filter, std::uint64_t fra
 
 std::unique_ptr<Writer> OpenFromEnvironment(const char* directory, const std::string& commit);
 Writer* Instance();
+bool GateRunEnabled();
+void ObservePresent(Writer* writer, std::uint64_t frame, double fps, std::int64_t timeNanos);
 
 }
 
