@@ -21,6 +21,15 @@ struct AwaitedWait {
     std::uint32_t bytes = 0;
 };
 
+struct MemoryLedgerRow {
+    std::uint64_t frame;
+    std::uint32_t kind;
+    char kindName[24];
+    char reason[48];
+    std::uint64_t count;
+    std::uint64_t bytes;
+};
+
 struct DrawShaderProfileRow {
     std::uint64_t code[DriverDetail::DrawProfilePrograms] = {};
     std::uint8_t stage[DriverDetail::DrawProfilePrograms] = {};
@@ -47,6 +56,8 @@ extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std
 extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait* waits, std::size_t capacity);
 extern "C" std::size_t AgcDriverDrawShaderProfile_nid_postfix(AgcDriver::DrawShaderProfileRow* rows, std::size_t capacity);
 extern "C" void AgcDriverResetDrawShaderProfile_nid_postfix();
+extern "C" std::size_t AgcDriverMemoryLedger_nid_postfix(AgcDriver::MemoryLedgerRow* rows, std::size_t capacity);
+extern "C" void AgcDriverResetMemoryLedger_nid_postfix();
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix();
 extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix();
 extern "C" std::uint64_t AgcDriverDispatchesRejectedAhead_nid_postfix();

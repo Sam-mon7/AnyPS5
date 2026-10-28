@@ -302,6 +302,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryLedger.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -737,6 +738,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/MemoryLedger.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -823,6 +825,7 @@ configure_windows_unwind(agc_locks_tests)
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/MemoryLedger.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -857,6 +860,7 @@ if(BUILD_TESTING AND NOT WIN32)
     add_test_executable(agc_collect_memo_generation_tests
             tests/CollectMemoGeneration.cpp
             Execution/src/GuestMemory.cpp
+            Execution/src/MemoryLedger.cpp
             Execution/src/PerformanceTraceThread.cpp
     )
     target_include_directories(agc_collect_memo_generation_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -3225,6 +3229,12 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_linear_readback_label_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set_tests_properties(agc_driver_memory_ledger PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_MEMORY_LEDGER=1" TIMEOUT 30)
+    add_test(NAME agc_driver_memory_ledger_off COMMAND agc_driver_memory_ledger_tests --off)
+    set_tests_properties(agc_driver_memory_ledger_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" ENVIRONMENT_MODIFICATION "APS5_PROFILE_MEMORY_LEDGER=unset:" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_property(TEST agc_driver_memory_ledger_off APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_driver_draw_shader_profile PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_DRAW=1;APS5_PROFILE_DRAW_SHADERS=1;APS5_PIPELINED_DRAWS=0" TIMEOUT 30)
     add_test(NAME agc_driver_draw_shader_profile_pipelined COMMAND agc_driver_draw_shader_profile_tests --pipelined)
     set_tests_properties(agc_driver_draw_shader_profile_pipelined PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_DRAW=1;APS5_PROFILE_DRAW_SHADERS=1;APS5_PIPELINED_DRAWS=8" SKIP_RETURN_CODE 77 TIMEOUT 30)
@@ -3607,7 +3617,7 @@ if(BUILD_TESTING)
     set_target_properties(agc_driver_frame_replay_state_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_driver_frame_replay_state_tests)
     add_dependencies(agc_driver_frame_replay_state_tests agc_frame_replay)
-    foreach(mode IN ITEMS submits shader_output profile_draws)
+    foreach(mode IN ITEMS submits shader_output profile_draws memory_ledger)
         add_test(NAME agc_driver_frame_replay_${mode} COMMAND ${CMAKE_COMMAND}
                 "-DTOOL=$<TARGET_FILE:agc_frame_replay>" "-DWRITER=$<TARGET_FILE:agc_driver_frame_replay_state_tests>"
                 "-DDIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-${mode}" "-DMODE=${mode}"

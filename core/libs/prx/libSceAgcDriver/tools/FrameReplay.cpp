@@ -83,6 +83,7 @@ struct Options {
     bool traceSerials = false;
     bool coldPipelines = false;
     std::filesystem::path profileDraws;
+    std::filesystem::path memoryLedger;
 };
 
 class Frames {
@@ -696,7 +697,7 @@ struct Replay {
 
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict]\n"
-                         "                        [--repeat <n>] [--cold-pipelines] [--profile-draws <file>] [--dump <address>:<bytes>:<file>]...\n"
+                         "                        [--repeat <n>] [--cold-pipelines] [--profile-draws <file>] [--memory-ledger <file>] [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
@@ -977,6 +978,61 @@ private:
     std::ofstream file;
 };
 
+class MemoryLedgerWriter {
+public:
+    explicit MemoryLedgerWriter(std::filesystem::path path) : path(std::move(path)), file(this->path, std::ios::trunc) {
+        if (!file.is_open()) throw std::runtime_error("frame replay: cannot open " + this->path.string());
+    }
+
+    void Write(std::size_t pass) {
+        std::vector<AgcDriver::MemoryLedgerRow> rows(AgcDriverMemoryLedger_nid_postfix(nullptr, 0));
+        for (;;) {
+            const auto count = AgcDriverMemoryLedger_nid_postfix(rows.data(), rows.size());
+            const bool complete = count <= rows.size();
+            rows.resize(count);
+            if (complete) break;
+        }
+        const auto first = rows.empty() ? 0 : rows.front().frame;
+        std::map<std::string, std::uint64_t> totals;
+        std::uint64_t frames = 0;
+        for (const auto& row : rows) {
+            const auto frame = row.frame - first;
+            frames = std::max(frames, frame + 1);
+            totals[row.kindName] += row.bytes;
+            file << "{\"pass\":" << pass << ",\"frame\":" << frame << ",\"kind\":\"" << row.kindName
+                 << "\",\"reason\":" << quoted(row.reason) << ",\"count\":" << row.count << ",\"bytes\":" << row.bytes << "}\n";
+            if (!file) throw std::runtime_error("frame replay: cannot write " + path.string());
+        }
+        file << "{\"pass\":" << pass << ",\"frames\":" << frames << ",\"totals\":{";
+        bool comma = false;
+        for (const auto& [kind, bytes] : totals) {
+            file << (comma ? "," : "") << '"' << kind << "\":" << bytes;
+            comma = true;
+        }
+        file << "}}\n";
+        file.flush();
+        if (!file) throw std::runtime_error("frame replay: cannot flush " + path.string());
+        AgcDriverResetMemoryLedger_nid_postfix();
+    }
+
+private:
+    static std::string quoted(std::string_view text) {
+        std::string result = "\"";
+        for (const unsigned char character : text) {
+            if (character == '"' || character == '\\') result += '\\';
+            if (character < 0x20) {
+                char escaped[7];
+                std::snprintf(escaped, sizeof(escaped), "\\u%04x", static_cast<unsigned>(character));
+                result += escaped;
+            } else result += static_cast<char>(character);
+        }
+        return result + '"';
+    }
+
+    std::filesystem::path path;
+    std::ofstream file;
+};
+
 int listShaders(const Options& options) {
     const FrameCaptureReader reader(options.directory);
     if (!options.shaderCode.empty()) std::filesystem::create_directories(options.shaderCode);
@@ -1120,6 +1176,8 @@ double percentile(std::vector<double> values, double fraction) {
 int run(const Options& options) {
     std::optional<DrawProfileWriter> drawProfile;
     if (!options.profileDraws.empty()) drawProfile.emplace(options.profileDraws);
+    std::optional<MemoryLedgerWriter> memoryLedger;
+    if (!options.memoryLedger.empty()) memoryLedger.emplace(options.memoryLedger);
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
@@ -1138,10 +1196,11 @@ int run(const Options& options) {
     const auto journalSeconds = std::chrono::duration<double>(Clock::now() - journalStart).count();
     std::set<std::uint32_t> initialOutputs;
     for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
-    if (drawProfile) {
-        drawProfile->SetHashes(codeHashes(reader));
+    if (drawProfile) drawProfile->SetHashes(codeHashes(reader));
+    if (drawProfile || memoryLedger) {
         AgcDriverWaitIdle_nid_postfix();
-        AgcDriverResetDrawShaderProfile_nid_postfix();
+        if (drawProfile) AgcDriverResetDrawShaderProfile_nid_postfix();
+        if (memoryLedger) AgcDriverResetMemoryLedger_nid_postfix();
     }
     std::vector<Pass> passes;
     for (std::size_t pass = 0; pass < options.repeat && (pass == 0 || replay.unfinished == 0); ++pass) {
@@ -1179,9 +1238,10 @@ int run(const Options& options) {
         measured.paceTimeouts = replay.paceTimeouts.load() - measured.paceTimeouts;
         measured.synthesized = replay.syntheticReleases.load() - measured.synthesized;
         passes.push_back(measured);
-        if (drawProfile) {
+        if (drawProfile || memoryLedger) {
             AgcDriverWaitIdle_nid_postfix();
-            drawProfile->Write(pass);
+            if (drawProfile) drawProfile->Write(pass);
+            if (memoryLedger) memoryLedger->Write(pass);
         }
     }
     FrameCheck check;
@@ -1228,6 +1288,7 @@ int run(const Options& options) {
 void configureEnvironment(const Options& options) {
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
+    if (!options.memoryLedger.empty()) _putenv_s("APS5_PROFILE_MEMORY_LEDGER", "1");
     _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", options.coldPipelines ? "" : "1");
     if (!options.profileDraws.empty()) {
         _putenv_s("APS5_PROFILE_DRAW", "1");
@@ -1235,6 +1296,7 @@ void configureEnvironment(const Options& options) {
     }
 #else
     unsetenv("APS5_FRAME_CAPTURE");
+    if (!options.memoryLedger.empty()) setenv("APS5_PROFILE_MEMORY_LEDGER", "1", 1);
     if (options.coldPipelines) unsetenv("APS5_HEADLESS_PIPELINE_CACHE");
     else setenv("APS5_HEADLESS_PIPELINE_CACHE", "1", 1);
     if (!options.profileDraws.empty()) {
@@ -1268,6 +1330,7 @@ int main(int argc, char** argv) {
         } else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
         else if (argument == "--profile-draws" && index + 1 < argc) options.profileDraws = argv[++index];
+        else if (argument == "--memory-ledger" && index + 1 < argc) options.memoryLedger = argv[++index];
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;

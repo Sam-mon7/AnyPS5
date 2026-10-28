@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/MemoryLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -6,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <mutex>
 
 namespace AgcDriver {
@@ -159,6 +161,27 @@ extern "C" std::size_t AgcDriverDrawShaderProfile_nid_postfix(AgcDriver::DrawSha
         row.commitMs = source.commitMs;
     }
     return totals.size();
+}
+
+extern "C" std::size_t AgcDriverMemoryLedger_nid_postfix(AgcDriver::MemoryLedgerRow* rows, std::size_t capacity) {
+    const auto totals = AgcDriver::MemoryLedger::Snapshot();
+    const auto count = rows == nullptr ? 0 : std::min(capacity, totals.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& source = totals[i];
+        auto& row = rows[i];
+        row = {};
+        row.frame = source.frame;
+        row.kind = static_cast<std::uint32_t>(source.kind);
+        std::snprintf(row.kindName, sizeof(row.kindName), "%s", AgcDriver::MemoryLedger::KindName(source.kind));
+        std::snprintf(row.reason, sizeof(row.reason), "%s", source.reason);
+        row.count = source.count;
+        row.bytes = source.bytes;
+    }
+    return totals.size();
+}
+
+extern "C" void AgcDriverResetMemoryLedger_nid_postfix() {
+    AgcDriver::MemoryLedger::Reset();
 }
 
 extern "C" void AgcDriverResetDrawShaderProfile_nid_postfix() {

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/MemoryLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -2020,6 +2021,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store) {
     return storeOwn(address, bytes, [&] {
         store();
+        if (MemoryLedger::Enabled()) MemoryLedger::Note(MemoryLedger::Kind::CpuWrite, ReadSiteName(CurrentReadSite()), bytes);
         return std::pair<std::uint64_t, std::uint64_t>{address, address + bytes};
     });
 }
@@ -2668,10 +2670,12 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
         std::memcpy(to + index, &word, sizeof(word));
     }
     for (; index < bytes; ++index) to[index] = static_cast<const volatile unsigned char*>(from)[index];
+    if (MemoryLedger::Enabled()) MemoryLedger::Note(MemoryLedger::Kind::CpuRead, ReadSiteName(CurrentReadSite()), bytes);
 }
 #else
 void CopyGuestBytes(void* destination, const void* source, std::size_t bytes) {
     std::memcpy(destination, source, bytes);
+    if (MemoryLedger::Enabled()) MemoryLedger::Note(MemoryLedger::Kind::CpuRead, ReadSiteName(CurrentReadSite()), bytes);
 }
 #endif
 
@@ -2680,10 +2684,14 @@ namespace {
 void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (Accessible(reinterpret_cast<const void*>(address), destination.size())) {
         std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
+        if (MemoryLedger::Enabled()) MemoryLedger::Note(MemoryLedger::Kind::CpuRead, ReadSiteName(CurrentReadSite()), destination.size());
         return;
     }
     std::memset(destination.data(), 0, destination.size());
-    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) {
+        std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+        if (MemoryLedger::Enabled()) MemoryLedger::Note(MemoryLedger::Kind::CpuRead, ReadSiteName(CurrentReadSite()), end - begin);
+    }
 }
 
 }
@@ -2740,7 +2748,10 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     auto outcome = Compare::Equal;
     const bool queried = describePages(static_cast<std::uintptr_t>(address), out.size(), [&](const PageRun& run) {
         if (!run.readable) outcome = Compare::Unmapped;
-        else std::memcpy(out.data() + (run.begin - address), reinterpret_cast<const void*>(run.begin), static_cast<std::size_t>(run.end - run.begin));
+        else {
+            std::memcpy(out.data() + (run.begin - address), reinterpret_cast<const void*>(run.begin), static_cast<std::size_t>(run.end - run.begin));
+            if (MemoryLedger::Enabled()) MemoryLedger::Note(MemoryLedger::Kind::CpuRead, ReadSiteName(CurrentReadSite()), run.end - run.begin);
+        }
         return outcome == Compare::Equal;
     });
     return queried ? outcome : Compare::Unmapped;
@@ -2768,6 +2779,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, current.size());
     const TimedAccess timed(CounterChangedWrite, current.size());
+    std::uint64_t changedBytes = 0;
     auto* destination = reinterpret_cast<std::byte*>(address);
     const auto size = current.size();
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
@@ -2784,6 +2796,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
             if (equal == 0) _mm_storeu_si128(reinterpret_cast<__m128i*>(destination + at), bytes);
             else _mm_maskmoveu_si128(bytes, _mm_xor_si128(same, _mm_set1_epi8(-1)), reinterpret_cast<char*>(destination + at));
             const auto changed = ~equal & 0xffffu;
+            if (MemoryLedger::Enabled()) changedBytes += std::popcount(changed);
             firstChanged = std::min(firstChanged, at + static_cast<std::size_t>(std::countr_zero(changed)));
             lastChanged = std::max(lastChanged, at + 32 - static_cast<std::size_t>(std::countl_zero(changed)));
         }
@@ -2791,11 +2804,13 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
         for (; at < size; ++at) {
             if (current[at] == original[at]) continue;
             destination[at] = current[at];
+            if (MemoryLedger::Enabled()) ++changedBytes;
             firstChanged = std::min(firstChanged, at);
             lastChanged = std::max(lastChanged, at + 1);
         }
         return firstChanged < lastChanged ? std::pair<std::uint64_t, std::uint64_t>{address + firstChanged, address + lastChanged} : std::pair<std::uint64_t, std::uint64_t>{0, 0};
     });
+    if (MemoryLedger::Enabled() && changedBytes != 0) MemoryLedger::Note(MemoryLedger::Kind::CpuWrite, ReadSiteName(CurrentReadSite()), changedBytes);
 }
 
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {

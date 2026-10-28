@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/MemoryLedger.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -420,6 +421,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     }
     if (const auto hook = publishSelectedHook.load(std::memory_order_acquire)) hook(ranges.front().first, ranges.front().second);
     if (!publishOnCpu() || !recordCopiesOnCpu(*shadow, copies, ranges, bytes, checked)) recordCopies(*shadow, copies, ranges, bytes);
+    MemoryLedger::Note(MemoryLedger::Kind::CopyBack, ReasonNames[static_cast<std::size_t>(reason)], bytes);
     if (ShadowVerify()) verifyPublished(*shadow, copies);
     return units;
 }

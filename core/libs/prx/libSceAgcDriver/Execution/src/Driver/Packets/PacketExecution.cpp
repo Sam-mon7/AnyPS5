@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/MemoryLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
@@ -433,6 +434,7 @@ void Driver::execute(const Submission& submission) {
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial.load()), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
+            MemoryLedger::AdvanceFrame();
         } else if (opcode == 0x15 || opcode == 0x16) {
             packetCounters.CountDispatch();
             landPendingWaits(submission.queue);

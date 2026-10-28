@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/MemoryLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -181,6 +182,8 @@ void reportStorageTraffic(StorageTraffic& traffic) {
 }
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes) {
+    static constexpr const char* paths[] = {"clear", "direct", "cpu", "alias"};
+    if (MemoryLedger::Enabled() && path != 0) MemoryLedger::Note(MemoryLedger::Kind::StorageUpload, paths[path], bytes);
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -193,6 +196,7 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
 }
 
 void countStorageWriteBack(std::uint64_t bytes, bool direct, bool drawn = false) {
+    if (MemoryLedger::Enabled()) MemoryLedger::Note(MemoryLedger::Kind::StorageWriteBack, flushReason != nullptr ? flushReason : "other", bytes);
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -417,6 +421,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             }
             auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
+            MemoryLedger::Note(MemoryLedger::Kind::TextureUpload, "sampled_staging", snapshot.size());
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (profile) Profile().allocate += timer.lap();
