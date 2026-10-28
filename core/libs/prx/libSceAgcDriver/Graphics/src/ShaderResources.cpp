@@ -3109,6 +3109,11 @@ std::chrono::steady_clock::duration TemplateAuditInterval() {
     return interval;
 }
 
+bool DepthBlocksProof(VkDevice device, std::uint64_t address, std::size_t bytes) {
+    static const bool staleOnly = std::getenv("APS5_DEPTH_PROOF_STALE_ONLY") != nullptr;
+    return staleOnly ? DepthSurfaceBlocksMemoryProof(device, address, bytes) : DepthSurfaceOverlaps(device, address, bytes);
+}
+
 bool TemplateAuditDue(std::chrono::steady_clock::time_point last) {
     const auto interval = TemplateAuditInterval();
     return interval.count() != 0 && std::chrono::steady_clock::now() - last >= interval;
@@ -3260,7 +3265,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
-        if (DepthSurfaceOverlaps(context.device, address, bytes)) return fail(FastFail::Depth);
+        if (DepthBlocksProof(context.device, address, bytes)) return fail(FastFail::Depth);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
         if (!surface.committed.has_value()) {
             surface.collected = GuestMemory::CollectWrites(address, bytes);
@@ -3318,7 +3323,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (DepthSurfaceOverlaps(context.device, address, bytes)) {
+        if (DepthBlocksProof(context.device, address, bytes)) {
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
@@ -3394,7 +3399,7 @@ bool ShaderResources::fastRevalidateEach() {
         if (textures[i]->Released()) return false;
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
-        if (DepthSurfaceOverlaps(context.device, address, bytes)) return false;
+        if (DepthBlocksProof(context.device, address, bytes)) return false;
         if (!FlushDepthPlanes(address, bytes).empty()) return false;
         if (!surface.committed.has_value()) {
             surface.collected = GuestMemory::CollectWrites(address, bytes);
@@ -3426,7 +3431,7 @@ bool ShaderResources::fastRevalidateEach() {
         if (own.dccAddress != 0) return false;
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (DepthSurfaceOverlaps(context.device, address, bytes)) {
+        if (DepthBlocksProof(context.device, address, bytes)) {
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
