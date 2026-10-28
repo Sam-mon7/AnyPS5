@@ -14,6 +14,7 @@ void TextureDetiler::BeginBatch() {
     resetRing(cmaskDescriptorSets, "vkResetDescriptorPool CMASK clear");
     resetRing(imageDescriptorSets, "vkResetDescriptorPool texture detiler");
     resetRing(readbackDescriptorSets, "vkResetDescriptorPool multisample readback");
+    resetRing(aliasDescriptorSets, "vkResetDescriptorPool image alias");
 }
 
 void TextureDetiler::resetRing(DescriptorRing& ring, const char* resetWhat) {

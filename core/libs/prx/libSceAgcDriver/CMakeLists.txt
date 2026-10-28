@@ -46,6 +46,16 @@ add_custom_command(
         VERBATIM
 )
 set(agcTextureDetileImageShaderSpv ${agcTextureDetileGeneratedDir}/TextureDetileImage.spv)
+set(agcTextureAliasSpv ${agcTextureDetileGeneratedDir}/TextureAlias.spv)
+set(agcTextureAliasSource ${agcTextureDetileGeneratedDir}/TextureAlias_spv.cpp)
+add_custom_command(
+        OUTPUT "${agcTextureAliasSource}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcTextureAliasSpv}" "${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/TextureAlias.comp"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcTextureAliasSpv} -DOUTPUT=${agcTextureAliasSource}
+        -DSYMBOL=TEXTURE_ALIAS_SPV -DACCESSOR=TextureAliasSpirv_nid_no_patch -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/TextureAlias.comp" "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake" glslang-standalone
+        VERBATIM)
 set(agcTextureDetileImageShaderHeader ${agcTextureDetileGeneratedDir}/TextureDetileImage_spv.h)
 add_custom_command(
         OUTPUT "${agcTextureDetileImageShaderHeader}"
@@ -362,6 +372,7 @@ set(agcDriverSources
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcTextureDetileImageShaderHeader}
+        ${agcTextureAliasSource}
         ${agcTextureRepackShaderHeader}
         ${agcDispatchArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
@@ -2903,6 +2914,51 @@ if(BUILD_TESTING)
         if(WIN32)
             set_property(TEST ${firstAccessTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
+    endforeach()
+    foreach(aliasReconcileMode IN ITEMS on off plain no_alias layer_tracking)
+        set(aliasReconcileTest agc_driver_gpu_alias_reconcile_${aliasReconcileMode})
+        add_test(NAME ${aliasReconcileTest} COMMAND agc_driver_storage_one_slice_alias_tests --alias-reconcile)
+        set_tests_properties(${aliasReconcileTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_DRAW=1;APS5_PIPELINED_DRAWS=0;APS5_BLOCK_WRITEBACK_EACH=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_property(TEST ${aliasReconcileTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PENDING_ALIAS_BORROW=unset:;APS5_NO_ALIAS_BORROW=unset:;APS5_NO_BLOCK_TRACKING=unset:;APS5_NO_LAYER_CLEAR=unset:;APS5_EAGER_WRITEBACK=unset:;APS5_NO_TEXTURE_CACHE=unset:")
+        if(aliasReconcileMode STREQUAL "off")
+            set_property(TEST ${aliasReconcileTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_GPU_ALIAS_RECONCILE=unset:")
+        else()
+            set_property(TEST ${aliasReconcileTest} APPEND PROPERTY ENVIRONMENT "APS5_GPU_ALIAS_RECONCILE=1")
+        endif()
+        if(aliasReconcileMode STREQUAL "plain")
+            set_property(TEST ${aliasReconcileTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PROFILE_DRAW=unset:")
+        endif()
+        if(aliasReconcileMode STREQUAL "no_alias")
+            set_property(TEST ${aliasReconcileTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_ALIAS_BORROW=set:1")
+        elseif(aliasReconcileMode STREQUAL "layer_tracking")
+            set_property(TEST ${aliasReconcileTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_BLOCK_TRACKING=set:1")
+        endif()
+        if(WIN32)
+            set_property(TEST ${aliasReconcileTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set(paddedAliasIndex 0)
+    foreach(paddedAliasCase IN ITEMS family layer_crossing partial_pending disjoint unwatch_consumer_first unwatch_source_first)
+        foreach(paddedAliasMode IN ITEMS on off plain no_alias)
+            set(paddedAliasTest agc_driver_gpu_alias_reconcile_padded_${paddedAliasCase}_${paddedAliasMode})
+            add_test(NAME ${paddedAliasTest} COMMAND agc_driver_storage_one_slice_alias_tests --padded-alias ${paddedAliasIndex})
+            set_tests_properties(${paddedAliasTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_DRAW=1;APS5_PIPELINED_DRAWS=0;APS5_BLOCK_WRITEBACK_EACH=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            set_property(TEST ${paddedAliasTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_ALIAS_BORROW=unset:;APS5_NO_BLOCK_TRACKING=unset:;APS5_NO_LAYER_CLEAR=unset:;APS5_EAGER_WRITEBACK=unset:;APS5_NO_TEXTURE_CACHE=unset:;APS5_GPU_NO_WRITEBACK=unset:")
+            if(paddedAliasMode STREQUAL "off")
+                set_property(TEST ${paddedAliasTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_GPU_ALIAS_RECONCILE=unset:")
+            else()
+                set_property(TEST ${paddedAliasTest} APPEND PROPERTY ENVIRONMENT "APS5_GPU_ALIAS_RECONCILE=1")
+            endif()
+            if(paddedAliasMode STREQUAL "plain")
+                set_property(TEST ${paddedAliasTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PROFILE_DRAW=unset:")
+            elseif(paddedAliasMode STREQUAL "no_alias")
+                set_property(TEST ${paddedAliasTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_ALIAS_BORROW=set:1")
+            endif()
+            if(WIN32)
+                set_property(TEST ${paddedAliasTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            endif()
+        endforeach()
+        math(EXPR paddedAliasIndex "${paddedAliasIndex} + 1")
     endforeach()
     foreach(pendingAliasMode IN ITEMS on off profile no_alias layer_tracking)
         set(pendingAliasTest agc_driver_pending_target_alias_${pendingAliasMode})

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -51,6 +52,8 @@ namespace AgcDriver::Graphics {
         void DispatchImage(VkCommandBuffer commands, TextureTileMode tileMode, std::uint32_t elementBytes, VkBuffer tiled, std::uint64_t tiledOffset, VkImageView view, const TileMipLayout& layout, bool retile = false, std::uint32_t slice = 0, const DetileWindow& window = {});
         void DispatchRepack(VkCommandBuffer commands, VkBuffer source, std::uint64_t sourceOffset, VkBuffer destination, std::uint64_t destinationOffset, std::uint64_t bytes);
         static VkFormat ImageElementFormat(std::uint32_t elementBytes);
+        static std::optional<std::array<std::uint32_t, 32>> AliasEquations(std::uint32_t elementBytes);
+        void DispatchAlias(VkCommandBuffer commands, VkImageView source, VkImageView target, VkBuffer mapping, std::uint64_t mappingBytes, const GuestTextureResource& from, const GuestTextureResource& to, std::uint32_t offset);
         // Recycles the descriptor sets of the previous batch; call before recording a new command batch.
         void BeginBatch();
         void DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask, std::uint64_t cmaskOffset, std::size_t cmaskBytes, VkImageView view, std::uint32_t width, std::uint32_t height, std::uint32_t elementBytes, const std::array<std::uint32_t, 2>& clearWords, bool write);
@@ -97,6 +100,11 @@ namespace AgcDriver::Graphics {
         std::vector<std::pair<std::uint32_t, VkPipeline>> readbackPipelines;
         DescriptorRing readbackDescriptorSets;
         VkShaderModule multisampleUploadModule = VK_NULL_HANDLE;
+        VkDescriptorSetLayout aliasDescriptorLayout = VK_NULL_HANDLE;
+        VkPipelineLayout aliasPipelineLayout = VK_NULL_HANDLE;
+        VkShaderModule aliasModule = VK_NULL_HANDLE;
+        VkPipeline aliasPipeline = VK_NULL_HANDLE;
+        DescriptorRing aliasDescriptorSets;
     };
 
 }

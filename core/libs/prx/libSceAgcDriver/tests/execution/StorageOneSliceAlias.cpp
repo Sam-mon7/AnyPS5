@@ -4,6 +4,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -20,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <iostream>
@@ -72,45 +76,45 @@ std::string Hex(std::uint32_t value) {
 
 class GuestBlock {
 public:
-    explicit GuestBlock(bool watched, bool resident = false) {
+    explicit GuestBlock(bool watched, bool resident = false, std::size_t allocationBytes = BlockBytes) : bytes(allocationBytes) {
 #ifdef _WIN32
-        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
         if (block != nullptr && resident) {
-            section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, BlockBytes, nullptr);
+            section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
             Require(section != nullptr, "one-slice alias: cannot create the resident backing");
-            GuestArena::GuestArenaMapDirect_nid_postfix(block, BlockBytes, section, 0, PAGE_READWRITE);
-        } else if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
+            GuestArena::GuestArenaMapDirect_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+        } else if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
         static_cast<void>(watched);
 #else
         static_cast<void>(resident);
         constexpr std::uintptr_t alignment = 65536;
-        void* mapped = mmap(nullptr, BlockBytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
             const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
             const auto aligned = (begin + alignment - 1) & ~(alignment - 1);
             if (aligned != begin) munmap(mapped, aligned - begin);
-            if (aligned + BlockBytes != begin + BlockBytes + alignment) munmap(reinterpret_cast<void*>(aligned + BlockBytes), begin + alignment - aligned);
+            if (aligned + bytes != begin + bytes + alignment) munmap(reinterpret_cast<void*>(aligned + bytes), begin + alignment - aligned);
             block = reinterpret_cast<std::uint8_t*>(aligned);
-            if (watched) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
+            if (watched) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
         }
 #endif
         Require(block != nullptr, "one-slice alias: cannot allocate the guest block");
-        Require(!watched || AgcDriver::GuestMemory::Watched(AddressOf(block), BlockBytes), "one-slice alias: the guest block is not write-watched");
-        GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
+        Require(!watched || AgcDriver::GuestMemory::Watched(AddressOf(block), bytes), "one-slice alias: the guest block is not write-watched");
+        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
     }
 
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
 #ifdef _WIN32
-        GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
-        GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
+        GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
         if (section != nullptr) {
             GuestArena::GuestArenaForgetSection_nid_postfix(section);
             CloseHandle(section);
         }
 #else
-        munmap(block, BlockBytes);
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes);
+        munmap(block, bytes);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
 #endif
     }
 
@@ -120,6 +124,7 @@ public:
     std::uint8_t* Data() { return block; }
 
 private:
+    std::size_t bytes;
     std::uint8_t* block = nullptr;
 #ifdef _WIN32
     HANDLE section = nullptr;
@@ -384,6 +389,261 @@ void CheckPendingTarget(AgcDriver::VulkanDevice& device, std::uint8_t* texels, b
 
 enum class ForeignFirstAccess { Fill, Read, FullScissor, PartialScissor };
 
+std::vector<std::uint32_t> TransferAliasImage(AgcDriver::VulkanDevice& device, StorageTexture& image, bool upload = false, bool recorded = false, bool partial = false, std::uint32_t firstLayer = 0, std::uint32_t layerCount = 0) {
+    using namespace AgcDriver::Graphics;
+    device.WaitIdle();
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const auto& resource = image.Descriptor();
+    const auto count = static_cast<std::size_t>(resource.width) * resource.height * image.ImageLayers() * AgcDriver::Graphics::BytesPerElement(resource.format) / 4;
+    auto buffer = std::make_shared<Buffer>(context, count * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::vector<std::uint32_t> values(count);
+    if (upload) {
+        for (std::size_t i = 0; i < count; ++i) values[i] = (partial ? 0x76540000u : 0x10000000u) + static_cast<std::uint32_t>(i);
+        std::memcpy(buffer->Bytes().data(), values.data(), count * 4);
+    }
+    auto* recorder = recorded ? Recorder::Active() : nullptr;
+    std::unique_ptr<CommandBatch> batch;
+    if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+    const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = upload ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image.Image();
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, image.ImageLayers()};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    const VkBufferImageCopy copy{static_cast<std::uint64_t>(firstLayer) * resource.width * resource.height * BytesPerElement(resource.format), 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, firstLayer, partial ? 1u : layerCount == 0 ? image.ImageLayers() : layerCount}, {0, 0, 0}, {partial ? 1u : resource.width, partial ? 1u : resource.height, 1}};
+    if (upload) context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, buffer->Handle(), image.Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    else context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image.Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &copy);
+    barrier.srcAccessMask = upload ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0, nullptr);
+    if (recorder != nullptr) {
+        recorder->Keep(buffer, buffer->Bytes().size());
+        recorder->Keep(image.shared_from_this());
+        return values;
+    }
+    batch->SubmitAndWait();
+    buffer->Invalidate();
+    std::memcpy(values.data(), buffer->Bytes().data(), count * 4);
+    return values;
+}
+
+enum class AliasCase { Reshape, Offset, MatchedXor, XorMismatch, Padding, CpuWrite, PartialPending, GuestWriter, Mips };
+
+struct PaddedResult {
+    std::vector<std::uint32_t> consumer;
+    std::vector<std::uint32_t> written;
+    std::vector<std::uint32_t> published;
+    std::vector<std::uint32_t> source;
+    std::vector<std::byte> guest;
+};
+
+PaddedResult RunPaddedAlias(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::size_t allocationBytes, std::uint32_t layers, bool reference, bool sourceFirst, bool partialPending, bool noAlias, bool cpuWrite, bool unwatch) {
+    using namespace AgcDriver::Graphics;
+    using namespace AgcDriver::GuestMemory;
+    std::lock_guard gpu(GpuMutex());
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), allocationBytes / 4, Initial);
+    CollectWritesUncached(AddressOf(texels), allocationBytes);
+    BumpCollectEpoch();
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    auto sourceResource = DecodeTextureResource(TextureDescriptor(texels, Type2DArray, 71));
+    sourceResource.width = 134;
+    sourceResource.height = 75;
+    sourceResource.depthOrLastArray = layers - 1;
+    const auto sourceBytes = DescribeSurface(sourceResource).guestBytes;
+    auto targetResource = DecodeTextureResource(TextureDescriptor(texels, Type2D, 71));
+    targetResource.width = 800;
+    targetResource.height = 450;
+    targetResource.baseAddress += noAlias ? sourceBytes : layers == 72 ? 0x760000 : 0x20000;
+    auto target = CachedStorageSurface(context, targetResource);
+    auto source = CachedStorageSurface(context, sourceResource);
+    Require(targetResource.baseAddress + target->GuestBytes() <= AddressOf(texels) + allocationBytes, "padded alias fixture exceeds its guest allocation");
+    TransferAliasImage(device, *source, true, true, false, partialPending ? 2u : 0u, partialPending ? 2u : 0u);
+    if (partialPending) source->MarkSliceDirty(2, 2);
+    else source->MarkDirty();
+    if (cpuWrite) {
+        reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(targetResource.baseAddress))[65536 + 37] = std::byte{0x39};
+        CollectWritesUncached(targetResource.baseAddress, static_cast<std::size_t>(target->GuestBytes()));
+    }
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "padded alias needs the active recorder");
+    recorder->NotePendingRead(targetResource.baseAddress, static_cast<std::size_t>(target->GuestBytes()), Recorder::ReadKind::AddressBased);
+    if (reference) StorageTexture::FlushPending(targetResource.baseAddress, static_cast<std::size_t>(target->GuestBytes()), nullptr, "test fallback", PublishScope::None);
+    BumpCollectEpoch();
+    const auto before = ThreadLookupOutcomes().work;
+    target->Refresh();
+    const auto after = ThreadLookupOutcomes().work;
+    const auto* setting = std::getenv("APS5_GPU_ALIAS_RECONCILE");
+    const bool enabled = setting != nullptr && std::string_view(setting) == "1" && std::getenv("APS5_NO_ALIAS_BORROW") == nullptr && std::getenv("APS5_NO_BLOCK_TRACKING") == nullptr;
+    VkFormatProperties properties{};
+    context.formatProperties(context.physical, VK_FORMAT_R32G32_UINT, &properties);
+    const bool expected = enabled && !reference && !noAlias && context.singlePassStorage && (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0 && Watched(targetResource.baseAddress, static_cast<std::size_t>(target->GuestBytes()));
+    if (LookupOutcomes::Profiled()) {
+        Require((after[LookupOutcomes::AliasPasses] > before[LookupOutcomes::AliasPasses]) == expected, "padded alias did not select the proven path");
+        if (expected) {
+            Require(after[LookupOutcomes::WriteBackBytes] == before[LookupOutcomes::WriteBackBytes], "padded alias retiled before the consumer");
+            Require(after[LookupOutcomes::FlushWaits] == before[LookupOutcomes::FlushWaits], "padded alias submitted or waited before the consumer");
+            Require(after[LookupOutcomes::AliasWaitsAvoided] > before[LookupOutcomes::AliasWaitsAvoided], "padded alias did not bypass the address-read wait site");
+            Require(target->HasCurrentAlias(), "the new padded alias has no current proof");
+        }
+    }
+    PaddedResult result;
+    result.consumer = TransferAliasImage(device, *target);
+    BumpCollectEpoch();
+    const auto passes = ThreadLookupOutcomes().work[LookupOutcomes::AliasPasses];
+    target->Refresh();
+    if (expected && LookupOutcomes::Profiled()) Require(ThreadLookupOutcomes().work[LookupOutcomes::AliasPasses] == passes, "an unchanged padded alias dispatched again");
+    TransferAliasImage(device, *target, true, true, true);
+    target->MarkDirty();
+    result.written = TransferAliasImage(device, *target);
+    if (expected) Require(target->HasCurrentAlias(), "a consumer write lost its padded alias proof");
+    if (unwatch) {
+        Unwatch(targetResource.baseAddress, static_cast<std::size_t>(target->GuestBytes()));
+        std::fill_n(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(targetResource.baseAddress)) + 65536, 65536, std::byte{0x39});
+    }
+    if (sourceFirst) source->WriteBack();
+    else target->WriteBack();
+    device.WaitIdle();
+    result.guest.resize(allocationBytes);
+    ReadCommitted(AddressOf(texels), result.guest);
+    device.WaitIdle();
+    source->Refresh();
+    result.source = TransferAliasImage(device, *source);
+    target->Refresh();
+    result.published = TransferAliasImage(device, *target);
+    if (!unwatch) Require(result.published == result.written, "padded publication resurrected older source texels");
+    if (cpuWrite || unwatch) Require(result.guest[static_cast<std::size_t>(targetResource.baseAddress - AddressOf(texels)) + 65536 + 37] == std::byte{0x39}, "padded publication lost a CPU-written byte");
+    target.reset();
+    source.reset();
+    ClearCachedTextures(device.Device());
+    return result;
+}
+
+void CheckPaddedAliases(AgcDriver::VulkanDevice& device, bool watched, int selected = -1) {
+    Require(selected >= -1 && selected < 6, "invalid padded alias test case");
+    for (const auto mode : {0, 1, 2, 3, 4, 5}) {
+        if (selected != -1 && selected != mode) continue;
+        const auto layers = mode == 0 ? 72u : 16u;
+        const auto bytes = static_cast<std::size_t>(layers) * 0x40000 + 0x380000;
+        const auto run = [&](bool reference) {
+            GuestBlock block(watched, true, bytes);
+            return RunPaddedAlias(device, block.Data(), bytes, layers, reference, mode % 2 != 0, mode == 2, mode == 3, mode == 1, mode >= 4);
+        };
+        const auto reference = run(true);
+        const auto copied = run(false);
+        Require(copied.consumer == reference.consumer, "padded GPU readback differs from fallback before a consumer write");
+        Require(copied.written == reference.written, "padded GPU readback differs from fallback after a consumer write");
+        Require(copied.published == reference.published, "padded GPU readback differs from fallback after publication");
+        Require(copied.source == reference.source, "padded alias lost source texels outside the consumer");
+        Require(copied.guest == reference.guest, "padded alias changed preserved padding or unrelated guest bytes");
+    }
+}
+
+void CheckAliasReconcile(AgcDriver::VulkanDevice& device, std::uint8_t* texels, AliasCase kind) {
+    using namespace AgcDriver::Graphics;
+    using namespace AgcDriver::GuestMemory;
+    std::lock_guard gpu(GpuMutex());
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), BlockBytes / 4, Initial);
+    CollectWritesUncached(AddressOf(texels), BlockBytes);
+    BumpCollectEpoch();
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    auto sourceResource = DecodeTextureResource(TextureDescriptor(texels, Type2DArray));
+    sourceResource.depthOrLastArray = 1;
+    auto targetResource = DecodeTextureResource(TextureDescriptor(texels + SurfaceBytes, Type2D));
+    sourceResource.tileMode = TextureTileMode::kStandard64KB;
+    targetResource.tileMode = sourceResource.tileMode;
+    if (kind == AliasCase::Reshape || kind == AliasCase::PartialPending) {
+        targetResource.baseAddress = sourceResource.baseAddress;
+        targetResource.width = 2 * Side;
+    } else if (kind == AliasCase::Offset) {
+        sourceResource.dimension = TextureDimension::k2D;
+        sourceResource.depthOrLastArray = 0;
+        sourceResource.width = 2 * Side;
+        sourceResource.tileMode = targetResource.tileMode = TextureTileMode::kR64KBX;
+    } else if (kind == AliasCase::MatchedXor || kind == AliasCase::XorMismatch) {
+        sourceResource.tileMode = targetResource.tileMode = TextureTileMode::kR64KBX;
+        if (kind == AliasCase::MatchedXor) targetResource.pipeBankXor = 2048;
+    } else if (kind == AliasCase::Padding) {
+        sourceResource.width = Side - 1;
+    } else if (kind == AliasCase::Mips) {
+        sourceResource.dimension = TextureDimension::k2D;
+        sourceResource.depthOrLastArray = 0;
+        sourceResource.mipCount = sourceResource.allocatedMipCount = 2;
+        sourceResource.lastLevel = 1;
+    }
+    auto target = CachedStorageSurface(context, targetResource);
+    auto source = CachedStorageSurface(context, sourceResource);
+    Require(target != source && source->GuestBytes() <= BlockBytes, "alias reconciliation needs distinct bounded images");
+    TransferAliasImage(device, *source, true);
+    if (kind == AliasCase::PartialPending) source->MarkSliceDirty(0);
+    else source->MarkDirty();
+    if (kind == AliasCase::CpuWrite) {
+        texels[SurfaceBytes + 17] = 0x39;
+        CollectWritesUncached(AddressOf(texels), BlockBytes);
+    }
+    if (kind == AliasCase::GuestWriter) {
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "alias guest-writer fixture needs a recorder");
+        const std::pair<std::uint64_t, std::uint64_t> range{targetResource.baseAddress, targetResource.baseAddress + SurfaceBytes};
+        recorder->NotePendingWrites(std::span(&range, 1));
+    }
+    BumpCollectEpoch();
+    const auto before = ThreadLookupOutcomes().work;
+    target->Refresh();
+    const auto after = ThreadLookupOutcomes().work;
+    const auto* setting = std::getenv("APS5_GPU_ALIAS_RECONCILE");
+    const bool enabled = setting != nullptr && std::string_view(setting) == "1" && std::getenv("APS5_NO_ALIAS_BORROW") == nullptr && std::getenv("APS5_NO_BLOCK_TRACKING") == nullptr;
+    const bool eligible = kind == AliasCase::Reshape || ((kind == AliasCase::Offset || kind == AliasCase::MatchedXor || kind == AliasCase::XorMismatch) && context.singlePassStorage);
+    if (LookupOutcomes::Profiled()) {
+        Require((after[LookupOutcomes::AliasReconciliations] > before[LookupOutcomes::AliasReconciliations]) == (enabled && eligible && Watched(targetResource.baseAddress, static_cast<std::size_t>(target->GuestBytes()))), "alias reconciliation selected an unproved case or missed a compatible window");
+        if (enabled && eligible && Watched(targetResource.baseAddress, static_cast<std::size_t>(target->GuestBytes()))) {
+            Require(after[LookupOutcomes::WriteBackBytes] == before[LookupOutcomes::WriteBackBytes], "alias reconciliation also retiled its source");
+            Require(after[LookupOutcomes::AliasWindowsAvoided] > before[LookupOutcomes::AliasWindowsAvoided], "alias reconciliation did not count its avoided windows");
+        }
+    }
+    const auto copied = TransferAliasImage(device, *target);
+    BumpCollectEpoch();
+    const auto copiesBeforeReuse = ThreadLookupOutcomes().work[LookupOutcomes::AliasCopies];
+    target->Refresh();
+    if (enabled && eligible && LookupOutcomes::Profiled() && Watched(targetResource.baseAddress, static_cast<std::size_t>(target->GuestBytes()))) Require(ThreadLookupOutcomes().work[LookupOutcomes::AliasCopies] == copiesBeforeReuse, "an unchanged borrowed alias was copied again");
+    std::vector<std::byte> published(static_cast<std::size_t>(target->GuestBytes()));
+    ReadCommitted(targetResource.baseAddress, published);
+    device.WaitIdle();
+    target->Refresh();
+    Require(TransferAliasImage(device, *target) == copied, "direct alias GPU readback differs from publication and fallback reload");
+    if (kind == AliasCase::Offset || kind == AliasCase::MatchedXor) {
+        TransferAliasImage(device, *source, true);
+        source->MarkDirty();
+        BumpCollectEpoch();
+        target->Refresh();
+        std::vector<std::uint32_t> userData(16, 0);
+        const auto texture = EncodeTextureResource(targetResource);
+        std::copy(texture.begin(), texture.end(), userData.begin() + 4);
+        userData[12] = 0x12345678u;
+        Dispatch(device, StoreCode, userData);
+        const auto drawn = TransferAliasImage(device, *target);
+        for (std::size_t i = 0; i < drawn.size(); ++i) Require(drawn[i] == (i < Threads ? userData[12] : copied[i]), "an alias consumer shader lost the copied texels");
+        StorageTexture::FlushPending(AddressOf(texels), BlockBytes, nullptr, "test");
+        device.WaitIdle();
+        target->Refresh();
+        Require(TransferAliasImage(device, *target) == drawn, "publication resurrected the source after a consumer write");
+    }
+    StorageTexture::FlushPending(AddressOf(texels), BlockBytes, nullptr, "test");
+    device.WaitIdle();
+    Require(kind != AliasCase::CpuWrite || texels[SurfaceBytes + 17] == 0x39, "publication lost a CPU overwrite");
+    target.reset();
+    source.reset();
+    ClearCachedTextures(device.Device());
+}
+
 void CheckForeignFirstAccess(AgcDriver::VulkanDevice& device, std::uint8_t* texels, ForeignFirstAccess firstAccess) {
     using namespace AgcDriver::Graphics;
     using namespace AgcDriver::GuestMemory;
@@ -456,6 +716,17 @@ int main(int argc, char** argv) {
         GuestBlock block(watched);
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--padded-alias") {
+            CheckPaddedAliases(*device, watched, argc == 3 ? std::stoi(argv[2]) : -1);
+            std::puts("padded GPU alias readback tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--alias-reconcile") {
+            GuestBlock resident(watched, true);
+            for (const auto kind : {AliasCase::Reshape, AliasCase::Offset, AliasCase::MatchedXor, AliasCase::XorMismatch, AliasCase::Padding, AliasCase::CpuWrite, AliasCase::PartialPending, AliasCase::GuestWriter, AliasCase::Mips}) CheckAliasReconcile(*device, resident.Data(), kind);
+            std::puts("GPU alias reconciliation readback tests passed");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--foreign-first-access") {
             GuestBlock resident(watched, true);
             for (const auto firstAccess : {ForeignFirstAccess::Fill, ForeignFirstAccess::Read, ForeignFirstAccess::FullScissor, ForeignFirstAccess::PartialScissor}) CheckForeignFirstAccess(*device, resident.Data(), firstAccess);

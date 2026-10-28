@@ -3329,6 +3329,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         };
         for (std::size_t k = 0; k < pending.size(); ++k) {
             if (!pending[k].overlaps) continue;
+            const auto* alias = owners[k].storage ? storageTextures[owners[k].element].get() : textures[owners[k].element]->StorageSource();
+            if (alias != nullptr && alias->HasCurrentAlias()) {
+                StorageTexture::CountAliasProof();
+                accepted = true;
+                continue;
+            }
             if (OwnImageRefreshEnabled() && owners[k].viewUncompressed && pending[k].found == pending[k].except) {
                 if (BuildProfiled()) Revalidations().ownSourceViews.fetch_add(1, std::memory_order_relaxed);
                 accepted = true;
