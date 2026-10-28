@@ -1856,6 +1856,7 @@ void Recorder::recordKeyStores(bool forWriter) {
             if (copyCount != 0) copy(commands, static_cast<Buffer*>(store.seed.get())->Handle(), store.buffer, copyCount, copies);
         }
         bytes += store.last - store.first;
+        if (GuestMemory::CopybackEnabled()) ProfileCopyback(GuestMemory::CopybackPath::Dcc, store.begin, static_cast<std::size_t>(store.end - store.begin));
     }
     recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
     CountBarriers(CommandClass::DccKeyStore, 2);
@@ -1941,6 +1942,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
             }
         }
         run.queued.push_back({buffer, offset, std::vector<std::byte>(bytes.begin(), bytes.end()), address});
+        if (GuestMemory::CopybackEnabled()) run.queued.back().copybackPath = GuestMemory::CopybackCurrentPath() == GuestMemory::CopybackPath::Eop ? GuestMemory::CopybackPath::Eop : GuestMemory::CopybackPath::Label;
         return;
     }
     // A label says the work before it is done: the queued key stores (results of that work) land
@@ -1987,6 +1989,10 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     run.buffer = buffer;
     run.offset = offset;
     run.bytes.assign(bytes.begin(), bytes.end());
+    if (GuestMemory::CopybackEnabled()) {
+        run.copybackAddress = address;
+        run.copybackPath = GuestMemory::CopybackCurrentPath() == GuestMemory::CopybackPath::Eop ? GuestMemory::CopybackPath::Eop : GuestMemory::CopybackPath::Label;
+    }
     if (!LabelRunsEnabled()) closeStoreRun();
 }
 
@@ -2005,6 +2011,7 @@ void Recorder::flushPendingStore() {
     function(cmdUpdateBuffer, "vkCmdUpdateBuffer")(open->commands, run.buffer, run.offset, run.bytes.size(), run.bytes.data());
     run.recorded.emplace_back(run.buffer, run.offset, run.offset + run.bytes.size());
     run.storedBytes += run.bytes.size();
+    if (GuestMemory::CopybackEnabled()) ProfileCopyback(run.copybackPath, run.copybackAddress, run.bytes.size());
     run.bytes.clear();
 }
 
@@ -2057,6 +2064,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         }
         const bool dumps = std::any_of(writes.begin(), writes.end(), [](const QueuedWrite& write) { return write.computed; });
         if (dumps) recordQueuedDumps(commands, stores);
+        if (GuestMemory::CopybackEnabled()) for (const auto& store : stores) ProfileCopyback(store.dumpTarget != 0 ? GuestMemory::CopybackPath::Eop : store.copybackPath, store.address, static_cast<std::size_t>(store.End() - store.address));
         std::size_t first = 0;
         std::uint32_t dumpIndex = 0, consumed = 0;
         for (const auto end : QueuedWriteGroups(writes)) {
@@ -2836,6 +2844,7 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
         FlushStores();
         Commands();
         foldSamples(*open, target);
+        if (GuestMemory::CopybackEnabled() && address != 0) ProfileCopyback(GuestMemory::CopybackPath::Eop, address, SampleDumpBytes);
         dumpsAtOnce.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -2846,6 +2855,7 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
     open->samplePool.reset();
     open->samples = VK_NULL_HANDLE;
     beginSamples(*open);
+    if (GuestMemory::CopybackEnabled() && address != 0) ProfileCopyback(GuestMemory::CopybackPath::Eop, address, SampleDumpBytes);
     return true;
 }
 
@@ -3283,6 +3293,15 @@ void Recorder::OnComplete(std::function<void()> action) {
     open->completions.push_back(std::move(action));
     ++open->writeBackCompletionCount;
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void Recorder::ProfileCopyback(GuestMemory::CopybackPath path, std::uint64_t address, std::size_t bytes) noexcept {
+    if (!GuestMemory::CopybackEnabled() || bytes == 0) return;
+    try {
+        auto* batch = open != nullptr ? open.get() : (!inFlight.empty() ? inFlight.back().get() : nullptr);
+        if (batch != nullptr && batch->copybacks.size() < 65536) batch->copybacks.push_back({path, address, bytes});
+        else GuestMemory::CopybackDropped();
+    } catch (...) { GuestMemory::CopybackDropped(); }
 }
 
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
@@ -3850,12 +3869,14 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         std::lock_guard ringLock(writtenBackMutex);
         return writtenBackSequence;
     }();
-    auto store = [this, address, copy = std::move(copy), sequence, storedOnGpu](auto&& visible) {
+    const auto copybackPath = GuestMemory::CopybackCurrentPath() == GuestMemory::CopybackPath::Eop ? GuestMemory::CopybackPath::Eop : GuestMemory::CopybackPath::Label;
+    auto store = [this, address, copy = std::move(copy), sequence, storedOnGpu, copybackPath](auto&& visible) {
         if (storedOnGpu && !always && !writtenBackSince(sequence, address, address + copy.size())) {
             completionStoresSkipped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         completionStoresRun.fetch_add(1, std::memory_order_relaxed);
+        const GuestMemory::CopybackScope copyback(copybackPath);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(address), copy.size(), 4, true);
         GuestMemory::StoreOwnBytes(address, copy);
         visible(copy);
@@ -4590,6 +4611,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         std::lock_guard lock(WaitLabels().mutex);
         WaitLabels().batches.at(batch.get())->stage = WaitStage::GpuComplete;
     }
+    if (GuestMemory::CopybackEnabled()) for (const auto& entry : batch->copybacks) GuestMemory::CopybackRecord(entry.path, entry.address, entry.bytes);
     readSamples(*batch);
     if (!batch->completions.empty()) EndComputeChain();
     if (batch->serial != 0) {

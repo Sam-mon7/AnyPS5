@@ -3935,6 +3935,12 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         // shadowed ones reach it through a publish, which notes its own.
         if (!imported.empty()) recorder->NotePendingWrites(imported);
     }
+    if (GuestMemory::CopybackEnabled()) {
+        for (const auto& [begin, end] : imported) {
+            if (batch) GuestMemory::CopybackRecord(GuestMemory::CopybackCurrentPath(), begin, static_cast<std::size_t>(end - begin));
+            else recorder->ProfileCopyback(GuestMemory::CopybackCurrentPath(), begin, static_cast<std::size_t>(end - begin));
+        }
+    }
     partialWriteBacks.fetch_add(1, std::memory_order_relaxed);
     partialWriteBackBytes.fetch_add(storedBytes, std::memory_order_relaxed);
     return storedBytes;
@@ -4351,11 +4357,13 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
     if (batch) {
         batch->SubmitAndWait();
+        if (GuestMemory::CopybackEnabled()) for (const auto& [begin, end] : stores) GuestMemory::CopybackRecord(GuestMemory::CopybackCurrentPath(), begin, static_cast<std::size_t>(end - begin));
         return storedBytes;
     }
     recorder->EndGpuTiming(timing, storedBytes);
     recorder->MarkShaderReadsCovered();
     recorder->NotePendingWrite(hullBegin, hullBytes);
+    if (GuestMemory::CopybackEnabled()) for (const auto& [begin, end] : stores) recorder->ProfileCopyback(GuestMemory::CopybackCurrentPath(), begin, static_cast<std::size_t>(end - begin));
     noteStore(recorder->LastWriteNote(hullBegin, hullBytes));
     return storedBytes;
 }
@@ -6286,6 +6294,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Storage);
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -6597,6 +6606,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             if (drawn.drawn) noteStore(recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
+        }
+        if (GuestMemory::CopybackEnabled()) {
+            for (const auto& [begin, end] : keep) {
+                if (batch) GuestMemory::CopybackRecord(GuestMemory::CopybackCurrentPath(), begin, static_cast<std::size_t>(end - begin));
+                else recorder->ProfileCopyback(GuestMemory::CopybackCurrentPath(), begin, static_cast<std::size_t>(end - begin));
+            }
         }
         if (profile) ThreadLookupOutcomes().work[LookupOutcomes::ImportBytes] += storedBytes;
         countStorageWriteBack(storedBytes, true, drawn.drawn);

@@ -1690,6 +1690,7 @@ std::optional<std::uint32_t> htileAfterPendingFills(const Recorder& recorder, st
 }
 
 bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t word) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Htile);
     if (address % 4u != 0 || bytes % 4u != 0) return false;
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr) return false;
@@ -1706,11 +1707,13 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     recorder.EndGpuTiming(timing, bytes);
     recorder.MarkCovered(filledAccess);
     recorder.NotePendingWordFill(address, bytes, word);
+    if (GuestMemory::CopybackEnabled()) recorder.ProfileCopyback(GuestMemory::CopybackPath::Htile, address, bytes);
     GuestMemory::MarkWritten(address, bytes);
     return true;
 }
 
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Htile);
     if (target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
@@ -2089,6 +2092,7 @@ bool DepthPlanesStale() {
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes, DepthPlaneScope scope) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Depth);
     static thread_local bool flushing = false;
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
     if (flushing || !overlapsStalePlane(address, end)) return {};

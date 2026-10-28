@@ -750,6 +750,36 @@ target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driv
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
 
+add_test_executable(agc_copyback_profile_tests EXCLUDE_FROM_ALL
+        tests/CopybackProfile.cpp
+        Execution/src/GuestMemory.cpp
+        Execution/src/PerformanceTraceThread.cpp
+)
+target_include_directories(agc_copyback_profile_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_copyback_profile_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_copyback_profile_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_copyback_profile_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_copyback_profile_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_copyback_model COMMAND agc_copyback_profile_tests model)
+    add_test(NAME agc_copyback_off COMMAND agc_copyback_profile_tests off)
+    add_test(NAME agc_copyback_counters COMMAND agc_copyback_profile_tests counters)
+    add_test(NAME agc_copyback_reads COMMAND agc_copyback_profile_tests reads)
+    add_test(NAME agc_copyback_reads_without_draw COMMAND agc_copyback_profile_tests off)
+    set_tests_properties(agc_copyback_model agc_copyback_off agc_copyback_counters agc_copyback_reads agc_copyback_reads_without_draw PROPERTIES
+            TIMEOUT 20 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_copyback_model agc_copyback_off PROPERTIES ENVIRONMENT_MODIFICATION "APS5_PROFILE_DRAW=unset:;APS5_PROFILE_COPYBACK_READS=unset:")
+    set_tests_properties(agc_copyback_counters PROPERTIES ENVIRONMENT_MODIFICATION "APS5_PROFILE_COPYBACK_READS=unset:")
+    set_tests_properties(agc_copyback_reads_without_draw PROPERTIES ENVIRONMENT_MODIFICATION "APS5_PROFILE_DRAW=unset:")
+    set_tests_properties(agc_copyback_counters PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1")
+    set_tests_properties(agc_copyback_reads PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1;APS5_PROFILE_COPYBACK_READS=1")
+    set_tests_properties(agc_copyback_reads_without_draw PROPERTIES ENVIRONMENT "APS5_PROFILE_COPYBACK_READS=1")
+    if(WIN32)
+        set_property(TEST agc_copyback_model agc_copyback_off agc_copyback_counters agc_copyback_reads agc_copyback_reads_without_draw APPEND PROPERTY ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_vertex_input_tests EXCLUDE_FROM_ALL tests/VertexInput.cpp)
 target_include_directories(agc_vertex_input_tests PRIVATE
         ${LIBS_INCLUDE_DIR}

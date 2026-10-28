@@ -206,6 +206,7 @@ void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
     const auto percentile = [&](double fraction) { return waits.empty() ? 0.0 : waits[std::min(waits.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(waits.size())))]; };
     const auto counts = VulkanDevice::PresentCounts();
     const auto presents = counts.presents - previous.presents;
+    GuestMemory::CopybackReport(presents);
     const double perPresent = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
     const auto dropped = counts.acquireDrops - previous.acquireDrops;
     const double perFrame = presents + dropped != 0 ? 1.0 / static_cast<double>(presents + dropped) : 0.0;

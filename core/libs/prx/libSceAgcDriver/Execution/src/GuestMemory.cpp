@@ -533,6 +533,7 @@ std::size_t ImagePagesSize() {
 }
 
 void ForgetPages(std::uintptr_t address, std::size_t bytes) {
+    if (CopybackReadsEnabled()) CopybackForget(address, bytes);
     forgetCalls.fetch_add(1, std::memory_order_relaxed);
     forgetBytes.fetch_add(bytes, std::memory_order_relaxed);
     forgetSerial.fetch_add(1, std::memory_order_release);
@@ -541,6 +542,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 }
 
 void ForgetInaccessiblePages(std::uintptr_t address, std::size_t bytes) {
+    if (CopybackReadsEnabled()) CopybackForget(address, bytes);
     Pages().accessSerial.fetch_add(1, std::memory_order_acq_rel);
     Pages().forgetInaccessible(address, bytes);
 }
@@ -1431,6 +1433,7 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     auto& tracker = runs.tracker;
     const auto kind = runs.kind;
     if (end <= begin) return;
+    if (kind != StampKind::Driver && CopybackReadsEnabled()) CopybackCpuWrite(begin, end - begin);
     ++runs.stamped;
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
@@ -1786,6 +1789,7 @@ void SetFreshCollectHook(FreshCollectHook hook) {
 #endif
 
 void Unwatch(std::uint64_t address, std::size_t bytes) {
+    if (CopybackReadsEnabled()) CopybackForget(address, bytes);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
     beforeUnwatch(address, bytes);
     auto& tracker = Tracker();
@@ -2018,10 +2022,12 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
 }
 
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store) {
-    return storeOwn(address, bytes, [&] {
+    const auto generation = storeOwn(address, bytes, [&] {
         store();
         return std::pair<std::uint64_t, std::uint64_t>{address, address + bytes};
     });
+    if (CopybackEnabled()) CopybackRecordCurrent(address, bytes);
+    return generation;
 }
 
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source) {
@@ -2701,6 +2707,7 @@ std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
 void PrepareHostRead(std::uintptr_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
     FlushGpuWrites(address, bytes);
+    if (CopybackReadsEnabled()) CopybackRead(address, bytes, __builtin_return_address(0), true);
 }
 }
 
@@ -2740,6 +2747,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
         if (trace) std::fprintf(stderr, "[unreadable]   read from +0x%llx\n", ModuleOffset(__builtin_return_address(0)));
         throw;
     }
+    if (CopybackReadsEnabled()) CopybackRead(address, destination.size(), __builtin_return_address(0));
     CopyGuestBytes(destination.data(), source, destination.size());
 }
 
@@ -2757,6 +2765,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 #else
 void CopyGuestBytes(void* destination, const void* source, std::size_t bytes) {
     std::memcpy(destination, source, bytes);
+    if (CopybackReadsEnabled()) CopybackRead(reinterpret_cast<std::uintptr_t>(source), bytes, __builtin_return_address(0));
 }
 #endif
 
@@ -2809,6 +2818,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     copyCommitted(address, destination);
+    if (CopybackReadsEnabled()) CopybackRead(address, destination.size(), __builtin_return_address(0));
 }
 
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
@@ -2817,6 +2827,7 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     copyCommitted(address, destination);
+    if (CopybackReadsEnabled()) CopybackRead(address, destination.size(), __builtin_return_address(0));
 }
 
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
@@ -2828,8 +2839,12 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     const TimedAccess timed(CounterCompare, bytes.size());
-    if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
+    if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) {
+        if (CopybackReadsEnabled()) CopybackRead(address, bytes.size(), __builtin_return_address(0));
+        return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
+    }
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
+        if (CopybackReadsEnabled()) CopybackRead(begin, static_cast<std::size_t>(end - begin), __builtin_return_address(0));
         if (std::memcmp(reinterpret_cast<const void*>(begin), bytes.data() + (begin - address), static_cast<std::size_t>(end - begin)) != 0) return false;
     }
     return true;
@@ -2838,11 +2853,15 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return Compare::Equal;
     if (address == 0 || bytes.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
+    const auto* copybackCaller = CopybackReadsEnabled() ? __builtin_return_address(0) : nullptr;
     auto outcome = Compare::Equal;
     // Each run's page state is consulted right before its bytes are compared.
     const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes.size(), [&](const PageRun& run) {
         if (!run.readable) outcome = Compare::Unmapped;
-        else if (std::memcmp(reinterpret_cast<const void*>(run.begin), bytes.data() + (run.begin - address), static_cast<std::size_t>(run.end - run.begin)) != 0) outcome = Compare::Differs;
+        else {
+            if (CopybackReadsEnabled()) CopybackRead(run.begin, static_cast<std::size_t>(run.end - run.begin), copybackCaller);
+            if (std::memcmp(reinterpret_cast<const void*>(run.begin), bytes.data() + (run.begin - address), static_cast<std::size_t>(run.end - run.begin)) != 0) outcome = Compare::Differs;
+        }
         return outcome == Compare::Equal;
     });
     return queried ? outcome : Compare::Unmapped;
@@ -2851,10 +2870,14 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     if (out.empty()) return Compare::Equal;
     if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
+    const auto* copybackCaller = CopybackReadsEnabled() ? __builtin_return_address(0) : nullptr;
     auto outcome = Compare::Equal;
     const bool queried = describePages(static_cast<std::uintptr_t>(address), out.size(), [&](const PageRun& run) {
         if (!run.readable) outcome = Compare::Unmapped;
-        else std::memcpy(out.data() + (run.begin - address), reinterpret_cast<const void*>(run.begin), static_cast<std::size_t>(run.end - run.begin));
+        else {
+            std::memcpy(out.data() + (run.begin - address), reinterpret_cast<const void*>(run.begin), static_cast<std::size_t>(run.end - run.begin));
+            if (CopybackReadsEnabled()) CopybackRead(run.begin, static_cast<std::size_t>(run.end - run.begin), copybackCaller);
+        }
         return outcome == Compare::Equal;
     });
     return queried ? outcome : Compare::Unmapped;
@@ -2890,8 +2913,24 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
     // still holding the snapshot are written. APS5_NO_WRITEBACK_MERGE=1 writes every changed byte.
     static const bool merge = std::getenv("APS5_NO_WRITEBACK_MERGE") == nullptr;
     std::size_t kept = 0;
+    bool copyback = CopybackEnabled();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> storedSpans;
+    const auto noteStored = [&](std::size_t offset, std::uint32_t mask) {
+        if (!copyback) return;
+        try {
+            while (mask != 0) {
+                const auto first = std::countr_zero(mask);
+                const auto length = std::countr_one(mask >> first);
+                const auto begin = address + offset + first;
+                const auto end = begin + length;
+                if (!storedSpans.empty() && storedSpans.back().second == begin) storedSpans.back().second = end;
+                else storedSpans.emplace_back(begin, end);
+                mask &= ~(((1u << length) - 1) << first);
+            }
+        } catch (...) { copyback = false; storedSpans.clear(); CopybackDropped(); }
+    };
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
-    storeOwn(address, size, [&] {
+    const auto store = [&]<bool TProfile> {
         std::size_t firstChanged = size;
         std::size_t lastChanged = 0;
         std::size_t at = 0;
@@ -2911,6 +2950,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
             if (changed == 0) continue;
             if (changed == 0xffffu) _mm_storeu_si128(reinterpret_cast<__m128i*>(destination + at), bytes);
             else _mm_maskmoveu_si128(bytes, write, reinterpret_cast<char*>(destination + at));
+            if constexpr (TProfile) noteStored(at, changed);
             firstChanged = std::min(firstChanged, at + static_cast<std::size_t>(std::countr_zero(changed)));
             lastChanged = std::max(lastChanged, at + 32 - static_cast<std::size_t>(std::countl_zero(changed)));
         }
@@ -2922,11 +2962,19 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
                 continue;
             }
             destination[at] = current[at];
+            if constexpr (TProfile) noteStored(at, 1);
             firstChanged = std::min(firstChanged, at);
             lastChanged = std::max(lastChanged, at + 1);
         }
         return firstChanged < lastChanged ? std::pair<std::uint64_t, std::uint64_t>{address + firstChanged, address + lastChanged} : std::pair<std::uint64_t, std::uint64_t>{0, 0};
+    };
+    storeOwn(address, size, [&] {
+        return copyback ? store.template operator()<true>() : store.template operator()<false>();
     });
+    if (!storedSpans.empty()) {
+        const auto publication = CopybackNewPublication();
+        for (const auto& [begin, end] : storedSpans) CopybackRecordCurrent(begin, static_cast<std::size_t>(end - begin), publication);
+    }
     static std::atomic<std::uint32_t> reported{0};
     if (kept != 0 && reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[guestmem] write-back of 0x%llx+0x%zx kept %zu bytes the guest rewrote since the snapshot\n", static_cast<unsigned long long>(address), size, kept);
 }
@@ -2954,11 +3002,197 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
 
 }
 
+namespace AgcDriver::GuestMemory {
+namespace {
+struct CopybackState {
+    std::mutex mutex;
+    CopybackTracker tracker;
+};
+
+std::atomic<std::uint64_t> copybackDropped{0};
+
+struct CopybackPathSlot {};
+
+std::uint64_t CopybackNow() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+CopybackState* Copybacks() noexcept {
+    static auto* state = []() noexcept -> CopybackState* {
+        try {
+            auto* result = new CopybackState;
+            std::atexit(&CopybackDisarm);
+            return result;
+        } catch (...) { CopybackDropped(); return nullptr; }
+    }();
+    return state;
+}
+
+CopybackPath CurrentCopybackPath() {
+    return HostThreadSlot<CopybackPath, CopybackPathSlot>::Get();
+}
+
+template<class TAction> void WithCopybacks(CopybackPath path, TAction action) noexcept {
+    if (!CopybackEnabled()) return;
+    if (auto* state = Copybacks()) {
+        try {
+            const auto before = CopybackNow();
+            std::lock_guard lock(state->mutex);
+            state->tracker.window[static_cast<std::size_t>(path)].lockNs += CopybackNow() - before;
+            action(state->tracker);
+        } catch (...) { CopybackDropped(); }
+    }
+}
+}
+
+void CopybackDropped() noexcept {
+    copybackDropped.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool CopybackEnabled() noexcept {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+bool CopybackReadsEnabled() noexcept {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_PROFILE_COPYBACK_READS"); return CopybackEnabled() && value != nullptr && std::strcmp(value, "1") == 0; }();
+    return enabled;
+}
+
+CopybackPath CopybackCurrentPath() noexcept {
+    return CopybackEnabled() ? CurrentCopybackPath() : CopybackPath::HostStore;
+}
+
+CopybackScope::CopybackScope(CopybackPath path) noexcept : path(path), previous(CopybackPath::HostStore) {
+    if (!CopybackEnabled()) return;
+    previous = CurrentCopybackPath();
+    if ((path == CopybackPath::Storage && previous == CopybackPath::Depth) || (path == CopybackPath::Label && previous == CopybackPath::Eop)) this->path = previous;
+    HostThreadSlot<CopybackPath, CopybackPathSlot>::Set(this->path);
+    started = CopybackNow();
+    held = ThreadGpuHeldNs();
+}
+
+CopybackScope::~CopybackScope() {
+    if (!CopybackEnabled()) return;
+    const auto elapsed = CopybackNow() - started;
+    const auto heldNs = ThreadGpuHeldNs() - held;
+    HostThreadSlot<CopybackPath, CopybackPathSlot>::Set(previous);
+    WithCopybacks(path, [&](auto& tracker) {
+        auto& counts = tracker.window[static_cast<std::size_t>(path)];
+        counts.ns += elapsed;
+        counts.heldNs += heldNs;
+    });
+}
+
+std::uint64_t CopybackNewPublication() noexcept {
+    std::uint64_t publication = 0;
+    WithCopybacks(CurrentCopybackPath(), [&](auto& tracker) { publication = tracker.NewPublication(); });
+    return publication;
+}
+
+void CopybackRecord(CopybackPath path, std::uint64_t address, std::size_t bytes, std::uint64_t generation) noexcept {
+    WithCopybacks(path, [&](auto& tracker) { tracker.Record(path, address, bytes, CopybackNow(), CopybackReadsEnabled(), generation); });
+}
+
+void CopybackRecordCurrent(std::uint64_t address, std::size_t bytes, std::uint64_t generation) noexcept {
+    if (CopybackEnabled()) CopybackRecord(CurrentCopybackPath(), address, bytes, generation);
+}
+
+void CopybackRead(std::uint64_t address, std::size_t bytes, const void* caller, bool host) noexcept {
+    if (!CopybackReadsEnabled()) return;
+    CopybackReader reader;
+    reader.rip = reinterpret_cast<std::uintptr_t>(caller);
+    reader.site = static_cast<std::uint8_t>(CurrentReadSite());
+    reader.host = host;
+    static thread_local const auto threadName = [] {
+        std::array<char, 64> name{};
+#ifdef _WIN32
+        using Describe = HRESULT (WINAPI*)(HANDLE, PWSTR*);
+        const auto describe = reinterpret_cast<Describe>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
+        PWSTR wide = nullptr;
+        if (describe != nullptr && SUCCEEDED(describe(GetCurrentThread(), &wide)) && wide != nullptr) {
+            WideCharToMultiByte(CP_UTF8, 0, wide, -1, name.data(), static_cast<int>(name.size()), nullptr, nullptr);
+            LocalFree(wide);
+        }
+#else
+        pthread_getname_np(pthread_self(), name.data(), name.size());
+#endif
+        name.back() = 0;
+        return name;
+    }();
+    reader.name = threadName;
+#ifdef _WIN32
+    reader.thread = GetCurrentThreadId();
+#else
+    reader.thread = reinterpret_cast<std::uintptr_t>(CurrentThreadToken());
+#endif
+    WithCopybacks(CopybackPath::HostStore, [&](auto& tracker) { tracker.Read(address, bytes, reader, CopybackNow()); });
+}
+
+void CopybackCpuWrite(std::uint64_t address, std::size_t bytes) noexcept {
+    if (!CopybackReadsEnabled()) return;
+    WithCopybacks(CopybackPath::HostStore, [&](auto& tracker) { tracker.CpuWrite(address, bytes); });
+}
+
+void CopybackForget(std::uint64_t address, std::size_t bytes) noexcept {
+    if (!CopybackReadsEnabled()) return;
+    WithCopybacks(CopybackPath::HostStore, [&](auto& tracker) { tracker.Forget(address, bytes); });
+}
+
+void CopybackDisarm() noexcept {
+    if (!CopybackReadsEnabled()) return;
+    WithCopybacks(CopybackPath::HostStore, [](auto& tracker) { tracker.Disarm(); });
+}
+
+void CopybackReport(std::uint64_t presents) noexcept {
+    if (!CopybackEnabled()) return;
+    std::array<CopybackCounters, CopybackNames.size()> counts;
+    std::vector<CopybackReader> readers;
+    std::size_t armed = 0;
+    std::uint64_t readerOverflow = 0;
+    WithCopybacks(CopybackPath::HostStore, [&](auto& tracker) {
+        tracker.Expire(CopybackNow());
+        counts = tracker.window;
+        readers = tracker.readers;
+        armed = tracker.Armed();
+        readerOverflow = tracker.ReaderOverflow();
+        tracker.NextWindow();
+    });
+    ProfilePrint_nid_no_patch("[copyback] presents=%llu probes=%s active=%zu direct-game-reads=unknown gpu-untouched=unknown read-coverage=hooks-only cohort=retired-pages cpu-writes=collected-page-watch timings=inclusive-cpu-scope gpu-timing=recorder lock=profiler-wait dropped-total=%llu\n", static_cast<unsigned long long>(presents), CopybackReadsEnabled() ? "1/64-spans,128-pages/s,4096-active,30s-expiry" : "off", armed, static_cast<unsigned long long>(copybackDropped.load(std::memory_order_relaxed)));
+    for (std::size_t index = 0; index < counts.size(); ++index) {
+        const auto& value = counts[index];
+        const auto fraction = [&](std::uint64_t count) { return value.retired != 0 ? static_cast<double>(count) / value.retired : 0.0; };
+        ProfilePrint_nid_no_patch("[copyback] path=%s bytes=%llu ranges=%llu unique-pages=%llu page-overflow=%llu bytes/present=%.1f ranges/present=%.2f pages/present=%.2f cpu-ms=%.3f gpu-held-ms=%.3f profile-lock-ms=%.3f sampled=%llu refused=%llu retired=%llu driver-hook=%llu/%.4f host-hook=%llu/%.4f cpu-write=%llu/%.4f overwritten=%llu no-observed-touch=%llu/%.4f censored=%llu\n", CopybackNames[index], static_cast<unsigned long long>(value.bytes), static_cast<unsigned long long>(value.ranges), static_cast<unsigned long long>(value.pages), static_cast<unsigned long long>(value.pageOverflow), presents ? static_cast<double>(value.bytes) / presents : 0.0, presents ? static_cast<double>(value.ranges) / presents : 0.0, presents ? static_cast<double>(value.pages) / presents : 0.0, value.ns / 1e6, value.heldNs / 1e6, value.lockNs / 1e6, static_cast<unsigned long long>(value.sampled), static_cast<unsigned long long>(value.refused), static_cast<unsigned long long>(value.retired), static_cast<unsigned long long>(value.driver), fraction(value.driver), static_cast<unsigned long long>(value.host), fraction(value.host), static_cast<unsigned long long>(value.cpuWrite), fraction(value.cpuWrite), static_cast<unsigned long long>(value.overwritten), static_cast<unsigned long long>(value.noObservedTouch), fraction(value.noObservedTouch), static_cast<unsigned long long>(value.censored));
+    }
+    std::sort(readers.begin(), readers.end(), [](const auto& left, const auto& right) { return left.count > right.count; });
+    for (std::size_t index = 0; index < std::min<std::size_t>(readers.size(), 16); ++index) {
+        const auto& reader = readers[index];
+        char moduleName[512] = "unknown";
+        auto offset = reader.rip;
+#ifdef _WIN32
+        HMODULE module = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(reader.rip), &module)) {
+            GetModuleFileNameA(module, moduleName, sizeof(moduleName));
+            offset -= reinterpret_cast<std::uintptr_t>(module);
+        }
+#endif
+        ProfilePrint_nid_no_patch("[copyback] reader-top-retained path=%s kind=%s site=%s thread=%llu name=\"%s\" callsite=%s+0x%llx page=0x%llx hits=%llu mean-age-us=%.1f retained-overflow=%llu\n", CopybackNames[static_cast<std::size_t>(reader.path)], reader.host ? "host-hook" : "driver-hook", ReadSiteName(static_cast<ReadSite>(reader.site)), static_cast<unsigned long long>(reader.thread), reader.name.data(), moduleName, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(reader.page), static_cast<unsigned long long>(reader.count), reader.count ? reader.ageNs / (1000.0 * reader.count) : 0.0, static_cast<unsigned long long>(readerOverflow));
+    }
+}
+
+CopybackSnapshot CopybackCounts() noexcept {
+    CopybackSnapshot snapshot;
+    WithCopybacks(CopybackPath::HostStore, [&](auto& tracker) { snapshot.counts = tracker.window; snapshot.active = tracker.Armed(); });
+    return snapshot;
+}
+}
+
 extern "C" void AgcDriverCheckGuestMemory_nid_postfix(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable) {
     AgcDriver::GuestMemory::CheckRange(pointer, bytes, alignment, writable);
 }
 
 extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value) {
+    const AgcDriver::GuestMemory::CopybackScope copyback(AgcDriver::GuestMemory::CopybackPath::Label);
     AgcDriver::GuestMemory::CheckRange(pointer, sizeof(*pointer), std::atomic_ref<std::uint64_t>::required_alignment, true);
     AgcDriver::GuestMemory::StoreOwnBytes(reinterpret_cast<std::uintptr_t>(pointer), sizeof(*pointer), [&] {
         std::atomic_ref(*pointer).store(value, std::memory_order_release);

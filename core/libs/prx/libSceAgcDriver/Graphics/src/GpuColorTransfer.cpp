@@ -177,6 +177,7 @@ void GpuColorTransfer::Tile(VkCommandBuffer commands) {
 }
 
 void GpuColorTransfer::WriteBack(std::uint64_t address) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Image);
     Require(tiled != nullptr, "color transfer is not prepared for writeback");
     Require(elementBytes == 4u, "color transfer cannot write 16-bit float texels back to the guest");
     const ColorTargetLayout layout(width, height, mode, elementBytes);

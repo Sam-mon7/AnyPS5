@@ -5058,6 +5058,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
 }
 
 void GuestBufferMemory::completeSpaceWrites() const {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::CopiedWriter);
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || Recorder::InCompletion() || !AnyPendingCpuWrites(context)) return;
     const auto& base = space->base;
@@ -5571,6 +5572,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             // Exactly the sub-range the shader may write, in place in the import: what the shader
             // would have stored there itself had the range been bindable.
             CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+            if (profile) recorder.ProfileCopyback(GuestMemory::CopybackPath::StagingOut, from, static_cast<std::size_t>(to - from));
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
             if (profile) {
@@ -5878,6 +5880,9 @@ void GuestBufferMemory::MarkDirectWrites() const {
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) {
+            if (region.direct != nullptr && GuestMemory::CopybackEnabled()) {
+                if (auto* recorder = Recorder::Active()) recorder->ProfileCopyback(GuestMemory::CopybackPath::DirectGpu, begin, static_cast<std::size_t>(end - begin));
+            }
             const auto generation = GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin));
             if (generation != 0) directWritesGeneration = std::max(directWritesGeneration, generation);
         }
@@ -5960,6 +5965,7 @@ void GuestBufferMemory::takeHeapReferences() {
 }
 
 void GuestBufferMemory::WriteBack() {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::CopiedWriter);
     Require(uploaded && !committed, "guest memory cannot be committed twice or before upload");
     const auto merged = mergeWrites(writes);
     // The CPU keeps running while the GPU works, so storing whole ranges would roll back its writes to
@@ -5977,6 +5983,7 @@ void GuestBufferMemory::WriteBack() {
         }
         if (region.mirror != nullptr) {
             if (!region.mirror->writable) continue;
+            const GuestMemory::CopybackScope mirrorCopyback(GuestMemory::CopybackPath::Mirror);
             Require(end <= region.end, "write-back range exceeds its GPU owner");
             // The shadow is what the GPU started from; it then takes the mirror's bytes so the next
             // refresh does not mistake the GPU's results for a guest change.

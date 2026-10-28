@@ -138,6 +138,7 @@ void Driver::flushAwaitedLabels(std::uint32_t queue) {
 }
 
 void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Label);
     auto& deferred = deferredLabels();
     if (deferred.labels.empty()) return;
 
