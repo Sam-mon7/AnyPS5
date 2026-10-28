@@ -30,7 +30,7 @@ std::vector<std::uint32_t> shaderKey(bool dataWords, bool movable, const std::ve
         for (const auto word : {0u, static_cast<std::uint32_t>(binding.role), 0u, 0u, binding.count, 0u, 0u, static_cast<std::uint32_t>(binding.words.size())}) key.push_back(word);
         const bool emitted = (movable && binding.role == DescriptorRole::GuestBuffers && binding.words.size() == binding.count * 4u) || (dataWords && !movable) || !data;
         if (emitted) key.insert(key.end(), binding.words.begin(), binding.words.end());
-        for (int flags = 0; flags < 9; ++flags) key.push_back(0u);
+        for (int flags = 0; flags < 10; ++flags) key.push_back(0u);
         key.push_back(0u);
         key.push_back(static_cast<std::uint32_t>(binding.shapes.size()));
         key.insert(key.end(), binding.shapes.begin(), binding.shapes.end());
@@ -140,6 +140,43 @@ void testDrawKey() {
     compare(drawKey(5, shaderKey(true, true, data), 0x1000), std::nullopt, "movable draw keys leave data words out");
 }
 
+void testSerializedKeys() {
+    ShaderRecompiler::RecompileResult program;
+    program.variantId = 7;
+    for (const auto& source : bindings()) {
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.role = source.role;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.count = source.count;
+        binding.guestDescriptor = source.words;
+        auto flags = binding.Flags();
+        flags.bufferWritten.assign(1, false);
+        binding.SetFlags(std::move(flags));
+        binding.imageSamplers = {0};
+        binding.imageShapes = {ShaderRecompiler::DescriptorImageShape::Image2D};
+        program.bindings.push_back(std::move(binding));
+    }
+    const Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Vertex, &program, 0};
+    for (const bool movable : {false, true}) {
+        const auto serialize = [&] {
+            const auto key = ShaderResources::ContentKey(shader, true, movable);
+            return movable ? drawKey(5, key, 0x1000) : key;
+        };
+        const auto base = serialize();
+        ContentKeyDiff diff;
+        check(ShaderResources::DiffContentKeys(base, base, movable, diff), "serialized keys were not comparable");
+        expectOnly(diff, std::nullopt, "equal serialized keys differed");
+        ++program.bindings[1].guestDescriptor[5];
+        check(ShaderResources::DiffContentKeys(base, serialize(), movable, diff), "serialized image change was not comparable");
+        expectOnly(diff, ContentKeyComponent::Image, "serialized image change was mislabeled");
+        --program.bindings[1].guestDescriptor[5];
+        ++program.bindings[3].guestDescriptor[0];
+        check(ShaderResources::DiffContentKeys(base, serialize(), movable, diff), "serialized data change was not comparable");
+        expectOnly(diff, movable ? std::nullopt : std::optional{ContentKeyComponent::ShaderData}, "serialized data change was mislabeled");
+        --program.bindings[3].guestDescriptor[0];
+    }
+}
+
 }
 
 int main() {
@@ -147,6 +184,7 @@ int main() {
         testDispatchKey();
         testDispatchKeyWithDevice();
         testDrawKey();
+        testSerializedKeys();
         std::puts("Key miss attribution passed");
         return 0;
     } catch (const std::exception& error) {

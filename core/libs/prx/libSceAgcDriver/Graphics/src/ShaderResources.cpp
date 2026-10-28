@@ -2845,7 +2845,7 @@ bool LabelShaderKey(std::span<const std::uint32_t> key, std::size_t at, std::siz
             labels[at + i] = static_cast<std::uint8_t>(component);
         }
         at += words;
-        for (int flags = 0; flags < 9; ++flags) {
+        for (int flags = 0; flags < 10; ++flags) {
             if (at >= end) return false;
             const auto count = 1 + (static_cast<std::size_t>(key[at]) + 31) / 32;
             if (!label(at, count, Component::Other)) return false;
@@ -3999,7 +3999,7 @@ ChurnProfile& Churn() {
 
 // Charges word `diff` of `key` to the binding of the ContentKey that starts at `at` (the layout of
 // ShaderResources::ContentKey), moving `at` past that key; false when `diff` lies beyond it.
-bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::size_t& at, std::size_t diff) {
+bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::size_t& at, std::size_t diff, bool movable = false) {
     if (at + 5 > key.size() || diff < at + 5) {
         ++profile.layout;
         return true;
@@ -4014,7 +4014,7 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
         }
         const auto kind = key[at];
         const auto role = key[at + 1];
-        const auto descriptorWords = dataWords || !DataRole(static_cast<ShaderRecompiler::DescriptorRole>(role)) ? key[at + 7] : 0u;
+        const auto descriptorWords = (dataWords && !movable) || !DataRole(static_cast<ShaderRecompiler::DescriptorRole>(role)) ? key[at + 7] : 0u;
         at += 8;
         if (diff < at + descriptorWords) {
             if (role < profile.roles.size()) ++profile.roles[role];
@@ -4024,12 +4024,13 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
             return true;
         }
         at += descriptorWords;
-        for (int flags = 0; flags < 4; ++flags) {
+        for (int flags = 0; flags < 12; ++flags) {
             if (at >= key.size()) {
                 ++profile.layout;
                 return true;
             }
-            const auto words = 1 + (static_cast<std::size_t>(key[at]) + 31) / 32;
+            const auto count = static_cast<std::size_t>(key[at]);
+            const auto words = 1 + (flags < 10 ? (count + 31) / 32 : count);
             if (diff < at + words) {
                 ++profile.layout;
                 return true;
@@ -4047,6 +4048,8 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     std::lock_guard lock(mutex);
     const auto found = index.find(key);
     if (found == index.end()) {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile) ++stats.misses;
         noteReturn(key);
         noteMiss(key);
         return nullptr;
@@ -4057,12 +4060,17 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
 }
 
 void ResourceCache::noteEvicted(const Key& key) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) ++stats.evictions;
     if (fixedCapacity) return;
     const auto hash = KeyHash{}(key);
     if (const auto found = evictedKeys.find(hash); found != evictedKeys.end()) evictedOrder.erase(found->second);
     evictedOrder.push_front(hash);
     evictedKeys[hash] = evictedOrder.begin();
-    while (evictedOrder.size() > capacity) {
+    static const bool wideHistory = std::getenv("APS5_NO_RESOURCE_CACHE_REUSE_HISTORY") == nullptr;
+    const auto historyLimit = wideHistory ? MaximumEntries : capacity;
+    while (evictedOrder.size() > historyLimit) {
+        if (profile) ++stats.forgotten;
         evictedKeys.erase(evictedOrder.back());
         evictedOrder.pop_back();
     }
@@ -4101,6 +4109,8 @@ void ResourceCache::noteReturn(const Key& key) {
     if (fixedCapacity) return;
     const auto found = evictedKeys.find(KeyHash{}(key));
     if (found == evictedKeys.end()) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) ++stats.returns;
     evictedOrder.erase(found->second);
     evictedKeys.erase(found);
     ++returnsSinceCheck;
@@ -4163,7 +4173,8 @@ void ResourceCache::noteMiss(const Key& key) {
             bool charged = false;
             for (std::uint32_t stage = 0; stage < key[3] && at < key.size() && !charged; ++stage) {
                 ++at;
-                charged = chargeShaderKey(counts, key, at, diff);
+                static const bool movable = std::getenv("APS5_NO_MOVED_BUFFER_TEMPLATES") == nullptr;
+                charged = chargeShaderKey(counts, key, at, diff, movable);
             }
             if (!charged) ++counts.drawWords;
         } else {
@@ -4226,7 +4237,12 @@ void ResourceCache::noteMiss(const Key& key) {
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
     dropReleasedTextures(evicted);
-    if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) {
+        if (profile) ++stats.rejected;
+        return;
+    }
+    if (profile) ++stats.inserts;
     if (const auto found = index.find(key); found != index.end()) {
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
@@ -4339,6 +4355,7 @@ void ResourceCache::Clear() {
     usesSinceCheck = 0;
     shrinkWindow = baseShrinkWindow;
     shrankLast = false;
+    stats = {};
     if (!fixedCapacity) capacity = 0;
 }
 
@@ -4351,6 +4368,11 @@ void ResourceCache::SetBase(std::size_t entries, std::size_t window) {
 std::size_t ResourceCache::Size() const {
     std::lock_guard lock(mutex);
     return entries.size();
+}
+
+ResourceCache::Stats ResourceCache::Counters() const {
+    std::lock_guard lock(mutex);
+    return stats;
 }
 
 std::size_t ResourceCache::Capacity() const {

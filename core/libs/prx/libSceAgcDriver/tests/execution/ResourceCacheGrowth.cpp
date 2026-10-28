@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
@@ -31,7 +32,7 @@ using AgcDriver::Graphics::Require;
 
 constexpr std::size_t BaseEntries = 32;
 constexpr std::size_t BaseShrinkWindow = 2;
-constexpr std::uint32_t Dispatches = 48;
+constexpr std::uint32_t Dispatches = 96;
 constexpr std::uint32_t Passes = 4;
 constexpr std::uint32_t HotDispatches = 2;
 constexpr std::uint32_t HotRepeats = 160;
@@ -111,6 +112,7 @@ void WorkingSetLargerThanTheInitialBound(const GuestBlock& block) {
     for (std::uint32_t pass = 0; pass < Passes; ++pass) {
         RunPass(block);
         if (pass != 0) continue;
+        Require(cache.Capacity() == BaseEntries, "resource cache growth: a one-use stream grew the bound");
         for (std::uint32_t dispatch = 0; dispatch < Dispatches; ++dispatch) {
             std::uint32_t stored = 0;
             AgcDriver::GuestMemory::Read(block.At(OutputOffset + static_cast<std::size_t>(dispatch) * OutputBytes), std::as_writable_bytes(std::span(&stored, 1)), 4);
@@ -147,6 +149,30 @@ void BoundComesBackDown(const GuestBlock& block) {
     Require(cache.Capacity() > BaseEntries, "resource cache growth: after Clear() the large working set did not grow the bound again");
 }
 
+void WideReuseWithBound(const GuestBlock& block) {
+    auto& cache = AgcDriver::Graphics::SharedResourceCache();
+    for (std::uint32_t pass = 1; pass < Passes; ++pass) RunPass(block);
+    const auto before = cache.Counters();
+    RunPass(block);
+    const auto after = cache.Counters();
+    const bool legacy = std::getenv("APS5_NO_RESOURCE_CACHE_REUSE_HISTORY") != nullptr;
+    const char* fixed = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
+    const auto bound = fixed != nullptr ? std::strtoull(fixed, nullptr, 10) : 0ull;
+    if (bound != 0 || legacy) {
+        const auto expected = bound != 0 ? bound : BaseEntries;
+        Require(cache.Capacity() == expected && cache.Size() == expected, "resource cache growth: the legacy or fixed bound changed");
+        if (std::getenv("APS5_PROFILE_DRAW") != nullptr) Require(after.inserts - before.inserts == Dispatches, "resource cache growth: the bounded cycle did not rebuild every resource set");
+    } else {
+        Require(cache.Size() >= Dispatches, "resource cache growth: a working set over twice the initial capacity kept rebuilding");
+        if (std::getenv("APS5_PROFILE_DRAW") != nullptr) Require(after.inserts == before.inserts, "resource cache growth: a warmed cycle still rebuilt resource sets");
+    }
+    for (std::uint32_t dispatch = 0; dispatch < Dispatches; ++dispatch) {
+        std::uint32_t stored = 0;
+        AgcDriver::GuestMemory::Read(block.At(OutputOffset + static_cast<std::size_t>(dispatch) * OutputBytes), std::as_writable_bytes(std::span(&stored, 1)), 4);
+        Require(stored == 1u, "resource cache growth: a repeated dispatch lost its output");
+    }
+}
+
 void UseTheResourceCacheOnEveryDispatch() {
 #ifdef _WIN32
     _putenv_s("APS5_NO_DISPATCH_RECIPE", "1");
@@ -157,7 +183,7 @@ void UseTheResourceCacheOnEveryDispatch() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     UseTheResourceCacheOnEveryDispatch();
     try {
         {
@@ -169,8 +195,11 @@ int main() {
         cache.Clear();
         GuestBlock block;
         Prepare(block);
-        WorkingSetLargerThanTheInitialBound(block);
-        BoundComesBackDown(block);
+        if (argc > 1 && std::string(argv[1]) == "--wide-reuse") WideReuseWithBound(block);
+        else {
+            WorkingSetLargerThanTheInitialBound(block);
+            BoundComesBackDown(block);
+        }
         AgcDriverShutdown_nid_postfix();
         std::puts("resource cache growth tests passed");
         return 0;

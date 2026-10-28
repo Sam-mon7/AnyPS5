@@ -555,6 +555,11 @@ constexpr std::array<const char*, LookupPhaseCount> LookupPhaseNames{"key/find/m
 enum RecipeBuild : std::size_t { RecipeNotRequested, RecipeDisabled, RecipeUncacheable, RecipeWaited, RecipeIndirect, RecipeNotReusable, RecipeMovedDisabled, RecipeMultisampled, RecipeReordered, RecipeBuilt, RecipeBuildCount };
 constexpr std::array<const char*, RecipeBuildCount> RecipeBuildNames{"not requested/shape", "disabled", "uncacheable", "waited", "indirect", "not reusable", "moved disabled", "multisampled", "sample order", "built"};
 
+enum ResourceBuildReason : std::size_t { BuildNoEntry, BuildProof, BuildBindings, BuildUnrecordable, BuildDisabled, BuildNoVariant, BuildAddressShape, ResourceBuildReasonCount };
+constexpr std::array<const char*, ResourceBuildReasonCount> ResourceBuildReasonNames{"no entry", "proof", "bindings", "not recordable", "disabled", "missing variant", "BDA/guard shape"};
+enum ResourceAdmission : std::size_t { BuildAdmissionAttempt, BuildNotReusable, BuildNotRecorded, BuildCacheDisabled, ResourceAdmissionCount };
+constexpr std::array<const char*, ResourceAdmissionCount> ResourceAdmissionNames{"insert attempted", "not reusable", "not recorded", "uncacheable"};
+
 bool DrawMovedRecipes() {
     static const bool enabled = std::getenv("APS5_NO_DRAW_MOVED_RECIPES") == nullptr;
     return enabled;
@@ -578,12 +583,16 @@ struct DrawOutcome {
         recipeBuild = RecipeNotRequested;
         movedBuffers = 0;
         movedRecipeBuilt = false;
+        resourceBuildReason = BuildNoEntry;
+        resourceAdmission = BuildCacheDisabled;
     }
     std::array<double, RecordPhaseCount> recordUs;
     std::array<double, LookupPhaseCount> lookupSplitUs;
     RecipeBuild recipeBuild;
     std::uint64_t movedBuffers;
     bool movedRecipeBuilt;
+    ResourceBuildReason resourceBuildReason;
+    ResourceAdmission resourceAdmission;
     // In the recorder; `waited` when the recorder was synced right after (copied writes or a lease).
     bool recorded = false;
     bool waited = false;
@@ -654,6 +663,9 @@ struct DrawProfile {
     std::array<double, RecordPhaseCount> recordUs{};
     std::array<double, LookupPhaseCount> lookupSplitUs{};
     std::array<std::uint64_t, RecipeBuildCount> recipeBuilds{};
+    std::array<std::uint64_t, ResourceBuildReasonCount> resourceBuilds{};
+    std::array<std::uint64_t, ResourceAdmissionCount> resourceAdmissions{};
+    std::array<double, KindCount> resourceBuildUs{};
     std::uint64_t movedRecipeBuilds = 0, movedRecipeHits = 0, movedRecipeBuffers = 0, movedRecipeRefused = 0;
     std::uint64_t movedDraws = 0;
     double movedRecipeUs = 0, movedDrawUs = 0;
@@ -748,6 +760,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.maxHookWaitUs = std::max(profile.maxHookWaitUs, outcome.hookWaitUs);
     profile.ownSyncUs += outcome.ownSyncUs;
     if (built != nullptr) {
+        ++profile.resourceBuilds[outcome.resourceBuildReason];
+        ++profile.resourceAdmissions[outcome.resourceAdmission];
+        profile.resourceBuildUs[outcome.kind] += us[PhaseResources];
         profile.bindingsUs += built->bindingsMs * 1000.0;
         profile.uploadUs += built->uploadMs * 1000.0;
         profile.descriptorsUs += built->descriptorsMs * 1000.0;
@@ -886,10 +901,30 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     profile.targets.clear();
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    std::string buildReasons;
+    std::string admissions;
+    std::uint64_t builds = 0;
+    char field[128];
+    for (std::size_t i = 0; i < ResourceBuildReasonCount; ++i) {
+        builds += profile.resourceBuilds[i];
+        std::snprintf(field, sizeof(field), " %s %llu", ResourceBuildReasonNames[i], static_cast<unsigned long long>(profile.resourceBuilds[i]));
+        buildReasons += field;
+    }
+    for (std::size_t i = 0; i < ResourceAdmissionCount; ++i) {
+        std::snprintf(field, sizeof(field), " %s %llu", ResourceAdmissionNames[i], static_cast<unsigned long long>(profile.resourceAdmissions[i]));
+        admissions += field;
+    }
+    const auto buildUs = profile.resourceBuildUs[KindBuild] + profile.resourceBuildUs[KindBda];
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-resource-build] (10 s): %llu builds / %llu draws (%.2f%%), resource CPU %.3f ms (%.3f us/draw; ordinary %.3f ms, BDA %.3f ms); reasons:%s; admission:%s\n", static_cast<unsigned long long>(builds), static_cast<unsigned long long>(profile.draws), profile.draws != 0 ? 100.0 * builds / profile.draws : 0.0, buildUs / 1000.0, profile.draws != 0 ? buildUs / profile.draws : 0.0, profile.resourceBuildUs[KindBuild] / 1000.0, profile.resourceBuildUs[KindBda] / 1000.0, buildReasons.c_str(), admissions.c_str());
+    const auto cacheStats = SharedResourceCache().Counters();
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] reuse history (since clear, dispatch + draw; includes prelock probes): %llu misses, %llu inserts, %llu rejected, %llu capacity evictions, %llu eviction returns, %llu forgotten; size %zu / %zu\n", static_cast<unsigned long long>(cacheStats.misses), static_cast<unsigned long long>(cacheStats.inserts), static_cast<unsigned long long>(cacheStats.rejected), static_cast<unsigned long long>(cacheStats.evictions), static_cast<unsigned long long>(cacheStats.returns), static_cast<unsigned long long>(cacheStats.forgotten), SharedResourceCache().Size(), SharedResourceCache().Capacity());
     profile.totalsUs.fill(0);
     profile.recordUs.fill(0);
     profile.lookupSplitUs.fill(0);
     profile.recipeBuilds.fill(0);
+    profile.resourceBuilds.fill(0);
+    profile.resourceAdmissions.fill(0);
+    profile.resourceBuildUs.fill(0);
     profile.movedRecipeBuilds = profile.movedRecipeHits = profile.movedRecipeBuffers = profile.movedRecipeRefused = 0;
     profile.movedDraws = 0;
     profile.movedRecipeUs = profile.movedDrawUs = 0;
@@ -1131,10 +1166,12 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     return key;
 }
 
-bool DrawResourcesCacheable(std::span<const CompiledShader> shaders) {
+bool DrawResourcesCacheable(std::span<const CompiledShader> shaders, ResourceBuildReason* refusal = nullptr) {
     static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
     static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    return !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    const auto reason = noDrawResourceCache || noTextureCache ? BuildDisabled : !std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) ? BuildNoVariant : ShaderResources::NeverReusable(shaders) ? BuildAddressShape : BuildNoEntry;
+    if (refusal != nullptr) *refusal = reason;
+    return reason == BuildNoEntry;
 }
 
 // The alias checks the build makes for every guest buffer descriptor (ShaderResources::
@@ -1920,7 +1957,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-    resolved.cacheable = recordable && DrawResourcesCacheable(shaders);
+    resolved.cacheable = recordable && DrawResourcesCacheable(shaders, timer.profile ? &outcome.resourceBuildReason : nullptr);
     if (resolved.cacheable) {
         if (preparation != nullptr && preparation->device == context.device && !preparation->resourceKey.empty()) {
             resolved.contentKey = std::exchange(preparation->resourceKey, {});
@@ -1943,14 +1980,16 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
-                countCache(&DrawProfile::cacheMisses);
+                if (timer.profile) outcome.resourceBuildReason = BuildBindings;
             } else {
+                if (timer.profile) outcome.resourceBuildReason = BuildProof;
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
             }
             lookupPhase(LookupMoveAliases);
         }
     } else {
+        if (timer.profile && !recordable) outcome.resourceBuildReason = BuildUnrecordable;
         countCache(&DrawProfile::uncacheable);
     }
     lookupPhase(LookupKeyFind);
@@ -3042,6 +3081,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         else outcome.recorded = false;
     }
     const bool recorded = prepared.recorded = outcome.recorded;
+    if (profile && built != nullptr) outcome.resourceAdmission = !cacheable ? BuildCacheDisabled : !recorded ? BuildNotRecorded : !resources->Reusable() ? BuildNotReusable : BuildAdmissionAttempt;
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).

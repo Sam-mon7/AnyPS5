@@ -739,6 +739,15 @@ private:
 class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
+    struct Stats {
+        std::uint64_t misses = 0;
+        std::uint64_t inserts = 0;
+        std::uint64_t rejected = 0;
+        std::uint64_t evictions = 0;
+        std::uint64_t returns = 0;
+        std::uint64_t forgotten = 0;
+    };
+    Stats Counters() const;
     std::shared_ptr<ShaderResources> Find(const Key& key);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
@@ -813,6 +822,7 @@ private:
     std::size_t baseShrinkWindow = InitialShrinkWindow;
     std::size_t shrinkWindow = InitialShrinkWindow;
     bool shrankLast = false;
+    Stats stats;
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears
