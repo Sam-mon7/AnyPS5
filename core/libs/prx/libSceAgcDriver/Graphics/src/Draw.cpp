@@ -299,6 +299,7 @@ bool clearToTexel(StorageTexture& image, const std::array<std::byte, 16>& texel,
 }
 
 void writeTexels(const ColorTarget& color, const std::array<std::byte, 16>& texel) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Image);
     const auto elementBytes = static_cast<std::size_t>(color.elementBytes);
     std::vector<std::byte> texels(color.bytes);
     for (std::size_t offset = 0; offset + elementBytes <= texels.size(); offset += elementBytes) std::memcpy(texels.data() + offset, texel.data(), elementBytes);
@@ -306,6 +307,7 @@ void writeTexels(const ColorTarget& color, const std::array<std::byte, 16>& texe
 }
 
 void storeClearTexels(const Context& context, const ColorTarget& color, const std::array<std::byte, 16>& texel) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Image);
     StorageTexture::FlushPending(color.address, color.bytes, nullptr, "fast-clear materialization");
     const auto keys = ReadDccKeys(color.dccAddress, color.bytes);
     if (!IsDccClear(keys)) return;
@@ -314,6 +316,7 @@ void storeClearTexels(const Context& context, const ColorTarget& color, const st
 }
 
 void storeSingleTexels(const Context& context, const ColorTarget& color) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Image);
     Require(color.tileMode != ColorTileMode::Linear, "comp-to-single DCC keys of a linear color target");
     const ColorTargetLayout surface(color.extent.width, color.extent.height, color.tileMode, color.elementBytes, color.pipeBankXor);
     Require(surface.Bytes() == color.bytes, "comp-to-single DCC keys over a color target whose layout differs from its surface");
@@ -438,6 +441,7 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
 }
 
 void storeCmaskClearTexels(const ColorTarget& color, const CmaskLayout& layout, const std::vector<std::uint32_t>* tiles, const std::array<std::byte, 16>& texel) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Image);
     StorageTexture::FlushPending(color.address, color.bytes, nullptr, "fast-clear materialization");
     const ColorTargetLayout surface(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
     Require(surface.Bytes() == color.bytes, "CMASK fast clear over a color target whose layout differs from its surface");
@@ -469,10 +473,12 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     recorder.Keep(resident);
     context.detiler->DispatchCmaskClear(commands, import.buffer, HostImportOffset(import, address), bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0);
     recorder.NotePendingWrite(address, bytes);
+    if (GuestMemory::CopybackEnabled()) recorder.ProfileCopyback(GuestMemory::CopybackPath::Cmask, address, bytes);
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
 }
 
 bool materializeCmaskClear(const Context& context, const ColorTarget& color, const std::shared_ptr<StorageTexture>& resident) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Cmask);
     if (color.cmaskAddress == 0) return false;
     if (context.detiler != nullptr) requireCmaskCodes(context.detiler->CmaskErrors());
     const CmaskLayout layout(color.extent.width, color.extent.height);
@@ -3462,6 +3468,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             binding.resident->MarkSliceDirty(binding.color.arraySlice, binding.color.arrayLastSlice != 0 ? binding.color.layers : 1u);
             continue;
         }
+        const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Image);
         if (binding.gpuTiling) GuestMemory::WriteChanged(binding.color.address, binding.tiled->Bytes(), binding.original);
         else WriteColorTarget(binding.color, binding.transfer->Bytes());
         // The stored texels are the whole target now, so later reads must see them rather than a fast clear.

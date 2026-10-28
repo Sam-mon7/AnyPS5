@@ -2607,6 +2607,7 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Label);
     if (state->recorder != nullptr) state->recorder->EndComputeChain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct LabelTiming {
@@ -2668,7 +2669,9 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // pair for a whole group of labels recorded back to back (Recorder::RecordStore orders the
     // stores of a run against each other and against the work before and after, the queued DCC
     // key stores included).
-    const auto recordStore = [&] { recorder.RecordStore(import->buffer, Graphics::HostImportOffset(*import, address), bytes, address); };
+    const auto recordStore = [&] {
+        recorder.RecordStore(import->buffer, Graphics::HostImportOffset(*import, address), bytes, address);
+    };
     // On the console every store a queue made before a label is in memory once the label is
     // visible. A listed copied writer (a dispatch or draw whose written buffer the device holds as a
     // CPU copy) is written back by the CPU when its batch is reaped, after the GPU already ran any
@@ -2760,6 +2763,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
 }
 
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, std::uint64_t* generation) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::CopyHle);
     if (state->recorder != nullptr) state->recorder->EndComputeChain();
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;
@@ -2937,6 +2941,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     phase(recordMs);
     if (uniform) recorder.NotePendingWordFill(address, bytes, pattern[0]);
     else recorder.NotePendingWrite(address, bytes);
+    if (GuestMemory::CopybackEnabled()) recorder.ProfileCopyback(GuestMemory::CopybackPath::CopyHle, address, bytes);
     const auto written = GuestMemory::MarkWritten(address, bytes);
     if (generation != nullptr) *generation = written;
     phase(notesMs);
@@ -3046,6 +3051,7 @@ bool VulkanDevice::GpuCopyPossible(std::uint64_t destination, std::uint64_t sour
 }
 
 VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::CopyHle);
     if (state->recorder != nullptr) state->recorder->EndComputeChain();
     CopyOutcome outcome{2, false, 0, CopyOutcome::None, false, false, 0, 0, 0, 0, false};
     if (!state->recorder || bytes == 0) return outcome;
@@ -3212,6 +3218,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // pending or still to land can change the source before the transfer reads it (a CPU store
     // to it in between is a hardware race too): the caller's ring entry carries them, stamped
     // with the generation this store gets, and goes in ahead of the note.
+    if (GuestMemory::CopybackEnabled()) recorder.ProfileCopyback(GuestMemory::CopybackPath::CopyHle, destination, bytes);
     const auto generation = GuestMemory::MarkWritten(destination, bytes);
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> sourceRange{{{source, source + bytes}}};
     const bool sourceCurrent = bytes <= knownMax && generation != 0 && !recorder.PendingWriteOverlaps(source, bytes) && !recorder.PendingLabelIn(source, bytes) && !completionStoreOverlaps(source) && !Graphics::StorageTexture::AnyPendingOverlaps(sourceRange) && !Graphics::AnyShadowedOverlaps(sourceRange);

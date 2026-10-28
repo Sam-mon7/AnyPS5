@@ -179,6 +179,7 @@ void Driver::stop() {
     Graphics::ReportHostImports();
     device.Reset();
     replacedDevices.clear();
+    GuestMemory::CopybackDisarm();
     Graphics::FlushPipelineJournal();
     Graphics::ShutdownGuestBufferWorkers();
     Graphics::StopCompareHelpers();

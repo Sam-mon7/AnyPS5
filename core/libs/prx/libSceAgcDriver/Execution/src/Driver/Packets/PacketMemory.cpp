@@ -29,6 +29,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
     const auto interruptSelect = opcode == 0x49 ? (packet[2] >> 24u) & 7u : 0u;
     endOfPipeInterrupt = interruptSelect != 0 && interruptSelect != 3;
+    const GuestMemory::CopybackScope copyback(opcode == 0x49 || opcode == 0x47 ? GuestMemory::CopybackPath::Eop : GuestMemory::CopybackPath::Label);
     interruptDeferred = false;
     if (!drainAll && endOfPipeInterrupt) {
         const auto label = Pm4::DecodeLabelWrite(packet);
@@ -288,6 +289,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 }
 
 void Driver::dumpSampleCounters(std::uint64_t address) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Eop);
     std::uint64_t samples = 0;
     {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
@@ -368,6 +370,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
 }
 
 void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Label);
     constexpr std::size_t gpuStoreLimit = 65536;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -448,6 +451,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
 }
 
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt) {
+    const GuestMemory::CopybackScope copyback(endOfPipeInterrupt ? GuestMemory::CopybackPath::Eop : GuestMemory::CopybackPath::Label);
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();

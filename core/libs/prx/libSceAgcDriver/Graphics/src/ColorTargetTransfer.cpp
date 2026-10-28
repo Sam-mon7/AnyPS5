@@ -22,6 +22,7 @@ void ReadColorTarget(const ColorTarget& target, std::span<std::byte> destination
 }
 
 void WriteColorTarget(const ColorTarget& target, std::span<const std::byte> source) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Image);
     PerformanceTimer timing("ColorTarget.Write");
     const ColorTargetLayout layout(target.extent.width, target.extent.height, target.tileMode, target.elementBytes, target.pipeBankXor);
     Require(target.bytes == layout.Bytes() && source.size() == layout.LinearBytes(), "color target transfer size mismatch");

@@ -240,6 +240,7 @@ struct SlabCopies {
 // Records the copies as one command group into the active recorder's open batch (a waited batch
 // without one). `ranges` are the guest ranges copied, for the note and the hazard tracker.
 void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes) {
+    const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Shadow);
     const auto& context = shadow.context;
     using CommandClass = Recorder::CommandClass;
     auto* recorder = Recorder::Active();
@@ -272,8 +273,10 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     Recorder::CountBarriers(CommandClass::ShadowPublish);
     if (batch) {
         batch->SubmitAndWait();
+        if (GuestMemory::CopybackEnabled()) for (const auto& [begin, end] : ranges) GuestMemory::CopybackRecord(GuestMemory::CopybackPath::Shadow, begin, static_cast<std::size_t>(end - begin));
         return;
     }
+    if (GuestMemory::CopybackEnabled()) for (const auto& [begin, end] : ranges) recorder->ProfileCopyback(GuestMemory::CopybackPath::Shadow, begin, static_cast<std::size_t>(end - begin));
     recorder->EndGpuTiming(timing, bytes);
     recorder->MarkCovered(publishedAccess);
     for (const auto& entry : copies) recorder->Keep(entry.slab);

@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CopybackProfile.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
@@ -174,6 +175,7 @@ public:
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
     void OnComplete(std::function<void()> action);
+    void ProfileCopyback(GuestMemory::CopybackPath path, std::uint64_t address, std::size_t bytes) noexcept;
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
@@ -613,6 +615,12 @@ private:
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
+        struct Copyback {
+            GuestMemory::CopybackPath path;
+            std::uint64_t address;
+            std::size_t bytes;
+        };
+        std::vector<Copyback> copybacks;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
@@ -682,6 +690,8 @@ private:
             bool open = false;
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
+            std::uint64_t copybackAddress = 0;
+            GuestMemory::CopybackPath copybackPath = GuestMemory::CopybackPath::Label;
             std::vector<std::byte> bytes;
             std::vector<std::tuple<VkBuffer, VkDeviceSize, VkDeviceSize>> recorded;
             // The run's [gputime] range (leading barrier to trailing barrier) and its stored bytes.
@@ -695,6 +705,7 @@ private:
                 std::uint64_t address;
                 VkDeviceAddress dumpTarget = 0;
                 std::uint32_t dumpSegments = 0;
+                GuestMemory::CopybackPath copybackPath = GuestMemory::CopybackPath::Label;
                 std::uint64_t End() const;
             };
             std::vector<Queued> queued;
