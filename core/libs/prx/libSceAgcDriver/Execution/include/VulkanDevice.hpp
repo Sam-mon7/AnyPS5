@@ -348,6 +348,7 @@ public:
         bool epochReused = false;
         double ms = 0;
         double hookWaitMs = 0;
+        std::size_t fastFail = 255;
         std::uint64_t directRegions = 0, directBytes = 0, describedRanges = 0, describedBytes = 0, storageImages = 0, storageBytes = 0;
     };
     static bool TakeLastDispatchProof(DispatchProof& proof);

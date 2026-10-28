@@ -3574,6 +3574,10 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 }
 
+const char* ShaderResources::FastFailName(std::size_t reason) {
+    return reason < FastFailNames.size() ? FastFailNames[reason] : "none";
+}
+
 ShaderResources::ProofExtent ShaderResources::Extent() const {
     ProofExtent extent;
     for (const auto& region : directRegions) {
@@ -3845,6 +3849,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             reason = FastFail::Audit;
         }
         if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
+        if (report != nullptr) report->fastFail = static_cast<std::size_t>(reason);
         if (!fast) {
             countFullWalk(reason);
             if (!fullWalk()) {

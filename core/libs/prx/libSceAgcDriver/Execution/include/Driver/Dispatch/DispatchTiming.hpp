@@ -41,6 +41,7 @@ struct PendingDispatchPhases {
     std::size_t proofPath = 0, proofFailure = 0;
     double proofMs = 0, proofWaitMs = 0;
     std::array<std::uint64_t, 6> proofExtent{};
+    std::size_t proofFastFail = 255;
 };
 
 struct DispatchShaderTotals {
@@ -57,6 +58,7 @@ struct DispatchShaderTotals {
     std::array<std::uint64_t, 7> proofFailures{};
     double proofMs = 0, proofWaitMs = 0;
     std::array<std::uint64_t, 6> proofExtent{};
+    std::array<std::uint64_t, 12> proofFastFails{};
 };
 
 struct DispatchPhaseTiming {

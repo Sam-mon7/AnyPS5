@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include <algorithm>
 #include <numeric>
 #include <string>
@@ -59,6 +60,7 @@ void Driver::addDispatchShader(DispatchClass which, const PendingDispatchPhases&
             row.proofMs += pending.proofMs;
             row.proofWaitMs += pending.proofWaitMs;
             for (std::size_t i = 0; i < row.proofExtent.size(); ++i) row.proofExtent[i] += pending.proofExtent[i];
+            if (pending.proofFastFail < row.proofFastFails.size()) ++row.proofFastFails[pending.proofFastFail];
         }
     }
     if (ShaderProfileReportEnabled() && std::chrono::steady_clock::now() - dispatchShaderReport >= std::chrono::seconds(10)) reportDispatchShaders();
@@ -123,6 +125,12 @@ void Driver::reportDispatchShaders() {
                           row.proofMs * 1000 / static_cast<double>(row.proofs), row.proofWaitMs * 1000 / static_cast<double>(row.proofs),
                           per(row.proofExtent[0]), per(row.proofExtent[1]) / 1024, per(row.proofExtent[2]), per(row.proofExtent[3]) / 1024, per(row.proofExtent[4]), per(row.proofExtent[5]) / 1024);
             report += text;
+            report += "; fast proof failed on";
+            for (std::size_t reason = 0; reason < row.proofFastFails.size(); ++reason) {
+                if (row.proofFastFails[reason] == 0) continue;
+                std::snprintf(text, sizeof(text), " %s %llu", Graphics::ShaderResources::FastFailName(reason), static_cast<unsigned long long>(row.proofFastFails[reason]));
+                report += text;
+            }
         }
     }
     AgcDriver::ProfilePrint_nid_no_patch("[dispatch-shaders] %.1f s, %llu dispatch packets of %zu shaders, %.1f ms; slowest:%s\n", seconds, static_cast<unsigned long long>(packets), rows.size(), total, report.c_str());

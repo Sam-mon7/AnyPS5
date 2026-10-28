@@ -6180,7 +6180,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         counters.proofNs.fetch_add(static_cast<std::uint64_t>(proofNs), std::memory_order_relaxed);
         timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
         const auto extent = hit->resources->Extent();
-        lastDispatchProof() = {true, {proved, static_cast<std::size_t>(report.path), static_cast<std::size_t>(report.failure), report.epochReused, static_cast<double>(proofNs) / 1e6, Graphics::Recorder::ThreadWaitedMs() - waitedBefore,
+        lastDispatchProof() = {true, {proved, static_cast<std::size_t>(report.path), static_cast<std::size_t>(report.failure), report.epochReused, static_cast<double>(proofNs) / 1e6, Graphics::Recorder::ThreadWaitedMs() - waitedBefore, report.fastFail,
                                       extent.directRegions, extent.directBytes, extent.describedRanges, extent.describedBytes, extent.storageImages, extent.storageBytes}};
     }
     timer.phase(PhaseProof);

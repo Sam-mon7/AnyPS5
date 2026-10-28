@@ -790,6 +790,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 pending.proofFailure = proof.failure;
                 pending.proofMs = proof.ms;
                 pending.proofWaitMs = proof.hookWaitMs;
+                pending.proofFastFail = proof.fastFail;
                 pending.proofExtent = {proof.directRegions, proof.directBytes, proof.describedRanges, proof.describedBytes, proof.storageImages, proof.storageBytes};
             }
         }
