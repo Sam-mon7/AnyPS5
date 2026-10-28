@@ -10,6 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #ifdef _WIN32
 #include <process.h>
@@ -58,6 +59,81 @@ void writerCost() {
     std::filesystem::remove_all(directory);
 }
 
+void toggleCase(const std::string& name) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    const auto path = std::filesystem::temp_directory_path() / ("archb-control-" + std::to_string(getpid()) + ".txt");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::filesystem::remove(path); }
+    } cleanup{path};
+    setEnvironment("APS5_ARCHB_GATE_RUN", "1");
+    setEnvironment("APS5_ARCHB_GATE_NOOP", "0");
+    setEnvironment("APS5_ARCHB_GATE_DELAY_US", "0");
+    setEnvironment("APS5_ARCHB_TEST_RUNTIME_DEPENDENT", "0");
+    setEnvironment("APS5_ARCHB_CONTROL_FILE", name == "NoFileNoCost" ? nullptr : path.string().c_str());
+    Switches::Initialize();
+    const auto write = [&](const std::string& line, bool poll = true) {
+        std::ofstream(path, std::ios::binary | std::ios::trunc) << line << '\n';
+        if (poll) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            Switches::PollControl();
+        }
+    };
+    if (name == "SeqMonotonic") {
+        write("2 GATE_NOOP=1 GATE_DELAY_US=7000");
+        check(Switches::Enabled(Feature::GateNoop) && Switches::GateDelayMicros() == 7000, "initial toggle");
+        const auto start = std::chrono::steady_clock::now();
+        VideoOutTelemetry::ObservePresent(nullptr, 1, 0, 1);
+        check(std::chrono::steady_clock::now() - start >= std::chrono::microseconds(7000), "VideoOut did not read the shared delay");
+        write("2 GATE_NOOP=0 GATE_DELAY_US=0");
+        write("1 GATE_NOOP=0 GATE_DELAY_US=0");
+        check(Switches::Enabled(Feature::GateNoop) && Switches::GateDelayMicros() == 7000, "old sequence applied");
+        write("3 GATE_NOOP=0 GATE_DELAY_US=0");
+        check(!Switches::Enabled(Feature::GateNoop) && Switches::GateDelayMicros() == 0, "new sequence ignored");
+        const auto polls = Switches::ControlPolls();
+        Switches::PollControl();
+        check(Switches::ControlPolls() == polls, "poll rate exceeded");
+    } else if (name == "RefusesStartupOnly" || name == "RefusesUnknown") {
+        write(name == "RefusesStartupOnly" ? "1 GATE_NOOP=1 GATE_RUN=0" : "1 GATE_NOOP=1 UNKNOWN=1");
+        check(!Switches::Enabled(Feature::GateNoop) && Switches::Enabled(Feature::GateRun), "refused line partially applied");
+        for (const auto* invalid : {"2", "-1", "true", "01", ""}) {
+            write("2 GATE_NOOP=" + std::string(invalid) + " GATE_DELAY_US=1");
+            check(!Switches::Enabled(Feature::GateNoop) && Switches::GateDelayMicros() == 0, "invalid boolean applied");
+        }
+        for (const auto* invalid : {"-1", "1.0", "9223372036854775807", "18446744073709551616"}) {
+            write("2 GATE_NOOP=1 GATE_DELAY_US=" + std::string(invalid));
+            check(!Switches::Enabled(Feature::GateNoop), "invalid delay partially applied");
+        }
+        write("2 GATE_NOOP=1\n3 GATE_NOOP=0");
+        check(!Switches::Enabled(Feature::GateNoop), "multiple lines applied");
+        write("2 GATE_NOOP=1 GATE_NOOP=0");
+        check(!Switches::Enabled(Feature::GateNoop), "duplicate token applied");
+        write("1 GATE_NOOP=1");
+        check(Switches::Enabled(Feature::GateNoop), "refused sequence was consumed");
+    } else if (name == "PrerequisiteCascades") {
+        write("1 TEST_RUNTIME_DEPENDENT=1");
+        check(!Switches::Enabled(Feature::TestRuntimeDependent), "prerequisite-disabled switch applied");
+        write("1 GATE_NOOP=1 TEST_RUNTIME_DEPENDENT=1");
+        check(Switches::Enabled(Feature::TestRuntimeDependent), "runtime dependency enable");
+        write("2 GATE_NOOP=0");
+        check(!Switches::Enabled(Feature::GateNoop) && !Switches::Enabled(Feature::TestRuntimeDependent), "dependent did not turn off");
+    } else if (name == "NoFileNoCost") {
+        for (int i = 0; i < 10000; ++i) Switches::PollControl();
+        check(Switches::ControlPolls() == 0, "no-file path performed a stat");
+        check(!Switches::Enabled(Feature::GateNoop), "no-file path changed switches");
+    } else if (name == "AppliesAtBoundaryOnly") {
+        write("1 GATE_NOOP=1 GATE_DELAY_US=7000", false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        VideoOutTelemetry::ObservePresent(nullptr, 1, 0, 1);
+        check(!Switches::Enabled(Feature::GateNoop) && Switches::GateDelayMicros() == 0, "toggle applied away from driver boundary");
+        Switches::PollControl();
+        check(Switches::Enabled(Feature::GateNoop) && Switches::GateDelayMicros() == 7000, "boundary did not apply toggle");
+    } else {
+        throw std::runtime_error("unknown toggle case");
+    }
+}
+
 }
 
 void* operator new(std::size_t size) {
@@ -76,6 +152,11 @@ int main(int argc, char** argv) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
     try {
+        if (argc == 3 && std::string(argv[1]) == "--toggle") {
+            toggleCase(argv[2]);
+            std::printf("%s passed\n", argv[2]);
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--probe") {
             const std::string probe(argv[2]);
             if (probe == "video") {
@@ -138,6 +219,11 @@ int main(int argc, char** argv) {
         check(run("writer", "1").first == 0, "full-rate writer cost");
         setEnvironment("APS5_ARCHB_GATE_DELAY_US", "7000");
         check(run("delay", "1").first == 0, "delay sensitivity hook");
+        setEnvironment("ARCHB_TEST_LEGACY_DRIVER", "1");
+        check(run("delay", "1").first == 0, "C01 parent delay fallback");
+        setEnvironment("APS5_ARCHB_GATE_DELAY_US", "invalid");
+        check(run("delay", "1").first != 0, "C01 parent fallback accepted an invalid delay");
+        setEnvironment("ARCHB_TEST_LEGACY_DRIVER", nullptr);
         setEnvironment("APS5_ARCHB_GATE_DELAY_US", "invalid");
         check(run("delay", "0").first == 0, "disabled gate honours delay hook");
         std::filesystem::remove(output);

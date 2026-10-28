@@ -5,7 +5,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[5] / "tools"))
 
-from archb_gate_config import GateError, child_environment, counter_assertion, measured_environment, repair_pending, restore, sha256, snapshot, switch_assertion, write_json
+from archb_gate_config import GateError, alternating_plan, child_environment, counter_assertion, measured_environment, repair_pending, restore, sha256, snapshot, switch_assertion, validation_cache_key, write_json
 
 
 def fails(call, code):
@@ -50,6 +50,27 @@ def required_counter_zero_fails(directory):
     fails(lambda: counter_assertion(text, ["depth_overlap_clean_accepted"]), 22)
     fails(lambda: counter_assertion(text, ["does_not_exist"]), 22)
     assert counter_assertion(text + "[archb] depth_overlap_clean_accepted=7\n", ["depth_overlap_clean_accepted"])["depth_overlap_clean_accepted"] == 7
+
+
+def alternating_eligibility(directory):
+    control = {"build": directory, "libs": {"driver": "abc"}, "env": {"APS5_ARCHB_GATE_RUN": "1"}}
+    candidate = {**control, "env": {**control["env"], "APS5_ARCHB_GATE_NOOP": "1", "APS5_ARCHB_GATE_DELAY_US": "7000"}}
+    off = "[archb] switches GATE_RUN=1(env) GATE_NOOP=0(default)(rt) GATE_DELAY_US=0(default)(rt)\n"
+    on = "[archb] switches GATE_RUN=1(env) GATE_NOOP=1(env)(rt) GATE_DELAY_US=7000(env)(rt)\n"
+    result = alternating_plan(control, candidate, off, on)
+    assert result["eligible"] and result["candidate"] == {"GATE_NOOP": "1", "GATE_DELAY_US": "7000"}
+    assert switch_assertion(on, {"GATE_NOOP": "1", "GATE_DELAY_US": "7000"})["GATE_RUN"] == "1"
+    assert not alternating_plan(control, {**candidate, "build": str(Path(directory) / "other")}, off, on)["eligible"]
+    assert not alternating_plan(control, {**candidate, "libs": {"driver": "def"}}, off, on)["eligible"]
+    assert not alternating_plan(control, candidate, off.replace("(rt)", ""), on.replace("(rt)", ""))["eligible"]
+    assert not alternating_plan(control, {**candidate, "env": {**candidate["env"], "ANYPS5_GPU": "other"}}, off, on)["eligible"]
+    assert not alternating_plan(control, {**candidate, "env": {**candidate["env"], "APS5_ARCHB_CONTROL_FILE": "other"}}, off, on)["eligible"]
+    calibration = alternating_plan(control, control, off, off, True)
+    assert calibration["eligible"] and calibration["control"]["GATE_NOOP"] == "0" and calibration["candidate"]["GATE_NOOP"] == "1"
+    manifest = {"configurations": {"control": control}, "gpu": [{"name": "gpu", "driver": "1"}], "display": {"width": 640}, "windows": "test"}
+    key = validation_cache_key(manifest)
+    assert key == validation_cache_key(dict(reversed(list(manifest.items()))))
+    assert key != validation_cache_key({**manifest, "gpu": [{"name": "gpu", "driver": "2"}]})
 
 
 def fake_runtime(directory):

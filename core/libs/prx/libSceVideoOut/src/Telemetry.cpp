@@ -1,4 +1,5 @@
 #include "prx/libSceVideoOut/include/Telemetry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 
 #include <chrono>
 #include <charconv>
@@ -13,6 +14,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <dlfcn.h>
 #include <unistd.h>
 #endif
 
@@ -26,6 +28,35 @@ constexpr char ContractLevel[] = "v1-pad";
 
 constexpr auto DropReportInterval = std::chrono::seconds(10);
 constexpr std::size_t DefaultQueueCapacity = 4096;
+
+std::int64_t gateDelayMicros() {
+    using ReadDelay = std::int64_t (*)();
+    static const ReadDelay readDelay = []() -> ReadDelay {
+#ifdef APS5_ARCHB_SWITCHES_TEST
+        return std::getenv("ARCHB_TEST_LEGACY_DRIVER") == nullptr ? &AgcDriverGateDelayMicros_nid_no_patch : nullptr;
+#elif defined(_WIN32)
+        const auto driver = GetModuleHandleW(L"libSceAgcDriver.prx");
+        return driver == nullptr ? nullptr : reinterpret_cast<ReadDelay>(GetProcAddress(driver, "AgcDriverGateDelayMicros_nid_no_patch"));
+#else
+        return reinterpret_cast<ReadDelay>(dlsym(RTLD_DEFAULT, "AgcDriverGateDelayMicros_nid_no_patch"));
+#endif
+    }();
+    if (readDelay != nullptr) return readDelay();
+    static const auto delay = [] {
+        if (const char* path = std::getenv("APS5_ARCHB_CONTROL_FILE"); path != nullptr && *path != '\0') throw std::runtime_error("VideoOut: runtime gate requires the C01b driver");
+        const char* value = std::getenv("APS5_ARCHB_GATE_DELAY_US");
+        if (value == nullptr) return std::int64_t{0};
+        const std::string_view text(value);
+        std::int64_t micros = 0;
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), micros);
+        if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || micros < 0 || micros > INT64_MAX / 1000) {
+            std::fprintf(stderr, "[archb] invalid GATE_DELAY_US=%s\n", value);
+            std::exit(EXIT_FAILURE);
+        }
+        return micros;
+    }();
+    return delay;
+}
 
 std::int64_t steadyNanos() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -184,18 +215,7 @@ void ObservePresent(Writer* writer, std::uint64_t frame, double fps, std::int64_
         else if (frame == 1 || frame % 30 == 0) writer->EmitPresent(frame, fps);
     }
     if (!gate) return;
-    static const auto delay = [] {
-        const char* value = std::getenv("APS5_ARCHB_GATE_DELAY_US");
-        if (value == nullptr) return std::chrono::microseconds(0);
-        const std::string_view text(value);
-        std::int64_t micros = 0;
-        const auto result = std::from_chars(text.data(), text.data() + text.size(), micros);
-        if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || micros < 0 || micros > INT64_MAX / 1000) {
-            std::fprintf(stderr, "[archb] invalid GATE_DELAY_US=%s\n", value);
-            std::exit(EXIT_FAILURE);
-        }
-        return std::chrono::microseconds(micros);
-    }();
+    const auto delay = std::chrono::microseconds(gateDelayMicros());
     if (delay.count() != 0) std::this_thread::sleep_for(delay);
 }
 

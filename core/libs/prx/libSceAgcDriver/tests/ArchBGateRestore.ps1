@@ -30,6 +30,75 @@ function Change-FakeRuntime([string]$Directory) {
     }
 }
 
+if ($Case -eq 'AlternatingBlocks' -or $Case -eq 'Bisection') {
+    $testRoot = Join-Path $repository ('build/archb-alternating-' + [Guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $testRoot
+    try {
+        if ($Case -eq 'AlternatingBlocks') {
+            $stderrPath = Join-Path $testRoot 'stderr.log'
+            [IO.File]::WriteAllText($stderrPath, "[archb] toggle seq=1 t_ns=123 GATE_NOOP=1 GATE_DELAY_US=0`n")
+            Assert-True ((Wait-GateToggle @{ HasExited = $false } $testRoot 1) -eq 123) 'Toggle acknowledgement was not read'
+            [IO.File]::WriteAllText($stderrPath, "[archb] toggle refused seq=2 unknown FOO`n")
+            $refused = $false
+            try { $null = Wait-GateToggle @{ HasExited = $false } $testRoot 2 }
+            catch { $refused = $_.Exception.Data['GateCode'] -eq 21 }
+            Assert-True $refused 'Refused toggle did not fail with code 21'
+            $Mode = 'Child'
+            $BlockSeconds = 1
+            $script:fakeClock = 1000000000L
+            $script:screenshots = @()
+            function Get-GateClock { $script:fakeClock += 1000000000; return $script:fakeClock }
+            function Add-GateMemorySample { param($Process, $Directory, $LowSince) }
+            function Wait-GateToggle {
+                param($Process, $Directory, $Sequence)
+                $line = [IO.File]::ReadAllText((Join-Path $Directory 'control.txt'))
+                Assert-True ($line.StartsWith("$Sequence ")) 'Control sequence differs from acknowledgement request'
+                Assert-True ($line -notmatch '[^\x00-\x7f]') 'Control file is not ASCII'
+                return Get-GateClock
+            }
+            function Invoke-GatePython {
+                param($Tool, $Arguments, $AllowedCodes)
+                if ($Tool -eq 'archb_gate_nav.py') { $script:screenshots += $Arguments[-1]; return @{} }
+                $blocks = Get-Content -LiteralPath (Join-Path $testRoot 'blocks.json') -Raw | ConvertFrom-Json -AsHashtable
+                return @{ verdict = $(if ($blocks.Count -eq 24) { 'continue' } else { 'pass' }); code = 0; stage = $blocks.Count / 2 }
+            }
+            $low = $null
+            $decision = Invoke-GateBlocks @{} $testRoot @{ control = @{ GATE_NOOP = '0'; GATE_DELAY_US = '0' }
+                candidate = @{ GATE_NOOP = '1'; GATE_DELAY_US = '7000' } } ([ref]$low)
+            Assert-True ($decision.stage -eq 24) 'Alternation did not extend to 24 pairs'
+            $blocks = Get-Content -LiteralPath (Join-Path $testRoot 'blocks.json') -Raw | ConvertFrom-Json -AsHashtable
+            Assert-True ($blocks.Count -eq 48) 'Wrong block count'
+            for ($i = 0; $i -lt $blocks.Count; $i += 2) {
+                Assert-True ($blocks[$i].role -ne $blocks[$i + 1].role) 'Pair lacks a control or candidate'
+                Assert-True ($blocks[$i].end_seq -eq $blocks[$i + 1].start_seq) 'Pair boundary sequence differs'
+            }
+            Assert-True ($script:screenshots.Count -eq 4) 'Missing end-of-stage role screenshots'
+        } else {
+            $script:attempts = @()
+            function Invoke-GateLeg {
+                param($Configuration, $Label, $Kind, $Seconds, $Measured, $Alternation)
+                Assert-True (@($Alternation.control.Values | Where-Object { $_ -ne '0' }).Count -eq 0) 'Bisection control is not all off'
+                $script:attempts += $Alternation
+                return @{ directory = $testRoot; alternating = @{ code = $(if ($Alternation.candidate.GATE_NOOP -eq '1') { 1 } else { 0 }) } }
+            }
+            $configuration = @{ name = 'test'; env = @{}; expectSwitches = @{} }
+            $plan = @{ control = @{ GATE_NOOP = '0'; GATE_DELAY_US = '0' }; candidate = @{ GATE_NOOP = '1'; GATE_DELAY_US = '7000' }
+                metadata = @{ GATE_RUN = @{ value = '1'; runtime = $false }; GATE_NOOP = @{ value = '1'; runtime = $true }
+                              GATE_DELAY_US = @{ value = '7000'; runtime = $true } } }
+            $result = Invoke-GateBisection $configuration $plan
+            Assert-True ($result.status -eq 'reproduced' -and $result.switch -eq 'GATE_NOOP') 'Bisection did not isolate the failing switch'
+            Assert-True ($script:attempts.Count -le 3) 'Bisection repeated unnecessary boots'
+        }
+        Write-Output "$Case passed"
+    } finally {
+        $resolved = [IO.Path]::GetFullPath($testRoot)
+        $allowed = [IO.Path]::GetFullPath((Join-Path $repository 'build')).TrimEnd('\') + '\'
+        if (-not $resolved.StartsWith($allowed, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe alternating test cleanup path' }
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
+    exit 0
+}
+
 if ($Child) {
     $manifest = Save-FakeRuntime $Root
     Change-FakeRuntime $Root
