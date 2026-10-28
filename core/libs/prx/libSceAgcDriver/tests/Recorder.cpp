@@ -670,8 +670,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder, bool co
             resources->MarkGpuWrites(recorder);
             return start;
         };
-        const auto* flag = std::getenv("APS5_COMPUTE_CHAINS");
-        const bool enabled = Recorder::ComputeChainsEnabled() && flag != nullptr && std::string_view(flag) == "1";
+        const bool enabled = std::getenv("APS5_COMPUTE_CHAINS") != nullptr && Recorder::MergeBarriers();
         *block = 10;
         block[1024] = 20;
         Require(dispatch(direct, address, 1).deferred == enabled, "compute chain switch did not control the GPU producer");

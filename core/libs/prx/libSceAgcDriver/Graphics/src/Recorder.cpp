@@ -1611,16 +1611,17 @@ std::uint64_t Recorder::ReapsWithWork() {
 }
 
 bool Recorder::ComputeChainsEnabled() {
-    static const bool enabled = [] {
-        const auto one = [](const char* name) { const auto* value = std::getenv(name); return value != nullptr && std::string_view(value) == "1"; };
-        return one("APS5_COMPUTE_CHAINS") || one("APS5_DS_COMPUTE_CHAINS");
-    }();
+    static const bool enabled = std::getenv("APS5_COMPUTE_CHAINS") != nullptr || UnsafeComputeChainsRequested();
     return enabled && MergeBarriers();
 }
 
-bool Recorder::DsComputeChains(std::string_view titleId) {
-    static const bool enabled = [] { const auto* value = std::getenv("APS5_DS_COMPUTE_CHAINS"); return value != nullptr && std::string_view(value) == "1"; }();
-    return enabled && ComputeChainsEnabled() && (titleId == "PPSA01340" || titleId == "PPSA01341");
+bool Recorder::UnsafeComputeChainsRequested() {
+    static const bool requested = [] { const auto* value = std::getenv("APS5_UNSAFE_COMPUTE_CHAINS"); return value != nullptr && std::string_view(value) == "1"; }();
+    return requested;
+}
+
+bool Recorder::UnsafeComputeChains() {
+    return UnsafeComputeChainsRequested() && ComputeChainsEnabled();
 }
 
 bool Recorder::ComputeChainPacketBoundary(std::uint32_t header) {
@@ -1633,12 +1634,11 @@ void Recorder::NoteComputeHostAccess() {
     if (ComputeChainsEnabled()) computeHostEpoch.fetch_add(1, std::memory_order_relaxed);
 }
 
-Recorder::ComputeDispatchStart Recorder::BeginComputeDispatch(const PassAccess& access, bool eligible, std::string_view titleId) {
-    static const bool tracked = [] { const auto* value = std::getenv("APS5_COMPUTE_CHAINS"); return value != nullptr && std::string_view(value) == "1"; }();
+Recorder::ComputeDispatchStart Recorder::BeginComputeDispatch(const PassAccess& access, bool eligible) {
     ComputeDispatchStart result;
-    result.unchecked = DsComputeChains(titleId);
+    result.unchecked = UnsafeComputeChains();
     const auto valid = [](GuestRangeList ranges) { return std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
-    if (!ComputeChainsEnabled() || (!tracked && !result.unchecked) || !eligible || access.anyReads || access.anyWrites || !valid(access.reads) || !valid(access.writes)) {
+    if (!ComputeChainsEnabled() || !eligible || access.anyReads || access.anyWrites || !valid(access.reads) || !valid(access.writes)) {
         if (ComputeChainsEnabled() && DrawProfiled()) computeChainRejected.fetch_add(1, std::memory_order_relaxed);
         result.commands = Commands(&result.covered);
         return result;
