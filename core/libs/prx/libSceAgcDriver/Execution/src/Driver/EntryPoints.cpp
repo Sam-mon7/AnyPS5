@@ -141,6 +141,30 @@ extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait*
     return count;
 }
 
+extern "C" std::size_t AgcDriverDrawShaderProfile_nid_postfix(AgcDriver::DrawShaderProfileRow* rows, std::size_t capacity) {
+    const auto totals = AgcDriver::DriverDetail::Driver::Get().DrawShaderProfile(false);
+    const auto count = rows == nullptr ? 0 : std::min(capacity, totals.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& source = totals[i];
+        auto& row = rows[i];
+        row = {};
+        std::copy_n(source.identity.code.begin(), source.identity.programs, row.code);
+        std::copy_n(source.identity.stage.begin(), source.identity.programs, row.stage);
+        row.programs = source.identity.programs;
+        row.draws = source.draws;
+        row.drawn = source.drawn;
+        row.captures = source.captures;
+        row.commits = source.commits;
+        std::copy(source.ms.begin(), source.ms.end(), row.ms);
+        row.commitMs = source.commitMs;
+    }
+    return totals.size();
+}
+
+extern "C" void AgcDriverResetDrawShaderProfile_nid_postfix() {
+    AgcDriver::DriverDetail::Driver::Get().DrawShaderProfile(true);
+}
+
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix() {
     AgcDriver::DriverDetail::Driver::Get().WaitForPipelineJournal();
 }

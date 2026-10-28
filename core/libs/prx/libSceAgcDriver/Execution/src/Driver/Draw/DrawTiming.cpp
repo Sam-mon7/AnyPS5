@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
+#include <cstdlib>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -9,8 +11,38 @@ PendingDrawPhases& Driver::pendingDrawPhases() {
     return pending;
 }
 
-void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures) {
+bool DrawShaderProfileEnabled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_PROFILE_DRAW_SHADERS") != nullptr;
+    return enabled;
+}
+
+std::vector<DrawShaderTotals> Driver::DrawShaderProfile(bool reset) {
     std::lock_guard lock(drawPhasesMutex);
+    std::vector<DrawShaderTotals> rows;
+    rows.reserve(drawShaderTotals.size());
+    for (const auto& [identity, row] : drawShaderTotals) rows.push_back(row);
+    if (reset) drawShaderTotals.clear();
+    return rows;
+}
+
+void Driver::addDrawCommit(const DrawProgramIdentity& identity, double ms) {
+    std::lock_guard lock(drawPhasesMutex);
+    auto& row = drawShaderTotals[identity];
+    row.identity = identity;
+    row.commitMs += ms;
+    ++row.commits;
+}
+
+void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures, const DrawProgramIdentity& identity) {
+    std::lock_guard lock(drawPhasesMutex);
+    if (DrawShaderProfileEnabled()) {
+        auto& row = drawShaderTotals[identity];
+        row.identity = identity;
+        for (std::size_t i = 0; i < DrawDriverPhaseCount; ++i) row.ms[i] += ms[i];
+        ++row.draws;
+        if (drawn) ++row.drawn;
+        row.captures += captures;
+    }
     auto& totals = drawPhaseTotals;
     for (std::size_t i = 0; i < DrawDriverPhaseCount; ++i) totals.ms[i] += ms[i];
     ++totals.packets;

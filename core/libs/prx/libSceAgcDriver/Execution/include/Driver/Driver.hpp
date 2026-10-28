@@ -111,6 +111,7 @@ public:
     static std::uint64_t DispatchCacheBytes();
     static ShaderMemory::PendingWrite QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
     std::shared_ptr<const ShaderRegistry> RegisteredShaders();
+    std::vector<DrawShaderTotals> DrawShaderProfile(bool reset);
 
 private:
     friend class SampledReadScope;
@@ -208,7 +209,8 @@ private:
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
     static PendingDrawPhases& pendingDrawPhases();
-    void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures);
+    void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures, const DrawProgramIdentity& identity);
+    void addDrawCommit(const DrawProgramIdentity& identity, double ms);
     void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
     bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer = nullptr);
     static void traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue);
@@ -438,6 +440,7 @@ private:
 
     AgcDriver::Mutex drawPhasesMutex;
     DrawPhaseTotals drawPhaseTotals;
+    std::unordered_map<DrawProgramIdentity, DrawShaderTotals, DrawProgramIdentityHash> drawShaderTotals;
 
     std::map<std::uint32_t, QueueState> queues;
     std::map<std::uint32_t, std::shared_ptr<IVideoOutput>> outputs;
