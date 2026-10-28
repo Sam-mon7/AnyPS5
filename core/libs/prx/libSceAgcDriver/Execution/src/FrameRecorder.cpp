@@ -374,8 +374,8 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     auto& driver = DriverDetail::Driver::Get();
     auto [accepted, completed] = driver.SerialProgress();
     if (completed < accepted && (!added.empty() || !blocks.empty())) {
-        if (!driver.WaitIdleFor(std::chrono::seconds(10))) {
-            stop("stopped: the GPU work submitted before a memory delta did not finish within 10 s");
+        if (!driver.WaitIdleOrParkedFor(std::chrono::seconds(10))) {
+            stop("stopped: the GPU work submitted before a memory delta neither finished nor parked on a wait within 10 s");
             return;
         }
         std::tie(accepted, completed) = driver.SerialProgress();

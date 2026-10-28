@@ -259,6 +259,30 @@ bool Driver::WaitIdleFor(std::chrono::milliseconds timeout) {
     return idle;
 }
 
+bool Driver::WaitIdleOrParkedFor(std::chrono::milliseconds timeout) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    std::unique_lock lock(mutex);
+    const auto target = accepted;
+    const auto parked = [&] {
+        if (runningWorkers.load(std::memory_order_acquire) != 0 || completionsPending()) return false;
+        bool blocked = false;
+        for (const auto& [queue, worker] : workers) {
+            const bool waiting = awaitedSlots[queue == 0 ? 0 : queue - 0x20 + 1].address.load(std::memory_order_acquire) != 0;
+            if (!worker.pending.empty() && !waiting) return false;
+            blocked = blocked || waiting;
+        }
+        return blocked;
+    };
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    ++idleWaiters;
+    bool settled = false;
+    while (!(settled = failure != nullptr || stopping || completed >= target || parked()) && std::chrono::steady_clock::now() < deadline) changed.wait_for(lock, std::chrono::milliseconds(1));
+    --idleWaiters;
+    rethrowFailure();
+    checkStopping();
+    return settled;
+}
+
 std::vector<AwaitedWait> Driver::AwaitedWaits() {
     std::vector<AwaitedWait> result;
     for (const auto& slot : awaitedSlots) {
