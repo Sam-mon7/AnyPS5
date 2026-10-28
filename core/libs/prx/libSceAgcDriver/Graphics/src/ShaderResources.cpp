@@ -3654,7 +3654,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
 }
 
 ShaderResources::ResourceEpochProof ShaderResources::currentResourceEpochProof() {
-    return {GuestMemory::CollectEpoch(), GuestMemory::ResourceProofSerial(), StorageTexture::PendingSerial(), GuestMemory::TrackerGeneration(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), GuestArena::GuestArenaCommitGeneration_nid_postfix(), GuestMemory::ForgetSerial(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial(), DepthSurfacesReleased()};
+#ifdef _WIN32
+    const auto committed = GuestArena::GuestArenaCommitGeneration_nid_postfix();
+#else
+    const std::uint64_t committed = 0;
+#endif
+    return {GuestMemory::CollectEpoch(), GuestMemory::ResourceProofSerial(), StorageTexture::PendingSerial(), GuestMemory::TrackerGeneration(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), committed, GuestMemory::ForgetSerial(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial(), DepthSurfacesReleased()};
 }
 
 bool ShaderResources::canRememberResourceEpoch() const {
