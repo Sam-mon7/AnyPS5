@@ -3679,7 +3679,20 @@ bool ShaderResources::canRememberResourceEpoch() const {
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, bool epochProofs) {
+    const bool traceStages = report != nullptr && report->trace;
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
+    if (report != nullptr) report->trace = traceStages;
+    auto stageLap = traceStages ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    double stageWaited = traceStages ? Recorder::ThreadWaitedMs() : 0.0;
+    const auto markStage = [&](std::size_t stage) {
+        if (!traceStages) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto waited = Recorder::ThreadWaitedMs();
+        report->stageMs[stage] += std::chrono::duration<double, std::milli>(now - stageLap).count();
+        report->stageWaitMs[stage] += waited - stageWaited;
+        stageLap = now;
+        stageWaited = waited;
+    };
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3696,6 +3709,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
+    markStage(0);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto epochBefore = epochProofs ? currentResourceEpochProof() : ResourceEpochProof{};
@@ -3843,6 +3857,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         refreshed.clear();
         FastFail reason = FastFail::Count;
         bool accepted = false;
+        markStage(1);
         fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
         // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
         // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
@@ -3864,6 +3879,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             }
             if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
         }
+        markStage(2);
         if (fast && TemplateAuditDue(lastFullWalk)) {
             fast = false;
             ownRefreshed = false;
@@ -3909,6 +3925,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             }
         }
     }
+    markStage(3);
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
     // to guest memory first (as an upload does), then each import must still be the one the set was
     // written against. This comes last because the lookups and flushes above can reconcile imports
@@ -3953,6 +3970,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
+    markStage(4);
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
@@ -3986,6 +4004,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             if (profile) Revalidations().epochUnstable.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    markStage(5);
     return finish(fast, true);
 }
 

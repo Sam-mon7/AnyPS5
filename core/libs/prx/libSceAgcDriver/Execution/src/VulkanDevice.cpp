@@ -6174,7 +6174,26 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     const auto waitedBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Graphics::ShaderResources::ProofReport report;
+    static const std::uint64_t traceProofProgram = [] {
+        const auto* value = std::getenv("APS5_TRACE_PROOF_PROGRAM");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+    }();
+    report.trace = traceProofProgram != 0 && programAddress == traceProofProgram;
     const bool proved = hit->resources->ProveCurrent(shaders[0], &report);
+    if (report.trace) {
+        static std::atomic<std::uint64_t> traced{0};
+        const auto count = traced.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 12 || count % 50 == 0) {
+            static constexpr std::array<const char*, 6> stageNames{"pending cpu writes", "setup", "fast proof", "full walk", "imports", "staging and tail"};
+            std::string stages;
+            for (std::size_t stage = 0; stage < stageNames.size(); ++stage) {
+                char text[96];
+                std::snprintf(text, sizeof(text), " %s %.2f ms (waits %.2f)", stageNames[stage], report.stageMs[stage], report.stageWaitMs[stage]);
+                stages += text;
+            }
+            std::fprintf(stderr, "[proof-trace] #%llu program 0x%llx proved %d path %zu fast-fail %s:%s\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(programAddress), proved ? 1 : 0, static_cast<std::size_t>(report.path), Graphics::ShaderResources::FastFailName(report.fastFail), stages.c_str());
+        }
+    }
     if (profile) {
         const auto proofNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - proofStart).count();
         counters.proofNs.fetch_add(static_cast<std::uint64_t>(proofNs), std::memory_order_relaxed);

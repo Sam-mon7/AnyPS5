@@ -308,6 +308,9 @@ public:
         ProofFailure failure = ProofFailure::None;
         bool epochReused = false;
         std::size_t fastFail = 255;
+        bool trace = false;
+        std::array<double, 6> stageMs{};
+        std::array<double, 6> stageWaitMs{};
     };
     static const char* FastFailName(std::size_t reason);
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
