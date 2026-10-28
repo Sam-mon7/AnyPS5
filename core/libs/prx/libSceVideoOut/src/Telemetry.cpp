@@ -1,11 +1,13 @@
 #include "prx/libSceVideoOut/include/Telemetry.hpp"
 
 #include <chrono>
+#include <charconv>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 #ifdef _WIN32
@@ -154,9 +156,47 @@ bool Writer::EmitPad(std::uint64_t frame, const PadInputState& state) {
 }
 
 void Writer::EmitPresent(std::uint64_t frame, double fps) {
+    EmitPresent(frame, fps, steadyNanos());
+}
+
+void Writer::EmitPresent(std::uint64_t frame, double fps, std::int64_t timeNanos) {
     char text[96];
     std::snprintf(text, sizeof(text), ",\"n\":%llu,\"fps\":%.2f}\n", static_cast<unsigned long long>(frame), fps);
-    emit(head(steadyNanos(), "present") + text, false);
+    emit(head(timeNanos, "present") + text, false);
+}
+
+bool GateRunEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_GATE_RUN");
+        if (value == nullptr) return false;
+        if (std::string_view(value) == "0") return false;
+        if (std::string_view(value) == "1") return true;
+        std::fprintf(stderr, "[archb] invalid GATE_RUN=%s\n", value);
+        std::exit(EXIT_FAILURE);
+    }();
+    return enabled;
+}
+
+void ObservePresent(Writer* writer, std::uint64_t frame, double fps, std::int64_t timeNanos) {
+    const bool gate = GateRunEnabled();
+    if (writer != nullptr) {
+        if (gate) writer->EmitPresent(frame, fps, timeNanos);
+        else if (frame == 1 || frame % 30 == 0) writer->EmitPresent(frame, fps);
+    }
+    if (!gate) return;
+    static const auto delay = [] {
+        const char* value = std::getenv("APS5_ARCHB_GATE_DELAY_US");
+        if (value == nullptr) return std::chrono::microseconds(0);
+        const std::string_view text(value);
+        std::int64_t micros = 0;
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), micros);
+        if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || micros < 0 || micros > INT64_MAX / 1000) {
+            std::fprintf(stderr, "[archb] invalid GATE_DELAY_US=%s\n", value);
+            std::exit(EXIT_FAILURE);
+        }
+        return std::chrono::microseconds(micros);
+    }();
+    if (delay.count() != 0) std::this_thread::sleep_for(delay);
 }
 
 std::uint64_t Writer::Dropped() const {

@@ -134,6 +134,37 @@ void contractPadAndPresentLines() {
     std::filesystem::remove_all(directory);
 }
 
+void gatePresents(const std::string& mode) {
+    const auto directory = freshDirectory(mode.c_str());
+    const bool enabled = VideoOutTelemetry::GateRunEnabled();
+    check(enabled == (mode != "GateRunOffKeepsCadence"), "gate environment mismatch");
+    {
+        VideoOutTelemetry::Writer writer(directory.string(), 4096, "test");
+        for (std::uint64_t frame = 1; frame <= 65; ++frame) {
+            VideoOutTelemetry::ObservePresent(&writer, frame, 7.0, 1000000000 + frame * 140000000);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(writer.Dropped() == 0, "gate lost present events");
+    }
+    const auto lines = readLines(directory / "videoout.jsonl");
+    std::uint64_t presents = 0;
+    long long last = 0;
+    for (const auto& line : lines) {
+        if (line.find("\"ev\":\"present\"") == std::string::npos) continue;
+        ++presents;
+        const auto n = field(line, "n");
+        const auto timestamp = field(line, "t_ns");
+        check(timestamp > last, "present timestamps must increase");
+        if (enabled) check(timestamp == 1000000000 + n * 140000000, "gate timestamp must be the observation timestamp");
+        check(line.find("\"fps\":7.00") != std::string::npos, "present fields changed");
+        if (enabled) check(n == static_cast<long long>(presents), "missing full-rate frame");
+        else check(n == (presents == 1 ? 1 : (presents - 1) * 30), "old cadence changed");
+        last = timestamp;
+    }
+    check(presents == (enabled ? 65 : 3), "incorrect present cadence");
+    std::filesystem::remove_all(directory);
+}
+
 int frameNumberMatchesCaption() {
     const auto directory = freshDirectory("caption");
     std::filesystem::create_directories(directory / "app0" / "sce_sys");
@@ -174,6 +205,11 @@ int main(int argc, char** argv) {
             const int result = frameNumberMatchesCaption();
             if (result == 0) std::printf("VideoOut caption counter test passed\n");
             return result;
+        }
+        if (argc > 1) {
+            gatePresents(argv[1]);
+            std::printf("%s passed\n", argv[1]);
+            return 0;
         }
         padChangeIgnoresSensors();
         padChangeSurvivesFullQueue();
