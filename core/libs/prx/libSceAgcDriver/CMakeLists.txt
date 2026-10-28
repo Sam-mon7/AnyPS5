@@ -3525,6 +3525,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_linear_readback_label_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set_tests_properties(agc_driver_draw_shader_profile PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_DRAW=1;APS5_PROFILE_DRAW_SHADERS=1;APS5_PIPELINED_DRAWS=0" TIMEOUT 30)
+    add_test(NAME agc_driver_draw_shader_profile_pipelined COMMAND agc_driver_draw_shader_profile_tests --pipelined)
+    set_tests_properties(agc_driver_draw_shader_profile_pipelined PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_DRAW=1;APS5_PROFILE_DRAW_SHADERS=1;APS5_PIPELINED_DRAWS=8" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    add_test(NAME agc_driver_draw_shader_profile_off COMMAND agc_driver_draw_shader_profile_tests --off)
+    set_tests_properties(agc_driver_draw_shader_profile_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_driver_draw_shader_profile_pipelined agc_driver_draw_shader_profile_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_draw_cache_reuse_off COMMAND agc_driver_draw_cache_reuse_tests)
     set_tests_properties(agc_driver_draw_cache_reuse_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_driver_draw_cache_reuse_verify COMMAND agc_driver_draw_cache_reuse_tests)
@@ -3944,7 +3952,7 @@ if(BUILD_TESTING)
     set_target_properties(agc_driver_frame_replay_state_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_driver_frame_replay_state_tests)
     add_dependencies(agc_driver_frame_replay_state_tests agc_frame_replay)
-    foreach(mode IN ITEMS submits shader_output)
+    foreach(mode IN ITEMS submits shader_output profile_draws)
         add_test(NAME agc_driver_frame_replay_${mode} COMMAND ${CMAKE_COMMAND}
                 "-DTOOL=$<TARGET_FILE:agc_frame_replay>" "-DWRITER=$<TARGET_FILE:agc_driver_frame_replay_state_tests>"
                 "-DDIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-${mode}" "-DMODE=${mode}"

@@ -26,6 +26,7 @@
 #include <future>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <set>
 #include <memory>
 #include <mutex>
@@ -76,6 +77,7 @@ struct Options {
     std::size_t submits = 0;
     bool traceSerials = false;
     bool coldPipelines = false;
+    std::filesystem::path profileDraws;
 };
 
 class Frames {
@@ -639,7 +641,7 @@ struct Replay {
 
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict]\n"
-                         "                        [--repeat <n>] [--cold-pipelines] [--dump <address>:<bytes>:<file>]...\n"
+                         "                        [--repeat <n>] [--cold-pipelines] [--profile-draws <file>] [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
@@ -650,6 +652,9 @@ int usage() {
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
+                         "  --profile-draws <f> sets APS5_PROFILE_DRAW and APS5_PROFILE_DRAW_SHADERS and writes to <f> one JSON line per\n"
+                         "                      pass and draw program set: its draw packets and the worker's time in each driver draw\n"
+                         "                      phase, slowest first\n"
                          "  --shaders           replays nothing and maps no guest memory; lists each shader registration with its code\n"
                          "                      address, size and code hash as the snapshot and the captured writes before it hold them,\n"
                          "                      and how many registrations share that code\n"
@@ -816,42 +821,123 @@ private:
     std::vector<std::byte> data;
 };
 
-int listShaders(const Options& options) {
-    const FrameCaptureReader reader(options.directory);
+template<typename TVisit>
+void visitRegistrations(const FrameCaptureReader& reader, TVisit&& visit) {
     CapturedMemory memory(reader);
-    if (!options.shaderCode.empty()) std::filesystem::create_directories(options.shaderCode);
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind == FrameMemoryKind::Delta) groups[chunk.group].push_back(&chunk);
     }
     const auto& calls = reader.Calls();
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
-    std::map<std::uint64_t, std::size_t> copies;
-    std::size_t listed = 0, inWindow = 0, unreadable = 0;
     for (auto call = calls.begin(); call != calls.end(); ++call) {
         if (call->kind == FrameCallKind::Memory) {
             if (const auto found = groups.find(call->values.at(0)); found != groups.end()) memory.Apply(found->second);
             continue;
         }
         if (call->kind != FrameCallKind::RegisterShader) continue;
+        const bool window = frameStart != calls.end() && call > frameStart;
         const auto header = memory.Read(call->address, sizeof(Shader));
         if (!header) {
-            ++unreadable;
+            visit(*call, nullptr, nullptr, window);
             continue;
         }
         Shader fields{};
         std::memcpy(&fields, header->data(), sizeof(Shader));
         const auto code = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code)));
         const auto bytes = fields.shader_size != 0 ? memory.Read(code, fields.shader_size) : std::nullopt;
-        if (!bytes) {
-            ++unreadable;
-            continue;
+        visit(*call, &fields, bytes ? &*bytes : nullptr, window);
+    }
+}
+
+std::uint64_t registeredCode(const Shader& fields) {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code)));
+}
+
+std::map<std::uint64_t, std::uint64_t> codeHashes(const FrameCaptureReader& reader) {
+    std::map<std::uint64_t, std::uint64_t> hashes;
+    visitRegistrations(reader, [&](const FrameCall&, const Shader* fields, const std::vector<std::byte>* bytes, bool) {
+        if (fields != nullptr && bytes != nullptr) hashes[registeredCode(*fields)] = contentHash(bytes->data(), bytes->size());
+    });
+    return hashes;
+}
+
+const char* stageName(std::uint8_t stage) {
+    static constexpr std::array<const char*, 8> names{"compute", "vertex", "tessellation_control", "tessellation_evaluation", "geometry", "fragment", "local", "mesh"};
+    return stage < names.size() ? names[stage] : "unknown";
+}
+
+class DrawProfileWriter {
+public:
+    explicit DrawProfileWriter(std::filesystem::path path) : path(std::move(path)), file(this->path, std::ios::trunc) {
+        if (!file.is_open()) throw std::runtime_error("frame replay: cannot open " + this->path.string());
+    }
+
+    void SetHashes(std::map<std::uint64_t, std::uint64_t> codes) {
+        hashes = std::move(codes);
+    }
+
+    void Write(std::size_t pass) {
+        std::vector<AgcDriver::DrawShaderProfileRow> rows(AgcDriverDrawShaderProfile_nid_postfix(nullptr, 0));
+        for (;;) {
+            const auto count = AgcDriverDrawShaderProfile_nid_postfix(rows.data(), rows.size());
+            const bool complete = count <= rows.size();
+            rows.resize(count);
+            if (complete) break;
         }
+        AgcDriverResetDrawShaderProfile_nid_postfix();
+        const auto worker = [](const AgcDriver::DrawShaderProfileRow& row) { return std::accumulate(std::begin(row.ms), std::end(row.ms), 0.0); };
+        const auto total = [&](const AgcDriver::DrawShaderProfileRow& row) { return worker(row) + row.commitMs; };
+        std::sort(rows.begin(), rows.end(), [&](const auto& a, const auto& b) { return total(a) > total(b); });
+        for (const auto& row : rows) {
+            std::string line = "{\"pass\":" + std::to_string(pass) + ",\"programs\":[";
+            for (std::uint32_t index = 0; index < row.programs; ++index) {
+                char program[160];
+                const auto known = hashes.find(row.code[index]);
+                if (known != hashes.end()) std::snprintf(program, sizeof(program), "%s{\"stage\":\"%s\",\"code\":%llu,\"hash\":\"%016llx\"}", index == 0 ? "" : ",", stageName(row.stage[index]), static_cast<unsigned long long>(row.code[index]), static_cast<unsigned long long>(known->second));
+                else std::snprintf(program, sizeof(program), "%s{\"stage\":\"%s\",\"code\":%llu,\"hash\":null}", index == 0 ? "" : ",", stageName(row.stage[index]), static_cast<unsigned long long>(row.code[index]));
+                line += program;
+            }
+            const auto ms = worker(row);
+            char counts[256];
+            std::snprintf(counts, sizeof(counts), "],\"packets\":%llu,\"drawn\":%llu,\"captures\":%llu,\"commits\":%llu,\"ms\":%.3f,\"commit_ms\":%.3f,\"us_per_packet\":%.2f,\"phases_ms\":{", static_cast<unsigned long long>(row.draws), static_cast<unsigned long long>(row.drawn),
+                          static_cast<unsigned long long>(row.captures), static_cast<unsigned long long>(row.commits), ms, row.commitMs, row.draws == 0 ? 0.0 : (ms + row.commitMs) * 1000.0 / static_cast<double>(row.draws));
+            line += counts;
+            for (std::size_t phase = 0; phase < AgcDriver::DriverDetail::DrawDriverPhaseCount; ++phase) {
+                char value[64];
+                std::snprintf(value, sizeof(value), "%s\"%s\":%.3f", phase == 0 ? "" : ",", AgcDriver::DriverDetail::DrawDriverPhaseNames[phase], row.ms[phase]);
+                line += value;
+            }
+            line += "}}\n";
+            file << line;
+            if (!file) throw std::runtime_error("frame replay: cannot write " + path.string());
+        }
+        file.flush();
+        if (!file) throw std::runtime_error("frame replay: cannot flush " + path.string());
+    }
+
+private:
+    std::filesystem::path path;
+    std::map<std::uint64_t, std::uint64_t> hashes;
+    std::ofstream file;
+};
+
+int listShaders(const Options& options) {
+    const FrameCaptureReader reader(options.directory);
+    if (!options.shaderCode.empty()) std::filesystem::create_directories(options.shaderCode);
+    std::map<std::uint64_t, std::size_t> copies;
+    std::size_t listed = 0, inWindow = 0, unreadable = 0;
+    visitRegistrations(reader, [&](const FrameCall& call, const Shader* fields, const std::vector<std::byte>* bytes, bool window) {
+        if (fields == nullptr || bytes == nullptr) {
+            ++unreadable;
+            return;
+        }
+        const auto code = registeredCode(*fields);
         const auto hash = contentHash(bytes->data(), bytes->size());
         const auto copy = ++copies[hash];
         if (copy == 1 && !options.shaderCode.empty()) {
             char name[64];
-            std::snprintf(name, sizeof(name), "type%u-%016llx.bin", static_cast<unsigned>(fields.type), static_cast<unsigned long long>(hash));
+            std::snprintf(name, sizeof(name), "type%u-%016llx.bin", static_cast<unsigned>(fields->type), static_cast<unsigned long long>(hash));
             const auto path = options.shaderCode / name;
             std::ofstream file(path, std::ios::binary | std::ios::trunc);
             if (!file.is_open()) throw std::runtime_error("frame replay: cannot open " + path.string());
@@ -862,12 +948,11 @@ int listShaders(const Options& options) {
             file.close();
             if (!file) throw std::runtime_error("frame replay: cannot close " + path.string());
         }
-        const bool window = frameStart != calls.end() && call > frameStart;
         ++listed;
         inWindow += window ? 1 : 0;
-        std::printf("{\"ordinal\":%llu,\"in_window\":%s,\"header\":%llu,\"code\":%llu,\"bytes\":%u,\"type\":%u,\"hash\":\"%016llx\",\"copy\":%zu}\n", static_cast<unsigned long long>(call->ordinal), window ? "true" : "false",
-                    static_cast<unsigned long long>(call->address), static_cast<unsigned long long>(code), fields.shader_size, static_cast<unsigned>(fields.type), static_cast<unsigned long long>(hash), copy);
-    }
+        std::printf("{\"ordinal\":%llu,\"in_window\":%s,\"header\":%llu,\"code\":%llu,\"bytes\":%u,\"type\":%u,\"hash\":\"%016llx\",\"copy\":%zu}\n", static_cast<unsigned long long>(call.ordinal), window ? "true" : "false",
+                    static_cast<unsigned long long>(call.address), static_cast<unsigned long long>(code), fields->shader_size, static_cast<unsigned>(fields->type), static_cast<unsigned long long>(hash), copy);
+    });
     std::printf("{\"registrations\":%zu,\"in_window\":%zu,\"distinct_code\":%zu,\"unreadable\":%zu}\n", listed, inWindow, copies.size(), unreadable);
     std::fflush(stdout);
     return 0;
@@ -978,6 +1063,8 @@ double percentile(std::vector<double> values, double fraction) {
 }
 
 int run(const Options& options) {
+    std::optional<DrawProfileWriter> drawProfile;
+    if (!options.profileDraws.empty()) drawProfile.emplace(options.profileDraws);
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
@@ -996,6 +1083,11 @@ int run(const Options& options) {
     const auto journalSeconds = std::chrono::duration<double>(Clock::now() - journalStart).count();
     std::set<std::uint32_t> initialOutputs;
     for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
+    if (drawProfile) {
+        drawProfile->SetHashes(codeHashes(reader));
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriverResetDrawShaderProfile_nid_postfix();
+    }
     std::vector<Pass> passes;
     for (std::size_t pass = 0; pass < options.repeat && (pass == 0 || replay.unfinished == 0); ++pass) {
         if (pass > 0) {
@@ -1032,6 +1124,10 @@ int run(const Options& options) {
         measured.paceTimeouts = replay.paceTimeouts.load() - measured.paceTimeouts;
         measured.synthesized = replay.syntheticReleases.load() - measured.synthesized;
         passes.push_back(measured);
+        if (drawProfile) {
+            AgcDriverWaitIdle_nid_postfix();
+            drawProfile->Write(pass);
+        }
     }
     FrameCheck check;
     if (replay.unfinished == 0) {
@@ -1078,10 +1174,18 @@ void configureEnvironment(const Options& options) {
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
     _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", options.coldPipelines ? "" : "1");
+    if (!options.profileDraws.empty()) {
+        _putenv_s("APS5_PROFILE_DRAW", "1");
+        _putenv_s("APS5_PROFILE_DRAW_SHADERS", "1");
+    }
 #else
     unsetenv("APS5_FRAME_CAPTURE");
     if (options.coldPipelines) unsetenv("APS5_HEADLESS_PIPELINE_CACHE");
     else setenv("APS5_HEADLESS_PIPELINE_CACHE", "1", 1);
+    if (!options.profileDraws.empty()) {
+        setenv("APS5_PROFILE_DRAW", "1", 1);
+        setenv("APS5_PROFILE_DRAW_SHADERS", "1", 1);
+    }
 #endif
 }
 
@@ -1108,6 +1212,7 @@ int main(int argc, char** argv) {
             if (error != std::errc{} || end != value.data() + value.size() || options.submits == 0) return usage();
         } else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
+        else if (argument == "--profile-draws" && index + 1 < argc) options.profileDraws = argv[++index];
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;

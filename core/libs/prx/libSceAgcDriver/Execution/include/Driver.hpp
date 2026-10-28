@@ -7,6 +7,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "SceShaders.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 
 namespace AgcDriver {
 
@@ -18,6 +19,18 @@ struct AwaitedWait {
     std::uint64_t mask = 0;
     std::uint32_t function = 0;
     std::uint32_t bytes = 0;
+};
+
+struct DrawShaderProfileRow {
+    std::uint64_t code[DriverDetail::DrawProfilePrograms] = {};
+    std::uint8_t stage[DriverDetail::DrawProfilePrograms] = {};
+    std::uint32_t programs = 0;
+    std::uint64_t draws = 0;
+    std::uint64_t drawn = 0;
+    std::uint64_t captures = 0;
+    std::uint64_t commits = 0;
+    double ms[DriverDetail::DrawDriverPhaseCount] = {};
+    double commitMs = 0;
 };
 
 }
@@ -32,6 +45,8 @@ extern "C" void AgcDriverRequestScreenshot_nid_postfix();
 extern "C" void AgcDriverSuspendPoint_nid_postfix();
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed);
 extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait* waits, std::size_t capacity);
+extern "C" std::size_t AgcDriverDrawShaderProfile_nid_postfix(AgcDriver::DrawShaderProfileRow* rows, std::size_t capacity);
+extern "C" void AgcDriverResetDrawShaderProfile_nid_postfix();
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix();
 extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix();
 extern "C" std::uint64_t AgcDriverDispatchesRejectedAhead_nid_postfix();
