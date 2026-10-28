@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -121,6 +122,17 @@ std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 std::atomic<std::uint64_t> pendingScanCalls{0}, pendingScanQueries{0}, pendingScanCandidates{0}, pendingScanSkipped{0}, pendingIndexBuilds{0};
 
+enum class AliasRefusal : std::size_t { Context, Owners, Layout, Metadata, Depth, Padding, Range, Pending, Tracking, Writer, Swizzle, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(AliasRefusal::Count)> AliasRefusalNames{"context", "owners", "layout", "metadata", "depth", "padding", "range", "partial-pending", "tracking-or-store", "guest-access", "swizzle"};
+struct AliasReconcileProfile {
+    std::atomic<std::uint64_t> served{0}, copies{0}, windows{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AliasRefusal::Count)> refused{};
+};
+AliasReconcileProfile& AliasReconciliations() {
+    static AliasReconcileProfile profile;
+    return profile;
+}
+
 struct StorageTraffic {
     struct FlushSource {
         std::uint64_t count = 0;
@@ -188,6 +200,15 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto drawn = drawnPending();
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
+    auto& aliases = AliasReconciliations();
+    std::string refusals;
+    for (std::size_t i = 0; i < aliases.refused.size(); ++i) {
+        const auto count = take(aliases.refused[i]);
+        if (count == 0) continue;
+        std::snprintf(text, sizeof(text), " %s=%llu", AliasRefusalNames[i], count);
+        refusals += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[alias-reconcile] (10 s): served %llu, image copies %llu, retile windows avoided %llu, pre-store waits avoided 0 (guest access conflicts refused); refusals:%s\n", take(aliases.served), take(aliases.copies), take(aliases.windows), refusals.c_str());
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] pending scan (10 s): %llu calls, %llu queries, %llu candidate images examined, %llu image visits skipped by index, %llu index rebuilds\n", take(pendingScanCalls), take(pendingScanQueries), take(pendingScanCandidates), take(pendingScanSkipped), take(pendingIndexBuilds));
@@ -2292,6 +2313,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, 
     // flush below and the compare through the hook skip it).
     refreshing = this;
     NoteProved();
+    if (!scoped && reconcileAlias()) return false;
     auto alias = scoped ? std::shared_ptr<StorageTexture>{} : pendingAlias();
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     bool borrowPending = false;
@@ -4097,8 +4119,9 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         for (std::uint32_t unit = first; unit < first + count; ++unit) {
             if (!borrowedUnits[unit]) continue;
             borrowedUnits[unit] = false;
-            if (source->version != borrowedVersion || !source->layerPending[unit]) continue;
-            source->layerPending[unit] = false;
+            const auto sourceUnit = unit + borrowedUnitOffset;
+            if (source->version != borrowedVersion || !source->layerPending[sourceUnit]) continue;
+            source->layerPending[sourceUnit] = false;
             unitsSuperseded.fetch_add(1, std::memory_order_relaxed);
             superseded = true;
         }
@@ -6134,6 +6157,101 @@ void StorageTexture::supersedeHandedOver(std::uint32_t first, std::uint32_t coun
     if (std::none_of(handedUnits.begin(), handedUnits.end(), [](bool handed) { return handed; })) handedUnits.clear();
 }
 
+bool StorageTexture::reconcileAlias() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_GPU_ALIAS_RECONCILE");
+        return value != nullptr && std::strcmp(value, "1") == 0 && std::getenv("APS5_NO_ALIAS_BORROW") == nullptr;
+    }();
+    if (!enabled) return false;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    const auto others = overlappingPending(descriptor.baseAddress, bytes);
+    if (others.empty()) return false;
+    const bool profile = LookupOutcomes::Profiled();
+    const auto refuse = [&](AliasRefusal reason) {
+        if (profile) AliasReconciliations().refused[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    auto* recorder = Recorder::Active();
+    if (!GuestMemory::GpuMutex().HeldByThisThread() || recorder == nullptr || Recorder::InCompletion()) return refuse(AliasRefusal::Context);
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        if (others.size() != 1 || std::any_of(pending.flushing.begin(), pending.flushing.end(), [&](const StorageTexture* texture) { return texture->overlaps(descriptor.baseAddress, bytes); })) return refuse(AliasRefusal::Owners);
+    }
+    auto& source = *others.front();
+    const auto& from = source.descriptor;
+    if (descriptor.baseAddress == from.baseAddress && guestBytes == source.guestBytes && descriptor.width == from.width && descriptor.height == from.height && geometry.imageLayers == source.geometry.imageLayers) return false;
+    const auto thin = [](const GuestTextureResource& resource) { return resource.dimension == TextureDimension::k2D || resource.dimension == TextureDimension::k2DArray; };
+    if (!thin(descriptor) || !thin(from) || descriptor.mipCount != 1 || from.mipCount != 1 || descriptor.allocatedMipCount > 1 || from.allocatedMipCount > 1 || descriptor.baseLevel != 0 || from.baseLevel != 0 || descriptor.lastLevel != 0 || from.lastLevel != 0 || descriptor.baseArray != 0 || from.baseArray != 0 || descriptor.samples != 1 || from.samples != 1 || descriptor.tileMode != from.tileMode || descriptor.tileMode == TextureTileMode::kLinear || storageFormat != source.storageFormat || descriptor.format != from.format || context.device != source.context.device || !Cached() || !source.Cached()) return refuse(AliasRefusal::Layout);
+    if (descriptor.dccAddress != 0 || from.dccAddress != 0 || descriptor.fmaskCmaskAddress != 0 || from.fmaskCmaskAddress != 0 || uploadedKeys != DccKeys::Uncompressed || source.uploadedKeys != DccKeys::Uncompressed) return refuse(AliasRefusal::Metadata);
+    if (DepthSurfaceOverlaps(context.device, descriptor.baseAddress, guestBytes)) return refuse(AliasRefusal::Depth);
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    const auto block = ThinBlockLayout(descriptor.tileMode, elementBytes);
+    if (block[0] != 65536 || descriptor.width % block[1] != 0 || descriptor.height % block[2] != 0 || from.width % block[1] != 0 || from.height % block[2] != 0) return refuse(AliasRefusal::Padding);
+    if (!blockUnits || !source.blockUnits || descriptor.baseAddress < from.baseAddress || guestBytes > source.guestBytes || descriptor.baseAddress - from.baseAddress > source.guestBytes - guestBytes) return refuse(AliasRefusal::Range);
+    if (anyLayerPending() || source.drawnListed) return refuse(AliasRefusal::Pending);
+    const auto offset = static_cast<std::uint32_t>((descriptor.baseAddress - from.baseAddress) / 65536);
+    std::vector<std::uint64_t> generations(trackedLayers);
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (!source.layerPending[unit + offset]) return refuse(AliasRefusal::Pending);
+        generations[unit] = source.layerGeneration[unit + offset];
+        if (generations[unit] == 0) return refuse(AliasRefusal::Tracking);
+    }
+    const auto current = GuestMemory::CollectWritesUncached(descriptor.baseAddress, bytes);
+    std::vector<std::uint8_t> changed(trackedLayers);
+    if (current == 0 || !GuestMemory::Watched(descriptor.baseAddress, bytes) || !GuestMemory::ChangedBlocks(descriptor.baseAddress, bytes, generations, changed) || std::any_of(changed.begin(), changed.end(), [](auto value) { return value != GuestMemory::BlockUnchanged; })) return refuse(AliasRefusal::Tracking);
+    if (recorder->PendingWriterSerial(descriptor.baseAddress, bytes) != 0) return refuse(AliasRefusal::Writer);
+    const auto mode = EquationSwizzleMode(descriptor.tileMode);
+    const auto* equation = mode == 0 ? nullptr : FindTextureSwizzleEquation(mode, elementBytes);
+    if (mode != 0 && equation == nullptr) return refuse(AliasRefusal::Swizzle);
+    const auto constant = [&](std::uint32_t x, std::uint32_t y, std::uint32_t layer, std::uint32_t pipeBankXor) {
+        std::uint32_t value = pipeBankXor;
+        if (equation == nullptr) return std::uint32_t{0};
+        for (std::uint32_t bit = 0; bit < equation->bits.size(); ++bit) {
+            const auto pattern = equation->bits[bit];
+            const auto parity = std::popcount(x & (pattern & 0xfffu)) + std::popcount(y & ((pattern >> 12u) & 0xfffu)) + std::popcount(layer & (pattern >> 24u));
+            value ^= static_cast<std::uint32_t>(parity & 1) << bit;
+        }
+        return value;
+    };
+    std::vector<VkImageCopy> copies;
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        const auto sourceBlock = static_cast<std::uint64_t>(unit + offset) * 65536;
+        const auto targetBlock = static_cast<std::uint64_t>(unit) * 65536;
+        const auto sourceLayer = static_cast<std::uint32_t>(sourceBlock / source.geometry.layerBytes);
+        const auto targetLayer = static_cast<std::uint32_t>(targetBlock / geometry.layerBytes);
+        const auto sourceTile = sourceBlock % source.geometry.layerBytes / 65536;
+        const auto targetTile = targetBlock % geometry.layerBytes / 65536;
+        const auto sourceX = static_cast<std::uint32_t>(sourceTile % source.mips[0].blocksPerRow) * block[1];
+        const auto sourceY = static_cast<std::uint32_t>(sourceTile / source.mips[0].blocksPerRow) * block[2];
+        const auto targetX = static_cast<std::uint32_t>(targetTile % mips[0].blocksPerRow) * block[1];
+        const auto targetY = static_cast<std::uint32_t>(targetTile / mips[0].blocksPerRow) * block[2];
+        if (constant(sourceX, sourceY, sourceLayer, from.pipeBankXor) != constant(targetX, targetY, targetLayer, descriptor.pipeBankXor)) return refuse(AliasRefusal::Swizzle);
+        copies.push_back({{VK_IMAGE_ASPECT_COLOR_BIT, 0, sourceLayer, 1}, {static_cast<std::int32_t>(sourceX), static_cast<std::int32_t>(sourceY), 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, targetLayer, 1}, {static_cast<std::int32_t>(targetX), static_cast<std::int32_t>(targetY), 0}, {block[1], block[2], 1}});
+    }
+    const bool reused = borrowedFrom.lock() == others.front() && borrowedVersion == source.version && borrowedUnitOffset == offset && borrowedUnits.size() == trackedLayers && std::all_of(borrowedUnits.begin(), borrowedUnits.end(), [](bool value) { return value; });
+    if (!reused) {
+        borrowUnits(source, std::vector<bool>(trackedLayers, true), copies, offset);
+        layerGeneration.assign(trackedLayers, current);
+        refreshGeneration();
+        layerBehind.clear();
+        layerOriginal.assign(trackedLayers, false);
+        cancelStoredSaves();
+        generationBaseline.clear();
+    }
+    if (profile) {
+        auto& totals = AliasReconciliations();
+        totals.served.fetch_add(1, std::memory_order_relaxed);
+        if (!reused) totals.copies.fetch_add(1, std::memory_order_relaxed);
+        const std::pair<std::uint64_t, std::uint64_t> run{descriptor.baseAddress - from.baseAddress, descriptor.baseAddress - from.baseAddress + guestBytes};
+        const auto windows = reused ? 0 : source.sliceWindows(std::span(&run, 1)).size();
+        totals.windows.fetch_add(windows, std::memory_order_relaxed);
+        ++ThreadLookupOutcomes().work[LookupOutcomes::AliasReconciliations];
+        ThreadLookupOutcomes().work[LookupOutcomes::AliasWindowsAvoided] += windows;
+    }
+    return true;
+}
+
 std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
     static const bool disabled = std::getenv("APS5_NO_ALIAS_BORROW") != nullptr;
     if (disabled || !blockUnits) return nullptr;
@@ -6168,14 +6286,17 @@ void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
     }
 }
 
-std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vector<bool>& units) {
+std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vector<bool>& units, std::span<const VkImageCopy> copies, std::uint32_t sourceUnitOffset) {
     const auto runs = unitRuns(units);
-    const auto windows = sliceWindows(runs);
-    Require(!windows.empty(), "storage image borrows no unit");
     std::vector<VkImageCopy> regions;
-    for (const auto& window : windows) {
-        for (const auto& region : window.regions) regions.push_back({region.imageSubresource, region.imageOffset, region.imageSubresource, region.imageOffset, region.imageExtent});
+    if (copies.empty()) {
+        for (const auto& window : sliceWindows(runs)) {
+            for (const auto& region : window.regions) regions.push_back({region.imageSubresource, region.imageOffset, region.imageSubresource, region.imageOffset, region.imageExtent});
+        }
+    } else {
+        regions.assign(copies.begin(), copies.end());
     }
+    Require(!regions.empty(), "storage image borrows no unit");
     std::uint64_t bytes = 0;
     for (const auto& [begin, end] : runs) bytes += end - begin;
     auto* recorder = Recorder::Active();
@@ -6208,6 +6329,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barriers[0].image = source.image;
+    barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, source.descriptor.mipCount, 0, source.geometry.imageLayers};
     barriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barriers[1].image = image;
@@ -6224,11 +6346,12 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     if (batch) batch->SubmitAndWait();
     else recorder->EndGpuTiming(timing, bytes);
     countStorageUpload(3, bytes);
-    if (borrowedFrom.lock() != source.weak_from_this().lock() || borrowedUnits.size() != trackedLayers) {
+    if (borrowedFrom.lock() != source.weak_from_this().lock() || borrowedUnits.size() != trackedLayers || borrowedUnitOffset != sourceUnitOffset) {
         borrowedUnits.assign(trackedLayers, false);
         borrowedFrom = source.weak_from_this();
     }
     borrowedVersion = source.version;
+    borrowedUnitOffset = sourceUnitOffset;
     source.lent = true;
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
         if (units[unit]) borrowedUnits[unit] = true;

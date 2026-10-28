@@ -598,6 +598,7 @@ private:
     // stays responsible for storing them until this image's own results supersede them
     // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
     std::shared_ptr<StorageTexture> pendingAlias() const;
+    bool reconcileAlias();
     std::optional<DccKeys> clearHandOver();
     void supersedeHandedOver(std::uint32_t first, std::uint32_t count);
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,
@@ -617,7 +618,7 @@ private:
     // Whether the results the last hook skip left pending over its access (AccessKeptByCpu) are
     // still the pending ones and a write-back for the range would store them.
     bool skippedResultsInside(std::uint64_t address, std::size_t bytes) const;
-    std::uint64_t borrowUnits(StorageTexture& source, const std::vector<bool>& units);
+    std::uint64_t borrowUnits(StorageTexture& source, const std::vector<bool>& units, std::span<const VkImageCopy> copies = {}, std::uint32_t sourceUnitOffset = 0);
     void forgetBorrowed(std::uint32_t first, std::uint32_t count);
     bool clearByKeysFill(DccKeys keys, std::uint8_t key);
     bool overlaps(std::uint64_t address, std::size_t bytes) const;
@@ -691,6 +692,7 @@ private:
     // Units holding the alias's results (see pendingAlias), at the alias's version then.
     std::weak_ptr<StorageTexture> borrowedFrom;
     std::uint64_t borrowedVersion = 0;
+    std::uint32_t borrowedUnitOffset = 0;
     std::vector<bool> borrowedUnits;
     std::vector<std::pair<std::weak_ptr<StorageTexture>, std::uint64_t>> handedOver;
     std::vector<bool> handedUnits;
@@ -763,7 +765,7 @@ private:
 // flush rows lie inside the storage and sampled rows.
 struct LookupOutcomes {
     enum Kind : std::size_t { SampledFast, SampledFastMiss, SampledHitView, SampledHitClearedView, SampledHitSnapshot, SampledMadeView, SampledMadeSnapshot, StorageHit, StorageMade, RefreshUnchanged, RefreshCompared, RefreshProved, UploadDirect, UploadCpu, UploadClear, DccScan, PendingFlush, RefreshWait, RefreshProofCheck, RefreshCollect, RefreshFlush, RefreshValidate, CleanProof, FlushDepth, FlushGpuWait, Count };
-    enum Work : std::size_t { FlushCalls, FlushImages, FlushStorage, FlushDraw, FlushFill, FlushCopy, FlushShadowOnly, FlushDepthRanges, FlushWaits, WriteBackBytes, ShadowBytes, ImportBytes, CpuBytes, RetileWindows, ImageBufferRegions, LayoutTransitions, AliasCopies, AliasBytes, PendingAliasUnits, PendingAliasRefused, PendingAliasWriters, PendingAliasForeign, ForeignClearFill, ForeignOverwrite, ForeignPartial, ForeignRead, ForeignFullScissor, WorkCount };
+    enum Work : std::size_t { FlushCalls, FlushImages, FlushStorage, FlushDraw, FlushFill, FlushCopy, FlushShadowOnly, FlushDepthRanges, FlushWaits, WriteBackBytes, ShadowBytes, ImportBytes, CpuBytes, RetileWindows, ImageBufferRegions, LayoutTransitions, AliasCopies, AliasBytes, PendingAliasUnits, PendingAliasRefused, PendingAliasWriters, PendingAliasForeign, ForeignClearFill, ForeignOverwrite, ForeignPartial, ForeignRead, ForeignFullScissor, AliasReconciliations, AliasWindowsAvoided, WorkCount };
     static const char* Name(Kind kind);
     static bool Profiled();
     // Charges the time since `start` to `kind` on this thread and returns now.
