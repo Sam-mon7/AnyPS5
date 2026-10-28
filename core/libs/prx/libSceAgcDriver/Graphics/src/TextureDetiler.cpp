@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/TextureDetile_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/CmaskClear_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/TextureDetileImage_spv.h"
@@ -15,6 +16,8 @@
 #include <string>
 
 namespace AgcDriver::Graphics {
+
+std::span<const std::uint32_t> TextureAliasSpirv_nid_no_patch();
 
 namespace {
 
@@ -105,6 +108,11 @@ TextureDetiler::~TextureDetiler() {
 }
 
 void TextureDetiler::release() noexcept {
+    for (const auto pool : aliasDescriptorSets.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+    if (aliasPipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, aliasPipeline, nullptr);
+    if (aliasModule) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, aliasModule, nullptr);
+    if (aliasPipelineLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, aliasPipelineLayout, nullptr);
+    if (aliasDescriptorLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, aliasDescriptorLayout, nullptr);
     for (const auto pool : readbackDescriptorSets.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     for (const auto& entry : readbackPipelines) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, entry.second, nullptr);
     for (const auto shader : readbackModules) if (shader) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, shader, nullptr);
@@ -138,6 +146,128 @@ VkFormat TextureDetiler::ImageElementFormat(std::uint32_t elementBytes) {
         case 16: return VK_FORMAT_R32G32B32A32_UINT;
         default: return VK_FORMAT_UNDEFINED;
     }
+}
+
+std::optional<std::array<std::uint32_t, 32>> TextureDetiler::AliasEquations(std::uint32_t elementBytes) {
+    if (!std::has_single_bit(elementBytes) || elementBytes > 16) return std::nullopt;
+    const auto* equation = FindTextureSwizzleEquation(27, elementBytes);
+    if (equation == nullptr) return std::nullopt;
+    const auto block = ThinBlockLayout(TextureTileMode::kR64KBX, elementBytes);
+    const auto byteBits = std::countr_zero(elementBytes);
+    const auto xBits = std::countr_zero(block[1]);
+    const auto yBits = std::countr_zero(block[2]);
+    std::array<std::uint32_t, 16> rows{};
+    std::array<std::uint32_t, 32> result{};
+    std::copy(equation->bits.begin(), equation->bits.end(), result.begin());
+    for (std::uint32_t bit = 0; bit < 16; ++bit) {
+        rows[bit] = bit < byteBits ? 1u << bit : 0;
+        rows[bit] |= (equation->bits[bit] & ((1u << xBits) - 1u)) << byteBits;
+        rows[bit] |= ((equation->bits[bit] >> 12u) & ((1u << yBits) - 1u)) << (byteBits + xBits);
+        result[16 + bit] = 1u << bit;
+    }
+    for (std::uint32_t column = 0; column < 16; ++column) {
+        auto pivot = column;
+        while (pivot < 16 && (rows[pivot] & (1u << column)) == 0) ++pivot;
+        if (pivot == 16) return std::nullopt;
+        std::swap(rows[column], rows[pivot]);
+        std::swap(result[16 + column], result[16 + pivot]);
+        for (std::uint32_t row = 0; row < 16; ++row) {
+            if (row == column || (rows[row] & (1u << column)) == 0) continue;
+            rows[row] ^= rows[column];
+            result[16 + row] ^= result[16 + column];
+        }
+    }
+    return result;
+}
+
+TextureDetiler::AliasCoverage TextureDetiler::ClassifyAliasUnit(const GuestTextureResource& from, const GuestTextureResource& to, std::uint32_t unit) {
+    const auto bytes = BytesPerElement(from.format);
+    const auto equations = AliasEquations(bytes);
+    Require(equations.has_value() && from.tileMode == TextureTileMode::kR64KBX && to.tileMode == from.tileMode && BytesPerElement(to.format) == bytes, "alias coverage needs matching R_X elements");
+    const auto thin = [](const GuestTextureResource& resource) { return (resource.dimension == TextureDimension::k2D || resource.dimension == TextureDimension::k2DArray) && resource.baseLevel == 0 && resource.baseArray == 0 && resource.lastLevel == 0 && resource.allocatedMipCount <= 1 && resource.samples == 1 && resource.pipeBankXor < 65536; };
+    Require(thin(from) && thin(to), "alias coverage needs single-sample thin base views");
+    Require(from.mipCount == 1 && to.mipCount == 1 && to.baseAddress >= from.baseAddress && (to.baseAddress - from.baseAddress) % 65536 == 0 && ((from.pipeBankXor | to.pipeBankXor) & (bytes - 1u)) == 0, "alias coverage needs aligned single-level surfaces");
+    const auto source = DescribeSurface(from);
+    const auto target = DescribeSurface(to);
+    const auto offsetBytes = to.baseAddress - from.baseAddress;
+    const auto unitEnd = (std::uint64_t{unit} + 1) * 65536;
+    Require(!source.thick && !target.thick && source.layerBytes % 65536 == 0 && target.layerBytes % 65536 == 0 && source.layerBytes != 0 && target.layerBytes != 0 && unitEnd <= target.guestBytes && offsetBytes <= source.guestBytes && unitEnd <= source.guestBytes - offsetBytes, "alias coverage unit is outside its thin surfaces");
+    const auto block = ThinBlockLayout(from.tileMode, bytes);
+    const auto byteBits = std::countr_zero(bytes);
+    const auto xBits = std::countr_zero(block[1]);
+    const auto coordinates = [&](const GuestTextureResource& resource, const SurfaceGeometry& geometry, std::uint64_t index, std::uint32_t address) {
+        const auto units = geometry.layerBytes / 65536;
+        const auto layer = static_cast<std::uint32_t>(index / units);
+        const auto tile = index % units;
+        const auto x = static_cast<std::uint32_t>(tile % geometry.mips[0].blocksPerRow) * block[1];
+        const auto y = static_cast<std::uint32_t>(tile / geometry.mips[0].blocksPerRow) * block[2];
+        auto encoded = resource.pipeBankXor;
+        for (std::uint32_t bit = 0; bit < 16; ++bit) {
+            const auto mask = (*equations)[bit];
+            encoded ^= (std::popcount((x & (mask & 0xfffu)) ^ ((y << 12u) & (mask & 0xfff000u)) ^ ((layer << 24u) & (mask & 0xff000000u))) & 1u) << bit;
+        }
+        std::uint32_t decoded = 0;
+        for (std::uint32_t bit = 0; bit < 16; ++bit) decoded |= (std::popcount((address ^ encoded) & (*equations)[16 + bit]) & 1u) << bit;
+        return x + ((decoded >> byteBits) & (block[1] - 1u)) < resource.width && y + ((decoded >> (byteBits + xBits)) & (block[2] - 1u)) < resource.height && layer < geometry.imageLayers;
+    };
+    AliasCoverage result;
+    const auto offset = (to.baseAddress - from.baseAddress) / 65536;
+    for (std::uint32_t address = 0; address < 65536; address += bytes) {
+        const bool consumer = coordinates(to, target, unit, address);
+        const bool valid = coordinates(from, source, offset + unit, address);
+        if (consumer) result.consumer += bytes;
+        else if (valid) result.sourceOnly += bytes;
+        else result.padding += bytes;
+        if (consumer && valid) result.shared += bytes;
+    }
+    return result;
+}
+
+void TextureDetiler::DispatchAlias(VkCommandBuffer commands, VkImageView source, VkImageView target, VkBuffer mapping, std::uint64_t mappingBytes, const GuestTextureResource& from, const GuestTextureResource& to, std::uint32_t offset) {
+    Require(commands != VK_NULL_HANDLE && source != VK_NULL_HANDLE && target != VK_NULL_HANDLE && mapping != VK_NULL_HANDLE, "image alias reconciliation needs images, a mapping and active commands");
+    Require(from.tileMode == TextureTileMode::kR64KBX && to.tileMode == from.tileMode && BytesPerElement(from.format) == BytesPerElement(to.format), "image alias reconciliation needs matching R_X element layouts");
+    if (aliasPipeline == VK_NULL_HANDLE) {
+        const std::array<VkDescriptorSetLayoutBinding, 3> bindings{{
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+        }};
+        VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
+        if (aliasDescriptorLayout == VK_NULL_HANDLE) Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &aliasDescriptorLayout), "vkCreateDescriptorSetLayout image alias");
+        const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16 * sizeof(std::uint32_t)};
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &aliasDescriptorLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &range;
+        if (aliasPipelineLayout == VK_NULL_HANDLE) Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &pipelineLayoutInfo, nullptr, &aliasPipelineLayout), "vkCreatePipelineLayout image alias");
+        const auto code = TextureAliasSpirv_nid_no_patch();
+        if (aliasModule == VK_NULL_HANDLE) aliasModule = CreateShaderModule(context, code.data(), code.size_bytes(), "vkCreateShaderModule image alias");
+        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, aliasModule, "main", nullptr};
+        info.layout = aliasPipelineLayout;
+        auto cacheLock = context.LockPipelineCacheForUse();
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &info, nullptr, &aliasPipeline), "vkCreateComputePipelines image alias");
+    }
+    const auto set = allocateFrom(aliasDescriptorSets, aliasDescriptorLayout, {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128}}, "vkCreateDescriptorPool image alias", "vkAllocateDescriptorSets image alias", "vkResetDescriptorPool image alias");
+    const VkDescriptorBufferInfo buffer{mapping, 0, mappingBytes};
+    const std::array<VkDescriptorImageInfo, 2> images{{{VK_NULL_HANDLE, source, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, target, VK_IMAGE_LAYOUT_GENERAL}}};
+    std::array<VkWriteDescriptorSet, 3> writes{};
+    for (std::uint32_t i = 0; i < writes.size(); ++i) {
+        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, i, 0, 1, i == 0 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, i == 0 ? nullptr : &images[i - 1], i == 0 ? &buffer : nullptr, nullptr};
+    }
+    context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    const auto fromGeometry = DescribeSurface(from);
+    const auto toGeometry = DescribeSurface(to);
+    const auto bytes = BytesPerElement(from.format);
+    const auto block = ThinBlockLayout(from.tileMode, bytes);
+    const std::array<std::uint32_t, 16> push{from.width, from.height, static_cast<std::uint32_t>(fromGeometry.layerBytes / 65536), fromGeometry.mips[0].blocksPerRow, to.width, to.height, static_cast<std::uint32_t>(toGeometry.layerBytes / 65536), toGeometry.mips[0].blocksPerRow, toGeometry.imageLayers, offset, from.pipeBankXor, to.pipeBankXor, block[1], block[2], static_cast<std::uint32_t>(std::countr_zero(bytes)), static_cast<std::uint32_t>(std::countr_zero(block[1]))};
+    context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, aliasPipeline);
+    context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, aliasPipelineLayout, 0, 1, &set, 0, nullptr);
+    context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, aliasPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push.data());
+    context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, (to.width + 7u) / 8u, (to.height + 7u) / 8u, toGeometry.imageLayers);
 }
 
 VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image) {

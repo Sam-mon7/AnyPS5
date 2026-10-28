@@ -1,6 +1,8 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRIVER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRIVER_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
@@ -210,7 +212,7 @@ private:
     static PendingDrawPhases& pendingDrawPhases();
     void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures);
     void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
-    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer = nullptr, std::optional<std::uint64_t>* seenGeneration = nullptr);
+    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer = nullptr, std::optional<std::uint64_t>* seenGeneration = nullptr, std::uint64_t* recordStamp = nullptr);
     static void traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue);
     static std::array<WriteRecord, 16384>& writeHistory();
     static std::size_t& writeCursor();
@@ -340,7 +342,8 @@ private:
     static WaitOutcomes& waitOutcomes();
     static Graphics::Recorder::LateStatistics& lateCountsSeen();
     static EpochBumps& epochBumps();
-    static void bumpEpoch(std::uint64_t EpochBumps::*counter);
+    static void bumpEpoch(std::uint64_t EpochBumps::*counter, GuestMemory::CollectEpochSource source = GuestMemory::CollectEpochSource::Other, std::uint64_t producerFloor = 0);
+    static std::uint64_t entryWaitFloor(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received);
     static std::chrono::steady_clock::time_point& lastEpochBump();
     static std::deque<const std::uint32_t*>& releasedTails();
     void noteReleasedTails(const Submission& submission);

@@ -380,6 +380,7 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
     recordLabelsForPacket(localDevice.get(), queueId);
     phase(FillLabels);
     GuestMemory::CheckRange(reinterpret_cast<const void*>(base), bytes, 16, true);
+    if (noteMetadata && GuestMemory::CopybackDebugSkip(GuestMemory::CopybackPath::CopyHle)) return;
     phase(FillCheck);
     const auto coverage = Graphics::StorageTexture::ClassifyFill(base, bytes);
     if (profile) Graphics::StorageTexture::ProfilePendingFill(base, bytes);

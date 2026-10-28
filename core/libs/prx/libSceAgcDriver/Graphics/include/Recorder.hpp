@@ -25,6 +25,8 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver::GuestMemory { enum class CollectEntryReason; }
+
 namespace AgcDriver::Graphics {
 
 class Buffer;
@@ -375,6 +377,8 @@ public:
         // Taken under the late rule: `generation` is the oldest group generation of the dwords.
         bool late;
         std::uint64_t generation;
+        std::uint64_t collectFloor = 0;
+        std::uint64_t collectUnwatched = 0, collectMapping = 0;
     };
     // Why a lookup refused a late candidate (an entry with stamp <= afterStamp), for the trace.
     // BehindCompletion replaces the other reasons when the refused entry's value reaches memory
@@ -400,6 +404,7 @@ public:
     // of its own (every mutation holds both), so a WAIT_REG_MEM consults it without queueing behind
     // device work. Nothing is done under the table mutex but the lookup (it never takes the GPU mutex).
     static std::optional<LabelHit> LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal = nullptr);
+    static std::optional<LabelHit> LookupEntryLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, std::uint32_t queue, GuestMemory::CollectEntryReason& reason);
     // The value alone, for callers asking whether any label is pending in a dword (afterStamp 0).
     static std::optional<std::uint64_t> LookupLabelValue(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp);
     static bool WideLabelIn(std::uint64_t address, std::size_t bytes);
@@ -770,6 +775,8 @@ private:
         bool overwritten = false;
         // The value lands in memory only when the batch's completion actions run (LabelRefusal::BehindCompletion).
         bool behindCompletion = false;
+        std::uint64_t collectFloor = 0;
+        std::uint64_t collectUnwatched = 0, collectMapping = 0;
     };
     void readGpuTiming(Batch& batch);
     void beginSamples(Batch& batch);

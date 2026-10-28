@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CopybackProfile.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -18,8 +19,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <future>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -2061,6 +2064,92 @@ void CheckAdoptLatestEpoch() {
     Require(keptOwn, "adopting the newest collect epoch moved a thread off its own");
 }
 
+void CheckCollectSites() {
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(3 * Block));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 3 * Block);
+    Require(std::getenv("APS5_PROFILE_DRAW") != nullptr, "the caller work-count check needs profiling");
+    BumpCollectEpoch();
+    const ReadSiteScope site(ReadSite::DispatchPrepare);
+    const auto before = ThreadCollectedBytes();
+    Require(CollectWrites(base, Block) != 0, "the caller fixture was not collected");
+    const auto collected = ThreadCollectedBytes();
+    Require(collected - before == Block, "a memoized API miss did not count its walk");
+    Require(CollectWrites(base, Block) != 0, "the repeated caller fixture was unavailable");
+    const bool memo = std::getenv("APS5_NO_COLLECT_MEMO") == nullptr;
+    Require(ThreadCollectedBytes() - collected == (memo ? 0 : Block), "the caller fixture's memo hit counted a walk");
+    const auto uncached = ThreadCollectedBytes();
+    Require(CollectWritesUncached(base, 3 * Block) != 0 && ThreadCollectedBytes() - uncached == 3 * Block, "an uncached API call did not count its whole walk");
+    CopybackReport(1);
+}
+
+void CheckCollectEpochFloor() {
+    using Source = CollectEpochSource;
+    auto* memory = static_cast<volatile std::uint8_t*>(AllocateWatched(3 * Block));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const bool floorEnabled = std::getenv("APS5_NO_COLLECT_EPOCH_FLOOR") == nullptr;
+    const bool enabled = floorEnabled && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr;
+    BumpCollectEpoch(Source::Submission);
+    const auto initial = CollectWrites(base, Block);
+    Require(initial != 0, "the floor fixture was not collected");
+    memory[0] = 1;
+    std::promise<void> ready;
+    std::promise<std::uint64_t> recorded;
+    auto inherited = recorded.get_future();
+    std::uint64_t thirdFloor = 0, thirdEpoch = 0;
+    bool thirdWalked = false;
+    std::thread third([&] {
+        BumpCollectEpoch(Source::Submission);
+        ready.set_value();
+        const auto floor = inherited.get();
+        BumpCollectEpoch(Source::WaitLabel, floor);
+        thirdFloor = ThreadCollectFloor();
+        thirdEpoch = ThreadCollectEpoch();
+        const auto before = ThreadCollectedBytes();
+        Require(CollectWrites(base + 2 * Block, Block) != 0, "the third worker could not collect");
+        thirdWalked = ThreadCollectedBytes() - before == Block;
+    });
+    ready.get_future().wait();
+    std::uint64_t producerFloor = 0;
+    std::thread([&] {
+        BumpCollectEpoch(Source::Submission);
+        producerFloor = ThreadCollectFloor();
+    }).join();
+    const auto previousFloor = ThreadCollectFloor();
+    BumpCollectEpoch(Source::WaitLabel, producerFloor);
+    const auto consumerFloor = ThreadCollectFloor();
+    const bool propagated = consumerFloor >= previousFloor && consumerFloor >= producerFloor && (!floorEnabled || consumerFloor == producerFloor);
+    const auto beforeRequired = ThreadCollectedBytes();
+    const auto required = CollectWrites(base, Block);
+    const bool observed = required != 0 && !UnchangedSince(base, Block, initial) && ThreadCollectedBytes() - beforeRequired == Block;
+    const auto beforeReuse = ThreadCollectedBytes();
+    BumpCollectEpoch(Source::WaitLabel, producerFloor);
+    CollectWrites(base, Block);
+    const bool reused = ThreadCollectedBytes() - beforeReuse == (enabled ? 0 : Block);
+    CollectWrites(base + 2 * Block, Block);
+    recorded.set_value(ThreadCollectFloor());
+    third.join();
+    Require(propagated, "a producer's floor was not propagated monotonically");
+    Require(observed, "a CPU write before the producer's submission was missed");
+    Require(reused, "the floor or opt-out did not control cross-epoch reuse");
+    Require(thirdFloor >= consumerFloor && (!floorEnabled || thirdFloor == producerFloor), "the floor did not propagate across three workers");
+    Require(floorEnabled || thirdFloor == thirdEpoch, "the opt-out did not restore a full bump");
+    Require(thirdWalked, "one worker reused another worker's memo");
+    BumpCollectEpoch(Source::Submission);
+    const auto freshFloor = ThreadCollectFloor();
+    CollectWrites(base, Block);
+    BumpCollectEpoch(Source::WaitLabel, producerFloor);
+    Require(ThreadCollectFloor() >= freshFloor, "an older label moved the floor backwards");
+    BumpCollectEpoch(Source::WaitLabel, 0);
+    Require(std::getenv("APS5_NO_COLLECT_MEMO") != nullptr || ThreadCollectFloor() == ThreadCollectEpoch(), "an unknown producer did not fully invalidate");
+    const auto beforeCpu = CollectWrites(base, Block);
+    memory[0] = 2;
+    BumpCollectEpoch(Source::WaitEntry);
+    CollectWrites(base, Block);
+    Require(!UnchangedSince(base, Block, beforeCpu), "a CPU-signalled wait hid a preceding CPU write");
+    CopybackReport(1);
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2074,6 +2163,14 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--failed-collect-memo") {
             CheckFailedCollectMemo();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--collect-epoch-floor") {
+            CheckCollectEpochFloor();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--collect-sites") {
+            CheckCollectSites();
             return 0;
         }
 #ifdef _WIN32
