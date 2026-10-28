@@ -191,7 +191,16 @@ void changedUnits(const UnitShadow& shadow, std::uint64_t first, std::uint64_t l
     const auto begin = std::max(shadow.UnitBegin(first), shadow.importBase);
     const auto end = std::min(shadow.UnitBegin(last + 1), shadow.ImportEnd());
     if (end <= begin) return;
-    GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), std::span(shadow.generation).subspan(static_cast<std::size_t>(first), count), changed, cpu);
+    if (GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), std::span(shadow.generation).subspan(static_cast<std::size_t>(first), count), changed, cpu)) return;
+    for (auto unit = first; unit <= last; ++unit) {
+        if (shadow.generation[unit] == 0) continue;
+        const auto [unitBegin, unitEnd] = shadow.UnitRange(unit);
+        if (unitEnd <= unitBegin) continue;
+        const auto bytes = static_cast<std::size_t>(unitEnd - unitBegin);
+        if (GuestMemory::CollectWritesUncached(unitBegin, bytes) == 0) continue;
+        const auto k = static_cast<std::size_t>(unit - first);
+        GuestMemory::ChangedBlocks(unitBegin, bytes, std::span(shadow.generation).subspan(static_cast<std::size_t>(unit), 1), std::span(changed).subspan(k, 1), std::span(cpu).subspan(k, 1));
+    }
 }
 
 std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t firstUnit, std::uint32_t units) {
@@ -240,6 +249,7 @@ struct SlabCopies {
 // Records the copies as one command group into the active recorder's open batch (a waited batch
 // without one). `ranges` are the guest ranges copied, for the note and the hazard tracker.
 void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes) {
+    if (GuestMemory::CopybackDebugSkip(GuestMemory::CopybackPath::Shadow)) return;
     const GuestMemory::CopybackScope copyback(GuestMemory::CopybackPath::Shadow);
     const auto& context = shadow.context;
     using CommandClass = Recorder::CommandClass;
@@ -311,7 +321,7 @@ void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& co
 }
 
 // The publish of one shadow: `selected[k]` (k = unit - first) names the units the scope chose.
-std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t first, std::uint64_t last, const std::vector<std::uint8_t>& selected, PublishReason reason) {
+std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t first, std::uint64_t last, std::span<const std::uint8_t> selected, PublishReason reason) {
     auto& registry = Registry();
     std::vector<SlabCopies> copies;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -389,7 +399,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
     recordCopies(*shadow, copies, ranges, bytes);
-    if (ShadowVerify()) verifyPublished(*shadow, copies);
+    if (ShadowVerify() && !GuestMemory::CopybackDebugSkip(GuestMemory::CopybackPath::Shadow)) verifyPublished(*shadow, copies);
     return units;
 }
 
@@ -758,6 +768,10 @@ std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const
     Require(GuestMemory::GpuMutex().HeldByThisThread(), "shadow address sources require the GPU lock");
     auto& registry = Registry();
     std::shared_ptr<UnitShadow> shadow;
+    static const bool liveRuns = std::getenv("APS5_NO_SHADOW_ADDRESS_LIVE_RUNS") == nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> collectRuns;
+    std::uint64_t livePages = 0;
     std::uint64_t first = 0, last = 0;
     {
         std::lock_guard lock(registry.mutex);
@@ -771,14 +785,29 @@ std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const
         while (first <= last && !shadow->Live(first)) ++first;
         while (first <= last && !shadow->Live(last)) --last;
         if (first > last) return result;
+        if (liveRuns || profile) {
+            for (auto unit = first; unit <= last; ++unit) {
+                if (!shadow->Live(unit)) continue;
+                const auto [from, to] = shadow->UnitRange(unit);
+                if (profile) livePages += ((to + 4095) / 4096) - from / 4096;
+                if (!liveRuns) continue;
+                if (!collectRuns.empty() && collectRuns.back().second == from) collectRuns.back().second = to;
+                else collectRuns.emplace_back(from, to);
+            }
+        }
     }
     const auto walkBegin = shadow->UnitRange(first).first;
     const auto walkEnd = shadow->UnitRange(last).second;
-    GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+    if (!liveRuns) collectRuns.emplace_back(walkBegin, walkEnd);
+    std::uint64_t walkedPages = 0;
+    for (const auto& [from, to] : collectRuns) {
+        GuestMemory::CollectWritesUncached(from, static_cast<std::size_t>(to - from));
+        if (profile) walkedPages += ((to + 4095) / 4096) - from / 4096;
+    }
+    if (profile) GuestMemory::CountShadowAddressCollect(walkedPages, livePages, collectRuns.size());
     std::vector<std::uint8_t> fallback(static_cast<std::size_t>(last - first + 1), 0);
     bool publish = false;
     std::uint64_t bytes = 0, saved = 0, savedUnits = 0;
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     {
         std::lock_guard lock(registry.mutex);
         std::vector<std::uint8_t> changed, cpu;
@@ -812,7 +841,17 @@ std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const
             }
         }
     }
-    if (publish) publishUnits(shadow, first, last, fallback, PublishReason::Address);
+    if (publish) {
+        if (liveRuns) {
+            for (const auto& [from, to] : collectRuns) {
+                const auto runFirst = shadow->UnitOf(from);
+                const auto runLast = shadow->UnitOf(to - 1);
+                publishUnits(shadow, runFirst, runLast, std::span(fallback).subspan(static_cast<std::size_t>(runFirst - first), static_cast<std::size_t>(runLast - runFirst + 1)), PublishReason::Address);
+            }
+        } else {
+            publishUnits(shadow, first, last, fallback, PublishReason::Address);
+        }
+    }
     if (profile && bytes != 0) {
         Stats().addressHandoffs.fetch_add(1, std::memory_order_relaxed);
         Stats().addressReadBytes.fetch_add(bytes, std::memory_order_relaxed);

@@ -3561,6 +3561,7 @@ bool Recorder::ReadTracking() {
 }
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
+    if (DrawProfiled() && kind == ReadKind::AddressBased) GuestMemory::ProfileAliasRead(address, bytes, GuestMemory::AliasRead::AddressBased);
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
@@ -3569,6 +3570,9 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
+    if (DrawProfiled() && kind == ReadKind::AddressBased) {
+        for (const auto& [begin, end] : ranges) if (end > begin) GuestMemory::ProfileAliasRead(begin, static_cast<std::size_t>(end - begin), GuestMemory::AliasRead::AddressBased);
+    }
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
@@ -3591,6 +3595,9 @@ void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadK
     if (CaptureTrace::Enabled() || FlipReadCheck()) {
         NotePendingReads(*ranges, kind);
         return;
+    }
+    if (DrawProfiled() && kind == ReadKind::AddressBased) {
+        for (const auto& [begin, end] : *ranges) GuestMemory::ProfileAliasRead(begin, static_cast<std::size_t>(end - begin), GuestMemory::AliasRead::AddressBased);
     }
     ensureOpen();
     readsNoted.fetch_add(ranges->size(), std::memory_order_relaxed);
@@ -3726,7 +3733,7 @@ void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const 
         std::uint32_t value = 0;
         std::memcpy(&value, bytes.data() + offset, 4);
         const auto dword = address + offset;
-        labels.insert_or_assign(dword, LabelEntry{value, queue, stamp, &batch, 0, false, behindCompletion});
+        labels.insert_or_assign(dword, LabelEntry{value, queue, stamp, &batch, 0, false, behindCompletion, GuestMemory::ThreadCollectFloor(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix()});
         batch.labelDwords.push_back(dword);
         LabelGroupDwords().emplace_back(dword, stamp);
     }
@@ -3801,6 +3808,7 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
     LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max()};
     bool queued = false;
     bool candidate = false;
+    bool floorKnown = true;
     const auto tag = GuestMemory::GpuLockThreadTag();
     const auto refuse = [&](LabelRefusal reason, std::uint64_t LateStatistics::*counter, const LabelEntry& entry) {
         if (refusal != nullptr) *refusal = entry.behindCompletion ? LabelRefusal::BehindCompletion : reason;
@@ -3823,6 +3831,8 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
             }
         }
         if (entry == nullptr) return std::nullopt;
+        floorKnown = floorKnown && entry->batch != nullptr && !entry->overwritten && entry->collectFloor != 0;
+        hit.collectFloor = std::max(hit.collectFloor, entry->collectFloor);
         if (entry->stamp <= afterStamp) {
             // The late rule (see NoteLabel): counted in both modes, so a control run shows the population.
             if (!candidate) ++lateCounts.candidates;
@@ -3844,8 +3854,42 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
             hit.stamp = entry->stamp;
         }
     }
+    if (!floorKnown || queued || hit.late) hit.collectFloor = 0;
     if (!hit.late) hit.generation = 0;
     if (queued) queuedLabelHits.fetch_add(1, std::memory_order_relaxed);
+    return hit;
+}
+
+std::optional<Recorder::LabelHit> Recorder::LookupEntryLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, std::uint32_t queue, GuestMemory::CollectEntryReason& reason) {
+    using Reason = GuestMemory::CollectEntryReason;
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "entry label proof requires the GPU lock");
+    std::lock_guard tableLock(labelTableMutex);
+    reason = Reason::NoLabel;
+    if (labelTableOwner == nullptr || (bytes != 4 && bytes != 8) || address % 4 != 0) return std::nullopt;
+    const auto& recorder = *labelTableOwner;
+    LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max()};
+    const auto refuse = [&](Reason why) -> std::optional<LabelHit> { reason = why; return std::nullopt; };
+    for (std::size_t offset = 0; offset < bytes; offset += 4) {
+        const auto found = recorder.labels.find(address + offset);
+        if (found == recorder.labels.end() || found->second.batch == nullptr || found->second.overwritten) return refuse(Reason::NoLabel);
+        const auto& entry = found->second;
+        if (entry.queue == queue) return refuse(Reason::SameQueue);
+        if (entry.stamp <= afterStamp) return refuse(Reason::Late);
+        if (entry.collectFloor == 0) return refuse(Reason::UnknownFloor);
+        if (entry.generation == 0 || entry.behindCompletion || !entry.batch->submitted || recorder.fenceStatus(entry.batch->fence) != VK_SUCCESS) return refuse(Reason::NotLanded);
+        if (offset == 0) {
+            hit.queue = entry.queue;
+            hit.stamp = entry.stamp;
+            hit.collectUnwatched = entry.collectUnwatched;
+            hit.collectMapping = entry.collectMapping;
+        } else if (hit.collectUnwatched != entry.collectUnwatched || hit.collectMapping != entry.collectMapping) {
+            return refuse(Reason::ChangedKey);
+        }
+        hit.value |= static_cast<std::uint64_t>(entry.value) << (offset * 8u);
+        hit.collectFloor = std::max(hit.collectFloor, entry.collectFloor);
+        hit.generation = std::min(hit.generation, entry.generation);
+    }
+    reason = Reason::None;
     return hit;
 }
 
@@ -4238,7 +4282,7 @@ bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
     GuestMemory::TagGpuLockSite(lockSite);
     mutex.lock();
     Check(result, "vkWaitSemaphoresKHR label readback");
-    GuestMemory::BumpCollectEpoch();
+    GuestMemory::BumpCollectEpoch(GuestMemory::CollectEpochSource::Drain);
     if (RecorderAlive(myId)) FinishUpTo(serial);
     return true;
 }

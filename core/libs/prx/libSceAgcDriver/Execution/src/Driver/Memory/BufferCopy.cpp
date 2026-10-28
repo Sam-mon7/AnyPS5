@@ -244,6 +244,7 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         return false;
     }
 
+    if (GuestMemory::CopybackDebugSkip(GuestMemory::CopybackPath::CopyHle)) return true;
     const auto outcome = localDevice->CopyBuffer(destination, source, bytes, cpuMax, gpuMax, copyKnownValues() ? KnownValueMaxBytes : 0, programAddress, queueId, [&](std::span<const std::byte> value, std::uint64_t generation) { noteCopyWriter(programAddress, destination, destination + bytes, queueId, value, generation); });
     countCopy(outcome.path, bytes, started, locked, &outcome);
     if (traceCopy() && bytes <= cpuMax && outcome.path != CopyCpu) traceCopyRefused(outcome, source, destination, bytes, localDevice);

@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, std430) readonly buffer Mapping { uint data[]; } mapping;
+layout(set = 0, binding = 1) readonly uniform uimage2DArray sourceImage;
+layout(set = 0, binding = 2) writeonly uniform uimage2DArray targetImage;
+layout(push_constant) uniform Push {
+    uint sourceWidth;
+    uint sourceHeight;
+    uint sourceLayerUnits;
+    uint sourceBlocksPerRow;
+    uint targetWidth;
+    uint targetHeight;
+    uint targetLayerUnits;
+    uint targetBlocksPerRow;
+    uint targetLayers;
+    uint sourceUnitOffset;
+    uint sourceXor;
+    uint targetXor;
+    uint blockWidth;
+    uint blockHeight;
+    uint elementBits;
+    uint xBits;
+} params;
+
+uint encode(uvec2 p, uint layer) {
+    uint value = 0u;
+    for (uint bit = 0u; bit < 16u; ++bit) {
+        uint mask = mapping.data[bit];
+        uint selected = (p.x & (mask & 0xfffu)) ^ ((p.y << 12u) & (mask & 0xfff000u)) ^ ((layer << 24u) & (mask & 0xff000000u));
+        value |= uint(bitCount(selected) & 1) << bit;
+    }
+    return value;
+}
+
+void main() {
+    uvec3 p = gl_GlobalInvocationID;
+    if (p.x >= params.targetWidth || p.y >= params.targetHeight || p.z >= params.targetLayers) return;
+    uint targetUnit = p.z * params.targetLayerUnits + (p.y / params.blockHeight) * params.targetBlocksPerRow + p.x / params.blockWidth;
+    if (mapping.data[32u + targetUnit] == 0u) return;
+    uint sourceUnit = params.sourceUnitOffset + targetUnit;
+    uint layer = sourceUnit / params.sourceLayerUnits;
+    uint tile = sourceUnit % params.sourceLayerUnits;
+    uvec2 origin = uvec2(tile % params.sourceBlocksPerRow, tile / params.sourceBlocksPerRow) * uvec2(params.blockWidth, params.blockHeight);
+    uint tiled = encode(p.xy, p.z) ^ params.targetXor ^ encode(origin, layer) ^ params.sourceXor;
+    uint decoded = 0u;
+    for (uint bit = 0u; bit < 16u; ++bit) decoded |= uint(bitCount(tiled & mapping.data[16u + bit]) & 1) << bit;
+    uvec2 q = origin + uvec2((decoded >> params.elementBits) & (params.blockWidth - 1u), (decoded >> (params.elementBits + params.xBits)) & (params.blockHeight - 1u));
+    if (q.x >= params.sourceWidth || q.y >= params.sourceHeight) return;
+    imageStore(targetImage, ivec3(p), imageLoad(sourceImage, ivec3(q, layer)));
+}

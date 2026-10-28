@@ -3,7 +3,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include <cstring>
+#include <bit>
 #include <string>
 #include <string_view>
 
@@ -67,6 +69,82 @@ void reject(TAction action, std::string_view reason) {
 }
 
 void RunTextureDetilerTests(const Context& context, const TextureDetilerTestAccess& access) {
+    for (const auto bytes : {1u, 2u, 4u, 8u, 16u}) {
+        const auto equations = TextureDetiler::AliasEquations(bytes);
+        Require(equations.has_value(), "R_X alias equations are not invertible");
+        const auto block = ThinBlockLayout(TextureTileMode::kR64KBX, bytes);
+        const auto byteBits = std::countr_zero(bytes);
+        const auto xBits = std::countr_zero(block[1]);
+        for (std::uint32_t bit = 0; bit < 16; ++bit) {
+            const auto input = 1u << bit;
+            const auto x = (input >> byteBits) & (block[1] - 1u);
+            const auto y = (input >> (byteBits + xBits)) & (block[2] - 1u);
+            std::uint32_t address = input & (bytes - 1u);
+            for (std::uint32_t out = 0; out < 16; ++out) {
+                const auto mask = (*equations)[out];
+                address ^= static_cast<std::uint32_t>(std::popcount((x & (mask & 0xfffu)) ^ ((y << 12u) & (mask & 0xfff000u))) & 1) << out;
+            }
+            std::uint32_t decoded = 0;
+            for (std::uint32_t out = 0; out < 16; ++out) decoded |= static_cast<std::uint32_t>(std::popcount(address & (*equations)[16 + out]) & 1) << out;
+            Require(decoded == input, "R_X alias inverse does not recover an address basis vector");
+        }
+    }
+    Require(!TextureDetiler::AliasEquations(3).has_value() && !TextureDetiler::AliasEquations(32).has_value(), "invalid alias element sizes were accepted");
+    {
+        GuestTextureResource source{};
+        source.dimension = TextureDimension::k2DArray;
+        source.tileMode = TextureTileMode::kR64KBX;
+        source.format = 71;
+        source.width = 134;
+        source.height = 75;
+        source.depthOrLastArray = 71;
+        source.mipCount = source.allocatedMipCount = 1;
+        source.samples = 1;
+        auto target = source;
+        target.dimension = TextureDimension::k2D;
+        target.depthOrLastArray = 0;
+        target.width = 800;
+        target.height = 450;
+        for (const auto offset : {6u, 62u, 118u}) {
+            target.baseAddress = std::uint64_t{offset} * 65536;
+            std::array<std::uint64_t, 4> totals{};
+            for (const auto unit : {6u, 13u, 20u, 27u, 34u, 41u, 48u, 49u, 50u, 51u, 52u, 53u, 54u, 55u}) {
+                const auto coverage = TextureDetiler::ClassifyAliasUnit(source, target, unit);
+                Require(coverage.consumer + coverage.sourceOnly + coverage.padding == 65536 && coverage.shared <= coverage.consumer, "edge coverage is not a byte partition");
+                totals[0] += coverage.consumer;
+                totals[1] += coverage.sourceOnly;
+                totals[2] += coverage.padding;
+                totals[3] += coverage.shared;
+            }
+            Require(totals == (offset == 62 ? std::array<std::uint64_t, 4>{127488, 261904, 528112, 45360} : std::array<std::uint64_t, 4>{127488, 263952, 526064, 43312}), "R_X family edge bytes lost their layer XOR");
+        }
+        target.baseAddress = 6 * 65536;
+        target.pipeBankXor = 2048;
+        const auto shifted = TextureDetiler::ClassifyAliasUnit(source, target, 6);
+        Require(shifted.consumer == 16384 && shifted.consumer + shifted.sourceOnly + shifted.padding == 65536, "pipe XOR changed the consumer extent");
+        const auto* equation = FindTextureSwizzleEquation(27, 8);
+        const auto encode = [&](std::uint32_t x, std::uint32_t y, std::uint32_t layer) {
+            const auto input = x | (y << 12u) | (layer << 24u);
+            std::uint32_t address = 0;
+            for (std::uint32_t bit = 0; bit < 16; ++bit) address |= (std::popcount(input & equation->bits[bit]) & 1u) << bit;
+            return address;
+        };
+        std::array<bool, 8192> consumer{}, valid{};
+        for (std::uint32_t y = 64; y < 128; ++y) for (std::uint32_t x = 768; x < 800; ++x) consumer[(encode(x, y, 0) ^ target.pipeBankXor) / 8] = true;
+        for (std::uint32_t y = 64; y < 75; ++y) for (std::uint32_t x = 128; x < 134; ++x) valid[(encode(x, y, 4) ^ source.pipeBankXor) / 8] = true;
+        TextureDetiler::AliasCoverage forward;
+        for (std::size_t index = 0; index < consumer.size(); ++index) {
+            if (consumer[index]) forward.consumer += 8;
+            else if (valid[index]) forward.sourceOnly += 8;
+            else forward.padding += 8;
+            if (consumer[index] && valid[index]) forward.shared += 8;
+        }
+        const auto inverse = TextureDetiler::ClassifyAliasUnit(source, target, 13);
+        Require(forward.consumer == inverse.consumer && forward.sourceOnly == inverse.sourceOnly && forward.padding == inverse.padding && forward.shared == inverse.shared, "inverse alias coverage differs from forward-address enumeration");
+        reject([&] { TextureDetiler::ClassifyAliasUnit(source, target, 56); }, "outside");
+        target.baseAddress += 1;
+        reject([&] { TextureDetiler::ClassifyAliasUnit(source, target, 0); }, "aligned");
+    }
     TextureDetiler detiler(context);
     const auto commands = reinterpret_cast<VkCommandBuffer>(static_cast<std::uintptr_t>(1));
     const auto source = access.makeBuffer(4096);

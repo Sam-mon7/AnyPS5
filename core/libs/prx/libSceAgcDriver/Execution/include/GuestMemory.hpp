@@ -94,22 +94,12 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std:
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source);
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
-// Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
-// returns the current generation instead. A guest write landing between two collects of the same
-// epoch is seen by the next epoch, which is the ordering real hardware gives a CPU write made while a
-// submission runs. The driver's own writes (Write, WriteChanged, MarkWritten) stamp their blocks, so
-// they are never hidden. APS5_NO_COLLECT_MEMO=1 disables the memo. CollectWritesUncached always walks:
-// for decisions about which blocks the CPU wrote while a GPU result was pending (a stale answer there
-// stores old texels over reused memory).
-// The epoch is per queue worker: BumpCollectEpoch advances the calling thread's epoch to a value no
-// other thread ever holds (one worker's walk never satisfies another's check) at the hardware
-// ordering points of its queue: the start of a submission, a WAIT_REG_MEM the CPU may have satisfied
-// (at entry, polled, timed out, or by another queue's recorded label; a label this queue recorded
-// itself orders no CPU write), a device drain, and before reaping completions outside a submission.
-// A thread that never bumps (the presenter, game threads inside the flush hook) gets a fresh epoch
-// for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
-// workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
-void BumpCollectEpoch();
+enum class CollectEpochSource { Other, Submission, WaitEntry, WaitPolled, WaitTimeout, WaitLabel, Drain, Reap, Packet, Count };
+enum class CollectEntryReason { None, NoLabel, SameQueue, Late, UnknownFloor, CpuStore, NotLanded, ValueMismatch, ChangedKey, LockBusy, Unwatched, Disabled, Count };
+void BumpCollectEpoch(CollectEpochSource source = CollectEpochSource::Other, std::uint64_t producerFloor = 0);
+void CountCollectEntryReason(CollectEntryReason reason);
+std::uint64_t ThreadCollectFloor();
+void CountShadowAddressCollect(std::uint64_t walkedPages, std::uint64_t livePages, std::uint64_t walks);
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 std::uint64_t ResourceProofSerial();
@@ -132,7 +122,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
 // range's pages first (a game store not collected yet becomes a block stamp), then the compare over
 // the stamps collects make (dirty pages), not the MarkWritten stamps of the driver's own GPU label
 // records, which share the title's label blocks. False when the arena is not write-watched.
-bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation, bool* collected = nullptr);
 // Per 64 KiB tracker block of [address, address + bytes) (block 0 holds `address`): `changed[k]`
 // receives whether the block was stamped after generations[k] (UnchangedSince over that block
 // alone), `cpu[k]`, when given, whether a collect stamped it after (a CPU store, as
@@ -257,6 +247,9 @@ const char* ReadSiteName(ReadSite site);
 // Sets the calling thread's read site and returns the previous one (nested scopes restore it).
 ReadSite SetReadSite(ReadSite site);
 ReadSite CurrentReadSite();
+enum class AliasRead : std::uint8_t { Driver, Host, AddressBased, Image, Forget };
+void SetAliasProfileHooks(void (*read)(std::uint64_t, std::size_t, AliasRead), void (*report)(std::uint64_t));
+void ProfileAliasRead(std::uint64_t address, std::size_t bytes, AliasRead kind);
 class ReadSiteScope {
 public:
     explicit ReadSiteScope(ReadSite site) : previous(SetReadSite(site)) {}

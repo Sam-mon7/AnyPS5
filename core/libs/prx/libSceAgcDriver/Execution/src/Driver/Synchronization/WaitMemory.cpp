@@ -144,8 +144,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
     struct EpochPoint {
         bool bump;
+        GuestMemory::CollectEpochSource source = GuestMemory::CollectEpochSource::Other;
+        std::uint64_t floor = 0;
+        bool timedOut = false;
         ~EpochPoint() {
-            if (bump) bumpEpoch(&EpochBumps::waits);
+            if (bump) bumpEpoch(&EpochBumps::waits, timedOut ? GuestMemory::CollectEpochSource::WaitTimeout : source, timedOut ? 0 : floor);
         }
     } epochPoint{!heldAtSubmit || requireMemory || !epochCovered};
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
@@ -167,6 +170,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     };
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
+        epochPoint.source = GuestMemory::CollectEpochSource::WaitEntry;
+        if (epochPoint.bump) epochPoint.floor = entryWaitFloor(packet, queue, received);
         ++outcomes.atEntry;
         finishProfile(Graphics::Recorder::WaitEnd::Entry);
         return;
@@ -175,10 +180,21 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         finishProfile(Graphics::Recorder::WaitEnd::Held);
         return;
     }
+    const auto recordedFloor = [&](std::uint32_t writer, std::uint64_t stamp) {
+        const auto hit = Graphics::Recorder::LookupLabel(awaited, awaitedBytes, received);
+        if (hit.has_value() && hit->queue == writer && hit->stamp == stamp && Pm4::WaitComparesValue(packet, hit->value)) {
+            epochPoint.source = GuestMemory::CollectEpochSource::WaitLabel;
+            epochPoint.floor = hit->collectFloor;
+        }
+    };
     std::optional<std::uint64_t> historyGeneration;
-    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
+    std::uint64_t historyStamp = 0;
+    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration, &historyStamp)) {
         submitWriter(writer);
-        if (writer != queue) notePendingWait(packet, queue, received);
+        if (writer != queue) {
+            recordedFloor(writer, historyStamp);
+            notePendingWait(packet, queue, received);
+        }
         else epochPoint.bump = false;
         finishProfile(Graphics::Recorder::WaitEnd::History);
         return;
@@ -223,6 +239,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             ++outcomes.fromRecorderSameQueue;
             if (!hit->late) epochPoint.bump = false;
         } else {
+            epochPoint.source = GuestMemory::CollectEpochSource::WaitLabel;
+            epochPoint.floor = hit->collectFloor;
             notePendingWait(packet, queue, received);
         }
         if (Timeline::Enabled) {
@@ -381,9 +399,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::uint32_t polls = 0;
     StallWatch stall(queue);
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
-        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
+        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration, &historyStamp)) {
             submitWriter(writer);
-            if (writer != queue) notePendingWait(packet, queue, received);
+            if (writer != queue) {
+                recordedFloor(writer, historyStamp);
+                notePendingWait(packet, queue, received);
+            }
             else epochPoint.bump = false;
             finishProfile(Graphics::Recorder::WaitEnd::History);
             return;
@@ -424,6 +445,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
         if (!warned && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(waitTimeoutMs())) {
             warned = true;
+            epochPoint.timedOut = true;
+            epochPoint.source = GuestMemory::CollectEpochSource::WaitTimeout;
             ++outcomes.timedOut;
             {
                 static std::mutex reportedMutex;
@@ -458,6 +481,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             context.Print(stderr, "[gpu]   preceding packet %s\n");
         }
     }
+    epochPoint.source = warned ? GuestMemory::CollectEpochSource::WaitTimeout : GuestMemory::CollectEpochSource::WaitPolled;
+    epochPoint.floor = 0;
     ++outcomes.polled;
     if (timelineWait.end != static_cast<std::uint32_t>(Graphics::Recorder::WaitEnd::Fence)) finishProfile(Graphics::Recorder::WaitEnd::Polled);
 }

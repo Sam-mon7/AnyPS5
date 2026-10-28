@@ -3018,6 +3018,7 @@ void countOwnRefreshFallback(OwnRefreshFallback reason) {
 }
 
 void countOwnRefresh(bool storage) {
+    StorageTexture::ProfileAliasRevalidation(true);
     TextureCounts().ownRefreshes.fetch_add(1, std::memory_order_relaxed);
     if (BuildProfiled()) (storage ? Revalidations().ownStorageRefreshes : Revalidations().ownViewRefreshes).fetch_add(1, std::memory_order_relaxed);
 }
@@ -3329,6 +3330,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         };
         for (std::size_t k = 0; k < pending.size(); ++k) {
             if (!pending[k].overlaps) continue;
+            const auto* alias = owners[k].storage ? storageTextures[owners[k].element].get() : textures[owners[k].element]->StorageSource();
+            if (alias != nullptr && alias->HasCurrentAlias()) {
+                StorageTexture::CountAliasProof();
+                accepted = true;
+                continue;
+            }
             if (OwnImageRefreshEnabled() && owners[k].viewUncompressed && pending[k].found == pending[k].except) {
                 if (BuildProfiled()) Revalidations().ownSourceViews.fetch_add(1, std::memory_order_relaxed);
                 accepted = true;
@@ -3342,6 +3349,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             overlapping.push_back(owners[k]);
         }
         if (!overlapping.empty()) {
+            StorageTexture::ProfileAliasRevalidation(false);
             countPendingFail(pending);
             return fail(FastFail::Pending);
         }
@@ -6117,7 +6125,7 @@ void ShaderResources::WriteBack() {
         unaligned = std::current_exception();
     }
     if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs();
-    if (!SkipWriteBack()) {
+    if (!SkipWriteBack() && !GuestMemory::CopybackDebugSkip(GuestMemory::CopybackPath::Storage)) {
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (!storageWritten[index] || storageTextures[index] == nullptr) continue;
             storageTextures[index]->MarkDirty();
@@ -6139,10 +6147,12 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
     }
     if (SkipWriteBack()) return;
-    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
-        if (!storageWritten[index] || storageTextures[index] == nullptr) continue;
-        storageTextures[index]->MarkDirty();
-        static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
+    if (!GuestMemory::CopybackDebugSkip(GuestMemory::CopybackPath::Storage)) {
+        for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+            if (!storageWritten[index] || storageTextures[index] == nullptr) continue;
+            storageTextures[index]->MarkDirty();
+            static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
+        }
     }
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),

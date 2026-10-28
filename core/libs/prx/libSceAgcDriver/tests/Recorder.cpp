@@ -24,6 +24,7 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -81,6 +82,33 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace AgcDriver::DriverDetail {
+
+struct DriverTestAccess {
+    static std::uint64_t Receive() { return ++Driver::Get().eventSerial; }
+
+    static void Record(Graphics::Recorder& recorder, std::uint64_t address, std::uint32_t queue) {
+        const std::uint32_t value = 1;
+        const auto bytes = std::as_bytes(std::span(&value, 1));
+        const auto stamp = ++Driver::Get().eventSerial;
+        recorder.NoteLabel(address, bytes, stamp, queue);
+        Driver::Get().noteLabelStore(address, bytes, stamp, queue);
+    }
+
+    static void Wait(std::uint64_t address, std::uint64_t received, std::uint32_t queue, bool fast = false) {
+        const std::array<std::uint32_t, 7> packet{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 1, 0xffffffffu, 0x19u};
+        if (fast) {
+            GuestMemory::TagGpuLockThread(queue);
+            if (!Pm4::WaitSatisfiedUnchecked(packet)) throw std::runtime_error("the entry fast-path fixture is unsatisfied");
+            Driver::bumpEpoch(&EpochBumps::waits, GuestMemory::CollectEpochSource::WaitEntry, Driver::entryWaitFloor(packet, queue, received));
+        } else {
+            Driver::Get().waitMemory(packet, queue, PacketHistory{}, received, false);
+        }
+    }
+};
+
+}
 
 namespace {
 
@@ -5236,6 +5264,273 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied
 // makes the unit stale), the scopes, the slab boundary, and the retire publish. With
 // APS5_UNIT_SHADOW_MIB=8 (one slab) the second slab's allocation evicts the first with a publish;
 // with APS5_NO_UNIT_SHADOW=1 every primitive is inert.
+bool collectFloorTests(Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    using Access = AgcDriver::DriverDetail::DriverTestAccess;
+    if (!WriteWatched()) return false;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = 2 * unit;
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) return false;
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0, bytes);
+    auto* cpu = static_cast<volatile std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto label = address + unit;
+    const auto received = Access::Receive();
+    const bool enabled = std::getenv("APS5_NO_COLLECT_EPOCH_FLOOR") == nullptr;
+    TagGpuLockThread(0);
+    BumpCollectEpoch(CollectEpochSource::Submission);
+    const auto beforeWrite = CollectWrites(address, unit);
+    std::promise<void> ready, recorded;
+    auto recordDone = recorded.get_future();
+    std::uint64_t thirdFloor = 0, thirdEpoch = 0;
+    std::thread third([&] {
+        TagGpuLockThread(0x38);
+        BumpCollectEpoch(CollectEpochSource::Submission);
+        ready.set_value();
+        recordDone.wait();
+        Access::Wait(label + 16, received, 0x38);
+        thirdFloor = ThreadCollectFloor();
+        thirdEpoch = ThreadCollectEpoch();
+    });
+    ready.get_future().wait();
+    cpu[0] = 2;
+    std::uint64_t producerFloor = 0;
+    std::thread([&] {
+        TagGpuLockThread(0x20);
+        BumpCollectEpoch(CollectEpochSource::Submission);
+        std::lock_guard lock(GpuMutex());
+        Access::Record(recorder, label, 0x20);
+        Access::Record(recorder, label + 8, 0x20);
+        producerFloor = ThreadCollectFloor();
+    }).join();
+    Access::Wait(label, received, 0);
+    const auto consumerFloor = ThreadCollectFloor();
+    const auto required = CollectWrites(address, unit);
+    const bool sawRequired = required != 0 && !UnchangedSince(address, unit, beforeWrite);
+    const auto beforeReuse = ThreadCollectedBytes();
+    Access::Wait(label + 8, received, 0);
+    CollectWrites(address, unit);
+    const bool reused = ThreadCollectedBytes() - beforeReuse == (enabled ? 0 : unit);
+    {
+        std::lock_guard lock(GpuMutex());
+        Access::Record(recorder, label + 16, 0);
+    }
+    recorded.set_value();
+    third.join();
+    Require(sawRequired, "a recorded-label wait missed a CPU write before the producer submission");
+    Require(consumerFloor >= producerFloor && (!enabled || consumerFloor == producerFloor), "a recorded-label wait did not inherit the producer floor");
+    Require(reused, "a second recorded-label wait or its opt-out did not control memo reuse");
+    Require(thirdFloor >= consumerFloor && (!enabled || thirdFloor == producerFloor), "recorded labels did not propagate a floor across three queues");
+    Require(enabled || thirdFloor == thirdEpoch, "the recorded-label opt-out did not restore a full bump");
+    cpu[0] = 3;
+    *reinterpret_cast<volatile std::uint32_t*>(label) = 1;
+    Access::Wait(label, received, 0);
+    Require(ThreadCollectFloor() == ThreadCollectEpoch(), "a CPU-visible label did not force a full bump");
+    CollectWrites(address, unit);
+    Require(!UnchangedSince(address, unit, required), "a CPU-written label wait hid a preceding CPU write");
+    std::lock_guard lock(GpuMutex());
+    recorder.Sync();
+    return true;
+}
+
+bool entryLabelFloorTests(const Device& device, Recorder& recorder, bool fast) {
+    using namespace AgcDriver::GuestMemory;
+    using Access = AgcDriver::DriverDetail::DriverTestAccess;
+    const auto& context = device.GetContext();
+    if (!WriteWatched() || context.hostImportAlignment == 0) {
+        std::cout << "skipped, write watching or host imports are unavailable\n";
+        return false;
+    }
+    const auto decided = PrepareImportWatch(context);
+    struct Restore {
+        const Context& context;
+        ImportWatch decided;
+        ~Restore() { SetImportWatch(context, decided); }
+    } restore{context, decided};
+    std::unique_lock gpu(GpuMutex());
+    constexpr std::size_t unit = 65536;
+    // 1 MiB: Windows keeps the write watch only on imports of at least settleFloorBytes.
+    constexpr std::size_t bytes = 16 * unit;
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) {
+        std::cout << "skipped, no write watching\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto label = address + unit;
+    const auto cpuLabel = address + 2 * unit;
+    *reinterpret_cast<volatile std::uint32_t*>(cpuLabel) = 1;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "skipped, the device does not import watched host memory\n";
+        return false;
+    }
+    recorder.Sync();
+    Require(CollectWritesUncached(address, bytes) != 0, "the entry-floor fixture was not collected");
+    TagGpuLockThread(0);
+    BumpCollectEpoch(CollectEpochSource::Submission);
+    const auto received = Access::Receive();
+    std::uint64_t producerFloor = 0;
+    gpu.unlock();
+    std::thread([&] {
+        TagGpuLockThread(0x20);
+        BumpCollectEpoch(CollectEpochSource::Submission);
+        std::lock_guard lock(GpuMutex());
+        const std::uint32_t value = 1;
+        recorder.RecordStore(import->buffer, HostImportOffset(*import, label), std::as_bytes(std::span(&value, 1)), label);
+        Access::Record(recorder, label, 0x20);
+        MarkWritten(label, sizeof(value));
+        Recorder::CloseLabelGroup(TrackerGeneration());
+        producerFloor = ThreadCollectFloor();
+        recorder.Submit();
+    }).join();
+    gpu.lock();
+    device.WaitQueue();
+    Require(*reinterpret_cast<const volatile std::uint32_t*>(label) == 1, "the producer's GPU label did not land");
+    Require(recorder.InFlightBatches() != 0, "the landed label fixture was reaped before its wait");
+    gpu.unlock();
+    const bool enabled = std::getenv("APS5_NO_COLLECT_EPOCH_FLOOR") == nullptr;
+    Require(CollectWrites(address, unit) != 0, "the entry-floor memo fixture was not collected");
+    Access::Wait(label, received, 0, fast);
+    Require(enabled ? ThreadCollectFloor() == producerFloor : ThreadCollectFloor() == ThreadCollectEpoch(), "the landed entry label or opt-out used the wrong floor");
+    auto before = ThreadCollectedBytes();
+    CollectWrites(address, unit);
+    Require(ThreadCollectedBytes() - before == (enabled ? 0 : unit), "the landed entry label did not retain memo work or honor the opt-out");
+    *reinterpret_cast<volatile std::uint32_t*>(label) = 1;
+    Access::Wait(label, received, 0, fast);
+    Require(ThreadCollectFloor() == ThreadCollectEpoch(), "a CPU store of the same label value did not force a full bump");
+    before = ThreadCollectedBytes();
+    CollectWrites(address, unit);
+    Require(ThreadCollectedBytes() - before == unit, "a same-value CPU label store retained memo work");
+    Access::Wait(label, Access::Receive(), 0, fast);
+    Require(ThreadCollectFloor() == ThreadCollectEpoch(), "a late landed label limited the entry floor");
+    Access::Wait(cpuLabel, received, 0, fast);
+    Require(ThreadCollectFloor() == ThreadCollectEpoch(), "a CPU-only label limited the entry floor");
+    Access::Wait(label, received, 0x20, fast);
+    Require(ThreadCollectFloor() == ThreadCollectEpoch(), "a same-queue landed label limited the entry floor");
+    StderrCapture capture;
+    CopybackReport(1);
+    const auto report = capture.Finish();
+    Require(report.find(enabled ? "wait-entry-limited/present=1.000" : "wait-entry-limited/present=0.000") != std::string::npos, "the entry limited counter is wrong");
+    if (enabled) {
+        for (const auto* why : {"cpu-store", "late", "no-label", "same-queue"}) {
+            Require(report.find(std::string("entry-full-") + why + "/present=1.000") != std::string::npos, "an entry full-bump reason was not counted");
+        }
+    } else {
+        Require(report.find("entry-full-disabled/present=4.000") != std::string::npos, "the disabled entry-floor counter is wrong");
+    }
+    gpu.lock();
+    recorder.Sync();
+    return true;
+}
+
+bool shadowLiveRunTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    if (!ShadowAddressEnabled() || !context.bufferDeviceAddress || context.hostImportAlignment == 0) {
+        std::cout << "skipped, shadow addresses or host imports are unavailable\n";
+        return false;
+    }
+    const auto decided = PrepareImportWatch(context);
+    struct Restore {
+        const Context& context;
+        ImportWatch decided;
+        ~Restore() { SetImportWatch(context, decided); }
+    } restore{context, decided};
+    constexpr std::size_t unit = 65536;
+    // 1 MiB: Windows keeps the write watch only on imports of at least settleFloorBytes.
+    constexpr std::size_t bytes = 16 * unit;
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) {
+        std::cout << "skipped, no write watching\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "skipped, the device does not import watched host memory\n";
+        return false;
+    }
+    recorder.Sync();
+    const auto baseline = CollectWritesUncached(address, bytes);
+    for (const auto index : {1u, 2u, 5u}) {
+        const auto begin = address + index * unit;
+        const auto destination = ShadowDestinationFor(context, *import, begin, begin + unit);
+        if (!destination.has_value()) {
+            std::cout << "skipped, no shadow slab for a live unit\n";
+            return false;
+        }
+        const ShadowedRange range{begin, begin + unit, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), baseline);
+    }
+    const bool liveRuns = std::getenv("APS5_NO_SHADOW_ADDRESS_LIVE_RUNS") == nullptr;
+    auto before = ThreadCollectedBytes();
+    const auto sources = ShadowAddressSources(context, *import, address, address + bytes);
+    Require(sources.size() == 2, "two separated live shadow runs were not bound");
+    Require(ThreadCollectedBytes() - before == (liveRuns ? 3 : 5) * unit, "the live-run switch did not control the collected page span");
+    auto* cpu = static_cast<volatile std::uint8_t*>(block);
+    cpu[unit] = 2;
+    cpu[5 * unit] = 3;
+    cpu[4 * unit] = 4;
+    before = ThreadCollectedBytes();
+    const auto changed = ShadowAddressSources(context, *import, address, address + bytes);
+    Require(ThreadCollectedBytes() - before == (liveRuns ? 5 : 10) * unit, "the live-run collection or its fallback publish walked a dead gap");
+    Require(!UnchangedSince(address + unit, unit, baseline) && !UnchangedSince(address + 5 * unit, unit, baseline), "a CPU write in a live shadow run was missed");
+    Require(UnchangedSince(address + 4 * unit, unit, baseline) == liveRuns, "a dead gap was collected with live runs enabled");
+    for (const auto& run : changed) Require(run.begin >= address + 2 * unit && run.end <= address + 3 * unit, "a CPU-overwritten live unit was bound to stale shadow bytes");
+    CollectWritesUncached(address + 4 * unit, unit);
+    Require(!UnchangedSince(address + 4 * unit, unit, baseline), "the dead-gap CPU write disappeared");
+    recorder.Sync();
+    return true;
+}
+
 bool unitShadowTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
@@ -11935,6 +12230,17 @@ int main(int argc, char** argv) {
             }
             idlePublishWaitTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--entry-label-floor-only" || std::string_view(argv[1]) == "--entry-label-floor-fast-only")) {
+            gpu.unlock();
+            return entryLabelFloorTests(device, recorder, std::string_view(argv[1]) == "--entry-label-floor-fast-only") ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--collect-epoch-floor-only") {
+            gpu.unlock();
+            return collectFloorTests(recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--shadow-live-runs-only") {
+            return shadowLiveRunTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unit-shadow-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
