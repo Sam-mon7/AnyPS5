@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -2061,6 +2062,84 @@ void CheckAdoptLatestEpoch() {
     Require(keptOwn, "adopting the newest collect epoch moved a thread off its own");
 }
 
+void CheckCollectCoverage() {
+    constexpr auto bytes = 520 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* cpu = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, bytes);
+    const bool coverage = std::getenv("APS5_NO_COLLECT_COVERAGE") == nullptr && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_NO_EPOCH_COLLECT_MAP") == nullptr && std::getenv("APS5_SHARED_COLLECT_MEMO") == nullptr;
+    Require(std::getenv("APS5_PROFILE_DRAW") != nullptr, "the coverage work-count check needs profiling");
+    const auto initial = CollectWrites(base, bytes);
+    Require(initial != 0, "the coverage fixture was not collected");
+    cpu[0] = 0x22;
+    Require(CollectWrites(base, Block) != 0 && !UnchangedSince(base, Block, initial), "an unbumped thread reused a collection across a CPU write");
+
+    BumpCollectEpoch();
+    const auto baseline = CollectWritesUncached(base, bytes);
+    BumpCollectEpoch();
+    Require(CollectWrites(base, Block) != 0 && CollectWrites(base + 2 * Block, Block) != 0, "the covered edges were not collected");
+    cpu[Block + 8] = 0x33;
+    auto before = ThreadCollectedBytes();
+    const auto joined = CollectWrites(base, 3 * Block);
+    Require(joined != 0 && !UnchangedSince(base + Block, Block, baseline), "a CPU write in the uncollected gap was missed");
+    Require(ThreadCollectedBytes() - before == (coverage ? Block : 3 * Block), "the covered edges were not trimmed to one middle walk");
+
+    BumpCollectEpoch();
+    Require(CollectWrites(base + Block, Block) != 0, "the middle range was not collected");
+    before = ThreadCollectedBytes();
+    Require(CollectWrites(base, 2 * Block) != 0 && ThreadCollectedBytes() - before == (coverage ? Block : 2 * Block), "a covered suffix was collected again");
+    before = ThreadCollectedBytes();
+    Require(CollectWrites(base + Block, 2 * Block) != 0 && ThreadCollectedBytes() - before == (coverage ? Block : 2 * Block), "a covered prefix was collected again");
+    const auto collected = CollectWrites(base, 3 * Block);
+    std::thread([&] { cpu[16] = 0x44; }).join();
+    const auto uncached = CollectWritesUncached(base, 3 * Block);
+    Require(uncached != 0 && !UnchangedSince(base, Block, collected), "an uncached collection hid a CPU write in the same epoch");
+    std::thread([&] { cpu[2 * Block + 16] = 0x55; }).join();
+    BumpCollectEpoch();
+    Require(CollectWrites(base, 3 * Block) != 0 && !UnchangedSince(base + 2 * Block, Block, uncached), "coverage survived an epoch boundary and hid a CPU write");
+    const auto beforeDriver = CollectWrites(base, 3 * Block);
+    const auto driver = MarkWritten(base + 32, 4);
+    Require(driver > beforeDriver && CollectWrites(base, 3 * Block) >= driver && !UnchangedSince(base, Block, beforeDriver), "coverage hid a driver write generation");
+
+    BumpCollectEpoch();
+    for (std::size_t index = 0; index < 258; ++index) Require(CollectWrites(base + 2 * index * Block, Block) != 0, "a separated range was not collected");
+    const auto generation = WriteGeneration();
+    before = ThreadCollectedBytes();
+    Require(CollectWrites(base + 4096, Block - 4096) != 0, "a contained range was not collected");
+    Require((WriteGeneration() == generation) == coverage, "coverage did not retain a contained range after ring eviction");
+    Require(ThreadCollectedBytes() - before == (coverage ? 0 : Block - 4096), "a retained range walked after ring eviction");
+    cpu[4096] = 0x66;
+    bool otherThreadSawWrite = false;
+    std::thread([&] {
+        BumpCollectEpoch();
+        otherThreadSawWrite = CollectWrites(base + 4096, Block - 4096) != 0 && !UnchangedSince(base + 4096, Block - 4096, generation);
+    }).join();
+    Require(otherThreadSawWrite, "a different thread reused this thread's coverage");
+    const auto otherThreadGeneration = WriteGeneration();
+    cpu[4096] = 0x67;
+    BumpCollectEpoch();
+    Require(CollectWrites(base + 4096, Block - 4096) != 0 && !UnchangedSince(base + 4096, Block - 4096, otherThreadGeneration), "a retained range hid a CPU write in a new epoch");
+
+    PartlyCommitted partial;
+    partial.Commit(0);
+    BumpCollectEpoch();
+    Require(CollectWrites(partial.Address(), Block) != 0 && CollectWrites(partial.Address(), PartlyCommitted::Bytes) == 0, "a covered prefix hid an unavailable gap");
+    partial.Commit(1);
+    partial.Commit(2);
+    partial.Commit(3);
+    Require(CollectWrites(partial.Address(), PartlyCommitted::Bytes) != 0, "a mapping change retained failed coverage");
+    const auto beforeMapping = CollectWrites(partial.Address(), PartlyCommitted::Bytes);
+    partial.Decommit(0);
+    Require(CollectWrites(partial.Address(), PartlyCommitted::Bytes) == 0, "a decommit retained completed coverage");
+    partial.Commit(0);
+    partial.Data()[0] = 0x77;
+    Require(CollectWrites(partial.Address(), PartlyCommitted::Bytes) != 0 && !UnchangedSince(partial.Address(), Block, beforeMapping), "a remapping retained completed coverage");
+    Unwatch(partial.Address(), Block);
+    Require(CollectWrites(partial.Address(), PartlyCommitted::Bytes) == 0, "an unwatch retained completed coverage");
+    Require(CollectWrites(UINT64_MAX - 4095, 4095) == 0, "a page-rounded overflow manufactured a collection");
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2074,6 +2153,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--failed-collect-memo") {
             CheckFailedCollectMemo();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--collect-coverage") {
+            CheckCollectCoverage();
             return 0;
         }
 #ifdef _WIN32

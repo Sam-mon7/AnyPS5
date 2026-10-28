@@ -863,6 +863,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_failed_collect_memo agc_failed_collect_memo_off PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     set_tests_properties(agc_failed_collect_memo_off PROPERTIES ENVIRONMENT "APS5_NO_FAILED_COLLECT_MEMO=1")
+    foreach(mode IN ITEMS on off no_memo no_map shared no_ring_merge)
+        add_test(NAME agc_collect_coverage_${mode} COMMAND agc_write_tracking_tests --collect-coverage)
+        set_tests_properties(agc_collect_coverage_${mode} PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PROFILE_DRAW=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endforeach()
+    set_property(TEST agc_collect_coverage_off APPEND PROPERTY ENVIRONMENT "APS5_NO_COLLECT_COVERAGE=1")
+    set_property(TEST agc_collect_coverage_no_memo APPEND PROPERTY ENVIRONMENT "APS5_NO_COLLECT_MEMO=1")
+    set_property(TEST agc_collect_coverage_no_map APPEND PROPERTY ENVIRONMENT "APS5_NO_EPOCH_COLLECT_MAP=1")
+    set_property(TEST agc_collect_coverage_shared APPEND PROPERTY ENVIRONMENT "APS5_SHARED_COLLECT_MEMO=1")
+    set_property(TEST agc_collect_coverage_no_ring_merge APPEND PROPERTY ENVIRONMENT "APS5_NO_COLLECT_MEMO_MERGE=1")
     if(WIN32)
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)

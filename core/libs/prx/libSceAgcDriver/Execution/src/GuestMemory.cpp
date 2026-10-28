@@ -30,6 +30,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -312,6 +313,92 @@ void CountWriteCaller(const void* returnAddress) {
 bool MemoryProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
+}
+
+namespace {
+
+enum class CollectKind { Memoized, Uncached, Walk, Fresh, Hint };
+
+struct CollectCounts {
+    std::uint64_t calls;
+    std::uint64_t pages;
+    std::uint64_t walks;
+    std::uint64_t walkedPages;
+    std::uint64_t memo;
+    std::uint64_t avoided;
+    std::uint64_t avoidedPages;
+    std::uint64_t failed;
+};
+
+struct CollectProfile {
+    using Key = std::tuple<std::uint32_t, ReadSite, CollectKind, const void*>;
+    std::mutex mutex;
+    std::map<Key, CollectCounts> counts;
+    std::uint64_t omitted = 0;
+};
+
+CollectProfile& collectProfile() {
+    static auto* profile = new CollectProfile;
+    return *profile;
+}
+
+struct CollectScope {
+    bool enabled = MemoryProfiled();
+    CollectKind kind;
+    const void* caller;
+    CollectCounts counts;
+
+    CollectScope(CollectKind kind, const void* caller, std::uint64_t first, std::uint64_t stop) : kind(kind), caller(caller) {
+        if (enabled) {
+            counts = {1, (stop - first) / 4096, 0, 0, 0, 0, 0, 0};
+        }
+    }
+
+    ~CollectScope() {
+        if (!enabled) return;
+        auto& profile = collectProfile();
+        std::lock_guard lock(profile.mutex);
+        const CollectProfile::Key key{GpuLockThreadTag(), CurrentReadSite(), kind, caller};
+        auto found = profile.counts.find(key);
+        if (found == profile.counts.end()) {
+            if (profile.counts.size() == 512) {
+                ++profile.omitted;
+                return;
+            }
+            found = profile.counts.emplace(key, CollectCounts{}).first;
+        }
+        auto& total = found->second;
+        total.calls += counts.calls;
+        total.pages += counts.pages;
+        total.walks += counts.walks;
+        total.walkedPages += counts.walkedPages;
+        total.memo += counts.memo;
+        total.avoided += counts.avoided;
+        total.avoidedPages += counts.avoidedPages;
+        total.failed += counts.failed;
+    }
+};
+
+void reportCollectProfile(std::uint64_t presents) {
+    if (!MemoryProfiled()) return;
+    auto& profile = collectProfile();
+    decltype(profile.counts) counts;
+    std::uint64_t omitted = 0;
+    {
+        std::lock_guard lock(profile.mutex);
+        counts.swap(profile.counts);
+        omitted = std::exchange(profile.omitted, 0);
+    }
+    static const auto base = reinterpret_cast<std::uintptr_t>(&CollectWrites) - ModuleOffset(reinterpret_cast<const void*>(&CollectWrites));
+    constexpr std::array names{"memoized", "uncached", "walk", "fresh", "hint"};
+    ProfilePrint_nid_no_patch("[collect-sites] presents=%llu omitted=%llu counts=logical-walks pages=4096-byte api-and-walk-rows-overlap\n", static_cast<unsigned long long>(presents), static_cast<unsigned long long>(omitted));
+    for (const auto& [key, value] : counts) {
+        const auto& [queue, site, kind, caller] = key;
+        const auto perPresent = [&](std::uint64_t count) { return presents ? static_cast<double>(count) / presents : 0.0; };
+        ProfilePrint_nid_no_patch("[collect-site] queue=0x%x site=%s kind=%s caller=+0x%llx calls=%llu pages=%llu walks=%llu walked-pages=%llu memo=%llu coverage-avoided=%llu coverage-pages=%llu failed=%llu calls/present=%.3f walks/present=%.3f coverage-avoided/present=%.3f coverage-pages/present=%.3f\n", queue, ReadSiteName(site), names[static_cast<std::size_t>(kind)], static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(caller) - base), static_cast<unsigned long long>(value.calls), static_cast<unsigned long long>(value.pages), static_cast<unsigned long long>(value.walks), static_cast<unsigned long long>(value.walkedPages), static_cast<unsigned long long>(value.memo), static_cast<unsigned long long>(value.avoided), static_cast<unsigned long long>(value.avoidedPages), static_cast<unsigned long long>(value.failed), perPresent(value.calls), perPresent(value.walks), perPresent(value.avoided), perPresent(value.avoidedPages));
+    }
+}
+
 }
 
 class TimedAccess {
@@ -1391,19 +1478,30 @@ ThreadCollectMemo& threadCollectMemo() {
 
 struct EpochCollectMap {
     std::uint64_t epoch = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
     std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
     std::unordered_map<std::uintptr_t, WriteTracker::Memo> failedRanges;
+    std::map<std::uintptr_t, std::uintptr_t> coverage;
 };
 
-EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
+EpochCollectMap& epochCollectMap(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t mapping) {
     thread_local EpochCollectMap* slot = nullptr;
     auto& map = ShaderRecompiler::ThreadOwned(slot);
-    if (map.epoch != epoch) {
+    if (map.epoch != epoch || map.unwatched != unwatched || map.mapping != mapping) {
         map.ranges.clear();
         map.failedRanges.clear();
+        map.coverage.clear();
         map.epoch = epoch;
+        map.unwatched = unwatched;
+        map.mapping = mapping;
     }
     return map;
+}
+
+bool collectCoverageEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_COLLECT_COVERAGE") == nullptr;
+    return enabled;
 }
 
 bool epochCollectMapEnabled() {
@@ -1497,28 +1595,36 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 #endif
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
+    CollectScope profile(CollectKind::Walk, MemoryProfiled() ? __builtin_return_address(0) : nullptr, first, stop);
+    if (profile.enabled) {
+        profile.counts.walks = 1;
+        profile.counts.walkedPages = profile.counts.pages;
+    }
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window};
 #ifdef _WIN32
     if (collectWindowsWrites(runs, first, stop, armedOnly)) return true;
+    if (profile.enabled) profile.counts.failed = 1;
     noteRefusedWalk(tracker, first, stop);
     return false;
 #else
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
     const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
+    if (profile.enabled && !complete) profile.counts.failed = 1;
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
     return complete;
 #endif
 }
 
-std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, const void* caller) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || address + bytes > std::numeric_limits<std::uint64_t>::max() - 4095) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
     auto first = address & ~(page - 1);
     auto stop = (address + bytes + page - 1) & ~(page - 1);
+    CollectScope profile(memoized ? CollectKind::Memoized : CollectKind::Uncached, caller, first, stop);
     // One epoch for the lookup and the entry made after the walk: an unbumped thread's fresh epoch
     // must not differ between them.
     const auto epoch = currentCollectEpoch();
@@ -1529,9 +1635,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
-            const auto& map = epochCollectMap(epoch);
+            const auto& map = epochCollectMap(epoch, unwatched, mapping);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (profile.enabled) profile.counts.memo = 1;
                 return tracker.stable.load(std::memory_order_acquire);
             }
         }
@@ -1541,22 +1648,36 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (profile.enabled) profile.counts.memo = 1;
+                return tracker.stable.load(std::memory_order_acquire);
+            }
+        }
+        if (epochCollectMapEnabled() && collectCoverageEnabled()) {
+            const auto& coverage = epochCollectMap(epoch, unwatched, mapping).coverage;
+            const auto next = coverage.upper_bound(first);
+            if (next != coverage.begin() && std::prev(next)->second >= stop) {
+                if (profile.enabled) {
+                    profile.counts.avoided = 1;
+                    profile.counts.avoidedPages = profile.counts.pages;
+                }
                 return tracker.stable.load(std::memory_order_acquire);
             }
         }
     }
     const bool memoFailures = useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && !sharedCollectMemo() && epochCollectMapEnabled() && failedCollectMemoEnabled();
     if (memoFailures) {
-        const auto& failed = epochCollectMap(epoch).failedRanges;
+        const auto& failed = epochCollectMap(epoch, unwatched, mapping).failedRanges;
         if (const auto found = failed.find(first); found != failed.end() && found->second.end == stop && found->second.unwatched == unwatched && found->second.mapping == mapping) {
             if (MemoryProfiled()) failedCollectMemoHits.fetch_add(1, std::memory_order_relaxed);
+            if (profile.enabled) profile.counts.failed = 1;
             return 0;
         }
     }
     const auto failedFirst = first;
     const auto failedStop = stop;
     const auto fail = [&]() -> std::uint64_t {
-        if (memoFailures) epochCollectMap(epoch).failedRanges[failedFirst] = {failedFirst, failedStop, epoch, unwatched, mapping};
+        if (memoFailures) epochCollectMap(epoch, unwatched, mapping).failedRanges[failedFirst] = {failedFirst, failedStop, epoch, unwatched, mapping};
+        if (profile.enabled) profile.counts.failed = 1;
         return 0;
     };
     const auto lock = lockTracker(tracker);
@@ -1567,11 +1688,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         for (const auto& entry : tracker.memo) {
             if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.mapping == mapping && entry.begin <= cursor && stop <= entry.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (profile.enabled) profile.counts.memo = 1;
                 return tracker.generation;
             }
         }
     }
-    const TimedAccess timed(CounterCollect, bytes);
 #ifndef _WIN32
     if (useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bytes <= WriteBlockBytes) {
         const auto begin = first & ~(WriteBlockBytes - 1);
@@ -1582,7 +1703,31 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return fail();
+    const auto memoFirst = first;
+    const auto memoStop = stop;
+    if (useMemo && !sharedCollectMemo() && epochCollectMapEnabled() && collectCoverageEnabled() && unwatched == unwatchSerial.load(std::memory_order_relaxed) && mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+        const auto& ranges = epochCollectMap(epoch, unwatched, mapping).coverage;
+        const auto prefix = ranges.upper_bound(first);
+        if (prefix != ranges.begin()) first = std::min(stop, std::max(first, std::prev(prefix)->second));
+        if (first < stop) {
+            const auto suffix = ranges.lower_bound(stop);
+            if (suffix != ranges.begin() && std::prev(suffix)->second >= stop) stop = std::max(first, std::prev(suffix)->first);
+        }
+        if (profile.enabled) {
+            profile.counts.avoided = first == stop;
+            profile.counts.avoidedPages = ((memoStop - memoFirst) - (stop - first)) / page;
+        }
+    }
+    if (first < stop) {
+        const TimedAccess timed(CounterCollect, first == memoFirst && stop == memoStop ? bytes : stop - first);
+        if (profile.enabled) {
+            profile.counts.walks = 1;
+            profile.counts.walkedPages = (stop - first) / page;
+        }
+        if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return fail();
+    }
+    first = memoFirst;
+    stop = memoStop;
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
@@ -1601,8 +1746,20 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
             memo.entries[memo.next++ % memo.entries.size()] = merged;
             if (epochCollectMapEnabled()) {
-                auto& entry = epochCollectMap(epoch).ranges[first];
+                auto& map = epochCollectMap(epoch, serial, mapping);
+                auto& entry = map.ranges[first];
                 if (entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
+                if (collectCoverageEnabled()) {
+                    auto& coverage = map.coverage;
+                    auto next = coverage.lower_bound(first);
+                    if (next != coverage.begin() && std::prev(next)->second >= first) --next;
+                    while (next != coverage.end() && next->first <= stop) {
+                        first = std::min(first, next->first);
+                        stop = std::max(stop, next->second);
+                        next = coverage.erase(next);
+                    }
+                    coverage.emplace(first, stop);
+                }
             }
         }
     }
@@ -1612,11 +1769,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 }
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
-    return collectWrites(address, bytes, true);
+    return collectWrites(address, bytes, true, MemoryProfiled() ? __builtin_return_address(0) : nullptr);
 }
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
-    return collectWrites(address, bytes, false);
+    return collectWrites(address, bytes, false, MemoryProfiled() ? __builtin_return_address(0) : nullptr);
 }
 
 std::uint64_t WriteGeneration() {
@@ -2054,6 +2211,11 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
     {
         const auto blockFirst = address & ~(std::uint64_t{WriteBlockBytes} - 1);
         const auto blockStop = (address + bytes + WriteBlockBytes - 1) & ~(std::uint64_t{WriteBlockBytes} - 1);
+        CollectScope profile(CollectKind::Fresh, MemoryProfiled() ? __builtin_return_address(0) : nullptr, blockFirst, blockStop);
+        if (profile.enabled) {
+            profile.counts.walks = 1;
+            profile.counts.walkedPages = profile.counts.pages;
+        }
         StampRuns runs{tracker, StampKind::Fresh};
 #ifdef _WIN32
         const bool collected = collectWindowsWrites(runs, blockFirst, blockStop, false);
@@ -2061,6 +2223,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
         const bool collected = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
         if (!collected) {
+            if (profile.enabled) profile.counts.failed = 1;
             lock.Suspend();
             beforeUnwatch(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             lock.Resume();
@@ -2146,11 +2309,19 @@ namespace {
 thread_local ThreadCollectMemo threadHintMemo;
 
 bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
+    CollectScope profile(CollectKind::Hint, MemoryProfiled() ? __builtin_return_address(0) : nullptr, first, stop);
+    if (profile.enabled) {
+        profile.counts.walks = 1;
+        profile.counts.walkedPages = profile.counts.pages;
+    }
     auto cursor = first;
     bool marked = false;
     while (cursor < stop) {
         std::size_t count = tracker.pages.size();
-        if (!GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, true)) return false;
+        if (!GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, true)) {
+            if (profile.enabled) profile.counts.failed = 1;
+            return false;
+        }
         if (count != 0 && !marked) ++tracker.generation;
         marked = marked || count != 0;
         for (std::size_t i = 0; i < count; ++i) tracker.stampHint(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])));
@@ -3145,6 +3316,7 @@ void CopybackDisarm() noexcept {
 }
 
 void CopybackReport(std::uint64_t presents) noexcept {
+    reportCollectProfile(presents);
     if (!CopybackEnabled()) return;
     std::array<CopybackCounters, CopybackNames.size()> counts;
     std::vector<CopybackReader> readers;
