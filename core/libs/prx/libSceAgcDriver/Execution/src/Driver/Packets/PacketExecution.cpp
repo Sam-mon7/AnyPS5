@@ -347,10 +347,12 @@ void Driver::execute(const Submission& submission) {
             if (!profilePackets) return;
             const auto now = std::chrono::steady_clock::now();
             auto& pending = pendingDispatchPhases();
+            const auto which = submission.queue != 0 ? OtherQueues : indirect ? Queue0Indirect : Queue0Direct;
             if (pending.phases) {
                 pending.ms[PhaseEpilogue] = std::chrono::duration<double, std::milli>(now - pending.tailAt).count();
-                addDriverPhases(submission.queue != 0 ? OtherQueues : indirect ? Queue0Indirect : Queue0Direct, pending.ms, pending.hit, pending.validated);
+                addDriverPhases(which, pending.ms, pending.hit, pending.validated);
             }
+            if (DrawShaderProfileEnabled()) addDispatchShader(which, pending, std::chrono::duration<double, std::milli>(now - packetTimer.start).count());
             if (indirect) return;
             auto& row = packetProfile.dispatchOutcomes[static_cast<std::size_t>(pending.outcome)];
             ++row.first;

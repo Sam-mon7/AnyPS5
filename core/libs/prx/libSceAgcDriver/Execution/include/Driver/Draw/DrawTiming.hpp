@@ -48,6 +48,7 @@ struct DrawShaderTotals {
 };
 
 bool DrawShaderProfileEnabled();
+bool ShaderProfileReportEnabled();
 
 struct PendingDrawPhases {
     bool phases = false;

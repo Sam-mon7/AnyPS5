@@ -33,6 +33,16 @@ struct PendingDispatchPhases {
     bool validated = false;
     std::array<double, DriverPhaseCount> ms{};
     std::chrono::steady_clock::time_point tailAt{};
+    std::uint64_t code = 0;
+};
+
+struct DispatchShaderTotals {
+    std::uint64_t code = 0;
+    DispatchClass which = Queue0Direct;
+    std::array<double, DriverPhaseCount> ms{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DispatchOutcome::Count)> packets{};
+    std::array<double, static_cast<std::size_t>(DispatchOutcome::Count)> packetMs{};
+    std::uint64_t hits = 0;
 };
 
 struct DispatchPhaseTiming {

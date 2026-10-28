@@ -1,6 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
+#include <algorithm>
+#include <numeric>
+#include <string>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -29,6 +33,64 @@ void Driver::addDriverPhases(DispatchClass which, const std::array<double, Drive
         AgcDriver::ProfilePrint_nid_no_patch("[dispatch] driver phases %s (10 s, %llu dispatches, %llu cache hits), us per dispatch:%s, total %.1f (%.1f ms); validate %.1f us per validation (%llu validations; GPU waits inside it %.1f us per validation apart)\n", DispatchClassNames[cls], static_cast<unsigned long long>(line.dispatches), static_cast<unsigned long long>(line.hits), report.c_str(), total * 1000 / static_cast<double>(line.dispatches), total, line.ms[PhaseValidate] * perValidation, static_cast<unsigned long long>(line.validations), line.ms[PhaseValidateWait] * perValidation);
         line = {};
     }
+}
+
+void Driver::addDispatchShader(DispatchClass which, const PendingDispatchPhases& pending, double packetMs) {
+    std::lock_guard lock(driverPhasesMutex);
+    auto& row = dispatchShaderTotals[pending.code | static_cast<std::uint64_t>(which)];
+    row.code = pending.code;
+    row.which = which;
+    const auto outcome = static_cast<std::size_t>(pending.outcome);
+    ++row.packets[outcome];
+    row.packetMs[outcome] += packetMs;
+    if (pending.phases) {
+        for (std::size_t i = 0; i < DriverPhaseCount; ++i) row.ms[i] += pending.ms[i];
+        if (pending.hit) ++row.hits;
+    }
+    if (ShaderProfileReportEnabled() && std::chrono::steady_clock::now() - dispatchShaderReport >= std::chrono::seconds(10)) reportDispatchShaders();
+}
+
+std::vector<DispatchShaderTotals> Driver::DispatchShaderProfile(bool reset) {
+    std::lock_guard lock(driverPhasesMutex);
+    std::vector<DispatchShaderTotals> rows;
+    rows.reserve(dispatchShaderTotals.size());
+    for (const auto& [key, row] : dispatchShaderTotals) rows.push_back(row);
+    if (reset) dispatchShaderTotals.clear();
+    return rows;
+}
+
+void Driver::reportDispatchShaders() {
+    const auto now = std::chrono::steady_clock::now();
+    const auto seconds = std::chrono::duration<double>(now - dispatchShaderReport).count();
+    dispatchShaderReport = now;
+    const auto rowMs = [](const DispatchShaderTotals* row) { return std::accumulate(row->packetMs.begin(), row->packetMs.end(), 0.0); };
+    const auto rowPackets = [](const DispatchShaderTotals* row) { return std::accumulate(row->packets.begin(), row->packets.end(), std::uint64_t{0}); };
+    std::vector<const DispatchShaderTotals*> rows;
+    double total = 0;
+    std::uint64_t packets = 0;
+    for (const auto& [key, row] : dispatchShaderTotals) {
+        rows.push_back(&row);
+        total += rowMs(&row);
+        packets += rowPackets(&row);
+    }
+    std::sort(rows.begin(), rows.end(), [&](const auto* a, const auto* b) { return rowMs(a) > rowMs(b); });
+    std::string report;
+    for (std::size_t index = 0; index < rows.size() && index < 12; ++index) {
+        const auto& row = *rows[index];
+        const auto count = rowPackets(&row);
+        std::array<std::size_t, DriverPhaseCount> order{};
+        std::iota(order.begin(), order.end(), std::size_t{0});
+        std::partial_sort(order.begin(), order.begin() + 3, order.end(), [&](std::size_t a, std::size_t b) { return row.ms[a] > row.ms[b]; });
+        const auto packetsOf = [&](DispatchOutcome outcome) { return static_cast<unsigned long long>(row.packets[static_cast<std::size_t>(outcome)]); };
+        char text[512];
+        std::snprintf(text, sizeof(text), "\n  0x%llx %s: %llu packets (real %llu, copy %llu, fill %llu, skipped %llu), %.1f ms, %.1f us each, %llu cache hits; top phases %s %.1f, %s %.1f, %s %.1f ms",
+                      static_cast<unsigned long long>(row.code), DispatchClassNames[row.which], static_cast<unsigned long long>(count), packetsOf(DispatchOutcome::Real), packetsOf(DispatchOutcome::CopyHle), packetsOf(DispatchOutcome::FillHle),
+                      packetsOf(DispatchOutcome::Skipped) + packetsOf(DispatchOutcome::SkippedMemo), rowMs(&row), count == 0 ? 0.0 : rowMs(&row) * 1000 / static_cast<double>(count), static_cast<unsigned long long>(row.hits),
+                      DriverPhaseNames[order[0]], row.ms[order[0]], DriverPhaseNames[order[1]], row.ms[order[1]], DriverPhaseNames[order[2]], row.ms[order[2]]);
+        report += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[dispatch-shaders] %.1f s, %llu dispatch packets of %zu shaders, %.1f ms; slowest:%s\n", seconds, static_cast<unsigned long long>(packets), rows.size(), total, report.c_str());
+    dispatchShaderTotals.clear();
 }
 
 PendingDispatchPhases& Driver::pendingDispatchPhases() {
