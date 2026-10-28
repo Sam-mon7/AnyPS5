@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include <cstring>
+#include <bit>
 #include <string>
 #include <string_view>
 
@@ -67,6 +68,27 @@ void reject(TAction action, std::string_view reason) {
 }
 
 void RunTextureDetilerTests(const Context& context, const TextureDetilerTestAccess& access) {
+    for (const auto bytes : {1u, 2u, 4u, 8u, 16u}) {
+        const auto equations = TextureDetiler::AliasEquations(bytes);
+        Require(equations.has_value(), "R_X alias equations are not invertible");
+        const auto block = ThinBlockLayout(TextureTileMode::kR64KBX, bytes);
+        const auto byteBits = std::countr_zero(bytes);
+        const auto xBits = std::countr_zero(block[1]);
+        for (std::uint32_t bit = 0; bit < 16; ++bit) {
+            const auto input = 1u << bit;
+            const auto x = (input >> byteBits) & (block[1] - 1u);
+            const auto y = (input >> (byteBits + xBits)) & (block[2] - 1u);
+            std::uint32_t address = input & (bytes - 1u);
+            for (std::uint32_t out = 0; out < 16; ++out) {
+                const auto mask = (*equations)[out];
+                address ^= static_cast<std::uint32_t>(std::popcount((x & (mask & 0xfffu)) ^ ((y << 12u) & (mask & 0xfff000u))) & 1) << out;
+            }
+            std::uint32_t decoded = 0;
+            for (std::uint32_t out = 0; out < 16; ++out) decoded |= static_cast<std::uint32_t>(std::popcount(address & (*equations)[16 + out]) & 1) << out;
+            Require(decoded == input, "R_X alias inverse does not recover an address basis vector");
+        }
+    }
+    Require(!TextureDetiler::AliasEquations(3).has_value() && !TextureDetiler::AliasEquations(32).has_value(), "invalid alias element sizes were accepted");
     TextureDetiler detiler(context);
     const auto commands = reinterpret_cast<VkCommandBuffer>(static_cast<std::uintptr_t>(1));
     const auto source = access.makeBuffer(4096);

@@ -375,6 +375,8 @@ public:
     bool CopyFrom(StorageTexture& source, const char*& refusal);
     static const char* CopyRefusal(const Context& context, const StorageTexture* destination, const StorageTexture& source, std::uint64_t address);
     VkImage Image() const { return image; }
+    bool HasCurrentAlias() const;
+    static void CountAliasProof();
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
     std::uint32_t ImageDepth() const { return geometry.imageDepth; }
@@ -582,8 +584,10 @@ private:
         std::shared_ptr<StorageTexture> texture;
         std::uint32_t layer;
         std::uint64_t generation;
+        bool alias = false;
     };
-    std::vector<Adjacent> adjacentPendingUnchanged(std::uint64_t firstBlock, std::uint64_t lastBlock) const;
+    std::vector<Adjacent> adjacentPendingUnchanged(std::uint64_t firstBlock, std::uint64_t lastBlock, std::span<const std::pair<std::uint64_t, std::uint64_t>> stores) const;
+    void saveAliasBaselines(const std::vector<Adjacent>& adjacent, std::span<const std::byte> stored = {});
     // Advances the entries' layers still at their seen generation to `now`, the generation this
     // write-back's stamps of blocks firstBlock..lastBlock are below, unless the layer's other
     // blocks were stamped since the check.
@@ -599,6 +603,9 @@ private:
     // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
     std::shared_ptr<StorageTexture> pendingAlias() const;
     bool reconcileAlias();
+    bool reconcilePaddedAlias(StorageTexture& source);
+    VkImageView aliasElementView();
+    void storeAliasDependencies(const std::vector<bool>& layers);
     std::optional<DccKeys> clearHandOver();
     void supersedeHandedOver(std::uint32_t first, std::uint32_t count);
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,
@@ -694,6 +701,14 @@ private:
     std::uint64_t borrowedVersion = 0;
     std::uint32_t borrowedUnitOffset = 0;
     std::vector<bool> borrowedUnits;
+    struct AliasBorrow {
+        std::shared_ptr<StorageTexture> source;
+        std::uint64_t version = 0;
+        std::uint32_t offset = 0;
+        std::vector<bool> dependencies;
+        bool current = false;
+    } aliasBorrow;
+    VkImageView aliasView = VK_NULL_HANDLE;
     std::vector<std::pair<std::weak_ptr<StorageTexture>, std::uint64_t>> handedOver;
     std::vector<bool> handedUnits;
     // Units of this image were borrowed since it was last written: the borrower's proofs
@@ -765,7 +780,7 @@ private:
 // flush rows lie inside the storage and sampled rows.
 struct LookupOutcomes {
     enum Kind : std::size_t { SampledFast, SampledFastMiss, SampledHitView, SampledHitClearedView, SampledHitSnapshot, SampledMadeView, SampledMadeSnapshot, StorageHit, StorageMade, RefreshUnchanged, RefreshCompared, RefreshProved, UploadDirect, UploadCpu, UploadClear, DccScan, PendingFlush, RefreshWait, RefreshProofCheck, RefreshCollect, RefreshFlush, RefreshValidate, CleanProof, FlushDepth, FlushGpuWait, Count };
-    enum Work : std::size_t { FlushCalls, FlushImages, FlushStorage, FlushDraw, FlushFill, FlushCopy, FlushShadowOnly, FlushDepthRanges, FlushWaits, WriteBackBytes, ShadowBytes, ImportBytes, CpuBytes, RetileWindows, ImageBufferRegions, LayoutTransitions, AliasCopies, AliasBytes, PendingAliasUnits, PendingAliasRefused, PendingAliasWriters, PendingAliasForeign, ForeignClearFill, ForeignOverwrite, ForeignPartial, ForeignRead, ForeignFullScissor, AliasReconciliations, AliasWindowsAvoided, WorkCount };
+    enum Work : std::size_t { FlushCalls, FlushImages, FlushStorage, FlushDraw, FlushFill, FlushCopy, FlushShadowOnly, FlushDepthRanges, FlushWaits, WriteBackBytes, ShadowBytes, ImportBytes, CpuBytes, RetileWindows, ImageBufferRegions, LayoutTransitions, AliasCopies, AliasBytes, PendingAliasUnits, PendingAliasRefused, PendingAliasWriters, PendingAliasForeign, ForeignClearFill, ForeignOverwrite, ForeignPartial, ForeignRead, ForeignFullScissor, AliasReconciliations, AliasWindowsAvoided, AliasPasses, AliasWaitsAvoided, AliasProofs, WorkCount };
     static const char* Name(Kind kind);
     static bool Profiled();
     // Charges the time since `start` to `kind` on this thread and returns now.
