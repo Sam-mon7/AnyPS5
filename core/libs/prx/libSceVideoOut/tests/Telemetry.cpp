@@ -1,8 +1,10 @@
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include "prx/libSceVideoOut/include/Telemetry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #ifdef _WIN32
 #include <process.h>
 #define getpid _getpid
@@ -165,6 +167,30 @@ void gatePresents(const std::string& mode) {
     std::filesystem::remove_all(directory);
 }
 
+void runtimeDelayShared() {
+    using AgcDriver::ArchB::Switches;
+    const auto directory = freshDirectory("runtime-delay");
+    const auto path = directory / "control.txt";
+#ifdef _WIN32
+    _putenv_s("APS5_ARCHB_CONTROL_FILE", path.string().c_str());
+#else
+    setenv("APS5_ARCHB_CONTROL_FILE", path.c_str(), 1);
+#endif
+    Switches::Initialize();
+    std::ofstream(path) << "1 GATE_DELAY_US=7000\n";
+    Switches::PollControl();
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < 3; ++i) VideoOutTelemetry::ObservePresent(nullptr, i + 1, 0, 1);
+    check(std::chrono::steady_clock::now() - start >= std::chrono::microseconds(21000), "VideoOut did not discover the driver's shared delay");
+    std::ofstream(path) << "2 GATE_DELAY_US=0\n";
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    Switches::PollControl();
+    const auto offStart = std::chrono::steady_clock::now();
+    for (int i = 0; i < 100; ++i) VideoOutTelemetry::ObservePresent(nullptr, i + 4, 0, 1);
+    check(std::chrono::steady_clock::now() - offStart < std::chrono::milliseconds(500), "VideoOut cached the toggled delay");
+    std::filesystem::remove_all(directory);
+}
+
 int frameNumberMatchesCaption() {
     const auto directory = freshDirectory("caption");
     std::filesystem::create_directories(directory / "app0" / "sce_sys");
@@ -207,7 +233,8 @@ int main(int argc, char** argv) {
             return result;
         }
         if (argc > 1) {
-            gatePresents(argv[1]);
+            if (std::string(argv[1]) == "RuntimeDelayShared") runtimeDelayShared();
+            else gatePresents(argv[1]);
             std::printf("%s passed\n", argv[1]);
             return 0;
         }

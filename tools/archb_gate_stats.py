@@ -10,6 +10,20 @@ from archb_gate_config import GateError, read_json, write_json
 
 
 FALSE_PASS_NOTE = "The fixed two-stage rule inflates the false-pass rate slightly above 5%; this is accepted."
+T_95 = (
+    6.313752, 2.919986, 2.353363, 2.131847, 2.015048, 1.943180, 1.894579, 1.859548, 1.833113, 1.812461,
+    1.795885, 1.782288, 1.770933, 1.761310, 1.753050, 1.745884, 1.739607, 1.734064, 1.729133, 1.724718,
+    1.720743, 1.717144, 1.713872, 1.710882, 1.708141, 1.705618, 1.703288, 1.701131, 1.699127, 1.697261,
+    1.695519, 1.693889, 1.692360, 1.690924, 1.689572, 1.688298, 1.687094, 1.685954, 1.684875, 1.683851,
+    1.682878, 1.681952, 1.681071, 1.680230, 1.679427, 1.678660, 1.677927, 1.677224, 1.676551, 1.675905,
+    1.675285, 1.674689, 1.674116, 1.673565, 1.673034, 1.672522, 1.672029, 1.671553, 1.671093, 1.670649,
+)
+
+
+def t_critical(degrees):
+    if type(degrees) is not int or not 1 <= degrees <= len(T_95):
+        raise GateError(24, "t table requires df 1 through 60")
+    return T_95[degrees - 1]
 
 
 def percentile(values, fraction):
@@ -41,6 +55,10 @@ def leg_summary(path, start_ns, end_ns, hold_seconds):
                 raise GateError(24, "present needs integer n and t_ns")
             if start_ns <= timestamp <= end_ns:
                 events.append((n, timestamp))
+    return summarize_events(events, start_ns, end_ns, hold_seconds)
+
+
+def summarize_events(events, start_ns, end_ns, hold_seconds):
     if len(events) < 2:
         raise GateError(24, "insufficient full-rate telemetry")
     intervals = []
@@ -68,29 +86,100 @@ def pair_deltas(pairs):
     return [math.log(positive(pair["candidate"]["ms"]) / positive(pair["control"]["ms"])) for pair in pairs]
 
 
-def bootstrap(pairs):
-    if len(pairs) != 6:
-        raise GateError(24, "Bootstrap requires six pairs")
+def bootstrap(pairs, alternating=False):
+    if len(pairs) != (24 if alternating else 6):
+        raise GateError(24, "Bootstrap requires 24 alternating or six boot pairs")
     deltas = pair_deltas(pairs)
     noise = statistics.stdev(deltas)
+    margin = max(0.02, 1.5 * noise)
     return {"code": 40 if noise > 0.033 else 0, "verdict": "noise" if noise > 0.033 else "pass",
-            "d_i": deltas, "s_AA": noise, "m": max(0.02, 1.5 * noise), "stage": 6}
+            "d_i": deltas, "s_AA": noise, "alternating_m" if alternating else "m": margin, "stage": len(pairs)}
 
 
-def sequential(pairs, margin):
-    if len(pairs) not in (4, 8) or not math.isfinite(margin) or margin < 0.02:
-        raise GateError(24, "Child requires four or eight pairs and a frozen margin >= 0.02")
+def sequential(pairs, margin, alternating=False):
+    stages = (12, 24) if alternating else (4, 8)
+    if len(pairs) not in stages or not math.isfinite(margin) or margin < 0.02:
+        raise GateError(24, f"Child requires {stages} pairs and a frozen margin >= 0.02")
     deltas = pair_deltas(pairs)
     mean = statistics.mean(deltas)
-    critical = {4: 2.353, 8: 1.895}[len(pairs)]
+    critical = t_critical(len(pairs) - 1) if alternating else {4: 2.353, 8: 1.895}[len(pairs)]
     radius = critical * statistics.stdev(deltas) / math.sqrt(len(pairs))
     lower, upper = mean - radius, mean + radius
     threshold = math.log1p(margin)
-    decision = "pass" if upper <= threshold else "fail" if lower > threshold or len(pairs) == 8 else "continue"
+    decision = "pass" if upper <= threshold else "fail" if lower > threshold or len(pairs) == stages[-1] else "continue"
     return {"code": 0 if decision in ("pass", "continue") else 1, "verdict": decision,
             "d_i": deltas, "LB": lower, "UB": upper, "threshold": threshold, "m": margin,
             "stage": len(pairs), "speedup": math.exp(-mean),
             "speedup_90_interval": [math.exp(-upper), math.exp(-lower)], "sequential_rule": FALSE_PASS_NOTE}
+
+
+def alternating_blocks(telemetry, text, blocks, settle_seconds):
+    if not math.isfinite(settle_seconds) or settle_seconds < 0 or len(blocks) not in (24, 48):
+        raise GateError(24, "alternation needs 24 or 48 blocks and nonnegative settling")
+    toggles = {}
+    last_sequence, last_timestamp = 0, -1
+    for line in text.splitlines():
+        if line.startswith("[archb] toggle refused"):
+            raise GateError(21, line)
+        match = re.fullmatch(r"\[archb\] toggle seq=([0-9]+) t_ns=([0-9]+)((?: [A-Z][A-Z0-9_]*=[0-9]+)+)", line)
+        if match is None:
+            continue
+        sequence, timestamp = int(match[1]), int(match[2])
+        if sequence <= last_sequence or timestamp <= last_timestamp:
+            raise GateError(24, "non-monotonic toggle acknowledgement")
+        last_sequence, last_timestamp = sequence, timestamp
+        toggles[sequence] = {"t_ns": timestamp, "values": dict(re.findall(r"([A-Z][A-Z0-9_]*)=([0-9]+)", match[3]))}
+    data = Path(telemetry).read_bytes()
+    events = []
+    for line in data[:data.rfind(b"\n") + 1].splitlines():
+        event = json.loads(line)
+        if not isinstance(event, dict):
+            raise GateError(24, "telemetry event must be an object")
+        if event.get("ev") == "present":
+            n, timestamp = event.get("n"), event.get("t_ns")
+            if type(n) is not int or type(timestamp) is not int:
+                raise GateError(24, "present needs integer n and t_ns")
+            events.append((n, timestamp))
+    summaries = []
+    previous_end = None
+    for block in blocks:
+        start, end = toggles.get(block["start_seq"]), toggles.get(block["end_seq"])
+        if start is None or end is None or block["end_seq"] != block["start_seq"] + 1:
+            raise GateError(24, "missing block boundary acknowledgement")
+        if any(start["values"].get(name) != value for name, value in block["values"].items()):
+            raise GateError(21, "toggle values differ from block plan")
+        if previous_end is not None and start["t_ns"] < previous_end:
+            raise GateError(24, "overlapping blocks")
+        previous_end = end["t_ns"]
+        settled = start["t_ns"] + round(settle_seconds * 1e9)
+        duration = (end["t_ns"] - settled) / 1e9
+        if duration <= 0:
+            raise GateError(24, "settling consumes block")
+        selected = [(n, t) for n, t in events if settled <= t < end["t_ns"]]
+        summary = summarize_events(selected, settled, end["t_ns"], duration)
+        summaries.append({**block, **summary, "toggle_ns": start["t_ns"]})
+    window = [(n, t) for n, t in events if summaries[0]["toggle_ns"] <= t < previous_end]
+    for (n0, t0), (n1, t1) in zip(window, window[1:]):
+        if n1 != n0 + 1 or t1 <= t0:
+            raise GateError(24, "present gap, duplicate or non-monotonic timestamp")
+    pairs = []
+    for index in range(0, len(summaries), 2):
+        pair = {block["role"]: block for block in summaries[index:index + 2]}
+        if set(pair) != {"control", "candidate"}:
+            raise GateError(24, "adjacent blocks must be a control/candidate pair")
+        pairs.append(pair)
+    return pairs
+
+
+def alternating_verdict(directory, settle_seconds, baseline=None, calibration=False):
+    directory = Path(directory)
+    pairs = alternating_blocks(directory / "videoout.jsonl", (directory / "stderr.log").read_text(encoding="utf-8", errors="replace"),
+                               read_json(directory / "blocks.json"), settle_seconds)
+    decision = bootstrap(pairs, True) if calibration else sequential(pairs, baseline["alternating_m"], True)
+    decision.update(tail_check(pairs))
+    if decision["code"] == 0 and decision["verdict"] != "continue" and decision["tail_code"]:
+        decision.update(code=2, verdict="fail")
+    return {**decision, "pairs": pairs, "alternating": True}
 
 
 def tail_check(pairs):
@@ -194,7 +283,12 @@ def main():
     decide.add_argument("--baseline")
     diagnostic = sub.add_parser("diagnostic")
     diagnostic.add_argument("directory")
-    for command in (leg, decide, diagnostic):
+    alternate = sub.add_parser("alternating")
+    alternate.add_argument("directory")
+    alternate.add_argument("--settle-seconds", type=float, default=3)
+    alternate.add_argument("--baseline")
+    alternate.add_argument("--bootstrap", action="store_true")
+    for command in (leg, decide, diagnostic, alternate):
         command.add_argument("--output")
     args = parser.parse_args()
     try:
@@ -202,6 +296,9 @@ def main():
             result = leg_summary(args.path, args.start_ns, args.end_ns, args.hold_seconds)
         elif args.command == "diagnostic":
             result = diagnostics(args.directory)
+        elif args.command == "alternating":
+            result = alternating_verdict(args.directory, args.settle_seconds,
+                                         read_json(args.baseline) if args.baseline else None, args.bootstrap)
         elif args.mode == "Final":
             result = final_verdict(read_json(args.pairs))
         else:

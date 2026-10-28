@@ -102,22 +102,60 @@ def validate_manifest(value):
             raise GateError(23, "invalid library name or SHA-256")
     if not isinstance(value["requiredCounters"], list) or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_]\w*", name) for name in value["requiredCounters"]):
         raise GateError(22, "invalid required counter names")
-    if not isinstance(value["expectSwitches"], dict) or any(not isinstance(key, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or item not in ("0", "1") for key, item in value["expectSwitches"].items()):
+    if not isinstance(value["expectSwitches"], dict) or any(not isinstance(key, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key)
+            or not isinstance(item, str) or not re.fullmatch(r"[01]" if key != "GATE_DELAY_US" else r"[0-9]+", item)
+            for key, item in value["expectSwitches"].items()):
         raise GateError(21, "invalid expectSwitches")
     return value
 
 
-def switch_assertion(text, expected):
+def switch_metadata(text):
     lines = re.findall(r"^\[archb\] switches(.*)$", text, re.M)
-    if not expected and not lines:
-        return {}
     if len(lines) != 1:
         raise GateError(21, f"expected one switches line, got {len(lines)}")
-    tokens = re.findall(r"\b([A-Z][A-Z0-9_]*)=([01])\((?:default|env)\)", lines[0])
-    actual = dict(tokens)
-    if len(tokens) != len(actual) or any(actual.get(key) != value for key, value in expected.items()):
+    result = {}
+    for token in lines[0].split():
+        match = re.fullmatch(r"([A-Z][A-Z0-9_]*)=([0-9]+)\((default|env)\)(\(rt\))?", token)
+        if match is None or match[1] in result or (match[1] != "GATE_DELAY_US" and match[2] not in ("0", "1")):
+            raise GateError(21, f"invalid switches token: {token}")
+        result[match[1]] = {"value": match[2], "runtime": bool(match[4])}
+    return result
+
+
+def switch_assertion(text, expected):
+    if not expected and not re.search(r"^\[archb\] switches", text, re.M):
+        return {}
+    actual = {name: entry["value"] for name, entry in switch_metadata(text).items()}
+    if any(actual.get(key) != value for key, value in expected.items()):
         raise GateError(21, f"switch mismatch: expected {expected}, observed {actual}")
     return actual
+
+
+def alternating_plan(control, candidate, control_text, candidate_text, bootstrap=False):
+    left, right = switch_metadata(control_text), switch_metadata(candidate_text)
+    if (os.path.normcase(str(Path(control["build"]).resolve())) != os.path.normcase(str(Path(candidate["build"]).resolve()))
+            or control["libs"] != candidate["libs"] or left.keys() != right.keys()
+            or any(left[name]["runtime"] != right[name]["runtime"] for name in left)):
+        return {"eligible": False, "reason": "different build, libraries or switch table"}
+    for key in control["env"].keys() | candidate["env"].keys():
+        if control["env"].get(key) == candidate["env"].get(key):
+            continue
+        name = key.removeprefix("APS5_ARCHB_")
+        if not key.startswith("APS5_ARCHB_") or not left.get(name, {}).get("runtime"):
+            return {"eligible": False, "reason": f"startup environment differs: {key}"}
+    if any(left[name]["value"] != right[name]["value"] and not left[name]["runtime"] for name in left):
+        return {"eligible": False, "reason": "startup switch differs"}
+    result = {"eligible": True, "metadata": right,
+              "control": {name: entry["value"] for name, entry in left.items() if entry["runtime"]},
+              "candidate": {name: entry["value"] for name, entry in right.items() if entry["runtime"]}}
+    if bootstrap:
+        if not right.get("GATE_NOOP", {}).get("runtime"):
+            raise GateError(21, "alternating Bootstrap requires runtime GATE_NOOP")
+        result["control"]["GATE_NOOP"] = "0"
+        result["candidate"]["GATE_NOOP"] = "1"
+    if not result["control"]:
+        return {"eligible": False, "reason": "no runtime switches"}
+    return result
 
 
 def counter_assertion(text, required):
@@ -149,6 +187,13 @@ def module_assertion(modules, libs, runtime):
 
 def validation_ids(text):
     return sorted(set(re.findall(r"\b(?:VUID|SYNC)-[A-Za-z0-9_.-]+", text)))
+
+
+def validation_cache_key(manifest):
+    control = manifest["configurations"]["control"]
+    identity = {"build": os.path.normcase(str(Path(control["build"]).resolve())), "libs": control["libs"], "env": control["env"],
+                **{key: manifest[key] for key in ("gpu", "display", "windows")}}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def revision(build):
@@ -280,6 +325,14 @@ def main():
     verify.add_argument("directory")
     verify.add_argument("runtime")
     verify.add_argument("--diagnostic", action="store_true")
+    alternate = sub.add_parser("alternating-plan")
+    alternate.add_argument("control")
+    alternate.add_argument("candidate")
+    alternate.add_argument("control_log")
+    alternate.add_argument("candidate_log")
+    alternate.add_argument("--bootstrap", action="store_true")
+    cache = sub.add_parser("validation-key")
+    cache.add_argument("manifest")
     args = parser.parse_args()
     try:
         if args.command == "prepare":
@@ -294,6 +347,12 @@ def main():
             result = restore(args.manifest)
         elif args.command == "repair":
             result = repair_pending(args.runtime)
+        elif args.command == "alternating-plan":
+            result = alternating_plan(read_json(args.control), read_json(args.candidate),
+                                      Path(args.control_log).read_text(encoding="utf-8", errors="replace"),
+                                      Path(args.candidate_log).read_text(encoding="utf-8", errors="replace"), args.bootstrap)
+        elif args.command == "validation-key":
+            result = {"key": validation_cache_key(read_json(args.manifest))}
         else:
             manifest = read_json(args.manifest)
             directory = Path(args.directory)

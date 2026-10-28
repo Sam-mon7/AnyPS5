@@ -226,7 +226,8 @@ def compare_capture(capture, dump):
 
 def contact_sheet(directory):
     directory = Path(directory)
-    files = sorted(list(directory.rglob("start.png")) + list(directory.rglob("end.png")))
+    files = sorted(list(directory.rglob("start.png")) + list(directory.rglob("end.png"))
+                   + list(directory.rglob("last-control.png")) + list(directory.rglob("last-candidate.png")))
     if not files:
         return {"screenshots": 0}
     sheet = Image.new("RGB", (640, ((len(files) + 1) // 2) * 205), "#202020")

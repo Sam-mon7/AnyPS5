@@ -500,6 +500,15 @@ if(BUILD_TESTING)
     add_dependencies(agc_archb_c01_switches_tests agc_trace_revision)
     add_test(NAME agc_archb_c01_switches COMMAND agc_archb_c01_switches_tests)
     set_tests_properties(agc_archb_c01_switches PROPERTIES TIMEOUT 30)
+    foreach(archbToggleCase IN ITEMS SeqMonotonic RefusesStartupOnly RefusesUnknown PrerequisiteCascades
+            NoFileNoCost AppliesAtBoundaryOnly)
+        add_test(NAME agc_archb_c01_toggle_${archbToggleCase} COMMAND agc_archb_c01_switches_tests --toggle ${archbToggleCase})
+        set_tests_properties(agc_archb_c01_toggle_${archbToggleCase} PROPERTIES TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archb_c01_toggle_${archbToggleCase} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     if(WIN32)
         set_tests_properties(agc_archb_c01_switches PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
@@ -507,20 +516,22 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         foreach(archbStatsCase IN ITEMS frame_deltas_compute_ms gap_or_duplicate_fails aa_noise_sets_margin
                 noise_above_limit_fails sequential_pass_at_four sequential_continue_then_fail
-                clear_regression_fails_early p95_median_rule final_mode_requires_every_leg old_30_frame_telemetry_rejected)
+                clear_regression_fails_early p95_median_rule final_mode_requires_every_leg old_30_frame_telemetry_rejected
+                alternating_block_pairing alternating_settle_discard alternating_sequential_12_24 alternating_t_table)
             add_test(NAME agc_archb_c01_stats_${archbStatsCase} COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBGateStats.py ${archbStatsCase})
             set_tests_properties(agc_archb_c01_stats_${archbStatsCase} PROPERTIES TIMEOUT 30)
         endforeach()
         foreach(archbConfigCase IN ITEMS strips_inherited_aps5 rejects_profile_in_measured_leg
-                switch_line_mismatch_fails required_counter_zero_fails restore_plan_round_trip pending_manifest_repaired)
+                switch_line_mismatch_fails required_counter_zero_fails restore_plan_round_trip pending_manifest_repaired
+                alternating_eligibility)
             add_test(NAME agc_archb_c01_config_${archbConfigCase} COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBGateConfig.py ${archbConfigCase})
             set_tests_properties(agc_archb_c01_config_${archbConfigCase} PROPERTIES TIMEOUT 30)
         endforeach()
         if(WIN32)
             foreach(archbRestoreCase IN ITEMS RestoreAfterNavigationFailure RestoreMissingArgsFile
-                    WatchdogRestoresAfterKill RejectWrongPidStartTime RestoreBothPrxDirectories)
+                    WatchdogRestoresAfterKill RejectWrongPidStartTime RestoreBothPrxDirectories AlternatingBlocks Bisection)
                 add_test(NAME agc_archb_c01_restore_${archbRestoreCase} COMMAND pwsh -NoProfile -File
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBGateRestore.ps1 -Case ${archbRestoreCase})
                 set_tests_properties(agc_archb_c01_restore_${archbRestoreCase} PROPERTIES TIMEOUT 30
