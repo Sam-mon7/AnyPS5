@@ -1,3 +1,6 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include <filesystem>
+#include <fstream>
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -551,6 +554,61 @@ ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address) {
     ShaderRecompiler::RecompileResult program;
     program.bindings.push_back(std::move(binding));
     return program;
+}
+
+void upperBoundToggle(const char* name, bool enabled) {
+    static std::uint64_t sequence = 0;
+    {
+        std::ofstream control(std::getenv("APS5_ARCHB_CONTROL_FILE"));
+        control << ++sequence << " " << name << "=" << (enabled ? 1 : 0) << "\n";
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(55));
+    AgcDriver::ArchB::Switches::PollControl();
+}
+
+void upperBoundLockTests() {
+    namespace Memory = AgcDriver::GuestMemory;
+    for (const bool enabled : {false, true, false}) {
+        upperBoundToggle("UB_NO_LOCK_INVALIDATION", enabled);
+        { std::lock_guard lock(Memory::GpuMutex()); }
+        const auto before = Memory::ProofSerial();
+        const auto resourceBefore = Memory::ResourceProofSerial();
+        const auto holdBefore = Memory::GpuHoldSerial();
+        std::thread worker([&] {
+            std::lock_guard lock(Memory::GpuMutex());
+            std::lock_guard nested(Memory::GpuMutex());
+        });
+        worker.join();
+        Require(Memory::ProofSerial() == before + (enabled ? 0 : 1), "UB lock invalidation changed the wrong proof serial");
+        Require(Memory::ResourceProofSerial() == resourceBefore + (enabled ? 0 : 1), "UB lock invalidation changed the wrong resource proof serial");
+        Require(Memory::GpuHoldSerial() == holdBefore + 1, "UB lock invalidation changed the hold serial");
+    }
+}
+
+void upperBoundProofTests(Context context) {
+    namespace Memory = AgcDriver::GuestMemory;
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    std::lock_guard lock(Memory::GpuMutex());
+    WatchedSurface surface(context);
+    const auto program = SampledProgram(surface.Address());
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, shader);
+    ShaderResources unproved(context, shader);
+    Require(resources.Revalidate(shader), "UB fixture failed its first full validation");
+    std::memset(reinterpret_cast<void*>(surface.Address()), 0x37, SurfaceBytes);
+    Memory::BumpCollectEpoch();
+    upperBoundToggle("UB_TRUST_PROOFS", true);
+    Require(!unproved.Revalidate(shader), "UB trust proofs skipped an object's first validation");
+    Require(resources.Revalidate(shader), "UB trust proofs repeated a stale resource check");
+    upperBoundToggle("UB_TRUST_PROOFS", false);
+    Require(!resources.Revalidate(shader), "UB disabled accepted a changed resource");
+    upperBoundToggle("UB_SKIP_DISPATCH_PROOF_WALK", true);
+    Require(resources.Revalidate(shader), "UB dispatch full walk was not skipped");
+    upperBoundToggle("UB_SKIP_DISPATCH_PROOF_WALK", false);
+    Require(!resources.Revalidate(shader), "UB dispatch off accepted a changed resource");
 }
 
 bool resourceEpochTests(Context context, bool draw) {
@@ -1497,6 +1555,28 @@ int main(int argc, char** argv) {
     try {
         const bool memory = argc > 1 && std::string(argv[1]) == "memory";
         const std::string mode = argc > 1 ? argv[1] : "";
+        const bool upperBound = mode == "ub-trust-proofs" || mode == "ub-lock-invalidation";
+        struct UpperBoundControl {
+            std::filesystem::path path;
+            ~UpperBoundControl() { if (!path.empty()) std::filesystem::remove(path); }
+        } control;
+        if (upperBound) {
+            control.path = std::filesystem::current_path() / ("archb-ub-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+#ifdef _WIN32
+            _putenv_s("APS5_ARCHB_GATE_RUN", "1");
+            _putenv_s("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str());
+            _putenv_s("APS5_RESOURCE_EPOCH_PROOFS", "1");
+#else
+            setenv("APS5_ARCHB_GATE_RUN", "1", 1);
+            setenv("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str(), 1);
+            setenv("APS5_RESOURCE_EPOCH_PROOFS", "1", 1);
+#endif
+            AgcDriver::ArchB::Switches::Initialize();
+            if (mode == "ub-lock-invalidation") {
+                upperBoundLockTests();
+                return 0;
+            }
+        }
         if (mode == "device-selection-cpu") {
             deviceSelectionTests();
             return 0;
@@ -1542,6 +1622,7 @@ int main(int argc, char** argv) {
         }
         TextureDetiler detiler(context);
         context.detiler = &detiler;
+        if (mode == "ub-trust-proofs") { upperBoundProofTests(context); return 0; }
         if (mode == "resource-epoch-draw" || mode == "resource-epoch-dispatch") {
             if (!resourceEpochTests(context, mode == "resource-epoch-draw")) return VulkanTestSkipped;
             std::puts("resource epoch proof tests passed");

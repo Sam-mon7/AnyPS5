@@ -5,6 +5,7 @@
 #include <vulkan/vulkan.h>
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PresentCounterBook.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ComputePipelineCapture.hpp"
@@ -260,6 +261,7 @@ public:
     // mutex (the same wait under it is only the fallback when the answer changes in between).
     bool PresentWaitsForSlots(const DisplayBuffer* buffer) const;
     bool AcquireImage();
+    static PresentCounterBook& PresentationCounters();
     bool PresentClear(std::uint32_t width, std::uint32_t height, bool opaque);
     void PresentPixels(std::uint32_t width, std::uint32_t height, std::span<const std::byte> pixels);
     bool PresentDisplayBuffer(const DisplayBuffer& buffer);

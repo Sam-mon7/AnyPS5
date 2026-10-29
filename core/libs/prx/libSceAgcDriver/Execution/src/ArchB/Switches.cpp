@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 
 #include <array>
 #include <atomic>
@@ -12,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -35,9 +37,22 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::TestDependent, "TEST_DEPENDENT", true, false, TestPrerequisites},
     {Feature::TestRuntimeDependent, "TEST_RUNTIME_DEPENDENT", false, true, TestRuntimePrerequisites},
 #endif
+    {Feature::UbTrustProofs, "UB_TRUST_PROOFS", false, true, {}},
+    {Feature::UbNoLockInvalidation, "UB_NO_LOCK_INVALIDATION", false, true, {}},
+    {Feature::UbPointerFreeDrawKeys, "UB_POINTER_FREE_DRAW_KEYS", false, true, {}},
+    {Feature::UbSkipCpuIndirect, "UB_SKIP_CPU_INDIRECT", false, true, {}},
+    {Feature::UbSkipDispatchProofWalk, "UB_SKIP_DISPATCH_PROOF_WALK", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
+std::array<std::atomic<std::uint64_t>, Entries.size()> upperBoundHits{};
+constexpr std::pair<Feature, const char*> UpperBoundCounters[] = {
+    {Feature::UbTrustProofs, "ub_trust_proofs_hits"},
+    {Feature::UbNoLockInvalidation, "ub_no_lock_invalidation_hits"},
+    {Feature::UbPointerFreeDrawKeys, "ub_pointer_free_draw_keys_hits"},
+    {Feature::UbSkipCpuIndirect, "ub_skip_cpu_indirect_hits"},
+    {Feature::UbSkipDispatchProofWalk, "ub_skip_dispatch_proof_walk_hits"},
+};
 std::atomic<std::int64_t> delayMicros{0};
 std::filesystem::path controlFile;
 std::chrono::steady_clock::time_point nextPoll;
@@ -85,6 +100,7 @@ void applyLine(const std::string& line) {
     for (std::size_t i = 0; i < values.size(); ++i) pending[i] = values[i].load(std::memory_order_acquire);
     auto delay = delayMicros.load(std::memory_order_acquire);
     bool delayNamed = false;
+    bool screenshot = false;
     bool any = false;
     while (stream >> token) {
         any = true;
@@ -92,6 +108,11 @@ void applyLine(const std::string& line) {
         if (equals == std::string::npos) return refuse("invalid token " + token);
         const auto name = token.substr(0, equals);
         const auto value = std::string_view(token).substr(equals + 1);
+        if (name == "SCREENSHOT") {
+            if (screenshot || value != "1") return refuse("invalid SCREENSHOT");
+            screenshot = true;
+            continue;
+        }
         if (name == "GATE_DELAY_US") {
             std::uint64_t parsed = 0;
             if (delayNamed || !number(value, parsed) || parsed > INT64_MAX / 1000) return refuse("invalid GATE_DELAY_US");
@@ -127,12 +148,18 @@ void applyLine(const std::string& line) {
     for (std::size_t i = 0; i < values.size(); ++i) values[i].store(pending[i], std::memory_order_release);
     delayMicros.store(delay, std::memory_order_release);
     lastSequence = sequence;
+    if (screenshot) AgcDriver::Screenshot::Request();
     const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    for (const auto& [feature, name] : UpperBoundCounters) {
+        const auto hits = upperBoundHits[static_cast<std::size_t>(feature)].load(std::memory_order_relaxed);
+        if (hits != 0) std::fprintf(stderr, "[archb] %s=%llu t_ns=%lld\n", name, static_cast<unsigned long long>(hits), static_cast<long long>(nanos));
+    }
     std::string text;
     for (const auto& entry : Entries) {
         if (entry.runtime) text += " " + std::string(entry.name) + "=" + (pending[static_cast<std::size_t>(entry.feature)] ? "1" : "0");
     }
     text += " GATE_DELAY_US=" + std::to_string(delay);
+    if (screenshot) text += " SCREENSHOT=1";
     std::fprintf(stderr, "[archb] toggle seq=%llu t_ns=%lld%s\n", static_cast<unsigned long long>(sequence), static_cast<long long>(nanos), text.c_str());
     std::fflush(stderr);
 }
@@ -188,6 +215,14 @@ void Switches::Initialize() {
 bool Switches::Enabled(Feature feature) {
     Initialize();
     return values.at(static_cast<std::size_t>(feature)).load(std::memory_order_acquire);
+}
+
+void Switches::CountUpperBoundHit(Feature feature) {
+    const auto previous = upperBoundHits.at(static_cast<std::size_t>(feature)).fetch_add(1, std::memory_order_relaxed);
+    if (previous != 0) return;
+    for (const auto& [entry, name] : UpperBoundCounters) {
+        if (entry == feature) std::fprintf(stderr, "[archb] %s=1\n", name);
+    }
 }
 
 void Switches::PollControl() {

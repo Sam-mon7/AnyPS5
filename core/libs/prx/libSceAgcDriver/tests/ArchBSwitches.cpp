@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceVideoOut/include/Telemetry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -18,10 +20,15 @@
 #include <unistd.h>
 #endif
 
+extern "C" void AgcDriverPresentCounters_nid_postfix(AgcDriver::PresentCounters* counters) {
+    *counters = {};
+}
+
 namespace {
 
 thread_local std::size_t allocations = 0;
 thread_local bool countAllocations = false;
+std::size_t screenshotRequests = 0;
 
 void check(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error(reason);
@@ -94,6 +101,27 @@ void toggleCase(const std::string& name) {
         const auto polls = Switches::ControlPolls();
         Switches::PollControl();
         check(Switches::ControlPolls() == polls, "poll rate exceeded");
+    } else if (name == "ScreenshotToken") {
+        write("1 SCREENSHOT=1", false);
+        check(screenshotRequests == 0, "screenshot requested away from boundary");
+        Switches::PollControl();
+        check(screenshotRequests == 1, "standalone screenshot token did not request once");
+        Switches::PollControl();
+        write("1 SCREENSHOT=1");
+        write("0 SCREENSHOT=1");
+        check(screenshotRequests == 1, "stale screenshot token requested again");
+        for (const auto* invalid : {"0", "2", "-1", "true", "01", ""}) {
+            write("2 GATE_NOOP=1 SCREENSHOT=" + std::string(invalid));
+        }
+        for (const auto* tokens : {"SCREENSHOT=1 UNKNOWN=1", "SCREENSHOT=1 GATE_RUN=0", "SCREENSHOT=1 SCREENSHOT=1",
+                                   "SCREENSHOT=1 TEST_RUNTIME_DEPENDENT=1", "SCREENSHOT=1\n3 SCREENSHOT=1"}) {
+            write("2 " + std::string(tokens));
+        }
+        check(screenshotRequests == 1 && !Switches::Enabled(Feature::GateNoop), "refused screenshot line had side effects");
+        write("2 GATE_NOOP=1 SCREENSHOT=1");
+        check(screenshotRequests == 2 && Switches::Enabled(Feature::GateNoop), "combined screenshot line did not apply once");
+        write("3 GATE_NOOP=0");
+        check(screenshotRequests == 2, "ordinary toggle requested screenshot");
     } else if (name == "RefusesStartupOnly" || name == "RefusesUnknown") {
         write(name == "RefusesStartupOnly" ? "1 GATE_NOOP=1 GATE_RUN=0" : "1 GATE_NOOP=1 UNKNOWN=1");
         check(!Switches::Enabled(Feature::GateNoop) && Switches::Enabled(Feature::GateRun), "refused line partially applied");
@@ -136,6 +164,10 @@ void toggleCase(const std::string& name) {
 
 }
 
+void AgcDriver::Screenshot::Request() {
+    ++screenshotRequests;
+}
+
 void* operator new(std::size_t size) {
     if (countAllocations) ++allocations;
     if (auto* memory = std::malloc(size == 0 ? 1 : size)) return memory;
@@ -152,6 +184,22 @@ int main(int argc, char** argv) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
     try {
+        if (argc == 2 && std::string(argv[1]) == "--ub-default") {
+            setEnvironment("APS5_ARCHB_GATE_RUN", nullptr);
+            for (const auto& entry : Switches::Table()) {
+                if (std::string(entry.name).starts_with("UB_")) setEnvironment(("APS5_ARCHB_" + std::string(entry.name)).c_str(), nullptr);
+            }
+            std::size_t count = 0;
+            for (const auto& entry : Switches::Table()) {
+                if (!std::string(entry.name).starts_with("UB_")) continue;
+                ++count;
+                check(!entry.defaultOn && entry.runtime && entry.prerequisites.empty() && !Switches::Enabled(entry.feature), "UB switch must default off, be runtime and have no prerequisites");
+                check(Switches::Describe().find(std::string(entry.name) + "=0(default)(rt)") != std::string::npos, "UB switch missing runtime description");
+            }
+            check(count == 5, "missing upper-bound switch");
+            std::puts("upper-bound switches default off passed");
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--toggle") {
             toggleCase(argv[2]);
             std::printf("%s passed\n", argv[2]);

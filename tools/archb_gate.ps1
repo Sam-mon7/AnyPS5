@@ -1,5 +1,6 @@
 [CmdletBinding(DefaultParameterSetName = 'Gate')]
 param(
+    [string[]]$Experiments,
     [Parameter(Mandatory, ParameterSetName = 'Gate')][string]$Control,
     [string]$Candidate,
     [string]$Matrix,
@@ -12,6 +13,9 @@ param(
     [switch]$Alternating,
     [ValidateRange(1, 3600)][int]$BlockSeconds = 15,
     [ValidateRange(0, 3599)][int]$SettleSeconds = 3,
+    [ValidateRange(1, 1000)][int]$MinFreeGB = 10,
+    [ValidateRange(0, 1048576)][int]$MinAvailableMiB = 256,
+    [ValidateRange(1, 3600)][int]$LowMemorySeconds = 60,
     [switch]$Bisect,
     [switch]$Diagnostic,
     [switch]$RecorderOverhead,
@@ -70,18 +74,6 @@ function Stop-GateProcess([int]$ProcessId, [long]$StartTicks) {
     $process.WaitForExit()
 }
 
-function Move-GateDumps([string]$RuntimePath, [string]$Destination, [long]$NotBeforeTicks) {
-    $runtimeRoot = [IO.Path]::GetFullPath($RuntimePath).TrimEnd('\')
-    $null = New-Item -ItemType Directory -Path $Destination -Force
-    foreach ($dump in Get-ChildItem -LiteralPath $RuntimePath -Filter 'frame_*.bmp' -File) {
-        if ($dump.Name -notmatch '^frame_[0-9]+\.bmp$' -or $dump.CreationTimeUtc.Ticks -lt $NotBeforeTicks) { continue }
-        if ([IO.Path]::GetDirectoryName($dump.FullName) -ne $runtimeRoot -or ($dump.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            Stop-GateFailure 30 'Unexpected diagnostic dump path'
-        }
-        Move-Item -LiteralPath $dump.FullName -Destination $Destination
-    }
-}
-
 function Restore-GateRuntime([string]$Manifest) {
     return Invoke-GatePython 'archb_gate_config.py' @('restore', $Manifest)
 }
@@ -89,7 +81,10 @@ function Restore-GateRuntime([string]$Manifest) {
 function Start-GateWatchdog([string]$Manifest, [int]$ProcessId, [long]$StartTicks) {
     $arguments = @('-NoProfile', '-File', "`"$script:GateScript`"", '-WatchdogManifest', "`"$Manifest`"",
                    '-RunnerPid', $ProcessId, '-RunnerStartTicks', $StartTicks)
-    return Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    $commandLine = "`"$((Get-Command pwsh).Source)`" -WindowStyle Hidden " + ($arguments -join ' ')
+    $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine }
+    if ($created.ReturnValue -ne 0) { Stop-GateFailure 31 "Watchdog could not start outside the runner's process tree ($($created.ReturnValue))" }
+    return Get-Process -Id $created.ProcessId
 }
 
 function Invoke-GateWatchdog([string]$Manifest, [int]$ProcessId, [long]$StartTicks) {
@@ -119,10 +114,6 @@ function Invoke-GateWatchdog([string]$Manifest, [int]$ProcessId, [long]$StartTic
         $gate.restoration = $restored
         $gate.code = 11
         $gate.verdict = 'runner terminated; watchdog restored runtime'
-        if ($active.ContainsKey('capture')) {
-            try { Move-GateDumps $active.capture.runtime $active.capture.destination $active.capture.notBeforeTicks }
-            catch { $gate.capture_error = $_.Exception.Message }
-        }
         $artifactRoot = Split-Path $Manifest -Parent
         $gate.legs = @(Get-ChildItem -LiteralPath $artifactRoot -Filter 'leg.json' -Recurse -File | ForEach-Object {
             Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json -AsHashtable
@@ -282,9 +273,16 @@ function Add-GateMemorySample($Process, [string]$Directory, [ref]$LowSince) {
     $timestamp = Get-GateClock
     "$timestamp,$($sample.private_commit),$($sample.working_set),$($sample.commit_headroom),$($sample.available_memory)" |
         Add-Content -LiteralPath (Join-Path $Directory 'memory.csv') -Encoding utf8
-    if ($sample.available_memory -lt 768MB) {
+    foreach ($record in @($script:ActiveLeg, $script:ActiveBlock)) {
+        if ($null -eq $record) { continue }
+        if ($null -eq $record.min_available_memory -or $sample.available_memory -lt $record.min_available_memory) {
+            $record.min_available_memory = $sample.available_memory
+        }
+        if ($record.measured) { $record.memory_pressure = $record.min_available_memory -lt 512MB }
+    }
+    if ($sample.available_memory -lt ([long]$MinAvailableMiB * 1MB)) {
         if ($null -eq $LowSince.Value) { $LowSince.Value = $timestamp }
-        if ($timestamp - $LowSince.Value -ge 30000000000) { Stop-GateFailure 26 'Available memory below 768 MiB for 30s' }
+        if ($timestamp - $LowSince.Value -ge ([long]$LowMemorySeconds * 1000000000)) { Stop-GateFailure 26 "Available memory below $MinAvailableMiB MiB for $LowMemorySeconds seconds" }
     } else { $LowSince.Value = $null }
     if ($sample.commit_headroom -lt 4GB) { Stop-GateFailure 26 'System commit headroom below 4 GiB' }
     return $sample
@@ -311,14 +309,17 @@ function Deploy-GateConfiguration($Configuration) {
     }
 }
 
-function Write-GateControl([string]$Directory, [long]$Sequence, $Values) {
+function Write-GateControl([string]$Directory, $Values) {
+    $remainder = 0L
+    $sequence = [Math]::DivRem(([DateTime]::UtcNow.Ticks - [DateTime]::UnixEpoch.Ticks), 10L, [ref]$remainder)
     $tokens = @($Values.Keys | Sort-Object | ForEach-Object { "$_=$($Values[$_])" })
     $path = Join-Path $Directory 'control.txt'
     $temporary = $path + '.tmp'
     try {
-        [IO.File]::WriteAllText($temporary, "$Sequence $($tokens -join ' ')`n", [Text.Encoding]::ASCII)
+        [IO.File]::WriteAllText($temporary, "$sequence $($tokens -join ' ')`n", [Text.Encoding]::ASCII)
         Move-GateFile $temporary $path
     } finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary } }
+    return $sequence
 }
 
 function Wait-GateToggle($Process, [string]$Directory, [long]$Sequence, $LowSince = $null) {
@@ -340,17 +341,20 @@ function Wait-GateToggle($Process, [string]$Directory, [long]$Sequence, $LowSinc
 
 function Invoke-GateBlocks($Process, [string]$Directory, $Plan, [ref]$LowSince) {
     $blocks = [Collections.Generic.List[object]]::new()
-    $sequence = 1L
-    $stages = if ($Mode -eq 'Bootstrap') { @(48) } elseif ($RecorderOverhead) { @(24, 48, 96) } else { @(24, 48) }
+    $script:ActiveBlocks = $blocks
+    $stages = if ($Mode -eq 'Bootstrap') { @(48) } else { @(24, 48, 96) }
     foreach ($total in $stages) {
         while ($blocks.Count -lt $total) {
             $order = if ([Security.Cryptography.RandomNumberGenerator]::GetInt32(2)) { @('control', 'candidate') } else { @('candidate', 'control') }
             foreach ($role in $order) {
-                Write-GateControl $Directory $sequence $Plan[$role]
+                $sequence = Write-GateControl $Directory $Plan[$role]
                 $applied = Wait-GateToggle $Process $Directory $sequence $LowSince
+                if ($null -ne $script:ActiveBlock) { $script:ActiveBlock.end_seq = $sequence }
                 $block = @{ role = $role; pair = [int][Math]::Floor($blocks.Count / 2); start_seq = $sequence
-                            end_seq = $sequence + 1; values = $Plan[$role]; applied_ns = $applied }
+                            values = $Plan[$role]; applied_ns = $applied; measured = $true; min_available_memory = $null; memory_pressure = $false }
+                $script:ActiveBlock = $block
                 $blocks.Add($block)
+                $null = Add-GateMemorySample $Process $Directory $LowSince
                 Write-GateJson (Join-Path $Directory 'blocks.json') @($blocks.ToArray())
                 $deadline = $applied + [long]$BlockSeconds * 1000000000
                 while ((Get-GateClock) -lt $deadline) {
@@ -360,21 +364,27 @@ function Invoke-GateBlocks($Process, [string]$Directory, $Plan, [ref]$LowSince) 
                 if ($blocks.Count -ge $total - 1) {
                     $null = Invoke-GatePython 'archb_gate_nav.py' @('screenshot', '--pid', $Process.Id, '--output', (Join-Path $Directory "last-$role.png"))
                 }
-                ++$sequence
             }
         }
-        Write-GateControl $Directory $sequence $Plan.control
+        $sequence = Write-GateControl $Directory $Plan.control
         $null = Wait-GateToggle $Process $Directory $sequence $LowSince
-        ++$sequence
+        $script:ActiveBlock.end_seq = $sequence
+        $script:ActiveBlock = $null
+        Write-GateJson (Join-Path $Directory 'blocks.json') @($blocks.ToArray())
         Start-Sleep -Milliseconds 250
         $arguments = @('alternating', $Directory, '--settle-seconds', $SettleSeconds, '--output', (Join-Path $Directory 'alternating.json'))
-        if ($Mode -eq 'Bootstrap') { $arguments += '--bootstrap' }
+        if ($Plan.ContainsKey('experiment')) {
+            $arguments = @('ub-experiment', $Directory, '--name', $Plan.experiment, '--settle-seconds', $SettleSeconds,
+                           '--output', (Join-Path $Directory 'ub-experiment.json'))
+            foreach ($name in $Plan.switches) { $arguments += @('--switch', $name) }
+        }
+        elseif ($Mode -eq 'Bootstrap') { $arguments += '--bootstrap' }
         else { $arguments += @('--baseline', $script:BaselinePath) }
         if ($RecorderOverhead) {
             $decision = Invoke-GatePython 'archb_recorder_gate.py' @($Directory, '--settle-seconds', $SettleSeconds,
                 '--output', (Join-Path $Directory 'alternating.json')) @(0, 1, 2, 3, 40)
         } else {
-            $decision = Invoke-GatePython 'archb_gate_stats.py' $arguments @(0, 1, 2, 40)
+            $decision = Invoke-GatePython 'archb_gate_stats.py' $arguments @(0, 1, 2, 3, 27, 40)
         }
         if ($decision.verdict -ne 'continue') { return $decision }
     }
@@ -386,6 +396,49 @@ function Get-GateAlternatingPlan($ControlLeg, $CandidateLeg) {
                    (Join-Path $CandidateLeg.directory 'stderr.log'))
     if ($Mode -eq 'Bootstrap') { $arguments += '--bootstrap' }
     return Invoke-GatePython 'archb_gate_config.py' $arguments
+}
+
+function Invoke-GateUpperBoundExperiments($Configuration) {
+    $names = @('UB_TRUST_PROOFS', 'UB_NO_LOCK_INVALIDATION', 'UB_POINTER_FREE_DRAW_KEYS', 'UB_SKIP_CPU_INDIRECT', 'UB_SKIP_DISPATCH_PROOF_WALK')
+    $requested = @($Experiments | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+    if (@($requested | Where-Object { $_ -notin $names }).Count) { Stop-GateFailure 21 'Unknown upper-bound experiment' }
+    $results = @()
+    foreach ($experiment in @($requested) + @('ALL_UB')) {
+        $enabled = if ($experiment -eq 'ALL_UB') { $names } else { @($experiment) }
+        $off = $Configuration | ConvertTo-Json -Depth 80 | ConvertFrom-Json -AsHashtable
+        $off.name = 'ub-' + $experiment.ToLowerInvariant()
+        $off.requiredCounters = @()
+        $plan = @{ control = @{}; candidate = @{}; experiment = $experiment; switches = @($enabled) }
+        foreach ($name in $names) {
+            $off.env["APS5_ARCHB_$name"] = '0'
+            $off.expectSwitches[$name] = '0'
+            $plan.control[$name] = '0'
+            $plan.candidate[$name] = if ($name -in $enabled) { '1' } else { '0' }
+        }
+        try {
+            $leg = Invoke-GateLeg $off $off.name 'measured' 0 $false $plan
+            $results += $leg.alternating
+        } catch {
+            $failed = $script:AllLegs[$script:AllLegs.Count - 1]
+            $hits = @{}
+            $stderr = Join-Path $failed.directory 'stderr.log'
+            if (Test-Path -LiteralPath $stderr) {
+                $text = [IO.File]::ReadAllText($stderr)
+                foreach ($name in $enabled) {
+                    $counter = $name.ToLowerInvariant() + '_hits'
+                    $values = @([regex]::Matches($text, "\b$counter=([0-9]+)\b") | ForEach-Object { [long]$_.Groups[1].Value })
+                    $hits[$counter] = if ($values.Count) { ($values | Measure-Object -Maximum).Maximum } else { 0 }
+                }
+            }
+            $results += @{ name = $experiment; switches = @($enabled); status = 'experiment crashed'; stage = $failed.stage
+                           error = $_.Exception.Message; directory = $failed.directory; hits = $hits }
+        }
+        $path = Join-Path $Output 'ub-experiments.json'
+        Write-GateJson $path @($results)
+        $report = Invoke-GatePython 'archb_gate_stats.py' @('ub-report', $path, '--output', (Join-Path $Output 'ub-report.json'), '--table', (Join-Path $Output 'ub-report.md'))
+    }
+    Write-Host $report.markdown
+    return @($results)
 }
 
 function Invoke-GateBisection($Configuration, $Plan) {
@@ -429,27 +482,21 @@ function Invoke-GateBisection($Configuration, $Plan) {
 function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Seconds, [bool]$Measured, $Alternation = $null) {
     $directory = Join-Path $Output $Label
     $null = New-Item -ItemType Directory -Path $directory
-    $result = @{ label = $Label; kind = $Kind; directory = $directory; status = 'running' }
+    $result = @{ label = $Label; kind = $Kind; directory = $directory; status = 'running'; measured = $Measured; min_available_memory = $null }
+    $script:ActiveLeg = $result
+    $script:ActiveBlock = $null
+    $script:ActiveBlocks = $null
+    $upperBound = $null -ne $Alternation -and $Alternation.ContainsKey('experiment')
+    if ($upperBound) { $result.stage = 'startup' }
     $script:AllLegs.Add($result)
     $configPath = Join-Path $directory 'configuration.json'
     Write-GateJson $configPath $Configuration
     $environment = Invoke-GatePython 'archb_gate_config.py' @('environment', $configPath, $directory, '--kind', $Kind)
-    if ($Kind -eq 'capture' -and $script:AlternatingBootstrap) {
-        $environment.APS5_PROFILE_DRAW = '1'
-        $environment.APS5_PROFILE_DRAW_SHADERS = '1'
-        $environment.APS5_PROFILE_SHADERS_REPORT = '1'
-        $environment.APS5_TRACE_SUMMARY_EVERY = '10'
-        $environment.APS5_TRACE_DIR = $directory
-    }
-    if ($null -ne $Alternation) { $environment.APS5_ARCHB_CONTROL_FILE = Join-Path $directory 'control.txt' }
     $recordedEnvironment = @{}
     foreach ($key in $environment.Keys) {
         if ($key -match '^(APS5_|ANYPS5_|VK_|VVL_)') { $recordedEnvironment[$key] = $environment[$key] }
     }
     Write-GateJson (Join-Path $directory 'environment.json') $recordedEnvironment
-    if ($Kind -eq 'capture' -and @(Get-ChildItem -LiteralPath $Runtime -Filter 'frame_*.bmp' -File).Count) {
-        Stop-GateFailure 30 'Bootstrap capture requires no existing frame_*.bmp in Runtime'
-    }
     Deploy-GateConfiguration $Configuration
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = Join-Path $Runtime 'demons-souls.exe'
@@ -476,9 +523,6 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
         $ticks = $process.StartTime.ToUniversalTime().Ticks
         $activePath = Join-Path $Output 'active-processes.json'
         $active = @{ game = @{ id = $process.Id; startTicks = $ticks } }
-        if ($Kind -eq 'capture') {
-            $active.capture = @{ runtime = $Runtime; destination = (Join-Path $directory 'frame-dumps'); notBeforeTicks = $ticks }
-        }
         Write-GateJson $activePath $active
         $outTask = $process.StandardOutput.BaseStream.CopyToAsync($outStream)
         $errTask = $process.StandardError.BaseStream.CopyToAsync($errStream)
@@ -490,16 +534,19 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
                                 '--refs', $NavigationRefs, '--pad', (Join-Path $directory 'pad.txt'), '--output', $directory)) {
             $navStart.ArgumentList.Add($argument)
         }
+        if ($upperBound) { $result.stage = 'navigation' }
         $navProcess = [Diagnostics.Process]::Start($navStart)
         $active.navigator = @{ id = $navProcess.Id; startTicks = $navProcess.StartTime.ToUniversalTime().Ticks }
         Write-GateJson $activePath $active
         while (-not $navProcess.WaitForExit(1000)) { $null = Add-GateMemorySample $process $directory ([ref]$lowSince) }
         if ($navProcess.ExitCode -ne 0) { Stop-GateFailure $navProcess.ExitCode 'Navigation failed' }
+        if ($upperBound) { $result.stage = 'warmup' }
         $navigation = Get-Content -LiteralPath (Join-Path $directory 'navigation.json') -Raw | ConvertFrom-Json -AsHashtable
         $null = Invoke-GatePython 'archb_gate_nav.py' @('screenshot', '--pid', $process.Id, '--output', (Join-Path $directory 'start.png'))
         Wait-GateHold $process $directory $WarmupSeconds ([ref]$lowSince)
         $holdStart = Get-GateClock
         $stderrStart = $errStream.Position
+        if ($upperBound) { $result.stage = 'blocks' }
         if ($null -ne $Alternation) { $result.alternating = Invoke-GateBlocks $process $directory $Alternation ([ref]$lowSince) }
         else { Wait-GateHold $process $directory $Seconds ([ref]$lowSince) }
         $holdEnd = Get-GateClock
@@ -517,9 +564,9 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
         $errTask.GetAwaiter().GetResult()
         $outStream.Dispose()
         $errStream.Dispose()
+        if ($upperBound) { $result.stage = 'verification' }
         $verifyArgs = @('verify', $configPath, $directory, $Runtime)
-        if (($Kind -eq 'diagnostic' -and $Configuration.name -ne $script:ControlName -and $Configuration.env.APS5_ARCHB_RECORDER -ne '1') -or
-            ($Kind -eq 'capture' -and $script:AlternatingBootstrap)) { $verifyArgs += '--diagnostic' }
+        if ($Kind -eq 'diagnostic' -and ($Configuration.name -ne $script:ControlName -or $script:AlternatingBootstrap) -and $Configuration.env.APS5_ARCHB_RECORDER -ne '1') { $verifyArgs += '--diagnostic' }
         $verification = Invoke-GatePython 'archb_gate_config.py' $verifyArgs
         $result.navigation = $navigation
         $result.memory = $memory
@@ -529,14 +576,14 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
         $result.hold_seconds = if ($null -ne $Alternation) { ($holdEnd - $holdStart) / 1000000000.0 } else { $Seconds }
         if ($Measured -and $null -eq $Alternation) {
             $statistics = Invoke-GatePython 'archb_gate_stats.py' @('leg', (Join-Path $directory 'videoout.jsonl'), '--start-ns', $holdStart,
-                                                                   '--end-ns', $holdEnd, '--hold-seconds', $Seconds)
+                                                                   '--end-ns', $holdEnd, '--hold-seconds', $Seconds) @(0, 27)
             foreach ($key in $statistics.Keys) { $result[$key] = $statistics[$key] }
         }
         if (($Measured -or $Kind -eq 'diagnostic') -and $Mode -ne 'Bootstrap') {
             $result.memory.incremental_host_bytes = [long]$memory.peak_private_commit - [long]$script:Baseline.peak_private_commit
             if (($Configuration.name -ne $script:ControlName -or $null -ne $Alternation) -and $result.memory.incremental_host_bytes -gt 4000000000) { Stop-GateFailure 26 'Incremental host memory exceeds 4,000,000,000 bytes' }
         }
-        if ($Kind -eq 'diagnostic' -or ($Kind -eq 'capture' -and $script:AlternatingBootstrap)) {
+        if ($Kind -eq 'diagnostic') {
             if ($Configuration.env.APS5_ARCHB_RECORDER -eq '1') {
                 Write-GateJson (Join-Path $directory 'recorder-config.json') @{
                     requiredCounters = $Configuration.requiredCounters; allocatorLedgerBytes = $Configuration.allocatorLedgerBytes }
@@ -553,17 +600,12 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
             $result.validation_counts = @{ VUID = @($result.validation_ids | Where-Object { $_.StartsWith('VUID-') }).Count
                                            SYNC = @($result.validation_ids | Where-Object { $_.StartsWith('SYNC-') }).Count }
         }
-        if ($Kind -eq 'capture') {
-            $dump = Get-ChildItem -LiteralPath $Runtime -Filter 'frame_*.bmp' -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-            if ($null -eq $dump) { Stop-GateFailure 24 'Bootstrap diagnostic produced no in-game frame dump' }
-            Copy-Item -LiteralPath $dump.FullName -Destination (Join-Path $directory 'capture-reference.bmp')
-            $result.capture_validation = Invoke-GatePython 'archb_gate_nav.py' @('compare', '--capture', (Join-Path $directory 'end.png'), '--dump',
-                (Join-Path $directory 'capture-reference.bmp'), '--output', (Join-Path $directory 'capture-validation.json'))
-        }
         $result.status = 'completed'
         Write-GateJson (Join-Path $directory 'leg.json') $result
         return $result
     } finally {
+        $script:ActiveBlock = $null
+        $script:ActiveLeg = $null
         if ($null -ne $navProcess -and -not $navProcess.HasExited) { $navProcess.Kill(); $navProcess.WaitForExit() }
         if ($started) { Stop-GateProcess $process.Id $ticks }
         if ($null -ne $outTask) { $outTask.GetAwaiter().GetResult() }
@@ -571,12 +613,13 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
         $outStream.Dispose()
         $errStream.Dispose()
         $process.Dispose()
+        if ($null -ne $script:ActiveBlocks) {
+            Write-GateJson (Join-Path $directory 'blocks.json') @($script:ActiveBlocks.ToArray())
+            $script:ActiveBlocks = $null
+        }
         if ($result.status -ne 'completed') {
             $result.status = 'failed'
             Write-GateJson (Join-Path $directory 'leg.json') $result
-        }
-        if ($Kind -eq 'capture' -and $started) {
-            Move-GateDumps $Runtime (Join-Path $directory 'frame-dumps') $ticks
         }
     }
 }
@@ -607,7 +650,8 @@ function Invoke-ArchBGate {
         $busy = @(Get-Process | Where-Object { $_.ProcessName -in @('demons-souls', 'ninja', 'cmake', 'ctest', 'agc_frame_replay') })
         if ($busy.Count) { Stop-GateFailure 30 "Busy processes: $($busy.ProcessName -join ', ')" }
         $null = Invoke-GatePython 'archb_gate_config.py' @('repair', $Runtime)
-        if (([bool]$Candidate) -eq ([bool]$Matrix)) { Stop-GateFailure 23 'Specify exactly one of -Candidate or -Matrix' }
+        if ($Experiments -and ($Mode -ne 'Child' -or $Matrix -or $Bisect -or -not $script:AllowAlternating -or $BlockSeconds -ne 15 -or $SettleSeconds -ne 3)) { Stop-GateFailure 21 'Experiments require alternating Child mode, 15s blocks and 3s settling' }
+        if (-not $Experiments -and (([bool]$Candidate) -eq ([bool]$Matrix))) { Stop-GateFailure 23 'Specify exactly one of -Candidate or -Matrix' }
         if ($SettleSeconds -ge $BlockSeconds) { Stop-GateFailure 24 'SettleSeconds must be less than BlockSeconds' }
         if ($Bisect -and ($Mode -notin @('Child', 'Milestone') -or -not $script:AllowAlternating -or $Matrix)) { Stop-GateFailure 21 'Bisection requires one alternating Child or Milestone candidate' }
         if (Test-Path -LiteralPath $Output) { Stop-GateFailure 30 'Output must be a new directory' }
@@ -622,7 +666,14 @@ function Invoke-ArchBGate {
         $null = New-Item -ItemType Directory -Path $Output
         $outputCreated = $true
         foreach ($path in @($Output, $Runtime)) {
-            if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($path))).AvailableFreeSpace -lt 20GB) { Stop-GateFailure 30 'At least 20 GB free disk space is required' }
+            if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($path))).AvailableFreeSpace -lt ([int64]$MinFreeGB * 1GB)) { Stop-GateFailure 30 "At least $MinFreeGB GB free disk space is required" }
+        }
+        if ($Experiments -and -not $Candidate) {
+            $selfCandidate = Get-Content -LiteralPath $Control -Raw | ConvertFrom-Json -AsHashtable
+            $selfCandidate.name += '-ub-runner'
+            $selfCandidate.shaderCache += '-ub-runner'
+            $Candidate = Join-Path $Output 'ub-runner-candidate.json'
+            Write-GateJson $Candidate $selfCandidate
         }
         $candidates = if ($Matrix) { @(Get-ChildItem -LiteralPath $Matrix -Filter '*.json' -File | Sort-Object Name | ForEach-Object { $_.FullName }) } else { @($Candidate) }
         $prepareArgs = @('prepare', '--control', $Control, '--mode', $Mode, '--output', (Join-Path $Output 'configurations.json'))
@@ -638,16 +689,17 @@ function Invoke-ArchBGate {
                 }
             }
             if ($cache -match '(?i)(^|[\\/])app0([\\/]|$)') { Stop-GateFailure 23 'A shader cache cannot be inside app0' }
-            if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($cache)).AvailableFreeSpace -lt 20GB) { Stop-GateFailure 30 'Shader cache drive needs at least 20 GB free' }
+            if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($cache)).AvailableFreeSpace -lt ([int64]$MinFreeGB * 1GB)) { Stop-GateFailure 30 "Shader cache drive needs at least $MinFreeGB GB free" }
         }
         if ($Mode -eq 'Final' -and $HoldSeconds -ne 120) { Stop-GateFailure 24 'Final legs must hold for 120s' }
         $baselinePath = Join-Path (Split-Path $Output -Parent) 'gate-baseline.json'
         $script:BaselinePath = $baselinePath
         if ($Mode -eq 'Bootstrap' -and (Test-Path -LiteralPath $baselinePath)) { Stop-GateFailure 30 'Frozen baseline already exists; use a new parent directory for a new Bootstrap' }
-        if ($Mode -ne 'Bootstrap') {
+        if ($Mode -ne 'Bootstrap' -and -not $Experiments) {
             $script:Baseline = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json -AsHashtable
             $gate.baseline = $script:Baseline
-            if ($script:Baseline.s_AA -gt 0.033) { Stop-GateFailure 40 'Frozen Bootstrap noise exceeds 0.033' }
+            if (1.677927 * $script:Baseline.s_AA / [Math]::Sqrt(48) -gt 0.01) { Stop-GateFailure 40 'Frozen Bootstrap noise cannot resolve 2% at 48 pairs' }
+            if (-not $script:Baseline.ContainsKey('mean_ms') -or $script:Baseline.mean_ms -le 0) { Stop-GateFailure 24 'Frozen Bootstrap needs its presented-frame mean_ms' }
             $referenceHashes = @{}
             foreach ($reference in Get-ChildItem -LiteralPath $NavigationRefs -Filter '*.bmp' -File) { $referenceHashes[$reference.Name] = (Get-FileHash -LiteralPath $reference.FullName).Hash.ToLowerInvariant() }
             if ((($referenceHashes.Keys | Sort-Object) -join ',') -ne (($script:Baseline.navref_hashes.Keys | Sort-Object) -join ',')) { Stop-GateFailure 11 'Navigation reference set differs from frozen Bootstrap' }
@@ -663,6 +715,7 @@ function Invoke-ArchBGate {
                        power_plan = (& powercfg /getactivescheme | Out-String).Trim()
                        windows = (Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber)
                        warmup_seconds = $WarmupSeconds; hold_seconds = $HoldSeconds
+                       min_available_mib = $MinAvailableMiB; low_memory_seconds = $LowMemorySeconds
                        alternating_allowed = $script:AllowAlternating; block_seconds = $BlockSeconds; settle_seconds = $SettleSeconds }
         Write-GateJson (Join-Path $Output 'manifest.json') $manifest
         $libraries = @(@($configuration.control.libs.Keys) + @($configuration.candidates | ForEach-Object { $_.libs.Keys }) | Sort-Object -Unique)
@@ -670,13 +723,17 @@ function Invoke-ArchBGate {
         $manifestWritten = $true
         $runner = Get-Process -Id $PID
         $null = Start-GateWatchdog $script:RestoreManifest $PID $runner.StartTime.ToUniversalTime().Ticks
+        if ($Experiments) {
+            $gate.experiments = @(Invoke-GateUpperBoundExperiments $configuration.control)
+            $gate.code = 0
+            $gate.verdict = 'experiments reported'
+        } else {
         if ($script:AlternatingBootstrap) {
-            $controlWarmup = Invoke-GateLeg $configuration.control 'bootstrap-navigation-1-diagnostic-capture' 'capture' 60 $false
-            $gate.capture_validation = $controlWarmup.capture_validation
+            $controlWarmup = Invoke-GateLeg $configuration.control 'bootstrap-navigation-1-diagnostic' 'diagnostic' 60 $false
             $candidateWarmups = @{}
             $candidateWarmups[$configuration.candidates[0].name] = Invoke-GateLeg $configuration.candidates[0] 'bootstrap-navigation-2-validation' 'validation' 60 $false
         } else {
-            if ($Mode -eq 'Bootstrap') { $gate.capture_validation = Invoke-GateLeg $configuration.candidates[0] 'bootstrap-capture' 'capture' 1 $false }
+            if ($Mode -eq 'Bootstrap') { $gate.bootstrap_diagnostic = Invoke-GateLeg $configuration.candidates[0] 'bootstrap-diagnostic' 'diagnostic' 1 $false }
             $controlWarmup = Invoke-GateLeg $configuration.control "warmup-control-$($configuration.control.name)" 'measured' 60 $false
             $candidateWarmups = @{}
             foreach ($candidateConfig in $configuration.candidates) {
@@ -700,7 +757,7 @@ function Invoke-ArchBGate {
                 $legs = @(1..3 | ForEach-Object { Invoke-GateLeg $candidateConfig "$($candidateConfig.name)-final-$_" 'measured' 120 $true })
                 $pairsPath = Join-Path $Output "$($candidateConfig.name)-final.json"
                 Write-GateJson $pairsPath $legs
-                $decision = Invoke-GatePython 'archb_gate_stats.py' @('decide', $pairsPath, '--mode', 'Final') @(0, 1)
+                $decision = Invoke-GatePython 'archb_gate_stats.py' @('decide', $pairsPath, '--mode', 'Final', '--baseline', $baselinePath) @(0, 1, 27)
             } elseif ($useAlternating) {
                 if ($Mode -ne 'Bootstrap' -and -not $script:Baseline.ContainsKey('alternating_m')) { Stop-GateFailure 40 'An alternating Bootstrap baseline is required' }
                 $label = if ($Mode -eq 'Bootstrap') { 'bootstrap-navigation-3-alternating' } else { "$($candidateConfig.name)-alternating" }
@@ -736,7 +793,7 @@ function Invoke-ArchBGate {
                     if ($Mode -ne 'Bootstrap' -and $index -notin @(4, 8)) { continue }
                     $decideArgs = @('decide', $pairsPath, '--mode', $Mode)
                     if ($Mode -ne 'Bootstrap') { $decideArgs += @('--baseline', $baselinePath) }
-                    $decision = Invoke-GatePython 'archb_gate_stats.py' $decideArgs @(0, 1, 2, 40)
+                    $decision = Invoke-GatePython 'archb_gate_stats.py' $decideArgs @(0, 1, 2, 3, 27, 40)
                     if ($decision.verdict -ne 'continue') { break }
                 }
             }
@@ -786,10 +843,10 @@ function Invoke-ArchBGate {
         }
         $gate.code = 0
         foreach ($result in $results) { if ($result.code -ne 0) { $gate.code = $result.code; break } }
-        $gate.verdict = if ($gate.code -eq 0) { 'pass' } else { 'fail' }
+        $gate.verdict = if ($gate.code -eq 0) { 'pass' } elseif ($gate.code -eq 3) { 'inconclusive' } elseif ($gate.code -eq 27) { 'present_drops' } else { 'fail' }
         if ($Mode -eq 'Bootstrap' -and $gate.code -eq 0) {
             $firstNav = $script:AllLegs[0].navigation
-            $baseline = @{ s_AA = $results[0].s_AA; d_i = $results[0].d_i
+            $baseline = @{ s_AA = $results[0].s_AA; d_i = $results[0].d_i; mean_ms = $results[0].mean_ms
                            peak_private_commit = Get-GateMedian @($script:AllLegs | Where-Object { $_.ContainsKey('ms') -or $_.ContainsKey('alternating') } | ForEach-Object { $_.memory.peak_private_commit })
                            T_nav = @($script:AllLegs | ForEach-Object { $_.navigation.T_nav }); navref_hashes = $firstNav.reference_hashes
                            manifest = (Join-Path $Output 'manifest.json'); contact = (Join-Path $Output 'contact.png') }
@@ -797,6 +854,7 @@ function Invoke-ArchBGate {
             else { $baseline.m = $results[0].m }
             Write-GateJson (Join-Path $Output 'gate-baseline.json') $baseline
             $gate.baseline = $baseline
+        }
         }
     } catch {
         $gate.code = if ($_.Exception.Data.Contains('GateCode')) { [int]$_.Exception.Data['GateCode'] } else { 30 }
@@ -809,6 +867,7 @@ function Invoke-ArchBGate {
             catch { $gate.code = 31; $gate.restoration = @{ status = 'failed'; error = $_.Exception.Message } }
         }
         $gate.legs = @($script:AllLegs.ToArray())
+        $gate.verdict_notes = @(@($gate.results) + @($gate.experiments) | ForEach-Object { $_.verdict_notes } | Sort-Object -Unique)
         $gate.wall_clock_seconds = $watch.Elapsed.TotalSeconds
         if ($outputCreated) {
             try { $null = Invoke-GatePython 'archb_gate_nav.py' @('contact', $Output) }

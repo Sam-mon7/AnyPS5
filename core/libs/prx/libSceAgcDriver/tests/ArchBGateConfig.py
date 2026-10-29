@@ -29,6 +29,11 @@ def strips_inherited_aps5(directory):
     assert result["ANYPS5_SHADER_CACHE_DIR"] == manifest["shaderCache"] and result["ANYPS5_OVERLAY"] == "1"
     assert child_environment({}, manifest, directory, "diagnostic")["APS5_PROFILE_DRAW_SHADERS"] == "1"
     assert child_environment({}, manifest, directory, "validation")["VK_INSTANCE_LAYERS"] == "VK_LAYER_KHRONOS_validation"
+    for kind in ("measured", "diagnostic", "validation"):
+        environment = child_environment(inherited, manifest, directory, kind)
+        assert environment["APS5_ARCHB_CONTROL_FILE"] == str(Path(directory) / "control.txt")
+        assert environment["ANYPS5_SCREENSHOTS"] == str(Path(directory) / "shots")
+        assert not any("DUMP" in key for key in environment)
 
 
 def rejects_profile_in_measured_leg(directory):
