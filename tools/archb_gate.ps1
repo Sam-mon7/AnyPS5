@@ -80,6 +80,11 @@ function Restore-GateRuntime([string]$Manifest) {
     return Invoke-GatePython 'archb_gate_config.py' @('restore', $Manifest)
 }
 
+function Read-GateShared([string]$Path) {
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    try { return [IO.StreamReader]::new($stream).ReadToEnd() } finally { $stream.Dispose() }
+}
+
 function Start-GateWatchdog([string]$Manifest, [int]$ProcessId, [long]$StartTicks) {
     $arguments = @('-NoProfile', '-File', "`"$script:GateScript`"", '-WatchdogManifest', "`"$Manifest`"",
                    '-RunnerPid', $ProcessId, '-RunnerStartTicks', $StartTicks)
@@ -329,7 +334,7 @@ function Wait-GateToggle($Process, [string]$Directory, [long]$Sequence, $LowSinc
     $nextSample = (Get-GateClock) + 1000000000
     while ((Get-GateClock) -lt $deadline) {
         if ($Process.HasExited) { Stop-GateFailure 24 'Game exited while awaiting toggle' }
-        $text = [IO.File]::ReadAllText((Join-Path $Directory 'stderr.log'))
+        $text = Read-GateShared (Join-Path $Directory 'stderr.log')
         if ($text -match '(?m)^\[archb\] toggle refused seq=\d+[^\r\n]*') { Stop-GateFailure 21 $Matches[0] }
         if ($text -match "(?m)^\[archb\] toggle seq=$Sequence t_ns=(\d+) [^\r\n]+`r?`$") { return [long]$Matches[1] }
         if ($null -ne $LowSince -and (Get-GateClock) -ge $nextSample) {
@@ -425,7 +430,7 @@ function Invoke-GateUpperBoundExperiments($Configuration) {
             $hits = @{}
             $stderr = Join-Path $failed.directory 'stderr.log'
             if (Test-Path -LiteralPath $stderr) {
-                $text = [IO.File]::ReadAllText($stderr)
+                $text = Read-GateShared $stderr
                 foreach ($name in $enabled) {
                     $counter = $name.ToLowerInvariant() + '_hits'
                     $values = @([regex]::Matches($text, "\b$counter=([0-9]+)\b") | ForEach-Object { [long]$_.Groups[1].Value })
@@ -597,7 +602,7 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
             }
         }
         if ($Kind -eq 'validation') {
-            $text = (Get-Content -LiteralPath (Join-Path $directory 'stderr.log') -Raw) + "`n" + (Get-Content -LiteralPath (Join-Path $directory 'stdout.log') -Raw)
+            $text = (Read-GateShared (Join-Path $directory 'stderr.log')) + "`n" + (Read-GateShared (Join-Path $directory 'stdout.log'))
             if ($text -match 'was not found but was requested by env var VK_INSTANCE_LAYERS') { Stop-GateFailure 25 'Requested validation layer is unavailable' }
             $result.validation_ids = @([regex]::Matches($text, '\b(?:VUID|SYNC)-[A-Za-z0-9_.-]+') | ForEach-Object { $_.Value } | Sort-Object -Unique)
             $result.validation_counts = @{ VUID = @($result.validation_ids | Where-Object { $_.StartsWith('VUID-') }).Count
