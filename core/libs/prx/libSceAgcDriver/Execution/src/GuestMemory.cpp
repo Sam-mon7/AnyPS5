@@ -1943,7 +1943,7 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     return true;
 }
 
-bool UnchangedSinceClean(std::span<const UnchangedQuery> queries) {
+bool UnchangedSinceClean(std::span<const UnchangedQuery> queries, bool privateWriteWatch) {
 #ifdef _WIN32
     if (queries.empty()) return false;
     auto& tracker = Tracker();
@@ -1956,11 +1956,17 @@ bool UnchangedSinceClean(std::span<const UnchangedQuery> queries) {
     if ((forgotten & 1) != 0) return false;
     for (const auto& [address, bytes, generation] : queries) {
         if (generation == 0 || bytes == 0 || bytes > UINT64_MAX - address || !tracker.covers(address, bytes)) return false;
-        if (!tracker.rangeUnchanged(address, bytes, generation) || !GuestArena::GuestArenaWritesClean_nid_no_patch(static_cast<std::uintptr_t>(address), bytes)) return false;
+        if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
+        if (GuestArena::GuestArenaWritesClean_nid_no_patch(static_cast<std::uintptr_t>(address), bytes)) continue;
+        void* page = nullptr;
+        ULONG_PTR count = 1;
+        DWORD granularity = 0;
+        if (!privateWriteWatch || GetWriteWatch(0, reinterpret_cast<void*>(address), bytes, &page, &count, &granularity) != 0 || count != 0) return false;
     }
     return mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && committed == GuestArena::GuestArenaCommitGeneration_nid_postfix() && forgotten == ForgetSerial();
 #else
     static_cast<void>(queries);
+    static_cast<void>(privateWriteWatch);
     return false;
 #endif
 }

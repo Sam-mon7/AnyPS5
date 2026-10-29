@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
@@ -27,6 +28,17 @@ namespace AgcDriver { class VulkanDevice; }
 namespace AgcDriver::Graphics {
 
 class Recorder;
+
+class ResourceProofScope {
+public:
+    explicit ResourceProofScope(bool enabled);
+    ~ResourceProofScope();
+    ResourceProofScope(const ResourceProofScope&) = delete;
+    ResourceProofScope& operator=(const ResourceProofScope&) = delete;
+    static bool Enabled();
+private:
+    bool previous;
+};
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
@@ -679,6 +691,8 @@ private:
         std::uint64_t unwatched = 0;
         std::uint64_t depth = 0;
         std::uint64_t depthReleased = 0;
+        std::uint64_t published = 0;
+        bool cheaper = false;
         bool operator==(const ResourceEpochProof&) const = default;
     };
     struct EpochImage {
@@ -690,6 +704,7 @@ private:
     HostImportsProof epochImports;
     std::uint64_t profiledResourceEpoch = 0;
     std::vector<EpochImage> epochImages;
+    std::vector<GuestMemory::UnchangedQuery> epochMemory;
     static ResourceEpochProof currentResourceEpochProof();
     bool canRememberResourceEpoch() const;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, bool epochProofs = false);

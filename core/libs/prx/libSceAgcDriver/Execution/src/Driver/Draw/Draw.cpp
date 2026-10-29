@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -139,6 +140,7 @@ struct DrawTail {
     std::shared_ptr<VulkanDevice> localDevice;
     bool registerKey = false;
     bool ubPointerFree = false;
+    bool cheaperProofs = false;
     bool ubSkipCpuIndirect = false;
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
@@ -426,6 +428,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto tailHolder = std::make_shared<DrawTail>();
     auto& tail = *tailHolder;
+    tail.cheaperProofs = ArchB::Switches::Enabled(ArchB::Feature::FixCheaperProofs);
+    const Graphics::ResourceProofScope proofScope(tail.cheaperProofs);
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
     auto& phaseLap = tail.phaseLap;
@@ -923,6 +927,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 }
 
 DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
+    const Graphics::ResourceProofScope proofScope(tail.cheaperProofs);
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
     const bool profile = tail.profile;
@@ -1075,7 +1080,21 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto& program = programs[i];
         pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, localDevice->GraphicsPipelineLibraries());
         pushOffsets[i] = pushCursorBytes;
-        if (drawHit) {
+        bool reuseCapture = false;
+        if (tail.cheaperProofs && !drawHit) {
+            const char* refusal = [&]() -> const char* {
+                if (matched[i] == nullptr) return "fix_proofs_capture_refused_unproved";
+                if (verifyHit || verifyDrawDataHits() || verifyDrawRecipe()) return "fix_proofs_capture_refused_verify";
+                if (tail.ubPointerFree || tail.relocatedDecode != decode || !matched[i]->shaderDataPatches.empty() || stageData[i].compiled != nullptr) return "fix_proofs_capture_refused_patched";
+                if (i != 0 || programs.size() != 2 || program.binary.stage != Stage::Vertex || programs[1].binary.stage != Stage::Fragment || graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh || graphics.stages.tessellation || graphics.rectList || drawParameters.indirect) return "fix_proofs_capture_refused_shape";
+                if (matched[i]->pushOffset != pushCursorBytes) return "fix_proofs_capture_refused_layout";
+                return nullptr;
+            }();
+            reuseCapture = refusal == nullptr;
+            ArchB::Recorder::Count(reuseCapture ? "fix_proofs_capture_reused" : refusal);
+        }
+        if (drawHit || reuseCapture) {
+            reused[i] = reuseCapture;
 
             programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
             if (drawParameters.indirect) stageCaptures[i].capture = matched[i]->indirectCapture;
@@ -1359,7 +1378,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = tail.packetOpcode;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-                auto commit = [this, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+                auto commit = [this, cheaperProofs = tail.cheaperProofs, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+                    const Graphics::ResourceProofScope proofScope(cheaperProofs);
                     ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
                     PerformanceTimer recorderTiming("Driver.DrawCommit");
                     DrawPipeline::FollowEpoch(epoch);
@@ -1410,7 +1430,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto commitPacket = tail.packetOpcode;
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+        auto commit = [this, cheaperProofs = tail.cheaperProofs, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+            const Graphics::ResourceProofScope proofScope(cheaperProofs);
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             PerformanceTimer recorderTiming("Driver.DrawCommit");
             DrawPipeline::FollowEpoch(epoch);

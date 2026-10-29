@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
@@ -243,7 +245,7 @@ void SightingsKeepCollidingKeys() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         SightingsKeepCollidingKeys();
         bool libraries = false;
@@ -253,7 +255,16 @@ int main() {
             libraries = device->GraphicsPipelineLibraries();
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
-        if (std::getenv("APS5_VERIFY_DRAW_ENTRIES") != nullptr) {
+        if (argc == 2 && std::string(argv[1]) == "--proof-capture") {
+            namespace ArchB = AgcDriver::ArchB;
+            Require(std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") != nullptr, "the capture fixture must miss on changed fragment words");
+            ArchB::Recorder::Boundary(true, 1, ArchB::Recorder::Clock::now());
+            StageDataHitsRefreshTheirWords(libraries);
+            const auto counts = ArchB::Recorder::Collect(ArchB::Recorder::Clock::now());
+            const bool reused = counts.counters.contains("fix_proofs_capture_reused") && counts.counters.at("fix_proofs_capture_reused") > 0;
+            Require(reused == ArchB::Switches::Enabled(ArchB::Feature::FixCheaperProofs), "the unchanged vertex capture did not follow the selected proof path");
+            std::puts(counts.Json().c_str());
+        } else if (std::getenv("APS5_VERIFY_DRAW_ENTRIES") != nullptr) {
             RefreshedStageDataVerifies();
         } else {
             ThirdDrawHitsTheCache(libraries);

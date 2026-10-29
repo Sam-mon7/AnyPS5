@@ -184,6 +184,18 @@ int main(int argc, char** argv) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
     try {
+        if (argc == 2 && std::string(argv[1]) == "--fix-proofs-default") {
+            setEnvironment("APS5_ARCHB_FIX_CHEAPER_PROOFS", nullptr);
+            bool found = false;
+            for (const auto& entry : Switches::Table()) {
+                if (std::string(entry.name) != "FIX_CHEAPER_PROOFS") continue;
+                found = true;
+                check(entry.feature == Feature::FixCheaperProofs && !entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "incorrect cheaper proof switch contract");
+                check(!Switches::Enabled(entry.feature), "cheaper proofs must default off");
+            }
+            check(found, "missing cheaper proof switch");
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--ub-default") {
             setEnvironment("APS5_ARCHB_GATE_RUN", nullptr);
             for (const auto& entry : Switches::Table()) {

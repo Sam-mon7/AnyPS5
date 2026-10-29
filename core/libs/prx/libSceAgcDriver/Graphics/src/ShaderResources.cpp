@@ -45,10 +45,27 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <tuple>
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 
 namespace AgcDriver::Graphics {
+namespace {
+thread_local bool cheaperProofs = false;
+}
+
+ResourceProofScope::ResourceProofScope(bool enabled) : previous(cheaperProofs) {
+    cheaperProofs = enabled;
+}
+
+ResourceProofScope::~ResourceProofScope() {
+    cheaperProofs = previous;
+}
+
+bool ResourceProofScope::Enabled() {
+    return cheaperProofs;
+}
+
 namespace {
 
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
@@ -2952,10 +2969,12 @@ constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> Fas
 using OwnRefreshFallback = ShaderResources::OwnRefreshFallback;
 constexpr std::array<const char*, static_cast<std::size_t>(OwnRefreshFallback::Count)> OwnRefreshFallbackNames{"disabled", "snapshot texture", "cleared view", "foreign view", "surface key", "not imported", "uncached", "re-run failed"};
 
-enum class EpochRefusal : std::size_t { Unlocked, Disabled, NoEpoch, Cold, Epoch, Writes, Tracker, Mapping, Pending, Depth, Cache, Images, Imports, Audit, Verify, PerUse, Count };
-constexpr std::array<const char*, static_cast<std::size_t>(EpochRefusal::Count)> EpochRefusalNames{"unlocked", "proof override", "no epoch", "cold or ineligible", "epoch changed", "write or foreign GPU holder", "tracker changed", "mapping changed", "pending image", "depth identity", "cache identity", "image version or keys", "imports", "audit", "verification", "per-use failure"};
+enum class EpochRefusal : std::size_t { Unlocked, Disabled, NoEpoch, Cold, Epoch, Writes, Tracker, Mapping, Pending, Depth, Cache, Images, Imports, Audit, Verify, PerUse, Memory, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(EpochRefusal::Count)> EpochRefusalNames{"unlocked", "proof override", "no epoch", "cold or ineligible", "epoch changed", "write or foreign GPU holder", "tracker changed", "mapping changed", "pending image", "depth identity", "cache identity", "image version or keys", "imports", "audit", "verification", "per-use failure", "unclean guest memory"};
+constexpr std::array<const char*, static_cast<std::size_t>(EpochRefusal::Count)> FixRefusalCounters{"fix_proofs_refused_unlocked", "fix_proofs_refused_disabled", "fix_proofs_refused_no_epoch", "fix_proofs_refused_cold", "fix_proofs_refused_epoch", "fix_proofs_refused_writes", "fix_proofs_refused_tracker", "fix_proofs_refused_mapping", "fix_proofs_refused_pending", "fix_proofs_refused_depth", "fix_proofs_refused_cache", "fix_proofs_refused_images", "fix_proofs_refused_imports", "fix_proofs_refused_audit", "fix_proofs_refused_verify", "fix_proofs_refused_per_use", "fix_proofs_refused_memory"};
 enum class EpochIneligible : std::size_t { Records, Depth, Partial, Tracking, Cache, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(EpochIneligible::Count)> EpochIneligibleNames{"no records", "native or overlapping depth", "partial snapshot", "untracked texels or keys", "cache identity"};
+constexpr std::array<const char*, static_cast<std::size_t>(EpochIneligible::Count)> FixIneligibleCounters{"fix_proofs_ineligible_records", "fix_proofs_ineligible_depth", "fix_proofs_ineligible_partial", "fix_proofs_ineligible_tracking", "fix_proofs_ineligible_cache"};
 
 struct RevalidateProfile {
     std::atomic<std::uint64_t> calls{0};
@@ -3225,6 +3244,7 @@ bool ShaderResources::finishPartialSnapshots(std::uint64_t forgetBefore) {
 // every surface at once. The stamp checks go through one tracker lock, the cache checks through
 // the images' cached flags and one touch of the cache.
 bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted) {
+    PerformanceTimer recorderTiming("Resources.Stamps", AgcDriver::ArchB::Recorder::Phase::Proof);
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
@@ -3626,6 +3646,10 @@ ShaderResources::ProofExtent ShaderResources::Extent() const {
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     PerformanceTimer recorderTiming("Resources.Proof", AgcDriver::ArchB::Recorder::Phase::Proof);
+    if (ResourceProofScope::Enabled()) {
+        provedEpoch = 0;
+        return revalidateFull(shaders, report, true);
+    }
     const bool trustProofs = ArchB::Switches::Enabled(ArchB::Feature::UbTrustProofs);
     if (trustProofs && provedOnce) {
         ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbTrustProofs);
@@ -3670,16 +3694,25 @@ ShaderResources::ResourceEpochProof ShaderResources::currentResourceEpochProof()
 #else
     const std::uint64_t committed = 0;
 #endif
-    return {GuestMemory::CollectEpoch(), GuestMemory::ResourceProofSerial(), StorageTexture::PendingSerial(), GuestMemory::TrackerGeneration(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), committed, GuestMemory::ForgetSerial(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial(), DepthSurfacesReleased()};
+    const bool cheaper = ResourceProofScope::Enabled();
+    return {GuestMemory::CollectEpoch(), cheaper ? GuestMemory::ProofSerial() : GuestMemory::ResourceProofSerial(), StorageTexture::PendingSerial(), GuestMemory::TrackerGeneration(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), committed, GuestMemory::ForgetSerial(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial(), DepthSurfacesReleased(), cheaper ? Recorder::PublishGeneration() : 0, cheaper};
 }
 
 bool ShaderResources::canRememberResourceEpoch() const {
     const auto fail = [](EpochIneligible reason) {
+        if (ResourceProofScope::Enabled()) ArchB::Recorder::Count(FixIneligibleCounters[static_cast<std::size_t>(reason)]);
         if (BuildProfiled()) Revalidations().epochIneligible[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
         return false;
     };
     if (validatedTextures.size() != textures.size()) return fail(EpochIneligible::Records);
     if (HoldsReleasedTexture() || !HasCachedStorageImages()) return fail(EpochIneligible::Cache);
+    if (ResourceProofScope::Enabled()) {
+        if (storageKeys.size() != storageTextures.size()) return fail(EpochIneligible::Records);
+        for (std::size_t i = 0; i < storageKeys.size(); ++i) {
+            if (storageTextures[i] == nullptr) return fail(EpochIneligible::Records);
+            if (storageKeys[i] != 0 && !GuestMemory::Watched(storageKeys[i], DccKeyBytes(storageTextures[i]->GuestBytes()))) return fail(EpochIneligible::Tracking);
+        }
+    }
     const auto trackedKeys = [](const GuestTextureResource& resource, std::uint64_t bytes) {
         return resource.dccAddress == 0 || GuestMemory::Watched(resource.dccAddress, DccKeyBytes(bytes));
     };
@@ -3700,8 +3733,9 @@ bool ShaderResources::canRememberResourceEpoch() const {
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, bool epochProofs) {
+    const bool cheaper = ResourceProofScope::Enabled();
     const bool skipDispatchProofWalk = ArchB::Switches::Enabled(ArchB::Feature::UbSkipDispatchProofWalk);
-    if (skipDispatchProofWalk && !drawBuild) {
+    if (!cheaper && skipDispatchProofWalk && !drawBuild) {
         ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbSkipDispatchProofWalk);
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
         return true;
@@ -3720,7 +3754,13 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         stageLap = now;
         stageWaited = waited;
     };
-    if (!reusable || shaders.empty()) return false;
+    if (!reusable || shaders.empty()) {
+        if (cheaper) {
+            ArchB::Recorder::Count("fix_proofs_full");
+            ArchB::Recorder::Count("fix_proofs_refused_unusable");
+        }
+        return false;
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) {
@@ -3739,18 +3779,28 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     markStage(0);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
+    bool memoryClean = true;
+    if (cheaper && resourceEpochProof.cheaper && resourceEpochProof.epoch != 0 && !epochMemory.empty()) {
+        PerformanceTimer recorderTiming("Resources.CleanMemory", ArchB::Recorder::Phase::Proof);
+        memoryClean = GuestMemory::UnchangedSinceClean(epochMemory, true);
+        if (!memoryClean) {
+            for (const auto& range : epochMemory) GuestMemory::CollectWritesUncached(range.address, range.bytes);
+        }
+    }
     const auto epochBefore = epochProofs ? currentResourceEpochProof() : ResourceEpochProof{};
     const auto importsBefore = epochProofs ? HostImportsIdentity(context, false) : HostImportsProof{};
     bool epochReused = false;
     if (epochProofs) {
+        PerformanceTimer recorderTiming("Resources.Epoch", AgcDriver::ArchB::Recorder::Phase::Proof);
         const auto refusal = [&] {
             if (!GuestMemory::GpuMutex().HeldByThisThread()) return EpochRefusal::Unlocked;
             if (noFast || !EpochRevalidate() || VerifyProofs()) return EpochRefusal::Disabled;
             if (epochBefore.epoch == 0) return EpochRefusal::NoEpoch;
-            if (resourceEpochProof.epoch == 0) return EpochRefusal::Cold;
+            if (resourceEpochProof.epoch == 0 || resourceEpochProof.cheaper != epochBefore.cheaper) return EpochRefusal::Cold;
+            if (!memoryClean) return EpochRefusal::Memory;
             if (resourceEpochProof.epoch != epochBefore.epoch) return EpochRefusal::Epoch;
             if (resourceEpochProof.writes != epochBefore.writes) return EpochRefusal::Writes;
-            if (resourceEpochProof.pending != epochBefore.pending) return EpochRefusal::Pending;
+            if (resourceEpochProof.pending != epochBefore.pending || resourceEpochProof.published != epochBefore.published) return EpochRefusal::Pending;
             if (resourceEpochProof.allocations != epochBefore.allocations || resourceEpochProof.commits != epochBefore.commits || resourceEpochProof.forgotten != epochBefore.forgotten || (epochBefore.forgotten & 1u) != 0 || resourceEpochProof.unwatched != epochBefore.unwatched) return EpochRefusal::Mapping;
             if (resourceEpochProof.depth != epochBefore.depth || resourceEpochProof.depthReleased != epochBefore.depthReleased) return EpochRefusal::Depth;
             if (resourceEpochProof.tracker != epochBefore.tracker) return EpochRefusal::Tracker;
@@ -3766,6 +3816,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             return EpochRefusal::Count;
         }();
         epochReused = refusal == EpochRefusal::Count;
+        if (cheaper && !epochReused) {
+            ArchB::Recorder::Count("fix_proofs_full");
+            ArchB::Recorder::Count(FixRefusalCounters[static_cast<std::size_t>(refusal)]);
+        }
         if (!epochReused) resourceEpochProof = {};
         if (profile) {
             const auto use = !drawBuild ? 1 : DrawPipelineEnabled() ? 2 : 0;
@@ -3775,6 +3829,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         }
     }
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+        if (cheaper && epochReused) {
+            ArchB::Recorder::Count(ok ? "fix_proofs_reused" : "fix_proofs_full");
+            if (!ok) ArchB::Recorder::Count("fix_proofs_refused_per_use");
+        }
         if (ok) AgcDriver::ArchB::Recorder::Count(fast ? (epochReused ? "proof_fast_pass_epoch" : "proof_fast_pass_stamps") : "proof_full_pass");
         if (!ok) AgcDriver::ArchB::Recorder::Count("proof_failed");
         if (ok) provedOnce = true;
@@ -4023,17 +4081,35 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (GuestMemory::GpuMutex().HeldByThisThread() && epochBefore.epoch != 0 && (epochBefore.forgotten & 1u) == 0 && (epochReused || canRememberResourceEpoch()) && currentResourceEpochProof() == epochBefore && HostImportsIdentity(context, false) == importsBefore) {
             if (!epochReused) {
                 epochImages.clear();
+                epochMemory.clear();
+                const auto rememberMemory = [&](const GuestTextureResource& resource, std::uint64_t bytes) {
+                    if (!cheaper) return;
+                    epochMemory.push_back({resource.baseAddress, static_cast<std::size_t>(bytes), epochBefore.tracker});
+                    if (resource.dccAddress != 0) epochMemory.push_back({resource.dccAddress, DccKeyBytes(bytes), epochBefore.tracker});
+                };
+                for (const auto& surface : validatedTextures) rememberMemory(surface.resource, surface.bytes);
                 const auto remember = [&](const StorageTexture* image) {
-                    if (image != nullptr) epochImages.push_back({image, image->Version(), image->Descriptor().dccAddress});
+                    if (image != nullptr) {
+                        epochImages.push_back({image, image->Version(), image->Descriptor().dccAddress});
+                        rememberMemory(image->Descriptor(), image->GuestBytes());
+                    }
                 };
                 for (const auto& surface : validatedTextures) remember(surface.source);
                 for (const auto& image : storageTextures) remember(image.get());
+                if (cheaper) {
+                    for (std::size_t i = 0; i < storageKeys.size(); ++i) {
+                        if (storageKeys[i] != 0) epochMemory.push_back({storageKeys[i], DccKeyBytes(storageTextures[i]->GuestBytes()), epochBefore.tracker});
+                    }
+                }
+                std::sort(epochMemory.begin(), epochMemory.end(), [](const auto& left, const auto& right) { return std::tie(left.address, left.bytes) < std::tie(right.address, right.bytes); });
+                epochMemory.erase(std::unique(epochMemory.begin(), epochMemory.end(), [](const auto& left, const auto& right) { return left.address == right.address && left.bytes == right.bytes; }), epochMemory.end());
                 if (profile) Revalidations().epochRemembered.fetch_add(1, std::memory_order_relaxed);
             }
             resourceEpochProof = epochBefore;
             epochImports = importsBefore;
         } else {
             resourceEpochProof = {};
+            if (cheaper) ArchB::Recorder::Count("fix_proofs_refused_retention");
             if (profile) Revalidations().epochUnstable.fetch_add(1, std::memory_order_relaxed);
         }
     }

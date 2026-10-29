@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "ThreadOwned.hpp"
@@ -162,8 +164,10 @@ bool Driver::pipelineDispatch() {
     return DispatchItemsEnabled();
 }
 
-void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, std::optional<bool> proofChoice) {
     ArchB::Recorder::Work recorderWork({ArchB::Recorder::Kind::Dispatch, 0});
+    const bool cheaperProofs = proofChoice.has_value() ? *proofChoice : ArchB::Switches::Enabled(ArchB::Feature::FixCheaperProofs);
+    const Graphics::ResourceProofScope proofScope(cheaperProofs);
     PerformanceTimer timing("Driver.Dispatch");
     const GuestMemory::ReadSiteScope handlerSite(GuestMemory::ReadSite::DispatchHandler);
     static const bool profileSplit = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -562,7 +566,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
-        dispatch(queue, packet, submission, indirectArguments);
+        dispatch(queue, packet, submission, indirectArguments, cheaperProofs);
         return;
     }
     phaseTiming.Phase(PhaseQueuedLabels);
@@ -595,7 +599,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto rethrow = [&](const std::exception& error) {
         if (fromAhead) {
             ++groupStats.deviceRejects;
-            dispatch(queue, packet, submission, indirectArguments);
+            dispatch(queue, packet, submission, indirectArguments, cheaperProofs);
             return true;
         }
         char where[64];
@@ -611,7 +615,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion] {
+        DrawPipeline::Queue0().Enqueue([this, cheaperProofs, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion] {
+            const Graphics::ResourceProofScope proofScope(cheaperProofs);
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             PerformanceTimer recorderTiming("Driver.DispatchCommit");
             DrawPipeline::FollowEpoch(epoch);

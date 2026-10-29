@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include <filesystem>
 #include <fstream>
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
@@ -328,6 +329,20 @@ public:
 
     std::uint64_t Address() const { return reinterpret_cast<std::uint64_t>(memory); }
 
+    void Remap() {
+        GuestAllocations::Mutation().Remove(memory);
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(memory, span);
+        GuestArena::GuestArenaCommit_nid_postfix(memory, span, PAGE_READWRITE, span);
+#else
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, span);
+        Require(mmap(memory, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == memory, "cannot remap the watched surface");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory, span);
+#endif
+        GuestAllocations::Mutation().Add(memory, span, true, true, true);
+        std::memset(memory, 0x37, span);
+    }
+
 private:
     const Context& context;
     std::size_t span = 0;
@@ -611,13 +626,80 @@ void upperBoundProofTests(Context context) {
     Require(!resources.Revalidate(shader), "UB dispatch off accepted a changed resource");
 }
 
+void cheaperProofToggleTests(Context context) {
+    namespace Memory = AgcDriver::GuestMemory;
+    namespace ArchB = AgcDriver::ArchB;
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    std::lock_guard gpu(Memory::GpuMutex());
+    Memory::MarkProofThread();
+    WatchedSurface surface(context);
+    const auto program = SampledProgram(surface.Address());
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, shader);
+    Memory::BumpCollectEpoch();
+    ShaderResources::ProofReport report;
+    for (const bool enabled : {true, false, true, false}) {
+        upperBoundToggle("FIX_CHEAPER_PROOFS", enabled);
+        const bool selected = ArchB::Switches::Enabled(ArchB::Feature::FixCheaperProofs);
+        Require(selected == enabled, "the cheaper proof switch did not toggle");
+        const ResourceProofScope item(selected);
+        upperBoundToggle("FIX_CHEAPER_PROOFS", !enabled);
+        for (int use = 0; use < 4; ++use) Require(resources.Revalidate(shader, &report), "toggling lost unchanged resources");
+#ifdef _WIN32
+        if (report.epochReused != enabled) std::puts(ArchB::Recorder::Collect(ArchB::Recorder::Clock::now()).Json().c_str());
+        Require(report.epochReused == enabled, "an in-flight item changed proof paths after a toggle");
+#endif
+        {
+            const ResourceProofScope nested(!selected);
+            Require(ResourceProofScope::Enabled() != selected, "nested work did not select its proof path");
+        }
+        Require(ResourceProofScope::Enabled() == selected, "nested work lost its caller's proof path");
+    }
+    Require(!ResourceProofScope::Enabled(), "the proof scope leaked to the next item");
+    upperBoundToggle("FIX_CHEAPER_PROOFS", false);
+    const auto serial = Memory::ProofSerial();
+    const std::byte value{0x37};
+    Memory::StoreOwnBytes(surface.Address(), std::span(&value, 1));
+    Require(Memory::ProofSerial() != serial, "an off-item write did not invalidate proofs");
+    upperBoundToggle("FIX_CHEAPER_PROOFS", true);
+    {
+        const ResourceProofScope item(ArchB::Switches::Enabled(ArchB::Feature::FixCheaperProofs));
+        Require(!resources.Revalidate(shader, &report) && !report.epochReused, "turning on accepted data written while off");
+    }
+    {
+        const ResourceProofScope item(false);
+        Require(!resources.Revalidate(shader, &report), "turning off consumed a stale legacy proof");
+    }
+    auto rebuilt = std::make_shared<ShaderResources>(context, shader);
+    for (const bool enabled : {false, true, false, true}) {
+        const ResourceProofScope item(enabled);
+        for (int use = 0; use < 4; ++use) Require(rebuilt->Revalidate(shader), "the profile fixture did not settle");
+        const auto started = std::chrono::steady_clock::now();
+        for (int use = 0; use < 1024; ++use) Require(rebuilt->Revalidate(shader), "the profile fixture changed");
+        const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+        std::printf("proof microprofile switch=%u sampled=1 calls=1024 us_per_call=%.3f\n", enabled ? 1u : 0u, us / 1024.0);
+    }
+}
+
 bool resourceEpochTests(Context context, bool draw) {
     namespace Memory = AgcDriver::GuestMemory;
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
     TextureCache textures(context);
     context.textureCache = &textures;
-    const bool enabled = Memory::ResourceEpochProofsEnabled();
+    const bool cheaper = ResourceProofScope::Enabled();
+    const bool enabled = cheaper || Memory::ResourceEpochProofsEnabled();
+    if (cheaper) Memory::MarkProofThread();
+    const auto writeSerial = [&] { return cheaper ? Memory::ProofSerial() : Memory::ResourceProofSerial(); };
+    const auto expectedReuse = [&](const ShaderResources& resources) {
+#ifndef _WIN32
+        if (cheaper && (!resources.SampledTextures().empty() || resources.Extent().storageImages != 0)) return false;
+#endif
+        return enabled;
+    };
     const auto stage = draw ? ShaderRecompiler::ShaderStage::Vertex : ShaderRecompiler::ShaderStage::Compute;
     std::unique_lock gpu(Memory::GpuMutex());
     const auto create = [&](const CompiledShader& shader) {
@@ -630,9 +712,12 @@ bool resourceEpochTests(Context context, bool draw) {
             Require(resources.Revalidate(shader, &report), "the epoch fixture did not prove current");
             if (report.epochReused) break;
         }
-        Require(report.epochReused == enabled, "the epoch fixture did not exercise the selected proof mode");
+        if (report.epochReused != expectedReuse(resources)) {
+            std::puts(AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now()).Json().c_str());
+        }
+        Require(report.epochReused == expectedReuse(resources), "the epoch fixture did not exercise the selected proof mode");
     };
-    for (const auto mutation : {0, 1, 2}) {
+    for (int mutation = 0; mutation < (cheaper ? 5 : 3); ++mutation) {
         WatchedSurface surface(context);
         const auto program = SampledProgram(surface.Address());
         const CompiledShader shader{stage, &program, 0};
@@ -641,12 +726,12 @@ bool resourceEpochTests(Context context, bool draw) {
         Memory::BumpCollectEpoch();
         warm(*resources, shader);
         const auto epoch = Memory::CollectEpoch();
-        const auto writes = Memory::ResourceProofSerial();
+        const auto writes = writeSerial();
         gpu.unlock();
         gpu.lock();
         ShaderResources::ProofReport report;
-        Require(resources->Revalidate(shader, &report) && report.epochReused == enabled, "reacquiring the GPU lock discarded an unchanged epoch proof");
-        Require(Memory::ResourceProofSerial() == writes, "an ordinary GPU lock acquisition changed the resource write serial");
+        Require(resources->Revalidate(shader, &report) && report.epochReused == expectedReuse(*resources), "reacquiring the GPU lock discarded an unchanged epoch proof");
+        Require(writeSerial() == writes, "an ordinary GPU lock acquisition changed the resource write serial");
         if (mutation == 0) {
             std::memset(reinterpret_cast<void*>(surface.Address()), 0x37, SurfaceBytes);
             Memory::BumpCollectEpoch();
@@ -674,12 +759,16 @@ bool resourceEpochTests(Context context, bool draw) {
             gpu.lock();
             if (error != nullptr) std::rethrow_exception(error);
             Require(Memory::CollectEpoch() == epoch, "the other queue changed the consumer's collect epoch");
-            Require(!enabled || Memory::ResourceProofSerial() != writes, "the other queue's write did not break the resource proof");
-        } else {
+            Require(!enabled || writeSerial() != writes, "the other queue's write did not break the resource proof");
+        } else if (mutation == 2) {
             std::memset(reinterpret_cast<void*>(surface.Address()), 0x37, SurfaceBytes);
             Memory::CollectWritesUncached(surface.Address(), SurfaceBytes);
             Require(Memory::CollectEpoch() == epoch, "an uncached collect changed the consumer's epoch");
-            Require(Memory::ResourceProofSerial() == writes, "the collected CPU-write test did not isolate tracker invalidation");
+            Require(writeSerial() == writes, "the collected CPU-write test did not isolate tracker invalidation");
+        } else if (mutation == 3) {
+            std::memset(reinterpret_cast<void*>(surface.Address()), 0x37, SurfaceBytes);
+        } else {
+            surface.Remap();
         }
         Require(!resources->Revalidate(shader, &report) && !report.epochReused, "a changed snapshot was accepted through an epoch proof");
     }
@@ -827,7 +916,7 @@ bool resourceEpochTests(Context context, bool draw) {
         recorder.Sync();
         std::memset(reinterpret_cast<void*>(surface.Address()), 0x37, bytes);
         ShaderResources::ProofReport report;
-        Require(resources->Revalidate(shader, &report) && report.epochReused == enabled, "the staged template did not reuse the selected image proof");
+        Require(resources->Revalidate(shader, &report) && report.epochReused == (enabled && !cheaper), "the staged template did not honor the publication proof guard");
         resources->MarkGpuWrites(recorder);
         recorder.Sync();
         const auto* data = reinterpret_cast<const std::uint8_t*>(surface.Address());
@@ -1556,20 +1645,21 @@ int main(int argc, char** argv) {
         const bool memory = argc > 1 && std::string(argv[1]) == "memory";
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool upperBound = mode == "ub-trust-proofs" || mode == "ub-lock-invalidation";
+        const bool fixProofs = mode.starts_with("fix-proofs-");
         struct UpperBoundControl {
             std::filesystem::path path;
             ~UpperBoundControl() { if (!path.empty()) std::filesystem::remove(path); }
         } control;
-        if (upperBound) {
+        if (upperBound || fixProofs) {
             control.path = std::filesystem::current_path() / ("archb-ub-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
 #ifdef _WIN32
             _putenv_s("APS5_ARCHB_GATE_RUN", "1");
             _putenv_s("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str());
-            _putenv_s("APS5_RESOURCE_EPOCH_PROOFS", "1");
+            _putenv_s("APS5_RESOURCE_EPOCH_PROOFS", upperBound ? "1" : "0");
 #else
             setenv("APS5_ARCHB_GATE_RUN", "1", 1);
             setenv("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str(), 1);
-            setenv("APS5_RESOURCE_EPOCH_PROOFS", "1", 1);
+            setenv("APS5_RESOURCE_EPOCH_PROOFS", upperBound ? "1" : "0", 1);
 #endif
             AgcDriver::ArchB::Switches::Initialize();
             if (mode == "ub-lock-invalidation") {
@@ -1623,6 +1713,25 @@ int main(int argc, char** argv) {
         TextureDetiler detiler(context);
         context.detiler = &detiler;
         if (mode == "ub-trust-proofs") { upperBoundProofTests(context); return 0; }
+        if (fixProofs) {
+            const bool selected = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixCheaperProofs);
+            Require(selected, "the cheaper proof test did not enable its runtime switch");
+            AgcDriver::ArchB::Recorder::BindThread("fix-proofs-test");
+            AgcDriver::ArchB::Recorder::Boundary(true, 1, AgcDriver::ArchB::Recorder::Clock::now());
+            if (mode == "fix-proofs-toggle" || mode == "fix-proofs-toggle_pipeline") cheaperProofToggleTests(context);
+            else {
+                const ResourceProofScope proofScope(selected);
+                if (!resourceEpochTests(context, mode == "fix-proofs-draw")) return VulkanTestSkipped;
+            }
+            const auto counts = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now());
+#ifdef _WIN32
+            Require(counts.counters.contains("fix_proofs_reused") && counts.counters.at("fix_proofs_reused") > 0, "the fix did not reuse a proof");
+#endif
+            Require(counts.counters.contains("fix_proofs_full") && counts.counters.at("fix_proofs_full") > 0, "the fix did not exercise fallback");
+            std::puts(counts.Json().c_str());
+            std::puts("cheaper resource proof tests passed");
+            return 0;
+        }
         if (mode == "resource-epoch-draw" || mode == "resource-epoch-dispatch") {
             if (!resourceEpochTests(context, mode == "resource-epoch-draw")) return VulkanTestSkipped;
             std::puts("resource epoch proof tests passed");
