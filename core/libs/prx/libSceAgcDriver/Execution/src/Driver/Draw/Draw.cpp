@@ -140,6 +140,7 @@ struct DrawTail {
     bool registerKey = false;
     bool ubPointerFree = false;
     bool ubSkipCpuIndirect = false;
+    bool fixIndirectCpuDraw = false;
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
@@ -426,6 +427,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto tailHolder = std::make_shared<DrawTail>();
     auto& tail = *tailHolder;
+    tail.fixIndirectCpuDraw = ArchB::Switches::Enabled(ArchB::Feature::FixIndirectCpuDraw);
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
     auto& phaseLap = tail.phaseLap;
@@ -797,7 +799,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         missesBefore = drawEntryCounters.misses;
     }
     try {
-        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree);
+        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree, tail.fixIndirectCpuDraw);
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
@@ -1159,7 +1161,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
-    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
+    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, tail.fixIndirectCpuDraw);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -1340,7 +1342,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 const auto* capture = !graphics.stages.mesh && !graphics.stages.tessellation && sameVertex ? stageCaptures[programIndex].capture.get() : nullptr;
                 RefreshIndirectStage(result, capture, programs[programIndex], vertexInfos[programIndex], [&] {
                     return materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
-                });
+                }, tail.fixIndirectCpuDraw);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
             }

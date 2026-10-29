@@ -8,7 +8,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool allowIndirectShaderData) {
     PerformanceTimer recorderTiming("Driver.DrawLookup", ArchB::Recorder::Phase::Proof);
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
@@ -147,7 +147,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                                 }
                             }
                             const auto info = variant->vertexInfo != nullptr ? std::optional(*variant->vertexInfo) : std::nullopt;
-                            if (!patchedWords.empty() && IndirectStageCacheRefusal(*variant->compiled, variant->indirectCapture.get(), programs[i], info, patchedWords) != IndirectCacheRefusal::None) continue;
+                            if (!patchedWords.empty() && IndirectStageCacheRefusal(*variant->compiled, variant->indirectCapture.get(), programs[i], info, patchedWords, allowIndirectShaderData) != IndirectCacheRefusal::None) continue;
                         }
                         if (!pointerFree && programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh && !std::equal(variant->meshIndexDescriptor.begin(), variant->meshIndexDescriptor.end(), programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord)) {
                             if (!anyLayout) outcome = EntryOutcome::Differing;

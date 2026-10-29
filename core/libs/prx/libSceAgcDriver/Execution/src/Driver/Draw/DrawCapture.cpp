@@ -220,7 +220,7 @@ void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderReco
     variant.dataSlots.resize(kept);
 }
 
-void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry) {
+void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry, bool allowIndirectShaderData) {
     const bool cpuIndirect = drawParameters.indirect && indirectCpu;
     static const bool cpuIndirectCache = std::getenv("APS5_NO_CPU_INDIRECT_DRAW_CACHE") == nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -238,13 +238,24 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             for (std::size_t i = 0; i < programs.size() && refusal == IndirectCacheRefusal::None; ++i) {
                 const auto& capture = stageCaptures[i];
                 if ((programs[i].binary.stage != ShaderRecompiler::ShaderStage::Vertex && programs[i].binary.stage != ShaderRecompiler::ShaderStage::Fragment) || programs[i].merged || programs[i].hiddenUserWords != 0 || capture.compiled == nullptr || !CacheableResult(*capture.compiled)) refusal = IndirectCacheRefusal::Path;
-                else if (!patchedWords[i].empty()) refusal = IndirectStageCacheRefusal(*capture.compiled, capture.capture.get(), programs[i], vertexInfos[i], patchedWords[i]);
+                else if (!patchedWords[i].empty()) refusal = IndirectStageCacheRefusal(*capture.compiled, capture.capture.get(), programs[i], vertexInfos[i], patchedWords[i], allowIndirectShaderData);
             }
         }
     }
     const bool cacheable = useDrawEntries && !drawHit && refusal == IndirectCacheRefusal::None;
     const bool admitted = cacheable && (verifyHit || admitDrawKey(drawKey, registerKey && drawDataHits() ? shapeKey : 0));
     const bool replaceShape = cacheable && !admitted && shapeNeedsEntry;
+    if (cpuIndirect) {
+        constexpr std::array<const char*, static_cast<std::size_t>(IndirectCacheRefusal::Count)> counters{
+            "fix_indirect_cpu_draw_refused_none", "fix_indirect_cpu_draw_refused_disabled", "fix_indirect_cpu_draw_refused_entries_disabled",
+            "fix_indirect_cpu_draw_refused_path", "fix_indirect_cpu_draw_refused_capture", "fix_indirect_cpu_draw_refused_plan",
+            "fix_indirect_cpu_draw_refused_capture_read", "fix_indirect_cpu_draw_refused_vertex_decode", "fix_indirect_cpu_draw_refused_push_mapping",
+            "fix_indirect_cpu_draw_refused_admission"
+        };
+        if (allowIndirectShaderData && (drawHit || verifyHit)) ArchB::Recorder::Count("fix_indirect_cpu_draw_cache_hits");
+        else if (refusal != IndirectCacheRefusal::None) ArchB::Recorder::Count(counters[static_cast<std::size_t>(refusal)]);
+        else if (!drawHit && !verifyHit && !admitted) ArchB::Recorder::Count(counters[static_cast<std::size_t>(IndirectCacheRefusal::Admission)]);
+    }
     if (cpuIndirect && profile) {
         std::lock_guard cacheLock(drawCacheMutex);
         if (drawHit || verifyHit) ++drawEntryCounters.indirectCpuHits;

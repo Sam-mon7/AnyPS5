@@ -8,6 +8,11 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "ShaderDiskCache.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include <filesystem>
+#include <fstream>
+#include <thread>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -33,7 +38,7 @@ struct DriverTestAccess {
         std::vector<std::vector<ShaderRecompiler::MemoryRegion>> regions{1};
     };
 
-    static Lookup Find(const std::shared_ptr<VulkanDevice>& device, const DrawDecode& decode, const ShaderRecompiler::ShaderVertexStageInfo& vertexInfo, const Pm4::DrawParameters& packet, std::uint64_t key = 0) {
+    static Lookup Find(const std::shared_ptr<VulkanDevice>& device, const DrawDecode& decode, const ShaderRecompiler::ShaderVertexStageInfo& vertexInfo, const Pm4::DrawParameters& packet, std::uint64_t key = 0, bool allowShaderData = false) {
         Lookup lookup;
         lookup.key = key;
         Submission submission{};
@@ -48,12 +53,12 @@ struct DriverTestAccess {
             const auto found = Driver::Get().drawCache.find(key);
             if (found != Driver::Get().drawCache.end()) lookup.entry = found->second;
         }
-        Driver::Get().lookupDraw(submission, device, decode.state, decode.pixel, decode.programs, decode.roles, infos, true, key != 0, false, lookup.key, lookup.entry, lookup.matched, lookup.regions, lookup.hit, verify, timing, ms, nullptr, candidates, data, packet);
+        Driver::Get().lookupDraw(submission, device, decode.state, decode.pixel, decode.programs, decode.roles, infos, true, key != 0, false, lookup.key, lookup.entry, lookup.matched, lookup.regions, lookup.hit, verify, timing, ms, nullptr, candidates, data, packet, false, allowShaderData);
         Graphics::Require(!verify, "cache regression must use the ordinary hit path");
         return lookup;
     }
 
-    static void Insert(const Lookup& lookup, const std::shared_ptr<const DrawDecode>& decode, const Pm4::DrawParameters& packet, const StageCapture& capture, const ShaderRecompiler::ShaderVertexStageInfo& vertexInfo, std::span<const Graphics::DecodeRead> decodeReads) {
+    static void Insert(const Lookup& lookup, const std::shared_ptr<const DrawDecode>& decode, const Pm4::DrawParameters& packet, const StageCapture& capture, const ShaderRecompiler::ShaderVertexStageInfo& vertexInfo, std::span<const Graphics::DecodeRead> decodeReads, bool allowShaderData = false) {
         std::vector<StageCapture> captures{capture};
         std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos{vertexInfo};
         std::vector<std::vector<Graphics::DecodeRead>> reads(1);
@@ -63,7 +68,7 @@ struct DriverTestAccess {
         std::array<double, DrawDriverPhaseCount> ms{};
         std::chrono::steady_clock::time_point lap{};
         DrawPhaseTiming timing{false, ms, lap};
-        Driver::Get().cacheDrawStages(true, false, packet, Graphics::IndirectDrawPath::NotFolded, decode->programs, captures, infos, reads, false, lookup.matched, data, fresh, lookup.key, false, decode, timing, std::vector<bool>(1, false), lookup.entry, 0);
+        Driver::Get().cacheDrawStages(true, lookup.hit, packet, Graphics::IndirectDrawPath::NotFolded, decode->programs, captures, infos, reads, false, lookup.matched, data, fresh, lookup.key, false, decode, timing, std::vector<bool>(1, false), lookup.entry, 0, false, allowShaderData);
     }
 };
 
@@ -700,9 +705,9 @@ std::string IndirectPushPatches(Fixture& fixture, bool bufferBase) {
     return failures;
 }
 
-std::string CachedIndirectPatches(Fixture& fixture) {
+std::string CachedIndirectPatches(Fixture& fixture, bool storageData = false, const std::filesystem::path& control = {}) {
     using namespace AgcDriver::DriverDetail;
-    const bool enabled = std::getenv("APS5_NO_CPU_INDIRECT_DRAW_CACHE") == nullptr;
+    const bool cacheEnabled = std::getenv("APS5_NO_CPU_INDIRECT_DRAW_CACHE") == nullptr;
     const bool pushEnabled = std::getenv("APS5_NO_INDIRECT_PUSH_PATCH") == nullptr;
     const bool verify = std::getenv("APS5_VERIFY_INDIRECT_PUSH_PATCH") != nullptr;
     auto decode = std::make_shared<DrawDecode>();
@@ -729,6 +734,14 @@ std::string CachedIndirectPatches(Fixture& fixture) {
     std::uint32_t hits = 0;
     std::string failures;
     for (std::uint32_t draw = 0; draw < 7; ++draw) {
+        using namespace AgcDriver::ArchB;
+        if (!control.empty()) {
+            std::ofstream(control, std::ios::trunc) << draw + 1u << " FIX_INDIRECT_CPU_DRAW=" << (draw != 3u ? 1 : 0) << '\n';
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            Switches::PollControl();
+        }
+        const bool allowShaderData = storageData && Switches::Enabled(Feature::FixIndirectCpuDraw);
+        const bool enabled = cacheEnabled && (!storageData || allowShaderData);
         const bool movedResource = draw >= 5;
         if (movedResource) {
             const auto descriptor = SlotDescriptor(otherVertices.data(), static_cast<std::uint32_t>(otherVertices.size()));
@@ -742,13 +755,14 @@ std::string CachedIndirectPatches(Fixture& fixture) {
             read.size = 16;
             std::memcpy(read.data.data(), BufferTable.data() + resource * 4u, read.size);
         }
-        auto lookup = DriverTestAccess::Find(fixture.device, *decode, originalInfo, packet, key);
+        auto lookup = DriverTestAccess::Find(fixture.device, *decode, originalInfo, packet, key, allowShaderData);
         key = lookup.key;
+        if (storageData && lookup.hit) Require(!DriverTestAccess::Find(fixture.device, *decode, originalInfo, packet, key).hit, "switch-off lookup consumed a storage-data proof");
         Require(lookup.hit == (enabled && draw >= 2 && draw != 5), "CPU indirect cache selected the wrong hit/miss for draw " + std::to_string(draw));
         if (enabled && draw == 2) {
             auto changedPacket = packet;
             changedPacket.indirect->baseVertexLocation = 0x90u;
-            Require(!DriverTestAccess::Find(fixture.device, *decode, originalInfo, changedPacket, key).hit, "CPU indirect cache reused a proof for different packet SGPR locations");
+            Require(!DriverTestAccess::Find(fixture.device, *decode, originalInfo, changedPacket, key, allowShaderData).hit, "CPU indirect cache reused a proof for different packet SGPR locations");
         }
         hits += lookup.hit;
         const std::array<ShaderRecompiler::MemoryRegion, 2> regions{{
@@ -757,6 +771,7 @@ std::string CachedIndirectPatches(Fixture& fixture) {
         }};
         AgcDriver::ShaderMemory memory(regions);
         ShaderRecompiler::RecompileRequest request{program.binary, {32, 8, program.userData, std::nullopt, std::nullopt, info, regions}, fixture.device->Target(), {0, 0, 0, 64}};
+        if (storageData) request.layout.pushConstantSizeBytes = 0;
         const auto handle = ShaderRecompiler::PrepareShader(request);
         Require(handle != nullptr, "cached indirect test has no prepared shader");
         StageCapture capture;
@@ -780,21 +795,35 @@ std::string CachedIndirectPatches(Fixture& fixture) {
             capture.userDataUse = capture.capture->userDataUse;
             capture.forgetSerial = AgcDriver::GuestMemory::ForgetSerial();
             const std::array<std::size_t, 2> words{8, 9};
-            Require(Driver::IndirectStageCacheRefusal(*capture.compiled, capture.capture.get(), program, info, words) == IndirectCacheRefusal::None, "cached indirect offsets were not proven push-only");
+            Require(Driver::IndirectStageCacheRefusal(*capture.compiled, capture.capture.get(), program, info, words, allowShaderData) == (storageData && !allowShaderData ? IndirectCacheRefusal::PushMapping : IndirectCacheRefusal::None), "cached indirect offsets selected the wrong proof");
+            if (storageData) {
+                Require(Driver::IndirectStageCacheRefusal(*capture.compiled, capture.capture.get(), program, info, words) == IndirectCacheRefusal::PushMapping, "storage-data test did not reproduce the old refusal");
+                auto malformed = *capture.compiled;
+                auto binding = std::find_if(malformed.bindings.begin(), malformed.bindings.end(), [](const auto& value) { return value.role == ShaderRecompiler::DescriptorRole::ShaderData; });
+                Require(binding != malformed.bindings.end(), "test shader data did not spill to storage");
+                binding->guestDescriptor.pop_back();
+                Require(Driver::IndirectStageCacheRefusal(malformed, capture.capture.get(), program, info, words, true) == IndirectCacheRefusal::PushMapping, "storage-data proof admitted a truncated buffer");
+                malformed = *capture.compiled;
+                binding = std::find_if(malformed.bindings.begin(), malformed.bindings.end(), [](const auto& value) { return value.role == ShaderRecompiler::DescriptorRole::ShaderData; });
+                const auto duplicate = *binding;
+                malformed.bindings.push_back(duplicate);
+                Require(Driver::IndirectStageCacheRefusal(malformed, capture.capture.get(), program, info, words, true) == IndirectCacheRefusal::PushMapping, "storage-data proof admitted duplicate buffers");
+            }
             if (draw == 0) {
                 auto unsafe = capture;
                 auto unsafeProof = std::make_shared<ShaderRecompiler::ResourceCapture>(*capture.capture);
                 unsafeProof->userDataUse.asValue |= std::uint64_t{1} << 8u;
                 unsafe.capture = unsafeProof;
-                DriverTestAccess::Insert(lookup, decode, packet, unsafe, info, decodeReads);
-                DriverTestAccess::Insert(lookup, decode, packet, unsafe, info, decodeReads);
-                Require(!DriverTestAccess::Find(fixture.device, *decode, originalInfo, packet, key).hit, "CPU indirect cache inserted a capture that reads a patched word");
+                Require(Driver::IndirectStageCacheRefusal(*capture.compiled, unsafeProof.get(), program, info, words, storageData) == IndirectCacheRefusal::CaptureRead, "storage-data proof admitted a captured patched value");
+                DriverTestAccess::Insert(lookup, decode, packet, unsafe, info, decodeReads, allowShaderData);
+                DriverTestAccess::Insert(lookup, decode, packet, unsafe, info, decodeReads, allowShaderData);
+                Require(!DriverTestAccess::Find(fixture.device, *decode, originalInfo, packet, key, allowShaderData).hit, "CPU indirect cache inserted a capture that reads a patched word");
                 auto fetchInfo = info;
                 fetchInfo.fetchBufferReg = 8;
-                Require(Driver::IndirectStageCacheRefusal(*capture.compiled, capture.capture.get(), program, fetchInfo, words) == IndirectCacheRefusal::VertexDecode, "CPU indirect cache admitted a patched fetch pointer");
+                Require(Driver::IndirectStageCacheRefusal(*capture.compiled, capture.capture.get(), program, fetchInfo, words, storageData) == IndirectCacheRefusal::VertexDecode, "CPU indirect cache admitted a patched fetch pointer");
             }
-            DriverTestAccess::Insert(lookup, decode, packet, capture, info, decodeReads);
         }
+        DriverTestAccess::Insert(lookup, decode, packet, capture, info, decodeReads, allowShaderData);
         const auto kept = capture.compiled;
         auto result = *kept;
         const auto record = std::array<std::uint32_t, 5>{Vertices, Instances, draw % 2u * 3u, 19u + draw * 11u, 37u + draw * 7u};
@@ -802,9 +831,11 @@ std::string CachedIndirectPatches(Fixture& fixture) {
         const auto arguments = AgcDriver::Pm4::ReadDrawArguments(*packet.indirect, 0);
         program.userData[8] = arguments.vertexOffset;
         program.userData[9] = arguments.firstInstance;
+        if (storageData) result.drawKeyMemo.words.store(std::make_shared<const std::vector<std::uint32_t>>(std::initializer_list<std::uint32_t>{0x51u, 0x62u}), std::memory_order_relaxed);
         std::uint32_t materializations = 0;
-        Driver::RefreshIndirectStage(result, capture.capture.get(), program, info, [&] { ++materializations; return materialize(); });
-        Require(materializations == (!pushEnabled || verify ? 1u : 0u), "cached indirect draw unexpectedly captured its resources");
+        Driver::RefreshIndirectStage(result, capture.capture.get(), program, info, [&] { ++materializations; return materialize(); }, allowShaderData);
+        if (storageData) Require(result.drawKeyMemo.words.load(std::memory_order_relaxed) == nullptr, "indirect data refresh retained the previous record's resource key");
+        Require(materializations == (!pushEnabled || verify || (storageData && !allowShaderData) ? 1u : 0u), "cached indirect draw unexpectedly captured its resources");
         const std::array<std::uint32_t, Vertices> raw{indices[arguments.firstVertexOrIndex], indices[arguments.firstVertexOrIndex + 1], indices[arguments.firstVertexOrIndex + 2]};
         fixture.Place(arguments.vertexOffset, raw, arguments.firstInstance);
         if (movedResource) {
@@ -813,13 +844,27 @@ std::string CachedIndirectPatches(Fixture& fixture) {
             VertexSlots.fill(Unwritten);
         }
         auto direct = FoldedDraw(result, program.userData, {packet.indexAddress + arguments.firstVertexOrIndex * packet.indexSize, arguments.count, packet.indexSize, arguments.instances, 0, true, 0, 0});
+        if (storageData) {
+            const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle);
+            Require(invocation.has_value(), "storage-data comparison lost its invocation");
+            SameResult(result, *invocation->Materialize(*memory.Capture(*invocation)));
+        }
         fixture.Draw(result, direct);
         failures += fixture.Check("cached CPU indirect draw " + std::to_string(draw), raw, arguments.vertexOffset, arguments.firstInstance, true);
-        Require(kept->pushConstants != result.pushConstants, "cached draw retained another record's push constants");
+        if (!storageData) Require(kept->pushConstants != result.pushConstants, "cached draw retained another record's push constants");
         program.userData = decode->programs[0].userData;
     }
     BufferTable = originalTable;
-    Require(hits == (enabled ? 4u : 0u), "CPU indirect cache did not exercise its expected hits");
+    const bool enabled = cacheEnabled && (!storageData || AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixIndirectCpuDraw));
+    Require(hits == (enabled ? control.empty() ? 4u : 3u : 0u), "CPU indirect cache did not exercise its expected hits");
+    if (storageData) {
+        const auto counters = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now()).counters;
+        for (const auto& [name, count] : counters) {
+            if (name.starts_with("fix_indirect_cpu_draw_")) std::cout << name << '=' << count << '\n';
+        }
+        if (enabled && pushEnabled) Require(counters.contains("fix_indirect_cpu_draw_hits") && counters.at("fix_indirect_cpu_draw_hits") > 0, "storage-data refresh counter was not recorded");
+        if (enabled) Require(counters.contains("fix_indirect_cpu_draw_cache_hits") && counters.at("fix_indirect_cpu_draw_cache_hits") == hits, "storage-data cache counter disagrees with reused draws");
+    }
     return failures;
 }
 
@@ -1018,6 +1063,20 @@ std::string Run(Fixture& fixture) {
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
+    const bool storageData = mode == "--storage-indirect-data" || mode == "--storage-indirect-toggle";
+    const auto control = mode == "--storage-indirect-toggle" ? std::filesystem::temp_directory_path() / ("agc-indirect-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())) : std::filesystem::path{};
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { if (!path.empty()) std::filesystem::remove(path); }
+    } cleanup{control};
+    if (!control.empty()) {
+#ifdef _WIN32
+        _putenv_s("APS5_ARCHB_CONTROL_FILE", control.string().c_str());
+#else
+        setenv("APS5_ARCHB_CONTROL_FILE", control.string().c_str(), 1);
+#endif
+    }
+    if (storageData) AgcDriver::ArchB::Recorder::Boundary(true, 0, AgcDriver::ArchB::Recorder::Clock::now());
     if (mode == "--builtin-offsets") {
 #ifdef _WIN32
         _putenv_s("APS5_PROFILE_DRAW", "1");
@@ -1030,7 +1089,7 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         if (mode == "--builtin-offsets" && (!device->DrawIndirectSupport().drawParameters || !device->DrawIndirectSupport().firstInstance)) return VulkanTestSkipped;
         Fixture fixture(device);
-        const auto failures = mode == "--builtin-offsets" ? BuiltinOffsets(fixture) : mode == "--cpu-indirect-cache" ? CachedIndirectPatches(fixture) : mode == "--indirect-push-patch" ? IndirectPushPatches(fixture, false) : mode == "--indirect-buffer-base" ? IndirectPushPatches(fixture, true) : Run(fixture);
+        const auto failures = storageData ? CachedIndirectPatches(fixture, true, control) : mode == "--builtin-offsets" ? BuiltinOffsets(fixture) : mode == "--cpu-indirect-cache" ? CachedIndirectPatches(fixture) : mode == "--indirect-push-patch" ? IndirectPushPatches(fixture, false) : mode == "--indirect-buffer-base" ? IndirectPushPatches(fixture, true) : Run(fixture);
         if (!failures.empty()) {
             std::cerr << "vertex and instance indices differ from the guest's:\n" << failures;
             return 1;

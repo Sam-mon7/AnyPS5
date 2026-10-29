@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -13,29 +14,45 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-IndirectCacheRefusal CheckIndirectPushConstants(const ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const std::size_t> patchedWords) {
+IndirectCacheRefusal CheckIndirectPushConstants(const ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const std::size_t> patchedWords, bool allowShaderData) {
     using Refusal = IndirectCacheRefusal;
+    const auto pushRefusal = [&](const char* reason) {
+        ArchB::Recorder::Count(reason);
+        static const bool trace = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
+        if (trace) std::fprintf(stderr, "[indirect-push] program 0x%llx %s data=%u push-bytes=%zu mapping=%zu storage=%zu\n", static_cast<unsigned long long>(program.binary.codeAddress), reason, result.shaderDataDwords, result.pushConstants.size(), result.shaderDataUserWords.size(), static_cast<std::size_t>(std::count_if(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; })));
+        return Refusal::PushMapping;
+    };
     if (capture == nullptr || capture->plan == nullptr || capture->plan->userDataBase != program.firstUserSgpr || capture->snapshot.userData.size() != program.userData.size()) return Refusal::Capture;
     if (!capture->plan->resourceTrackingComplete || !capture->plan->srtPlanComplete || capture->plan->requiresSpecializationMemory) return Refusal::Plan;
     if (program.binary.stage != ShaderRecompiler::ShaderStage::Vertex && program.binary.stage != ShaderRecompiler::ShaderStage::Fragment) return Refusal::Path;
     const auto& mapping = result.shaderDataUserWords;
-    if (mapping.empty() || mapping.size() != result.memoryOffsetDword || mapping.size() > result.shaderDataDwords || result.shaderDataDwords > result.pushConstants.size() / sizeof(std::uint32_t)) return Refusal::PushMapping;
-    if (std::any_of(result.bindings.begin(), result.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; })) return Refusal::PushMapping;
+    if (mapping.empty()) return pushRefusal("fix_indirect_cpu_draw_push_empty");
+    if (mapping.size() != result.memoryOffsetDword) return pushRefusal("fix_indirect_cpu_draw_push_memory_offset");
+    if (mapping.size() > result.shaderDataDwords) return pushRefusal("fix_indirect_cpu_draw_push_data_size");
+    const auto storage = std::find_if(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; });
+    if (allowShaderData && storage != result.bindings.end()) {
+        if (storage->kind != ShaderRecompiler::DescriptorKind::StorageBuffer || storage->count != 1u || storage->guestDescriptor.size() != result.shaderDataDwords) return pushRefusal("fix_indirect_cpu_draw_push_storage_layout");
+        if (std::any_of(storage + 1, result.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; })) return pushRefusal("fix_indirect_cpu_draw_push_storage_duplicate");
+    } else {
+        if (result.shaderDataDwords > result.pushConstants.size() / sizeof(std::uint32_t)) return pushRefusal("fix_indirect_cpu_draw_push_capacity");
+        if (storage != result.bindings.end()) return pushRefusal("fix_indirect_cpu_draw_push_storage");
+    }
     std::uint64_t forwarded = 0;
     for (const auto word : mapping) {
-        if (word >= ShaderRecompiler::SrtUserDataUse::TrackedWords || word >= program.userData.size() || (forwarded & (std::uint64_t{1} << word)) != 0) return Refusal::PushMapping;
+        if (word >= ShaderRecompiler::SrtUserDataUse::TrackedWords || word >= program.userData.size()) return pushRefusal("fix_indirect_cpu_draw_push_word_range");
+        if ((forwarded & (std::uint64_t{1} << word)) != 0) return pushRefusal("fix_indirect_cpu_draw_push_duplicate");
         forwarded |= std::uint64_t{1} << word;
     }
-    if (forwarded != result.userDataRegisterReads) return Refusal::PushMapping;
+    if (forwarded != result.userDataRegisterReads) return pushRefusal("fix_indirect_cpu_draw_push_read_mask");
     const auto consumed = capture->userDataUse.asBase | capture->userDataUse.asValue;
     for (const auto word : patchedWords) {
-        if (word >= program.userData.size()) return Refusal::PushMapping;
+        if (word >= program.userData.size()) return pushRefusal("fix_indirect_cpu_draw_push_patch_range");
     }
     for (std::size_t word = 0; word < program.userData.size(); ++word) {
         if (program.userData[word] == capture->snapshot.userData[word] && std::find(patchedWords.begin(), patchedWords.end(), word) == patchedWords.end()) continue;
-        if (word >= ShaderRecompiler::SrtUserDataUse::TrackedWords) return Refusal::PushMapping;
+        if (word >= ShaderRecompiler::SrtUserDataUse::TrackedWords) return pushRefusal("fix_indirect_cpu_draw_push_untracked");
         if ((consumed & (std::uint64_t{1} << word)) != 0) return Refusal::CaptureRead;
-        if ((forwarded & (std::uint64_t{1} << word)) == 0) return Refusal::PushMapping;
+        if ((forwarded & (std::uint64_t{1} << word)) == 0) return pushRefusal("fix_indirect_cpu_draw_push_not_forwarded");
         if (word < program.hiddenUserWords) return Refusal::Path;
         if (vertexInfo && vertexInfo->resourcesNum != 0) {
             for (const auto reg : {vertexInfo->fetchAttribReg, vertexInfo->fetchBufferReg}) {
@@ -49,12 +66,15 @@ IndirectCacheRefusal CheckIndirectPushConstants(const ShaderRecompiler::Recompil
     return Refusal::None;
 }
 
-bool PatchIndirectPushConstants(ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo) {
-    if (CheckIndirectPushConstants(result, capture, program, vertexInfo, {}) != IndirectCacheRefusal::None) return false;
+bool PatchIndirectPushConstants(ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, bool allowShaderData) {
+    if (CheckIndirectPushConstants(result, capture, program, vertexInfo, {}, allowShaderData) != IndirectCacheRefusal::None) return false;
+    const auto storage = std::find_if(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; });
     const auto& mapping = result.shaderDataUserWords;
     for (std::size_t slot = 0; slot < mapping.size(); ++slot) {
-        std::memcpy(result.pushConstants.data() + slot * sizeof(std::uint32_t), &program.userData[mapping[slot]], sizeof(std::uint32_t));
+        if (storage != result.bindings.end()) storage->guestDescriptor[slot] = program.userData[mapping[slot]];
+        else std::memcpy(result.pushConstants.data() + slot * sizeof(std::uint32_t), &program.userData[mapping[slot]], sizeof(std::uint32_t));
     }
+    if (storage != result.bindings.end()) result.drawKeyMemo.words.store(nullptr, std::memory_order_relaxed);
     return true;
 }
 
@@ -88,14 +108,16 @@ void CountIndirectFold(std::optional<Graphics::IndirectDrawPath> cpu, bool built
 
 }
 
-IndirectCacheRefusal Driver::IndirectStageCacheRefusal(const ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const std::size_t> patchedWords) {
-    return CheckIndirectPushConstants(result, capture, program, vertexInfo, patchedWords);
+IndirectCacheRefusal Driver::IndirectStageCacheRefusal(const ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const std::size_t> patchedWords, bool allowShaderData) {
+    return CheckIndirectPushConstants(result, capture, program, vertexInfo, patchedWords, allowShaderData);
 }
 
-bool Driver::RefreshIndirectStage(ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, const std::function<std::shared_ptr<const ShaderRecompiler::RecompileResult>()>& materialize) {
+bool Driver::RefreshIndirectStage(ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, const std::function<std::shared_ptr<const ShaderRecompiler::RecompileResult>()>& materialize, bool allowShaderData) {
     static const bool enabled = std::getenv("APS5_NO_INDIRECT_PUSH_PATCH") == nullptr;
     static const bool verify = std::getenv("APS5_VERIFY_INDIRECT_PUSH_PATCH") != nullptr;
-    const bool patched = enabled && PatchIndirectPushConstants(result, capture, program, vertexInfo);
+    const bool patched = enabled && PatchIndirectPushConstants(result, capture, program, vertexInfo, allowShaderData);
+    if (allowShaderData && patched && std::any_of(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; })) ArchB::Recorder::Count("fix_indirect_cpu_draw_hits");
+    else if (allowShaderData && !patched) ArchB::Recorder::Count("fix_indirect_cpu_draw_refresh_refused");
     if (!patched || verify) {
         const auto full = materialize();
         require(full != nullptr, "indirect stage materialization returned no result");
@@ -194,8 +216,16 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         const auto location = [](std::uint32_t value, std::int32_t sgpr) { char text[24]; if (value == 0x280u) std::snprintf(text, sizeof(text), "none"); else std::snprintf(text, sizeof(text), "0x%x(s%d)", value, sgpr); return std::string(text); };
         const auto rule = [](Rule value, std::uint32_t constant) { char text[24]; if (value == Rule::InPlace) std::snprintf(text, sizeof(text), "in-place"); else std::snprintf(text, sizeof(text), "const %u", constant); return std::string(text); };
         std::string decision = indirectCpu ? "cpu (" + std::string(Graphics::IndirectDrawPathName(*indirectCpu)) + ")" : "gpu vertex=" + rule(indirect.vertexRule, indirect.vertexConstant) + " instance=" + rule(indirect.instanceRule, indirect.instanceConstant);
-        std::fprintf(stderr, "[draw] indirect 0x%x args 0x%llx stride %u count %u%s locs base=%s inst=%s idx=%s%s analyzer v=%d i=%d shared=%d/%d conflict=%d/%d indx=%u user reads 0x%llx (first %u, hidden %u) -> %s\n", indirect.opcode, static_cast<unsigned long long>(indirect.arguments), indirect.stride, indirect.count, indirect.countIndirect ? " (indirect)" : "", location(indirect.baseVertexLocation, indirect.baseVertexSgpr).c_str(), location(indirect.startInstanceLocation, indirect.startInstanceSgpr).c_str(), location(indirect.drawIndexLocation, indirect.drawIndexSgpr).c_str(), indirect.drawIndexEnabled ? " (enabled)" : "", result.vertexOffsetSgpr, result.instanceOffsetSgpr, result.vertexOffsetShared ? 1 : 0, result.instanceOffsetShared ? 1 : 0, result.vertexOffsetConflict ? 1 : 0, result.instanceOffsetConflict ? 1 : 0, indirect.indxOffset, static_cast<unsigned long long>(result.userDataRegisterReads), static_cast<unsigned>(frontProgram.firstUserSgpr), static_cast<unsigned>(frontProgram.hiddenUserWords), decision.c_str());
+        std::fprintf(stderr, "[draw] indirect program 0x%llx opcode 0x%x args 0x%llx stride %u count %u%s locs base=%s inst=%s idx=%s%s analyzer v=%d i=%d shared=%d/%d conflict=%d/%d indx=%u user reads 0x%llx (first %u, hidden %u) -> %s\n", static_cast<unsigned long long>(frontProgram.binary.codeAddress), indirect.opcode, static_cast<unsigned long long>(indirect.arguments), indirect.stride, indirect.count, indirect.countIndirect ? " (indirect)" : "", location(indirect.baseVertexLocation, indirect.baseVertexSgpr).c_str(), location(indirect.startInstanceLocation, indirect.startInstanceSgpr).c_str(), location(indirect.drawIndexLocation, indirect.drawIndexSgpr).c_str(), indirect.drawIndexEnabled ? " (enabled)" : "", result.vertexOffsetSgpr, result.instanceOffsetSgpr, result.vertexOffsetShared ? 1 : 0, result.instanceOffsetShared ? 1 : 0, result.vertexOffsetConflict ? 1 : 0, result.instanceOffsetConflict ? 1 : 0, indirect.indxOffset, static_cast<unsigned long long>(result.userDataRegisterReads), static_cast<unsigned>(frontProgram.firstUserSgpr), static_cast<unsigned>(frontProgram.hiddenUserWords), decision.c_str());
     }
+    constexpr std::array<const char*, static_cast<std::size_t>(Path::Count)> counters{
+        "fix_indirect_cpu_draw_path_gpu", "fix_indirect_cpu_draw_path_not_folded", "fix_indirect_cpu_draw_path_fetch_unknown",
+        "fix_indirect_cpu_draw_path_non_vertex", "fix_indirect_cpu_draw_path_index_offset", "fix_indirect_cpu_draw_path_draw_index",
+        "fix_indirect_cpu_draw_path_vertex_range", "fix_indirect_cpu_draw_path_feature_gap", "fix_indirect_cpu_draw_path_pending_image",
+        "fix_indirect_cpu_draw_path_pending_label_or_copy", "fix_indirect_cpu_draw_path_not_imported", "fix_indirect_cpu_draw_path_disabled",
+        "fix_indirect_cpu_draw_path_index_range", "fix_indirect_cpu_draw_path_index_limit_unknown"
+    };
+    if (indirectCpu) ArchB::Recorder::Count(counters[static_cast<std::size_t>(*indirectCpu)]);
     if (profile) CountIndirectFold(indirectCpu, indirect.vertexFromBase || indirect.instanceFromBase, notFoldedMismatch, notFoldedShared);
     return indirectCpu;
 }
