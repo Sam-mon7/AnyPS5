@@ -778,7 +778,9 @@ function Invoke-ArchBGate {
                     Write-GateJson (Join-Path $alternatingLeg.directory 'recorder-config.json') @{
                         requiredCounters = $candidateConfig.requiredCounters; switches = $plan.candidate; settle_seconds = $SettleSeconds
                         allocatorLedgerBytes = $candidateConfig.allocatorLedgerBytes }
-                    $alternatingLeg.attribution = Invoke-GatePython 'archb_gate_stats.py' @('diagnostic', $alternatingLeg.directory)
+                    $attribution = Invoke-GatePython 'archb_gate_stats.py' @('diagnostic', $alternatingLeg.directory)
+                    if ($alternatingLeg -is [System.Collections.IDictionary]) { $alternatingLeg.attribution = $attribution }
+                    else { $alternatingLeg | Add-Member -NotePropertyName attribution -NotePropertyValue $attribution -Force }
                     if ($alternatingLeg.attribution.source -ne 'recorder') { Stop-GateFailure 24 'Measured boot has no recorder attribution' }
                     $recorderDiagnostics[$candidateConfig.name] = $alternatingLeg
                 }
