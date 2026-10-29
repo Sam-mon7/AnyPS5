@@ -271,7 +271,7 @@ public:
         const bool record = ArchB::Recorder::Enabled();
         if (frame != nullptr || trace != nullptr || record) start = Clock::now();
         previous = start;
-        if (record) recorder.Begin(scope, start, phase);
+        if (record) AgcDriverRecorderScopeBegin_nid_no_patch(&recorder, scope, start.time_since_epoch().count(), static_cast<std::uint8_t>(phase));
     }
 
     PerformanceTimer(const PerformanceTimer&) = delete;
@@ -285,7 +285,7 @@ public:
         zone.End();
         if (frame == nullptr && trace == nullptr && !recorder.Active()) return;
         const auto end = Clock::now();
-        recorder.End(end);
+        if (recorder.Active()) AgcDriverRecorderScopeEnd_nid_no_patch(&recorder, end.time_since_epoch().count());
         if (trace != nullptr) trace->Add(scope, nullptr, start, end);
         trace = nullptr;
         if (frame == nullptr) return;
@@ -306,7 +306,7 @@ public:
     void Mark(const char* stage, std::uint64_t bytes = 0) {
         if (frame == nullptr && trace == nullptr && !recorder.Active()) return;
         const auto now = Clock::now();
-        recorder.Mark(stage, now);
+        if (recorder.Active()) AgcDriverRecorderScopeMark_nid_no_patch(&recorder, stage, now.time_since_epoch().count());
         if (trace != nullptr) trace->Add(scope, stage, previous, now);
         if (frame != nullptr) {
             if (tail == nullptr) tail = frame->Get(scope, "tail");

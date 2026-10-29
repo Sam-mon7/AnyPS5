@@ -388,3 +388,15 @@ std::string Recorder::Snapshot::Line() const {
 }
 
 }
+
+extern "C" void AgcDriverRecorderScopeBegin_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* name, std::int64_t now, std::uint8_t phase) {
+    scope->Begin(name, AgcDriver::ArchB::Recorder::Clock::time_point(AgcDriver::ArchB::Recorder::Clock::duration(now)), static_cast<AgcDriver::ArchB::Recorder::Phase>(phase));
+}
+
+extern "C" void AgcDriverRecorderScopeMark_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* stage, std::int64_t now) {
+    scope->Mark(stage, AgcDriver::ArchB::Recorder::Clock::time_point(AgcDriver::ArchB::Recorder::Clock::duration(now)));
+}
+
+extern "C" void AgcDriverRecorderScopeEnd_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, std::int64_t now) {
+    scope->End(AgcDriver::ArchB::Recorder::Clock::time_point(AgcDriver::ArchB::Recorder::Clock::duration(now)));
+}
