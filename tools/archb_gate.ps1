@@ -79,7 +79,10 @@ function Restore-GateRuntime([string]$Manifest) {
 function Start-GateWatchdog([string]$Manifest, [int]$ProcessId, [long]$StartTicks) {
     $arguments = @('-NoProfile', '-File', "`"$script:GateScript`"", '-WatchdogManifest', "`"$Manifest`"",
                    '-RunnerPid', $ProcessId, '-RunnerStartTicks', $StartTicks)
-    return Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    $commandLine = "`"$((Get-Command pwsh).Source)`" -WindowStyle Hidden " + ($arguments -join ' ')
+    $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine }
+    if ($created.ReturnValue -ne 0) { Stop-GateFailure 31 "Watchdog could not start outside the runner's process tree ($($created.ReturnValue))" }
+    return Get-Process -Id $created.ProcessId
 }
 
 function Invoke-GateWatchdog([string]$Manifest, [int]$ProcessId, [long]$StartTicks) {
