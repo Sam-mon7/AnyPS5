@@ -60,19 +60,20 @@ if ($Case -eq 'AlternatingBlocks' -or $Case -eq 'Bisection') {
                 param($Tool, $Arguments, $AllowedCodes)
                 if ($Tool -eq 'archb_gate_nav.py') { $script:screenshots += $Arguments[-1]; return @{} }
                 $blocks = Get-Content -LiteralPath (Join-Path $testRoot 'blocks.json') -Raw | ConvertFrom-Json -AsHashtable
-                return @{ verdict = $(if ($blocks.Count -eq 24) { 'continue' } else { 'pass' }); code = 0; stage = $blocks.Count / 2 }
+                return @{ verdict = $(if ($blocks.Count -lt 96) { 'continue' } else { 'inconclusive' });
+                          code = $(if ($blocks.Count -lt 96) { 0 } else { 3 }); stage = $blocks.Count / 2 }
             }
             $low = $null
             $decision = Invoke-GateBlocks @{} $testRoot @{ control = @{ GATE_NOOP = '0'; GATE_DELAY_US = '0' }
                 candidate = @{ GATE_NOOP = '1'; GATE_DELAY_US = '7000' } } ([ref]$low)
-            Assert-True ($decision.stage -eq 24) 'Alternation did not extend to 24 pairs'
+            Assert-True ($decision.stage -eq 48 -and $decision.code -eq 3 -and $decision.verdict -eq 'inconclusive') 'Alternation did not end inconclusive at 48 pairs'
             $blocks = Get-Content -LiteralPath (Join-Path $testRoot 'blocks.json') -Raw | ConvertFrom-Json -AsHashtable
-            Assert-True ($blocks.Count -eq 48) 'Wrong block count'
+            Assert-True ($blocks.Count -eq 96) 'Wrong block count'
             for ($i = 0; $i -lt $blocks.Count; $i += 2) {
                 Assert-True ($blocks[$i].role -ne $blocks[$i + 1].role) 'Pair lacks a control or candidate'
                 Assert-True ($blocks[$i].end_seq -eq $blocks[$i + 1].start_seq) 'Pair boundary sequence differs'
             }
-            Assert-True ($script:screenshots.Count -eq 4) 'Missing end-of-stage role screenshots'
+            Assert-True ($script:screenshots.Count -eq 6) 'Missing end-of-stage role screenshots'
         } else {
             $script:attempts = @()
             function Invoke-GateLeg {

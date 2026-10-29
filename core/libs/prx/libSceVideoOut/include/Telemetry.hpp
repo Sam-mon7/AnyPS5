@@ -13,6 +13,10 @@
 
 #include "prx/libScePad/include/PadState.hpp"
 
+namespace AgcDriver {
+struct PresentCounters;
+}
+
 namespace VideoOutTelemetry {
 
 class BoundedLineQueue {
@@ -42,6 +46,7 @@ public:
     bool EmitPad(std::uint64_t frame, const PadInputState& state);
     void EmitPresent(std::uint64_t frame, double fps);
     void EmitPresent(std::uint64_t frame, double fps, std::int64_t timeNanos);
+    void EmitPresent(std::uint64_t frame, double fps, std::int64_t timeNanos, const AgcDriver::PresentCounters& counters);
     std::uint64_t Dropped() const;
 
 private:

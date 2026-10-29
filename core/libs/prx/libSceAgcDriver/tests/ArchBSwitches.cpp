@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceVideoOut/include/Telemetry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -17,6 +18,10 @@
 #else
 #include <unistd.h>
 #endif
+
+extern "C" void AgcDriverPresentCounters_nid_postfix(AgcDriver::PresentCounters* counters) {
+    *counters = {};
+}
 
 namespace {
 

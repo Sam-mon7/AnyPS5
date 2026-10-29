@@ -9,7 +9,8 @@ from pathlib import Path
 from archb_gate_config import GateError, read_json, write_json
 
 
-FALSE_PASS_NOTE = "The fixed two-stage rule inflates the false-pass rate slightly above 5%; this is accepted."
+FALSE_PASS_NOTE = "The fixed sequential stages inflate the false-pass rate above 5%; this is accepted."
+PRESENT_FIELDS = ("n", "t_ns", "attempts", "presented", "acquire_dropped", "out_of_date")
 T_95 = (
     6.313752, 2.919986, 2.353363, 2.131847, 2.015048, 1.943180, 1.894579, 1.859548, 1.833113, 1.812461,
     1.795885, 1.782288, 1.770933, 1.761310, 1.753050, 1.745884, 1.739607, 1.734064, 1.729133, 1.724718,
@@ -36,6 +37,25 @@ def percentile(values, fraction):
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
+def present_event(event):
+    values = tuple(event.get(name) for name in PRESENT_FIELDS)
+    if any(type(value) is not int or value < 0 for value in values):
+        raise GateError(24, "present needs nonnegative integer n, t_ns and driver counters")
+    n, timestamp, attempts, presented, acquire_dropped, out_of_date = values
+    if presented + acquire_dropped + out_of_date > attempts:
+        raise GateError(24, "inconsistent presentation counters")
+    return values
+
+
+def validate_events(events):
+    for previous, current in zip(events, events[1:]):
+        if current[0] != previous[0] + 1 or current[1] <= previous[1]:
+            raise GateError(24, "present gap, duplicate or non-monotonic timestamp")
+        delta = [new - old for old, new in zip(previous[2:], current[2:])]
+        if delta[0] < 1 or any(value < 0 for value in delta) or sum(delta[1:]) > delta[0]:
+            raise GateError(24, "non-monotonic or inconsistent presentation counters")
+
+
 def leg_summary(path, start_ns, end_ns, hold_seconds):
     if hold_seconds <= 0 or end_ns <= start_ns:
         raise GateError(24, "invalid hold window")
@@ -50,27 +70,35 @@ def leg_summary(path, start_ns, end_ns, hold_seconds):
                 raise GateError(24, "telemetry event must be an object")
             if event.get("ev") != "present":
                 continue
-            n, timestamp = event.get("n"), event.get("t_ns")
-            if type(n) is not int or type(timestamp) is not int:
-                raise GateError(24, "present needs integer n and t_ns")
-            if start_ns <= timestamp <= end_ns:
-                events.append((n, timestamp))
+            values = present_event(event)
+            if start_ns <= values[1] <= end_ns:
+                events.append(values)
     return summarize_events(events, start_ns, end_ns, hold_seconds)
 
 
 def summarize_events(events, start_ns, end_ns, hold_seconds):
     if len(events) < 2:
         raise GateError(24, "insufficient full-rate telemetry")
+    validate_events(events)
+    attempts, presented, acquire_dropped, out_of_date = [last - first for first, last in zip(events[0][2:], events[-1][2:])]
+    if presented < 2:
+        raise GateError(24, "fewer than two presented frames")
     intervals = []
-    for (n0, t0), (n1, t1) in zip(events, events[1:]):
-        if n1 != n0 + 1 or t1 <= t0:
-            raise GateError(24, "present gap, duplicate or non-monotonic timestamp")
-        intervals.append((t1 - t0) / 1e6)
+    last_present_ns = events[0][1]
+    for previous, current in zip(events, events[1:]):
+        if current[3] > previous[3]:
+            intervals.append((current[1] - last_present_ns) / 1e6)
+            last_present_ns = current[1]
     span = (events[-1][1] - events[0][1]) / 1e9
     if span < 0.9 * hold_seconds:
         raise GateError(24, f"only {span:.3f}s of a {hold_seconds}s hold")
-    ms = (events[-1][1] - events[0][1]) / (events[-1][0] - events[0][0]) / 1e6
-    return {"ms": ms, "fps": 1000 / ms, "p50": percentile(intervals, 0.5),
+    ms = (events[-1][1] - events[0][1]) / presented / 1e6
+    dropped = attempts - presented
+    return {"code": 27 if dropped * 100 > attempts else 0,
+            "verdict": "present_drops" if dropped * 100 > attempts else "valid",
+            "attempts": attempts, "presented": presented, "dropped": dropped, "drop_rate": dropped / attempts,
+            "acquire_dropped": acquire_dropped, "out_of_date": out_of_date,
+            "ms": ms, "fps": 1000 / ms, "p50": percentile(intervals, 0.5),
             "p95": percentile(intervals, 0.95), "p99": percentile(intervals, 0.99),
             "longest_interval_ms": max(intervals), "frames": len(events), "span_s": span,
             "start_ns": start_ns, "end_ns": end_ns}
@@ -86,36 +114,72 @@ def pair_deltas(pairs):
     return [math.log(positive(pair["candidate"]["ms"]) / positive(pair["control"]["ms"])) for pair in pairs]
 
 
+def measurement_report(configurations, baseline=None):
+    drops = {}
+    invalid = False
+    for role, legs in configurations.items():
+        fields = ("attempts", "presented", "acquire_dropped", "out_of_date")
+        for leg in legs:
+            if any(type(leg.get(name)) is not int or leg[name] < 0 for name in fields):
+                raise GateError(24, "leg needs nonnegative integer presentation counters")
+            if leg["presented"] < 2 or sum(leg[name] for name in fields[1:]) > leg["attempts"]:
+                raise GateError(24, "insufficient or inconsistent presented frames")
+        totals = {name: sum(leg[name] for leg in legs) for name in fields}
+        invalid = invalid or any((leg["attempts"] - leg["presented"]) * 100 > leg["attempts"] for leg in legs)
+        totals["dropped"] = totals["attempts"] - totals["presented"]
+        totals["drop_rate"] = totals["dropped"] / totals["attempts"] if totals["attempts"] else 0
+        drops[role] = totals
+    report = {"drops": drops, "candidate_mean_ms": statistics.mean(positive(leg["ms"]) for leg in configurations["candidate"])}
+    if baseline is not None:
+        report.update(baseline_mean_ms=positive(baseline["mean_ms"]))
+        report["cumulative_speedup"] = report["baseline_mean_ms"] / report["candidate_mean_ms"]
+        report["cumulative_change"] = report["candidate_mean_ms"] / report["baseline_mean_ms"] - 1
+    if invalid:
+        report.update(code=27, verdict="present_drops")
+    return report
+
+
+def pair_report(pairs, baseline=None):
+    return measurement_report({role: [pair[role] for pair in pairs] for role in ("control", "candidate")}, baseline)
+
+
 def bootstrap(pairs, alternating=False):
     if len(pairs) != (24 if alternating else 6):
         raise GateError(24, "Bootstrap requires 24 alternating or six boot pairs")
     deltas = pair_deltas(pairs)
     noise = statistics.stdev(deltas)
-    margin = max(0.02, 1.5 * noise)
-    return {"code": 40 if noise > 0.033 else 0, "verdict": "noise" if noise > 0.033 else "pass",
-            "d_i": deltas, "s_AA": noise, "alternating_m" if alternating else "m": margin, "stage": len(pairs)}
+    noisy = t_critical(47) * noise / math.sqrt(48) > 0.01
+    mean_ms = statistics.mean(positive(leg["ms"]) for pair in pairs for leg in pair.values())
+    result = {"code": 40 if noisy else 0, "verdict": "noise" if noisy else "pass",
+              "d_i": deltas, "s_AA": noise, "m": 0.02, "stage": len(pairs), "mean_ms": mean_ms,
+              **pair_report(pairs, {"mean_ms": mean_ms})}
+    if alternating:
+        result["alternating_m"] = 0.02
+    return result
 
 
-def sequential(pairs, margin, alternating=False):
-    stages = (12, 24) if alternating else (4, 8)
-    if len(pairs) not in stages or not math.isfinite(margin) or margin < 0.02:
-        raise GateError(24, f"Child requires {stages} pairs and a frozen margin >= 0.02")
+def sequential(pairs, margin=0.02, alternating=False):
+    stages = (12, 24, 48) if alternating else (4, 8)
+    if len(pairs) not in stages:
+        raise GateError(24, f"Child requires {stages} pairs")
+    margin = 0.02
     deltas = pair_deltas(pairs)
     mean = statistics.mean(deltas)
     critical = t_critical(len(pairs) - 1) if alternating else {4: 2.353, 8: 1.895}[len(pairs)]
     radius = critical * statistics.stdev(deltas) / math.sqrt(len(pairs))
     lower, upper = mean - radius, mean + radius
     threshold = math.log1p(margin)
-    decision = "pass" if upper <= threshold else "fail" if lower > threshold or len(pairs) == stages[-1] else "continue"
-    return {"code": 0 if decision in ("pass", "continue") else 1, "verdict": decision,
+    decision = "pass" if upper <= threshold else "fail" if lower > threshold else "inconclusive" if len(pairs) == stages[-1] else "continue"
+    return {"code": {"pass": 0, "continue": 0, "fail": 1, "inconclusive": 3}[decision], "verdict": decision,
             "d_i": deltas, "LB": lower, "UB": upper, "threshold": threshold, "m": margin,
             "stage": len(pairs), "speedup": math.exp(-mean),
-            "speedup_90_interval": [math.exp(-upper), math.exp(-lower)], "sequential_rule": FALSE_PASS_NOTE}
+            "speedup_90_interval": [math.exp(-upper), math.exp(-lower)], "sequential_rule": FALSE_PASS_NOTE,
+            **pair_report(pairs)}
 
 
 def alternating_blocks(telemetry, text, blocks, settle_seconds):
-    if not math.isfinite(settle_seconds) or settle_seconds < 0 or len(blocks) not in (24, 48):
-        raise GateError(24, "alternation needs 24 or 48 blocks and nonnegative settling")
+    if not math.isfinite(settle_seconds) or settle_seconds < 0 or len(blocks) not in (24, 48, 96):
+        raise GateError(24, "alternation needs 24, 48 or 96 blocks and nonnegative settling")
     toggles = {}
     last_sequence, last_timestamp = 0, -1
     for line in text.splitlines():
@@ -136,10 +200,7 @@ def alternating_blocks(telemetry, text, blocks, settle_seconds):
         if not isinstance(event, dict):
             raise GateError(24, "telemetry event must be an object")
         if event.get("ev") == "present":
-            n, timestamp = event.get("n"), event.get("t_ns")
-            if type(n) is not int or type(timestamp) is not int:
-                raise GateError(24, "present needs integer n and t_ns")
-            events.append((n, timestamp))
+            events.append(present_event(event))
     summaries = []
     previous_end = None
     for block in blocks:
@@ -155,13 +216,11 @@ def alternating_blocks(telemetry, text, blocks, settle_seconds):
         duration = (end["t_ns"] - settled) / 1e9
         if duration <= 0:
             raise GateError(24, "settling consumes block")
-        selected = [(n, t) for n, t in events if settled <= t < end["t_ns"]]
+        selected = [event for event in events if settled <= event[1] < end["t_ns"]]
         summary = summarize_events(selected, settled, end["t_ns"], duration)
         summaries.append({**block, **summary, "toggle_ns": start["t_ns"]})
-    window = [(n, t) for n, t in events if summaries[0]["toggle_ns"] <= t < previous_end]
-    for (n0, t0), (n1, t1) in zip(window, window[1:]):
-        if n1 != n0 + 1 or t1 <= t0:
-            raise GateError(24, "present gap, duplicate or non-monotonic timestamp")
+    window = [event for event in events if summaries[0]["toggle_ns"] <= event[1] < previous_end]
+    validate_events(window)
     pairs = []
     for index in range(0, len(summaries), 2):
         pair = {block["role"]: block for block in summaries[index:index + 2]}
@@ -172,10 +231,14 @@ def alternating_blocks(telemetry, text, blocks, settle_seconds):
 
 
 def alternating_verdict(directory, settle_seconds, baseline=None, calibration=False):
+    if not calibration and baseline is None:
+        raise GateError(24, "alternating gate requires a frozen baseline")
     directory = Path(directory)
     pairs = alternating_blocks(directory / "videoout.jsonl", (directory / "stderr.log").read_text(encoding="utf-8", errors="replace"),
                                read_json(directory / "blocks.json"), settle_seconds)
-    decision = bootstrap(pairs, True) if calibration else sequential(pairs, baseline["alternating_m"], True)
+    decision = bootstrap(pairs, True) if calibration else sequential(pairs, alternating=True)
+    if not calibration:
+        decision.update(pair_report(pairs, baseline))
     decision.update(tail_check(pairs))
     if decision["code"] == 0 and decision["verdict"] != "continue" and decision["tail_code"]:
         decision.update(code=2, verdict="fail")
@@ -188,11 +251,12 @@ def tail_check(pairs):
     return {"tail_ratios": ratios, "tail_median": median, "tail_code": 0 if median <= 1.05 else 2}
 
 
-def final_verdict(legs):
+def final_verdict(legs, baseline=None):
     if len(legs) != 3:
         raise GateError(24, "Final requires three candidate legs")
-    passed = all(positive(leg["ms"]) <= 66.7 for leg in legs)
-    return {"code": 0 if passed else 1, "verdict": "pass" if passed else "fail", "legs": legs, "stage": 3}
+    passed = all(positive(leg["ms"]) <= 1000 / 15.0 for leg in legs)
+    return {"code": 0 if passed else 1, "verdict": "pass" if passed else "fail", "legs": legs, "stage": 3, "m": 0.02,
+            **measurement_report({"candidate": legs}, baseline)}
 
 
 def diagnostics(directory):
@@ -300,10 +364,12 @@ def main():
             result = alternating_verdict(args.directory, args.settle_seconds,
                                          read_json(args.baseline) if args.baseline else None, args.bootstrap)
         elif args.mode == "Final":
-            result = final_verdict(read_json(args.pairs))
+            result = final_verdict(read_json(args.pairs), read_json(args.baseline))
         else:
             pairs = read_json(args.pairs)
             result = bootstrap(pairs) if args.mode == "Bootstrap" else sequential(pairs, read_json(args.baseline)["m"])
+            if args.mode != "Bootstrap":
+                result.update(pair_report(pairs, read_json(args.baseline)))
             result.update(tail_check(pairs))
             if result["code"] == 0 and result["verdict"] != "continue" and result["tail_code"]:
                 result.update(code=2, verdict="fail")
