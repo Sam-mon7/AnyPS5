@@ -157,6 +157,22 @@ int main(int argc, char** argv) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
     try {
+        if (argc == 2 && std::string(argv[1]) == "--ub-default") {
+            setEnvironment("APS5_ARCHB_GATE_RUN", nullptr);
+            for (const auto& entry : Switches::Table()) {
+                if (std::string(entry.name).starts_with("UB_")) setEnvironment(("APS5_ARCHB_" + std::string(entry.name)).c_str(), nullptr);
+            }
+            std::size_t count = 0;
+            for (const auto& entry : Switches::Table()) {
+                if (!std::string(entry.name).starts_with("UB_")) continue;
+                ++count;
+                check(!entry.defaultOn && entry.runtime && entry.prerequisites.empty() && !Switches::Enabled(entry.feature), "UB switch must default off, be runtime and have no prerequisites");
+                check(Switches::Describe().find(std::string(entry.name) + "=0(default)(rt)") != std::string::npos, "UB switch missing runtime description");
+            }
+            check(count == 5, "missing upper-bound switch");
+            std::puts("upper-bound switches default off passed");
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--toggle") {
             toggleCase(argv[2]);
             std::printf("%s passed\n", argv[2]);

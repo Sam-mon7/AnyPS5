@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -2411,13 +2412,22 @@ void GpuMutexType::acquired() {
     if (++depth == 1) {
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) proofSerial.fetch_add(1, std::memory_order_acq_rel);
+        const bool skipInvalidation = ArchB::Switches::Enabled(ArchB::Feature::UbNoLockInvalidation);
+        bool skipped = false;
+        if (!proofThread) {
+            if (skipInvalidation) skipped = true;
+            else proofSerial.fetch_add(1, std::memory_order_acq_rel);
+        }
         if (ResourceEpochProofsEnabled()) {
             static const void* resourceProofOwner = nullptr;
             const auto token = CurrentThreadToken();
-            if (resourceProofOwner != token) resourceProofSerial.fetch_add(1, std::memory_order_acq_rel);
+            if (resourceProofOwner != token) {
+                if (skipInvalidation) skipped = true;
+                else resourceProofSerial.fetch_add(1, std::memory_order_acq_rel);
+            }
             resourceProofOwner = token;
         }
+        if (skipped) ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbNoLockInvalidation);
     }
 }
 

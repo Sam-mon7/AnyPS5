@@ -14,6 +14,11 @@ enum class Feature : std::uint8_t {
     TestDependent,
     TestRuntimeDependent,
 #endif
+    UbTrustProofs,
+    UbNoLockInvalidation,
+    UbPointerFreeDrawKeys,
+    UbSkipCpuIndirect,
+    UbSkipDispatchProofWalk,
     Count
 };
 
@@ -36,6 +41,7 @@ public:
 #endif
     static std::string Describe();
     static std::span<const SwitchInfo> Table();
+    static void CountUpperBoundHit(Feature feature);
 };
 
 }

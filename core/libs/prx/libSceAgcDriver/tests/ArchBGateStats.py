@@ -2,6 +2,7 @@ import json
 import math
 from pathlib import Path
 import statistics
+import subprocess
 import sys
 import tempfile
 
@@ -319,6 +320,94 @@ def inconclusive_48(directory):
     decision = alternating_verdict(directory, 3, {"mean_ms": 400})
     assert decision["stage"] == 48 and decision["baseline_mean_ms"] == 400
     assert decision["candidate_mean_ms"] == 200 and decision["cumulative_speedup"] == 2
+def ub_experiment_report(directory):
+    from archb_gate_stats import ub_experiment, ub_report
+    path, text, blocks, events = alternating_fixture(directory)
+    text = text.replace("GATE_NOOP", "UB_TRUST_PROOFS")
+    for block in blocks:
+        block["values"]["UB_TRUST_PROOFS"] = block["values"].pop("GATE_NOOP")
+    (Path(directory) / "blocks.json").write_text(json.dumps(blocks), encoding="utf-8")
+    stderr = Path(directory) / "stderr.log"
+    stderr.write_text(text + "\n[archb] ub_trust_proofs_hits=1\n[archb] ub_trust_proofs_hits=1234 t_ns=361000000000\n", encoding="utf-8")
+    records = []
+    for index, block in enumerate(blocks):
+        start = 1 + index * 15 + 4
+        cost = 30 if block["role"] == "control" else 10
+        record = {"interval_start_s": start - 1, "interval_end_s": start + 4,
+                  "archb": {"start_ns": start * 1000000000, "end_ns": (start + 5) * 1000000000,
+                            "toggle_seq": block["start_seq"], "recorder_enabled": True,
+                            "frames": 50, "presented": 25, "phases_ms": {"queue0": {"proof": cost}}}}
+        records.append(record)
+        records.append({**record, "recorder_toggled": True})
+    records.append({"interval_start_s": 0, "interval_end_s": 20,
+                    "archb": {"frames": 1, "phases_ms": {"queue0": {"proof": 999999}}}})
+    (Path(directory) / "aps5-summary.jsonl").write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
+    result = ub_experiment(directory, "UB_TRUST_PROOFS", ["UB_TRUST_PROOFS"])
+    assert result["frame_time_ratio"] == 2
+    assert result["frame_time_ratio_90_interval"] == [2, 2]
+    assert math.isclose(result["presented_fps"]["control"], 10) and math.isclose(result["presented_fps"]["candidate"], 5)
+    assert result["hits"] == {"ub_trust_proofs_hits": 1234}
+    assert "verdict" not in result and "code" not in result
+    assert result["attribution"]["control"]["phases_ms_per_frame"]["queue0"]["proof"] == 1.2
+    assert result["attribution"]["candidate"]["phases_ms_per_frame"]["queue0"]["proof"] == 0.4
+    report = ub_report([result, {"name": "ALL_UB", "status": "experiment crashed", "stage": "blocks"}])
+    assert "2.0000 [2.0000, 2.0000]" in report["markdown"]
+    assert "10.000 | 5.000" in report["markdown"] and "ub_trust_proofs_hits=1234" in report["markdown"]
+    assert "experiment crashed / blocks" in report["markdown"] and "pass" not in report["markdown"]
+    for index, block in enumerate(blocks):
+        if block["role"] != "candidate":
+            continue
+        start = 1000000000 + index * 15000000000
+        shift = 0
+        for event in events:
+            if start + 3000000000 <= event["t_ns"] < start + 15000000000:
+                event["t_ns"] += shift * (100000 if (index // 2) % 2 else -100000)
+                shift += 1
+    path.write_text("\n".join(map(json.dumps, events)) + "\n", encoding="utf-8")
+    varied = ub_experiment(directory, "UB_TRUST_PROOFS", ["UB_TRUST_PROOFS"])
+    deltas = varied["d_i"]
+    radius = t_critical(11) * statistics.stdev(deltas) / math.sqrt(12)
+    assert math.isclose(varied["frame_time_ratio_90_interval"][0], math.exp(statistics.mean(deltas) - radius))
+    assert math.isclose(varied["frame_time_ratio_90_interval"][1], math.exp(statistics.mean(deltas) + radius))
+    assert varied["frame_time_ratio_90_interval"][0] < varied["frame_time_ratio"] < varied["frame_time_ratio_90_interval"][1]
+    fails(lambda: ub_experiment(directory, "bad", ["UB_UNKNOWN"]), 21)
+    tools = Path(__file__).resolve().parents[5] / "tools"
+    output = Path(directory) / "report.json"
+    completed = subprocess.run([sys.executable, str(tools / "archb_gate_stats.py"), "ub-experiment", directory,
+                                "--name", "UB_TRUST_PROOFS", "--switch", "UB_TRUST_PROOFS", "--output", str(output)],
+                               capture_output=True, text=True, timeout=5)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(output.read_text())["status"] == "completed"
+    if sys.platform == "win32":
+        script = r"""
+. $args[0] -Control unused -Output unused
+$Output = $args[1]
+$Experiments = @('UB_TRUST_PROOFS', 'UB_SKIP_CPU_INDIRECT')
+$script:AllLegs = [Collections.Generic.List[object]]::new()
+$script:seen = @()
+function Invoke-GateLeg($Configuration, $Label, $Kind, $Seconds, $Measured, $Alternation) {
+    if ($Measured -or $Kind -ne 'measured' -or $Seconds -ne 0) { throw 'Invalid experiment leg' }
+    if (@($Alternation.control.Values | Where-Object { $_ -ne '0' }).Count) { throw 'Control has UB enabled' }
+    if (@($Configuration.env.Keys | Where-Object { $_ -like 'APS5_ARCHB_UB_*' -and $Configuration.env[$_] -ne '0' }).Count) { throw 'Navigation has UB enabled' }
+    $script:seen += $Alternation.experiment
+    if ($Alternation.experiment -eq 'UB_SKIP_CPU_INDIRECT') {
+        $script:AllLegs.Add(@{ directory = $Output; stage = 'blocks' })
+        throw 'synthetic device loss'
+    }
+    if ($Alternation.experiment -eq 'ALL_UB' -and @($Alternation.candidate.Values | Where-Object { $_ -eq '1' }).Count -ne 5) { throw 'Missing all-on switch' }
+    return @{ alternating = @{ name = $Alternation.experiment; status = 'completed'; stage = 'measurement'; frame_time_ratio = 0.5
+        frame_time_ratio_90_interval = @(0.4, 0.6); presented_fps = @{control = 7; candidate = 14}; hits = @{ ub_trust_proofs_hits = 77 } } }
+}
+$config = @{ name = 'base'; env = @{}; expectSwitches = @{}; requiredCounters = @('unused') }
+$result = @(Invoke-GateUpperBoundExperiments $config)
+if (($script:seen -join ',') -ne 'UB_TRUST_PROOFS,UB_SKIP_CPU_INDIRECT,ALL_UB') { throw 'Wrong experiment boots' }
+if ($result[0].status -ne 'completed' -or $result[2].status -ne 'completed') { throw 'Successful experiments were not reported' }
+if ($result.Count -ne 3 -or $result[1].status -ne 'experiment crashed' -or $result[1].stage -ne 'blocks') { throw 'Crash not recorded' }
+if (-not (Test-Path (Join-Path $Output 'ub-report.json'))) { throw 'Missing report' }
+"""
+        command = "& {" + script + "} '" + str(tools / "archb_gate.ps1").replace("'", "''") + "' '" + directory.replace("'", "''") + "'"
+        completed = subprocess.run(["pwsh", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=10)
+        assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 if __name__ == "__main__":
