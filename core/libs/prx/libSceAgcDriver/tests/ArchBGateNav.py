@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -76,6 +77,24 @@ def seq_monotonic(directory):
         sequences.append(sequence)
         time.sleep(0.001)
     assert sequences == sorted(set(sequences))
+
+
+def continue_steady_scene(directory):
+    scene = [(int(index * 1e9 / 8), index) for index in range(8 * 40)]
+    assert nav.window_rates(scene) == [8.0, 8.0, 8.0] and nav.steady(nav.window_rates(scene), 10)
+    menu = [(int(index * 1e9 / 30), index) for index in range(30 * 40)]
+    assert not nav.steady(nav.window_rates(menu), 10)
+    assert nav.window_rates(scene[:50]) == []
+    wobbly = [(int(second * 1e9), round(second * (8 if second < 20 else 4))) for second in range(40)]
+    assert not nav.steady(nav.window_rates(wobbly), 10)
+
+
+def continue_reads_presented(directory):
+    path = directory / "videoout.jsonl"
+    lines = [json.dumps({"ev": "present", "t_ns": index * 100_000_000, "n": index * 2, "presented": index}) for index in range(1, 6)]
+    path.write_text("".join(line + "\n" for line in lines + ['{"ev":"contract"}', "not json"]), encoding="utf-8")
+    assert nav.presented_events(path) == [(index * 100_000_000, index) for index in range(1, 6)]
+    assert nav.presented_events(directory / "missing.jsonl") == []
 
 
 if __name__ == "__main__":

@@ -272,6 +272,84 @@ def contact_sheet(directory):
     return {"screenshots": len(files)}
 
 
+def presented_events(path):
+    events = []
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return events
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("ev") == "present" and type(event.get("t_ns")) is int and type(event.get("presented")) is int:
+            events.append((event["t_ns"], event["presented"]))
+    return events
+
+
+def window_rates(events, seconds=10):
+    if len(events) < 2:
+        return []
+    width = seconds * 1_000_000_000
+    rates = []
+    end = events[-1][0]
+    while len(rates) < 3:
+        start = end - width
+        inside = [event for event in events if start <= event[0] <= end]
+        if len(inside) < 2 or events[0][0] > start:
+            break
+        rates.append((inside[-1][1] - inside[0][1]) * 1e9 / (inside[-1][0] - inside[0][0]))
+        end = start
+    return list(reversed(rates))
+
+
+def steady(rates, scene_max_fps):
+    if len(rates) < 3 or any(rate < 0.5 or rate >= scene_max_fps for rate in rates):
+        return False
+    return all(abs(after - before) <= 0.2 * max(before, after) for before, after in zip(rates, rates[1:]))
+
+
+def navigate_continue(pid, pad, output, timeout=1500, capture="driver", control=None, shots=None, scene_max_fps=10.0):
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    telemetry = output / "videoout.jsonl"
+    started = time.monotonic()
+    deadline = started + timeout
+    first_frame = None
+    opening = []
+    presses = 0
+    last_press = None
+    with (output / "nav.log").open("a", encoding="utf-8") as log:
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            events = presented_events(telemetry)
+            if first_frame is None and events:
+                first_frame = now
+                opening = [first_frame + 20, first_frame + 32]
+            rates = window_rates(events)
+            log.write(f"{now - started:.3f} continue presented={events[-1][1] if events else 0} rates={[round(rate, 2) for rate in rates]}\n")
+            log.flush()
+            if opening and now >= opening[0]:
+                opening.pop(0)
+                press(pad, "cross", 1500, output)
+                presses, last_press = presses + 1, now
+            elif not opening and first_frame is not None:
+                if steady(rates, scene_max_fps):
+                    press(pad, "release", 1, output)
+                    image = (Capture(pid) if capture == "window" else DriverCapture(control or output / "control.txt", shots or output / "shots")).image()
+                    if image is not None:
+                        image.save(output / "target.png")
+                    result = {"state": "continue_scene", "rates": rates, "presses": presses, "T_nav": time.monotonic() - started}
+                    write_json(output / "navigation.json", result)
+                    return result
+                if rates and rates[-1] >= scene_max_fps and presses < 8 and now - last_press > 60:
+                    press(pad, "cross", 1500, output)
+                    presses, last_press = presses + 1, now
+            time.sleep(2)
+    raise GateError(13, f"global navigation timeout ({timeout}s)")
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -280,6 +358,8 @@ def main():
     nav.add_argument("--refs", required=True)
     nav.add_argument("--pad", required=True)
     nav.add_argument("--output", required=True)
+    nav.add_argument("--route", choices=("continue", "creator"), default="continue")
+    nav.add_argument("--scene-max-fps", type=float, default=10.0)
     screenshot = sub.add_parser("screenshot")
     screenshot.add_argument("--pid", type=int, required=True)
     screenshot.add_argument("--output", required=True)
@@ -291,7 +371,10 @@ def main():
     contact.add_argument("directory")
     args = parser.parse_args()
     try:
-        if args.command == "navigate":
+        if args.command == "navigate" and args.route == "continue":
+            result = navigate_continue(args.pid, args.pad, args.output, capture=args.capture, control=args.control, shots=args.shots,
+                                       scene_max_fps=args.scene_max_fps)
+        elif args.command == "navigate":
             result = navigate(args.pid, args.refs, args.pad, args.output, capture=args.capture, control=args.control, shots=args.shots)
         elif args.command == "screenshot":
             directory = Path(args.output).parent
