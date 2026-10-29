@@ -7,6 +7,7 @@
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include <algorithm>
 #include <mutex>
+#include <stdexcept>
 
 namespace AgcDriver {
 
@@ -221,6 +222,11 @@ extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::Presentation
 
 extern "C" void AgcDriverReleaseWindow_nid_postfix(void* window) {
     AgcDriver::ReleaseWindow(window);
+}
+
+extern "C" void AgcDriverPresentCounters_nid_postfix(AgcDriver::PresentCounters* counters) {
+    if (counters == nullptr) throw std::invalid_argument("null presentation counters");
+    *counters = AgcDriver::VulkanDevice::PresentationCounters().Snapshot();
 }
 
 extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {

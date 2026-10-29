@@ -284,6 +284,7 @@ private:
 
 // The [present] line's counters (see the header); mutated under State::presentMutex.
 VulkanDevice::PresentStatistics presentCounters{};
+PresentCounterBook presentationCounters;
 
 }
 
@@ -3658,6 +3659,10 @@ bool VulkanDevice::takeScreenshot(bool dumpFrame) {
     return state->nextDumpScreenshot;
 }
 
+PresentCounterBook& VulkanDevice::PresentationCounters() {
+    return presentationCounters;
+}
+
 bool VulkanDevice::AcquireImage() {
     PerformanceTimer timing("Vulkan.Acquire");
     require(state->swapchain != VK_NULL_HANDLE, "device has no swapchain");
@@ -3672,12 +3677,13 @@ bool VulkanDevice::AcquireImage() {
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
     const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 0, VK_NULL_HANDLE, state->acquireFence, &index);
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+        presentationCounters.Acquire(acquired);
         ArchB::Recorder::Count("acquire_out_of_date");
-        ArchB::Recorder::Count("acquire_drops");
         state->extent = {0, 0};
         return false;
     }
     if (acquired == VK_NOT_READY || acquired == VK_TIMEOUT) {
+        presentationCounters.Acquire(acquired);
         ++presentCounters.acquireDrops;
         ArchB::Recorder::Count("acquire_drops");
         return false;
@@ -4016,6 +4022,7 @@ void VulkanDevice::QueuePresent() {
     std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
     if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->presentQueue != VK_NULL_HANDLE ? state->presentQueue : state->queue, &present);
+    presentationCounters.Present(presented);
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
     Timeline::Emit(Timeline::Kind::Present, index, 0, 0, 0, 0, static_cast<std::uint32_t>(presented));

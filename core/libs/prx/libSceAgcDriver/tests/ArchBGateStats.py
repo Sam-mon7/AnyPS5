@@ -2,13 +2,14 @@ import json
 import math
 from pathlib import Path
 import statistics
+import subprocess
 import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[5] / "tools"))
 
 from archb_gate_config import GateError
-from archb_gate_stats import T_95, alternating_blocks, alternating_verdict, bootstrap, diagnostics, final_verdict, leg_summary, sequential, t_critical, tail_check
+from archb_gate_stats import T_95, alternating_blocks, alternating_verdict, bootstrap, diagnostics, final_verdict, leg_summary, pair_report, sequential, t_critical, tail_check
 
 
 def fails(call, code=24):
@@ -20,14 +21,23 @@ def fails(call, code=24):
         raise AssertionError("expected gate failure")
 
 
+def event(frame, timestamp, presented=None, acquire_dropped=0, out_of_date=0):
+    return {"ev": "present", "n": frame, "t_ns": timestamp, "attempts": frame,
+            "presented": frame if presented is None else presented, "acquire_dropped": acquire_dropped, "out_of_date": out_of_date}
+
+
+def write_events(path, events):
+    path.write_text("\n".join(map(json.dumps, events)) + "\n", encoding="utf-8")
+
+
 def fixture(directory, intervals, step=1):
     timestamp = 1000000000
-    events = [{"ev": "present", "n": 1, "t_ns": timestamp}]
+    events = [event(1, timestamp)]
     for index, milliseconds in enumerate(intervals, 1):
         timestamp += round(milliseconds * 1e6)
-        events.append({"ev": "present", "n": 1 + index * step, "t_ns": timestamp})
+        events.append(event(1 + index * step, timestamp))
     path = Path(directory) / "videoout.jsonl"
-    path.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+    write_events(path, events)
     return path, events
 
 
@@ -37,7 +47,8 @@ def summary(directory, intervals, step=1):
 
 
 def pairs(deltas):
-    return [{"control": {"ms": 100, "p95": 110}, "candidate": {"ms": 100 * math.exp(delta), "p95": 110}} for delta in deltas]
+    counts = {"attempts": 100, "presented": 100, "acquire_dropped": 0, "out_of_date": 0}
+    return [{"control": {**counts, "ms": 100, "p95": 110}, "candidate": {**counts, "ms": 100 * math.exp(delta), "p95": 110}} for delta in deltas]
 
 
 def frame_deltas_compute_ms(directory):
@@ -82,7 +93,7 @@ def aa_noise_sets_margin(directory):
         result = bootstrap(pairs(deltas))
         assert result["code"] == 0
         assert math.isclose(result["s_AA"], statistics.stdev(deltas), abs_tol=1e-14)
-        assert math.isclose(result["m"], max(0.02, 1.5 * statistics.stdev(deltas)))
+        assert result["m"] == 0.02
 
 
 def noise_above_limit_fails(directory):
@@ -101,10 +112,10 @@ def sequential_continue_then_fail(directory):
     first = pairs([0.06, -0.06, 0.06, -0.06])
     result = sequential(first, 0.02)
     assert result["verdict"] == "continue"
-    final = sequential(first + pairs([0.15] * 4), 0.02)
+    final = sequential(first + pairs([0.3] * 4), 0.02)
     assert final["code"] == 1 and final["verdict"] == "fail" and final["stage"] == 8
     ambiguous = sequential(pairs([0.06, -0.06] * 4), 0.02)
-    assert ambiguous["code"] == 1 and ambiguous["LB"] <= math.log1p(0.02) < ambiguous["UB"]
+    assert ambiguous["code"] == 3 and ambiguous["verdict"] == "inconclusive" and ambiguous["LB"] <= math.log1p(0.02) < ambiguous["UB"]
 
 
 def clear_regression_fails_early(directory):
@@ -126,6 +137,9 @@ def final_mode_requires_every_leg(directory):
     good = summary(directory, [60] * 100)
     slow = summary(directory, [70] * 100)
     assert final_verdict([good] * 3)["code"] == 0
+    assert final_verdict([{**good, "ms": 1000 / 15}] * 3)["code"] == 0
+    assert final_verdict([{**good, "ms": 66.68}] * 3)["code"] == 1
+    assert final_verdict([{**good, "attempts": 100, "presented": 98}] * 3)["code"] == 27
     for index in range(3):
         legs = [good] * 3
         legs[index] = slow
@@ -147,7 +161,7 @@ def alternating_fixture(directory, count=24):
         lines.append(f"[archb] toggle seq={index + 1} t_ns={start} GATE_NOOP={values['GATE_NOOP']} GATE_DELAY_US=0")
         timestamp = start
         while timestamp < start + 15000000000:
-            events.append({"ev": "present", "n": frame, "t_ns": timestamp})
+            events.append(event(frame, timestamp))
             milliseconds = 500 if timestamp < start + 3000000000 else 100 if role == "control" else 200
             timestamp += milliseconds * 1000000
             frame += 1
@@ -166,8 +180,25 @@ def alternating_block_pairing(directory):
     assert all(pair["control"]["ms"] == 100 and pair["candidate"]["ms"] == 200 for pair in result)
     assert result[1]["candidate"]["toggle_ns"] < result[1]["control"]["toggle_ns"]
     assert all(math.isclose(delta, math.log(2)) for delta in sequential(result, 0.02, True)["d_i"])
-    verdict = alternating_verdict(directory, 3, {"alternating_m": 0.02})
+    verdict = alternating_verdict(directory, 3, {"alternating_m": 0.02, "mean_ms": 150})
     assert verdict["code"] == 1 and verdict["stage"] == 12
+    spaced = [{**block, "start_seq": block["start_seq"] * 1000000, "end_seq": block["end_seq"] * 1000000,
+               "min_available_memory": (400 if index < 2 else 512) * 1024 * 1024} for index, block in enumerate(blocks)]
+    interleaved = []
+    for index, line in enumerate(text.splitlines()):
+        sequence = (index + 1) * 1000000
+        interleaved.append(line.replace(f"seq={index + 1} ", f"seq={sequence} "))
+        interleaved.append(f"[archb] toggle seq={sequence + 10} t_ns={1000000001 + index * 15000000000} SCREENSHOT=1")
+    spaced_pairs = alternating_blocks(path, "\n".join(interleaved), spaced, 3)
+    assert spaced_pairs[0]["control"]["memory_pressure"] and spaced_pairs[0]["candidate"]["memory_pressure"]
+    report = sequential(spaced_pairs, alternating=True)
+    assert report["memory_pressure_blocks"] == {"control": 1, "candidate": 1}
+    assert report["pair_min_available_memory"][0] == 400 * 1024 * 1024 and report["memory_pressure"]
+    assert len(report["verdict_notes"]) == 2 and report["code"] == verdict["code"]
+    for pair in spaced_pairs:
+        pair["candidate"]["ms"] = pair["control"]["ms"]
+        pair["candidate"]["p95"] = pair["control"]["p95"]
+    assert sequential(spaced_pairs, alternating=True)["code"] == 0
     fails(lambda: alternating_blocks(path, text.replace("GATE_NOOP=1", "GATE_NOOP=0"), blocks, 3), 21)
     fails(lambda: alternating_blocks(path, text + "\n[archb] toggle refused seq=25 unknown FOO", blocks, 3), 21)
     fails(lambda: alternating_blocks(path, text.rsplit("\n", 1)[0], blocks, 3))
@@ -198,11 +229,11 @@ def alternating_sequential_12_24(directory):
     ambiguous = pairs([0.10, -0.10] * 6)
     assert sequential(ambiguous, 0.02, True)["verdict"] == "continue"
     result = sequential(ambiguous + ambiguous, 0.02, True)
-    assert result["code"] == 1 and result["stage"] == 24 and result["LB"] < result["threshold"] < result["UB"]
+    assert result["code"] == 0 and result["verdict"] == "continue" and result["stage"] == 24 and result["LB"] < result["threshold"] < result["UB"]
     assert sequential(ambiguous + pairs([-0.05] * 12), 0.02, True)["verdict"] == "pass"
     result = bootstrap(pairs([0.01, -0.01] * 12), True)
     assert result["code"] == 0 and result["alternating_m"] == 0.02 and result["stage"] == 24
-    assert bootstrap(pairs([0.04, -0.04] * 12), True)["code"] == 40
+    assert bootstrap(pairs([0.05, -0.05] * 12), True)["code"] == 40
     fails(lambda: sequential(pairs([0] * 4), 0.02, True))
     fails(lambda: bootstrap(pairs([0] * 12), True))
 
@@ -216,6 +247,184 @@ def alternating_t_table(directory):
     assert math.isclose(result["UB"], statistics.mean(result["d_i"]) + radius)
     fails(lambda: t_critical(0))
     fails(lambda: t_critical(61))
+
+
+def presented_denominator(directory):
+    path = Path(directory) / "videoout.jsonl"
+    events = [event(index + 1, 1000000000 + round(index * 1e9 / 60), 1 + index // 2, (index + 1) // 2)
+              for index in range(121)]
+    write_events(path, events)
+    result = leg_summary(path, events[0]["t_ns"], events[-1]["t_ns"], 2)
+    assert math.isclose(result["ms"], 1000 / 30) and math.isclose(result["fps"], 30)
+    assert math.isclose(result["p95"], 1000 / 30, abs_tol=1e-6)
+    assert math.isclose(result["p50"], 1000 / 30, abs_tol=1e-6)
+    assert result["attempts"] == 120 and result["presented"] == 60 and result["code"] == 27
+    for count in (0, 1):
+        write_events(path, [event(index + 1, 1000000000 + index * 10000000, 1 + min(index, count)) for index in range(10)])
+        fails(lambda: leg_summary(path, 1000000000, 1090000000, 0.09))
+    path, events = fixture(directory, [100] * 10)
+    for field, value in (("presented", 0), ("attempts", 0), ("acquire_dropped", -1), ("out_of_date", 1.0), ("presented", 99)):
+        changed = [dict(item) for item in events]
+        changed[5][field] = value
+        write_events(path, changed)
+        fails(lambda: leg_summary(path, 1000000000, 2000000000, 1))
+    del events[5]["presented"]
+    write_events(path, events)
+    fails(lambda: leg_summary(path, 1000000000, 2000000000, 1))
+
+
+def drop_limit(directory):
+    path = Path(directory) / "videoout.jsonl"
+    for drop_count in (1, 2):
+        events = [event(index + 1, 1000000000 + index * 10000000,
+                        index + 1 - min(index, drop_count), min(index, drop_count)) for index in range(101)]
+        write_events(path, events)
+        result = leg_summary(path, 1000000000, 2000000000, 1)
+        assert result["code"] == (0 if drop_count == 1 else 27)
+        assert result["dropped"] == drop_count and result["drop_rate"] == drop_count / 100
+        values = [{"control": {**result, "attempts": 100, "presented": 100, "acquire_dropped": 0}, "candidate": result}] * 4
+        decision = sequential(values)
+        assert decision["code"] == result["code"]
+        assert decision["drops"]["candidate"]["dropped"] == 4 * drop_count
+        report = pair_report(values, {"mean_ms": 20})
+        assert report["baseline_mean_ms"] == 20 and report["candidate_mean_ms"] == result["ms"]
+        assert math.isclose(report["cumulative_speedup"], 20 / result["ms"])
+        assert final_verdict([result] * 3)["code"] == result["code"]
+    path, text, blocks, events = alternating_fixture(directory)
+    dropped = 0
+    for item in events:
+        if item["n"] % 20 == 0:
+            dropped += 1
+        item.update(presented=item["n"] - dropped, acquire_dropped=dropped)
+    write_events(path, events)
+    decision = alternating_verdict(directory, 3, {"mean_ms": 100})
+    assert decision["code"] == 27 and decision["verdict"] == "present_drops"
+    assert decision["drops"]["control"]["dropped"] > 0 and decision["drops"]["candidate"]["dropped"] > 0
+    valid = {"ms": 10, "p95": 10, "attempts": 1000, "presented": 1000, "acquire_dropped": 0, "out_of_date": 0}
+    invalid = {**valid, "attempts": 100, "presented": 98}
+    values = [{"control": valid, "candidate": valid}] * 3 + [{"control": valid, "candidate": invalid}]
+    assert sequential(values)["code"] == 27
+    assert bootstrap(values + values[:2])["code"] == 27
+    fails(lambda: final_verdict([{"ms": 10}] * 3))
+    fails(lambda: sequential([{"control": {"ms": 10}, "candidate": {"ms": 10}}] * 4))
+
+
+def fixed_margin(directory):
+    for alternating, count in ((False, 6), (True, 24)):
+        scale = 0.03 / statistics.stdev([-1, 1] * (count // 2))
+        result = bootstrap(pairs([-scale, scale] * (count // 2)), alternating)
+        assert result["code"] == 0 and math.isclose(result["s_AA"], 0.03)
+        assert result["m"] == 0.02
+        if alternating:
+            assert result["alternating_m"] == 0.02
+        noise_limit = 0.01 * math.sqrt(48) / t_critical(47)
+        for multiplier, expected in ((0.999, 0), (1.001, 40)):
+            scale = noise_limit * multiplier / statistics.stdev([-1, 1] * (count // 2))
+            assert bootstrap(pairs([-scale, scale] * (count // 2)), alternating)["code"] == expected
+    result = sequential(pairs([0.03] * 4), 0.045)
+    assert result["m"] == 0.02 and result["code"] == 1
+
+
+def inconclusive_48(directory):
+    for count, expected in ((12, "continue"), (24, "continue"), (48, "inconclusive")):
+        result = sequential(pairs([0.1, -0.1] * (count // 2)), alternating=True)
+        assert result["verdict"] == expected and result["code"] == (3 if count == 48 else 0)
+    assert sequential(pairs([0.001, -0.001] * 24), alternating=True)["verdict"] == "pass"
+    assert sequential(pairs([0.05] * 48), alternating=True)["code"] == 1
+    path, text, blocks, events = alternating_fixture(directory, 96)
+    result = alternating_blocks(path, text, blocks, 3)
+    assert len(result) == 48
+    decision = alternating_verdict(directory, 3, {"mean_ms": 400})
+    assert decision["stage"] == 48 and decision["baseline_mean_ms"] == 400
+    assert decision["candidate_mean_ms"] == 200 and decision["cumulative_speedup"] == 2
+def ub_experiment_report(directory):
+    from archb_gate_stats import ub_experiment, ub_report
+    path, text, blocks, events = alternating_fixture(directory)
+    text = text.replace("GATE_NOOP", "UB_TRUST_PROOFS")
+    for block in blocks:
+        block["values"]["UB_TRUST_PROOFS"] = block["values"].pop("GATE_NOOP")
+    (Path(directory) / "blocks.json").write_text(json.dumps(blocks), encoding="utf-8")
+    stderr = Path(directory) / "stderr.log"
+    stderr.write_text(text + "\n[archb] ub_trust_proofs_hits=1\n[archb] ub_trust_proofs_hits=1234 t_ns=361000000000\n", encoding="utf-8")
+    records = []
+    for index, block in enumerate(blocks):
+        start = 1 + index * 15 + 4
+        cost = 30 if block["role"] == "control" else 10
+        record = {"interval_start_s": start - 1, "interval_end_s": start + 4,
+                  "archb": {"start_ns": start * 1000000000, "end_ns": (start + 5) * 1000000000,
+                            "toggle_seq": block["start_seq"], "recorder_enabled": True,
+                            "frames": 50, "presented": 25, "phases_ms": {"queue0": {"proof": cost}}}}
+        records.append(record)
+        records.append({**record, "recorder_toggled": True})
+    records.append({"interval_start_s": 0, "interval_end_s": 20,
+                    "archb": {"frames": 1, "phases_ms": {"queue0": {"proof": 999999}}}})
+    (Path(directory) / "aps5-summary.jsonl").write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
+    result = ub_experiment(directory, "UB_TRUST_PROOFS", ["UB_TRUST_PROOFS"])
+    assert result["frame_time_ratio"] == 2
+    assert result["frame_time_ratio_90_interval"] == [2, 2]
+    assert math.isclose(result["presented_fps"]["control"], 10) and math.isclose(result["presented_fps"]["candidate"], 5)
+    assert result["hits"] == {"ub_trust_proofs_hits": 1234}
+    assert "verdict" not in result and "code" not in result
+    assert result["attribution"]["control"]["phases_ms_per_frame"]["queue0"]["proof"] == 1.2
+    assert result["attribution"]["candidate"]["phases_ms_per_frame"]["queue0"]["proof"] == 0.4
+    report = ub_report([result, {"name": "ALL_UB", "status": "experiment crashed", "stage": "blocks"}])
+    assert "2.0000 [2.0000, 2.0000]" in report["markdown"]
+    assert "10.000 | 5.000" in report["markdown"] and "ub_trust_proofs_hits=1234" in report["markdown"]
+    assert "experiment crashed / blocks" in report["markdown"] and "pass" not in report["markdown"]
+    for index, block in enumerate(blocks):
+        if block["role"] != "candidate":
+            continue
+        start = 1000000000 + index * 15000000000
+        shift = 0
+        for event in events:
+            if start + 3000000000 <= event["t_ns"] < start + 15000000000:
+                event["t_ns"] += shift * (100000 if (index // 2) % 2 else -100000)
+                shift += 1
+    path.write_text("\n".join(map(json.dumps, events)) + "\n", encoding="utf-8")
+    varied = ub_experiment(directory, "UB_TRUST_PROOFS", ["UB_TRUST_PROOFS"])
+    deltas = varied["d_i"]
+    radius = t_critical(11) * statistics.stdev(deltas) / math.sqrt(12)
+    assert math.isclose(varied["frame_time_ratio_90_interval"][0], math.exp(statistics.mean(deltas) - radius))
+    assert math.isclose(varied["frame_time_ratio_90_interval"][1], math.exp(statistics.mean(deltas) + radius))
+    assert varied["frame_time_ratio_90_interval"][0] < varied["frame_time_ratio"] < varied["frame_time_ratio_90_interval"][1]
+    fails(lambda: ub_experiment(directory, "bad", ["UB_UNKNOWN"]), 21)
+    tools = Path(__file__).resolve().parents[5] / "tools"
+    output = Path(directory) / "report.json"
+    completed = subprocess.run([sys.executable, str(tools / "archb_gate_stats.py"), "ub-experiment", directory,
+                                "--name", "UB_TRUST_PROOFS", "--switch", "UB_TRUST_PROOFS", "--output", str(output)],
+                               capture_output=True, text=True, timeout=5)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(output.read_text())["status"] == "completed"
+    if sys.platform == "win32":
+        script = r"""
+. $args[0] -Control unused -Output unused
+$Output = $args[1]
+$Experiments = @('UB_TRUST_PROOFS', 'UB_SKIP_CPU_INDIRECT')
+$script:AllLegs = [Collections.Generic.List[object]]::new()
+$script:seen = @()
+function Invoke-GateLeg($Configuration, $Label, $Kind, $Seconds, $Measured, $Alternation) {
+    if ($Measured -or $Kind -ne 'measured' -or $Seconds -ne 0) { throw 'Invalid experiment leg' }
+    if (@($Alternation.control.Values | Where-Object { $_ -ne '0' }).Count) { throw 'Control has UB enabled' }
+    if (@($Configuration.env.Keys | Where-Object { $_ -like 'APS5_ARCHB_UB_*' -and $Configuration.env[$_] -ne '0' }).Count) { throw 'Navigation has UB enabled' }
+    $script:seen += $Alternation.experiment
+    if ($Alternation.experiment -eq 'UB_SKIP_CPU_INDIRECT') {
+        $script:AllLegs.Add(@{ directory = $Output; stage = 'blocks' })
+        throw 'synthetic device loss'
+    }
+    if ($Alternation.experiment -eq 'ALL_UB' -and @($Alternation.candidate.Values | Where-Object { $_ -eq '1' }).Count -ne 5) { throw 'Missing all-on switch' }
+    return @{ alternating = @{ name = $Alternation.experiment; status = 'completed'; stage = 'measurement'; frame_time_ratio = 0.5
+        frame_time_ratio_90_interval = @(0.4, 0.6); presented_fps = @{control = 7; candidate = 14}; hits = @{ ub_trust_proofs_hits = 77 } } }
+}
+$config = @{ name = 'base'; env = @{}; expectSwitches = @{}; requiredCounters = @('unused') }
+$result = @(Invoke-GateUpperBoundExperiments $config)
+if (($script:seen -join ',') -ne 'UB_TRUST_PROOFS,UB_SKIP_CPU_INDIRECT,ALL_UB') { throw 'Wrong experiment boots' }
+if ($result[0].status -ne 'completed' -or $result[2].status -ne 'completed') { throw 'Successful experiments were not reported' }
+if ($result.Count -ne 3 -or $result[1].status -ne 'experiment crashed' -or $result[1].stage -ne 'blocks') { throw 'Crash not recorded' }
+if (-not (Test-Path (Join-Path $Output 'ub-report.json'))) { throw 'Missing report' }
+"""
+        command = "& {" + script + "} '" + str(tools / "archb_gate.ps1").replace("'", "''") + "' '" + directory.replace("'", "''") + "'"
+        completed = subprocess.run(["pwsh", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=10)
+        assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 if __name__ == "__main__":

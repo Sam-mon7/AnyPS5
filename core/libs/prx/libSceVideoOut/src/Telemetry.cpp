@@ -1,5 +1,6 @@
 #include "prx/libSceVideoOut/include/Telemetry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 
 #include <chrono>
 #include <charconv>
@@ -196,6 +197,15 @@ void Writer::EmitPresent(std::uint64_t frame, double fps, std::int64_t timeNanos
     emit(head(timeNanos, "present") + text, false);
 }
 
+void Writer::EmitPresent(std::uint64_t frame, double fps, std::int64_t timeNanos, const AgcDriver::PresentCounters& counters) {
+    char text[288];
+    std::snprintf(text, sizeof(text), ",\"n\":%llu,\"fps\":%.2f,\"presented\":%llu,\"attempts\":%llu,\"acquire_dropped\":%llu,\"out_of_date\":%llu}\n",
+        static_cast<unsigned long long>(frame), fps, static_cast<unsigned long long>(counters.presented),
+        static_cast<unsigned long long>(counters.attempts), static_cast<unsigned long long>(counters.acquireDropped),
+        static_cast<unsigned long long>(counters.outOfDate));
+    emit(head(timeNanos, "present") + text, false);
+}
+
 bool GateRunEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_ARCHB_GATE_RUN");
@@ -211,7 +221,11 @@ bool GateRunEnabled() {
 void ObservePresent(Writer* writer, std::uint64_t frame, double fps, std::int64_t timeNanos) {
     const bool gate = GateRunEnabled();
     if (writer != nullptr) {
-        if (gate) writer->EmitPresent(frame, fps, timeNanos);
+        if (gate) {
+            AgcDriver::PresentCounters counters{};
+            AgcDriverPresentCounters_nid_postfix(&counters);
+            writer->EmitPresent(frame, fps, timeNanos, counters);
+        }
         else if (frame == 1 || frame % 30 == 0) writer->EmitPresent(frame, fps);
     }
     if (!gate) return;

@@ -30,11 +30,60 @@ function Change-FakeRuntime([string]$Directory) {
     }
 }
 
-if ($Case -eq 'AlternatingBlocks' -or $Case -eq 'Bisection') {
+if ($Case -in @('AlternatingBlocks', 'Bisection', 'MemoryGuard')) {
     $testRoot = Join-Path $repository ('build/archb-alternating-' + [Guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $testRoot
     try {
-        if ($Case -eq 'AlternatingBlocks') {
+        if ($Case -eq 'MemoryGuard') {
+            Assert-True ($MinAvailableMiB -eq 256 -and $LowMemorySeconds -eq 60) 'Wrong memory guard defaults'
+            . $runnerScript -Control unused -Output unused -MinAvailableMiB 128 -LowMemorySeconds 7
+            Assert-True ($MinAvailableMiB -eq 128 -and $LowMemorySeconds -eq 7) 'Memory guard parameters were not accepted'
+            $MinAvailableMiB = 256
+            $LowMemorySeconds = 60
+            $script:ActiveLeg = @{ measured = $true }
+            $script:ActiveBlock = @{ measured = $true }
+            $script:sample = @{ private_commit = 1; working_set = 2; available_memory = 300MB; commit_headroom = 4GB }
+            $script:fakeClock = 0L
+            function Get-GateMemory { return $script:sample }
+            function Get-GateClock { return $script:fakeClock }
+            $process = @{ HasExited = $false }
+            $low = $null
+            $null = Add-GateMemorySample $process $testRoot ([ref]$low)
+            $script:fakeClock = 61000000000L
+            $null = Add-GateMemorySample $process $testRoot ([ref]$low)
+            Assert-True ($null -eq $low) 'Memory above guard threshold started the timer'
+            Assert-True ($script:ActiveLeg.min_available_memory -eq 300MB -and $script:ActiveBlock.memory_pressure) 'Minimum or memory pressure was not recorded'
+            $script:sample.available_memory = 255MB
+            $script:fakeClock = 100000000000L
+            $null = Add-GateMemorySample $process $testRoot ([ref]$low)
+            $script:fakeClock = 159000000000L
+            $null = Add-GateMemorySample $process $testRoot ([ref]$low)
+            $script:fakeClock = 160000000000L
+            $stopped = $false
+            try { $null = Add-GateMemorySample $process $testRoot ([ref]$low) }
+            catch { $stopped = $_.Exception.Data['GateCode'] -eq 26 }
+            Assert-True $stopped 'Low memory did not stop at the configured duration'
+            Assert-True ($script:ActiveLeg.min_available_memory -eq 255MB) 'Minimum memory was not retained'
+            $script:sample.available_memory = 512MB
+            $script:ActiveBlock = @{ measured = $true }
+            $null = Add-GateMemorySample $process $testRoot ([ref]$low)
+            Assert-True ($null -eq $low -and -not $script:ActiveBlock.memory_pressure -and $script:ActiveLeg.memory_pressure) 'Recovery lost the minimum or flagged 512 MiB'
+            $MinAvailableMiB = 128
+            $LowMemorySeconds = 7
+            $script:sample.available_memory = 127MB
+            $null = Add-GateMemorySample $process $testRoot ([ref]$low)
+            $script:fakeClock += 7000000000L
+            $stopped = $false
+            try { $null = Add-GateMemorySample $process $testRoot ([ref]$low) }
+            catch { $stopped = $_.Exception.Data['GateCode'] -eq 26 }
+            Assert-True $stopped 'Custom memory thresholds were not used'
+            $script:sample.available_memory = 1024MB
+            $script:sample.commit_headroom = 4GB - 1
+            $stopped = $false
+            try { $null = Add-GateMemorySample $process $testRoot ([ref]$low) }
+            catch { $stopped = $_.Exception.Data['GateCode'] -eq 26 }
+            Assert-True $stopped 'Commit headroom below 4 GiB did not stop immediately'
+        } elseif ($Case -eq 'AlternatingBlocks') {
             $stderrPath = Join-Path $testRoot 'stderr.log'
             [IO.File]::WriteAllText($stderrPath, "[archb] toggle seq=1 t_ns=123 GATE_NOOP=1 GATE_DELAY_US=0`n")
             Assert-True ((Wait-GateToggle @{ HasExited = $false } $testRoot 1) -eq 123) 'Toggle acknowledgement was not read'
@@ -48,7 +97,13 @@ if ($Case -eq 'AlternatingBlocks' -or $Case -eq 'Bisection') {
             $script:fakeClock = 1000000000L
             $script:screenshots = @()
             function Get-GateClock { $script:fakeClock += 1000000000; return $script:fakeClock }
-            function Add-GateMemorySample { param($Process, $Directory, $LowSince) }
+            function Add-GateMemorySample {
+                param($Process, $Directory, $LowSince)
+                if ($null -ne $script:ActiveBlock) {
+                    $script:ActiveBlock.min_available_memory = if ($script:ActiveBlock.role -eq 'control') { 400MB } else { 600MB }
+                    $script:ActiveBlock.memory_pressure = $script:ActiveBlock.min_available_memory -lt 512MB
+                }
+            }
             function Wait-GateToggle {
                 param($Process, $Directory, $Sequence)
                 $line = [IO.File]::ReadAllText((Join-Path $Directory 'control.txt'))
@@ -58,21 +113,27 @@ if ($Case -eq 'AlternatingBlocks' -or $Case -eq 'Bisection') {
             }
             function Invoke-GatePython {
                 param($Tool, $Arguments, $AllowedCodes)
-                if ($Tool -eq 'archb_gate_nav.py') { $script:screenshots += $Arguments[-1]; return @{} }
+                if ($Tool -eq 'archb_gate_nav.py') {
+                    $script:screenshots += $Arguments[-1]
+                    $null = Write-GateControl $testRoot @{ SCREENSHOT = '1' }
+                    return @{}
+                }
                 $blocks = Get-Content -LiteralPath (Join-Path $testRoot 'blocks.json') -Raw | ConvertFrom-Json -AsHashtable
-                return @{ verdict = $(if ($blocks.Count -eq 24) { 'continue' } else { 'pass' }); code = 0; stage = $blocks.Count / 2 }
+                return @{ verdict = $(if ($blocks.Count -lt 96) { 'continue' } else { 'inconclusive' });
+                          code = $(if ($blocks.Count -lt 96) { 0 } else { 3 }); stage = $blocks.Count / 2 }
             }
             $low = $null
             $decision = Invoke-GateBlocks @{} $testRoot @{ control = @{ GATE_NOOP = '0'; GATE_DELAY_US = '0' }
                 candidate = @{ GATE_NOOP = '1'; GATE_DELAY_US = '7000' } } ([ref]$low)
-            Assert-True ($decision.stage -eq 24) 'Alternation did not extend to 24 pairs'
+            Assert-True ($decision.stage -eq 48 -and $decision.code -eq 3 -and $decision.verdict -eq 'inconclusive') 'Alternation did not end inconclusive at 48 pairs'
             $blocks = Get-Content -LiteralPath (Join-Path $testRoot 'blocks.json') -Raw | ConvertFrom-Json -AsHashtable
-            Assert-True ($blocks.Count -eq 48) 'Wrong block count'
+            Assert-True ($blocks.Count -eq 96) 'Wrong block count'
+            Assert-True (@($blocks | Where-Object { $_.memory_pressure }).Count -eq 48) 'Block memory pressure was not retained'
             for ($i = 0; $i -lt $blocks.Count; $i += 2) {
                 Assert-True ($blocks[$i].role -ne $blocks[$i + 1].role) 'Pair lacks a control or candidate'
                 Assert-True ($blocks[$i].end_seq -eq $blocks[$i + 1].start_seq) 'Pair boundary sequence differs'
             }
-            Assert-True ($script:screenshots.Count -eq 4) 'Missing end-of-stage role screenshots'
+            Assert-True ($script:screenshots.Count -eq 6) 'Missing end-of-stage role screenshots'
         } else {
             $script:attempts = @()
             function Invoke-GateLeg {
@@ -102,11 +163,9 @@ if ($Case -eq 'AlternatingBlocks' -or $Case -eq 'Bisection') {
 if ($Child) {
     $manifest = Save-FakeRuntime $Root
     Change-FakeRuntime $Root
-    $notBefore = [DateTime]::UtcNow.AddSeconds(-1).Ticks
-    Set-FakeBytes (Join-Path $Root 'runtime/frame_000.bmp') ([byte[]]@(66, 77, 0, 255))
-    Write-GateJson (Join-Path $Root 'active-processes.json') @{ capture = @{
-        runtime = (Join-Path $Root 'runtime'); destination = (Join-Path $Root 'captured'); notBeforeTicks = $notBefore
-    } }
+    $null = New-Item -ItemType Directory -Path (Join-Path $Root 'leg/shots')
+    Set-FakeBytes (Join-Path $Root 'leg/shots/frame.png') ([byte[]]@(137, 80, 78, 71))
+    Write-GateJson (Join-Path $Root 'leg/leg.json') @{ min_available_memory = 300MB; memory_pressure = $true }
     $self = Get-Process -Id $PID
     $null = Start-GateWatchdog $manifest $PID $self.StartTime.ToUniversalTime().Ticks
     Set-Content -LiteralPath (Join-Path $Root 'ready') -Value ready
@@ -149,8 +208,9 @@ try {
         Assert-True ($plan.status -eq 'restored') 'Watchdog did not restore after kill'
         $until = [DateTime]::UtcNow.AddSeconds(2)
         while (-not (Test-Path -LiteralPath (Join-Path $Root 'gate.json')) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
-        Assert-True (Test-Path -LiteralPath (Join-Path $Root 'captured/frame_000.bmp')) 'Watchdog did not collect its diagnostic dump'
-        Assert-True (-not (Test-Path -LiteralPath (Join-Path $Root 'runtime/frame_000.bmp'))) 'Diagnostic dump was left in fake runtime'
+        Assert-True (Test-Path -LiteralPath (Join-Path $Root 'leg/shots/frame.png')) 'Watchdog removed a driver screenshot'
+        $gate = Get-Content -LiteralPath (Join-Path $Root 'gate.json') -Raw | ConvertFrom-Json -AsHashtable
+        Assert-True ($gate.legs[0].min_available_memory -eq 300MB -and $gate.legs[0].memory_pressure) 'Watchdog lost leg memory pressure'
     } else {
         $manifest = Save-FakeRuntime $Root
         Change-FakeRuntime $Root

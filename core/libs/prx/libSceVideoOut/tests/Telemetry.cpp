@@ -1,6 +1,7 @@
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include "prx/libSceVideoOut/include/Telemetry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -139,12 +140,13 @@ void contractPadAndPresentLines() {
 void gatePresents(const std::string& mode) {
     const auto directory = freshDirectory(mode.c_str());
     const bool enabled = VideoOutTelemetry::GateRunEnabled();
+    AgcDriver::PresentCounters counters{};
+    AgcDriverPresentCounters_nid_postfix(&counters);
     check(enabled == (mode != "GateRunOffKeepsCadence"), "gate environment mismatch");
     {
         VideoOutTelemetry::Writer writer(directory.string(), 4096, "test");
         for (std::uint64_t frame = 1; frame <= 65; ++frame) {
             VideoOutTelemetry::ObservePresent(&writer, frame, 7.0, 1000000000 + frame * 140000000);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         check(writer.Dropped() == 0, "gate lost present events");
     }
@@ -158,12 +160,37 @@ void gatePresents(const std::string& mode) {
         const auto timestamp = field(line, "t_ns");
         check(timestamp > last, "present timestamps must increase");
         if (enabled) check(timestamp == 1000000000 + n * 140000000, "gate timestamp must be the observation timestamp");
+        if (enabled) {
+            check(field(line, "attempts") == static_cast<long long>(counters.attempts), "driver attempts were not exported");
+            check(field(line, "presented") == static_cast<long long>(counters.presented), "driver presents were not exported");
+            check(field(line, "acquire_dropped") == static_cast<long long>(counters.acquireDropped), "driver acquire drops were not exported");
+            check(field(line, "out_of_date") == static_cast<long long>(counters.outOfDate), "driver out-of-date drops were not exported");
+        } else {
+            check(line.find("\"presented\"") == std::string::npos && line.find("\"attempts\"") == std::string::npos &&
+                line.find("\"acquire_dropped\"") == std::string::npos && line.find("\"out_of_date\"") == std::string::npos, "gate-off fields changed");
+        }
         check(line.find("\"fps\":7.00") != std::string::npos, "present fields changed");
         if (enabled) check(n == static_cast<long long>(presents), "missing full-rate frame");
         else check(n == (presents == 1 ? 1 : (presents - 1) * 30), "old cadence changed");
         last = timestamp;
     }
     check(presents == (enabled ? 65 : 3), "incorrect present cadence");
+    if (mode == "GateRunEmitsPresentCounters") {
+        const auto counterDirectory = directory / "counters";
+        std::filesystem::create_directory(counterDirectory);
+        {
+            VideoOutTelemetry::Writer writer(counterDirectory.string(), 4096, "test");
+            writer.EmitPresent(9, 7.0, 123456789, AgcDriver::PresentCounters{100, 97, 2, 1});
+            writer.EmitPresent(10, 7.0, 223456789, AgcDriver::PresentCounters{101, 97, 3, 1});
+        }
+        const auto counterLines = readLines(counterDirectory / "videoout.jsonl");
+        check(counterLines.size() == 3, "missing synthetic counter events");
+        for (std::size_t i = 1; i < counterLines.size(); ++i) {
+            check(field(counterLines[i], "attempts") == 99 + static_cast<long long>(i) && field(counterLines[i], "presented") == 97 &&
+                field(counterLines[i], "acquire_dropped") == 1 + static_cast<long long>(i) && field(counterLines[i], "out_of_date") == 1,
+                "cumulative counter fields differ from the snapshot");
+        }
+    }
     std::filesystem::remove_all(directory);
 }
 
