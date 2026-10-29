@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -35,7 +36,14 @@ def atomic_bytes(path, data):
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        for attempt in range(60):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 59:
+                    raise
+                time.sleep(0.5)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
