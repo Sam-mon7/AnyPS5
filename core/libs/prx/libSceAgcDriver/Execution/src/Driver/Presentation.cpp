@@ -78,6 +78,7 @@ void Driver::AttachWindow(const PresentationWindow& window) {
 }
 
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool opaque, void (*gpuReady)(void*), void* context) {
+    VulkanDevice::PresentationCounters().Attempt();
     ArchB::Switches::PollControl();
     const auto timelineBegin = Timeline::Enabled ? Timeline::Emit(Timeline::Kind::PresentBegin, window.timing ? window.timing->Id() : 0) : 0;
     struct TimelinePresent {

@@ -339,7 +339,7 @@ function Wait-GateToggle($Process, [string]$Directory, [long]$Sequence, $LowSinc
 function Invoke-GateBlocks($Process, [string]$Directory, $Plan, [ref]$LowSince) {
     $blocks = [Collections.Generic.List[object]]::new()
     $sequence = 1L
-    $stages = if ($Mode -eq 'Bootstrap') { @(48) } else { @(24, 48) }
+    $stages = if ($Mode -eq 'Bootstrap') { @(48) } else { @(24, 48, 96) }
     foreach ($total in $stages) {
         while ($blocks.Count -lt $total) {
             $order = if ([Security.Cryptography.RandomNumberGenerator]::GetInt32(2)) { @('control', 'candidate') } else { @('candidate', 'control') }
@@ -368,7 +368,7 @@ function Invoke-GateBlocks($Process, [string]$Directory, $Plan, [ref]$LowSince) 
         $arguments = @('alternating', $Directory, '--settle-seconds', $SettleSeconds, '--output', (Join-Path $Directory 'alternating.json'))
         if ($Mode -eq 'Bootstrap') { $arguments += '--bootstrap' }
         else { $arguments += @('--baseline', $script:BaselinePath) }
-        $decision = Invoke-GatePython 'archb_gate_stats.py' $arguments @(0, 1, 2, 40)
+        $decision = Invoke-GatePython 'archb_gate_stats.py' $arguments @(0, 1, 2, 3, 27, 40)
         if ($decision.verdict -ne 'continue') { return $decision }
     }
 }
@@ -522,7 +522,7 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
         $result.hold_seconds = if ($null -ne $Alternation) { ($holdEnd - $holdStart) / 1000000000.0 } else { $Seconds }
         if ($Measured -and $null -eq $Alternation) {
             $statistics = Invoke-GatePython 'archb_gate_stats.py' @('leg', (Join-Path $directory 'videoout.jsonl'), '--start-ns', $holdStart,
-                                                                   '--end-ns', $holdEnd, '--hold-seconds', $Seconds)
+                                                                   '--end-ns', $holdEnd, '--hold-seconds', $Seconds) @(0, 27)
             foreach ($key in $statistics.Keys) { $result[$key] = $statistics[$key] }
         }
         if (($Measured -or $Kind -eq 'diagnostic') -and $Mode -ne 'Bootstrap') {
@@ -633,7 +633,8 @@ function Invoke-ArchBGate {
         if ($Mode -ne 'Bootstrap') {
             $script:Baseline = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json -AsHashtable
             $gate.baseline = $script:Baseline
-            if ($script:Baseline.s_AA -gt 0.033) { Stop-GateFailure 40 'Frozen Bootstrap noise exceeds 0.033' }
+            if (1.677927 * $script:Baseline.s_AA / [Math]::Sqrt(48) -gt 0.01) { Stop-GateFailure 40 'Frozen Bootstrap noise cannot resolve 2% at 48 pairs' }
+            if (-not $script:Baseline.ContainsKey('mean_ms') -or $script:Baseline.mean_ms -le 0) { Stop-GateFailure 24 'Frozen Bootstrap needs its presented-frame mean_ms' }
             $referenceHashes = @{}
             foreach ($reference in Get-ChildItem -LiteralPath $NavigationRefs -Filter '*.bmp' -File) { $referenceHashes[$reference.Name] = (Get-FileHash -LiteralPath $reference.FullName).Hash.ToLowerInvariant() }
             if ((($referenceHashes.Keys | Sort-Object) -join ',') -ne (($script:Baseline.navref_hashes.Keys | Sort-Object) -join ',')) { Stop-GateFailure 11 'Navigation reference set differs from frozen Bootstrap' }
@@ -684,7 +685,7 @@ function Invoke-ArchBGate {
                 $legs = @(1..3 | ForEach-Object { Invoke-GateLeg $candidateConfig "$($candidateConfig.name)-final-$_" 'measured' 120 $true })
                 $pairsPath = Join-Path $Output "$($candidateConfig.name)-final.json"
                 Write-GateJson $pairsPath $legs
-                $decision = Invoke-GatePython 'archb_gate_stats.py' @('decide', $pairsPath, '--mode', 'Final') @(0, 1)
+                $decision = Invoke-GatePython 'archb_gate_stats.py' @('decide', $pairsPath, '--mode', 'Final', '--baseline', $baselinePath) @(0, 1, 27)
             } elseif ($useAlternating) {
                 if ($Mode -ne 'Bootstrap' -and -not $script:Baseline.ContainsKey('alternating_m')) { Stop-GateFailure 40 'An alternating Bootstrap baseline is required' }
                 $label = if ($Mode -eq 'Bootstrap') { 'bootstrap-navigation-3-alternating' } else { "$($candidateConfig.name)-alternating" }
@@ -708,7 +709,7 @@ function Invoke-ArchBGate {
                     if ($Mode -ne 'Bootstrap' -and $index -notin @(4, 8)) { continue }
                     $decideArgs = @('decide', $pairsPath, '--mode', $Mode)
                     if ($Mode -ne 'Bootstrap') { $decideArgs += @('--baseline', $baselinePath) }
-                    $decision = Invoke-GatePython 'archb_gate_stats.py' $decideArgs @(0, 1, 2, 40)
+                    $decision = Invoke-GatePython 'archb_gate_stats.py' $decideArgs @(0, 1, 2, 3, 27, 40)
                     if ($decision.verdict -ne 'continue') { break }
                 }
             }
@@ -755,10 +756,10 @@ function Invoke-ArchBGate {
         }
         $gate.code = 0
         foreach ($result in $results) { if ($result.code -ne 0) { $gate.code = $result.code; break } }
-        $gate.verdict = if ($gate.code -eq 0) { 'pass' } else { 'fail' }
+        $gate.verdict = if ($gate.code -eq 0) { 'pass' } elseif ($gate.code -eq 3) { 'inconclusive' } elseif ($gate.code -eq 27) { 'present_drops' } else { 'fail' }
         if ($Mode -eq 'Bootstrap' -and $gate.code -eq 0) {
             $firstNav = $script:AllLegs[0].navigation
-            $baseline = @{ s_AA = $results[0].s_AA; d_i = $results[0].d_i
+            $baseline = @{ s_AA = $results[0].s_AA; d_i = $results[0].d_i; mean_ms = $results[0].mean_ms
                            peak_private_commit = Get-GateMedian @($script:AllLegs | Where-Object { $_.ContainsKey('ms') -or $_.ContainsKey('alternating') } | ForEach-Object { $_.memory.peak_private_commit })
                            T_nav = @($script:AllLegs | ForEach-Object { $_.navigation.T_nav }); navref_hashes = $firstNav.reference_hashes
                            manifest = (Join-Path $Output 'manifest.json'); contact = (Join-Path $Output 'contact.png') }

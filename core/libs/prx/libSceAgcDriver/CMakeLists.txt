@@ -490,9 +490,21 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    add_test_executable(agc_archb_c01_present_counters_tests tests/PresentCounters.cpp)
+    target_include_directories(agc_archb_c01_present_counters_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+    target_link_libraries(agc_archb_c01_present_counters_tests PRIVATE libc)
+    set_target_properties(agc_archb_c01_present_counters_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_archb_c01_present_counters_tests)
+    add_test(NAME agc_archb_c01_present_counters COMMAND agc_archb_c01_present_counters_tests)
+    set_tests_properties(agc_archb_c01_present_counters PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_c01_present_counters PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(agc_archb_c01_switches_tests tests/ArchBSwitches.cpp
         Execution/src/ArchB/Switches.cpp ../libSceVideoOut/src/Telemetry.cpp)
-    target_include_directories(agc_archb_c01_switches_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    target_include_directories(agc_archb_c01_switches_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
     target_compile_definitions(agc_archb_c01_switches_tests PRIVATE APS5_ARCHB_SWITCHES_TEST)
     target_link_libraries(agc_archb_c01_switches_tests PRIVATE libc)
     configure_windows_unwind(agc_archb_c01_switches_tests)
@@ -517,7 +529,8 @@ if(BUILD_TESTING)
         foreach(archbStatsCase IN ITEMS frame_deltas_compute_ms gap_or_duplicate_fails aa_noise_sets_margin
                 noise_above_limit_fails sequential_pass_at_four sequential_continue_then_fail
                 clear_regression_fails_early p95_median_rule final_mode_requires_every_leg old_30_frame_telemetry_rejected
-                alternating_block_pairing alternating_settle_discard alternating_sequential_12_24 alternating_t_table)
+                alternating_block_pairing alternating_settle_discard alternating_sequential_12_24 alternating_t_table
+                presented_denominator drop_limit fixed_margin inconclusive_48)
             add_test(NAME agc_archb_c01_stats_${archbStatsCase} COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBGateStats.py ${archbStatsCase})
             set_tests_properties(agc_archb_c01_stats_${archbStatsCase} PROPERTIES TIMEOUT 30)
