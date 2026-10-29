@@ -57,6 +57,8 @@ def sha256(path):
 def measured_environment(env):
     for key in env:
         upper = key.upper()
+        if upper.startswith("APS5_ARCHB_"):
+            continue
         if (upper.startswith(("APS5_PROFILE_", "APS5_TRACE_", "VVL_"))
                 or any(word in upper for word in ("CAPTURE", "DUMP", "VALIDATION"))
                 or upper in ("VK_INSTANCE_LAYERS", "VK_LAYER_ENABLES", "VK_LAYER_SETTINGS_PATH")):
