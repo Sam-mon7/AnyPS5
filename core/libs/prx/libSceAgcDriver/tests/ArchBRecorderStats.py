@@ -21,7 +21,7 @@ def overhead(directory):
                        "end_seq": index + 2, "values": {"RECORDER": str(on)}})
         lines.append(f"[archb] toggle seq={index + 1} t_ns={start} RECORDER={on}")
         for offset in range(150):
-            events.append({"ev": "present", "n": len(events) + 1, "t_ns": start + offset * 100_000_000})
+            events.append({"ev": "present", "n": len(events) + 1, "t_ns": start + offset * 100_000_000, "attempts": len(events) + 1, "presented": len(events) + 1, "acquire_dropped": 0, "out_of_date": 0})
         records.append({"archb": {"recorder_toggled": False, "recorder_enabled": bool(on),
                                   "toggle_seq": index + 1, "start_ns": start + 5_000_000_000,
                                   "end_ns": start + 10_000_000_000, "frames": 50,
