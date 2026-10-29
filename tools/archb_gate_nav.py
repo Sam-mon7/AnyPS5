@@ -12,7 +12,7 @@ import time
 import numpy as np
 from PIL import Image, ImageDraw
 
-from archb_gate_config import GateError, read_json, sha256, write_json
+from archb_gate_config import GateError, atomic_bytes, sha256, write_json
 
 
 PROMPT_BOX = (250, 205, 390, 250)
@@ -46,6 +46,8 @@ def load_refs(directory):
 
 
 def classify(image, refs):
+    if image is None:
+        return "loading", 0.0
     luma = np.asarray(image.convert("L"), dtype=np.float32)
     if float(luma.mean()) < 2 or float(luma.std()) < 1:
         return "loading", 0.0
@@ -59,6 +61,35 @@ def classify(image, refs):
                                for name in ("online_prompt_online", "online_prompt_offline"))
         score = min(score, crop_score)
     return (name if score >= 0.80 else "unknown"), score
+
+
+class DriverCapture:
+    def __init__(self, control, shots, timeout=5):
+        self.control = Path(control)
+        self.shots = Path(shots)
+        self.timeout = timeout
+        self.shots.mkdir(parents=True, exist_ok=True)
+
+    def image(self):
+        existing = set(self.shots.glob("*.png"))
+        requested = time.time_ns()
+        atomic_bytes(self.control, f"{requested // 1000} SCREENSHOT=1\n".encode("ascii"))
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            files = sorted(self.shots.glob("*.png"), key=lambda path: (path.stat().st_mtime_ns, path.name))
+            for path in reversed(files):
+                if path in existing or path.stat().st_mtime_ns <= requested:
+                    continue
+                try:
+                    with Image.open(path) as source:
+                        image = source.convert("RGB")
+                except OSError:
+                    continue
+                for old in files[:-5]:
+                    old.unlink(missing_ok=True)
+                return image
+            time.sleep(0.05)
+        return None
 
 
 class Capture:
@@ -158,11 +189,11 @@ def press(pad, button, milliseconds, output):
         raise GateError(11, "pad_input.py failed")
 
 
-def navigate(pid, refs_directory, pad, output, timeout=1500):
+def navigate(pid, refs_directory, pad, output, timeout=1500, capture="driver", control=None, shots=None):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     refs = load_refs(refs_directory)
-    capture = Capture(pid)
+    capture = Capture(pid) if capture == "window" else DriverCapture(control or output / "control.txt", shots or output / "shots")
     started = time.monotonic()
     deadline = started + timeout
     unknown_since = started
@@ -177,10 +208,12 @@ def navigate(pid, refs_directory, pad, output, timeout=1500):
                 raise GateError(12, "Circle did not return class_list to name_screen within 10s")
             try:
                 image = capture.image()
-                recent.append(image)
+                if image is not None:
+                    recent.append(image)
                 state, score = classify(image, refs)
             except GateError:
                 image, state, score = None, "unknown", 0.0
+            now = time.monotonic()
             scores_seen[state] = max(scores_seen.get(state, -1), score)
             with (output / "nav.log").open("a", encoding="utf-8") as log:
                 log.write(f"{now - started:.3f} {state} {score:.6f}\n")
@@ -222,14 +255,6 @@ def navigate(pid, refs_directory, pad, output, timeout=1500):
         raise
 
 
-def compare_capture(capture, dump):
-    with Image.open(capture) as first, Image.open(dump) as second:
-        score = float((feature(first) * feature(second)).sum())
-    if score < 0.95:
-        raise GateError(24, f"capture/dump correlation {score:.6f} below 0.95")
-    return {"correlation": score, "capture": str(capture), "dump": str(dump)}
-
-
 def contact_sheet(directory):
     directory = Path(directory)
     files = sorted(list(directory.rglob("start.png")) + list(directory.rglob("end.png"))
@@ -258,22 +283,24 @@ def main():
     screenshot = sub.add_parser("screenshot")
     screenshot.add_argument("--pid", type=int, required=True)
     screenshot.add_argument("--output", required=True)
-    compare = sub.add_parser("compare")
-    compare.add_argument("--capture", required=True)
-    compare.add_argument("--dump", required=True)
-    compare.add_argument("--output", required=True)
+    for command in (nav, screenshot):
+        command.add_argument("--capture", choices=("driver", "window"), default="driver")
+        command.add_argument("--control")
+        command.add_argument("--shots")
     contact = sub.add_parser("contact")
     contact.add_argument("directory")
     args = parser.parse_args()
     try:
         if args.command == "navigate":
-            result = navigate(args.pid, args.refs, args.pad, args.output)
+            result = navigate(args.pid, args.refs, args.pad, args.output, capture=args.capture, control=args.control, shots=args.shots)
         elif args.command == "screenshot":
-            Capture(args.pid).image().save(args.output)
+            directory = Path(args.output).parent
+            capture = Capture(args.pid) if args.capture == "window" else DriverCapture(args.control or directory / "control.txt", args.shots or directory / "shots")
+            image = capture.image()
+            if image is None:
+                raise GateError(11, "no driver screenshot within 5s")
+            image.save(args.output)
             result = {"screenshot": args.output}
-        elif args.command == "compare":
-            result = compare_capture(args.capture, args.dump)
-            write_json(args.output, result)
         else:
             result = contact_sheet(args.directory)
         print(json.dumps(result))

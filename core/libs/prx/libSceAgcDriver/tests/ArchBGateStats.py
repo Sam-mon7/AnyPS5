@@ -182,6 +182,23 @@ def alternating_block_pairing(directory):
     assert all(math.isclose(delta, math.log(2)) for delta in sequential(result, 0.02, True)["d_i"])
     verdict = alternating_verdict(directory, 3, {"alternating_m": 0.02, "mean_ms": 150})
     assert verdict["code"] == 1 and verdict["stage"] == 12
+    spaced = [{**block, "start_seq": block["start_seq"] * 1000000, "end_seq": block["end_seq"] * 1000000,
+               "min_available_memory": (400 if index < 2 else 512) * 1024 * 1024} for index, block in enumerate(blocks)]
+    interleaved = []
+    for index, line in enumerate(text.splitlines()):
+        sequence = (index + 1) * 1000000
+        interleaved.append(line.replace(f"seq={index + 1} ", f"seq={sequence} "))
+        interleaved.append(f"[archb] toggle seq={sequence + 10} t_ns={1000000001 + index * 15000000000} SCREENSHOT=1")
+    spaced_pairs = alternating_blocks(path, "\n".join(interleaved), spaced, 3)
+    assert spaced_pairs[0]["control"]["memory_pressure"] and spaced_pairs[0]["candidate"]["memory_pressure"]
+    report = sequential(spaced_pairs, alternating=True)
+    assert report["memory_pressure_blocks"] == {"control": 1, "candidate": 1}
+    assert report["pair_min_available_memory"][0] == 400 * 1024 * 1024 and report["memory_pressure"]
+    assert len(report["verdict_notes"]) == 2 and report["code"] == verdict["code"]
+    for pair in spaced_pairs:
+        pair["candidate"]["ms"] = pair["control"]["ms"]
+        pair["candidate"]["p95"] = pair["control"]["p95"]
+    assert sequential(spaced_pairs, alternating=True)["code"] == 0
     fails(lambda: alternating_blocks(path, text.replace("GATE_NOOP=1", "GATE_NOOP=0"), blocks, 3), 21)
     fails(lambda: alternating_blocks(path, text + "\n[archb] toggle refused seq=25 unknown FOO", blocks, 3), 21)
     fails(lambda: alternating_blocks(path, text.rsplit("\n", 1)[0], blocks, 3))
