@@ -39,6 +39,7 @@ def strips_inherited_aps5(directory):
 def rejects_profile_in_measured_leg(directory):
     for key in ("APS5_PROFILE_DRAW", "APS5_TRACE_SUMMARY_EVERY", "APS5_CAPTURE_FRAME", "APS5_DUMP_FRAMES", "VK_INSTANCE_LAYERS", "VK_LAYER_ENABLES", "VVL_CONFIG"):
         fails(lambda: measured_environment({key: "0"}), 24)
+    measured_environment({"APS5_ARCHB_UB_NO_LOCK_INVALIDATION": "1", "APS5_ARCHB_RECORDER": "1"})
 
 
 def switch_line_mismatch_fails(directory):
