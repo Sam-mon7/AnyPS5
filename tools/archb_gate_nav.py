@@ -310,7 +310,7 @@ def steady(rates, scene_max_fps):
     return all(abs(after - before) <= 0.2 * max(before, after) for before, after in zip(rates, rates[1:]))
 
 
-def navigate_continue(pid, pad, output, timeout=1500, capture="driver", control=None, shots=None, scene_max_fps=10.0):
+def navigate_continue(pid, pad, output, timeout=1500, capture="driver", control=None, shots=None, scene_max_fps=10.0, press_cross=True):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     telemetry = output / "videoout.jsonl"
@@ -326,7 +326,7 @@ def navigate_continue(pid, pad, output, timeout=1500, capture="driver", control=
             events = presented_events(telemetry)
             if first_frame is None and events:
                 first_frame = now
-                opening = [first_frame + 20, first_frame + 32]
+                opening = [first_frame + 20, first_frame + 32] if press_cross else []
             rates = window_rates(events)
             log.write(f"{now - started:.3f} continue presented={events[-1][1] if events else 0} rates={[round(rate, 2) for rate in rates]}\n")
             log.flush()
@@ -343,7 +343,7 @@ def navigate_continue(pid, pad, output, timeout=1500, capture="driver", control=
                     result = {"state": "continue_scene", "rates": rates, "presses": presses, "T_nav": time.monotonic() - started}
                     write_json(output / "navigation.json", result)
                     return result
-                if rates and rates[-1] >= scene_max_fps and presses < 8 and now - last_press > 60:
+                if press_cross and rates and rates[-1] >= scene_max_fps and presses < 8 and (last_press is None or now - last_press > 60):
                     press(pad, "cross", 1500, output)
                     presses, last_press = presses + 1, now
             time.sleep(2)
@@ -358,7 +358,7 @@ def main():
     nav.add_argument("--refs", required=True)
     nav.add_argument("--pad", required=True)
     nav.add_argument("--output", required=True)
-    nav.add_argument("--route", choices=("continue", "creator"), default="continue")
+    nav.add_argument("--route", choices=("continue", "auto", "creator"), default="continue")
     nav.add_argument("--scene-max-fps", type=float, default=10.0)
     screenshot = sub.add_parser("screenshot")
     screenshot.add_argument("--pid", type=int, required=True)
@@ -371,9 +371,9 @@ def main():
     contact.add_argument("directory")
     args = parser.parse_args()
     try:
-        if args.command == "navigate" and args.route == "continue":
+        if args.command == "navigate" and args.route in ("continue", "auto"):
             result = navigate_continue(args.pid, args.pad, args.output, capture=args.capture, control=args.control, shots=args.shots,
-                                       scene_max_fps=args.scene_max_fps)
+                                       scene_max_fps=args.scene_max_fps, press_cross=args.route == "continue")
         elif args.command == "navigate":
             result = navigate(args.pid, args.refs, args.pad, args.output, capture=args.capture, control=args.control, shots=args.shots)
         elif args.command == "screenshot":
