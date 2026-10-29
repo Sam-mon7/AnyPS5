@@ -177,7 +177,7 @@ def alternating_block_pairing(directory):
     path, text, blocks, events = alternating_fixture(directory)
     result = alternating_blocks(path, text, blocks, 3)
     assert len(result) == 12
-    assert all(pair["control"]["ms"] == 100 and pair["candidate"]["ms"] == 200 for pair in result)
+    assert all(math.isclose(pair["control"]["ms"], 100) and math.isclose(pair["candidate"]["ms"], 200) for pair in result)
     assert result[1]["candidate"]["toggle_ns"] < result[1]["control"]["toggle_ns"]
     assert all(math.isclose(delta, math.log(2)) for delta in sequential(result, 0.02, True)["d_i"])
     verdict = alternating_verdict(directory, 3, {"alternating_m": 0.02, "mean_ms": 150})
@@ -360,7 +360,7 @@ def ub_experiment_report(directory):
                     "archb": {"frames": 1, "phases_ms": {"queue0": {"proof": 999999}}}})
     (Path(directory) / "aps5-summary.jsonl").write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
     result = ub_experiment(directory, "UB_TRUST_PROOFS", ["UB_TRUST_PROOFS"])
-    assert result["frame_time_ratio"] == 2
+    assert math.isclose(result["frame_time_ratio"], 2)
     assert result["frame_time_ratio_90_interval"] == [2, 2]
     assert math.isclose(result["presented_fps"]["control"], 10) and math.isclose(result["presented_fps"]["candidate"], 5)
     assert result["hits"] == {"ub_trust_proofs_hits": 1234}
@@ -375,11 +375,14 @@ def ub_experiment_report(directory):
         if block["role"] != "candidate":
             continue
         start = 1000000000 + index * 15000000000
+        step = 100000 if (index // 2) % 2 else -100000
         shift = 0
         for event in events:
             if start + 3000000000 <= event["t_ns"] < start + 15000000000:
-                event["t_ns"] += shift * (100000 if (index // 2) % 2 else -100000)
+                event["t_ns"] += shift * step
                 shift += 1
+            elif event["t_ns"] >= start + 15000000000:
+                event["t_ns"] += shift * step
     path.write_text("\n".join(map(json.dumps, events)) + "\n", encoding="utf-8")
     varied = ub_experiment(directory, "UB_TRUST_PROOFS", ["UB_TRUST_PROOFS"])
     deltas = varied["d_i"]
