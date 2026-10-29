@@ -37,6 +37,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::TestDependent, "TEST_DEPENDENT", true, false, TestPrerequisites},
     {Feature::TestRuntimeDependent, "TEST_RUNTIME_DEPENDENT", false, true, TestRuntimePrerequisites},
 #endif
+    {Feature::FixStructuralDrawKeys, "FIX_STRUCTURAL_DRAW_KEYS", false, true, {}},
     {Feature::UbTrustProofs, "UB_TRUST_PROOFS", false, true, {}},
     {Feature::UbNoLockInvalidation, "UB_NO_LOCK_INVALIDATION", false, true, {}},
     {Feature::UbPointerFreeDrawKeys, "UB_POINTER_FREE_DRAW_KEYS", false, true, {}},

@@ -37,6 +37,17 @@ struct DrawProgram {
     std::uint32_t hiddenUserWords = 0;
 };
 
+struct DrawKeyProof {
+    std::vector<std::uint32_t> userWords;
+    std::vector<std::uint8_t> userClasses, capturedClasses;
+    std::uint64_t runtimeWords = 0, pointerWords = 0;
+    bool complete = false;
+};
+
+void RecordDrawKeyProof(DispatchVariant& variant, const DrawProgram& program, const ShaderRecompiler::ResourceCapture& capture, bool eligible);
+std::shared_ptr<DispatchVariant> StructuralDrawVariant(const std::shared_ptr<DispatchVariant>& variant, const DrawProgram& program);
+void CountDrawFragmentDifferences(const DispatchVariant& variant);
+
 struct DrawDecode {
     Graphics::State state;
     ShaderRecompiler::ShaderPixelStageInfo pixel;

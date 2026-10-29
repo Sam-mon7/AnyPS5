@@ -686,6 +686,9 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     const auto waitedBefore = profile ? WaitedMs() : 0.0;
     const auto started = std::chrono::steady_clock::now();
     ShaderRecompiler::SrtRuntime runtime;
+    ShaderRecompiler::SrtReadTrace trace;
+    trace.profile = traceResourceReads;
+    runtime.readTrace = traceResourceReads ? &trace : nullptr;
     runtime.userData = request.context.userData;
     runtime.shaderBase = request.shader.codeAddress;
     runtime.userContext = this;

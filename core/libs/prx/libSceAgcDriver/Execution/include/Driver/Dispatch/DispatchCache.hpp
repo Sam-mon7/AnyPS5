@@ -30,7 +30,10 @@ namespace AgcDriver::DriverDetail {
 
 inline constexpr std::size_t MaxDispatchVariants = 8;
 
+struct DrawKeyProof;
+
 struct DispatchVariant {
+    std::shared_ptr<const DrawKeyProof> drawKeyProof;
 
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
     std::vector<std::uint32_t> words;

@@ -264,6 +264,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawDecode.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawLookup.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawStructuralKeys.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
@@ -3741,6 +3742,21 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_draw_cache_reuse_inline PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=0;APS5_VERIFY_DRAW_RECIPE=1;APS5_VERIFY_REGISTER_KEYS=1" SKIP_RETURN_CODE 77)
     set_tests_properties(agc_driver_draw_cache_reuse agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
     set_property(TEST agc_driver_draw_cache_reuse agc_driver_draw_cache_reuse_off APPEND PROPERTY ENVIRONMENT "APS5_VERIFY_DRAW_RECIPE=1" "APS5_VERIFY_REGISTER_KEYS=1")
+    foreach(drawKeysCase IN ITEMS pointer scalar descriptor captured_descriptor moved_descriptor toggle pointer_pipeline pointer_no_gpl proof)
+        set(drawKeysTest agc_archb_fix_drawkeys_${drawKeysCase})
+        string(REGEX REPLACE "_pipeline$|_no_gpl$" "" drawKeysMode ${drawKeysCase})
+        add_test(NAME ${drawKeysTest} COMMAND agc_driver_draw_data_hit_user_words_tests --structural ${drawKeysMode})
+        set_tests_properties(${drawKeysTest} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_FIX_STRUCTURAL_DRAW_KEYS=1;APS5_ARCHB_RECORDER=1;APS5_ARCHB_GATE_RUN=1")
+        if(drawKeysCase MATCHES "_pipeline$")
+            set_property(TEST ${drawKeysTest} APPEND PROPERTY ENVIRONMENT "APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=32;APS5_PIPELINE_DISPATCH=1")
+        elseif(drawKeysCase MATCHES "_no_gpl$")
+            set_property(TEST ${drawKeysTest} APPEND PROPERTY ENVIRONMENT "APS5_NO_GPL=1")
+        endif()
+        if(WIN32)
+            set_tests_properties(${drawKeysTest} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_driver_draw_data_hit_user_words_verify COMMAND agc_driver_draw_data_hit_user_words_tests)
     set_tests_properties(agc_driver_draw_data_hit_user_words_verify PROPERTIES ENVIRONMENT "APS5_VERIFY_DRAW_DATA_HITS=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_driver_draw_data_hit_user_words_refresh COMMAND agc_driver_draw_data_hit_user_words_tests)

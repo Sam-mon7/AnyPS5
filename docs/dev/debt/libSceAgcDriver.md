@@ -7,6 +7,8 @@
 
 ### Unknown function info
 
+- [Structural draw keys](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawStructuralKeys.cpp) remain opt-in under `APS5_ARCHB_FIX_STRUCTURAL_DRAW_KEYS`. Changed descriptor contents, vertex-fetch inputs, indirect or merged stages, specialization-memory plans, untracked pointer arithmetic and changed pointer high words retain the full capture path. Only tracked low-word pointer relocation with equal structural capture words and compiler-forwarded runtime scalars is accepted. Live title coverage and performance remain unverified.
+
 - [Presentation counters](../../../core/libs/prx/libSceAgcDriver/Execution/include/PresentCounterBook.hpp) have unit coverage for failed acquires and successful queue results, but the driver test seam cannot inject acquire failures without a window. Device-level out-of-date and unavailable-image accounting still needs live verification.
 - [Arch-B upper-bound switches](../../../core/libs/prx/libSceAgcDriver/Execution/src/ArchB/Switches.cpp) deliberately skip resource proofs, GPU-lock invalidation, draw user-data key checks or CPU indirect draws. They can render incorrectly, crash or lose the device; all five default off and exist only for measurement on this branch. Live switch-off rendering equivalence, experiment stability and recorder attribution require verification after integration.
 

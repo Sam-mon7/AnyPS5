@@ -8,9 +8,10 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool structuralKeys) {
     PerformanceTimer recorderTiming("Driver.DrawLookup", ArchB::Recorder::Phase::Proof);
     using Role = ShaderRecompiler::ProgramRole;
+    if (structuralKeys && (!useDrawEntries || !registerKey || pointerFree)) ArchB::Recorder::Count("fix_drawkeys_refused_cache");
     if (useDrawEntries) {
         if (pointerFree) ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbPointerFreeDrawKeys);
         if (!registerKey) {
@@ -113,6 +114,28 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             else ++drawEntryCounters.absent;
             maybeReportDrawCache(profile);
         }
+        bool structuralEntry = false;
+        if (structuralKeys && entry == nullptr && dataEntry == nullptr) ArchB::Recorder::Count("fix_drawkeys_refused_no_candidate");
+        if (structuralKeys && !pointerFree && entry == nullptr && dataEntry != nullptr) {
+            if (!registerKey || drawParameters.indirect || graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList || graphics.stages.mesh || graphics.stages.tessellation || dataEntry->stages.size() != programs.size()) {
+                ArchB::Recorder::Count("fix_drawkeys_refused_path");
+            } else {
+                auto candidate = std::make_shared<DrawEntry>();
+                candidate->decode = dataEntry->decode;
+                candidate->stages.resize(programs.size());
+                bool complete = true;
+                for (std::size_t i = 0; i < programs.size(); ++i) {
+                    for (const auto& variant : dataEntry->stages[i]) {
+                        if (auto refreshed = StructuralDrawVariant(variant, programs[i])) candidate->stages[i].push_back(std::move(refreshed));
+                    }
+                    complete &= !candidate->stages[i].empty();
+                }
+                if (complete) {
+                    entry = std::move(candidate);
+                    structuralEntry = true;
+                }
+            }
+        }
         if (entry == nullptr) ArchB::Recorder::Count("draw_cache_miss_absent");
         if (entry != nullptr) {
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
@@ -120,7 +143,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::vector<std::size_t> ranks(programs.size(), 0);
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, dataStages = 0, dataWords = 0;
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
-            auto* live = drawStageDataHits() ? &liveData : nullptr;
+            auto* live = drawStageDataHits() || structuralEntry ? &liveData : nullptr;
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
             std::uint32_t cursor = 0;
@@ -173,6 +196,10 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             ++dataStages;
                             dataWords += liveData.size();
                         }
+                        if (structuralEntry && result == EntryOutcome::Equal) {
+                            stageData[i].words = variant->words;
+                            stageData[i].compiled = variant->compiled;
+                        }
                         matched[i] = variant;
                         ranks[i] = rank;
                         ++stageEqual;
@@ -183,9 +210,14 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (!anyLayout) miss = DrawMiss::Layout;
                     else if (outcome != EntryOutcome::Differing) miss = DrawMiss::Gate;
                     else miss = roles[i] == Role::Fragment ? DrawMiss::FragmentDiffering : i == 0 ? DrawMiss::FrontDiffering : DrawMiss::OtherDiffering;
+                    if (!structuralEntry && miss == DrawMiss::FragmentDiffering) {
+                        const auto near = std::find_if(variants.begin(), variants.end(), [&](const auto& variant) { return variant->pushOffset == cursor; });
+                        if (near != variants.end()) CountDrawFragmentDifferences(**near);
+                    }
                 }
             }
             drawHit = !miss;
+            if (structuralEntry) ArchB::Recorder::Count(drawHit ? "fix_drawkeys_structural_hits" : *miss == DrawMiss::Gate ? "fix_drawkeys_refused_gate" : "fix_drawkeys_refused_capture");
             constexpr const char* recorderMisses[] = {"draw_cache_miss_front", "draw_cache_miss_fragment", "draw_cache_miss_other", "draw_cache_miss_layout", "draw_cache_miss_gate", "draw_cache_miss_stages"};
             ArchB::Recorder::Count(miss ? recorderMisses[static_cast<std::size_t>(*miss)] : "draw_cache_hits");
             std::lock_guard cacheLock(drawCacheMutex);

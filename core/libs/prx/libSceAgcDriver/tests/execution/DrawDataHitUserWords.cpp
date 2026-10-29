@@ -1,8 +1,15 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <thread>
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -258,9 +265,184 @@ void DirectBufferBaseMovesWithItsPayload() {
     Require(after.dataStagesCompiled - before.dataStagesCompiled >= 1, "a draw whose descriptor base moved reused the pixel stage built for the old base: the rebuild this test documents is gone, flip it to a reuse check (" + Counts(after) + ", before: " + Counts(before) + ")");
 }
 
+
+void StructuralProofRefusals() {
+    using namespace AgcDriver::DriverDetail;
+    DrawProgram program{};
+    program.binary.stage = ShaderRecompiler::ShaderStage::Fragment;
+    program.firstUserSgpr = 0;
+    program.userData = {0x1000};
+    auto plan = std::make_shared<ShaderRecompiler::IrResourcePlan>();
+    plan->resourceTrackingComplete = plan->srtPlanComplete = true;
+    ShaderRecompiler::ResourceCapture capture;
+    capture.plan = plan;
+    capture.snapshot.userData = program.userData;
+    capture.userDataUse.asBase = 1;
+    capture.readTrace.profile = true;
+    auto compiled = std::make_shared<ShaderRecompiler::RecompileResult>();
+    compiled->userDataRegisterReads = 1;
+    compiled->memoryOffsetDword = compiled->shaderDataDwords = 1;
+    compiled->pushConstants.resize(sizeof(std::uint32_t));
+    std::memcpy(compiled->pushConstants.data(), program.userData.data(), sizeof(std::uint32_t));
+    auto variant = std::make_shared<DispatchVariant>();
+    variant->compiled = compiled;
+    variant->runs = {{0x1000, 0x1004}};
+    variant->runBases = {0};
+    variant->relocatableWords = 1;
+    variant->words = {0};
+    auto current = program;
+    current.userData[0] = 0x2000;
+    RecordDrawKeyProof(*variant, program, capture, true);
+    Require(StructuralDrawVariant(variant, current) == nullptr, "missing push mapping accepted a forwarded pointer");
+    compiled->shaderDataUserWords = {0};
+    RecordDrawKeyProof(*variant, program, capture, true);
+    const auto refreshed = StructuralDrawVariant(variant, current);
+    Require(refreshed != nullptr && refreshed->runs.front().first == 0x2000 && variant->runs.front().first == 0x1000, "relocation mutated the cached ranges");
+    std::uint32_t pushed = 0, original = 0;
+    std::memcpy(&pushed, refreshed->compiled->pushConstants.data(), sizeof(pushed));
+    std::memcpy(&original, variant->compiled->pushConstants.data(), sizeof(original));
+    Require(pushed == 0x2000 && original == 0x1000, "forwarded pointer was stale or mutated the cached result");
+    plan->requiresSpecializationMemory = true;
+    RecordDrawKeyProof(*variant, program, capture, true);
+    Require(StructuralDrawVariant(variant, current) == nullptr, "specialization memory accepted runtime word elision");
+    plan->requiresSpecializationMemory = false;
+    plan->resourceTrackingComplete = false;
+    RecordDrawKeyProof(*variant, program, capture, true);
+    Require(StructuralDrawVariant(variant, current) == nullptr, "incomplete resource tracking accepted runtime word elision");
+    plan->resourceTrackingComplete = true;
+    RecordDrawKeyProof(*variant, program, capture, false);
+    Require(StructuralDrawVariant(variant, current) == nullptr, "vertex fetch decode accepted runtime word elision");
 }
 
-int main() {
+void StructuralDrawKeys(const std::string& mode, const std::filesystem::path& control) {
+    using AgcDriver::DriverDetail::Driver;
+    using AgcDriver::ArchB::Recorder;
+    using AgcDriver::ArchB::Switches;
+    using AgcDriver::ArchB::Feature;
+    Recorder::Boundary(true, Switches::Sequence(), Recorder::Clock::now());
+    const auto entry = std::find_if(Switches::Table().begin(), Switches::Table().end(), [](const auto& info) { return info.feature == Feature::FixStructuralDrawKeys; });
+    Require(entry != Switches::Table().end() && !entry->defaultOn && entry->runtime && entry->prerequisites.empty(), "structural draw switch contract");
+    if (mode == "proof") {
+        StructuralProofRefusals();
+        return;
+    }
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(ArithmeticPixelHeader, ArithmeticPixelCode.data(), sizeof(ArithmeticPixelCode), 1);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    Registered(DirectBufferPixelHeader, DirectBufferPixelCode.data(), sizeof(DirectBufferPixelCode), 1);
+    auto* block = GuestBlock();
+    auto* first = block + 1024;
+    auto* second = block + 2048;
+    first[0] = std::bit_cast<std::uint32_t>(0.25f);
+    second[0] = std::bit_cast<std::uint32_t>(0.5f);
+    const auto counts = [&] { return Driver::Get().DrawCacheCounters(); };
+    const auto color = [&](unsigned expected) {
+        const auto actual = BrightestColorByte();
+        Require(actual + 2 >= expected && actual <= expected + 2, "structural draw output " + std::to_string(actual) + ", expected " + std::to_string(expected));
+    };
+    const auto scalarDraw = [&](const std::uint32_t* pointer, float scalar, bool setup = false) {
+        auto commands = setup ? Setup(true) : std::vector<std::uint32_t>{};
+        PixelUserData(commands, pointer, std::bit_cast<std::uint32_t>(scalar));
+        Append(commands, 0x2d, {3, 2});
+        return Submit(std::move(commands));
+    };
+    const auto toggle = [&](std::uint64_t sequence, bool enabled) {
+        std::ofstream(control, std::ios::trunc) << sequence << " FIX_STRUCTURAL_DRAW_KEYS=" << (enabled ? 1 : 0) << '\n';
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        Switches::PollControl();
+        Require(Switches::Enabled(Feature::FixStructuralDrawKeys) == enabled, "runtime toggle did not apply");
+    };
+    if (mode == "pointer" || mode == "scalar" || mode == "toggle") {
+        scalarDraw(first, 0.125f, true);
+        scalarDraw(first, 0.125f);
+        scalarDraw(first, 0.125f);
+        color(96);
+        const auto before = counts();
+        if (mode == "scalar") {
+            scalarDraw(first, 0.5f);
+            color(191);
+        } else {
+            scalarDraw(second, 0.125f);
+            color(159);
+        }
+        Require(counts().hits == before.hits + 1, "runtime-only change did not hit the structural key");
+        second[0] = std::bit_cast<std::uint32_t>(0.75f);
+        scalarDraw(second, 0.125f);
+        color(223);
+        scalarDraw(first, 0.125f);
+        color(96);
+        if (mode == "toggle") {
+            toggle(1, false);
+            const auto off = counts();
+            scalarDraw(second + 1, 0.125f);
+            color(32);
+            Require(counts().hits == off.hits, "off path consumed a structural entry");
+            toggle(2, true);
+            const auto on = counts();
+            scalarDraw(second + 2, 0.125f);
+            color(32);
+            Require(counts().hits == on.hits + 1, "on path failed after an intervening off draw");
+            toggle(3, false);
+            first[0] = std::bit_cast<std::uint32_t>(0.5f);
+            scalarDraw(first, 0.125f);
+            color(159);
+        }
+        const auto snapshot = Recorder::Collect(Recorder::Clock::now());
+        Require(snapshot.counters.contains("fix_drawkeys_structural_hits") && snapshot.counters.at("fix_drawkeys_structural_hits") > 0, "structural hit counter was not recorded");
+        std::cout << snapshot.Json() << '\n';
+        return;
+    }
+    const auto descriptor = [](std::uint32_t* words, const std::uint32_t* data) {
+        const auto address = reinterpret_cast<std::uintptr_t>(data);
+        words[0] = static_cast<std::uint32_t>(address);
+        words[1] = static_cast<std::uint32_t>(address >> 32u) & 0xffffu;
+        words[2] = 16;
+        words[3] = 0x3004bfacu;
+    };
+    descriptor(block, first);
+    const bool direct = mode == "descriptor";
+    auto* table = block;
+    const auto draw = [&](bool setup = false) {
+        auto commands = setup ? Setup(true, direct ? DirectBufferPixelCode.data() : PixelCode.data(), direct ? 4 : 3) : std::vector<std::uint32_t>{};
+        if (direct) {
+            for (std::uint32_t word = 0; word < 4; ++word) Append(commands, 0x76, {0x00c + word, block[word]});
+        } else PixelUserData(commands, table, 0);
+        Append(commands, 0x2d, {3, 2});
+        return Submit(std::move(commands));
+    };
+    draw(true);
+    draw();
+    draw();
+    color(64);
+    const auto before = counts();
+    if (mode == "moved_descriptor") table = block + 16;
+    descriptor(table, second);
+    if (direct) block[1] |= 4u << 16u;
+    draw();
+    color(128);
+    Require(counts().hits == before.hits, "changed resource descriptor reused a structural draw");
+    const auto snapshot = Recorder::Collect(Recorder::Clock::now());
+    std::cout << snapshot.Json() << '\n';
+    const char* counter = direct ? "fix_drawkeys_refused_structural_word" : mode == "moved_descriptor" ? "fix_drawkeys_refused_capture" : "fix_drawkeys_fragment_descriptor_words";
+    Require(snapshot.counters.contains(counter) && snapshot.counters.at(counter) > 0, std::string("missing refusal/classification counter: ") + counter);
+}
+
+}
+
+int main(int argc, char** argv) {
+    const bool structural = argc == 3 && std::string(argv[1]) == "--structural";
+    const auto control = std::filesystem::temp_directory_path() / ("drawkeys-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code error; std::filesystem::remove(path, error); }
+    } cleanup{control};
+    if (structural) {
+#ifdef _WIN32
+        _putenv_s("APS5_ARCHB_CONTROL_FILE", control.string().c_str());
+#else
+        setenv("APS5_ARCHB_CONTROL_FILE", control.string().c_str(), 1);
+#endif
+    }
     try {
         bool libraries = false;
         {
@@ -269,6 +451,11 @@ int main() {
             libraries = device->GraphicsPipelineLibraries();
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
+        if (structural) {
+            StructuralDrawKeys(argv[2], control);
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
         const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
         UnreadUserWordsKeepTheStage(verify);
         ReadUserWordsChangeTheOutput();

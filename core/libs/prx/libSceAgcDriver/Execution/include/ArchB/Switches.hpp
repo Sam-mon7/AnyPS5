@@ -15,6 +15,7 @@ enum class Feature : std::uint8_t {
     TestDependent,
     TestRuntimeDependent,
 #endif
+    FixStructuralDrawKeys,
     UbTrustProofs,
     UbNoLockInvalidation,
     UbPointerFreeDrawKeys,
