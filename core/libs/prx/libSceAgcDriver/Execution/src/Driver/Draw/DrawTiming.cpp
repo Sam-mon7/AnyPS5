@@ -56,6 +56,8 @@ void Driver::reportDrawShaders() {
                       static_cast<unsigned long long>(row.draws), static_cast<unsigned long long>(row.drawn), static_cast<unsigned long long>(row.captures), rowMs(&row), row.commitMs, row.draws == 0 ? 0.0 : rowMs(&row) * 1000 / static_cast<double>(row.draws),
                       DrawDriverPhaseNames[order[0]], row.ms[order[0]], DrawDriverPhaseNames[order[1]], row.ms[order[1]], DrawDriverPhaseNames[order[2]], row.ms[order[2]]);
         report += text;
+        std::snprintf(text, sizeof(text), "; code=%016llx", static_cast<unsigned long long>(row.identity.digest));
+        report += text;
         report += "; cache";
         for (std::size_t outcome = 0; outcome < DrawCacheOutcomeCount; ++outcome) {
             if (row.cache[outcome] == 0) continue;

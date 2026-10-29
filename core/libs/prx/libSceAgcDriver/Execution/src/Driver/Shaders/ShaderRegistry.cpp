@@ -88,6 +88,15 @@ void DrainShaderWrites(std::uint64_t address, std::size_t bytes) {
 
 }
 
+std::uint64_t ShaderSnapshot::CodeDigest() const {
+    auto value = prepared->recorderDigest.load(std::memory_order_relaxed);
+    if (value == 0) {
+        value = ArchB::Recorder::Digest(code);
+        prepared->recorderDigest.store(value, std::memory_order_relaxed);
+    }
+    return value;
+}
+
 std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
     GuestMemory::CheckRange(reinterpret_cast<const void*>(address), sizeof(std::uint32_t), 256);
     static std::mutex cacheMutex;
@@ -1490,7 +1499,7 @@ public:
         static auto* pool = [] {
             const char* text = std::getenv("APS5_PREBUILD_THREADS");
             std::lock_guard lifecycle(Lifecycle());
-            auto* created = new RegistrationPreparePool(Closing() ? 0u : text != nullptr ? std::max(1u, static_cast<unsigned>(std::strtoul(text, nullptr, 10))) : 1u);
+            auto* created = new RegistrationPreparePool(Closing() ? 0u : text != nullptr ? std::max(1u, static_cast<unsigned>(std::strtoul(text, nullptr, 10))) : 1u, "pipeline builder");
             PrebuildSlot().store(created);
             return created;
         }();
@@ -1608,7 +1617,7 @@ private:
     }
 #endif
 
-    explicit RegistrationPreparePool(unsigned count) {
+    explicit RegistrationPreparePool(unsigned count, const char* role = "shader prepare") : role(role) {
 #ifdef _WIN32
         for (unsigned index = 0; index < count; ++index) {
             unsigned id = 0;
@@ -1644,7 +1653,8 @@ private:
 
     static void* Main(void* argument) {
         auto& pool = *static_cast<RegistrationPreparePool*>(argument);
-        if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("shader prepare", TraceThread::DefaultCapacity / 8);
+        const auto role = std::string(pool.role) + " " + std::to_string(pool.nextThread.fetch_add(1, std::memory_order_relaxed));
+        PerformanceTrace::BindThread(role.c_str(), TraceThread::DefaultCapacity / 8);
         for (;;) {
             Task task;
             {
@@ -1659,7 +1669,10 @@ private:
                 ++pool.running;
             }
             const auto sequence = task.sequence;
-            task.function();
+            {
+                PerformanceTimer recorderTiming("Shader.PrepareTask");
+                task.function();
+            }
             task = {};
             bool drained = false;
             {
@@ -1687,6 +1700,8 @@ private:
     std::condition_variable idle;
     std::deque<Task> tasks;
     std::vector<Worker> workers;
+    const char* role;
+    std::atomic<unsigned> nextThread{0};
     unsigned threads = 0;
     inline static std::atomic<unsigned> liveWorkers{0};
     unsigned running = 0;
@@ -1851,7 +1866,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
 namespace {
 
 void BindTitleThread() {
-    if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("title", TraceThread::DefaultCapacity / 8);
+    PerformanceTrace::BindThread("title", TraceThread::DefaultCapacity / 8);
 }
 
 }

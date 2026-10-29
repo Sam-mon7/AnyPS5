@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -7,6 +8,7 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters) {
+    PerformanceTimer recorderTiming("Driver.DrawLookup", ArchB::Recorder::Phase::Proof);
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
         if (!registerKey) {
@@ -109,6 +111,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             else ++drawEntryCounters.absent;
             maybeReportDrawCache(profile);
         }
+        if (entry == nullptr) ArchB::Recorder::Count("draw_cache_miss_absent");
         if (entry != nullptr) {
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             std::optional<DrawMiss> miss;
@@ -181,6 +184,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
             }
             drawHit = !miss;
+            constexpr const char* recorderMisses[] = {"draw_cache_miss_front", "draw_cache_miss_fragment", "draw_cache_miss_other", "draw_cache_miss_layout", "draw_cache_miss_gate", "draw_cache_miss_stages"};
+            ArchB::Recorder::Count(miss ? recorderMisses[static_cast<std::size_t>(*miss)] : "draw_cache_hits");
             std::lock_guard cacheLock(drawCacheMutex);
             auto& counters = drawEntryCounters;
             counters.stageValidations += stageValidations;

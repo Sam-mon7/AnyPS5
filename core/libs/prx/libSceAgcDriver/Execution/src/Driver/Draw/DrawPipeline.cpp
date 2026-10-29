@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -375,6 +376,9 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
+    static std::atomic<std::uint64_t> recorderCommits{0};
+    static const bool registered = [] { ArchB::Recorder::RegisterCounter("draw_pipeline_commits", recorderCommits); return true; }();
+    static_cast<void>(registered);
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
@@ -415,6 +419,7 @@ void DrawPipeline::run() {
         items.pop_front();
         retiredItems.fetch_add(1, std::memory_order_release);
         ++commits;
+        recorderCommits.fetch_add(1, std::memory_order_relaxed);
         commitNs += spent;
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;

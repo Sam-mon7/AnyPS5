@@ -84,7 +84,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         std::uint64_t begin;
         ~TimelinePresent() { if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::PresentEnd, begin); }
     } timelinePresent{timelineBegin};
-    if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
+    PerformanceTrace::Present(window.width, window.height, device.Load().get());
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");
     static thread_local bool pinned = false;

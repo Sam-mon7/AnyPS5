@@ -27,6 +27,7 @@ enum DrawCacheOutcome : std::uint8_t { CacheNotLookedUp, CacheNoRegisterKey, Cac
 inline constexpr const char* DrawCacheOutcomeNames[DrawCacheOutcomeCount] = {"not looked up", "no register key", "no entry", "hit", "miss front", "miss fragment", "miss other", "miss layout", "miss gate", "miss stage count"};
 
 struct DrawProgramIdentity {
+    std::uint64_t digest = 0;
     std::array<std::uint64_t, DrawProfilePrograms> code{};
     std::array<std::uint8_t, DrawProfilePrograms> stage{};
     std::uint8_t programs = 0;

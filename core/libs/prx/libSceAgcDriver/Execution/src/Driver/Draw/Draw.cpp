@@ -123,6 +123,7 @@ std::string_view TrimmedReason(std::string_view reason) {
 
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
+    ArchB::Recorder::Key recorderKey;
     bool profile = false;
     DrawCacheOutcome cacheOutcome = CacheNotLookedUp;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
@@ -266,13 +267,22 @@ struct DrawLockTiming {
 
 void noteFinisherHandOff(bool handed) {
     static std::atomic<std::uint64_t> handedOff{0}, kept{0};
+    static std::atomic<std::uint64_t> reportedHanded{0}, reportedKept{0};
+    static const bool registered = [] {
+        ArchB::Recorder::RegisterCounter("finisher_handoffs", handedOff);
+        ArchB::Recorder::RegisterCounter("finisher_inline", kept);
+        return true;
+    }();
+    static_cast<void>(registered);
     static std::atomic<std::int64_t> reportedAt{0};
     (handed ? handedOff : kept).fetch_add(1, std::memory_order_relaxed);
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!stats) return;
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
-    AgcDriver::ProfilePrint_nid_no_patch("[finisher] draws (10 s): %llu handed to the draw finisher, %llu finished on the worker%s\n", static_cast<unsigned long long>(handedOff.exchange(0)), static_cast<unsigned long long>(kept.exchange(0)), DrawFinisher::DrainText().c_str());
+    const auto handedNow = handedOff.load(std::memory_order_relaxed);
+    const auto keptNow = kept.load(std::memory_order_relaxed);
+    AgcDriver::ProfilePrint_nid_no_patch("[finisher] draws (10 s): %llu handed to the draw finisher, %llu finished on the worker%s\n", static_cast<unsigned long long>(handedNow - reportedHanded.exchange(handedNow)), static_cast<unsigned long long>(keptNow - reportedKept.exchange(keptNow)), DrawFinisher::DrainText().c_str());
 }
 
 }
@@ -376,9 +386,20 @@ bool EmptyIndirectSkip() {
     return enabled;
 }
 
+ArchB::Recorder::Key RecorderProgramKey(const std::vector<DrawProgram>& programs) {
+    std::uint64_t digest = 0xcbf29ce484222325ull ^ programs.size();
+    for (const auto& program : programs) {
+        digest = (digest ^ program.snapshot->CodeDigest()) * 0x100000001b3ull;
+        digest = (digest ^ program.codeOffset) * 0x100000001b3ull;
+        digest = (digest ^ static_cast<std::uint64_t>(program.binary.stage)) * 0x100000001b3ull;
+    }
+    return {ArchB::Recorder::Kind::Draw, digest};
+}
+
 DrawProgramIdentity ProgramIdentity(const std::vector<DrawProgram>* programs) {
     DrawProgramIdentity identity;
     if (programs == nullptr || !DrawShaderProfileEnabled()) return identity;
+    identity.digest = RecorderProgramKey(*programs).code;
     for (const auto& program : *programs) {
         if (identity.programs == DrawProfilePrograms) break;
         identity.code[identity.programs] = program.binary.codeAddress;
@@ -397,6 +418,7 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
+    ArchB::Recorder::Work recorderWork;
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto tailHolder = std::make_shared<DrawTail>();
@@ -625,6 +647,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     for (const auto& patch : userPatches) writablePrograms[patch.program].userData[patch.index] = patch.value;
     tail.programs = writesPrograms ? &writablePrograms : &decode->programs;
     const auto& programs = *tail.programs;
+    if (ArchB::Recorder::Enabled()) {
+        tail.recorderKey = RecorderProgramKey(programs);
+        recorderWork.SetKey(tail.recorderKey);
+    }
     if (std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return SkippedShader(program.binary.codeAddress); })) return drawn();
     static const bool fromBase = std::getenv("APS5_NO_INDIRECT_BUILTIN_OFFSETS") == nullptr;
     const bool emptyIndirectSkip = EmptyIndirectSkip() && !(fromBase && drawParameters.indexed);
@@ -867,6 +893,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             auto& job = *tailHolder;
             DrawPipeline::FollowEpoch(job.epoch);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
+            ArchB::Recorder::Work recorderWork(job.recorderKey, ArchB::Recorder::Phase::Prepare, false);
             PerformanceTimer finishTiming("Driver.DrawFinish");
             try {
                 if (finishDraw(job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
@@ -1323,7 +1350,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = tail.packetOpcode;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-                auto commit = [this, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+                auto commit = [this, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+                    ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
+                    PerformanceTimer recorderTiming("Driver.DrawCommit");
                     DrawPipeline::FollowEpoch(epoch);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
                     const auto committing = identity.programs != 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1372,7 +1401,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto commitPacket = tail.packetOpcode;
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+        auto commit = [this, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+            ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
+            PerformanceTimer recorderTiming("Driver.DrawCommit");
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             const auto committing = identity.programs != 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

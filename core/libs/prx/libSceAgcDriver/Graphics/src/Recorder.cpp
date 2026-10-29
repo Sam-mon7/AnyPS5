@@ -3955,6 +3955,7 @@ void Recorder::HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value) {
 void Recorder::Submit() {
     EndComputeChain();
     PerformanceTimer frameTiming("Recorder.Submit");
+    AgcDriver::ArchB::Recorder::Count("flushes");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
     // count behind, and the callers that act on it would otherwise take the mutex for nothing at

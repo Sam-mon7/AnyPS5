@@ -2791,7 +2791,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     if (state.quadList || StripPatches(state, shaders)) recipeOut = nullptr;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
-    auto& timing = prepared.timing.emplace("Graphics.Draw");
+    auto& timing = prepared.timing.emplace("Graphics.Draw", AgcDriver::ArchB::Recorder::Phase::Prepare);
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& timer = prepared.timer;
@@ -3147,6 +3147,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     static AgcDriver::Mutex dumpMutex;
     static std::map<std::uint64_t, int> dumped;
     auto& timing = *prepared.timing;
+    timing.Mark("prepare_complete");
+    timing.RecorderPhase(AgcDriver::ArchB::Recorder::Phase::Record);
     auto& timer = prepared.timer;
     auto& outcome = prepared.outcome;
     const auto* built = prepared.built;
@@ -3596,7 +3598,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
-    PerformanceTimer timing("Graphics.DrawWithRecipe");
+    PerformanceTimer timing("Graphics.DrawWithRecipe", AgcDriver::ArchB::Recorder::Phase::Record);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
     DrawRecipeOutcome result;

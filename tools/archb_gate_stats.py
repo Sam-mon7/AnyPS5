@@ -195,7 +195,80 @@ def final_verdict(legs):
     return {"code": 0 if passed else 1, "verdict": "pass" if passed else "fail", "legs": legs, "stage": 3}
 
 
+def recorder_diagnostics(directory):
+    directory = Path(directory)
+    path = directory / "aps5-summary.jsonl"
+    if not path.is_file():
+        return None
+    records = [item["archb"] for line in path.read_text(encoding="utf-8").splitlines()
+               if "archb" in (item := json.loads(line))]
+    if not records:
+        return None
+    window = read_json(directory / "hold.json") if (directory / "hold.json").is_file() else None
+    config = read_json(directory / "recorder-config.json") if (directory / "recorder-config.json").is_file() else {}
+    blocks = read_json(directory / "blocks.json") if (directory / "blocks.json").is_file() else None
+    selected = []
+    toggles = {}
+    if blocks is not None:
+        text = (directory / "stderr.log").read_text(encoding="utf-8", errors="replace")
+        for match in re.finditer(r"^\[archb\] toggle seq=(\d+) t_ns=(\d+)((?: [A-Z][A-Z0-9_]*=[0-9]+)+)$", text, re.M):
+            toggles[int(match[1])] = (int(match[2]), dict(re.findall(r"([A-Z][A-Z0-9_]*)=([0-9]+)", match[3])))
+    for record in records:
+        if record.get("recorder_toggled", True) or not record.get("recorder_enabled", False):
+            continue
+        start, end = record["start_ns"], record["end_ns"]
+        if end <= start or record["frames"] <= 0:
+            continue
+        if window is not None and (start < window["start_ns"] or end > window["end_ns"]):
+            continue
+        if blocks is not None:
+            block = next((block for block in blocks if block["role"] == "candidate"
+                          and block["start_seq"] == record["toggle_seq"]), None)
+            if block is None:
+                continue
+            begin, finish = toggles.get(block["start_seq"]), toggles.get(block["end_seq"])
+            if begin is None or finish is None or any(begin[1].get(name) != value for name, value in block["values"].items()):
+                raise GateError(21, "recorder candidate toggle differs from block plan")
+            if any(begin[1].get(name) != value for name, value in config.get("switches", {}).items()):
+                raise GateError(21, "recorder candidate configuration differs from manifest")
+            if start < begin[0] + round(config.get("settle_seconds", 3) * 1e9) or end > finish[0]:
+                continue
+        selected.append(record)
+    frames = sum(item["frames"] for item in selected)
+    if not frames:
+        raise GateError(24, "no complete stable recorder intervals in the candidate measurement")
+    phases, counters, shaders = {}, {}, {}
+    accounted, unaccounted = 0.0, 0.0
+    for item in selected:
+        for role, rows in item["phases_ms"].items():
+            for name, value in rows.items():
+                key = role + ":" + name
+                phases[key] = phases.get(key, 0.0) + value / frames
+        for name, value in item["counters"].items():
+            if not isinstance(value, (float, int)) or not math.isfinite(value) or value < 0:
+                raise GateError(24, "invalid recorder counter " + name)
+            counters[name] = counters.get(name, 0.0) + value
+        for row in item["shaders"]["top"]:
+            key = row["kind"] + ":" + row["code"]
+            shaders[key] = shaders.get(key, 0.0) + sum(row[name] for name in ("prepare_ms", "record_ms", "proof_ms", "bind_ms")) / frames
+        accounted += item["accounted_cpu_ms_per_frame"] * item["frames"] / frames
+        unaccounted += item["unaccounted_ms_per_frame"] * item["frames"] / frames
+    missing = [name for name in config.get("requiredCounters", []) if counters.get(name, 0) <= 0]
+    if missing:
+        raise GateError(22, "required recorder counters missing or zero: " + ", ".join(missing))
+    ledger = config.get("allocatorLedgerBytes")
+    if ledger is not None:
+        if "allocator_high_water_bytes" not in counters or counters["allocator_high_water_bytes"] > ledger:
+            raise GateError(26, "recorder allocator high-water is missing or exceeds its ledger")
+    return {"source": "recorder", "frames": frames, "window": window, "recorder_intervals": selected,
+            "counters": counters, "shader_exclusive_cpu": shaders, "archb_ms_per_frame": phases,
+            "accounted_cpu_ms_per_frame": accounted, "unaccounted_ms_per_frame": unaccounted}
+
+
 def diagnostics(directory):
+    recorder = recorder_diagnostics(directory)
+    if recorder is not None:
+        return recorder
     directory = Path(directory)
     window = read_json(directory / "hold.json") if (directory / "hold.json").is_file() else None
     with (directory / "stderr.log").open("rb") as source:

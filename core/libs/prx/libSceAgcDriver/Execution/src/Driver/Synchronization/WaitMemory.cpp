@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -118,6 +119,9 @@ void Driver::landPendingWaits(std::uint32_t queue) {
 }
 
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory, bool epochCovered) {
+    PerformanceTimer recorderTiming("Driver.LabelWait");
+    recorderTiming.RecorderCounter("label_wait_ms");
+    ArchB::Recorder::Count("label_waits");
 
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();

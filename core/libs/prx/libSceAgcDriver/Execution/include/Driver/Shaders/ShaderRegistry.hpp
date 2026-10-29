@@ -167,6 +167,7 @@ struct PreparedShaders : PreparedShaderState {
     std::condition_variable settled;
     std::exception_ptr failure;
     std::atomic<bool> demanded{false};
+    std::atomic<std::uint64_t> recorderDigest{0};
     bool pending = false;
     std::vector<std::size_t> convertedSamples;
 };
@@ -192,6 +193,7 @@ struct ShaderSnapshot {
     std::shared_ptr<std::atomic<std::uint8_t>> memoryWrites = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<bool>> rawGraphicsNoted = std::make_shared<std::atomic<bool>>(false);
     std::optional<std::uint32_t> userDataTailRegister;
+    std::uint64_t CodeDigest() const;
 };
 
 

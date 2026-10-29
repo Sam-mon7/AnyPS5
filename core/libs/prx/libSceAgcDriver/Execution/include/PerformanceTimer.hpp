@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETIMER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
@@ -263,12 +264,14 @@ private:
 
 class PerformanceTimer {
 public:
-    explicit PerformanceTimer(const char* scope) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr), scope(scope) {
+    explicit PerformanceTimer(const char* scope, ArchB::Recorder::Phase phase = ArchB::Recorder::Phase::Inherit) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr), scope(scope) {
         if (frame != nullptr) {
             total = frame->Get(scope, "total");
         }
-        if (frame != nullptr || trace != nullptr) start = Clock::now();
+        const bool record = ArchB::Recorder::Enabled();
+        if (frame != nullptr || trace != nullptr || record) start = Clock::now();
         previous = start;
+        if (record) recorder.Begin(scope, start, phase);
     }
 
     PerformanceTimer(const PerformanceTimer&) = delete;
@@ -280,8 +283,9 @@ public:
 
     void Finish() {
         zone.End();
-        if (frame == nullptr && trace == nullptr) return;
+        if (frame == nullptr && trace == nullptr && !recorder.Active()) return;
         const auto end = Clock::now();
+        recorder.End(end);
         if (trace != nullptr) trace->Add(scope, nullptr, start, end);
         trace = nullptr;
         if (frame == nullptr) return;
@@ -290,14 +294,19 @@ public:
         frame = nullptr;
     }
 
+    void RecorderCounter(const char* name) { recorder.Counter(name); }
+
+    void RecorderPhase(ArchB::Recorder::Phase phase) { recorder.SetPhase(phase); }
+
     void FinishPacket(std::uint64_t serial, std::size_t offset, std::uint32_t opcode, std::size_t words) {
         if (frame != nullptr) frame->NotePacket(serial, offset, opcode, words, Clock::now() - start);
         Finish();
     }
 
     void Mark(const char* stage, std::uint64_t bytes = 0) {
-        if (frame == nullptr && trace == nullptr) return;
+        if (frame == nullptr && trace == nullptr && !recorder.Active()) return;
         const auto now = Clock::now();
+        recorder.Mark(stage, now);
         if (trace != nullptr) trace->Add(scope, stage, previous, now);
         if (frame != nullptr) {
             if (tail == nullptr) tail = frame->Get(scope, "tail");
@@ -311,6 +320,7 @@ private:
 
     FrameTiming* frame;
     TraceThread* trace;
+    ArchB::Recorder::Scope recorder;
     const char* scope;
     [[no_unique_address]] TracyZone zone{scope};
     FrameTiming::Metric* total = nullptr;
