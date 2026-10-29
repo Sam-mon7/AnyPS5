@@ -333,6 +333,96 @@ def diagnostics(directory):
             "accounted_cpu_ms_per_frame": packet_ms / denominator + sum(phases.values())}
 
 
+UB_SWITCHES = (
+    "UB_TRUST_PROOFS", "UB_NO_LOCK_INVALIDATION", "UB_POINTER_FREE_DRAW_KEYS",
+    "UB_SKIP_CPU_INDIRECT", "UB_SKIP_DISPATCH_PROOF_WALK",
+)
+
+
+def ub_counter_hits(text, switches):
+    return {name.lower() + "_hits": max((int(value) for value in re.findall(
+        rf"\b{re.escape(name.lower())}_hits=([0-9]+)\b", text)), default=0) for name in switches}
+
+
+def ub_recorder_attribution(directory, pairs):
+    path = Path(directory) / "aps5-summary.jsonl"
+    if not path.is_file():
+        return {}
+    with (Path(directory) / "videoout.jsonl").open(encoding="utf-8-sig") as source:
+        first_present = next(json.loads(line)["t_ns"] for line in source if json.loads(line).get("ev") == "present")
+    result = {role: {"frames": 0, "intervals": 0, "phases_ms_per_frame": {}} for role in ("control", "candidate")}
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        item = json.loads(line)
+        record = item.get("archb")
+        if not record or item.get("recorder_toggled") or record.get("recorder_toggled") or record.get("recorder_enabled") is False:
+            continue
+        start = record.get("start_ns", item.get("interval_start_ns"))
+        end = record.get("end_ns", item.get("interval_end_ns"))
+        if start is None or end is None:
+            start = first_present + round(item["interval_start_s"] * 1e9)
+            end = first_present + round(item["interval_end_s"] * 1e9)
+        for role in result:
+            if not any(pair[role]["start_ns"] <= start < end <= pair[role]["end_ns"] for pair in pairs):
+                continue
+            frames = record.get("presented", record.get("frames", 0))
+            if frames <= 0:
+                continue
+            target = result[role]
+            target["frames"] += frames
+            target["intervals"] += 1
+            for thread, phases in record.get("phases_ms", {}).items():
+                if isinstance(phases, dict):
+                    totals = target["phases_ms_per_frame"].setdefault(thread, {})
+                    for phase, milliseconds in phases.items():
+                        totals[phase] = totals.get(phase, 0) + milliseconds
+                else:
+                    totals = target["phases_ms_per_frame"]
+                    totals[thread] = totals.get(thread, 0) + phases
+    for target in result.values():
+        if target["frames"]:
+            for thread, phases in target["phases_ms_per_frame"].items():
+                if isinstance(phases, dict):
+                    target["phases_ms_per_frame"][thread] = {phase: milliseconds / target["frames"] for phase, milliseconds in phases.items()}
+                else:
+                    target["phases_ms_per_frame"][thread] /= target["frames"]
+    return result
+
+
+def ub_experiment(directory, name, switches, settle_seconds=3):
+    if not switches or set(switches) - set(UB_SWITCHES):
+        raise GateError(21, "unknown upper-bound experiment")
+    directory = Path(directory)
+    text = (directory / "stderr.log").read_text(encoding="utf-8", errors="replace")
+    pairs = alternating_blocks(directory / "videoout.jsonl", text, read_json(directory / "blocks.json"), settle_seconds)
+    deltas = pair_deltas(pairs)
+    mean = statistics.mean(deltas)
+    radius = t_critical(len(pairs) - 1) * statistics.stdev(deltas) / math.sqrt(len(pairs))
+    fps = {}
+    for role in ("control", "candidate"):
+        intervals = sum(pair[role].get("presented", pair[role]["frames"] - 1) for pair in pairs)
+        span = sum(pair[role]["span_s"] for pair in pairs)
+        fps[role] = intervals / positive(span)
+    return {"name": name, "switches": list(switches), "status": "completed", "stage": "measurement",
+            "frame_time_ratio": math.exp(mean), "frame_time_ratio_90_interval": [math.exp(mean - radius), math.exp(mean + radius)],
+            "presented_fps": fps, "hits": ub_counter_hits(text, switches), "d_i": deltas, "pairs": pairs,
+            "attribution": ub_recorder_attribution(directory, pairs), "directory": str(directory)}
+
+
+def ub_report(experiments):
+    rows = ["| Experiment | Status / stage | Candidate/control ms (90% interval) | Control FPS | Candidate FPS | Hits |",
+            "|---|---|---:|---:|---:|---:|"]
+    for item in experiments:
+        if item["status"] == "completed":
+            low, high = item["frame_time_ratio_90_interval"]
+            metric = f"{item['frame_time_ratio']:.4f} [{low:.4f}, {high:.4f}]"
+            control, candidate = (f"{item['presented_fps'][role]:.3f}" for role in ("control", "candidate"))
+        else:
+            metric, control, candidate = "n/a", "n/a", "n/a"
+        hits = ", ".join(f"{name}={value}" for name, value in item.get("hits", {}).items()) or "0"
+        rows.append(f"| {item['name']} | {item['status']} / {item['stage']} | {metric} | {control} | {candidate} | {hits} |")
+    return {"format": "anyps5-ub/1", "experiments": experiments, "markdown": "\n".join(rows) + "\n"}
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -352,11 +442,25 @@ def main():
     alternate.add_argument("--settle-seconds", type=float, default=3)
     alternate.add_argument("--baseline")
     alternate.add_argument("--bootstrap", action="store_true")
-    for command in (leg, decide, diagnostic, alternate):
+    experiment = sub.add_parser("ub-experiment")
+    experiment.add_argument("directory")
+    experiment.add_argument("--name", required=True)
+    experiment.add_argument("--switch", action="append", required=True)
+    experiment.add_argument("--settle-seconds", type=float, default=3)
+    report = sub.add_parser("ub-report")
+    report.add_argument("experiments")
+    report.add_argument("--table")
+    for command in (leg, decide, diagnostic, alternate, experiment, report):
         command.add_argument("--output")
     args = parser.parse_args()
     try:
-        if args.command == "leg":
+        if args.command == "ub-experiment":
+            result = ub_experiment(args.directory, args.name, args.switch, args.settle_seconds)
+        elif args.command == "ub-report":
+            result = ub_report(read_json(args.experiments))
+            if args.table:
+                Path(args.table).write_text(result["markdown"], encoding="utf-8")
+        elif args.command == "leg":
             result = leg_summary(args.path, args.start_ns, args.end_ns, args.hold_seconds)
         elif args.command == "diagnostic":
             result = diagnostics(args.directory)

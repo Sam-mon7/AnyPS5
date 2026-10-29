@@ -510,6 +510,12 @@ if(BUILD_TESTING)
     configure_windows_unwind(agc_archb_c01_switches_tests)
     set_target_properties(agc_archb_c01_switches_tests PROPERTIES CXX_EXTENSIONS OFF)
     add_dependencies(agc_archb_c01_switches_tests agc_trace_revision)
+    add_test(NAME agc_archb_ub_switches_default_off COMMAND agc_archb_c01_switches_tests --ub-default)
+    set_tests_properties(agc_archb_ub_switches_default_off PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_ub_switches_default_off PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_archb_c01_switches COMMAND agc_archb_c01_switches_tests)
     set_tests_properties(agc_archb_c01_switches PROPERTIES TIMEOUT 30)
     foreach(archbToggleCase IN ITEMS SeqMonotonic RefusesStartupOnly RefusesUnknown PrerequisiteCascades
@@ -526,6 +532,9 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     if(Python3_Interpreter_FOUND)
+        add_test(NAME agc_archb_ub_stats_experiment_report COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBGateStats.py ub_experiment_report)
+        set_tests_properties(agc_archb_ub_stats_experiment_report PROPERTIES TIMEOUT 30)
         foreach(archbStatsCase IN ITEMS frame_deltas_compute_ms gap_or_duplicate_fails aa_noise_sets_margin
                 noise_above_limit_fails sequential_pass_at_four sequential_continue_then_fail
                 clear_regression_fails_early p95_median_rule final_mode_requires_every_leg old_30_frame_telemetry_rejected
@@ -3526,6 +3535,14 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_driver_storage_cache_retained_batch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_archb_ub_trust_proofs_skips_revalidate COMMAND agc_driver_sampled_cache_budget_tests ub-trust-proofs)
+    add_test(NAME agc_archb_ub_lock_invalidation_skipped COMMAND agc_driver_sampled_cache_budget_tests ub-lock-invalidation)
+    set_tests_properties(agc_archb_ub_trust_proofs_skips_revalidate agc_archb_ub_lock_invalidation_skipped PROPERTIES
+        TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_archb_ub_trust_proofs_skips_revalidate agc_archb_ub_lock_invalidation_skipped PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_sampled_cache_budget_memory COMMAND agc_driver_sampled_cache_budget_tests memory)
     set_tests_properties(agc_driver_sampled_cache_budget_memory PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)

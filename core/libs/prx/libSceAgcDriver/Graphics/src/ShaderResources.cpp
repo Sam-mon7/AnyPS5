@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -3622,6 +3623,12 @@ ShaderResources::ProofExtent ShaderResources::Extent() const {
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const bool trustProofs = ArchB::Switches::Enabled(ArchB::Feature::UbTrustProofs);
+    if (trustProofs && provedOnce) {
+        ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbTrustProofs);
+        if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+        return true;
+    }
     if (GuestMemory::ResourceEpochProofsEnabled()) return revalidateFull(shaders, report, true);
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
@@ -3689,6 +3696,12 @@ bool ShaderResources::canRememberResourceEpoch() const {
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, bool epochProofs) {
+    const bool skipDispatchProofWalk = ArchB::Switches::Enabled(ArchB::Feature::UbSkipDispatchProofWalk);
+    if (skipDispatchProofWalk && !drawBuild) {
+        ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbSkipDispatchProofWalk);
+        if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+        return true;
+    }
     const bool traceStages = report != nullptr && report->trace;
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (report != nullptr) report->trace = traceStages;
@@ -3758,6 +3771,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         }
     }
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+        if (ok) provedOnce = true;
         if (epochProofs && !ok) resourceEpochProof = {};
         if (report != nullptr) report->epochReused = epochReused && ok;
         if (profile && epochReused) {

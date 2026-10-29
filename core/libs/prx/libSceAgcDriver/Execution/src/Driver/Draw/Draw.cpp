@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -136,6 +137,8 @@ struct DrawTail {
     std::uint64_t dumpSlot1 = 0;
     std::shared_ptr<VulkanDevice> localDevice;
     bool registerKey = false;
+    bool ubPointerFree = false;
+    bool ubSkipCpuIndirect = false;
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
@@ -483,7 +486,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     phaseTiming.Phase(DrawRowVectors);
 
     const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
-    tail.registerKey = useDrawEntries && registerKeyEnabled();
+    tail.ubPointerFree = ArchB::Switches::Enabled(ArchB::Feature::UbPointerFreeDrawKeys);
+    tail.ubSkipCpuIndirect = ArchB::Switches::Enabled(ArchB::Feature::UbSkipCpuIndirect);
+    tail.registerKey = useDrawEntries && registerKeyEnabled() && !tail.ubPointerFree;
     const bool registerKey = tail.registerKey;
     auto& drawKey = tail.drawKey;
     std::array<std::uint64_t, 5> drawKeyComponents{};
@@ -627,7 +632,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto& programs = *tail.programs;
     if (std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return SkippedShader(program.binary.codeAddress); })) return drawn();
     static const bool fromBase = std::getenv("APS5_NO_INDIRECT_BUILTIN_OFFSETS") == nullptr;
-    const bool emptyIndirectSkip = EmptyIndirectSkip() && !(fromBase && drawParameters.indexed);
+    const bool emptyIndirectSkip = !tail.ubSkipCpuIndirect && EmptyIndirectSkip() && !(fromBase && drawParameters.indexed);
     auto& cpuIndirectPrograms = CpuIndirectPrograms();
     const auto recordDraws = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || !drawParameters.indirect->indexLimitKnown || arguments.firstVertexOrIndex < drawParameters.indexCount); };
     if (emptyIndirectSkip && drawParameters.indirect && !programs.empty()) {
@@ -766,7 +771,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         missesBefore = drawEntryCounters.misses;
     }
     try {
-        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters);
+        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree);
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
@@ -1077,6 +1082,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), vertexInfos.front(), localDevice, drawParameters, traceIndirect);
+            if (tail.ubSkipCpuIndirect && indirectCpu) {
+                ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbSkipCpuIndirect);
+                return drawn();
+            }
             if (EmptyIndirectSkip()) CpuIndirectPrograms()[programs.front().binary.codeAddress] = indirectCpu.has_value();
         } else if (i == 0) {
             fold(result, drawParameters);
