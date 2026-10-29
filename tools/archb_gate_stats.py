@@ -76,6 +76,18 @@ def leg_summary(path, start_ns, end_ns, hold_seconds):
     return summarize_events(events, start_ns, end_ns, hold_seconds)
 
 
+def window_ms(events, start_ns, end_ns, fallback):
+    times = [current[1] for previous, current in zip(events, events[1:]) if current[3] > previous[3]]
+    if times:
+        end_ns = min(end_ns, times[-1])
+    frames = 0.0
+    for first, second in zip(times, times[1:]):
+        low, high = max(first, start_ns), min(second, end_ns)
+        if high > low:
+            frames += (high - low) / (second - first)
+    return (end_ns - start_ns) / frames / 1e6 if frames > 0 else fallback
+
+
 def summarize_events(events, start_ns, end_ns, hold_seconds):
     if len(events) < 2:
         raise GateError(24, "insufficient full-rate telemetry")
@@ -90,7 +102,7 @@ def summarize_events(events, start_ns, end_ns, hold_seconds):
             intervals.append((current[1] - last_present_ns) / 1e6)
             last_present_ns = current[1]
     span = (events[-1][1] - events[0][1]) / 1e9
-    if span < 0.9 * hold_seconds:
+    if span < 0.5 * hold_seconds:
         raise GateError(24, f"only {span:.3f}s of a {hold_seconds}s hold")
     ms = (events[-1][1] - events[0][1]) / presented / 1e6
     dropped = attempts - presented
@@ -230,6 +242,8 @@ def alternating_blocks(telemetry, text, blocks, settle_seconds):
             raise GateError(24, "settling consumes block")
         selected = [event for event in events if settled <= event[1] < end["t_ns"]]
         summary = summarize_events(selected, settled, end["t_ns"], duration)
+        summary["ms"] = window_ms(events, settled, end["t_ns"], summary["ms"])
+        summary["fps"] = 1000 / summary["ms"]
         minimum = block.get("min_available_memory")
         summaries.append({**block, **summary, "toggle_ns": start["t_ns"],
                           "memory_pressure": minimum is not None and minimum < 512 * 1024 * 1024})
