@@ -13,6 +13,7 @@ param(
     [switch]$Alternating,
     [ValidateRange(1, 3600)][int]$BlockSeconds = 15,
     [ValidateRange(0, 3599)][int]$SettleSeconds = 3,
+    [ValidateRange(1, 1000)][int]$MinFreeGB = 10,
     [switch]$Bisect,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][string]$WatchdogManifest,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][int]$RunnerPid,
@@ -664,7 +665,7 @@ function Invoke-ArchBGate {
         $null = New-Item -ItemType Directory -Path $Output
         $outputCreated = $true
         foreach ($path in @($Output, $Runtime)) {
-            if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($path))).AvailableFreeSpace -lt 20GB) { Stop-GateFailure 30 'At least 20 GB free disk space is required' }
+            if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($path))).AvailableFreeSpace -lt ([int64]$MinFreeGB * 1GB)) { Stop-GateFailure 30 "At least $MinFreeGB GB free disk space is required" }
         }
         if ($Experiments -and -not $Candidate) {
             $selfCandidate = Get-Content -LiteralPath $Control -Raw | ConvertFrom-Json -AsHashtable
@@ -687,7 +688,7 @@ function Invoke-ArchBGate {
                 }
             }
             if ($cache -match '(?i)(^|[\\/])app0([\\/]|$)') { Stop-GateFailure 23 'A shader cache cannot be inside app0' }
-            if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($cache)).AvailableFreeSpace -lt 20GB) { Stop-GateFailure 30 'Shader cache drive needs at least 20 GB free' }
+            if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($cache)).AvailableFreeSpace -lt ([int64]$MinFreeGB * 1GB)) { Stop-GateFailure 30 "Shader cache drive needs at least $MinFreeGB GB free" }
         }
         if ($Mode -eq 'Final' -and $HoldSeconds -ne 120) { Stop-GateFailure 24 'Final legs must hold for 120s' }
         $baselinePath = Join-Path (Split-Path $Output -Parent) 'gate-baseline.json'
