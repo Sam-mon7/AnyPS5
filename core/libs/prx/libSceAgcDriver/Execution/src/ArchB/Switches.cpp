@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 
 #include <array>
 #include <atomic>
@@ -98,6 +99,7 @@ void applyLine(const std::string& line) {
     for (std::size_t i = 0; i < values.size(); ++i) pending[i] = values[i].load(std::memory_order_acquire);
     auto delay = delayMicros.load(std::memory_order_acquire);
     bool delayNamed = false;
+    bool screenshot = false;
     bool any = false;
     while (stream >> token) {
         any = true;
@@ -105,6 +107,11 @@ void applyLine(const std::string& line) {
         if (equals == std::string::npos) return refuse("invalid token " + token);
         const auto name = token.substr(0, equals);
         const auto value = std::string_view(token).substr(equals + 1);
+        if (name == "SCREENSHOT") {
+            if (screenshot || value != "1") return refuse("invalid SCREENSHOT");
+            screenshot = true;
+            continue;
+        }
         if (name == "GATE_DELAY_US") {
             std::uint64_t parsed = 0;
             if (delayNamed || !number(value, parsed) || parsed > INT64_MAX / 1000) return refuse("invalid GATE_DELAY_US");
@@ -140,6 +147,7 @@ void applyLine(const std::string& line) {
     for (std::size_t i = 0; i < values.size(); ++i) values[i].store(pending[i], std::memory_order_release);
     delayMicros.store(delay, std::memory_order_release);
     lastSequence = sequence;
+    if (screenshot) AgcDriver::Screenshot::Request();
     const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     for (const auto& [feature, name] : UpperBoundCounters) {
         const auto hits = upperBoundHits[static_cast<std::size_t>(feature)].load(std::memory_order_relaxed);
@@ -150,6 +158,7 @@ void applyLine(const std::string& line) {
         if (entry.runtime) text += " " + std::string(entry.name) + "=" + (pending[static_cast<std::size_t>(entry.feature)] ? "1" : "0");
     }
     text += " GATE_DELAY_US=" + std::to_string(delay);
+    if (screenshot) text += " SCREENSHOT=1";
     std::fprintf(stderr, "[archb] toggle seq=%llu t_ns=%lld%s\n", static_cast<unsigned long long>(sequence), static_cast<long long>(nanos), text.c_str());
     std::fflush(stderr);
 }

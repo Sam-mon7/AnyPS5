@@ -114,6 +114,14 @@ def pair_deltas(pairs):
     return [math.log(positive(pair["candidate"]["ms"]) / positive(pair["control"]["ms"])) for pair in pairs]
 
 
+def memory_report(configurations):
+    pressure = {role: sum(leg.get("min_available_memory") is not None and leg["min_available_memory"] < 512 * 1024 * 1024
+                          for leg in legs) for role, legs in configurations.items()}
+    return {"memory_pressure_blocks": pressure, "memory_pressure": any(pressure.values()),
+            "verdict_notes": [f"Memory pressure below 512 MiB affected {count} {role} measured blocks."
+                              for role, count in pressure.items() if count]}
+
+
 def measurement_report(configurations, baseline=None):
     drops = {}
     invalid = False
@@ -129,7 +137,8 @@ def measurement_report(configurations, baseline=None):
         totals["dropped"] = totals["attempts"] - totals["presented"]
         totals["drop_rate"] = totals["dropped"] / totals["attempts"] if totals["attempts"] else 0
         drops[role] = totals
-    report = {"drops": drops, "candidate_mean_ms": statistics.mean(positive(leg["ms"]) for leg in configurations["candidate"])}
+    report = {"drops": drops, "candidate_mean_ms": statistics.mean(positive(leg["ms"]) for leg in configurations["candidate"]),
+              **memory_report(configurations)}
     if baseline is not None:
         report.update(baseline_mean_ms=positive(baseline["mean_ms"]))
         report["cumulative_speedup"] = report["baseline_mean_ms"] / report["candidate_mean_ms"]
@@ -140,7 +149,10 @@ def measurement_report(configurations, baseline=None):
 
 
 def pair_report(pairs, baseline=None):
-    return measurement_report({role: [pair[role] for pair in pairs] for role in ("control", "candidate")}, baseline)
+    report = measurement_report({role: [pair[role] for pair in pairs] for role in ("control", "candidate")}, baseline)
+    report["pair_min_available_memory"] = [min((pair[role]["min_available_memory"] for role in ("control", "candidate")
+                                              if pair[role].get("min_available_memory") is not None), default=None) for pair in pairs]
+    return report
 
 
 def bootstrap(pairs, alternating=False):
@@ -205,7 +217,7 @@ def alternating_blocks(telemetry, text, blocks, settle_seconds):
     previous_end = None
     for block in blocks:
         start, end = toggles.get(block["start_seq"]), toggles.get(block["end_seq"])
-        if start is None or end is None or block["end_seq"] != block["start_seq"] + 1:
+        if start is None or end is None or block["end_seq"] <= block["start_seq"]:
             raise GateError(24, "missing block boundary acknowledgement")
         if any(start["values"].get(name) != value for name, value in block["values"].items()):
             raise GateError(21, "toggle values differ from block plan")
@@ -218,7 +230,9 @@ def alternating_blocks(telemetry, text, blocks, settle_seconds):
             raise GateError(24, "settling consumes block")
         selected = [event for event in events if settled <= event[1] < end["t_ns"]]
         summary = summarize_events(selected, settled, end["t_ns"], duration)
-        summaries.append({**block, **summary, "toggle_ns": start["t_ns"]})
+        minimum = block.get("min_available_memory")
+        summaries.append({**block, **summary, "toggle_ns": start["t_ns"],
+                          "memory_pressure": minimum is not None and minimum < 512 * 1024 * 1024})
     window = [event for event in events if summaries[0]["toggle_ns"] <= event[1] < previous_end]
     validate_events(window)
     pairs = []
@@ -405,6 +419,7 @@ def ub_experiment(directory, name, switches, settle_seconds=3):
     return {"name": name, "switches": list(switches), "status": "completed", "stage": "measurement",
             "frame_time_ratio": math.exp(mean), "frame_time_ratio_90_interval": [math.exp(mean - radius), math.exp(mean + radius)],
             "presented_fps": fps, "hits": ub_counter_hits(text, switches), "d_i": deltas, "pairs": pairs,
+            **memory_report({role: [pair[role] for pair in pairs] for role in ("control", "candidate")}),
             "attribution": ub_recorder_attribution(directory, pairs), "directory": str(directory)}
 
 

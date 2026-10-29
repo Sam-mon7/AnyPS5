@@ -519,7 +519,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_c01_switches COMMAND agc_archb_c01_switches_tests)
     set_tests_properties(agc_archb_c01_switches PROPERTIES TIMEOUT 30)
     foreach(archbToggleCase IN ITEMS SeqMonotonic RefusesStartupOnly RefusesUnknown PrerequisiteCascades
-            NoFileNoCost AppliesAtBoundaryOnly)
+            NoFileNoCost AppliesAtBoundaryOnly ScreenshotToken)
         add_test(NAME agc_archb_c01_toggle_${archbToggleCase} COMMAND agc_archb_c01_switches_tests --toggle ${archbToggleCase})
         set_tests_properties(agc_archb_c01_toggle_${archbToggleCase} PROPERTIES TIMEOUT 30)
         if(WIN32)
@@ -532,6 +532,11 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     if(Python3_Interpreter_FOUND)
+        foreach(archbNavCase IN ITEMS driver_capture_waits driver_capture_classifies seq_monotonic)
+            add_test(NAME agc_archb_c01_nav_${archbNavCase} COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBGateNav.py ${archbNavCase})
+            set_tests_properties(agc_archb_c01_nav_${archbNavCase} PROPERTIES TIMEOUT 30)
+        endforeach()
         add_test(NAME agc_archb_ub_stats_experiment_report COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBGateStats.py ub_experiment_report)
         set_tests_properties(agc_archb_ub_stats_experiment_report PROPERTIES TIMEOUT 30)
@@ -552,6 +557,9 @@ if(BUILD_TESTING)
             set_tests_properties(agc_archb_c01_config_${archbConfigCase} PROPERTIES TIMEOUT 30)
         endforeach()
         if(WIN32)
+            add_test(NAME agc_archb_c01_config_memory_guard_params COMMAND pwsh -NoProfile -File
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBGateRestore.ps1 -Case MemoryGuard)
+            set_tests_properties(agc_archb_c01_config_memory_guard_params PROPERTIES TIMEOUT 30)
             foreach(archbRestoreCase IN ITEMS RestoreAfterNavigationFailure RestoreMissingArgsFile
                     WatchdogRestoresAfterKill RejectWrongPidStartTime RestoreBothPrxDirectories AlternatingBlocks Bisection)
                 add_test(NAME agc_archb_c01_restore_${archbRestoreCase} COMMAND pwsh -NoProfile -File

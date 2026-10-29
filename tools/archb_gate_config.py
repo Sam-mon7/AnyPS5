@@ -63,6 +63,8 @@ def child_environment(inherited, manifest, leg, kind="measured"):
     result.update(configured)
     result.update(APS5_PAD_INPUT_FILE=str(Path(leg) / "pad.txt"),
                   APS5_VIDEOOUT_TELEMETRY_DIR=str(leg),
+                  APS5_ARCHB_CONTROL_FILE=str(Path(leg) / "control.txt"),
+                  ANYPS5_SCREENSHOTS=str(Path(leg) / "shots"),
                   ANYPS5_SHADER_CACHE_DIR=manifest["shaderCache"], ANYPS5_OVERLAY="1")
     if kind == "diagnostic":
         result.update(APS5_PROFILE_DRAW="1", APS5_PROFILE_DRAW_SHADERS="1", APS5_PROFILE_SHADERS_REPORT="1",
@@ -70,8 +72,6 @@ def child_environment(inherited, manifest, leg, kind="measured"):
     elif kind == "validation":
         result.update(VK_INSTANCE_LAYERS="VK_LAYER_KHRONOS_validation",
                       VK_LAYER_ENABLES="VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT")
-    elif kind == "capture":
-        result.update(APS5_DUMP_FRAMES="10000", APS5_DUMP_FRAMES_EVERY="10", APS5_DUMP_SCALE="4")
     elif kind != "measured":
         raise GateError(24, f"unknown leg kind: {kind}")
     return result
