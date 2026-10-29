@@ -35,6 +35,7 @@ struct PendingDispatchPhases {
     std::array<double, DriverPhaseCount> ms{};
     std::chrono::steady_clock::time_point tailAt{};
     std::uint64_t code = 0;
+    std::uint64_t digest = 0;
     std::vector<double> deviceMs;
     bool proofSet = false;
     bool proofProved = false;
@@ -46,6 +47,7 @@ struct PendingDispatchPhases {
 
 struct DispatchShaderTotals {
     std::uint64_t code = 0;
+    std::uint64_t digest = 0;
     DispatchClass which = Queue0Direct;
     std::array<double, DriverPhaseCount> ms{};
     std::array<std::uint64_t, static_cast<std::size_t>(DispatchOutcome::Count)> packets{};

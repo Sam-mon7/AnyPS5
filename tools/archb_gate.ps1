@@ -13,6 +13,8 @@ param(
     [ValidateRange(1, 3600)][int]$BlockSeconds = 15,
     [ValidateRange(0, 3599)][int]$SettleSeconds = 3,
     [switch]$Bisect,
+    [switch]$Diagnostic,
+    [switch]$RecorderOverhead,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][string]$WatchdogManifest,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][int]$RunnerPid,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][long]$RunnerStartTicks
@@ -339,7 +341,7 @@ function Wait-GateToggle($Process, [string]$Directory, [long]$Sequence, $LowSinc
 function Invoke-GateBlocks($Process, [string]$Directory, $Plan, [ref]$LowSince) {
     $blocks = [Collections.Generic.List[object]]::new()
     $sequence = 1L
-    $stages = if ($Mode -eq 'Bootstrap') { @(48) } else { @(24, 48) }
+    $stages = if ($Mode -eq 'Bootstrap') { @(48) } elseif ($RecorderOverhead) { @(24, 48, 96) } else { @(24, 48) }
     foreach ($total in $stages) {
         while ($blocks.Count -lt $total) {
             $order = if ([Security.Cryptography.RandomNumberGenerator]::GetInt32(2)) { @('control', 'candidate') } else { @('candidate', 'control') }
@@ -368,7 +370,12 @@ function Invoke-GateBlocks($Process, [string]$Directory, $Plan, [ref]$LowSince) 
         $arguments = @('alternating', $Directory, '--settle-seconds', $SettleSeconds, '--output', (Join-Path $Directory 'alternating.json'))
         if ($Mode -eq 'Bootstrap') { $arguments += '--bootstrap' }
         else { $arguments += @('--baseline', $script:BaselinePath) }
-        $decision = Invoke-GatePython 'archb_gate_stats.py' $arguments @(0, 1, 2, 40)
+        if ($RecorderOverhead) {
+            $decision = Invoke-GatePython 'archb_recorder_gate.py' @($Directory, '--settle-seconds', $SettleSeconds,
+                '--output', (Join-Path $Directory 'alternating.json')) @(0, 1, 2, 3, 40)
+        } else {
+            $decision = Invoke-GatePython 'archb_gate_stats.py' $arguments @(0, 1, 2, 40)
+        }
         if ($decision.verdict -ne 'continue') { return $decision }
     }
 }
@@ -511,7 +518,7 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
         $outStream.Dispose()
         $errStream.Dispose()
         $verifyArgs = @('verify', $configPath, $directory, $Runtime)
-        if (($Kind -eq 'diagnostic' -and $Configuration.name -ne $script:ControlName) -or
+        if (($Kind -eq 'diagnostic' -and $Configuration.name -ne $script:ControlName -and $Configuration.env.APS5_ARCHB_RECORDER -ne '1') -or
             ($Kind -eq 'capture' -and $script:AlternatingBootstrap)) { $verifyArgs += '--diagnostic' }
         $verification = Invoke-GatePython 'archb_gate_config.py' $verifyArgs
         $result.navigation = $navigation
@@ -530,7 +537,14 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
             if (($Configuration.name -ne $script:ControlName -or $null -ne $Alternation) -and $result.memory.incremental_host_bytes -gt 4000000000) { Stop-GateFailure 26 'Incremental host memory exceeds 4,000,000,000 bytes' }
         }
         if ($Kind -eq 'diagnostic' -or ($Kind -eq 'capture' -and $script:AlternatingBootstrap)) {
+            if ($Configuration.env.APS5_ARCHB_RECORDER -eq '1') {
+                Write-GateJson (Join-Path $directory 'recorder-config.json') @{
+                    requiredCounters = $Configuration.requiredCounters; allocatorLedgerBytes = $Configuration.allocatorLedgerBytes }
+            }
             $result.attribution = Invoke-GatePython 'archb_gate_stats.py' @('diagnostic', $directory)
+            if ($Configuration.env.APS5_ARCHB_RECORDER -eq '1' -and $result.attribution.source -ne 'recorder') {
+                Stop-GateFailure 24 'Diagnostic boot has no recorder attribution'
+            }
         }
         if ($Kind -eq 'validation') {
             $text = (Get-Content -LiteralPath (Join-Path $directory 'stderr.log') -Raw) + "`n" + (Get-Content -LiteralPath (Join-Path $directory 'stdout.log') -Raw)
@@ -671,6 +685,7 @@ function Invoke-ArchBGate {
         }
         $results = @()
         $gate.alternating_plans = @{}
+        $recorderDiagnostics = @{}
         $allAlternating = $true
         foreach ($candidateConfig in $configuration.candidates) {
             $pairs = @()
@@ -680,6 +695,7 @@ function Invoke-ArchBGate {
             if ($Bisect -and -not $useAlternating) { Stop-GateFailure 21 'Bisection requires identical builds and runtime-only differences' }
             if ($script:AlternatingBootstrap -and -not $useAlternating) { Stop-GateFailure 21 'Alternating Bootstrap requires runtime GATE_NOOP' }
             if (-not $useAlternating) { $allAlternating = $false }
+            if ($RecorderOverhead -and (-not $useAlternating -or $Mode -notin @('Child', 'Milestone') -or $Matrix -or $Bisect)) { Stop-GateFailure 21 'Recorder overhead requires one alternating Child or Milestone candidate' }
             if ($Mode -eq 'Final') {
                 $legs = @(1..3 | ForEach-Object { Invoke-GateLeg $candidateConfig "$($candidateConfig.name)-final-$_" 'measured' 120 $true })
                 $pairsPath = Join-Path $Output "$($candidateConfig.name)-final.json"
@@ -688,7 +704,19 @@ function Invoke-ArchBGate {
             } elseif ($useAlternating) {
                 if ($Mode -ne 'Bootstrap' -and -not $script:Baseline.ContainsKey('alternating_m')) { Stop-GateFailure 40 'An alternating Bootstrap baseline is required' }
                 $label = if ($Mode -eq 'Bootstrap') { 'bootstrap-navigation-3-alternating' } else { "$($candidateConfig.name)-alternating" }
+                if ($RecorderOverhead -and ($plan.control.RECORDER -ne '0' -or $plan.candidate.RECORDER -ne '1' -or
+                    @($plan.control.Keys | Where-Object { $_ -ne 'RECORDER' -and $plan.control[$_] -ne $plan.candidate[$_] }).Count)) {
+                    Stop-GateFailure 21 'Recorder overhead requires RECORDER=0 versus RECORDER=1 with all other switches identical'
+                }
                 $alternatingLeg = Invoke-GateLeg $configuration.control $label 'measured' 0 $true $plan
+                if ($plan.control.RECORDER -eq '1' -and $plan.candidate.RECORDER -eq '1') {
+                    Write-GateJson (Join-Path $alternatingLeg.directory 'recorder-config.json') @{
+                        requiredCounters = $candidateConfig.requiredCounters; switches = $plan.candidate; settle_seconds = $SettleSeconds
+                        allocatorLedgerBytes = $candidateConfig.allocatorLedgerBytes }
+                    $alternatingLeg.attribution = Invoke-GatePython 'archb_gate_stats.py' @('diagnostic', $alternatingLeg.directory)
+                    if ($alternatingLeg.attribution.source -ne 'recorder') { Stop-GateFailure 24 'Measured boot has no recorder attribution' }
+                    $recorderDiagnostics[$candidateConfig.name] = $alternatingLeg
+                }
                 $decision = $alternatingLeg.alternating
                 if ($Bisect -and $decision.code -in @(1, 2)) { $gate.bisection = Invoke-GateBisection $candidateConfig $plan }
             } else {
@@ -721,7 +749,10 @@ function Invoke-ArchBGate {
             $diagnostics[$configuration.candidates[0].name] = $controlWarmup
         } else {
             $diagnosticConfigurations = if ($allAlternating) { @($configuration.candidates) } else { @($configuration.control) + @($configuration.candidates) }
-            foreach ($item in $diagnosticConfigurations) { $diagnostics[$item.name] = Invoke-GateLeg $item "diagnostic-$($item.name)" 'diagnostic' 60 $false }
+            foreach ($item in $diagnosticConfigurations) {
+                if (-not $Diagnostic -and $recorderDiagnostics.ContainsKey($item.name)) { $diagnostics[$item.name] = $recorderDiagnostics[$item.name] }
+                else { $diagnostics[$item.name] = Invoke-GateLeg $item "diagnostic-$($item.name)" 'diagnostic' 60 $false }
+            }
         }
         $gate.diagnostics = $diagnostics
         $gate.validation_diffs = @{}

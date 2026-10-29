@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TraceFile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -45,6 +47,8 @@ struct Session {
     std::vector<std::vector<TraceThread::Total>> windowBase;
     std::optional<TraceInterval> interval;
     bool intervalOpen = false;
+    bool explicitInterval = false;
+    bool recorderSeen = false;
     std::uint64_t intervalFirstPresent = 0;
     double intervalGpuBusy = 0;
     std::vector<std::vector<TraceThread::Total>> intervalBase;
@@ -82,6 +86,7 @@ std::unique_ptr<TraceBenchWriter>& benchWriter() {
 
 std::filesystem::path traceDirectory() {
     const char* directory = std::getenv("APS5_TRACE_DIR");
+    if (directory == nullptr) directory = std::getenv("APS5_VIDEOOUT_TELEMETRY_DIR");
     return std::filesystem::path(directory != nullptr ? directory : ".");
 }
 
@@ -214,6 +219,7 @@ double seconds(Clock::duration elapsed) {
 }
 
 void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
+    ArchB::Recorder::BindThread(name);
     if (!Configured() || local != nullptr) return;
     const bool windowed = std::getenv("APS5_TRACE_FRAMES") != nullptr || std::getenv("APS5_TRACE_SECONDS") != nullptr;
     if (windowed && capacity == TraceThread::DefaultCapacity) capacity = TraceThread::ParseCapacity(std::getenv("APS5_TRACE_EVENTS"));
@@ -262,7 +268,14 @@ void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width,
     summary.firstPresent = state.intervalFirstPresent;
     summary.gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs - state.intervalGpuBusy;
     summary.interval = std::make_pair(seconds(state.intervalPresents.front() - state.first), seconds(now - state.first));
-    summaryWriter()->Write(TraceFormat::Summary(summary, snapshots, state.intervalPresents));
+    auto line = TraceFormat::Summary(summary, snapshots, state.intervalPresents);
+    if (state.recorderSeen) {
+        const auto recorder = ArchB::Recorder::Collect(now);
+        const auto close = line.find_last_of('}');
+        line.insert(close, ",\"archb\":" + recorder.Json());
+        ProfilePrint_nid_no_patch("%s\n", recorder.Line().c_str());
+    }
+    summaryWriter()->Write(std::move(line));
     if (!state.bench) return;
     TraceBench::Keep(state.benchIntervals, std::make_shared<const TraceBenchInterval>(TraceBenchInterval{summary.interval->first, summary.interval->second, summary.firstPresent, width, height, summary.gpuBusyMs, TraceFormat::FrameMicroseconds(state.intervalPresents)}), state.benchDropped);
     if (!benchWriter()) {
@@ -284,15 +297,22 @@ void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width,
 
 void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const VulkanDevice* device) {
     const auto now = Clock::now();
+    const bool recorderOn = ArchB::Switches::Enabled(ArchB::Feature::Recorder);
     BindThread("presenter");
     auto& state = session();
     std::lock_guard lock(state.mutex);
     if (!state.started) {
         state.window = TraceWindow::Parse(std::getenv("APS5_TRACE_FRAMES"), std::getenv("APS5_TRACE_SECONDS"));
+        state.explicitInterval = std::getenv("APS5_TRACE_SUMMARY_EVERY") != nullptr;
         state.interval = TraceInterval::Parse(std::getenv("APS5_TRACE_SUMMARY_EVERY"));
         state.bench = TraceBench::Parse(std::getenv("APS5_TRACE_BENCH"), state.interval.has_value());
         state.first = now;
         state.started = true;
+    }
+    if (recorderOn || state.recorderSeen) {
+        ArchB::Recorder::Boundary(recorderOn, ArchB::Switches::Sequence(), now);
+        state.recorderSeen = true;
+        if (!state.interval) state.interval = TraceInterval::Parse("5");
     }
     const auto present = state.present++;
     const auto edge = state.window ? state.window->Present(present, now - state.first) : TraceWindow::Edge::None;
@@ -330,7 +350,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     if (!state.windowOpen) {
         if (!state.interval) return;
         presentCount.fetch_add(1, std::memory_order_relaxed);
-        recording.store(true, std::memory_order_relaxed);
+        recording.store(state.explicitInterval, std::memory_order_relaxed);
         return;
     }
     state.presents.push_back(now);
@@ -338,7 +358,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     if (edge != TraceWindow::Edge::Close) return;
     state.windowOpen = false;
     buffering.store(false, std::memory_order_relaxed);
-    recording.store(state.interval.has_value(), std::memory_order_relaxed);
+    recording.store(state.explicitInterval, std::memory_order_relaxed);
 
     std::vector<TraceThread::Snapshot> snapshots;
     std::size_t presenter = 0;

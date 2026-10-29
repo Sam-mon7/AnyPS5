@@ -240,6 +240,7 @@ endforeach()
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/Switches.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
@@ -488,6 +489,38 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_frame_dump_io PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/Draw.cpp" recorderHandoff REGEX "const bool handOff =")
+    string(REPLACE "\\;" ";" recorderHandoff "${recorderHandoff}")
+    string(REGEX REPLACE "^[ ]*const bool handOff = (.*);$" "\\1" recorderHandoff "${recorderHandoff}")
+    set(recorderOperands "pipelined" "drawParameters.indirect" "profile" "lockedPrepare" "dumpTarget == 0"
+        "dumpSlot1 == 0" "tracePrograms" "verifyDrawDataHits()" "deferredLabels().labels.empty()" "DrawFinisher::Enabled()")
+    set(recorderIndex 0)
+    foreach(recorderOperand IN LISTS recorderOperands)
+        string(REPLACE "${recorderOperand}" "values[${recorderIndex}]" recorderHandoff "${recorderHandoff}")
+        math(EXPR recorderIndex "${recorderIndex} + 1")
+    endforeach()
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/ArchBRecorderHandoff.hpp"
+        "inline bool RecorderFixtureHandoff(const std::array<bool, 10>& values) { return ${recorderHandoff}; }\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "Execution/src/Driver/Draw/Draw.cpp")
+    add_test_executable(agc_archb_c09a_recorder_tests tests/ArchBRecorder.cpp
+        Execution/src/ArchB/Recorder.cpp Execution/src/PerformanceTraceThread.cpp)
+    target_include_directories(agc_archb_c09a_recorder_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    target_link_libraries(agc_archb_c09a_recorder_tests PRIVATE libc)
+    configure_windows_unwind(agc_archb_c09a_recorder_tests)
+    foreach(recorderCase IN ITEMS reconciles no_path_change toggle_interval_tagged shader_table_overflow)
+        add_test(NAME agc_archb_c09a_recorder_${recorderCase} COMMAND agc_archb_c09a_recorder_tests ${recorderCase})
+        set_tests_properties(agc_archb_c09a_recorder_${recorderCase} PROPERTIES TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archb_c09a_recorder_${recorderCase} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME agc_archb_c09a_stats_reads_recorder COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBRecorderStats.py)
+        set_tests_properties(agc_archb_c09a_stats_reads_recorder PROPERTIES TIMEOUT 30)
     endif()
 
     add_test_executable(agc_archb_c01_switches_tests tests/ArchBSwitches.cpp

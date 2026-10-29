@@ -156,7 +156,7 @@ void Driver::run(std::uint32_t id) noexcept {
     auto& costs = submissionCosts(id);
     try {
         Timeline::Bind(id);
-        if (PerformanceTrace::Configured()) PerformanceTrace::BindThread(role);
+        PerformanceTrace::BindThread(role);
         for (;;) {
             submission = Submission{};
             struct Running {

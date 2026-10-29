@@ -10,6 +10,7 @@ namespace AgcDriver::ArchB {
 enum class Feature : std::uint8_t {
     GateRun,
     GateNoop,
+    Recorder,
 #ifdef APS5_ARCHB_SWITCHES_TEST
     TestDependent,
     TestRuntimeDependent,
@@ -30,6 +31,7 @@ public:
     static bool Enabled(Feature feature);
     static void Initialize();
     static void PollControl();
+    static std::uint64_t Sequence();
     static std::int64_t GateDelayMicros();
 #ifdef APS5_ARCHB_SWITCHES_TEST
     static std::uint64_t ControlPolls();

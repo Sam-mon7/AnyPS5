@@ -163,6 +163,7 @@ bool Driver::pipelineDispatch() {
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    ArchB::Recorder::Work recorderWork({ArchB::Recorder::Kind::Dispatch, 0});
     PerformanceTimer timing("Driver.Dispatch");
     const GuestMemory::ReadSiteScope handlerSite(GuestMemory::ReadSite::DispatchHandler);
     static const bool profileSplit = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -197,6 +198,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     if (profileSplit) splitMarks[3] = std::chrono::steady_clock::now();
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
+    if (ArchB::Recorder::Enabled() || DrawShaderProfileEnabled()) {
+        const auto digest = (snapshot.CodeDigest() ^ codeOffset) * 0x100000001b3ull;
+        recorderWork.SetKey({ArchB::Recorder::Kind::Dispatch, digest});
+        if (!resolving && DrawShaderProfileEnabled()) pendingDispatchPhases().digest = digest;
+    }
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
     bool fromAhead = false;
@@ -605,7 +611,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion] {
+        DrawPipeline::Queue0().Enqueue([this, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion] {
+            ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
+            PerformanceTimer recorderTiming("Driver.DispatchCommit");
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;

@@ -3007,6 +3007,8 @@ RevalidateProfile& Revalidations() {
 }
 
 void countFastFail(FastFail reason) {
+    constexpr const char* names[] = {"proof_fast_fail_no_record", "proof_fast_fail_collect", "proof_fast_fail_pending", "proof_fast_fail_evicted", "proof_fast_fail_changed", "proof_fast_fail_keys", "proof_fast_fail_cleared_view", "proof_fast_fail_storage_keys", "proof_fast_fail_depth", "proof_fast_fail_replaced", "proof_fast_fail_audit"};
+    AgcDriver::ArchB::Recorder::Count(names[static_cast<std::size_t>(reason)]);
     if (BuildProfiled()) Revalidations().fastFails[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -3622,6 +3624,7 @@ ShaderResources::ProofExtent ShaderResources::Extent() const {
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    PerformanceTimer recorderTiming("Resources.Proof", AgcDriver::ArchB::Recorder::Phase::Proof);
     if (GuestMemory::ResourceEpochProofsEnabled()) return revalidateFull(shaders, report, true);
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
@@ -3636,6 +3639,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 return ok;
             }
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+            AgcDriver::ArchB::Recorder::Count("proof_fast_pass_epoch_memo");
             noteEpochProof(true, false, false);
             return true;
         }
@@ -3758,6 +3762,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         }
     }
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+        if (ok) AgcDriver::ArchB::Recorder::Count(fast ? (epochReused ? "proof_fast_pass_epoch" : "proof_fast_pass_stamps") : "proof_full_pass");
+        if (!ok) AgcDriver::ArchB::Recorder::Count("proof_failed");
         if (epochProofs && !ok) resourceEpochProof = {};
         if (report != nullptr) report->epochReused = epochReused && ok;
         if (profile && epochReused) {
@@ -3776,6 +3782,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // they must hand back the very objects the set's views belong to. The build appended them stage
     // by stage, binding by binding, so the walk repeats that order.
     const auto fullWalk = [&] {
+        PerformanceTimer recorderTiming("Resources.FullWalk", AgcDriver::ArchB::Recorder::Phase::Proof);
+        recorderTiming.RecorderCounter("full_walk_ms");
+        AgcDriver::ArchB::Recorder::Count("full_walks");
         lastFullWalk = std::chrono::steady_clock::now();
         lookupLog().clear();
         BuildLookups lookups;
@@ -6169,6 +6178,7 @@ bool ShaderResources::RecordPrivateDescriptors(VkDescriptorSet destination, cons
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
+    PerformanceTimer recorderTiming("Resources.Bind", AgcDriver::ArchB::Recorder::Phase::Bind);
     if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
     if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);
 }

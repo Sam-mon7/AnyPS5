@@ -40,6 +40,7 @@ void Driver::addDispatchShader(DispatchClass which, const PendingDispatchPhases&
     std::lock_guard lock(driverPhasesMutex);
     auto& row = dispatchShaderTotals[pending.code | static_cast<std::uint64_t>(which)];
     row.code = pending.code;
+    row.digest = pending.digest;
     row.which = which;
     const auto outcome = static_cast<std::size_t>(pending.outcome);
     ++row.packets[outcome];
@@ -103,6 +104,8 @@ void Driver::reportDispatchShaders() {
                       static_cast<unsigned long long>(row.code), DispatchClassNames[row.which], static_cast<unsigned long long>(count), packetsOf(DispatchOutcome::Real), packetsOf(DispatchOutcome::CopyHle), packetsOf(DispatchOutcome::FillHle),
                       packetsOf(DispatchOutcome::Skipped) + packetsOf(DispatchOutcome::SkippedMemo), rowMs(&row), count == 0 ? 0.0 : rowMs(&row) * 1000 / static_cast<double>(count), static_cast<unsigned long long>(row.hits),
                       DriverPhaseNames[order[0]], row.ms[order[0]], DriverPhaseNames[order[1]], row.ms[order[1]], DriverPhaseNames[order[2]], row.ms[order[2]]);
+        report += text;
+        std::snprintf(text, sizeof(text), "; code=%016llx", static_cast<unsigned long long>(row.digest));
         report += text;
         if (row.deviceCalls != 0) {
             std::vector<std::size_t> deviceOrder(row.deviceMs.size());

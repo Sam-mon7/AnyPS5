@@ -2453,6 +2453,7 @@ bool VulkanDevice::HasComputePipeline(const ShaderRecompiler::RecompileResult& s
 }
 
 void VulkanDevice::PrebuildComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress) {
+    PerformanceTimer recorderTiming("Vulkan.PrepareDispatch", ArchB::Recorder::Phase::Prepare);
     if (shader.spirv.size() < 5 || shader.spirv[0] != 0x07230203u) return;
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     const auto context = graphicsContext();
@@ -3671,11 +3672,14 @@ bool VulkanDevice::AcquireImage() {
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
     const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 0, VK_NULL_HANDLE, state->acquireFence, &index);
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+        ArchB::Recorder::Count("acquire_out_of_date");
+        ArchB::Recorder::Count("acquire_drops");
         state->extent = {0, 0};
         return false;
     }
     if (acquired == VK_NOT_READY || acquired == VK_TIMEOUT) {
         ++presentCounters.acquireDrops;
+        ArchB::Recorder::Count("acquire_drops");
         return false;
     }
     if (acquired != VK_SUBOPTIMAL_KHR) check(acquired, "vkAcquireNextImageKHR");
@@ -4941,7 +4945,7 @@ void VulkanDevice::NoteDrawRecipeMiss(DrawRecipePrecheck miss) {
 }
 
 RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace, Graphics::DrawPreparation* preparation) {
-    PerformanceTimer timing("Vulkan.DrawFromRecipe");
+    PerformanceTimer timing("Vulkan.DrawFromRecipe", ArchB::Recorder::Phase::Record);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& counters = Recipes().kinds[static_cast<std::size_t>(RecipeKind::Draw)];
     // R10: the recipe names the device it was built on (the driver may have replaced the device
@@ -5346,6 +5350,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
 }
 
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
+    PerformanceTimer recorderTiming("Vulkan.RecordDispatch", ArchB::Recorder::Phase::Record);
     auto& d = Dispatches();
     auto& recorder = *state->recorder;
     auto& timer = *record.timer;
@@ -5754,7 +5759,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
-    PerformanceTimer timing("Vulkan.Dispatch");
+    PerformanceTimer timing("Vulkan.Dispatch", ArchB::Recorder::Phase::Record);
     if (recipeOut != nullptr) *recipeOut = nullptr;
     // Group counts for the trace lines; an indirect dispatch does not know them.
     char groupsText[40];
@@ -6108,7 +6113,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
 RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords, const std::array<std::uint32_t, 3>& threadGroup, std::shared_ptr<PrivateDispatch> privateDispatch) {
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
-    PerformanceTimer timing("Vulkan.DispatchRecipe");
+    PerformanceTimer timing("Vulkan.DispatchRecipe", ArchB::Recorder::Phase::Record);
     outcome = {0, 0};
     char groupsText[40];
     if (arguments != 0) std::snprintf(groupsText, sizeof(groupsText), "indirect");

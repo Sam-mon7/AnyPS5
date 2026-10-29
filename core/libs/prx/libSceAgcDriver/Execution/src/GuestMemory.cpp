@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -2396,6 +2397,8 @@ std::string WaitedBehindReport(const HolderMatrixValues& waited) {
 
 namespace {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
+thread_local std::chrono::steady_clock::time_point recorderHoldStart{};
+thread_local std::uint64_t recorderHoldGeneration = 0;
 }
 
 void GpuMutexType::enter() {
@@ -2409,6 +2412,8 @@ bool GpuMutexType::tryEnter() {
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
+        recorderHoldGeneration = ArchB::Recorder::Generation();
+        recorderHoldStart = ArchB::Recorder::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         if (!proofThread) proofSerial.fetch_add(1, std::memory_order_acq_rel);
@@ -2478,6 +2483,10 @@ std::uint64_t ThreadGpuHeldNs() {
 void GpuMutexType::unlock() {
     const bool outermost = --depth == 0;
     if (outermost) {
+        if (recorderHoldStart != std::chrono::steady_clock::time_point{} && recorderHoldGeneration == ArchB::Recorder::Generation()) {
+            ArchB::Recorder::Count("gpu_mutex_hold_ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - recorderHoldStart).count());
+            recorderHoldStart = {};
+        }
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
@@ -2508,6 +2517,8 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    PerformanceTimer recorderTiming("GpuMutex.wait");
+    recorderTiming.RecorderCounter("gpu_mutex_wait_ms");
     if (Timeline::Enabled && !HeldByThisThread()) {
         Timeline::LockSite = static_cast<std::uint32_t>(LockStats().nextSite) + 1;
         Timeline::Emit(Timeline::Kind::LockBegin, 0, 0, 0, 0, 0, Timeline::LockSite);
