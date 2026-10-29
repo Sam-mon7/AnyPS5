@@ -46,6 +46,9 @@ def load_refs(directory):
 
 
 def classify(image, refs):
+    luma = np.asarray(image.convert("L"), dtype=np.float32)
+    if float(luma.mean()) < 2 or float(luma.std()) < 1:
+        return "loading", 0.0
     full = feature(image)
     score, name = max((float((full * reference[0]).sum()), name) for name, reference in refs.items())
     if score < 0.80:
@@ -181,7 +184,10 @@ def navigate(pid, refs_directory, pad, output, timeout=1500):
             scores_seen[state] = max(scores_seen.get(state, -1), score)
             with (output / "nav.log").open("a", encoding="utf-8") as log:
                 log.write(f"{now - started:.3f} {state} {score:.6f}\n")
-            if state == "unknown":
+            if state == "loading":
+                streak_state, streak = None, 0
+                unknown_since = now
+            elif state == "unknown":
                 streak_state, streak = None, 0
                 if now - unknown_since >= 60:
                     raise GateError(11, "unknown screen for 60s; no input sent")
