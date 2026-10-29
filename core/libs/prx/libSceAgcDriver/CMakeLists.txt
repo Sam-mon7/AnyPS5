@@ -565,7 +565,7 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     if(Python3_Interpreter_FOUND)
-        foreach(archbNavCase IN ITEMS driver_capture_waits driver_capture_classifies seq_monotonic)
+        foreach(archbNavCase IN ITEMS driver_capture_waits driver_capture_classifies seq_monotonic continue_steady_scene continue_reads_presented)
             add_test(NAME agc_archb_c01_nav_${archbNavCase} COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBGateNav.py ${archbNavCase})
             set_tests_properties(agc_archb_c01_nav_${archbNavCase} PROPERTIES TIMEOUT 30)

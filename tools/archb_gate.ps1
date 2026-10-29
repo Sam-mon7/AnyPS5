@@ -14,6 +14,8 @@ param(
     [ValidateRange(1, 3600)][int]$BlockSeconds = 15,
     [ValidateRange(0, 3599)][int]$SettleSeconds = 3,
     [ValidateRange(1, 1000)][int]$MinFreeGB = 10,
+    [ValidateSet('continue', 'creator')][string]$Route = 'continue',
+    [ValidateRange(1, 1000)][double]$SceneMaxFps = 10,
     [ValidateRange(0, 1048576)][int]$MinAvailableMiB = 256,
     [ValidateRange(1, 3600)][int]$LowMemorySeconds = 60,
     [switch]$Bisect,
@@ -531,7 +533,8 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
         $navStart.FileName = $script:GatePython
         $navStart.UseShellExecute = $false
         foreach ($argument in @((Join-Path $script:GateTools 'archb_gate_nav.py'), 'navigate', '--pid', [string]$process.Id,
-                                '--refs', $NavigationRefs, '--pad', (Join-Path $directory 'pad.txt'), '--output', $directory)) {
+                                '--refs', $NavigationRefs, '--pad', (Join-Path $directory 'pad.txt'), '--output', $directory,
+                                '--route', $Route, '--scene-max-fps', [string]$SceneMaxFps)) {
             $navStart.ArgumentList.Add($argument)
         }
         if ($upperBound) { $result.stage = 'navigation' }
