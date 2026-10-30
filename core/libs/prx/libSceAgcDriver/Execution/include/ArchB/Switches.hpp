@@ -20,6 +20,7 @@ enum class Feature : std::uint8_t {
     UbPointerFreeDrawKeys,
     UbSkipCpuIndirect,
     UbSkipDispatchProofWalk,
+    FixQueue0LockPriority,
     Count
 };
 

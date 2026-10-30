@@ -2402,8 +2402,36 @@ thread_local std::chrono::steady_clock::time_point recorderHoldStart{};
 thread_local std::uint64_t recorderHoldGeneration = 0;
 }
 
+namespace {
+// FIX_QUEUE0_LOCK_PRIORITY: queue 0 is the frame's critical path. While it waits for the mutex, a
+// thread that does not hold it defers its own acquisition for a bounded window, so the release goes
+// to queue 0 instead of to whichever thread spins first. Only the order of acquisition changes,
+// never what a holder does; the window bounds the delay, so no thread can be held off for good.
+std::atomic<std::uint32_t> criticalLockWaiters{0};
+
+void LockGpuMutexSpinning(Mutex& mutex) {
+    if (ArchB::Switches::Enabled(ArchB::Feature::FixQueue0LockPriority)) {
+        if (LockStats().tag == 0) {
+            if (mutex.try_lock()) return;
+            criticalLockWaiters.fetch_add(1, std::memory_order_acq_rel);
+            struct Leave {
+                ~Leave() { criticalLockWaiters.fetch_sub(1, std::memory_order_acq_rel); }
+            } leave;
+            ArchB::Recorder::Count("fix_lock_priority_waits");
+            LockSpinning(mutex, HandoffSpinWindow());
+            return;
+        }
+        if (criticalLockWaiters.load(std::memory_order_acquire) != 0) {
+            ArchB::Recorder::Count("fix_lock_priority_deferrals");
+            SpinUntil(std::chrono::microseconds(200), [] { return criticalLockWaiters.load(std::memory_order_acquire) == 0; });
+        }
+    }
+    LockSpinning(mutex, HandoffSpinWindow());
+}
+} // namespace
+
 void GpuMutexType::enter() {
-    if (!HeldByThisThread()) LockSpinning(mutex, HandoffSpinWindow());
+    if (!HeldByThisThread()) LockGpuMutexSpinning(mutex);
 }
 
 bool GpuMutexType::tryEnter() {
@@ -2542,7 +2570,7 @@ void GpuMutexType::lock() {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {
                 const auto start = std::chrono::steady_clock::now();
-                LockSpinning(mutex, HandoffSpinWindow());
+                LockGpuMutexSpinning(mutex);
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -2560,7 +2588,7 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
-        LockSpinning(mutex, HandoffSpinWindow());
+        LockGpuMutexSpinning(mutex);
         acquired();
         if (depth == 1) stats.holdSite = site;
         const auto now = std::chrono::steady_clock::now();
