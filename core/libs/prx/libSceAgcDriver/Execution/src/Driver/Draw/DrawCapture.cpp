@@ -120,6 +120,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         return std::runtime_error(where.str() + error.what());
     };
     const auto capture = [&] {
+        ArchB::Recorder::Count("m1_draw_stage_captures");
         const SampledReadScope sampling(evidenceReads);
         try {
             return CaptureInvocation(shaderMemory, *program.snapshot, program.codeOffset, request, invocation);
@@ -221,6 +222,7 @@ void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderReco
 }
 
 void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry) {
+    if (ArchB::Recorder::Enabled() && useDrawEntries && !drawHit && !verifyHit) censusDrawMiss(programs, stageCaptures, decodeReads, reused, matched, entry, shapeKey);
     const bool cpuIndirect = drawParameters.indirect && indirectCpu;
     static const bool cpuIndirectCache = std::getenv("APS5_NO_CPU_INDIRECT_DRAW_CACHE") == nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -267,6 +269,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             if (stageCapture.compiled == nullptr || !CacheableResult(*stageCapture.compiled)) continue;
             auto variant = std::make_shared<DispatchVariant>();
             variant->compiled = stageCapture.compiled;
+            if (ArchB::Recorder::Enabled()) variant->censusCapture = stageCapture.capture;
             if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh) {
                 std::copy_n(programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord, variant->meshIndexDescriptor.size(), variant->meshIndexDescriptor.begin());
             }

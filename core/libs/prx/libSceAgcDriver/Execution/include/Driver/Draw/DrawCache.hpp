@@ -137,6 +137,20 @@ struct StageCapture {
     std::uint64_t userDataMask = ~std::uint64_t{0};
 };
 
+struct DrawMissDifference {
+    enum : std::uint32_t { Image = 1, Sampler = 2, Buffer = 4, Data = 8, Layout = 16, Other = 32, ImageFields = 64, Specialized = 128 };
+    std::uint32_t kinds = 0;
+    std::size_t words = 0;
+    std::size_t layout = 0;
+    std::array<std::uint32_t, 8> imageChanges{};
+    std::size_t dataWords = 0;
+    std::size_t refreshableDataWords = 0;
+    std::size_t userDataWords = 0;
+    const char* Class() const;
+};
+
+DrawMissDifference CompareDrawMissStage(const DispatchVariant& old, const StageCapture& fresh, std::span<const Graphics::DecodeRead> reads);
+
 struct RelocatableUserWord {
     std::uint32_t reg;
     std::vector<std::pair<std::int64_t, std::uint32_t>> reads;
