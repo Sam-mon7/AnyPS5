@@ -5,11 +5,14 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
 
 void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree) {
     PerformanceTimer recorderTiming("Driver.DrawLookup", ArchB::Recorder::Phase::Proof);
+    static const bool diagnose = std::getenv("APS5_DIAG_DRAW_DATA") != nullptr;
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
         if (pointerFree) ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbPointerFreeDrawKeys);
@@ -158,18 +161,25 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         regions.clear();
                         appendEntryRegions(*variant, regions);
                         ++compared;
+                        const auto validateStarted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        if (diagnose && result != EntryOutcome::Equal && result != EntryOutcome::EqualData) std::fprintf(stderr, "[draw-data-lookup] program=%llx stage=%zu rank=%zu result=%u mask=%zu live=%zu\n", static_cast<unsigned long long>(programs[i].binary.codeAddress), i, rank, static_cast<unsigned>(result), variant->dataPositions.size(), liveData.size());
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
                         if (result == EntryOutcome::EqualData) {
                             auto& hit = stageData[i];
+                            const auto refreshStarted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                            if (profile) hit.validationUs = std::chrono::duration<double, std::micro>(refreshStarted - validateStarted).count();
                             hit.words = variant->words;
                             for (const auto& [position, value] : liveData) hit.words[position] = value;
                             regions.clear();
                             appendEntryRegions(*variant, regions, &hit.words);
                             hit.compiled = patchDataWords(*variant, hit.words);
+                            hit.refreshedWords = liveData.size();
+                            if (profile) hit.refreshUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - refreshStarted).count();
+                            if (diagnose) std::fprintf(stderr, "[draw-data-refresh] program=%llx stage=%zu words=%zu\n", static_cast<unsigned long long>(programs[i].binary.codeAddress), i, liveData.size());
                             ++dataStages;
                             dataWords += liveData.size();
                         }

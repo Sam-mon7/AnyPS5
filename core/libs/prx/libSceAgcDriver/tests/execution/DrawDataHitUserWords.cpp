@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
@@ -17,11 +19,30 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <initializer_list>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
+
+namespace AgcDriver::DriverDetail {
+
+struct DriverTestAccess {
+    static std::array<std::shared_ptr<DispatchVariant>, 2> Stages() {
+        const auto& stages = Driver::Get().drawCache.begin()->second->stages;
+        return {stages[0].front(), stages[1].front()};
+    }
+    static bool HasFragmentVariantExcept(std::uint64_t id) {
+        for (const auto& [key, entry] : Driver::Get().drawCache) {
+            for (const auto& stage : entry->stages[1]) if (stage->compiled->PipelineVariantId() != id) return true;
+        }
+        return false;
+    }
+};
+
+}
 
 namespace {
 
@@ -37,6 +58,15 @@ alignas(256) constexpr std::array<std::uint32_t, 10> ArithmeticPixelCode{0xf4000
 alignas(256) constexpr std::array<std::uint32_t, 8> DirectBufferPixelCode{0xe0300000u, 0x80000000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 alignas(256) std::array<float, 4> PixelConstant{};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
+alignas(256) constexpr std::array<std::uint32_t, 20> DataVertexCode{
+    0xf4000284u, 0xfa000000u, 0xbf8cc07fu,
+    0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x0602020au,
+    0x060400f3u, 0x10040500u, 0x060404f3u, 0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
+};
+alignas(256) constexpr std::array<std::uint32_t, 16> ImagePixelCode{
+    0xf40c0100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000280u, 0x7e020280u,
+    0xf0001108u, 0x00010200u, 0xbf8c3f70u, 0x7e060280u, 0xf800180fu, 0x02030302u, 0xbf810000u,
+};
 
 constexpr std::size_t BlockBytes = 65536;
 
@@ -258,10 +288,109 @@ void DirectBufferBaseMovesWithItsPayload() {
     Require(after.dataStagesCompiled - before.dataStagesCompiled >= 1, "a draw whose descriptor base moved reused the pixel stage built for the old base: the rebuild this test documents is gone, flip it to a reuse check (" + Counts(after) + ", before: " + Counts(before) + ")");
 }
 
+void PartialDataHit(const std::string& mode) {
+    using AgcDriver::ArchB::Recorder;
+    using AgcDriver::DriverDetail::DrawMiss;
+    const bool images = mode != "partial";
+    const auto* pixelCode = images ? ImagePixelCode.data() : PixelCode.data();
+    Registered(VertexHeader, DataVertexCode.data(), sizeof(DataVertexCode), 2);
+    Registered(PixelHeader, pixelCode, images ? sizeof(ImagePixelCode) : sizeof(PixelCode), 1);
+    auto* block = GuestBlock();
+    auto* vertexData = block + 128;
+    const auto describe = [&](std::size_t offset, float value) {
+        auto* data = block + offset;
+        std::fill_n(data, 1024, std::bit_cast<std::uint32_t>(value));
+        const auto address = reinterpret_cast<std::uintptr_t>(data);
+        if (images) {
+            block[0] = static_cast<std::uint32_t>(address >> 8u);
+            block[1] = static_cast<std::uint32_t>(address >> 40u) | (22u << 20u) | (3u << 30u);
+            block[2] = 15u | (15u << 14u);
+            block[3] = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u) | (9u << 28u);
+        } else {
+            block[0] = static_cast<std::uint32_t>(address);
+            block[1] = static_cast<std::uint32_t>(address >> 32u) & 0xffffu;
+            block[2] = 16;
+            block[3] = 0x3004bfacu;
+        }
+    };
+    const auto draw = [&](bool setup, bool layout = false, bool variant = false) {
+        auto commands = setup ? Setup(true, pixelCode, 2) : std::vector<std::uint32_t>{};
+        if (setup) {
+            const auto code = reinterpret_cast<std::uintptr_t>(DataVertexCode.data());
+            const auto data = reinterpret_cast<std::uintptr_t>(vertexData);
+            Append(commands, 0x76, {0xc8, static_cast<std::uint32_t>(code >> 8u), static_cast<std::uint32_t>(code >> 40u)});
+            Append(commands, 0x76, {0x8b, 4, static_cast<std::uint32_t>(data), static_cast<std::uint32_t>(data >> 32u)});
+            PixelUserData(commands, block, 0);
+        }
+        if (layout) Append(commands, 0x69, {0x207, 1});
+        if (variant) Append(commands, 0x69, {0x1c5, 1});
+        Append(commands, 0x2d, {3, 2});
+        return Submit(std::move(commands));
+    };
+    describe(1024, 0.25f);
+    ColorMemory.fill(std::byte{0});
+    draw(true);
+    draw(false);
+    const auto cached = draw(false);
+    const auto originalStages = AgcDriver::DriverDetail::DriverTestAccess::Stages();
+    Require(BrightestColorByte() == 64, "partial data hit: the original draw rendered " + std::to_string(BrightestColorByte()) + ", expected 64");
+    Recorder::Boundary(true, 0, Recorder::Clock::now());
+    static_cast<void>(Recorder::Collect(Recorder::Clock::now()));
+    vertexData[0] = std::bit_cast<std::uint32_t>(8.0f);
+    describe(2048, 1.0f);
+    if (mode == "type") block[3] = (block[3] & 0x0fffffffu) | (8u << 28u);
+    bool refused = false;
+    AgcDriver::DriverDetail::DrawEntryCounters after;
+    try {
+        after = draw(false, mode == "layout", mode == "variant");
+    } catch (const std::exception& error) {
+        if (mode != "type") throw;
+        Require(std::string(error.what()).find("guest 1D texture descriptor has a nonzero height") != std::string::npos, "the changed descriptor failed for another reason");
+        refused = true;
+    }
+    const auto snapshot = Recorder::Collect(Recorder::Clock::now());
+    const auto count = [&](const char* name) { const auto found = snapshot.counters.find(name); return found == snapshot.counters.end() ? 0.0 : found->second; };
+    if (mode == "type") Require(refused, "a changed image descriptor type was accepted by the old stage");
+    else if (mode == "layout") Require(after.absent > cached.absent && count("fix_draw_data_hits_hits") == 0, "changed vertex layout reused the old data stage");
+    else if (mode == "variant") {
+        Require(after.absent > cached.absent && count("fix_draw_data_hits_hits") == 0, "a changed pixel variant reused the old data stage");
+        draw(false);
+        Require(AgcDriver::DriverDetail::DriverTestAccess::HasFragmentVariantExcept(originalStages[1]->compiled->PipelineVariantId()), "the variant test did not change the fragment pipeline variant");
+    }
+    else {
+        Require(after.hits == cached.hits && after.misses[static_cast<std::size_t>(DrawMiss::FragmentDiffering)] == cached.misses[static_cast<std::size_t>(DrawMiss::FragmentDiffering)] + 1, "a structural fragment descriptor change did not miss");
+        Require(count("fix_draw_data_hits_hits") == 1 && count("fix_draw_data_hits_words") == 1, "the proven vertex data refresh was captured again");
+        if (std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr) Require(count("fix_draw_data_hits_verified") == 1, "the partial data hit was not independently verified");
+        Require(BrightestColorByte() == 64, "the partial data hit rendered with the old vertex position");
+        vertexData[0] = std::bit_cast<std::uint32_t>(-0.125f);
+        describe(3072, 0.5f);
+        draw(false);
+        Require(BrightestColorByte() >= 127 && BrightestColorByte() <= 128, "the partial data hit rendered " + std::to_string(BrightestColorByte()) + ", expected 128 from refreshed vertex and fragment data");
+        if (mode == "toggle") {
+            for (unsigned sequence = 1; sequence <= 2; ++sequence) {
+                const bool on = sequence == 2;
+                std::ofstream(std::getenv("APS5_ARCHB_CONTROL_FILE"), std::ios::trunc) << sequence << " FIX_DRAW_DATA_HITS=" << on << '\n';
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+                AgcDriver::ArchB::Switches::PollControl();
+                Require(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawDataHits) == on, "the runtime switch did not change");
+                static_cast<void>(Recorder::Collect(Recorder::Clock::now()));
+                vertexData[0] = std::bit_cast<std::uint32_t>(on ? -0.5f : -0.25f);
+                describe(on ? 5120 : 4096, on ? 0.75f : 0.625f);
+                draw(false);
+                auto counters = Recorder::Collect(Recorder::Clock::now()).counters;
+                Require(counters["fix_draw_data_hits_hits"] == (on ? 1 : 0), "the draw used the wrong path after a toggle");
+                const auto expected = on ? 191u : 159u;
+                Require(BrightestColorByte() + 1 >= expected && BrightestColorByte() <= expected + 1, "a runtime toggle rendered " + std::to_string(BrightestColorByte()) + ", expected " + std::to_string(expected));
+            }
+        }
+    }
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "toggle") std::ofstream(std::getenv("APS5_ARCHB_CONTROL_FILE"), std::ios::trunc) << "0 FIX_DRAW_DATA_HITS=1\n";
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();
@@ -269,6 +398,11 @@ int main() {
             libraries = device->GraphicsPipelineLibraries();
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
+        if (argc == 2) {
+            PartialDataHit(argv[1]);
+            try { AgcDriverShutdown_nid_postfix(); } catch (const std::exception&) { if (std::string(argv[1]) != "type") throw; }
+            return 0;
+        }
         const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
         UnreadUserWordsKeepTheStage(verify);
         ReadUserWordsChangeTheOutput();
@@ -278,7 +412,7 @@ int main() {
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        AgcDriverShutdown_nid_postfix();
+        try { AgcDriverShutdown_nid_postfix(); } catch (const std::exception&) {}
         return 1;
     }
 }

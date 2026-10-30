@@ -908,7 +908,17 @@ public:
                 std::snprintf(value, sizeof(value), "%s\"%s\":%.3f", phase == 0 ? "" : ",", AgcDriver::DriverDetail::DrawDriverPhaseNames[phase], row.ms[phase]);
                 line += value;
             }
-            line += "}}\n";
+            char digest[64];
+            std::snprintf(digest, sizeof(digest), "},\"digest\":\"%016llx\",\"cache\":{", static_cast<unsigned long long>(row.digest));
+            line += digest;
+            for (std::size_t outcome = 0; outcome < AgcDriver::DriverDetail::DrawCacheOutcomeCount; ++outcome) {
+                line += (outcome == 0 ? "" : ",") + std::string("\"") + AgcDriver::DriverDetail::DrawCacheOutcomeNames[outcome] + "\":" + std::to_string(row.cache[outcome]);
+            }
+            line += "},\"graphics_draws\":" + std::to_string(row.graphicsDraws) + ",\"graphics_us\":[";
+            for (std::size_t phase = 0; phase < AgcDriver::DriverDetail::DrawProfileGraphicsPhases; ++phase) {
+                line += (phase == 0 ? "" : ",") + std::to_string(row.graphicsUs[phase]);
+            }
+            line += "]}\n";
             file << line;
             if (!file) throw std::runtime_error("frame replay: cannot write " + path.string());
         }

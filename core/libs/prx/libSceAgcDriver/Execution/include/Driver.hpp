@@ -22,6 +22,7 @@ struct AwaitedWait {
 };
 
 struct DrawShaderProfileRow {
+    std::uint64_t digest = 0;
     std::uint64_t code[DriverDetail::DrawProfilePrograms] = {};
     std::uint8_t stage[DriverDetail::DrawProfilePrograms] = {};
     std::uint32_t programs = 0;
@@ -31,6 +32,9 @@ struct DrawShaderProfileRow {
     std::uint64_t commits = 0;
     double ms[DriverDetail::DrawDriverPhaseCount] = {};
     double commitMs = 0;
+    std::uint64_t cache[DriverDetail::DrawCacheOutcomeCount] = {};
+    std::uint64_t graphicsDraws = 0;
+    double graphicsUs[DriverDetail::DrawProfileGraphicsPhases] = {};
 };
 
 }

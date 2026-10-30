@@ -86,6 +86,9 @@ using DrawDataCandidates = std::vector<std::vector<std::pair<std::shared_ptr<Dis
 struct StageDataHit {
     std::vector<std::uint32_t> words;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::size_t refreshedWords = 0;
+    double refreshUs = 0;
+    double validationUs = 0;
 };
 
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };

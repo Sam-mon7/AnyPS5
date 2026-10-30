@@ -140,6 +140,7 @@ struct DrawTail {
     bool registerKey = false;
     bool ubPointerFree = false;
     bool ubSkipCpuIndirect = false;
+    bool fixDrawDataHits = false;
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
@@ -426,6 +427,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto tailHolder = std::make_shared<DrawTail>();
     auto& tail = *tailHolder;
+    tail.fixDrawDataHits = ArchB::Switches::Enabled(ArchB::Feature::FixDrawDataHits);
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
     auto& phaseLap = tail.phaseLap;
@@ -1049,6 +1051,77 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: stage %zu (program 0x%llx) of a data-only hit differs from its full build in its %s (%zu runs / %zu words kept, %zu / %zu fresh; variant 0x%llx / 0x%llx; key 0x%llx, shape 0x%llx)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, kept.runs.size(), kept.words.size(), runs.size(), words.size(), static_cast<unsigned long long>(kept.compiled->variantId), static_cast<unsigned long long>(compiled.variantId), static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(shapeKey));
         throw std::runtime_error(message);
     };
+    const auto diagnoseDataStage = [&](std::size_t i) {
+        static const bool enabled = std::getenv("APS5_DIAG_DRAW_DATA") != nullptr;
+        if (!enabled) return;
+        const auto donor = entry != nullptr ? entry : dataEntry;
+        const auto& capture = stageCaptures[i];
+        std::vector<ShaderRecompiler::MemoryRegion> regions(capture.regions.begin(), capture.regions.end());
+        for (const auto& read : decodeReads[i]) regions.push_back({read.address, read.Bytes()});
+        std::stable_sort(regions.begin(), regions.end(), [](const auto& a, const auto& b) { return a.guestAddress < b.guestAddress; });
+        DispatchVariant current;
+        tagVariantRuns(current, regions, capture.userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords, capture.supplied);
+        const auto& runs = current.runs;
+        const auto& words = current.words;
+        const DispatchVariant* closest = nullptr;
+        std::size_t differences = SIZE_MAX;
+        if (donor != nullptr && i < donor->stages.size()) {
+            for (const auto& candidate : donor->stages[i]) {
+                if (candidate->pushOffset != pushCursorBytes) continue;
+                const bool sameRuns = candidate->runs == runs && candidate->words.size() == words.size();
+                std::size_t changed = 0;
+                if (sameRuns) for (std::size_t w = 0; w < words.size(); ++w) changed += words[w] != candidate->words[w];
+                else changed = SIZE_MAX - 1;
+                if (changed < differences) {
+                    closest = candidate.get();
+                    differences = changed;
+                }
+            }
+        }
+        const auto digest = RecorderProgramKey(programs).code;
+        if (closest == nullptr) {
+            std::fprintf(stderr, "[draw-data-diag] code=%016llx stage=%zu cache=%u donor=%u cause=absent\n", static_cast<unsigned long long>(digest), i, static_cast<unsigned>(tail.cacheOutcome), donor != nullptr);
+            return;
+        }
+        const auto& fresh = *stageCaptures[i].compiled;
+        const auto& old = *closest->compiled;
+        const bool sameRuns = closest->runs == runs && closest->words.size() == words.size();
+        std::size_t data = 0, decoded = 0, other = 0, unknown = 0, bindingChanges = 0, flatChanges = 0;
+        std::string changedWords;
+        if (sameRuns) {
+            std::size_t w = 0;
+            for (const auto& [begin, end] : runs) {
+                for (auto address = begin; address < end; address += sizeof(std::uint32_t), ++w) {
+                    if (words[w] == closest->words[w]) continue;
+                    const bool isData = std::binary_search(closest->dataPositions.begin(), closest->dataPositions.end(), w);
+                    const bool isDecode = std::any_of(decodeReads[i].begin(), decodeReads[i].end(), [&](const auto& read) { return address >= read.address && address < read.address + read.size; });
+                    const auto& reads = stageCaptures[i].capture->readTrace.otherReads;
+                    const bool isOther = std::binary_search(reads.begin(), reads.end(), address);
+                    ++(isData ? data : isDecode ? decoded : isOther ? other : unknown);
+                    if (data + decoded + other + unknown <= 8) {
+                        char value[96];
+                        std::snprintf(value, sizeof(value), " %llx:%08x>%08x:%s", static_cast<unsigned long long>(address), closest->words[w], words[w], isData ? "data" : isDecode ? "decode" : isOther ? "other" : "unknown");
+                        changedWords += value;
+                    }
+                }
+            }
+        }
+        for (std::size_t b = 0; b < std::min(fresh.bindings.size(), old.bindings.size()); ++b) {
+            const auto& a = old.bindings[b];
+            const auto& z = fresh.bindings[b];
+            if (a.kind != z.kind || a.role != z.role || a.binding != z.binding || a.count != z.count || a.guestDescriptor != z.guestDescriptor) {
+                ++(a.role == ShaderRecompiler::DescriptorRole::FlattenedSrt && z.role == a.role ? flatChanges : bindingChanges);
+                if (a.role != ShaderRecompiler::DescriptorRole::FlattenedSrt && bindingChanges <= 3) {
+                    std::size_t first = 0;
+                    while (first < std::min(a.guestDescriptor.size(), z.guestDescriptor.size()) && a.guestDescriptor[first] == z.guestDescriptor[first]) ++first;
+                    char value[128];
+                    std::snprintf(value, sizeof(value), " binding%zu:kind%u>%u:role%u>%u:word%zu:%08x>%08x", b, static_cast<unsigned>(a.kind), static_cast<unsigned>(z.kind), static_cast<unsigned>(a.role), static_cast<unsigned>(z.role), first, first < a.guestDescriptor.size() ? a.guestDescriptor[first] : 0u, first < z.guestDescriptor.size() ? z.guestDescriptor[first] : 0u);
+                    changedWords += value;
+                }
+            }
+        }
+        std::fprintf(stderr, "[draw-data-diag] code=%016llx stage=%zu cache=%u donor=%u matched=%u runs=%u variant=%u push=%u bindings=%zu/%zu data=%zu decode=%zu other=%zu unknown=%zu mask=%zu words=%zu%s\n", static_cast<unsigned long long>(digest), i, static_cast<unsigned>(tail.cacheOutcome), entry != nullptr ? 1u : 2u, matched[i] != nullptr, !sameRuns, old.variantId != fresh.variantId, old.pushConstants != fresh.pushConstants, bindingChanges + (old.bindings.size() != fresh.bindings.size()), flatChanges, data, decoded, other, unknown, closest->dataPositions.size(), words.size(), changedWords.c_str());
+    };
     const auto verifyStageData = [&](std::size_t i) {
         const auto& hit = stageData[i];
         const auto& kept = *matched[i];
@@ -1082,7 +1155,23 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             const auto candidate = std::find_if(dataCandidates[i].begin(), dataCandidates[i].end(), [&](const auto& kept) { return kept.first->pushOffset == pushCursorBytes; });
-            if (candidate != dataCandidates[i].end() && !verifyDrawDataHits()) {
+            bool partialDataHit = false;
+            if (tail.fixDrawDataHits && i == 0) {
+                if (matched[i] == nullptr || stageData[i].compiled == nullptr || verifyHit) ArchB::Recorder::Count("fix_draw_data_hits_refused_unproved");
+                else if (!stageEntries || drawParameters.indirect || graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList || program.merged || program.hiddenUserWords != 0) ArchB::Recorder::Count("fix_draw_data_hits_refused_path");
+                else if (matched[i]->pushOffset != pushCursorBytes || vertexInfos[i].has_value() != (matched[i]->vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *matched[i]->vertexInfo))) ArchB::Recorder::Count("fix_draw_data_hits_refused_shape");
+                else {
+                    partialDataHit = true;
+                    ArchB::Recorder::Count("fix_draw_data_hits_hits");
+                    ArchB::Recorder::Count("fix_draw_data_hits_words", static_cast<double>(stageData[i].refreshedWords));
+                    if (profile) std::fprintf(stderr, "[draw-data-partial] code=%016llx words=%zu refresh_us=%.3f validate_us=%.3f verify=%u\n", static_cast<unsigned long long>(RecorderProgramKey(programs).code), stageData[i].refreshedWords, stageData[i].refreshUs, stageData[i].validationUs, verifyDrawDataHits());
+                }
+            }
+            if (partialDataHit && !verifyDrawDataHits()) {
+                reused[i] = true;
+                programResults[i] = stageData[i].compiled.get();
+                memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
+            } else if (candidate != dataCandidates[i].end() && !verifyDrawDataHits()) {
                 matched[i] = candidate->first;
                 matchedRegions[i] = std::move(candidate->second);
                 reused[i] = true;
@@ -1100,8 +1189,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = compiledStages.back().get();
+                diagnoseDataStage(i);
                 if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
                 if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
+                if (partialDataHit && verifyDrawDataHits()) ArchB::Recorder::Count("fix_draw_data_hits_verified");
             }
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
             else if (dataEntry != nullptr) ++dataStagesCompiled;

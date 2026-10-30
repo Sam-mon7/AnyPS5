@@ -10,6 +10,23 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+struct DiagnosticHitTotals {
+    std::uint64_t draws = 0;
+    std::array<double, DrawDriverPhaseCount> ms{};
+    std::array<double, DrawProfileGraphicsPhases> graphicsUs{};
+};
+
+std::map<std::uint64_t, DiagnosticHitTotals> diagnosticHitTotals;
+
+bool DiagnoseDrawData() {
+    static const bool enabled = std::getenv("APS5_DIAG_DRAW_DATA") != nullptr;
+    return enabled;
+}
+
+}
+
 PendingDrawPhases& Driver::pendingDrawPhases() {
     static thread_local PendingDrawPhases pending;
     return pending;
@@ -83,7 +100,13 @@ std::vector<DrawShaderTotals> Driver::DrawShaderProfile(bool reset) {
     std::vector<DrawShaderTotals> rows;
     rows.reserve(drawShaderTotals.size());
     for (const auto& [identity, row] : drawShaderTotals) rows.push_back(row);
-    if (reset) drawShaderTotals.clear();
+    if (reset) {
+        drawShaderTotals.clear();
+        for (const auto& [code, hits] : diagnosticHitTotals) {
+            std::fprintf(stderr, "[draw-data-hit-cost] code=%016llx hits=%llu cpu_us=%.3f lookup_us=%.3f record_us=%.3f prepare_us=%.3f resources_us=%.3f pipeline_us=%.3f\n", static_cast<unsigned long long>(code), static_cast<unsigned long long>(hits.draws), std::accumulate(hits.ms.begin(), hits.ms.end(), 0.0) * 1000.0 / hits.draws, hits.ms[DrawRowKeyLookupValidate] * 1000.0 / hits.draws, hits.graphicsUs[8] / hits.draws, hits.graphicsUs[4] / hits.draws, hits.graphicsUs[6] / hits.draws, hits.graphicsUs[7] / hits.draws);
+        }
+        diagnosticHitTotals.clear();
+    }
     return rows;
 }
 
@@ -98,6 +121,12 @@ void Driver::addDrawCommit(const DrawProgramIdentity& identity, double ms) {
 void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures, const DrawProgramIdentity& identity, DrawCacheOutcome cache, const std::array<double, DrawProfileGraphicsPhases>* graphicsUs) {
     std::lock_guard lock(drawPhasesMutex);
     if (DrawShaderProfileEnabled()) {
+        if (DiagnoseDrawData() && cache == CacheHit) {
+            auto& hit = diagnosticHitTotals[identity.digest];
+            ++hit.draws;
+            for (std::size_t i = 0; i < DrawDriverPhaseCount; ++i) hit.ms[i] += ms[i];
+            if (graphicsUs != nullptr) for (std::size_t i = 0; i < DrawProfileGraphicsPhases; ++i) hit.graphicsUs[i] += (*graphicsUs)[i];
+        }
         auto& row = drawShaderTotals[identity];
         row.identity = identity;
         for (std::size_t i = 0; i < DrawDriverPhaseCount; ++i) row.ms[i] += ms[i];
