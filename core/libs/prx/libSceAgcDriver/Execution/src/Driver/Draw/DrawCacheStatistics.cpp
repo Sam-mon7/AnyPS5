@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -262,6 +263,24 @@ void Driver::censusDrawMiss(const std::vector<DrawProgram>& programs, const std:
     if (image[3] & 0xf0000000u) ArchB::Recorder::Count("m1_diff_image_type");
     if ((image[3] & 0xff000u) || (image[4] & 0x1fff0000u) || (image[5] & 0xffu)) ArchB::Recorder::Count("m1_diff_image_mip_array");
     if ((closest.kinds & (DrawMissDifference::Image | DrawMissDifference::Data)) == (DrawMissDifference::Image | DrawMissDifference::Data)) ArchB::Recorder::Count("m1_diff_image_and_data");
+    if ((closest.kinds & DrawMissDifference::Image) && std::all_of(image.begin(), image.end(), [](std::uint32_t bits) { return bits == 0; })) ArchB::Recorder::Count("m1_diff_image_no_bits");
+    if (closest.kinds & DrawMissDifference::Image) {
+        static auto* bitNames = new std::set<std::string>;
+        static std::mutex bitNamesMutex;
+        for (std::size_t w = 0; w < image.size(); ++w) {
+            for (std::uint32_t b = 0; b < 32; ++b) {
+                if ((image[w] & (1u << b)) == 0) continue;
+                char bit[48];
+                std::snprintf(bit, sizeof bit, "m1_tbit_w%zu_b%02u", w, b);
+                const char* bitCounter;
+                {
+                    std::lock_guard lock(bitNamesMutex);
+                    bitCounter = bitNames->emplace(bit).first->c_str();
+                }
+                ArchB::Recorder::Count(bitCounter);
+            }
+        }
+    }
     if (closest.userDataWords != 0) ArchB::Recorder::Count("m1_diff_user_data");
     if (closest.dataWords != 0) ArchB::Recorder::Count("m1_diff_captured_data");
     if (closest.dataWords != 0 && closest.dataWords == closest.refreshableDataWords && closest.userDataWords == 0) {
