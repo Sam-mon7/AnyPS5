@@ -804,10 +804,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     try {
         lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree);
-        if (!drawParameters.indirect) {
-            recorderDraw.Classify(drawHit ? ArchB::Recorder::DrawOutcome::Hit : ArchB::Recorder::DrawOutcome::Miss);
-            ArchB::Recorder::Count("direct_draws");
-        }
+        recorderDraw.Classify(drawHit ? ArchB::Recorder::DrawOutcome::Hit : ArchB::Recorder::DrawOutcome::Miss);
+        ArchB::Recorder::Count(drawParameters.indirect ? "indirect_draws" : "direct_draws");
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
