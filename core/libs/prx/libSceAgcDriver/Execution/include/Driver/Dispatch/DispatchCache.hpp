@@ -37,6 +37,7 @@ struct TsharpFeedbackMasks {
     WordBitMasks userData;
     std::vector<WordBitMasks> bindings;
     WordBitMasks pushConstants;
+    bool operator==(const TsharpFeedbackMasks&) const = default;
 };
 
 struct DispatchVariant {
@@ -122,6 +123,7 @@ bool SameCapturedRuns(std::span<const std::pair<std::uint64_t, std::uint64_t>> b
 std::uint32_t WordMask(std::span<const std::pair<std::uint32_t, std::uint32_t>> masks, std::size_t position);
 bool FeedbackWordsEqual(std::span<const std::uint32_t> before, std::span<const std::uint32_t> after, std::span<const std::pair<std::uint32_t, std::uint32_t>> masks, bool* used = nullptr);
 void RecordTsharpFeedbackMasks(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
+void RecordUncachedTsharpFeedbackMasks(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
 bool FeedbackBindingsEqual(const DispatchVariant& variant, const ShaderRecompiler::RecompileResult& before, const ShaderRecompiler::RecompileResult& after, bool enabled);
 
 enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };

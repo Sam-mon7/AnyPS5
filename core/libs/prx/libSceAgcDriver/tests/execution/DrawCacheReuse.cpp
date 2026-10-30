@@ -274,7 +274,7 @@ void TsharpMaskProofs() {
         plan->shaderFlatSlots.push_back(0);
         capture.readTrace.slotReads.emplace_back(raw, 0x1000 + 4 * word);
     }
-    const auto record = [&] { RecordTsharpFeedbackMasks(variant, capture); };
+    const auto record = [&] { RecordUncachedTsharpFeedbackMasks(variant, capture); };
     record();
     Require(variant.feedback.memory == WordBitMasks{{5, 0x020fff00}, {6, 0xff}}, "feedback mask did not identify exact memory words");
     for (std::uint32_t word = 0; word < 8; ++word) {
@@ -312,6 +312,112 @@ void TsharpMaskProofs() {
     plan->requiresSpecializationMemory = true;
     record();
     Require(variant.feedback.memory.empty(), "an uncertain plan acquired a feedback mask");
+}
+
+void TsharpCachedProofs(bool user, bool refused) {
+    using namespace ShaderRecompiler;
+    using namespace AgcDriver::DriverDetail;
+    using Recorder = AgcDriver::ArchB::Recorder;
+    Recorder::Boundary(true, 0, Recorder::Clock::now());
+    auto plan = std::make_shared<IrResourcePlan>();
+    plan->srtPlanComplete = plan->resourceTrackingComplete = true;
+    plan->userDataBase = 16;
+    plan->valueStorage.Reserve(16);
+    plan->descriptorSources.resize(1);
+    plan->materializationSources = {0};
+    plan->info.images.push_back({.source = 0});
+    auto& descriptor = plan->descriptorSources[0];
+    descriptor.dwordCount = 8;
+    ResourceCapture capture;
+    capture.plan = plan;
+    capture.snapshot.userData.resize(8);
+    capture.snapshot.images.resize(1);
+    capture.snapshot.images[0].dwordCount = 8;
+    auto compiled = std::make_shared<RecompileResult>();
+    compiled->registrationModule = true;
+    compiled->runtimeImageCount = 1;
+    compiled->imageMetadataDword = 16;
+    compiled->shaderDataUserWords = {5, 6};
+    compiled->bindings.resize(3);
+    compiled->bindings[0].role = DescriptorRole::FlattenedSrt;
+    compiled->bindings[1].role = DescriptorRole::ShaderData;
+    compiled->bindings[2].role = DescriptorRole::GuestImages;
+    compiled->bindings[2].guestDescriptor.resize(8);
+    DispatchVariant variant;
+    variant.compiled = compiled;
+    variant.runs = {{0x1000, 0x1020}};
+    variant.words.resize(8);
+    for (std::uint32_t word = 0; word < 8; ++word) {
+        auto* raw = plan->valueStorage.Create(user ? IrOpcode::GetUserData : IrOpcode::LoadAddressU32, IrType::U32, word);
+        if (user) {
+            auto* reg = plan->valueStorage.Create(IrOpcode::Void, IrType::U32, word + 8);
+            reg->SetRegister({RegisterBank::UserData, plan->userDataBase + word});
+            raw->AddArgument(reg);
+        } else capture.readTrace.slotReads.emplace_back(raw, 0x1000 + word * 4);
+        descriptor.dwords[word] = raw;
+        plan->srtReads.push_back({raw, word});
+        plan->shaderFlatSlots.push_back(0);
+    }
+    if (refused) {
+        descriptor.dwords[4] = descriptor.dwords[5];
+        descriptor.dwords[7] = descriptor.dwords[6];
+    }
+    std::size_t calls = 0;
+    const auto compare = [&](bool masks) {
+        RecordTsharpFeedbackMasks(variant, capture);
+        ++calls;
+        const auto cached = variant.feedback;
+        RecordUncachedTsharpFeedbackMasks(variant, capture);
+        Require(cached == variant.feedback, "cached proof differs from the uncached builder");
+        Require(!(user ? cached.userData : cached.memory).empty() == masks, "cached proof accepted or refused the wrong positions");
+        if (masks) Require((user ? cached.userData : cached.memory) == WordBitMasks{{5, 0x020fff00}, {6, 0xff}}, "cached proof changed the feedback positions");
+    };
+    compare(!refused);
+    compare(!refused);
+    if (!refused) {
+        capture.snapshot.images[0].dwords[5] = capture.snapshot.images[0].dwords[6] = 1;
+        compare(false);
+        capture.snapshot.images[0].dwords[5] = capture.snapshot.images[0].dwords[6] = 0;
+        if (user) {
+            capture.userDataUse.asBase = (1ull << 5) | (1ull << 6);
+            compare(false);
+            capture.userDataUse.asBase = 0;
+            capture.snapshot.userData.resize(5);
+            compare(false);
+            capture.snapshot.userData.resize(8);
+        } else {
+            variant.dataPositions = {5, 6};
+            compare(false);
+            variant.dataPositions.clear();
+            capture.readTrace.leaves = {{5, 0x1014}, {6, 0x1018}};
+            compare(false);
+            capture.readTrace.leaves.clear();
+            capture.readTrace.slotReads.emplace_back(plan->srtReads[5].value, 0x2014);
+            capture.readTrace.slotReads.emplace_back(plan->srtReads[6].value, 0x2018);
+            compare(false);
+            capture.readTrace.slotReads.resize(8);
+            capture.readTrace.slotReads[4].second = 0x1014;
+            capture.readTrace.slotReads[7].second = 0x1018;
+            compare(false);
+            capture.readTrace.slotReads[4].second = 0x1010;
+            capture.readTrace.slotReads[7].second = 0x101c;
+            variant.runs = {{0x3000, 0x3020}};
+            compare(false);
+            for (auto& read : capture.readTrace.slotReads) read.second += 0x2000;
+            compare(true);
+            IrValue unknown(IrOpcode::LoadAddressU32, IrType::U32, 99);
+            capture.readTrace.slotReads.emplace_back(&unknown, 0x4000);
+            compare(true);
+            capture.readTrace.slotReads.pop_back();
+        }
+        compare(true);
+    }
+    const auto counters = Recorder::Collect(Recorder::Clock::now()).counters;
+    const auto count = [&](const char* name) { const auto found = counters.find(name); return found == counters.end() ? 0.0 : found->second; };
+    Require(count("fix_tsharp_build_plan_calls") == 1 && count("fix_tsharp_build_plan_hits") == calls - 1, "plan proof was rebuilt for another insert");
+    Require(count("fix_tsharp_build_verified") == calls && count("fix_tsharp_build_verify_mismatches") == 0, "cached proof verification was incomplete or mismatched");
+    Require(!refused || count("fix_tsharp_build_skipped") == calls, "plan-level role refusal was not reused");
+    Require(refused || user || count("fix_tsharp_build_calls_fallback") == 1, "unknown trace value did not use the uncached builder");
 }
 
 alignas(256) std::array<std::uint32_t, 16> FeedbackTable{};
@@ -438,6 +544,7 @@ void TsharpCachePath(bool dispatch, bool user, bool toggle) {
     Require((count("fix_tsharp_mask_hits") > 0) == enabled, "feedback hits were not counted correctly");
     Require(!enabled || count("fix_tsharp_mask_positions") >= 2, "feedback positions were not counted");
     Require(count("fix_tsharp_mask_verify_mismatches") == 0, "feedback verification mismatched");
+    Require(count("fix_tsharp_build_verify_mismatches") == 0, "cached feedback proof verification mismatched");
     Require(!enabled || !verify || dispatch || count("fix_tsharp_mask_verified") >= 3, "feedback-only hits were not verified");
 }
 
@@ -447,6 +554,11 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--tsharp-proof") {
             TsharpMaskProofs();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]).starts_with("--tsharp-cached-")) {
+            const std::string_view mode(argv[1]);
+            TsharpCachedProofs(mode.find("user") != std::string_view::npos, mode.find("refused") != std::string_view::npos);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]).starts_with("--tsharp-")) {
