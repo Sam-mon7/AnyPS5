@@ -1869,6 +1869,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     require(available.samplerAnisotropy && available.textureCompressionBC, "device lacks sampler anisotropy or BC texture compression support required for texture sampling");
     enabled.samplerAnisotropy = VK_TRUE;
     enabled.textureCompressionBC = VK_TRUE;
+    // Color targets may carry different blend states (same change as upstream #6782).
+    enabled.independentBlend = available.independentBlend;
     // Guest shaders routinely read past descriptor ranges; robust access turns that into zeros
     // instead of a GPU fault that loses the device.
     enabled.robustBufferAccess = available.robustBufferAccess;
