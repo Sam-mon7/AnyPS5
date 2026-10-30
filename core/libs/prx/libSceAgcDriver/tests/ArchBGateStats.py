@@ -223,6 +223,12 @@ def alternating_settle_discard(directory):
     fails(lambda: alternating_blocks(path, text, blocks, -1))
 
 
+def alternating_futility_at_six(directory):
+    result = sequential(pairs([0.05] * 6), 0.02, True)
+    assert result["code"] == 1 and result["verdict"] == "fail" and result["stage"] == 6
+    assert sequential(pairs([0.001, -0.001] * 3), 0.02, True)["verdict"] == "continue"
+
+
 def alternating_sequential_12_24(directory):
     assert sequential(pairs([0.001, -0.001] * 6), 0.02, True)["verdict"] == "pass"
     assert sequential(pairs([0.05] * 12), 0.02, True)["code"] == 1
