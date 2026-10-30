@@ -164,7 +164,7 @@ void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
     waitedMsProvider.store(provider, std::memory_order_release);
 }
 
-ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits, PendingWriteQuery pendingSpan) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits), pendingSpan(pendingSpan != nullptr ? pendingSpan : pendingWrite) {
+ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits, PendingWriteQuery pendingSpan, bool traceDescriptors) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits), pendingSpan(pendingSpan != nullptr ? pendingSpan : pendingWrite), traceDescriptors(traceDescriptors) {
     const ShaderRecompiler::RequestMemoryView validated(regions);
     initial.reserve(regions.size());
     for (const auto& region : regions) initial.emplace_back(region.guestAddress, region.bytes);
@@ -697,6 +697,11 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.stampWrites = &stampWrites;
     runtime.unchangedSince = &unchangedSince;
     runtime.supplyWords = &supplyWords;
+    ShaderRecompiler::SrtReadTrace descriptorTrace;
+    if (traceDescriptors) {
+        descriptorTrace.profile = true;
+        runtime.readTrace = &descriptorTrace;
+    }
     auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);

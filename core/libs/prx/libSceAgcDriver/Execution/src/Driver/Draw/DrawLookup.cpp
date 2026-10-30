@@ -8,16 +8,20 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::uint64_t& shapeKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool feedbackMask) {
     PerformanceTimer recorderTiming("Driver.DrawLookup", ArchB::Recorder::Phase::Proof);
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
         if (pointerFree) ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbPointerFreeDrawKeys);
+        std::shared_ptr<DrawEntry> feedbackEntry = dataEntry;
+        bool feedbackAlias = false;
         if (!registerKey) {
             drawKey = 0xcbf29ce484222325ull;
+            if (feedbackMask) shapeKey = drawKey;
             const auto mix = [&](std::uint64_t value) {
                 drawKey ^= value;
                 drawKey *= 0x100000001b3ull;
+                if (feedbackMask) shapeKey = (shapeKey ^ value) * 0x100000001b3ull;
             };
             if (drawParameters.indirect) {
                 const auto& indirect = *drawParameters.indirect;
@@ -54,7 +58,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 mix(program.userDataBase);
                 mix(program.firstUserSgpr);
                 mix(program.userData.size());
-                if (!pointerFree) for (const auto word : program.userData) mix(word);
+                if (!pointerFree) for (const auto word : program.userData) drawKey = (drawKey ^ word) * 0x100000001b3ull;
                 mix(vertexInfos[i].has_value());
                 if (!vertexInfos[i]) continue;
                 const auto& vertex = *vertexInfos[i];
@@ -111,7 +115,29 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             const auto found = drawCache.find(drawKey);
             if (found != drawCache.end()) entry = found->second;
             else ++drawEntryCounters.absent;
+            if (entry == nullptr && feedbackMask) {
+                const auto shape = drawShapes.find(shapeKey);
+                if (shape != drawShapes.end()) {
+                    const auto kept = drawCache.find(shape->second);
+                    if (kept != drawCache.end()) feedbackEntry = kept->second;
+                }
+            }
             maybeReportDrawCache(profile);
+        }
+        if (feedbackMask && entry == nullptr && feedbackEntry != nullptr && feedbackEntry->stages.size() == programs.size()) {
+            bool eligible = true, maskedUser = false;
+            for (std::size_t i = 0; eligible && i < programs.size(); ++i) {
+                if (roles[i] == Role::GeometryBack) continue;
+                eligible = std::any_of(feedbackEntry->stages[i].begin(), feedbackEntry->stages[i].end(), [&](const auto& variant) {
+                    bool used = false;
+                    if (variant->userData.empty() && feedbackEntry->decode == nullptr && !programs[i].userData.empty()) return false;
+                    const auto& before = variant->userData.empty() && feedbackEntry->decode != nullptr ? feedbackEntry->decode->programs[i].userData : variant->userData;
+                    if (!FeedbackWordsEqual(before, programs[i].userData, variant->feedback.userData, &used)) return false;
+                    maskedUser |= used;
+                    return true;
+                });
+            }
+            if (eligible && maskedUser) { entry = feedbackEntry; feedbackAlias = true; }
         }
         if (entry == nullptr) ArchB::Recorder::Count("draw_cache_miss_absent");
         if (entry != nullptr) {
@@ -154,12 +180,19 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             anyLayout = true;
                             continue;
                         }
+                        bool userFeedback = false;
+                        if (feedbackMask && (!variant->userData.empty() || feedbackAlias)) {
+                            if (variant->userData.empty() && entry->decode == nullptr && !programs[i].userData.empty()) continue;
+                            const auto& before = variant->userData.empty() && entry->decode != nullptr ? entry->decode->programs[i].userData : variant->userData;
+                            if (!FeedbackWordsEqual(before, programs[i].userData, variant->feedback.userData, &userFeedback)) continue;
+                        }
+                        bool memoryFeedback = false;
                         auto& regions = matchedRegions[i];
                         regions.clear();
                         appendEntryRegions(*variant, regions);
                         ++compared;
-                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
-                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback);
+                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback);
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
@@ -173,6 +206,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             ++dataStages;
                             dataWords += liveData.size();
                         }
+                        stageData[i].feedbackHit = userFeedback || memoryFeedback;
                         matched[i] = variant;
                         ranks[i] = rank;
                         ++stageEqual;
@@ -186,6 +220,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
             }
             drawHit = !miss;
+            const bool feedbackHit = drawHit && std::any_of(stageData.begin(), stageData.end(), [](const auto& stage) { return stage.feedbackHit; });
+            if (feedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");
             constexpr const char* recorderMisses[] = {"draw_cache_miss_front", "draw_cache_miss_fragment", "draw_cache_miss_other", "draw_cache_miss_layout", "draw_cache_miss_gate", "draw_cache_miss_stages"};
             ArchB::Recorder::Count(miss ? recorderMisses[static_cast<std::size_t>(*miss)] : "draw_cache_hits");
             std::lock_guard cacheLock(drawCacheMutex);
@@ -235,7 +271,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     verifyHit = true;
                     drawHit = false;
                 }
-                if (dataStages != 0 && verifyDrawDataHits()) drawHit = false;
+                if ((dataStages != 0 || feedbackHit) && verifyDrawDataHits()) drawHit = false;
             } else {
                 ++counters.misses[static_cast<std::size_t>(*miss)];
                 if (registerKey && entry->decode != nullptr) ++counters.decodePartial;
@@ -255,20 +291,23 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 if (roles[i] == Role::GeometryBack || programs[i].userData.size() != dataEntry->decode->programs[i].userData.size()) continue;
                 const auto& now = programs[i].userData;
-                const auto& was = dataEntry->decode->programs[i].userData;
                 auto& candidates = dataCandidates[i];
                 for (const auto& variant : dataEntry->stages[i]) {
-                    bool usedEqual = true;
+                    const auto& was = variant->userData.empty() ? dataEntry->decode->programs[i].userData : variant->userData;
+                    bool usedEqual = was.size() == now.size(), userFeedback = false, memoryFeedback = false;
                     for (std::size_t w = 0; !pointerFree && w < now.size() && usedEqual; ++w) {
-                        if (now[w] != was[w] && (w >= 64u || ((variant->userDataMask >> w) & 1u) != 0)) usedEqual = false;
+                        const auto difference = now[w] ^ was[w];
+                        if (difference == 0u || (w < 64u && ((variant->userDataMask >> w) & 1u) == 0u)) continue;
+                        if (feedbackMask && (difference & ~WordMask(variant->feedback.userData, w)) == 0u) userFeedback = true;
+                        else usedEqual = false;
                     }
                     if (!usedEqual) continue;
-                    if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
+                    if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.variant->pushOffset == variant->pushOffset; })) continue;
                     std::vector<ShaderRecompiler::MemoryRegion> regions;
                     appendEntryRegions(*variant, regions);
-                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (result == EntryOutcome::Equal) candidates.emplace_back(variant, std::move(regions));
+                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, nullptr, feedbackMask, &memoryFeedback);
+                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, nullptr, feedbackMask, &memoryFeedback);
+                    if (result == EntryOutcome::Equal) candidates.push_back({variant, std::move(regions), userFeedback || memoryFeedback});
                 }
             }
         }
