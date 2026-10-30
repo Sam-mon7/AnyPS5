@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/ProofEvents.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -270,6 +271,7 @@ void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width,
     summary.interval = std::make_pair(seconds(state.intervalPresents.front() - state.first), seconds(now - state.first));
     auto line = TraceFormat::Summary(summary, snapshots, state.intervalPresents);
     if (state.recorderSeen) {
+        ArchB::ProofEvents::FlushCounters();
         const auto recorder = ArchB::Recorder::Collect(now);
         const auto close = line.find_last_of('}');
         line.insert(close, ",\"archb\":" + recorder.Json());
@@ -310,6 +312,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
         state.started = true;
     }
     if (recorderOn || state.recorderSeen) {
+        ArchB::ProofEvents::FlushCounters();
         ArchB::Recorder::Boundary(recorderOn, ArchB::Switches::Sequence(), now);
         state.recorderSeen = true;
         if (!state.interval) state.interval = TraceInterval::Parse("5");

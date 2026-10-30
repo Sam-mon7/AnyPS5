@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/ProofEvents.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -535,6 +536,7 @@ std::size_t ImagePagesSize() {
 }
 
 void ForgetPages(std::uintptr_t address, std::size_t bytes) {
+    ArchB::ProofEvents::Publish(ArchB::ProofMutation::CpuWrite, ArchB::ProofSource::TrackerForget, address, bytes);
     forgetCalls.fetch_add(1, std::memory_order_relaxed);
     forgetBytes.fetch_add(bytes, std::memory_order_relaxed);
     forgetSerial.fetch_add(1, std::memory_order_release);
@@ -543,6 +545,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 }
 
 void ForgetInaccessiblePages(std::uintptr_t address, std::size_t bytes) {
+    ArchB::ProofEvents::Publish(ArchB::ProofMutation::CpuWrite, ArchB::ProofSource::TrackerForget, address, bytes);
     Pages().accessSerial.fetch_add(1, std::memory_order_acq_rel);
     Pages().forgetInaccessible(address, bytes);
 }
@@ -1053,10 +1056,12 @@ struct WriteTracker {
     std::map<std::uint64_t, std::uint32_t> refused;
 
     void noteCpuStore(std::uint64_t begin, std::uint64_t end, std::uint32_t stampGeneration) {
+        ArchB::ProofEvents::Publish(ArchB::ProofMutation::CpuWrite, ArchB::ProofSource::TrackerCollect, begin, end - begin);
         notePages(cpuPages, begin, end, stampGeneration);
     }
 
     void noteWalkStore(std::uint64_t begin, std::uint64_t end, std::uint32_t stampGeneration) {
+        ArchB::ProofEvents::Publish(ArchB::ProofMutation::CpuWrite, ArchB::ProofSource::TrackerCollect, begin, end - begin);
         notePages(walkPages, begin, end, stampGeneration);
     }
 
@@ -1340,6 +1345,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     if (!tracker.watched || bytes == 0 || bytes > tracker.size || address < tracker.base || address - tracker.base > tracker.size - bytes) return;
+    ArchB::ProofEvents::Publish(ArchB::ProofMutation::CpuWrite, ArchB::ProofSource::TrackerRewatch, address, bytes);
     tracker.coverage.Restore(address, bytes, generation);
     ++tracker.generation;
     tracker.noteCpuStore(address, address + bytes, tracker.generation);
@@ -1731,6 +1737,13 @@ std::uint64_t ResourceProofSerial() {
 }
 
 void BreakProofs() {
+    ArchB::ProofEvents::Publish(ArchB::ProofMutation::CpuWrite, ArchB::ProofSource::ExplicitBreak);
+    proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    if (ResourceEpochProofsEnabled()) resourceProofSerial.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void BreakProofs(std::uint64_t address, std::size_t bytes) {
+    ArchB::ProofEvents::Publish(ArchB::ProofMutation::CpuWrite, ArchB::ProofSource::ExplicitBreak, address, bytes);
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
     if (ResourceEpochProofsEnabled()) resourceProofSerial.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -1766,6 +1779,7 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
 }
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
+    ArchB::ProofEvents::Publish(ArchB::ProofMutation::CpuWrite, ArchB::ProofSource::TrackerUnwatch, address, bytes);
     if (!tracker.watched) return;
 #ifdef _WIN32
     tracker.startHints(address, bytes);
@@ -1809,6 +1823,7 @@ void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
         if (tracker.coverage.Covers(begin, bytes)) continue;
         GuestArena::GuestArenaCompareWhenShared_nid_no_patch(static_cast<std::uintptr_t>(begin), bytes);
         if (!walkWrites(tracker, begin, end, StampKind::Cpu) || !tracker.coverage.Restore(begin, bytes)) continue;
+        ArchB::ProofEvents::Publish(ArchB::ProofMutation::CpuWrite, ArchB::ProofSource::TrackerRewatch, begin, bytes);
         ++tracker.generation;
         tracker.noteCpuStore(begin, end, tracker.generation);
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) {
@@ -1991,9 +2006,10 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
-    BreakProofs();
+    BreakProofs(address, bytes);
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
+        ArchB::ProofEvents::Publish(ArchB::ProofMutation::CpuWrite, ArchB::ProofSource::TrackerWrite, stored.first, stored.second - stored.first);
         ++tracker.generation;
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
             tracker.noteUnstampedStore(stored.first, stored.second);
@@ -2036,7 +2052,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
-    BreakProofs();
+    BreakProofs(address, bytes);
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2896,7 +2912,7 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
 
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(address, current.size());
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).

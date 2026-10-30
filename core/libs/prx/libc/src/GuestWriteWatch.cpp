@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -40,6 +41,11 @@
 
 namespace GuestWriteWatch {
 namespace {
+
+void notifyWritten(void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context, std::uintptr_t begin, std::uintptr_t end) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::WatchCollect, begin, end - begin);
+    written(context, begin, end);
+}
 
 #if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
 constexpr std::uintptr_t PageBytes = 4096;
@@ -162,7 +168,7 @@ private:
             for (const auto& [from, to] : fresh) remove(_fresh, from, to);
         }
         for (const auto& [from, to] : fresh) {
-            written(context, from, to);
+            notifyWritten(written, context, from, to);
             if (protect(from, to)) continue;
             std::unique_lock lock(_lock);
             for (const auto& [left, right] : fresh) {
@@ -170,8 +176,8 @@ private:
                 remove(_fresh, left, right);
                 insert(_fresh, left, right);
             }
-            if (whole) written(context, begin, end);
-            else for (const auto& [left, right] : fresh) written(context, left, right);
+            if (whole) notifyWritten(written, context, begin, end);
+            else for (const auto& [left, right] : fresh) notifyWritten(written, context, left, right);
             return false;
         }
         return true;
@@ -192,10 +198,10 @@ private:
             scan.return_mask = PAGE_IS_WRITTEN;
             const auto count = ioctl(_pagemap, PAGEMAP_SCAN, &scan);
             if (count < 0) {
-                written(context, cursor, end);
+                notifyWritten(written, context, cursor, end);
                 return false;
             }
-            for (long i = 0; i < count; ++i) written(context, regions[i].start, regions[i].end);
+            for (long i = 0; i < count; ++i) notifyWritten(written, context, regions[i].start, regions[i].end);
             if (scan.walk_end <= cursor || scan.walk_end >= end) break;
             cursor = scan.walk_end;
         }
@@ -418,7 +424,7 @@ public:
             });
             for (const auto& [first, last] : runs) protect(first, last);
         }
-        for (const auto& [first, last] : runs) written(context, first, last);
+        for (const auto& [first, last] : runs) notifyWritten(written, context, first, last);
         return true;
     }
 
@@ -667,6 +673,7 @@ bool GuestWriteWatchAvailable_nid_postfix() {
 void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes) {
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::WatchRegister, begin, bytes);
     Watch::Get().Register(begin, begin + bytes);
 #else
     static_cast<void>(pointer);
@@ -677,6 +684,7 @@ void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes)
 bool GuestWriteWatchUnregister_nid_postfix(const void* pointer, std::size_t bytes) {
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::WatchUnregister, begin, bytes);
     return Watch::Get().Unregister(begin, begin + bytes);
 #else
     static_cast<void>(pointer);
@@ -719,6 +727,7 @@ bool GuestWriteWatchCollect_nid_postfix(std::uintptr_t address, std::size_t byte
 }
 
 void GuestWriteWatchBeginHostWrite_nid_postfix(const void* pointer, std::size_t bytes) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::HostWriteBegin, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #if defined(__APPLE__)
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     Watch::Get().BeginHostWrite(begin, begin + bytes);
@@ -736,12 +745,14 @@ void GuestWriteWatchEndHostWrite_nid_postfix(const void* pointer, std::size_t by
     static_cast<void>(pointer);
     static_cast<void>(bytes);
 #endif
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::HostWriteEnd, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestWriteWatchProtectionChanged_nid_postfix(const void* pointer, std::size_t bytes, int protection) {
 #if defined(__APPLE__)
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     Watch::Get().ProtectionChanged(begin, begin + bytes, protection);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Protection, begin, bytes);
 #else
     static_cast<void>(pointer);
     static_cast<void>(bytes);

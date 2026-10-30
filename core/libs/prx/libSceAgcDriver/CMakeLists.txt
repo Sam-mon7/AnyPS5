@@ -239,6 +239,7 @@ endforeach()
 
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/ProofCpuEvents.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/Switches.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
@@ -434,6 +435,18 @@ if(MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(BUILD_TESTING)
+    add_test_executable(agc_archb_c12_tests tests/ArchBC12.cpp)
+    target_include_directories(agc_archb_c12_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_archb_c12_tests PRIVATE libSceAgcDriver libc)
+    configure_windows_unwind(agc_archb_c12_tests)
+    foreach(proofCase IN ITEMS cpu_events map_events old_invalidation_kept outside_lock_write)
+        add_test(NAME agc_archb_c12_${proofCase} COMMAND agc_archb_c12_tests ${proofCase})
+        set_tests_properties(agc_archb_c12_${proofCase} PROPERTIES TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archb_c12_${proofCase} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test_executable(agc_driver_unsupported_diagnostics_tests tests/UnsupportedDiagnostics.cpp)
     target_include_directories(agc_driver_unsupported_diagnostics_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_driver_unsupported_diagnostics_tests PRIVATE libSceAgcDriver)
@@ -855,12 +868,9 @@ endif()
 
 add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
-        Execution/src/ShaderMemory.cpp
-        Execution/src/GuestMemory.cpp
-        Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
+target_link_libraries(agc_shader_memory_tests PRIVATE libSceAgcDriver shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
 
@@ -931,11 +941,9 @@ configure_windows_unwind(agc_locks_tests)
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
-        Execution/src/GuestMemory.cpp
-        Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_write_tracking_tests PRIVATE shader_recompiler_agc_driver libc)
+target_link_libraries(agc_write_tracking_tests PRIVATE libSceAgcDriver libc)
 set_target_properties(agc_write_tracking_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_write_tracking_tests)
 if(BUILD_TESTING)
@@ -971,11 +979,9 @@ endif()
 if(BUILD_TESTING AND NOT WIN32)
     add_test_executable(agc_collect_memo_generation_tests
             tests/CollectMemoGeneration.cpp
-            Execution/src/GuestMemory.cpp
-            Execution/src/PerformanceTraceThread.cpp
     )
     target_include_directories(agc_collect_memo_generation_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(agc_collect_memo_generation_tests PRIVATE shader_recompiler_agc_driver libc)
+    target_link_libraries(agc_collect_memo_generation_tests PRIVATE libSceAgcDriver libc)
     set_target_properties(agc_collect_memo_generation_tests PROPERTIES CXX_EXTENSIONS OFF)
     add_test(NAME agc_collect_memo_generation COMMAND agc_collect_memo_generation_tests)
     set_tests_properties(agc_collect_memo_generation PROPERTIES TIMEOUT 30)

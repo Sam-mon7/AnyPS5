@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
@@ -409,8 +410,10 @@ std::invalid_argument OutsideArena(const char* operation, const void* pointer, s
 
 #ifdef _WIN32
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Protection, address, bytes);
     WindowsMappings::Get().SetProtection(address, bytes, protection);
     noteAccess(reinterpret_cast<const void*>(address), bytes);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Protection, address, bytes);
 }
 
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
@@ -468,6 +471,7 @@ void GuestArenaSetPrivateMappingObserver_nid_postfix(void (*callback)(std::uintp
 }
 
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Mapping, reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("commit", pointer, bytes);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     const auto created = WindowsMappings::Get().Commit(pointer, bytes, protection, granule, Arena::Get().WriteWatched());
@@ -475,20 +479,26 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
         for (const auto& [address, size] : created) callback(address, size, generation);
     }
     noteAccess(pointer, bytes);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Mapping, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Retire, reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
     WindowsMappings::Get().Reset(pointer, bytes);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Retire, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Mapping, reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("shared mapping", pointer, bytes);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false);
     noteAccess(pointer, bytes);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Mapping, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Mapping, reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("direct memory mapping", pointer, bytes);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::vector<std::pair<std::uintptr_t, std::size_t>> created;
@@ -508,11 +518,14 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
     }
     if (failure != nullptr) std::rethrow_exception(failure);
     noteAccess(pointer, bytes);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Mapping, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestArenaMapFile_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection, std::uint32_t viewProtection, std::size_t sectionBytes) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Mapping, reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("file mapping", pointer, bytes);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false, viewProtection, sectionBytes);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Mapping, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) {
@@ -575,13 +588,16 @@ void* PlaceAt(void* pointer, std::size_t bytes, std::uint32_t protection) {
 
 #if defined(__linux__) || defined(__APPLE__)
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Protection, address, bytes);
     if (!Arena::Get().Contains(reinterpret_cast<void*>(address), bytes)) throw OutsideArena("set protection", reinterpret_cast<void*>(address), bytes);
     if (mprotect(reinterpret_cast<void*>(address), bytes, PosixProtection(protection)) != 0)
         throw std::system_error(errno, std::generic_category(), "guest arena protection failed");
     noteAccess(reinterpret_cast<const void*>(address), bytes);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Protection, address, bytes);
 }
 
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Mapping, reinterpret_cast<std::uintptr_t>(pointer), bytes);
     (void)granule;
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("commit", pointer, bytes);
     const bool marked = Arena::Get().MarkUsedForCommit(pointer, bytes);
@@ -592,11 +608,14 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
         throw;
     }
     noteAccess(pointer, bytes);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Mapping, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Retire, reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
     if (PlaceAt(pointer, bytes, 0x01) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "guest arena reset failed");
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::Retire, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 #endif
 
@@ -620,7 +639,9 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #ifdef _WIN32
-    return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    if (!WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes)) return false;
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::HostWriteBegin, reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    return true;
 #else
     GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(pointer, bytes);
     return true;
@@ -640,6 +661,7 @@ void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #ifdef _WIN32
     WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    GuestAllocations::GuestAllocationsNotifyMutation_nid_no_patch(GuestAllocations::MemoryMutation::HostWriteEnd, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else
     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);
 #endif

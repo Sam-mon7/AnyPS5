@@ -11,6 +11,7 @@ enum class Feature : std::uint8_t {
     GateRun,
     GateNoop,
     Recorder,
+    ProofCpuEvents,
 #ifdef APS5_ARCHB_SWITCHES_TEST
     TestDependent,
     TestRuntimeDependent,

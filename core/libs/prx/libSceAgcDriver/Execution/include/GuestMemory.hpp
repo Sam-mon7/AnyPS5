@@ -114,6 +114,7 @@ std::uint64_t ProofSerial();
 std::uint64_t ResourceProofSerial();
 bool ResourceEpochProofsEnabled();
 void BreakProofs();
+void BreakProofs(std::uint64_t address, std::size_t bytes);
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();

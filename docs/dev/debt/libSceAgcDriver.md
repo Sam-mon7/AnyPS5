@@ -293,6 +293,103 @@
 
 ### Opt-in draw paths
 
+#### C12 CPU and mapping mutation coverage
+
+[ProofEvents.hpp](../../../core/libs/prx/libSceAgcDriver/Execution/include/ArchB/ProofEvents.hpp) is a temporary C12 interface because C07 is absent. Move `ProofMutation`, `ProofEpoch` and the event/observation declarations into C07's contracts when that child lands; do not create a second owner. `APS5_ARCHB_PROOF_CPU_EVENTS` is runtime-controlled, defaults off and has no prerequisites. C12 changes no reuse decision. Existing proof serials, resource proof serials, collect checks, GPU hold serials, lock-entry invalidation and resource lifetimes remain authoritative.
+
+C12 does not observe every native CPU store at the instruction that performs it. Windows write-watch collection, Linux pagemap scanning and macOS protected-page collection report writes later; byte-comparison paths cannot establish that a same-value native store did not occur. Host-write begin/end events are invalidations, not completion leases, and a global tuple is not a reservation against a concurrent writer. `ProofObservation::missingCoverage` therefore includes `NativeWrites` and `GpuEvents`; an off observation has `Disabled`. All such observations are conservative and cannot authorize prepared-resource reuse. The exit criterion is C13's closed GPU ledger plus C06's collect/pending/capture validation and C29's native publication protocol. Owners: C13/C06/C29. Missing backend support never turns into a clean proof.
+
+The publisher invokes the optional range observer before a release increment of the memory or mapping epoch. `Acquire` loads both with acquire ordering; the resources member remains zero until C13. `ShaderResources::buildPrepare`, `buildComplete` and `Revalidate` acquire observations before preparing/adopting resources, but always execute the existing validation path. Draw/dispatch entry samples the switch once; finisher and committer handoffs retain that value. A mutation outside an item samples the current switch. C06 must reject evidence spanning a disabled interval or changed switch sequence. The epochs are monotonic instrumentation, not a coherent multi-epoch transaction.
+
+The libc boundary is the libc-owned `MemoryMutation` enum and `GuestAllocationsSetMutationHook_nid_no_patch` registration pointer. No libc source imports an AGC C++ symbol. Registered callbacks must be nonthrowing, must not wait, allocate, access guest bytes or reenter a registry, and must be installed/replaced only with publishers quiescent. C12 installs one process-lifetime callback; concurrent driver unload remains part of C29's drain contract. There is no event mutex or retained event queue. Diagnostic counts accumulate in atomics only while the recorder is on, then the presenter transfers them through `Recorder::Count`; mutation callbacks never initialize recorder thread storage or acquire its registration mutex.
+
+The next range consumer belongs to C06: retain backing/generation-qualified dependencies per prepared proof, consume intersecting events between the saved and acquired epochs, and reject unknown-range events globally. A bounded concurrent event journal needs committed sequence numbers, reader watermarks, explicit overflow/lost-history refusal, disabled-interval invalidation and mapping ABA/alias handling. A reader must not treat an epoch advance as proof that all writers have finished. Registration callbacks alone provide no history for a late subscriber. Keep the full walk for native coverage gaps, unknown ranges, pending host writes, incomplete publications and lost history. C13 must add announcement-time GPU/representation events and the resources epoch before this consumer can be enabled. No per-range index, journal or proof reuse is implemented here.
+
+Checked source ledger: production C++ sources under `core/`, excluding tests, were searched for every `BreakProofs`, tracker write/forget/unwatch, allocation mutation and `HostWrite` boundary. Counts below are static emission sites, counting Windows and POSIX branches separately, not a count of stores or emitted events. There are **50 sites: 17 CPU/tracker/host sites, 16 mapping sites, 7 protection sites and 10 mapping-retirement sites**. The 14 `ProofSource` categories deliberately separate watch reports from tracker reports; one operation may emit more than one event. Every bounded range uses guest byte address plus byte count; zero/overflow or an unavailable range is global/conservative.
+
+| Source symbol | Category; sites | Ordering point | Range | Focused coverage |
+|---|---|---|---|---|
+| `GuestMemory::BreakProofs()` / range overload | ExplicitBreak; 2 | Before the unchanged legacy serial increments | No / yes | `cpu_events`, `old_invalidation_kept`, `outside_lock_write` |
+| `GuestMemory::storeOwn` / `stampStored` | TrackerWrite; 1 | After the store callback, before tracker stamps and unlock | Actual stored interval | `cpu_events`, `outside_lock_write` |
+| `WriteTracker::noteCpuStore`, `noteWalkStore` | TrackerCollect; 2 | After backend collection or known restoration, before stamp publication | Dirty page run, sometimes a conservative fresh run | `cpu_events`, existing write-tracking cases |
+| `GuestMemory::ForgetPages`, `ForgetInaccessiblePages` | TrackerForget; 2 | Before cached page-state invalidation | Yes | `cpu_events`, `map_events` |
+| `GuestMemory::unwatchLocked` | TrackerUnwatch; 1 | Before coverage exclusion/unregister, including failed import/collect paths | Yes | `cpu_events`, existing import/watch cases |
+| `GuestMemory::watchPrivateMapping`, `Rewatch` | TrackerRewatch; 2 | Before restored coverage is published | Yes | `map_events`, existing resident-remap/rewatch cases; Windows only |
+| `GuestAllocations::renewBacking` | Mapping; 1 | Before replacing backing identities at mutation end | Yes | `map_events` |
+| `GuestAllocationsInvalidate_nid_postfix` | Mapping; 1 | Before generation publication and legacy invalidator | Yes | `cpu_events` |
+| Windows `registerImage`, POSIX `registerImagePages` | Mapping; 2 | Per discovered image run, before replacement registry becomes visible | Yes, individual image runs | Shared add/retire path; image-loader execution remains untested by C12 |
+| `GuestAllocationsAdd_nid_postfix` | Mapping; 2 | Before and after insertion, under the existing registry lock | Yes | `map_events` |
+| `GuestAllocationsProtect_nid_postfix` | Protection; 2 | Before OS apply, after registry patch, before unlock | Yes | `map_events` |
+| `GuestAllocationsUnregisterImage_nid_postfix` | MappingRetire; 2 | After unpin wait, before and after removal | Yes, whole registered image span | Same retirement boundary; loader execution remains untested by C12 |
+| `GuestAllocationsRemove_nid_postfix` | MappingRetire; 2 | After unpin wait, before and after removal | Yes, allocation extent | `map_events` cleanup and ABA |
+| `GuestAllocationsUnmap_nid_postfix` | MappingRetire; 2 | Per piece before OS apply and after registry patch | Yes, each mapped piece | `map_events` |
+| Windows/POSIX `GuestArenaCommit_nid_postfix` | Mapping; 4 | Before OS commit and after access notification | Yes | `map_events` |
+| `GuestArenaMap_nid_postfix`, `GuestArenaMapDirect_nid_postfix`, `GuestArenaMapFile_nid_postfix` | Mapping; 6 | Before OS map and after successful completion | Yes | Existing direct/shared/file tests; Windows only |
+| Windows/POSIX `GuestArenaSetProtection_nid_postfix` | Protection; 4 | Before OS protect and after access notification | Yes | `map_events` |
+| Windows/POSIX `GuestArenaReset_nid_postfix` | MappingRetire; 4 | Before and after decommit/replacement | Yes | `map_events` |
+| Windows `GuestArenaBeginHostWrite_nid_postfix`, `GuestArenaEndHostWrite_nid_postfix` | HostWriteBegin/End; 2 | Successful opening before caller writes; completion before returning | Yes, caller destination extent | `cpu_events`; all callers below share this seam |
+| `GuestWriteWatchBeginHostWrite_nid_postfix`, `GuestWriteWatchEndHostWrite_nid_postfix` | HostWriteBegin/End; 2 | Before access and after backend completion; POSIX arena delegates here | Yes | `cpu_events` on POSIX; Windows direct entry points are backend stubs |
+| `GuestWriteWatchRegister_nid_postfix`, `GuestWriteWatchUnregister_nid_postfix` | WatchRegister/Unregister; 2 | Before backend coverage changes | Yes | Existing Linux/macOS watch tests; Windows has no such backend |
+| `GuestWriteWatch::notifyWritten` | WatchCollect; 1 | Before delivering each backend dirty/fresh run to its caller | Yes | Linux/macOS collect/fresh/armed paths; Windows tracker consumes arena page lists instead |
+| `GuestWriteWatchProtectionChanged_nid_postfix` | Protection; 1 | After macOS watch protection state changes | Yes | macOS backend only; other platforms explicitly have no operation |
+
+All nine production calls of `BreakProofs` are covered by those two overloads. Five calls have ranges; four remain global:
+
+| Caller | Range | Ordering and remaining owner |
+|---|---|---|
+| `GuestMemory::storeOwn`, `markWritten`, `WriteChanged` (3) | Yes | Before explicit store/stamp/merge; actual stores also release-publish afterward |
+| `Graphics::Recorder::AfterCompletions` (1) | Yes, label bytes | After completion-count change and before label/write publication; C13 must classify queued GPU authority |
+| `Graphics::Recorder::NoteWrittenBack` (1) | Yes, affected label interval | Before late completion label publication; C13 must classify authority |
+| `Graphics::Recorder::AfterRecordedWork` (1) | No, opaque action | After action/count registration; global refusal until C13 classifies the action |
+| `DriverDetail::DrawPipeline::run` (1) | No, opaque non-draw commit | After the commit; C13 must add announcement events, not infer them from this completion |
+| `Graphics::keepRecordedDraw` copied-writer branch (1) | No single range at this boundary | After copied-writer registration; global refusal, C13 owns representation/write announcements |
+| `Graphics::ShaderResources::MarkGpuWrites` (1) | No complete range for arbitrary BDA/storage writers | After writer registration; global refusal until C13 |
+
+The qualified tracker API caller inventory has 57 production sites, all routed to the ranged write/unwatch hooks above. `E` is `Execution/src`, `G` is `Graphics/src` in libSceAgcDriver. These calls describe known stores and may also represent GPU completion bookkeeping; they do not replace C13's earlier queued-write announcements.
+
+| File | Source symbols (site counts) |
+|---|---|
+| `G/BdaResources.cpp` | `BdaResources::markWrittenPages` (1) |
+| `G/ColorTargetTransfer.cpp` | `WriteColorTarget` (2) |
+| `G/DccMetadata.cpp` | `StoreUncompressedOnGpu`, `StoreUncompressedOnCpu` (1 each) |
+| `G/DepthSurface.cpp` | `storeHtileOnGpu`, `storeBackClearedHtile`, `CompleteHtileDepthClear` (1 each) |
+| `G/Draw.cpp` | `writeTexels`, `storeSingleTexels`, `storeCmaskClearTexels`, `recordCmaskClear`, `materializeCmaskClear`, `recordPreparedDraw` (1 each) |
+| `G/GpuColorTransfer.cpp` | `GpuColorTransfer::WriteBack` (1) |
+| `G/GuestBufferMemory.cpp` | `refreshImports` (1 unwatch), `MarkDirectWrites` (1), `storeChanged` (2), `storeSparse` (1), `WriteBack` (4) |
+| `G/Recorder.cpp` | `Recorder::AfterCompletions` (1) |
+| `G/Texture.cpp` | `StorageTexture::FillClear` (1), `CopyFrom` (1), `writeBackLayers` (4) |
+| `E/GuestMemory.cpp` | `AgcDriverStoreGuestLabel_nid_postfix` (1); internal `Write`, `WriteChangedCommitted` and both `StoreOwnBytes` overloads also funnel through the same hooks |
+| `E/Pm4.cpp` | `copyMemory` (1), `Execute` (9) |
+| `E/VulkanDevice.cpp` | `WriteLabelOnGpu` (2), `DumpSamplesOnGpu` (1), `FillBuffer` (1), `CopyBuffer` (3) |
+| `E/Driver/Memory/BufferFill.cpp` | `Driver::storeBufferFill` (1) |
+| `E/Driver/Packets/PacketMemory.cpp` | `preparePacketMemory` (3), `dumpSampleCounters`, `commitDmaStore`, `commitLabel` (1 each) |
+| `E/Driver/Synchronization/DeferredLabels.cpp` | `Driver::recordDeferredLabels` (1) |
+
+The allocation caller inventory has 21 production mutation calls: libkernel `DirectMemory.cpp` has `RemapFixedIntoRegistered` (1 protect), `UnmapRegistered` (1 unmap), `DoMapDirect`/`DoMapAnon`/`DoMapShared`/`DoReserveVirtual` (1 add each), `DoMapFileBacked_nid_no_patch` (2 platform add sites), and `DoMprotect` (2 main-image registrations, 2 image registrations, 1 protect). `Module/src/DynamicLoader.cpp::dlclose_nid_postfix` has 2 platform image-unregister sites. libc `GuestHeap.cpp` has `allocate` (1 add), `emptyInPlace` (1 remove, 1 zero-size add) and `free` (1 remove). AGC `Driver/Lifecycle.cpp::MapDriverMemory` has 1 add and `tools/FrameReplay.cpp::restoreMemory` has 1 add. Zero-size allocations carry no byte range and publish no ranged event. `GuestHeap` decommit notifications route through `GuestAllocationsInvalidate_nid_postfix`. Empty registry transactions are not classified as memory writes.
+
+Host-write caller ledger: each constructor opens the specified guest destination before the write, and its destructor publishes completion before the operation returns. Every row has a range; vector helpers emit one pair per destination. Direct calls to the arena begin/end functions occur only in the `HostWrite` wrapper and tests. This is boundary coverage, not a claim that every listed subsystem has been executed by the C12 fixture.
+
+| File in `core/libs/prx` | Source symbols |
+|---|---|
+| `libc/src/General.cpp` | `GuestCopyOut_nid_no_patch` |
+| `libc/src/FileAndHeap.cpp` | `fread_nid_postfix` |
+| `libkernel/Aio/src/Aio.cpp` | `NativePread` |
+| `libkernel/Apr/src/Apr.cpp` | `_readFile` |
+| `libkernel/File/src/Open.cpp` | `sceKernelRead` |
+| `libkernel/File/src/Stdio.cpp` | `pipe_nid_postfix`, `pread_nid_postfix`, both platform `sceKernelGetdirentries` implementations (buffer and base), `OpenIovecs`, both platform `sceKernelPread` implementations, `TransferIovecs`, `sceKernelReadv`, `sceKernelPreadv` |
+| `libkernel/File/src/DescriptorControl.cpp` | `ProcessRecordLock`, `RecordLock`, `Ioctl` |
+| `libkernel/Socket/src/Udp.cpp` | `socketpair_nid_postfix`, `recv_nid_postfix`, `recvfrom_nid_postfix`, `WriteGuest` |
+| `libkernel/System/src/Process.cpp` | `StoreGuestId`, `WriteGuest` |
+| `libSceNet/Export.cpp` | `sceNetRecv`, `sceNetRecvfrom` (payload/address/length), `sceNetRecvmsg` (message and iovecs) |
+| `libSceFreeType/src/List.cpp` | `ListWrite::ListWrite` (list and up to four nodes); list mutation exports route through this wrapper |
+| `libSceFreeType/src/Names.cpp` | `FT_Get_Glyph_Name_nid_postfix` |
+| `libSceJxr/Export.cpp` | `readIS_nid_postfix` |
+| `libSceJobManager/Export.cpp` | `Sequence::SubmitCompute`, `SetComputeStorage`, `FlushCompute`, `DestroyManager`, `Initialize` (command/state/node storage) |
+| `libScePosixForWebKit/Filesystem.cpp` | `mkstemp_nid_postfix` |
+| `libSceAgcDriver/Execution/src/GuestMemory.cpp` | `ImportWatched` on macOS when an import can write guest bytes |
+
+Host imports (`GuestArenaBeginHostImport_nid_no_patch`/`EndHostImport`) are not CPU host writes. Their GPU/import changes, shared aliases outside the supplied virtual range, unknown third-party native writes and native same-value writes remain conservative. Linux compilation and capable WSL validation must be completed before acceptance; the lane's WSL service currently refuses access with `Wsl/EnumerateDistros/Service/E_ACCESSDENIED`. Live gate, visual and replay-output qualification remain external to C12's hook microbenchmark and are not established by it.
+
 - [Indirect builtin offsets](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/Draw.cpp) lack host-GPU and console validation. They are on by default; presence of `APS5_NO_INDIRECT_BUILTIN_OFFSETS` restores folding, indexed CPU argument prechecks and CPU indirect draw caching. The port of `eeb1665538` and `139d442de5` follows Kyty/SuperMedo's `TryGpuIndirectDraw`: Vulkan BaseVertex/BaseInstance replace packet-patched front-stage SGPRs and are subtracted from VertexIndex/InstanceIndex, following Vulkan/SPIR-V builtin semantics. Only indexed plain vertex draws without decoded header fetch resources qualify; other paths retain folding. Compile-time resource selection through a patched SGPR can still fail recompilation. CPU fallback re-materializes builtin stages when removed offset words defeat the push-only cache proof. GPU readback, validation-layer comparison and zoo_s work counts remain unverified.
 
 - [CPU indirect draw caching](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawCapture.cpp) is on by default (`APS5_NO_CPU_INDIRECT_DRAW_CACHE` turns it off). Unprofiled runs: zoo scene 8.31/8.46 FPS against 7.98/7.91, Dregling room 37.73/39.24 against 37.62/37.79. Its focused tests are clean under Vulkan validation; no in-game run used validation. Admission excludes capture-dependent patched words, incomplete or specialization-dependent plans, non-push shader data, merged programs, mesh, tessellation and rectangle paths. Original register words remain keyed; only record-patched values are excluded by taking the key before record patching. Hit resource validation and per-record argument reads remain active. The zoo profile records only the aggregate `NotFolded` reason, so its shares of differing packet/analyzer SGPRs and shared or observed index values are unknown; `[indirect-fold]` reports these shares on a future profiled run.

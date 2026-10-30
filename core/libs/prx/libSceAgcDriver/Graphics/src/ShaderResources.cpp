@@ -2092,6 +2092,7 @@ void ValidateRuntimeResources(const CompiledShader& shader, std::span<const std:
 }
 
 void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
+    observeCpuProof();
     PerformanceTimer frameTiming("Resources.Prepare");
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
@@ -2484,6 +2485,7 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
 }
 
 void ShaderResources::buildComplete() {
+    observeCpuProof();
     PerformanceTimer frameTiming("Resources.Complete");
     BuildLookups lookups;
     Require(!completed, "cannot update a published descriptor heap");
@@ -3624,7 +3626,17 @@ ShaderResources::ProofExtent ShaderResources::Extent() const {
     return extent;
 }
 
+void ShaderResources::observeCpuProof() {
+    if (ArchB::ProofEvents::Enabled()) {
+        const auto observed = ArchB::ProofEvents::Acquire(true);
+        if (cpuProofObservation.epoch.memory != 0 && cpuProofObservation.epoch != observed.epoch) ArchB::Recorder::Count("proof_cpu_prepared_changed");
+        if (observed.Conservative()) ArchB::Recorder::Count("proof_cpu_incomplete_coverage");
+        cpuProofObservation = observed;
+    }
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    observeCpuProof();
     PerformanceTimer recorderTiming("Resources.Proof", AgcDriver::ArchB::Recorder::Phase::Proof);
     const bool trustProofs = ArchB::Switches::Enabled(ArchB::Feature::UbTrustProofs);
     if (trustProofs && provedOnce) {

@@ -52,7 +52,14 @@ private:
 };
 using Mapped = std::vector<std::weak_ptr<const Range>>;
 
+enum class MemoryMutation : std::uint8_t {
+    Mapping, Protection, Retire, HostWriteBegin, HostWriteEnd, WatchRegister, WatchUnregister, WatchCollect
+};
+using MutationHook = void (*)(MemoryMutation, std::uintptr_t, std::size_t) noexcept;
+
 extern "C" {
+void GuestAllocationsSetMutationHook_nid_no_patch(MutationHook callback);
+void GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation event, std::uintptr_t address, std::size_t bytes) noexcept;
 void* GuestAllocationsBegin_nid_postfix();
 void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation);
 void GuestAllocationsRegisterImage_nid_postfix(void* mutation, const void* image);

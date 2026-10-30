@@ -51,6 +51,7 @@ std::uint64_t freshBacking() {
 }
 
 void renewBacking(std::uintptr_t address, std::size_t bytes) {
+    GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Mapping, address, bytes);
     auto& ranges = registry().ranges;
     auto it = ranges.upper_bound(address);
     if (it != ranges.begin()) --it;
@@ -63,6 +64,7 @@ void renewBacking(std::uintptr_t address, std::size_t bytes) {
 }
 
 std::atomic<std::uint64_t> generation{1};
+std::atomic<MutationHook> mutationHook{nullptr};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> invalidator{nullptr};
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> pinWaiter{nullptr};
 std::atomic<void (*)(const Mapped&, std::uint64_t)> gpuMapObserver{nullptr};
@@ -148,6 +150,15 @@ void* GuestAllocationsBegin_nid_postfix() {
     return state;
 }
 
+void GuestAllocationsSetMutationHook_nid_no_patch(MutationHook callback) {
+    mutationHook.store(callback, std::memory_order_release);
+}
+
+void GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation event, std::uintptr_t address, std::size_t bytes) noexcept {
+    if (bytes == 0) return;
+    if (const auto callback = mutationHook.load(std::memory_order_acquire)) callback(event, address, bytes);
+}
+
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
     for (const auto& [address, bytes] : state->unpinned) renewBacking(address, bytes);
@@ -190,6 +201,7 @@ void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t,
 }
 
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Mapping, address, bytes);
     generation.fetch_add(1, std::memory_order_release);
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
 }
@@ -234,6 +246,7 @@ void registerImage(const void* image) {
                 require(previous.address + previous.bytes <= cursor, "guest image overlaps a registered allocation");
             }
             replacement.emplace(cursor, std::make_shared<const Range>(Range{cursor, memory.RegionSize, readable, writable, cursor, memory.RegionSize, false, false, freshBacking()}));
+            GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Mapping, cursor, memory.RegionSize);
             registered = true;
         }
         cursor += memory.RegionSize;
@@ -307,6 +320,7 @@ std::uintptr_t registerImagePages(const ImagePages& collected) {
             require(previous.address + previous.bytes <= address, "guest image overlaps a registered allocation");
         }
         replacement.emplace(address, std::make_shared<const Range>(Range{address, bytes, page->second.readable, page->second.writable, address, bytes, false, false, freshBacking()}));
+        GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Mapping, address, bytes);
         page = std::next(last);
     }
     state.ranges.swap(replacement);
@@ -344,9 +358,11 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
     if (found == state.registeredImages.end()) return;
     const auto [begin, end] = *found;
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, image, end - begin);
+    GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Retire, begin, end - begin);
     recordChange(mutation, image, end - begin);
     std::erase_if(state.ranges, [&](const auto& entry) { return !entry.second->releasable && entry.second->allocationAddress >= begin && entry.second->allocationAddress < end; });
     state.registeredImages.erase(found);
+    GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Retire, begin, end - begin);
 }
 
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu) {
@@ -361,7 +377,9 @@ void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t 
         const auto& previous = *std::prev(next)->second;
         require(previous.address + previous.bytes <= address, "overlapping guest allocation");
     }
+    GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Mapping, address, bytes);
     ranges.emplace(address, std::make_shared<const Range>(Range{address, bytes, readable, writable, address, bytes, true, gpu, freshBacking()}));
+    GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Mapping, address, bytes);
 }
 
 [[noreturn]] void PinnedFailure(std::uintptr_t address, std::size_t bytes, const char* why) {
@@ -517,6 +535,7 @@ Range GuestAllocationsFind_nid_postfix(void*, const void* pointer) {
 void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     const auto range = GuestAllocationsFind_nid_postfix(mutation, pointer);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, range.bytes);
+    GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Retire, range.address, range.bytes);
     recordChange(mutation, pointer, range.bytes);
     auto& ranges = registry().ranges;
     const auto exact = ranges.find(range.address);
@@ -525,6 +544,7 @@ void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     } else {
         std::erase_if(ranges, [&](const auto& entry) { return entry.second->allocationAddress == range.address; });
     }
+    GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Retire, range.address, range.bytes);
     if (const auto observer = unmapObserver.load(std::memory_order_acquire)) observer(range.address, range.bytes);
 }
 
@@ -590,8 +610,10 @@ void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, st
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
     recordChange(mutation, pointer, bytes);
     const auto patch = replaceRange(pointer, bytes, false, readable, writable, gpu);
+    GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Protection, reinterpret_cast<std::uintptr_t>(pointer), bytes);
     apply();
     applyPatch(patch);
+    GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Protection, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply) {
@@ -617,8 +639,10 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
         const auto pieceEnd = std::min<std::uint64_t>(end, range.address + range.bytes);
         const auto patch = replaceRange(reinterpret_cast<const void*>(cursor), pieceEnd - cursor, true, false, false, false);
         const bool last = !allocationRemains(range, patch);
+        GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Retire, cursor, pieceEnd - cursor);
         apply(reinterpret_cast<const void*>(cursor), pieceEnd - cursor, reinterpret_cast<const void*>(range.allocationAddress), last);
         applyPatch(patch);
+        GuestAllocationsNotifyMutation_nid_no_patch(MemoryMutation::Retire, cursor, pieceEnd - cursor);
         if (const auto observer = unmapObserver.load(std::memory_order_acquire)) observer(cursor, pieceEnd - cursor);
         any = true;
         cursor = pieceEnd;

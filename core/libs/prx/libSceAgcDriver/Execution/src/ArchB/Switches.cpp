@@ -33,6 +33,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
     {Feature::Recorder, "RECORDER", false, true, {}},
+    {Feature::ProofCpuEvents, "PROOF_CPU_EVENTS", false, true, {}},
 #ifdef APS5_ARCHB_SWITCHES_TEST
     {Feature::TestDependent, "TEST_DEPENDENT", true, false, TestPrerequisites},
     {Feature::TestRuntimeDependent, "TEST_RUNTIME_DEPENDENT", false, true, TestRuntimePrerequisites},
