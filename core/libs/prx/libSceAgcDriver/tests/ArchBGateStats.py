@@ -227,6 +227,10 @@ def alternating_futility_at_six(directory):
     result = sequential(pairs([0.05] * 6), 0.02, True)
     assert result["code"] == 1 and result["verdict"] == "fail" and result["stage"] == 6
     assert sequential(pairs([0.001, -0.001] * 3), 0.02, True)["verdict"] == "continue"
+    path, text, blocks, events = alternating_fixture(directory, 12)
+    result = alternating_blocks(path, text, blocks, 3)
+    assert len(result) == 6
+    assert alternating_verdict(directory, 3, {"alternating_m": 0.02, "mean_ms": 150})["stage"] == 6
 
 
 def alternating_sequential_12_24(directory):

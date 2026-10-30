@@ -204,8 +204,8 @@ def sequential(pairs, margin=0.02, alternating=False):
 
 
 def alternating_blocks(telemetry, text, blocks, settle_seconds):
-    if not math.isfinite(settle_seconds) or settle_seconds < 0 or len(blocks) not in (24, 48, 96):
-        raise GateError(24, "alternation needs 24, 48 or 96 blocks and nonnegative settling")
+    if not math.isfinite(settle_seconds) or settle_seconds < 0 or len(blocks) not in (12, 24, 48, 96):
+        raise GateError(24, "alternation needs 12, 24, 48 or 96 blocks and nonnegative settling")
     toggles = {}
     last_sequence, last_timestamp = 0, -1
     for line in text.splitlines():
