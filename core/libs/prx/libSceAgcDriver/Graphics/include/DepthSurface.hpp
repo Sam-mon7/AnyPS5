@@ -53,6 +53,7 @@ struct WrittenStorageExtent {
 void RetireCoveredDepthSurfaces(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::span<const WrittenStorageExtent> extents);
 bool DepthSurfaceAt(std::uint64_t address);
 bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes);
+bool DepthSurfaceOverlaps(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 bool DepthSurfaceBlocksMemoryProof(VkDevice device, std::uint64_t address, std::uint64_t bytes);
 std::string DescribeDepthOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes);
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource);

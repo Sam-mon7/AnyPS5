@@ -2650,6 +2650,17 @@ bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t 
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && surface->context.device == device && surface->Overlaps(address, bytes); });
 }
 
+bool DepthSurfaceOverlaps(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire) || surface->retired || surface->context.device != device) continue;
+        for (const auto& [begin, end] : ranges) {
+            if (end > begin && surface->Overlaps(begin, end - begin)) return true;
+        }
+    }
+    return false;
+}
+
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {

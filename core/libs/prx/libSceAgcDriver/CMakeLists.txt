@@ -3638,7 +3638,7 @@ if(BUILD_TESTING)
             set_property(TEST agc_archb_fix_proofs_capture_${proofMode} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-    foreach(proofUse IN ITEMS draw dispatch toggle toggle_pipeline)
+    foreach(proofUse IN ITEMS draw dispatch toggle toggle_pipeline ranges depth profile)
         add_test(NAME agc_archb_fix_proofs_${proofUse}_stale COMMAND agc_driver_sampled_cache_budget_tests fix-proofs-${proofUse})
         set_tests_properties(agc_archb_fix_proofs_${proofUse}_stale PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_FIX_CHEAPER_PROOFS=1;APS5_PIPELINED_DRAWS=0;APS5_TEMPLATE_AUDIT_MS=250")

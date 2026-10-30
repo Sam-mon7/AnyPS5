@@ -518,6 +518,28 @@ PageStates& Pages() {
     return pages;
 }
 
+struct MappingChanges {
+    std::mutex mutex;
+    std::atomic<std::uint64_t> generation{1};
+    std::map<std::uint64_t, std::uint64_t> ranges{{0, 1}};
+
+    void Invalidate(std::uintptr_t address, std::size_t bytes) {
+        if (bytes == 0 || bytes > UINT64_MAX - address) return;
+        std::lock_guard lock(mutex);
+        const auto end = address + bytes;
+        const auto after = std::prev(ranges.upper_bound(end))->second;
+        const auto stop = ranges.try_emplace(end, after).first;
+        ranges.erase(ranges.lower_bound(address), stop);
+        ranges.emplace(address, generation.load(std::memory_order_relaxed) + 1);
+        generation.fetch_add(1, std::memory_order_release);
+    }
+};
+
+MappingChanges& Mappings() {
+    static MappingChanges changes;
+    return changes;
+}
+
 std::uintptr_t PagesBase() {
     return Pages().arena.base;
 }
@@ -539,12 +561,14 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetBytes.fetch_add(bytes, std::memory_order_relaxed);
     forgetSerial.fetch_add(1, std::memory_order_release);
     Pages().forget(address, bytes);
+    Mappings().Invalidate(address, bytes);
     forgetSerial.fetch_add(1, std::memory_order_release);
 }
 
 void ForgetInaccessiblePages(std::uintptr_t address, std::size_t bytes) {
     Pages().accessSerial.fetch_add(1, std::memory_order_acq_rel);
     Pages().forgetInaccessible(address, bytes);
+    Mappings().Invalidate(address, bytes);
 }
 
 #ifdef __linux__
@@ -1969,6 +1993,28 @@ bool UnchangedSinceClean(std::span<const UnchangedQuery> queries, bool privateWr
     static_cast<void>(privateWriteWatch);
     return false;
 #endif
+}
+
+std::uint64_t MappingGeneration() {
+    auto& pages = Pages();
+    pages.initialize();
+    if (pages.arena.size == 0 && pages.image.size == 0) return 0;
+    return Mappings().generation.load(std::memory_order_acquire);
+}
+
+bool MappingsUnchanged(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t& generation) {
+    auto& changes = Mappings();
+    if (generation == 0 || (ForgetSerial() & 1u) != 0) return false;
+    if (changes.generation.load(std::memory_order_acquire) == generation) return true;
+    std::lock_guard lock(changes.mutex);
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) return false;
+        for (auto it = std::prev(changes.ranges.upper_bound(begin)); it != changes.ranges.end() && it->first < end; ++it) {
+            if (it->second > generation) return false;
+        }
+    }
+    generation = changes.generation.load(std::memory_order_relaxed);
+    return true;
 }
 
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {

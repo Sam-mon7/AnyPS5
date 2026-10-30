@@ -289,11 +289,18 @@ private:
 
 class WatchedSurface {
 public:
-    explicit WatchedSurface(const Context& context, std::size_t bytes = SurfaceBytes) : context(context), span(bytes) {
+    explicit WatchedSurface(const Context& context, std::size_t bytes = SurfaceBytes, bool shared = false) : context(context), span(bytes) {
 #ifdef _WIN32
         memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
-        if (memory != nullptr) GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+        if (memory != nullptr) {
+            if (shared) {
+                backing = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+                Require(backing != nullptr, "cannot create the shared proof backing");
+                GuestArena::GuestArenaMap_nid_postfix(memory, bytes, backing, 0, PAGE_READWRITE);
+            } else GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+        }
 #else
+        static_cast<void>(shared);
         constexpr std::uintptr_t alignment = 65536;
         void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
@@ -314,10 +321,14 @@ public:
 
     ~WatchedSurface() {
         ClearCachedTextures(context.device);
-        GuestAllocations::Mutation().Remove(memory);
+        if (registered) GuestAllocations::Mutation().Remove(memory);
 #ifdef _WIN32
         GuestArena::GuestArenaReset_nid_postfix(memory, span);
         GuestArena::GuestArenaRelease_nid_postfix(memory, span);
+        if (backing != nullptr) {
+            GuestArena::GuestArenaForgetSection_nid_postfix(backing);
+            CloseHandle(backing);
+        }
 #else
         munmap(memory, span);
         GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, span);
@@ -328,6 +339,17 @@ public:
     WatchedSurface& operator=(const WatchedSurface&) = delete;
 
     std::uint64_t Address() const { return reinterpret_cast<std::uint64_t>(memory); }
+
+    void Unmap() {
+        GuestAllocations::Mutation().Remove(memory);
+        registered = false;
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(memory, span);
+#else
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, span);
+        Require(mmap(memory, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == memory, "cannot unmap the watched surface");
+#endif
+    }
 
     void Remap() {
         GuestAllocations::Mutation().Remove(memory);
@@ -347,6 +369,10 @@ private:
     const Context& context;
     std::size_t span = 0;
     std::uint8_t* memory = nullptr;
+    bool registered = true;
+#ifdef _WIN32
+    HANDLE backing = nullptr;
+#endif
 };
 
 std::array<std::uint32_t, 8> Descriptor(std::uint64_t address, std::uint32_t side = Side, std::uint32_t format = Format32UInt) {
@@ -790,6 +816,17 @@ bool resourceEpochTests(Context context, bool draw) {
         ShaderResources::ProofReport report;
         Require(!resources->Revalidate(shader, &report) && !report.epochReused, "a DCC key change was accepted through an epoch proof");
         Require(Memory::CollectEpoch() == epoch, "the key test changed the consumer's epoch");
+        if (cheaper) {
+            auto copied = context;
+            copied.hostImportAlignment = 0;
+            program.bindings.front().kind = ShaderRecompiler::DescriptorKind::StorageImage;
+            program.bindings.front().binding = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + PlaceholderDimensionsPerClass + 2u;
+            auto stored = draw ? std::make_shared<ShaderResources>(copied, std::span(&shader, 1), ColorTarget{}, 0, 0, 0) : std::make_shared<ShaderResources>(copied, shader);
+            warm(*stored, shader);
+            Require(StorageTexture::NoteKeysFill(metadata.Address(), DccKeyBytes(SurfaceBytes), 0x40) != 0, "the key-state test did not change an image");
+            stored->Revalidate(shader, &report);
+            Require(!report.epochReused, "an image key-state change reused its old proof");
+        }
     }
     {
         WatchedSurface surface(context);
@@ -800,7 +837,7 @@ bool resourceEpochTests(Context context, bool draw) {
         warm(*resources, shader);
         ClearDepthSurfaces(context.device);
         ShaderResources::ProofReport report;
-        Require(resources->Revalidate(shader, &report) && !report.epochReused, "a changed depth registry reused its old proof");
+        Require(resources->Revalidate(shader, &report) && report.epochReused == (cheaper && expectedReuse(*resources)), "an unrelated depth registry change used the wrong proof path");
         warm(*resources, shader);
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         Require(resources->Revalidate(shader, &report) && !report.epochReused && report.path == ShaderResources::ProofPath::Full, "epoch reuse postponed the lookup audit");
@@ -822,6 +859,14 @@ bool resourceEpochTests(Context context, bool draw) {
         warm(*resources, shader);
         const auto image = StorageTexture::FindLive(surface.Address(), SurfaceBytes);
         Require(image != nullptr && image->Cached(), "the storage epoch fixture is not cached");
+        if (cheaper) {
+            const auto version = image->Version();
+            image->MarkDirty();
+            Require(image->Version() != version, "the image version fixture did not change its image");
+            ShaderResources::ProofReport report;
+            Require(resources->Revalidate(shader, &report) && !report.epochReused, "a changed image version reused its old proof");
+            image->Flush();
+        }
         ClearCachedTextures(context.device);
         Require(!image->Cached(), "the storage epoch fixture was not evicted");
         ShaderResources::ProofReport report;
@@ -916,13 +961,176 @@ bool resourceEpochTests(Context context, bool draw) {
         recorder.Sync();
         std::memset(reinterpret_cast<void*>(surface.Address()), 0x37, bytes);
         ShaderResources::ProofReport report;
-        Require(resources->Revalidate(shader, &report) && report.epochReused == (enabled && !cheaper), "the staged template did not honor the publication proof guard");
+        Require(resources->Revalidate(shader, &report) && report.epochReused == enabled, "the staged template did not retain its per-use copy");
         resources->MarkGpuWrites(recorder);
         recorder.Sync();
         const auto* data = reinterpret_cast<const std::uint8_t*>(surface.Address());
         Require(std::all_of(data, data + bytes, [](std::uint8_t value) { return value == 0x37; }), "an epoch hit skipped the new staging copy and copied old bytes back");
     }
     return true;
+}
+
+void cheaperRangeTests(Context context) {
+    namespace Memory = AgcDriver::GuestMemory;
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context);
+    WatchedSurface unrelated(context);
+    std::unique_lock gpu(Memory::GpuMutex());
+    const ResourceProofScope item(true);
+    const auto program = SampledProgram(surface.Address());
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, shader);
+    ShaderResources::ProofReport report;
+    for (int i = 0; i < 4; ++i) Require(resources.Revalidate(shader, &report), "range proof warmup failed");
+    const auto unchanged = [&] {
+        Require(resources.Revalidate(shader, &report), "unrelated activity changed the resource");
+#ifdef _WIN32
+        Require(report.epochReused, "unrelated activity discarded the range proof");
+#endif
+    };
+    unchanged();
+    Memory::BumpCollectEpoch();
+    unchanged();
+    gpu.unlock();
+    std::thread([&] {
+        std::lock_guard other(Memory::GpuMutex());
+        const std::byte value{0x13};
+        Memory::StoreOwnBytes(unrelated.Address(), std::span(&value, 1));
+    }).join();
+    gpu.lock();
+    unchanged();
+    std::memset(reinterpret_cast<void*>(unrelated.Address()), 0x27, SurfaceBytes);
+    Memory::CollectWritesUncached(unrelated.Address(), SurfaceBytes);
+    unchanged();
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(unrelated.Address(), SurfaceBytes);
+    unchanged();
+    unrelated.Remap();
+    unchanged();
+    Memory::Unwatch(unrelated.Address(), SurfaceBytes);
+    unchanged();
+    Memory::Rewatch(std::array{std::pair{unrelated.Address(), unrelated.Address() + SurfaceBytes}});
+    unchanged();
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        recorder.NotePendingWrite(unrelated.Address(), SurfaceBytes);
+        unchanged();
+        recorder.NotePendingWrite(surface.Address(), SurfaceBytes);
+        Require(resources.Revalidate(shader, &report) && !report.epochReused, "an overlapping queued GPU write reused a proof");
+        recorder.Sync();
+    }
+    for (int i = 0; i < 4; ++i) Require(resources.Revalidate(shader, &report), "range proof did not recover from pending work");
+    unchanged();
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(surface.Address(), SurfaceBytes);
+    Require(resources.Revalidate(shader, &report) && !report.epochReused, "a local mapping invalidation reused its proof");
+    for (int i = 0; i < 4; ++i) Require(resources.Revalidate(shader, &report), "range proof did not recover from a mapping change");
+    auto copied = context;
+    copied.hostImportAlignment = 0;
+    auto image = CachedStorageSurface(copied, Resource(unrelated.Address()));
+    image->MarkDirty();
+    unchanged();
+    image->Flush();
+    unchanged();
+    ClearDepthSurfaces(context.device);
+    unchanged();
+    Memory::Unwatch(surface.Address(), SurfaceBytes);
+    resources.Revalidate(shader, &report);
+    Require(!report.epochReused, "an unwatched proof range was reused");
+    Memory::Rewatch(std::array{std::pair{surface.Address(), surface.Address() + SurfaceBytes}});
+    ShaderResources unmapped(context, shader);
+    for (int i = 0; i < 4; ++i) Require(unmapped.Revalidate(shader, &report), "the unmap fixture did not settle");
+#ifdef _WIN32
+    Require(report.epochReused, "the unmap fixture did not retain a proof");
+#endif
+    surface.Unmap();
+    try {
+        unmapped.Revalidate(shader, &report);
+    } catch (const std::runtime_error&) {
+    }
+    Require(!report.epochReused, "an unmapped proof range was reused");
+    std::puts("range proof survived unrelated epochs, holders, writes, maps, watches, pending images and depth changes");
+}
+
+void cheaperProofProfile(Context context) {
+    namespace Memory = AgcDriver::GuestMemory;
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    std::lock_guard gpu(Memory::GpuMutex());
+    for (const bool shared : {false, true}) {
+        for (const std::uint32_t count : {1u, 3u}) {
+            WatchedSurface surface(context, count * SurfaceBytes, shared);
+            auto program = SampledProgram(surface.Address());
+            auto& binding = program.bindings.front();
+            binding.count = count;
+            binding.guestDescriptor.clear();
+            for (std::uint32_t i = 0; i < count; ++i) {
+                const auto words = Descriptor(surface.Address() + i * SurfaceBytes);
+                binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
+            }
+            binding.imageSamplers.assign(count, 0u);
+            { auto flags = binding.Flags(); flags.imageWritten.assign(count, false); binding.SetFlags(std::move(flags)); }
+            const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+            ShaderResources resources(context, shader);
+            for (const bool advanceEpoch : {false, true}) {
+                for (const bool enabled : {false, true, true, false}) {
+                    const ResourceProofScope item(enabled);
+                    Memory::BumpCollectEpoch();
+                    ShaderResources::ProofReport report;
+                    for (int i = 0; i < 4; ++i) Require(resources.Revalidate(shader, &report), "profile warmup failed");
+                    std::size_t reused = 0;
+                    constexpr int calls = 2048;
+                    const auto start = std::chrono::steady_clock::now();
+                    for (int i = 0; i < calls; ++i) {
+                        if (advanceEpoch) Memory::BumpCollectEpoch();
+                        Require(resources.Revalidate(shader, &report), "profile resource changed");
+                        reused += report.epochReused;
+                    }
+                    const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / calls;
+                    std::printf("range microprofile shared=%u sampled=%u advance_epoch=%u switch=%u calls=%d reused=%zu us_per_call=%.3f\n", shared ? 1u : 0u, count, advanceEpoch ? 1u : 0u, enabled ? 1u : 0u, calls, reused, us);
+                }
+            }
+            if (shared) {
+                const ResourceProofScope item(true);
+                ShaderResources::ProofReport report;
+                Require(resources.Revalidate(shader, &report), "shared proof did not settle");
+                {
+                    GuestArena::HostWrite write(reinterpret_cast<void*>(surface.Address()), 1);
+                    *reinterpret_cast<std::uint8_t*>(surface.Address()) = 0x37;
+                }
+                Require(!resources.Revalidate(shader, &report) && !report.epochReused, "a shared clean-bit proof missed a CPU write");
+            }
+        }
+    }
+}
+
+void cheaperDepthTests(Context context) {
+    namespace Memory = AgcDriver::GuestMemory;
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context);
+    std::lock_guard gpu(Memory::GpuMutex());
+    const ResourceProofScope item(true);
+    auto program = SampledProgram(surface.Address());
+    auto& words = program.bindings.front().guestDescriptor;
+    words[1] = (words[1] & ~(0x3ffu << 20u)) | (22u << 20u);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, shader);
+    ShaderResources::ProofReport report;
+    for (int i = 0; i < 4; ++i) Require(resources.Revalidate(shader, &report), "depth proof warmup failed");
+#ifdef _WIN32
+    Require(report.epochReused, "depth transition did not start with a reused proof");
+#endif
+    const DepthTarget target{surface.Address(), 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    Require(DepthSurfaceView(context, target, false) != VK_NULL_HANDLE, "the depth owner was not registered");
+    Require(!resources.Revalidate(shader, &report) && !report.epochReused, "a depth transition reused the old sampled proof");
+    ClearDepthSurfaces(context.device);
 }
 
 void replacedEntryTests(Context context) {
@@ -1719,6 +1927,9 @@ int main(int argc, char** argv) {
             AgcDriver::ArchB::Recorder::BindThread("fix-proofs-test");
             AgcDriver::ArchB::Recorder::Boundary(true, 1, AgcDriver::ArchB::Recorder::Clock::now());
             if (mode == "fix-proofs-toggle" || mode == "fix-proofs-toggle_pipeline") cheaperProofToggleTests(context);
+            else if (mode == "fix-proofs-ranges") cheaperRangeTests(context);
+            else if (mode == "fix-proofs-depth") cheaperDepthTests(context);
+            else if (mode == "fix-proofs-profile") cheaperProofProfile(context);
             else {
                 const ResourceProofScope proofScope(selected);
                 if (!resourceEpochTests(context, mode == "fix-proofs-draw")) return VulkanTestSkipped;
