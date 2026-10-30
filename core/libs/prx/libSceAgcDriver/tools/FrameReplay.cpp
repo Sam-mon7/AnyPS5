@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -85,6 +86,7 @@ public:
     void MarkReady() {
         std::lock_guard lock(mutex);
         ready.push_back(Clock::now());
+        AgcDriverRecorderReplayFrame_nid_no_patch(false);
     }
 
     void Failed(std::exception_ptr error) {
@@ -1063,6 +1065,7 @@ double percentile(std::vector<double> values, double fraction) {
 }
 
 int run(const Options& options) {
+    AgcDriverRecorderReplayFrame_nid_no_patch(true);
     std::optional<DrawProfileWriter> drawProfile;
     if (!options.profileDraws.empty()) drawProfile.emplace(options.profileDraws);
     const auto loadStart = Clock::now();

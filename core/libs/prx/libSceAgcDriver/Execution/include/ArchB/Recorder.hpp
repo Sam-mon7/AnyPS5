@@ -18,6 +18,31 @@ public:
     using Clock = std::chrono::steady_clock;
     enum class Kind : std::uint8_t { Draw, Dispatch };
     enum class Phase : std::uint8_t { Prepare, Record, Proof, Bind, Inherit };
+    enum class DrawOutcome : std::uint8_t { None, Hit, Miss, Unclassified };
+    class Draw {
+    public:
+        explicit Draw(DrawOutcome outcome = DrawOutcome::Unclassified);
+        ~Draw();
+        Draw(const Draw&) = delete;
+        Draw& operator=(const Draw&) = delete;
+        void Classify(DrawOutcome value);
+    private:
+        friend class Recorder;
+        struct Pending {
+            const char* name;
+            const char* stage;
+            Clock::duration elapsed;
+            bool locked;
+            bool counter;
+            double value;
+        };
+        void Add(Pending value);
+        Draw* previous = nullptr;
+        DrawOutcome outcome;
+        std::uint64_t generation = 0;
+        std::vector<Pending> pending;
+        bool active = false;
+    };
     struct Key {
         Kind kind = Kind::Draw;
         std::uint64_t code = 0;
@@ -65,9 +90,25 @@ public:
         Clock::duration elapsed{};
         Clock::time_point previous{};
         Clock::duration children{};
+        Clock::duration heldBefore{};
+        Clock::duration heldChildren{};
         Phase category = Phase::Prepare;
         std::uint64_t generation = 0;
         bool active = false;
+    };
+    class Timer {
+    public:
+        explicit Timer(const char* name, Phase phase = Phase::Inherit) {
+            Begin(name, phase);
+        }
+        void Begin(const char* name, Phase phase = Phase::Inherit) { if (name != nullptr && Enabled()) scope.Begin(name, Clock::now(), phase); }
+        ~Timer() { Finish(); }
+        Timer(const Timer&) = delete;
+        Timer& operator=(const Timer&) = delete;
+        void Mark(const char* stage) { if (scope.Active()) scope.Mark(stage, Clock::now()); }
+        void Finish() { if (scope.Active()) scope.End(Clock::now()); }
+    private:
+        Scope scope;
     };
     class Work {
     public:
@@ -88,6 +129,8 @@ public:
     };
     static std::uint64_t Generation() { return generation.load(std::memory_order_relaxed); }
     static bool Enabled() { return enabled.load(std::memory_order_relaxed); }
+    static bool RecordingDraw() { return Enabled() && currentDraw != nullptr && currentDraw->outcome != DrawOutcome::None; }
+    static void GpuLock(bool held, Clock::time_point now);
     static void BindThread(const char* name);
     static void Boundary(bool on, std::uint64_t sequence, Clock::time_point now);
     static Snapshot Collect(Clock::time_point now);
@@ -99,12 +142,18 @@ public:
 private:
     struct Thread;
     static Thread& thread();
-    static void phase(const char* name, const char* stage, Clock::duration elapsed);
+    static void phase(const char* name, const char* stage, Clock::duration elapsed, DrawOutcome outcome = DrawOutcome::None, bool locked = false);
+    static void count(const char* name, double value, DrawOutcome outcome);
+    static Clock::duration heldTime(Clock::time_point now);
     inline static std::atomic<bool> enabled{false};
     inline static std::atomic<std::uint64_t> generation{0};
     inline static thread_local Thread* local = nullptr;
     inline static thread_local Scope* currentScope = nullptr;
     inline static thread_local Work* currentWork = nullptr;
+    inline static thread_local Draw* currentDraw = nullptr;
+    inline static thread_local bool gpuHeld = false;
+    inline static thread_local Clock::time_point gpuSince{};
+    inline static thread_local Clock::duration gpuElapsed{};
 };
 
 }
@@ -112,5 +161,8 @@ private:
 extern "C" void AgcDriverRecorderScopeBegin_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* name, std::int64_t now, std::uint8_t phase);
 extern "C" void AgcDriverRecorderScopeMark_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* stage, std::int64_t now);
 extern "C" void AgcDriverRecorderScopeEnd_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, std::int64_t now);
+extern "C" void AgcDriverRecorderVulkanBegin_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* name);
+extern "C" void AgcDriverRecorderCount_nid_no_patch(const char* name, double value);
+extern "C" void AgcDriverRecorderReplayFrame_nid_no_patch(bool first);
 
 #endif

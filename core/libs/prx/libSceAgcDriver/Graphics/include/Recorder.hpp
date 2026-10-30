@@ -808,21 +808,25 @@ private:
     PFN_vkGetFenceStatus getFenceStatus = nullptr;
     PFN_vkResetFences resetFences = nullptr;
     PFN_vkWaitForFences waitForFences = nullptr;
-    PFN_vkCmdUpdateBuffer cmdUpdateBuffer = nullptr;
+    RecordedVulkanCall<PFN_vkCmdUpdateBuffer> cmdUpdateBuffer{};
     PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
     PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
     PFN_vkQueueSubmit queueSubmit = nullptr;
-    PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
-    PFN_vkCmdBeginQuery cmdBeginQuery = nullptr;
-    PFN_vkCmdEndQuery cmdEndQuery = nullptr;
-    PFN_vkCmdResetQueryPool cmdResetQueryPool = nullptr;
-    PFN_vkCmdCopyQueryPoolResults cmdCopyQueryPoolResults = nullptr;
-    PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
-    PFN_vkCmdPushConstants cmdPushConstants = nullptr;
-    PFN_vkCmdDispatch cmdDispatch = nullptr;
+    RecordedVulkanCall<PFN_vkCmdPipelineBarrier> cmdPipelineBarrier{};
+    RecordedVulkanCall<PFN_vkCmdBeginQuery> cmdBeginQuery{};
+    RecordedVulkanCall<PFN_vkCmdEndQuery> cmdEndQuery{};
+    RecordedVulkanCall<PFN_vkCmdResetQueryPool> cmdResetQueryPool{};
+    RecordedVulkanCall<PFN_vkCmdCopyQueryPoolResults> cmdCopyQueryPoolResults{};
+    RecordedVulkanCall<PFN_vkCmdBindPipeline> cmdBindPipeline{};
+    RecordedVulkanCall<PFN_vkCmdPushConstants> cmdPushConstants{};
+    RecordedVulkanCall<PFN_vkCmdDispatch> cmdDispatch{};
     template<typename TFunction>
     TFunction function(TFunction resolved, const char* name) const {
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);
+    }
+    template<typename TFunction>
+    RecordedVulkanCall<TFunction> function(RecordedVulkanCall<TFunction> resolved, const char* name) const {
+        return resolved.function != nullptr ? resolved : context.Function<TFunction>(name);
     }
     VkResult fenceStatus(VkFence fence) const { return function(getFenceStatus, "vkGetFenceStatus")(context.device, fence); }
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;

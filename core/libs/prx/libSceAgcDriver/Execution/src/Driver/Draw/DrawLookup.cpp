@@ -14,6 +14,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
     if (useDrawEntries) {
         if (pointerFree) ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbPointerFreeDrawKeys);
         if (!registerKey) {
+            ArchB::Recorder::Timer keyTiming("Draw.Key");
             drawKey = 0xcbf29ce484222325ull;
             const auto mix = [&](std::uint64_t value) {
                 drawKey ^= value;
@@ -106,6 +107,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(static_cast<std::uint64_t>(pixel.positionLocation));
             for (const auto location : pixel.sampleLocations) mix(location);
             for (const auto order : pixel.sampleOrder) mix(order);
+            keyTiming.Finish();
+            ArchB::Recorder::Timer lookupTiming("Draw.Lookup");
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);

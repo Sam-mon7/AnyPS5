@@ -2415,6 +2415,7 @@ void GpuMutexType::acquired() {
     if (++depth == 1) {
         recorderHoldGeneration = ArchB::Recorder::Generation();
         recorderHoldStart = ArchB::Recorder::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (recorderHoldStart != std::chrono::steady_clock::time_point{}) ArchB::Recorder::GpuLock(true, recorderHoldStart);
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         const bool skipInvalidation = ArchB::Switches::Enabled(ArchB::Feature::UbNoLockInvalidation);
@@ -2493,6 +2494,7 @@ std::uint64_t ThreadGpuHeldNs() {
 void GpuMutexType::unlock() {
     const bool outermost = --depth == 0;
     if (outermost) {
+        if (recorderHoldStart != std::chrono::steady_clock::time_point{}) ArchB::Recorder::GpuLock(false, std::chrono::steady_clock::now());
         if (recorderHoldStart != std::chrono::steady_clock::time_point{} && recorderHoldGeneration == ArchB::Recorder::Generation()) {
             ArchB::Recorder::Count("gpu_mutex_hold_ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - recorderHoldStart).count());
             recorderHoldStart = {};

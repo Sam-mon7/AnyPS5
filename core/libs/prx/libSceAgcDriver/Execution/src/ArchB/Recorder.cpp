@@ -2,6 +2,9 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <numeric>
 #include <sstream>
@@ -95,18 +98,22 @@ struct Recorder::Thread {
     struct PhaseEntry {
         std::atomic<const char*> name{nullptr};
         const char* stage = nullptr;
+        DrawOutcome outcome = DrawOutcome::None;
+        bool locked = false;
         Value ms;
     };
     struct CounterEntry {
         std::atomic<const char*> name{nullptr};
+        DrawOutcome outcome = DrawOutcome::None;
         Value value;
     };
     const std::string name;
     std::array<ShaderEntry, 1024> shaders;
     ShaderEntry other;
-    std::array<PhaseEntry, 1024> phases;
-    std::array<CounterEntry, 512> counters;
+    std::array<PhaseEntry, 2048> phases;
+    std::array<CounterEntry, 1024> counters;
     Value phaseOverflow;
+    Value drawPhaseOverflow;
     Value counterOverflow;
 };
 
@@ -143,6 +150,7 @@ void Recorder::Scope::Begin(const char* scope, Clock::time_point now, Phase phas
     active = true;
     name = scope;
     previous = now;
+    heldBefore = heldTime(now);
     parent = currentScope;
     work = currentWork;
     category = phase != Phase::Inherit ? phase : parent != nullptr && parent->work == work ? parent->category : work != nullptr ? work->phase : Phase::Prepare;
@@ -155,13 +163,25 @@ void Recorder::Scope::Mark(const char* stage, Clock::time_point now) {
     const auto inclusive = now - previous;
     elapsed += inclusive;
     const auto exclusive = inclusive - children;
+    const auto held = heldTime(now);
+    const auto inclusiveHeld = held - heldBefore;
+    const auto exclusiveHeld = std::clamp(inclusiveHeld - heldChildren, Clock::duration{}, exclusive);
     if (generation == Recorder::generation.load(std::memory_order_relaxed)) {
         Recorder::phase(name, stage, exclusive);
+        if (currentDraw != nullptr) {
+            currentDraw->Add({name, stage, exclusiveHeld, true, false, 0});
+            currentDraw->Add({name, stage, exclusive - exclusiveHeld, false, false, 0});
+        }
         if (work != nullptr && work->generation == generation) work->elapsed[static_cast<std::size_t>(category)] += exclusive;
     }
-    if (parent != nullptr) parent->children += inclusive;
+    if (parent != nullptr) {
+        parent->children += inclusive;
+        parent->heldChildren += inclusiveHeld;
+    }
     previous = now;
     children = {};
+    heldBefore = held;
+    heldChildren = {};
 }
 
 void Recorder::Scope::End(Clock::time_point now) {
@@ -182,20 +202,69 @@ Recorder::Work::~Work() {
     currentWork = previous;
 }
 
-void Recorder::phase(const char* name, const char* stage, Clock::duration elapsed) {
+Recorder::Draw::Draw(DrawOutcome outcome) : outcome(outcome) {
+    if (!Enabled()) return;
+    active = true;
+    previous = currentDraw;
+    currentDraw = this;
+    generation = Generation();
+}
+
+Recorder::Draw::~Draw() {
+    if (!active) return;
+    Classify(outcome);
+    currentDraw = previous;
+}
+
+void Recorder::Draw::Classify(DrawOutcome value) {
+    outcome = value;
+    if (!active || generation != Generation()) {
+        pending.clear();
+        return;
+    }
+    for (const auto& entry : pending) {
+        if (outcome == DrawOutcome::None) break;
+        if (entry.counter) Recorder::count(entry.name, entry.value, outcome);
+        else Recorder::phase(entry.name, entry.stage, entry.elapsed, outcome, entry.locked);
+    }
+    pending.clear();
+}
+
+void Recorder::Draw::Add(Pending value) {
+    if (generation != Generation() || outcome == DrawOutcome::None) return;
+    if (!value.counter && value.elapsed == Clock::duration{}) return;
+    if (outcome == DrawOutcome::Unclassified) pending.push_back(value);
+    else if (value.counter) Recorder::count(value.name, value.value, outcome);
+    else Recorder::phase(value.name, value.stage, value.elapsed, outcome, value.locked);
+}
+
+Recorder::Clock::duration Recorder::heldTime(Clock::time_point now) {
+    return gpuElapsed + (gpuHeld ? now - gpuSince : Clock::duration{});
+}
+
+void Recorder::GpuLock(bool held, Clock::time_point now) {
+    gpuElapsed = heldTime(now);
+    gpuSince = now;
+    gpuHeld = held;
+}
+
+void Recorder::phase(const char* name, const char* stage, Clock::duration elapsed, DrawOutcome outcome, bool locked) {
     auto& t = thread();
-    const auto hash = (reinterpret_cast<std::uintptr_t>(name) ^ (reinterpret_cast<std::uintptr_t>(stage) >> 3)) * 0x9e3779b97f4a7c15ull;
+    const auto hash = (reinterpret_cast<std::uintptr_t>(name) ^ (reinterpret_cast<std::uintptr_t>(stage) >> 3) ^ (static_cast<std::uint64_t>(outcome) << 4) ^ locked) * 0x9e3779b97f4a7c15ull;
     for (std::size_t probe = 0; probe < t.phases.size(); ++probe) {
         auto& row = t.phases[(hash + probe) % t.phases.size()];
         const auto* key = row.name.load(std::memory_order_relaxed);
         if (key == nullptr) {
             row.stage = stage;
+            row.outcome = outcome;
+            row.locked = locked;
             row.name.store(name, std::memory_order_release);
-        } else if (key != name || row.stage != stage) continue;
+        } else if (key != name || row.stage != stage || row.outcome != outcome || row.locked != locked) continue;
         row.ms.Add(milliseconds(elapsed));
         return;
     }
-    t.phaseOverflow.Add(milliseconds(elapsed));
+    if (outcome == DrawOutcome::None) t.phaseOverflow.Add(milliseconds(elapsed));
+    else t.drawPhaseOverflow.Add(milliseconds(elapsed));
 }
 
 void Recorder::AddShader(Key key, std::uint64_t calls, const std::array<Clock::duration, 4>& elapsed) {
@@ -220,13 +289,20 @@ void Recorder::AddShader(Key key, std::uint64_t calls, const std::array<Clock::d
 
 void Recorder::Count(const char* name, double value) {
     if (!Enabled()) return;
+    count(name, value, DrawOutcome::None);
+    if (currentDraw != nullptr) currentDraw->Add({name, nullptr, {}, false, true, value});
+}
+
+void Recorder::count(const char* name, double value, DrawOutcome outcome) {
     auto& t = thread();
-    const auto hash = reinterpret_cast<std::uintptr_t>(name) * 0x9e3779b97f4a7c15ull;
+    const auto hash = (reinterpret_cast<std::uintptr_t>(name) ^ static_cast<std::uint64_t>(outcome)) * 0x9e3779b97f4a7c15ull;
     for (std::size_t probe = 0; probe < t.counters.size(); ++probe) {
         auto& row = t.counters[(hash + probe) % t.counters.size()];
         const auto* key = row.name.load(std::memory_order_relaxed);
-        if (key == nullptr) row.name.store(name, std::memory_order_release);
-        else if (key != name) continue;
+        if (key == nullptr) {
+            row.outcome = outcome;
+            row.name.store(name, std::memory_order_release);
+        } else if (key != name || row.outcome != outcome) continue;
         row.value.Add(value);
         return;
     }
@@ -268,16 +344,24 @@ Recorder::Snapshot Recorder::Collect(Clock::time_point now) {
         }
     }
     {
+        const auto prefix = [](DrawOutcome outcome) -> std::string {
+            switch (outcome) {
+                case DrawOutcome::Hit: return "Hit.";
+                case DrawOutcome::Miss: return "Miss.";
+                case DrawOutcome::Unclassified: return "Unclassified.";
+                default: return {};
+            }
+        };
         for (auto& pointer : threads) {
             auto& t = *static_cast<Thread*>(pointer.get());
             double busy = 0;
             for (auto& row : t.phases) {
                 const auto* name = row.name.load(std::memory_order_acquire);
                 if (name == nullptr) continue;
-                const auto phase = TraceFormat::Name(name, row.stage);
+                const auto phase = prefix(row.outcome) + (row.outcome != DrawOutcome::None ? (row.locked ? "Locked." : "Outside.") : "") + TraceFormat::Name(name, row.stage);
                 const auto ms = row.ms.Take();
                 result.phases[t.name][phase] += ms;
-                if (phase.find("Wait") == std::string::npos && phase.find("wait") == std::string::npos) busy += ms;
+                if (row.outcome == DrawOutcome::None && phase.find("Wait") == std::string::npos && phase.find("wait") == std::string::npos) busy += ms;
             }
             const auto overflow = t.phaseOverflow.Take();
             result.phases[t.name]["other"] += overflow;
@@ -287,10 +371,12 @@ Recorder::Snapshot Recorder::Collect(Clock::time_point now) {
                 const auto* name = row.name.load(std::memory_order_acquire);
                 if (name == nullptr) continue;
                 const auto value = row.value.Take();
-                result.counters[name] += value;
-                result.threadCounters[t.name][name] += value;
+                const auto key = prefix(row.outcome) + name;
+                result.counters[key] += value;
+                result.threadCounters[t.name][key] += value;
             }
             result.counters["recorder_counter_overflow"] += t.counterOverflow.Take();
+            result.counters["recorder_draw_phase_overflow_ms"] += t.drawPhaseOverflow.Take();
             const auto take = [](auto& row) {
                 Shader value;
                 value.key = row.key;
@@ -399,4 +485,47 @@ extern "C" void AgcDriverRecorderScopeMark_nid_no_patch(AgcDriver::ArchB::Record
 
 extern "C" void AgcDriverRecorderScopeEnd_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, std::int64_t now) {
     scope->End(AgcDriver::ArchB::Recorder::Clock::time_point(AgcDriver::ArchB::Recorder::Clock::duration(now)));
+}
+
+extern "C" void AgcDriverRecorderVulkanBegin_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* name) {
+    using Recorder = AgcDriver::ArchB::Recorder;
+    if (!Recorder::RecordingDraw()) return;
+    const std::string_view operation(name);
+    const char* phase = nullptr;
+    if (operation.starts_with("vkCmd")) {
+        Recorder::Count("vkcmd_calls");
+        phase = "Vulkan.Commands";
+        if (operation == "vkCmdPipelineBarrier" || operation == "vkCmdPipelineBarrier2") {
+            Recorder::Count("barrier_calls");
+            phase = "Vulkan.Barriers";
+        } else if (operation == "vkCmdBindDescriptorSets") phase = "Vulkan.DescriptorBind";
+        else if (operation == "vkCmdPushConstants") phase = "Vulkan.PushConstants";
+    } else if (operation == "vkUpdateDescriptorSets") {
+        Recorder::Count("descriptor_update_calls");
+        phase = "Vulkan.DescriptorWrites";
+    } else if (operation == "vkAllocateDescriptorSets") {
+        Recorder::Count("descriptor_allocate_calls");
+        phase = "Vulkan.DescriptorAllocate";
+    }
+    if (phase != nullptr) scope->Begin(phase, Recorder::Clock::now(), Recorder::Phase::Record);
+}
+
+extern "C" void AgcDriverRecorderCount_nid_no_patch(const char* name, double value) {
+    AgcDriver::ArchB::Recorder::Count(name, value);
+}
+
+extern "C" void AgcDriverRecorderReplayFrame_nid_no_patch(bool first) {
+    using Recorder = AgcDriver::ArchB::Recorder;
+    const auto* enabled = std::getenv("APS5_ARCHB_RECORDER");
+    if (enabled == nullptr || std::string_view(enabled) != "1") return;
+    const auto now = Recorder::Clock::now();
+    Recorder::Boundary(true, 0, now);
+    if (first) return;
+    const auto snapshot = Recorder::Collect(now);
+    const auto* directory = std::getenv("APS5_TRACE_DIR");
+    const auto path = std::filesystem::path(directory != nullptr ? directory : ".") / "aps5-summary.jsonl";
+    std::ofstream output(path, std::ios::app);
+    output << "{\"source\":\"frame-replay\",\"archb\":" << snapshot.Json() << "}\n";
+    output.flush();
+    if (!output) throw std::runtime_error("frame replay: cannot write " + path.string());
 }

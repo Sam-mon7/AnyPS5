@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "ArchBRecorderHandoff.hpp"
 #include <cmath>
 #include <iostream>
@@ -148,6 +149,87 @@ void shaderTableOverflow() {
     near(sum(Recorder::Collect(start + 2s).total.ms), 0);
 }
 
+void drawAttribution() {
+    const Recorder::Clock::time_point start{};
+    Recorder::BindThread("queue worker 0");
+    Recorder::Boundary(true, 0, start);
+    for (const auto outcome : {Recorder::DrawOutcome::Hit, Recorder::DrawOutcome::Miss}) {
+        Recorder::Draw draw;
+        Recorder::Scope outer, key, proof;
+        outer.Begin("draw", start);
+        key.Begin("key", start);
+        key.End(start + 10ms);
+        Recorder::GpuLock(true, start + 20ms);
+        proof.Begin("proof", start + 30ms);
+        proof.End(start + 40ms);
+        Recorder::GpuLock(false, start + 60ms);
+        Recorder::Count("descriptor_writes", 3);
+        draw.Classify(outcome);
+        outer.End(start + 100ms);
+    }
+    const auto result = Recorder::Collect(start + 100ms);
+    const auto& phases = result.phases.at("queue worker 0");
+    near(result.accountedMs, 200);
+    for (const std::string prefix : {"Hit.", "Miss."}) {
+        near(phases.at(prefix + "Outside.key"), 10);
+        near(phases.at(prefix + "Locked.proof"), 10);
+        near(phases.at(prefix + "Locked.draw"), 30);
+        near(phases.at(prefix + "Outside.draw"), 50);
+        near(result.threadCounters.at("queue worker 0").at(prefix + "descriptor_writes"), 3);
+    }
+    Recorder::Boundary(false, 1, start + 200ms);
+    {
+        Recorder::Draw draw(Recorder::DrawOutcome::Hit);
+        Recorder::Timer timing("disabled");
+        Recorder::Count("descriptor_writes", 99);
+    }
+    const auto off = Recorder::Collect(start + 300ms);
+    require(!off.phases.at("queue worker 0").contains("Hit.Outside.disabled"), "disabled draw was recorded");
+    near(off.counters.at("Hit.descriptor_writes"), 0);
+    Recorder::Boundary(true, 2, start + 400ms);
+    {
+        Recorder::Draw draw;
+        Recorder::Scope key;
+        key.Begin("stale", start + 400ms);
+        key.End(start + 410ms);
+        Recorder::Boundary(true, 3, start + 420ms);
+        draw.Classify(Recorder::DrawOutcome::Hit);
+    }
+    require(!Recorder::Collect(start + 500ms).phases.at("queue worker 0").contains("Hit.Outside.stale"), "stale generation attributed as a hit");
+}
+
+void vulkanCalls() {
+    using AgcDriver::Graphics::RecordedVulkanCall;
+    Recorder::Boundary(true, 0, Recorder::Clock::now());
+    Recorder::BindThread("queue worker 0");
+    unsigned calls = 0;
+    static unsigned* called = nullptr;
+    called = &calls;
+    const RecordedVulkanCall<PFN_vkCmdDraw> command{+[](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) { ++*called; }, "vkCmdDraw"};
+    const RecordedVulkanCall<PFN_vkAllocateDescriptorSets> allocate{+[](VkDevice, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet*) { return info->descriptorSetCount == 2 ? VK_SUCCESS : VK_ERROR_OUT_OF_POOL_MEMORY; }, "vkAllocateDescriptorSets"};
+    const RecordedVulkanCall<PFN_vkUpdateDescriptorSets> update{+[](VkDevice, std::uint32_t, const VkWriteDescriptorSet*, std::uint32_t, const VkCopyDescriptorSet*) {}, "vkUpdateDescriptorSets"};
+    const RecordedVulkanCall<PFN_vkCmdPipelineBarrier> barrier{+[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}, "vkCmdPipelineBarrier"};
+    {
+        Recorder::Draw draw(Recorder::DrawOutcome::Hit);
+        for (unsigned i = 0; i < 3; ++i) command(VK_NULL_HANDLE, 0, 0, 0, 0);
+        VkDescriptorSetAllocateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        info.descriptorSetCount = 2;
+        require(allocate(VK_NULL_HANDLE, &info, nullptr) == VK_SUCCESS, "allocation result changed");
+        info.descriptorSetCount = 1;
+        require(allocate(VK_NULL_HANDLE, &info, nullptr) == VK_ERROR_OUT_OF_POOL_MEMORY, "allocation failure changed");
+        update(VK_NULL_HANDLE, 4, nullptr, 0, nullptr);
+        barrier(VK_NULL_HANDLE, 0, 0, 0, 1, nullptr, 2, nullptr, 3, nullptr);
+    }
+    command(VK_NULL_HANDLE, 0, 0, 0, 0);
+    const auto result = Recorder::Collect(Recorder::Clock::now());
+    require(calls == 4, "instrumentation changed invocation count");
+    near(result.counters.at("Hit.vkcmd_calls"), 4);
+    near(result.counters.at("Hit.barriers_emitted"), 6);
+    near(result.counters.at("Hit.descriptor_writes"), 4);
+    near(result.counters.at("Hit.descriptor_allocate_calls"), 2);
+    near(result.counters.at("Hit.descriptor_sets_allocated"), 2);
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -158,6 +240,8 @@ int main(int argc, char** argv) {
         else if (name == "no_path_change") noPathChange();
         else if (name == "toggle_interval_tagged") toggleIntervalTagged();
         else if (name == "shader_table_overflow") shaderTableOverflow();
+        else if (name == "draw_attribution") drawAttribution();
+        else if (name == "vulkan_calls") vulkanCalls();
         else throw std::runtime_error("unknown test case");
         return 0;
     } catch (const std::exception& error) {

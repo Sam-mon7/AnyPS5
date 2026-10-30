@@ -3225,6 +3225,7 @@ bool ShaderResources::finishPartialSnapshots(std::uint64_t forgetBefore) {
 // every surface at once. The stamp checks go through one tracker lock, the cache checks through
 // the images' cached flags and one touch of the cache.
 bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted) {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Resources.Proof.Stamps");
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
@@ -3467,6 +3468,7 @@ bool ShaderResources::fastRevalidateEach() {
 }
 
 ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> overlapping) {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Resources.Proof.OwnRefresh");
     const auto listed = [&](std::size_t element, bool storage) {
         return std::find_if(overlapping.begin(), overlapping.end(), [&](const PendingOverlap& overlap) { return overlap.element == element && overlap.storage == storage; });
     };
@@ -3634,6 +3636,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     }
     if (GuestMemory::ResourceEpochProofsEnabled()) return revalidateFull(shaders, report, true);
     if (EpochProofs()) {
+        AgcDriver::ArchB::Recorder::Timer epochTiming("Resources.Proof.EpochMemo");
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
@@ -3743,6 +3746,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     const auto importsBefore = epochProofs ? HostImportsIdentity(context, false) : HostImportsProof{};
     bool epochReused = false;
     if (epochProofs) {
+        AgcDriver::ArchB::Recorder::Timer epochTiming("Resources.Proof.Epoch");
         const auto refusal = [&] {
             if (!GuestMemory::GpuMutex().HeldByThisThread()) return EpochRefusal::Unlocked;
             if (noFast || !EpochRevalidate() || VerifyProofs()) return EpochRefusal::Disabled;
@@ -5849,6 +5853,7 @@ std::shared_ptr<const TableDescriptors> ShaderResources::keptTable(std::size_t s
 }
 
 void ShaderResources::release() noexcept {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Resources.Release");
     // A set from the cache's pool chain goes back to it; a dedicated pool dies with its set.
     std::shared_ptr<const std::vector<std::weak_ptr<Texture>>> held;
     if (cacheAllocation.pool && context.descriptorCache != nullptr) context.descriptorCache->Free(cacheAllocation, keptTable(0, held));
@@ -5886,6 +5891,7 @@ bool ShaderResources::LayoutUpdateAfterBind() const {
 }
 
 ShaderResources::DrawBindings::~DrawBindings() {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Resources.ReleaseBindings");
     if (cache == nullptr) return;
     const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
         if (set.set == VK_NULL_HANDLE) return;
@@ -6019,6 +6025,7 @@ std::size_t ShaderResources::DrawUploadLimit() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Resources.DrawBindings");
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);

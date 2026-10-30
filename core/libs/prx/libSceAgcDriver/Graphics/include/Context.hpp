@@ -18,6 +18,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <tuple>
+#include <type_traits>
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -151,6 +154,42 @@ inline std::uint64_t& DeviceProcLookups() {
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
+template<typename TFunction> struct RecordedVulkanCall;
+
+template<typename TResult, typename... TArgs>
+struct RecordedVulkanCall<TResult(VKAPI_PTR*)(TArgs...)> {
+    using Function = TResult(VKAPI_PTR*)(TArgs...);
+    Function function = nullptr;
+    const char* name = nullptr;
+    operator Function() const { return function; }
+    TResult operator()(TArgs... args) const {
+        using Recorder = AgcDriver::ArchB::Recorder;
+        if (!Recorder::Enabled()) return function(args...);
+        Recorder::Scope scope;
+        AgcDriverRecorderVulkanBegin_nid_no_patch(&scope, name);
+        if (!scope.Active()) return function(args...);
+        const auto arguments = std::tie(args...);
+        if constexpr (std::is_same_v<Function, PFN_vkUpdateDescriptorSets>) {
+            AgcDriverRecorderCount_nid_no_patch("descriptor_writes", std::get<1>(arguments));
+            AgcDriverRecorderCount_nid_no_patch("descriptor_copies", std::get<3>(arguments));
+        } else if constexpr (std::is_same_v<Function, PFN_vkCmdPipelineBarrier>) {
+            AgcDriverRecorderCount_nid_no_patch("barriers_emitted", std::get<4>(arguments) + std::get<6>(arguments) + std::get<8>(arguments));
+        }
+        const auto finish = [&] { AgcDriverRecorderScopeEnd_nid_no_patch(&scope, Recorder::Clock::now().time_since_epoch().count()); };
+        if constexpr (std::is_void_v<TResult>) {
+            function(args...);
+            finish();
+        } else {
+            const auto result = function(args...);
+            if constexpr (std::is_same_v<Function, PFN_vkAllocateDescriptorSets>) {
+                if (result == VK_SUCCESS) AgcDriverRecorderCount_nid_no_patch("descriptor_sets_allocated", std::get<1>(arguments)->descriptorSetCount);
+            }
+            finish();
+            return result;
+        }
+    }
+};
+
 struct Context {
     VkDevice device;
     VkPhysicalDevice physical;
@@ -282,18 +321,18 @@ struct Context {
     VertexInputCache* vertexInputs = nullptr;
 
     template<typename TFunction>
-    TFunction Function(const char* name) const {
+    RecordedVulkanCall<TFunction> Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
         ++DeviceProcLookups();
         const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
-        return function;
+        return {function, name};
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.
     template<typename TFunction>
-    TFunction Resolved(TFunction DeviceFunctions::*member, const char* name) const {
-        if (functions != nullptr && functions->*member != nullptr) return functions->*member;
+    RecordedVulkanCall<TFunction> Resolved(TFunction DeviceFunctions::*member, const char* name) const {
+        if (functions != nullptr && functions->*member != nullptr) return {functions->*member, name};
         return Function<TFunction>(name);
     }
 
