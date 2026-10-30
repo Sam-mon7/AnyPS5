@@ -1,8 +1,290 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "Optimization/ResourceProgram.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include <cstdlib>
+#include <cstring>
+#include <set>
 
 namespace AgcDriver::DriverDetail {
+
+const char* DrawMissDifference::Class() const {
+    if (kinds & Layout) return "m1_miss_layout";
+    if (kinds & Buffer) return "m1_miss_buffer";
+    if (kinds & Data) return "m1_miss_data";
+    if (kinds & Other) return "m1_miss_other";
+    if ((kinds & (Image | Sampler)) == (Image | Sampler)) return kinds & (ImageFields | Specialized) ? "m1_miss_image_sampler_specialized" : "m1_miss_image_sampler_independent";
+    if (kinds & Image) return kinds & (ImageFields | Specialized) ? "m1_miss_image_fields" : "m1_miss_image_address";
+    if (kinds & Sampler) return kinds & (ImageFields | Specialized) ? "m1_miss_sampler_specialized" : "m1_miss_sampler_independent";
+    return "m1_miss_other";
+}
+
+DrawMissDifference CompareDrawMissStage(const DispatchVariant& old, const StageCapture& fresh, std::span<const Graphics::DecodeRead> reads) {
+    using Difference = DrawMissDifference;
+    DrawMissDifference result;
+    const auto imageChange = [&](std::size_t word, std::uint32_t changed) {
+        constexpr std::array<std::uint32_t, 8> addressMasks{0xffffffffu, 0xffu, 0, 0, 0, 0, 0xff000000u, 0xffffffffu};
+        result.imageChanges[word] |= changed;
+        if ((changed & ~addressMasks[word]) != 0) result.kinds |= Difference::ImageFields;
+    };
+    const auto layout = [&] { result.kinds |= Difference::Layout; ++result.layout; };
+    if (old.censusCapture == nullptr || fresh.capture == nullptr || old.compiled == nullptr || fresh.compiled == nullptr) {
+        result.kinds = Difference::Other;
+        result.layout = 1;
+        return result;
+    }
+    const auto& before = *old.censusCapture;
+    const auto& after = *fresh.capture;
+    if (before.plan != after.plan || old.pushOffset != fresh.pushOffset) layout();
+    const auto descriptors = [&](const auto& a, const auto& b, std::uint32_t kind) {
+        if (a.size() != b.size()) layout();
+        for (std::size_t i = 0; i < std::min(a.size(), b.size()); ++i) {
+            if (a[i] == b[i]) continue;
+            if (a[i].dwordCount != b[i].dwordCount || a[i].availableDwordMask != b[i].availableDwordMask) layout();
+            if (kind != Difference::Image) continue;
+            for (std::size_t w = 0; w < a[i].dwords.size(); ++w) {
+                imageChange(w, a[i].dwords[w] ^ b[i].dwords[w]);
+            }
+        }
+    };
+    descriptors(before.snapshot.images, after.snapshot.images, Difference::Image);
+    descriptors(before.snapshot.samplers, after.snapshot.samplers, Difference::Sampler);
+    descriptors(before.snapshot.buffers, after.snapshot.buffers, Difference::Buffer);
+    if (before.snapshot.tables != after.snapshot.tables || before.snapshot.srtPoison != after.snapshot.srtPoison || before.snapshot.nullRootReads != after.snapshot.nullRootReads) layout();
+    if (before.snapshot.userData.size() != after.snapshot.userData.size()) layout();
+    const auto& a = *old.compiled;
+    const auto& b = *fresh.compiled;
+    if (a.vertexAttributes.size() != b.vertexAttributes.size()) layout();
+    for (std::size_t i = 0; i < std::min(a.vertexAttributes.size(), b.vertexAttributes.size()); ++i) {
+        if (a.vertexAttributes[i].resource.fields != b.vertexAttributes[i].resource.fields) result.kinds |= Difference::Buffer;
+    }
+    if (a.spirv.ContentHash() != b.spirv.ContentHash() || a.specialization != b.specialization) result.kinds |= Difference::Specialized;
+    const auto sameBinding = [](const auto& x, const auto& y) {
+        return x.kind == y.kind && x.role == y.role && x.descriptorSet == y.descriptorSet && x.binding == y.binding && x.count == y.count;
+    };
+    if (a.bindings.size() != b.bindings.size() || !std::equal(a.bindings.begin(), a.bindings.end(), b.bindings.begin(), sameBinding)) layout();
+    for (std::size_t i = 0; i < std::min(a.bindings.size(), b.bindings.size()); ++i) {
+        const auto& x = a.bindings[i];
+        const auto& y = b.bindings[i];
+        if (x.imageShape != y.imageShape || x.imageShapes != y.imageShapes || x.imageSamplers != y.imageSamplers || x.Flags() != y.Flags()) result.kinds |= Difference::Specialized;
+    }
+    std::map<std::uint64_t, std::uint32_t> was, now;
+    std::set<std::uint64_t> refreshable;
+    std::size_t word = 0;
+    for (const auto& [begin, end] : old.runs) {
+        for (auto address = begin; address + 4 <= end && word < old.words.size(); address += 4) {
+            if (std::binary_search(old.dataPositions.begin(), old.dataPositions.end(), word)) refreshable.insert(address);
+            was[address] = old.words[word++];
+        }
+    }
+    const auto append = [&](std::uint64_t address, std::span<const std::byte> bytes) {
+        for (std::size_t offset = 0; offset + 4 <= bytes.size(); offset += 4) {
+            std::uint32_t value;
+            std::memcpy(&value, bytes.data() + offset, 4);
+            now[address + offset] = value;
+        }
+    };
+    for (const auto& region : fresh.regions) append(region.guestAddress, region.bytes);
+    for (const auto& read : reads) append(read.address, read.Bytes());
+    std::map<std::uint64_t, std::uint32_t> roles;
+    std::map<std::size_t, std::uint32_t> userRoles;
+    std::map<std::uint64_t, std::uint8_t> imageWords;
+    std::map<std::size_t, std::uint8_t> userImageWords;
+    std::set<std::uint64_t> observed, pointers;
+    const auto mark = [&](const ShaderRecompiler::ResourceCapture& capture) {
+        if (capture.plan == nullptr) return;
+        std::map<const ShaderRecompiler::IrValue*, std::vector<std::uint64_t>> addresses;
+        for (const auto& [value, address] : capture.readTrace.slotReads) {
+            addresses[value].push_back(address);
+            observed.insert(address);
+        }
+        const auto sourceValue = [&](const ShaderRecompiler::IrValue* value) {
+            std::set<const ShaderRecompiler::IrValue*> seen;
+            while (value != nullptr) {
+                value = value->Resolve();
+                if (!seen.insert(value).second) return static_cast<const ShaderRecompiler::IrValue*>(nullptr);
+                if (value->Opcode() == ShaderRecompiler::IrOpcode::ReadConst && value->ArgumentCount() >= 2) {
+                    const auto* slot = value->Argument(1)->Resolve();
+                    if (slot->HasImmediate() && slot->Type() == ShaderRecompiler::IrType::U32 && slot->ImmediateU32() < capture.plan->srtReads.size()) {
+                        value = capture.plan->srtReads[slot->ImmediateU32()].value;
+                        continue;
+                    }
+                }
+                if ((value->Opcode() == ShaderRecompiler::IrOpcode::BitCastU32F32 || value->Opcode() == ShaderRecompiler::IrOpcode::BitCastF32U32) && value->ArgumentCount() != 0) {
+                    value = value->Argument(0);
+                    continue;
+                }
+                return value;
+            }
+            return value;
+        };
+        const auto sources = [&](const auto& resources, std::uint32_t kind) {
+            for (const auto& resource : resources) {
+                if constexpr (requires { resource.imageAlias; }) {
+                    if (resource.imageAlias != ShaderRecompiler::BufferResource::NoImageAlias) continue;
+                }
+                if (resource.source >= capture.plan->descriptorSources.size()) continue;
+                const auto& source = capture.plan->descriptorSources[resource.source];
+                for (std::size_t w = 0; w < source.dwordCount; ++w) {
+                    const auto* value = sourceValue(source.dwords[w]);
+                    if (value == nullptr) continue;
+                    if (value->Opcode() == ShaderRecompiler::IrOpcode::GetUserData && value->ArgumentCount() != 0) {
+                        const auto reg = value->Argument(0)->Register().index;
+                        if (reg >= capture.plan->userDataBase) {
+                            userRoles[reg - capture.plan->userDataBase] |= kind;
+                            if (kind == Difference::Image) userImageWords[reg - capture.plan->userDataBase] |= static_cast<std::uint8_t>(1u << w);
+                        }
+                    }
+                    if (const auto found = addresses.find(value); found != addresses.end()) {
+                        for (const auto address : found->second) {
+                            roles[address] |= kind;
+                            if (kind == Difference::Image) imageWords[address] |= static_cast<std::uint8_t>(1u << w);
+                        }
+                    }
+                }
+            }
+        };
+        sources(capture.plan->info.images, Difference::Image);
+        sources(capture.plan->info.samplers, Difference::Sampler);
+        sources(capture.plan->info.buffers, Difference::Buffer);
+        std::set<const ShaderRecompiler::IrValue*> visited;
+        const auto pointer = [&](auto&& self, const ShaderRecompiler::IrValue* value) -> void {
+            value = sourceValue(value);
+            if (value == nullptr) return;
+            if (!visited.insert(value).second) return;
+            if (const auto found = addresses.find(value); found != addresses.end()) {
+                pointers.insert(found->second.begin(), found->second.end());
+            }
+            for (const auto* argument : value->Arguments()) self(self, argument);
+        };
+        for (const auto& [value, address] : capture.readTrace.slotReads) {
+            for (const auto* argument : value->Arguments()) pointer(pointer, argument);
+        }
+    };
+    mark(before);
+    mark(after);
+    for (const auto address : observed) if (!roles.contains(address)) roles[address] = pointers.contains(address) ? Difference::Layout : Difference::Data;
+    for (std::size_t w = 0; w < std::min(before.snapshot.userData.size(), after.snapshot.userData.size()); ++w) {
+        if (before.snapshot.userData[w] == after.snapshot.userData[w]) continue;
+        ++result.words;
+        if (const auto found = userImageWords.find(w); found != userImageWords.end()) {
+            for (std::size_t i = 0; i < 8; ++i) if (found->second & (1u << i)) imageChange(i, before.snapshot.userData[w] ^ after.snapshot.userData[w]);
+        }
+        if (w < 64 && ((before.userDataUse.asBase | after.userDataUse.asBase) & (std::uint64_t{1} << w))) layout();
+        else if (const auto role = userRoles.find(w); role != userRoles.end()) result.kinds |= role->second;
+        else { result.kinds |= Difference::Data; ++result.userDataWords; }
+    }
+    for (const auto& [slot, address] : after.readTrace.leaves) if (!roles.contains(address)) roles[address] = Difference::Data;
+    for (const auto& [address, value] : now) {
+        const auto found = was.find(address);
+        if (found == was.end()) { layout(); continue; }
+        if (found->second == value) continue;
+        ++result.words;
+        if (const auto image = imageWords.find(address); image != imageWords.end()) {
+            for (std::size_t i = 0; i < 8; ++i) if (image->second & (1u << i)) imageChange(i, found->second ^ value);
+        }
+        const auto role = roles.find(address);
+        result.kinds |= role == roles.end() ? Difference::Other : role->second;
+        if (role != roles.end() && (role->second & Difference::Layout)) ++result.layout;
+        if (role != roles.end() && (role->second & Difference::Data)) {
+            ++result.dataWords;
+            if (refreshable.contains(address)) ++result.refreshableDataWords;
+        }
+    }
+    for (const auto& [address, value] : was) if (!now.contains(address)) layout();
+    if ((result.kinds & Difference::Specialized) && !(result.kinds & (Difference::Image | Difference::Sampler | Difference::Buffer | Difference::Data))) layout();
+    return result;
+}
+
+void Driver::censusDrawMiss(const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures, const std::vector<std::vector<Graphics::DecodeRead>>& reads, const std::vector<bool>& reused, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shape) {
+    if (!ArchB::Recorder::Enabled()) return;
+    ArchB::Recorder::Count("m1_miss_total");
+    std::vector<std::shared_ptr<DrawEntry>> candidates;
+    {
+        std::lock_guard lock(drawCacheMutex);
+        for (const auto& [key, candidate] : drawCache) {
+            if (candidate->decode == nullptr || candidate->decode->programs.size() != programs.size() || candidate->stages.size() != programs.size()) continue;
+            bool same = true;
+            for (std::size_t i = 0; same && i < programs.size(); ++i) {
+                const auto& kept = candidate->decode->programs[i];
+                same = kept.snapshot->CodeDigest() == programs[i].snapshot->CodeDigest() && kept.codeOffset == programs[i].codeOffset && kept.binary.stage == programs[i].binary.stage;
+            }
+            if (same) candidates.push_back(candidate);
+        }
+    }
+    if (candidates.empty()) {
+        ArchB::Recorder::Count("m1_miss_no_pair");
+        return;
+    }
+    if (entry == nullptr) ArchB::Recorder::Count("m1_miss_absent_pair");
+    const auto score = [](const DrawMissDifference& value) { return std::pair(value.layout, value.words); };
+    DrawMissDifference closest;
+    closest.layout = std::numeric_limits<std::size_t>::max();
+    for (const auto& candidate : candidates) {
+        DrawMissDifference difference;
+        if (shape != 0 && candidate->shape != shape) { difference.kinds |= DrawMissDifference::Layout; ++difference.layout; }
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            if (candidate->decode->roles[i] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
+            StageCapture current = captures[i];
+            std::span<const Graphics::DecodeRead> currentReads = reads[i];
+            if (reused[i] && matched[i] != nullptr) {
+                current.capture = matched[i]->censusCapture;
+                current.compiled = matched[i]->compiled;
+                current.pushOffset = matched[i]->pushOffset;
+                appendEntryRegions(*matched[i], current.regions);
+                currentReads = {};
+            }
+            DrawMissDifference best;
+            best.layout = std::numeric_limits<std::size_t>::max();
+            for (const auto& variant : candidate->stages[i]) {
+                const auto change = CompareDrawMissStage(*variant, current, currentReads);
+                if (score(change) < score(best)) best = change;
+            }
+            if (best.layout == std::numeric_limits<std::size_t>::max()) { best.kinds = DrawMissDifference::Layout; best.layout = 1; }
+            difference.kinds |= best.kinds;
+            difference.words += best.words;
+            difference.layout += best.layout;
+            difference.dataWords += best.dataWords;
+            difference.refreshableDataWords += best.refreshableDataWords;
+            difference.userDataWords += best.userDataWords;
+            for (std::size_t w = 0; w < difference.imageChanges.size(); ++w) difference.imageChanges[w] |= best.imageChanges[w];
+        }
+        if (score(difference) < score(closest)) closest = difference;
+    }
+    ArchB::Recorder::Count(closest.Class());
+    if (closest.kinds & DrawMissDifference::Image) ArchB::Recorder::Count("m1_diff_image");
+    if (closest.kinds & DrawMissDifference::Sampler) ArchB::Recorder::Count("m1_diff_sampler");
+    const auto& image = closest.imageChanges;
+    if (image[0] || (image[1] & 0xffu) || (image[6] & 0xff000000u) || image[7]) ArchB::Recorder::Count("m1_diff_image_address");
+    if (image[1] & 0x1ff00000u) ArchB::Recorder::Count("m1_diff_image_format");
+    if ((image[1] & 0xc0000000u) || (image[2] & 0x0fffcfffu) || (image[4] & 0x1fffu)) ArchB::Recorder::Count("m1_diff_image_dimensions");
+    if (image[3] & 0xfffu) ArchB::Recorder::Count("m1_diff_image_swizzle");
+    if (image[3] & 0xf0000000u) ArchB::Recorder::Count("m1_diff_image_type");
+    if ((image[3] & 0xff000u) || (image[4] & 0x1fff0000u) || (image[5] & 0xffu)) ArchB::Recorder::Count("m1_diff_image_mip_array");
+    if ((closest.kinds & (DrawMissDifference::Image | DrawMissDifference::Data)) == (DrawMissDifference::Image | DrawMissDifference::Data)) ArchB::Recorder::Count("m1_diff_image_and_data");
+    if (closest.userDataWords != 0) ArchB::Recorder::Count("m1_diff_user_data");
+    if (closest.dataWords != 0) ArchB::Recorder::Count("m1_diff_captured_data");
+    if (closest.dataWords != 0 && closest.dataWords == closest.refreshableDataWords && closest.userDataWords == 0) {
+        ArchB::Recorder::Count("m1_diff_refreshable_data");
+        if (closest.kinds & DrawMissDifference::Image) ArchB::Recorder::Count("m1_diff_image_with_refreshable_data");
+    }
+    std::uint64_t code = 0xcbf29ce484222325ull ^ programs.size();
+    for (const auto& program : programs) {
+        code = (code ^ program.snapshot->CodeDigest()) * 0x100000001b3ull;
+        code = (code ^ program.codeOffset) * 0x100000001b3ull;
+        code = (code ^ static_cast<std::uint64_t>(program.binary.stage)) * 0x100000001b3ull;
+    }
+    char name[128];
+    std::snprintf(name, sizeof name, "%s_program_%016llx", closest.Class(), static_cast<unsigned long long>(code));
+    static auto* names = new std::set<std::string>;
+    static std::mutex namesMutex;
+    const char* counter;
+    {
+        std::lock_guard lock(namesMutex);
+        counter = names->emplace(name).first->c_str();
+    }
+    ArchB::Recorder::Count(counter);
+}
 
 bool Driver::traceDrawCache() {
     static const bool trace = std::getenv("APS5_TRACE_DRAW_CACHE") != nullptr;

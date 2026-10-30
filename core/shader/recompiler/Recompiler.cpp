@@ -1922,8 +1922,8 @@ void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     SrtRuntime traced = runtime;
     traced.userDataUse = &capture.userDataUse;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    capture.readTrace.profile = profile;
-    if (!profile && std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
+    capture.readTrace.profile = profile || (runtime.readTrace != nullptr && runtime.readTrace->profile);
+    if (!capture.readTrace.profile && std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
         ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
         return;
     }

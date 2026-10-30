@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/State/include/Configuration.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -1114,6 +1116,12 @@ int run(const Options& options) {
         }
         Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
         replay.recording = true;
+        const bool recorder = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::Recorder);
+        if (recorder) {
+            AgcDriverWaitIdle_nid_postfix();
+            AgcDriver::ArchB::Recorder::Boundary(true, 0, Clock::now());
+            static_cast<void>(AgcDriver::ArchB::Recorder::Collect(Clock::now()));
+        }
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
@@ -1124,6 +1132,10 @@ int run(const Options& options) {
         measured.paceTimeouts = replay.paceTimeouts.load() - measured.paceTimeouts;
         measured.synthesized = replay.syntheticReleases.load() - measured.synthesized;
         passes.push_back(measured);
+        if (recorder) {
+            AgcDriverWaitIdle_nid_postfix();
+            std::fprintf(stderr, "[frame-replay-recorder] pass=%zu frames=%zu %s\n", pass, measured.frames, AgcDriver::ArchB::Recorder::Collect(Clock::now()).Json().c_str());
+        }
         if (drawProfile) {
             AgcDriverWaitIdle_nid_postfix();
             drawProfile->Write(pass);

@@ -182,6 +182,7 @@ private:
     std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
     static bool traceDrawCache();
+    void censusDrawMiss(const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures, const std::vector<std::vector<Graphics::DecodeRead>>& reads, const std::vector<bool>& reused, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shape);
     static void traceInsert(std::unordered_set<std::uint64_t>& set, std::uint64_t key);
     void maybeReportDrawCache(bool profile);
     void reportDrawCache(DrawEntryCounters& counters, bool profile);

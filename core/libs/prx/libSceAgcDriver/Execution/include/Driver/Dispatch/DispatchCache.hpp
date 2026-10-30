@@ -56,6 +56,7 @@ struct DispatchVariant {
     std::uint64_t userDataMask = ~std::uint64_t{0};
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> indirectCapture;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> censusCapture;
 
     std::shared_ptr<ShaderMemory> memory;
     std::vector<ShaderRecompiler::MemoryRegion> captured;

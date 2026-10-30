@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
+#include "Optimization/ResourceProgram.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -241,10 +243,106 @@ void SightingsKeepCollidingKeys() {
     Require(sightings.SeenBefore(12) && sightings.SeenBefore(13) && sightings.SeenBefore(14), "a full bucket lost a key newer than the one it replaced");
 }
 
+void MissCensus() {
+    using namespace AgcDriver::DriverDetail;
+    using namespace ShaderRecompiler;
+    auto plan = std::make_shared<IrResourcePlan>();
+    plan->valueStorage.Reserve(16);
+    plan->descriptorSources.resize(3);
+    plan->info.images.push_back({.source = 0});
+    plan->info.samplers.push_back({.source = 1});
+    plan->info.buffers.push_back({.source = 2});
+    auto capture = std::make_shared<ResourceCapture>();
+    capture->plan = plan;
+    std::array<std::uint32_t, 18> words{};
+    for (std::size_t i = 0; i < words.size(); ++i) words[i] = static_cast<std::uint32_t>(i + 1);
+    for (std::uint32_t source = 0, offset = 0; source < 3; ++source) {
+        auto& descriptor = plan->descriptorSources[source];
+        descriptor.dwordCount = source == 0 ? 8 : 4;
+        DescriptorValue value;
+        value.dwordCount = descriptor.dwordCount;
+        value.availableDwordMask = static_cast<std::uint8_t>((1u << value.dwordCount) - 1u);
+        for (std::uint32_t w = 0; w < descriptor.dwordCount; ++w, ++offset) {
+            descriptor.dwords[w] = plan->valueStorage.Create(IrOpcode::GetRegister, IrType::U32, offset);
+            capture->readTrace.slotReads.emplace_back(descriptor.dwords[w], 0x1000u + offset * 4u);
+            value.dwords[w] = words[offset];
+        }
+        (source == 0 ? capture->snapshot.images : source == 1 ? capture->snapshot.samplers : capture->snapshot.buffers).push_back(value);
+    }
+    capture->readTrace.leaves.emplace_back(0, 0x1040);
+    auto compiled = std::make_shared<RecompileResult>();
+    DispatchVariant old;
+    old.censusCapture = capture;
+    old.compiled = compiled;
+    old.runs.emplace_back(0x1000, 0x1048);
+    old.words.assign(words.begin(), words.end());
+    const auto check = [&](std::initializer_list<std::pair<std::size_t, std::uint32_t>> changes, const char* expected, bool specialized = false, bool moved = false, bool imageFromSampler = false, bool inactiveImage = false) {
+        auto currentWords = words;
+        for (const auto& [word, bits] : changes) currentWords[word] ^= bits;
+        auto currentCapture = std::make_shared<ResourceCapture>(*capture);
+        if (!inactiveImage) std::copy_n(currentWords.begin(), 8, currentCapture->snapshot.images[0].dwords.begin());
+        std::copy_n(currentWords.begin() + 8, 4, currentCapture->snapshot.samplers[0].dwords.begin());
+        std::copy_n(currentWords.begin() + 12, 4, currentCapture->snapshot.buffers[0].dwords.begin());
+        if (imageFromSampler) currentCapture->snapshot.images[0].dwords[1] ^= 1u << 20u;
+        auto currentCompiled = std::make_shared<RecompileResult>(*compiled);
+        if (specialized) currentCompiled->specialization.push_back({1, 1});
+        StageCapture fresh;
+        fresh.capture = currentCapture;
+        fresh.compiled = currentCompiled;
+        fresh.regions.push_back({moved ? 0x2000u : 0x1000u, std::as_bytes(std::span(currentWords))});
+        const auto difference = CompareDrawMissStage(old, fresh, {});
+        Require(std::string_view(difference.Class()) == expected, "miss census assigned the wrong primary class");
+    };
+    check({{0, 0x100}, {1, 1}}, "m1_miss_image_address");
+    for (std::size_t w = 1; w < 7; ++w) check({{w, 1u << 20u}}, "m1_miss_image_fields");
+    check({{6, 1u << 24u}, {7, 1}}, "m1_miss_image_address");
+    check({{1, 1u << 20u}}, "m1_miss_image_fields", false, false, false, true);
+    check({{8, 1}}, "m1_miss_sampler_independent");
+    check({{8, 1}}, "m1_miss_sampler_specialized", true);
+    check({{8, 1}}, "m1_miss_sampler_specialized", true, false, true);
+    check({{8, 1}}, "m1_miss_sampler_specialized", false, false, true);
+    check({{0, 0x100}, {8, 1}}, "m1_miss_image_sampler_independent");
+    check({{2, 1}, {8, 1}}, "m1_miss_image_sampler_specialized");
+    check({{12, 1}}, "m1_miss_buffer");
+    check({{16, 1}}, "m1_miss_data");
+    check({{0, 0x100}, {16, 1}}, "m1_miss_data");
+    check({{17, 1}}, "m1_miss_other");
+    check({{0, 0x100}}, "m1_miss_layout", false, true);
+    IrValue computed(IrOpcode::IAdd32, IrType::U32, 20);
+    computed.AddArgument(plan->descriptorSources[0].dwords[0]);
+    auto* original = plan->descriptorSources[0].dwords[0];
+    plan->descriptorSources[0].dwords[0] = &computed;
+    check({{0, 0x100}}, "m1_miss_data");
+    plan->descriptorSources[0].dwords[0] = original;
+    IrValue slot(IrOpcode::Void, IrType::U32, 21);
+    slot.SetImmediateU32(0);
+    IrValue flattened(IrOpcode::ReadConst, IrType::U32, 22);
+    flattened.AddArgument(nullptr);
+    flattened.AddArgument(&slot);
+    plan->srtReads.push_back({.value = original});
+    plan->descriptorSources[0].dwords[0] = &flattened;
+    check({{0, 0x100}}, "m1_miss_image_address");
+    IrValue cast(IrOpcode::BitCastF32U32, IrType::U32, 23);
+    cast.AddArgument(&flattened);
+    plan->descriptorSources[0].dwords[0] = &cast;
+    check({{0, 0x100}}, "m1_miss_image_address");
+    plan->descriptorSources[0].dwords[0] = original;
+    plan->info.buffers[0].imageAlias = 0;
+    plan->info.buffers[0].source = 0;
+    check({{0, 0x100}}, "m1_miss_image_address");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--miss-census") {
+            MissCensus();
+            return 0;
+        }
+        const bool census = argc == 2 && std::string_view(argv[1]) == "--miss-census-path";
+        using Recorder = AgcDriver::ArchB::Recorder;
+        if (census) Recorder::Boundary(true, 0, Recorder::Clock::now());
         SightingsKeepCollidingKeys();
         bool libraries = false;
         {
@@ -262,6 +360,16 @@ int main() {
             RetainedPixelCacheTransitions();
         }
         AgcDriverShutdown_nid_postfix();
+        if (census) {
+            const auto counts = Recorder::Collect(Recorder::Clock::now()).counters;
+            double classified = 0;
+            for (const auto& [name, value] : counts) {
+                if (name.starts_with("m1_miss_") && name.find("_program_") == std::string::npos && name != "m1_miss_total" && name != "m1_miss_absent_pair") classified += value;
+            }
+            Require(counts.at("m1_miss_total") > 0 && classified == counts.at("m1_miss_total"), "miss census lost or double-counted a draw");
+            Require(counts.at("m1_miss_absent_pair") > 0, "miss census did not recognize an absent key with an existing program pair");
+            Require(counts.at("recorder_counter_overflow") == 0, "miss census counters overflowed");
+        }
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");
         std::cout << "A repeated draw reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;
