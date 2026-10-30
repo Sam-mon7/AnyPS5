@@ -155,6 +155,7 @@ extern "C" std::size_t AgcDriverDrawShaderProfile_nid_postfix(AgcDriver::DrawSha
         row.draws = source.draws;
         row.drawn = source.drawn;
         row.captures = source.captures;
+        row.cacheHits = source.cache[AgcDriver::DriverDetail::CacheHit];
         row.commits = source.commits;
         std::copy(source.ms.begin(), source.ms.end(), row.ms);
         row.commitMs = source.commitMs;

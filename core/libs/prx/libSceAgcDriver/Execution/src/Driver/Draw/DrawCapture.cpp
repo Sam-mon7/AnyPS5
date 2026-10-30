@@ -169,6 +169,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     try {
         stageCapture.compiled = invocation.Materialize(*capture);
         stageCapture.capture = capture;
+        if (traceDrawCache()) std::fprintf(stderr, "[draw-materialize] program 0x%llx stage=%zu cache-hit=%u\n", static_cast<unsigned long long>(program.binary.codeAddress), i, stageCapture.compiled->cacheHit);
     } catch (const std::exception& error) {
         TraceMaterializationFailure(traceToken, submission, packetOffset, i, "capture-or-materialize", std::current_exception());
         throw named(error, request.context.memory);
@@ -245,6 +246,8 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
     const bool cacheable = useDrawEntries && !drawHit && refusal == IndirectCacheRefusal::None;
     const bool admitted = cacheable && (verifyHit || admitDrawKey(drawKey, registerKey && drawDataHits() ? shapeKey : 0));
     const bool replaceShape = cacheable && !admitted && shapeNeedsEntry;
+    static const bool traceIndirect = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
+    if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[indirect-cache] insert program 0x%llx key=0x%llx shape=0x%llx cpu=%u hit=%u refusal=%u admitted=%u\n", static_cast<unsigned long long>(programs.front().binary.codeAddress), static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(shapeKey), cpuIndirect, drawHit, static_cast<unsigned>(refusal), admitted);
     if (cpuIndirect) {
         constexpr std::array<const char*, static_cast<std::size_t>(IndirectCacheRefusal::Count)> counters{
             "fix_indirect_cpu_draw_refused_none", "fix_indirect_cpu_draw_refused_disabled", "fix_indirect_cpu_draw_refused_entries_disabled",
@@ -285,6 +288,10 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             variant->forgetSerial = stageCapture.forgetSerial;
             variant->pushOffset = stageCapture.pushOffset;
             variant->userDataMask = stageCapture.userDataMask;
+            if (allowIndirectShaderData && drawParameters.indirect && stageCapture.capture != nullptr) {
+                auto proof = std::make_shared<ShaderRecompiler::ResourceCapture>(*stageCapture.capture);
+                variant->relocationCapture = std::move(proof);
+            }
             if (cpuIndirect && stageCapture.capture != nullptr) {
                 auto proof = std::make_shared<ShaderRecompiler::ResourceCapture>();
                 proof->plan = stageCapture.capture->plan;
@@ -299,6 +306,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             for (const auto& read : decodeReads[i]) regions.push_back({read.address, read.Bytes()});
             std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
             tagVariantRuns(*variant, regions, stageCapture.userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords, stageCapture.supplied);
+            if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[indirect-cache] retained stage %zu relocatable=0x%llx base=0x%llx value=0x%llx reads=0x%llx\n", i, static_cast<unsigned long long>(variant->relocatableWords), static_cast<unsigned long long>(stageCapture.userDataUse.asBase), static_cast<unsigned long long>(stageCapture.userDataUse.asValue), static_cast<unsigned long long>(variant->userDataMask));
             if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
             if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
                 const auto& variants = entry->stages[i];

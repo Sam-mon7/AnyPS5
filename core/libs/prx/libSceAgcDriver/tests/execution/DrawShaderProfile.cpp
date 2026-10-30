@@ -125,6 +125,7 @@ void ProgramSetsGetTheirOwnRows(bool pipelined) {
     Require(first != nullptr && second != nullptr, "the profile has " + std::to_string(rows.size()) + " rows, without one for each vertex and pixel program pair drawn");
     Require(first->draws == 3 && first->drawn == 3, "the first program pair counted " + std::to_string(first->draws) + " packets and " + std::to_string(first->drawn) + " drawn, expected 3 and 3");
     Require(second->draws == 2 && second->drawn == 2, "the second program pair counted " + std::to_string(second->draws) + " packets and " + std::to_string(second->drawn) + " drawn, expected 2 and 2");
+    Require(first->cacheHits == 1 && second->cacheHits == 0, "the profile recorded the wrong packet cache hit counts");
     for (const auto* row : {first, second}) {
         Require(std::accumulate(std::begin(row->ms), std::end(row->ms), 0.0) > 0.0, "a profiled program pair recorded no worker time");
         if (pipelined) Require(row->commits == row->drawn && row->commitMs > 0.0, "a pipelined program pair counted " + std::to_string(row->commits) + " commits for " + std::to_string(row->drawn) + " drawn packets, or no commit time");

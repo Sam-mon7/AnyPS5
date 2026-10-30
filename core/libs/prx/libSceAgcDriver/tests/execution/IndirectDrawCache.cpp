@@ -37,6 +37,13 @@ alignas(256) constexpr std::array<std::uint32_t, 20> VertexCode{
     0x7e060280u, 0x7e0802f2u, 0x7e0a02ffu, 0x44800000u, 0xf80000d1u, 0x00000005u, 0xf80008cfu, 0x04030201u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
 };
 alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0x7e000200u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 11> SrtPixelCode{0xf4080100u, 0xfa000000u, 0xbf8cc07fu, 0xe0300000u, 0x80010000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 16> NestedSrtPixelCode{0xf4040100u, 0xfa000000u, 0xbf8cc07fu, 0xf4000202u, 0xfa000010u, 0xf4080102u, 0xfa000000u, 0xbf8cc07fu, 0xe0300000u, 0x80010000u, 0xbf8c3f70u, 0x7e020208u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+alignas(256) std::array<float, 4> SrtColors{1.0f, 0.5f, 0.0f, 0.0f};
+alignas(256) std::array<float, 4> OtherSrtColors{0.5f, 0.0f, 0.0f, 0.0f};
+alignas(256) std::array<std::array<float, 4>, 5> NestedSrtColors{};
+alignas(256) std::array<std::array<std::uint32_t, 5>, 5> SrtTables{};
+alignas(256) std::array<std::array<std::uint32_t, 2>, 5> SrtRoots{};
 alignas(256) constexpr auto CpuVertexCode = [] {
     auto code = VertexCode;
     code[10] = 0x7e0a0208u;
@@ -64,6 +71,7 @@ struct Header {
 alignas(8) Header VertexHeader{};
 alignas(8) Header PixelHeader{};
 alignas(8) Header CpuVertexHeader{};
+alignas(8) Header SrtPixelHeader{};
 
 void Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -81,9 +89,9 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-void AppendState(std::vector<std::uint32_t>& commands, std::array<std::byte, 1024>& memory, const std::uint32_t* vertexCode = VertexCode.data()) {
+void AppendState(std::vector<std::uint32_t>& commands, std::array<std::byte, 1024>& memory, const std::uint32_t* vertexCode = VertexCode.data(), const std::uint32_t* pixelCode = PixelCode.data()) {
     const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
-    const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode);
     const auto color = reinterpret_cast<std::uintptr_t>(memory.data());
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
@@ -180,15 +188,28 @@ void RepeatedIndirectDrawsStayOnTheGpu() {
     Require(cache.hits - cacheBefore.hits >= (Frames - 1) * Draws, "the repeated indirect draws hit the draw cache " + std::to_string(cache.hits - cacheBefore.hits) + " times");
 }
 
-void CpuIndirectCacheRefreshesPushConstants(bool builtinTest = false, bool unknownLimit = false) {
+void CpuIndirectCacheRefreshesPushConstants(bool builtinTest = false, bool unknownLimit = false, bool runtimeWords = false, bool relocated = false, bool nested = false) {
     const bool builtins = builtinTest && std::getenv("APS5_NO_INDIRECT_BUILTIN_OFFSETS") == nullptr;
     const bool enabled = std::getenv("APS5_NO_CPU_INDIRECT_DRAW_CACHE") == nullptr;
     alignas(256) std::array<std::uint16_t, 6> indices{0, 1, 2, 0, 0, 0};
-    if (builtinTest) indices = {0, 1, 2, 2, 0, 1};
+    if (builtinTest || runtimeWords) indices = {0, 1, 2, 2, 0, 1};
     const auto indexAddress = reinterpret_cast<std::uintptr_t>(indices.data());
     const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
     const auto pathsBefore = AgcDriver::Graphics::IndirectDrawCounts();
     const auto draws = builtinTest ? 8u : 5u;
+    const auto pixel = [&](std::vector<std::uint32_t>& commands, std::size_t table) {
+        if (!relocated) return;
+        const auto pointer = reinterpret_cast<std::uintptr_t>(nested ? SrtRoots[table].data() : SrtTables[table].data());
+        Append(commands, 0x76, {0x00b, 2u << 1u});
+        Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32u)});
+    };
+    for (std::size_t table = 0; table < SrtTables.size(); ++table) {
+        NestedSrtColors[table][0] = 0.125f * static_cast<float>(table + 1u);
+        const auto data = reinterpret_cast<std::uintptr_t>(nested ? NestedSrtColors[table].data() : table == 3u ? OtherSrtColors.data() : SrtColors.data());
+        SrtTables[table] = {static_cast<std::uint32_t>(data), static_cast<std::uint32_t>(data >> 32u) & 0xffffu, table == 3u ? 12u : 16u, 0x4bfacu, std::bit_cast<std::uint32_t>(0.125f * static_cast<float>(table + 1u))};
+        const auto pointer = reinterpret_cast<std::uintptr_t>(SrtTables[table].data());
+        SrtRoots[table] = {static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32u)};
+    }
     for (std::uint32_t draw = 0; draw < draws; ++draw) {
         const auto color = std::bit_cast<std::uint32_t>(0.125f * static_cast<float>(draw + 1u));
         const auto location = BaseVertexLocation + (builtinTest && draw % 2u != 0u ? 1u : 0u);
@@ -198,7 +219,8 @@ void CpuIndirectCacheRefreshesPushConstants(bool builtinTest = false, bool unkno
         const auto firstIndex = draw % 2u * 3u;
         const auto indexCount = draw == 4 ? 1u : 3u;
         std::vector<std::uint32_t> direct;
-        AppendState(direct, DirectMemory, CpuVertexCode.data());
+        AppendState(direct, DirectMemory, CpuVertexCode.data(), nested ? NestedSrtPixelCode.data() : relocated ? SrtPixelCode.data() : PixelCode.data());
+        pixel(direct, nested ? draw : draw == 3u ? 3u : 0u);
         if (builtinTest) Append(direct, 0x76, {0x8b, 2u << 1u});
         Append(direct, 0x76, {BaseVertexLocation, location == BaseVertexLocation ? color : stale});
         Append(direct, 0x2a, {0});
@@ -208,7 +230,12 @@ void CpuIndirectCacheRefreshesPushConstants(bool builtinTest = false, bool unkno
         const std::array<std::uint32_t, 5> record{indexCount, 1, firstIndex, color, 0};
         std::copy(record.begin(), record.end(), Records);
         std::vector<std::uint32_t> indirect;
-        AppendState(indirect, IndirectMemory, CpuVertexCode.data());
+        AppendState(indirect, IndirectMemory, CpuVertexCode.data(), nested ? NestedSrtPixelCode.data() : relocated ? SrtPixelCode.data() : PixelCode.data());
+        pixel(indirect, draw);
+        if (runtimeWords) {
+            Append(indirect, 0x76, {BaseVertexLocation, StaleBaseVertex + draw});
+            if (draw == 3u && !relocated) Append(indirect, 0x76, {0x00c, std::bit_cast<std::uint32_t>(0.5f)});
+        }
         if (builtinTest) {
             Append(indirect, 0x76, {0x8b, 2u << 1u});
             Append(indirect, 0x76, {BaseVertexLocation, stale, 0x51u});
@@ -219,13 +246,17 @@ void CpuIndirectCacheRefreshesPushConstants(bool builtinTest = false, bool unkno
         Append(indirect, 0x26, {static_cast<std::uint32_t>(indexAddress), static_cast<std::uint32_t>(indexAddress >> 32u)});
         if (!unknownLimit) Append(indirect, 0x13, {static_cast<std::uint32_t>(indices.size())});
         Append(indirect, 0x25, {0, location, builtinTest ? 0x280u : 0u, 0});
+        const auto cacheBeforeDraw = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
         Submit(indirect);
+        if (runtimeWords && draw == 3u) Require(AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters().indirectCpuHits == cacheBeforeDraw.indirectCpuHits, "changed non-runtime word hit the indirect cache");
         Flush(DirectMemory);
         Flush(IndirectMemory);
-        if ((builtinTest || firstIndex == 0) && indexCount == 3) Require(std::any_of(DirectMemory.begin(), DirectMemory.end(), [](std::byte value) { return value != Kept; }), "CPU indirect reference draw wrote no pixels");
-        Require(IndirectMemory == DirectMemory, "cached CPU indirect draw reused another record's color or index range");
+        if ((builtinTest || runtimeWords || firstIndex == 0) && indexCount == 3) Require(std::any_of(DirectMemory.begin(), DirectMemory.end(), [](std::byte value) { return value != Kept; }), "CPU indirect reference draw wrote no pixels");
+        if (runtimeWords && draw == 3u && !relocated) Require(IndirectMemory != DirectMemory, "changed non-runtime pixel word reused the cached stage");
+        else Require(IndirectMemory == DirectMemory, "cached CPU indirect draw reused another record's color or index range");
     }
     const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(after.verifyMismatches == before.verifyMismatches, "indirect cache hit disagrees with fresh capture");
     const auto paths = AgcDriver::Graphics::IndirectDrawCounts();
     if (builtinTest) {
         const auto expected = unknownLimit ? Path::IndexLimitUnknown : builtins ? std::getenv("APS5_NO_GPU_INDIRECT_DRAW") != nullptr ? Path::Disabled : Path::Gpu : Path::NotFolded;
@@ -238,8 +269,28 @@ void CpuIndirectCacheRefreshesPushConstants(bool builtinTest = false, bool unkno
         Require(after.verifyMismatches == before.verifyMismatches, "builtin draw-cache verification disagreed with materialization");
     } else {
         Require(paths[static_cast<std::size_t>(Path::NotFolded)] - pathsBefore[static_cast<std::size_t>(Path::NotFolded)] == 5, "CPU indirect cache regression did not take NotFolded");
-        Require(after.indirectCpuHits - before.indirectCpuHits == (enabled ? 3u : 0u), "CPU indirect submission did not exercise the expected cache hits: " + std::to_string(after.indirectCpuHits - before.indirectCpuHits));
+        Require(after.indirectCpuHits - before.indirectCpuHits == (enabled ? runtimeWords ? 2u : 3u : 0u), "CPU indirect submission did not exercise the expected cache hits: " + std::to_string(after.indirectCpuHits - before.indirectCpuHits));
     }
+}
+
+void EmptyIndirectPacketsSkipCapture() {
+    IndirectDrawsMatchTheDirectDraw();
+    const auto empty = AgcDriver::Graphics::EmptyIndirectDrawCount();
+    const auto paths = AgcDriver::Graphics::IndirectDrawCounts();
+    for (const auto record : {std::array<std::uint32_t, 4>{0, 1, 0, 0}, {3, 0, 0, 0}, {0, 0, 0, 0}}) {
+        std::copy(record.begin(), record.end(), Records);
+        IndirectMemory.fill(Kept);
+        std::vector<std::uint32_t> commands;
+        AppendState(commands, IndirectMemory);
+        const auto address = reinterpret_cast<std::uintptr_t>(Records);
+        Append(commands, 0x11, {1, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)});
+        Append(commands, 0x24, {0, BaseVertexLocation, 0, 2});
+        Submit(commands);
+        Flush(IndirectMemory);
+        Require(std::all_of(IndirectMemory.begin(), IndirectMemory.end(), [](std::byte value) { return value == Kept; }), "empty indirect draw wrote pixels");
+    }
+    Require(AgcDriver::Graphics::EmptyIndirectDrawCount() == empty + 3u, "empty indirect packets were not skipped");
+    Require(AgcDriver::Graphics::IndirectDrawCounts() == paths, "empty indirect packets reached shader classification");
 }
 
 }
@@ -264,9 +315,13 @@ int main(int argc, char** argv) {
             if (!device || !device->DrawIndirectSupport().drawParameters || !device->DrawIndirectSupport().firstInstance) return VulkanTestSkipped;
             Registered(CpuVertexHeader, CpuVertexCode.data(), sizeof(CpuVertexCode), 2);
             CpuIndirectCacheRefreshesPushConstants(true, mode == "--builtin-offsets-fallback");
-        } else if (mode == "--cpu-indirect-cache") {
+        } else if (mode == "--empty-indirect") {
+            EmptyIndirectPacketsSkipCapture();
+        } else if (mode == "--cpu-indirect-cache" || mode == "--runtime-words" || mode == "--relocated-runtime-words" || mode == "--nested-runtime-words") {
             Registered(CpuVertexHeader, CpuVertexCode.data(), sizeof(CpuVertexCode), 2);
-            CpuIndirectCacheRefreshesPushConstants();
+            if (mode == "--relocated-runtime-words") Registered(SrtPixelHeader, SrtPixelCode.data(), sizeof(SrtPixelCode), 1);
+            if (mode == "--nested-runtime-words") Registered(SrtPixelHeader, NestedSrtPixelCode.data(), sizeof(NestedSrtPixelCode), 1);
+            CpuIndirectCacheRefreshesPushConstants(false, false, mode != "--cpu-indirect-cache", mode == "--relocated-runtime-words" || mode == "--nested-runtime-words", mode == "--nested-runtime-words");
         } else {
             IndirectDrawsMatchTheDirectDraw();
             RepeatedIndirectDrawsStayOnTheGpu();

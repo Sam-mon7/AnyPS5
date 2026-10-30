@@ -246,8 +246,11 @@ function(add_shader_recompiler target runtimeTarget)
             BuildPreparedShaderKey
             BuildRectListShaders
             CaptureResources
+            RecaptureResources
+            RefreshCapturedImageTables
             DebugProbeActive
             DepthBitsTextureWidth
+            GetResourcePlan
             HashBytes
             LayoutBarycentricEmulation
             MeshBarycentricLayoutOf

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -112,6 +113,195 @@ IndirectCacheRefusal Driver::IndirectStageCacheRefusal(const ShaderRecompiler::R
     return CheckIndirectPushConstants(result, capture, program, vertexInfo, patchedWords, allowShaderData);
 }
 
+std::shared_ptr<DispatchVariant> Driver::RelocateIndirectStage(const std::shared_ptr<DispatchVariant>& variant, const DrawProgram& program, std::span<const std::uint32_t> previous, std::span<const std::size_t> patchedWords) {
+    if (previous.size() != program.userData.size()) return nullptr;
+    std::vector<std::size_t> moved;
+    std::vector<std::size_t> runtime;
+    for (std::size_t word = 0; word < previous.size(); ++word) {
+        if (previous[word] == program.userData[word]) continue;
+        if (word >= 64u) return nullptr;
+        if ((variant->userDataMask & (std::uint64_t{1} << word)) == 0) continue;
+        if (variant->indirectCapture != nullptr && std::find(patchedWords.begin(), patchedWords.end(), word) != patchedWords.end()) {
+            runtime.push_back(word);
+            continue;
+        }
+        if ((variant->relocatableWords & (std::uint64_t{1} << word)) == 0 || previous[word] == 0 || program.userData[word] == 0 || ((previous[word] ^ program.userData[word]) & 3u) != 0 || variant->runBases.size() != variant->runs.size()) return nullptr;
+        moved.push_back(word);
+    }
+    if (moved.empty() && runtime.empty()) return variant;
+    auto copy = std::make_shared<DispatchVariant>();
+    copy->runs = variant->runs;
+    copy->runBases = variant->runBases;
+    copy->relocatableWords = variant->relocatableWords;
+    copy->words = variant->words;
+    copy->forgetSerial = variant->forgetSerial;
+    copy->compiled = variant->compiled;
+    copy->shader = variant->shader;
+    copy->dataPositions = variant->dataPositions;
+    copy->dataSlots = variant->dataSlots;
+    copy->flatBinding = variant->flatBinding;
+    copy->pushOffset = variant->pushOffset;
+    copy->vertexInfo = variant->vertexInfo;
+    copy->userDataMask = variant->userDataMask;
+    copy->relocationCapture = variant->relocationCapture;
+    auto proof = variant->indirectCapture != nullptr ? std::make_shared<ShaderRecompiler::ResourceCapture>(*variant->indirectCapture) : nullptr;
+    for (const auto word : moved) {
+        const auto delta = static_cast<std::int64_t>(program.userData[word] & ~3u) - static_cast<std::int64_t>(previous[word] & ~3u);
+        for (std::size_t run = 0; run < copy->runs.size(); ++run) {
+            if (copy->runBases[run] != static_cast<std::int8_t>(word)) continue;
+            copy->runs[run].first += delta;
+            copy->runs[run].second += delta;
+        }
+        if (proof != nullptr) proof->snapshot.userData[word] = program.userData[word];
+    }
+    runtime.insert(runtime.end(), moved.begin(), moved.end());
+    for (const auto word : runtime) {
+        const auto& forwarded = variant->compiled->shaderDataUserWords;
+        for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
+            if (forwarded[slot] == word) copy->shaderDataPatches.emplace_back(slot, program.userData[word]);
+        }
+    }
+    copy->indirectCapture = std::move(proof);
+    return copy;
+}
+
+bool Driver::RewalkIndirectStage(DispatchVariant& variant, const DrawProgram& program, std::uint64_t& captures) try {
+    const auto& previous = variant.relocationCapture;
+    if (previous == nullptr || previous->plan == nullptr || !previous->plan->resourceTrackingComplete || !previous->plan->srtPlanComplete || (variant.vertexInfo != nullptr && variant.vertexInfo->resourcesNum != 0)) {
+        ArchB::Recorder::Count("fix_indirect_cpu_draw_rewalk_refused_plan");
+        return false;
+    }
+    const SampledReadScope sampling(evidenceReads);
+    ShaderMemory memory({}, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
+    const auto current = memory.Recapture(*previous, program.binary, program.userData);
+    ++captures;
+    const auto& before = previous->snapshot;
+    const auto& after = current->snapshot;
+    const auto relocatedDescriptors = [](const auto& before, const auto& after, std::uint32_t width, std::uint32_t highMask) {
+        if (before.size() != after.size()) return false;
+        for (std::size_t resource = 0; resource < before.size(); ++resource) {
+            const auto& old = before[resource];
+            auto live = after[resource];
+            if (old == live) continue;
+            if (old.dwordCount != width || live.dwordCount != width || (old.dwords[0] == 0u && (old.dwords[1] & highMask) == 0u) || (live.dwords[0] == 0u && (live.dwords[1] & highMask) == 0u)) return false;
+            if (width == 4u && (old.dwords[2] == 0u || ((old.dwords[0] ^ live.dwords[0]) & 3u) != 0u)) return false;
+            live.dwords[0] = old.dwords[0];
+            live.dwords[1] = (live.dwords[1] & ~highMask) | (old.dwords[1] & highMask);
+            if (old != live) return false;
+        }
+        return true;
+    };
+    const auto relocatedTables = [&] {
+        if (before.tables.shader != after.tables.shader || before.tables.tables.size() != after.tables.tables.size()) return false;
+        if (before.tables == after.tables) return true;
+        for (std::size_t table = 0; table < before.tables.tables.size(); ++table) {
+            const auto& old = before.tables.tables[table];
+            const auto& live = after.tables.tables[table];
+            if (old.size != live.size || old.records != live.records || old.keys != live.keys || old.fault != live.fault || old.outside != live.outside) return false;
+        }
+        return true;
+    };
+    if (!relocatedDescriptors(before.buffers, after.buffers, 4u, 0xffffu) || !relocatedDescriptors(before.images, after.images, 8u, 0xffu) || before.samplers != after.samplers || before.uniformFill != after.uniformFill || !relocatedTables() || !before.srtPoison.empty() || !after.srtPoison.empty() || before.nullRootReads != 0 || after.nullRootReads != 0 || before.flattenedSrt.size() != after.flattenedSrt.size()) {
+        ArchB::Recorder::Count("fix_indirect_cpu_draw_rewalk_refused_snapshot");
+        static const bool trace = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
+        if (trace) std::fprintf(stderr, "[indirect-cache] rewalk program 0x%llx refused buffers=%u images=%u samplers=%u tables=%u flat-size=%u poison=%u\n", static_cast<unsigned long long>(program.binary.codeAddress), before.buffers != after.buffers, before.images != after.images, before.samplers != after.samplers, before.tables != after.tables, before.flattenedSrt.size() != after.flattenedSrt.size(), !before.srtPoison.empty() || !after.srtPoison.empty() || before.nullRootReads != 0 || after.nullRootReads != 0);
+        if (trace) {
+            const auto differences = [&](const char* kind, const auto& old, const auto& live) {
+                for (std::size_t resource = 0; resource < std::min(old.size(), live.size()); ++resource) {
+                    for (std::size_t word = 0; word < old[resource].dwordCount; ++word) {
+                        if (old[resource].dwords[word] != live[resource].dwords[word]) std::fprintf(stderr, "[indirect-cache] %s %zu word %zu stored=0x%x live=0x%x\n", kind, resource, word, old[resource].dwords[word], live[resource].dwords[word]);
+                    }
+                }
+            };
+            differences("buffer", before.buffers, after.buffers);
+            differences("image", before.images, after.images);
+            for (std::size_t table = 0; table < std::min(before.tables.tables.size(), after.tables.tables.size()); ++table) {
+                const auto& old = before.tables.tables[table];
+                const auto& live = after.tables.tables[table];
+                if (old != live) std::fprintf(stderr, "[indirect-cache] table %zu base=0x%llx/0x%llx size=%u records=%u keys=%u fault=%u outside=%u codes=%u words=%u ranges=%u\n", table, static_cast<unsigned long long>(old.base), static_cast<unsigned long long>(live.base), old.size != live.size, old.records != live.records, old.keys != live.keys, old.fault != live.fault, old.outside != live.outside, old.codes != live.codes, old.words != live.words, old.readRanges != live.readRanges);
+            }
+        }
+        return false;
+    }
+    auto compiled = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    const auto bindingRefusal = [&] {
+        ArchB::Recorder::Count("fix_indirect_cpu_draw_rewalk_refused_binding");
+        static const bool trace = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
+        if (trace) std::fprintf(stderr, "[indirect-cache] rewalk program 0x%llx refused binding mapping\n", static_cast<unsigned long long>(program.binary.codeAddress));
+        return false;
+    };
+    if (before.tables != after.tables && !ShaderRecompiler::RefreshCapturedImageTables(*compiled, *current)) return bindingRefusal();
+    for (auto& binding : compiled->bindings) {
+        const bool image = binding.role == ShaderRecompiler::DescriptorRole::GuestImages;
+        if ((image && before.images != after.images) || (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && before.buffers != after.buffers)) {
+            const auto& oldDescriptors = image ? before.images : before.buffers;
+            const auto& liveDescriptors = image ? after.images : after.buffers;
+            const auto width = image ? 8u : 4u;
+            if (binding.guestDescriptor.size() != binding.count * width) return bindingRefusal();
+            for (std::size_t offset = 0; offset < binding.guestDescriptor.size(); offset += width) {
+                const auto first = binding.guestDescriptor.begin() + offset;
+                if (image && std::all_of(first, first + width, [](auto word) { return word == 0u; })) continue;
+                const ShaderRecompiler::DescriptorValue* replacement = nullptr;
+                for (std::size_t resource = 0; resource < oldDescriptors.size(); ++resource) {
+                    auto old = oldDescriptors[resource];
+                    if (old.dwordCount != width) continue;
+                    if (!std::equal(old.dwords.begin(), old.dwords.begin() + width, first)) {
+                        if (!image) continue;
+                        old.dwords[3] = (old.dwords[3] & ~0xfffu) | ShaderRecompiler::ShaderImageIdentitySwizzle;
+                        if (!std::equal(old.dwords.begin(), old.dwords.begin() + width, first)) continue;
+                    }
+                    if (replacement != nullptr && *replacement != liveDescriptors[resource]) return bindingRefusal();
+                    replacement = &liveDescriptors[resource];
+                }
+                if (replacement == nullptr) return bindingRefusal();
+                std::copy_n(replacement->dwords.begin(), 2u, first);
+            }
+        }
+        if (binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
+        if (binding.guestDescriptor != before.flattenedSrt) return bindingRefusal();
+        binding.guestDescriptor = after.flattenedSrt;
+    }
+    if (before.images != after.images) {
+        if (!compiled->runtimeImageResources.empty()) return bindingRefusal();
+        const auto storage = std::find_if(compiled->bindings.begin(), compiled->bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; });
+        auto data = storage != compiled->bindings.end() ? std::as_writable_bytes(std::span(storage->guestDescriptor)) : std::span(compiled->pushConstants);
+        for (std::size_t resource = 0; compiled->runtimeImageCount != 0u && resource < before.images.size(); ++resource) {
+            if (resource >= previous->plan->info.images.size() || resource >= compiled->runtimeImageCount) return bindingRefusal();
+            if (previous->plan->info.images[resource].table != ShaderRecompiler::NoTable) continue;
+            if (before.images[resource] == after.images[resource]) continue;
+            const auto offset = compiled->imageMetadataDword * sizeof(std::uint32_t) + resource * sizeof(ShaderRecompiler::RuntimeAbi::ResourceMetadata) + offsetof(ShaderRecompiler::RuntimeAbi::ResourceMetadata, descriptor);
+            const auto bytes = 8u * sizeof(std::uint32_t);
+            if (offset > data.size() || bytes > data.size() - offset || std::memcmp(data.data() + offset, before.images[resource].dwords.data(), bytes) != 0) return bindingRefusal();
+            std::memcpy(data.data() + offset, after.images[resource].dwords.data(), bytes);
+        }
+    }
+    if (!before.tables.tables.empty()) {
+        compiled->imageTableRanges = after.tables.ranges;
+        compiled->imageTableReadRanges.clear();
+        for (const auto& table : after.tables.tables) compiled->imageTableReadRanges.push_back(table.readRanges.Copy());
+    }
+    variant.compiled = std::move(compiled);
+    variant.runs.clear();
+    variant.runBases.clear();
+    variant.words.clear();
+    variant.shared.clear();
+    variant.dataPositions.clear();
+    variant.dataSlots.clear();
+    variant.flatBinding = DispatchVariant::NoFlatBinding;
+    variant.forgetSerial = GuestMemory::ForgetSerial();
+    tagVariantRuns(variant, memory.Regions(), current->userDataUse, true, program.hiddenUserWords);
+    recordStageDataPositions(variant, *current, {});
+    if (variant.indirectCapture != nullptr) variant.indirectCapture = current;
+    variant.relocationCapture = current;
+    ArchB::Recorder::Count("fix_indirect_cpu_draw_rewalk_hits");
+    return true;
+} catch (const std::runtime_error& error) {
+    ArchB::Recorder::Count("fix_indirect_cpu_draw_rewalk_refused_capture");
+    static const bool trace = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
+    if (trace) std::fprintf(stderr, "[indirect-cache] rewalk program 0x%llx refused: %s\n", static_cast<unsigned long long>(program.binary.codeAddress), error.what());
+    return false;
+}
+
 bool Driver::RefreshIndirectStage(ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::ResourceCapture* capture, const DrawProgram& program, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, const std::function<std::shared_ptr<const ShaderRecompiler::RecompileResult>()>& materialize, bool allowShaderData) {
     static const bool enabled = std::getenv("APS5_NO_INDIRECT_PUSH_PATCH") == nullptr;
     static const bool verify = std::getenv("APS5_VERIFY_INDIRECT_PUSH_PATCH") != nullptr;
@@ -135,6 +325,26 @@ bool Driver::RefreshIndirectStage(ShaderRecompiler::RecompileResult& result, con
     }
     CountIndirectStage(patched, patched && verify);
     return patched;
+}
+
+bool Driver::IndirectBuiltinPlanSupported(const ShaderRecompiler::RecompileRequest& request) {
+    try {
+        if (!request.graphics) return false;
+        auto ordinary = request;
+        ordinary.graphics->instanceFromBase = false;
+        ordinary.graphics->vertexFromBase = false;
+        const auto plan = ShaderRecompiler::GetResourcePlan(ordinary);
+        return plan != nullptr && plan->resourceTrackingComplete && plan->srtPlanComplete && !plan->requiresSpecializationMemory &&
+               std::none_of(plan->valueStorage.begin(), plan->valueStorage.end(), [&](const auto& value) {
+                   if (value.Opcode() != ShaderRecompiler::IrOpcode::GetUserData || value.ArgumentCount() != 1) return false;
+                   const auto sgpr = static_cast<std::int32_t>(value.Argument(0)->Register().index);
+                   return (request.graphics->instanceFromBase && sgpr == request.graphics->baseInstanceSgpr) || (request.graphics->vertexFromBase && sgpr == request.graphics->baseVertexSgpr);
+               });
+    } catch (const std::runtime_error&) {
+        return false;
+    } catch (const std::invalid_argument&) {
+        return false;
+    }
 }
 
 std::uint32_t Driver::drawUserWord(const DrawProgram& program, std::int32_t sgpr) {

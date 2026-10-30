@@ -908,7 +908,7 @@ public:
                 std::snprintf(value, sizeof(value), "%s\"%s\":%.3f", phase == 0 ? "" : ",", AgcDriver::DriverDetail::DrawDriverPhaseNames[phase], row.ms[phase]);
                 line += value;
             }
-            line += "}}\n";
+            line += "},\"cache_hits\":" + std::to_string(row.cacheHits) + "}\n";
             file << line;
             if (!file) throw std::runtime_error("frame replay: cannot write " + path.string());
         }

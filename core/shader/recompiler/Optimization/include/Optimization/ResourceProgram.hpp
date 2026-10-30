@@ -44,6 +44,8 @@ struct ResourceCapture {
     std::uint64_t sourceNanoseconds = 0;
 };
 [[nodiscard]] std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime);
+[[nodiscard]] std::shared_ptr<const ResourceCapture> RecaptureResources(const ResourceCapture& previous, const SrtRuntime& runtime);
+bool RefreshCapturedImageTables(RecompileResult& result, const ResourceCapture& capture);
 
 // The resolved source of a request (its cache entry with the plan built), for a driver that
 // memoizes it per registered shader: ResolveSource is what CaptureResources does before the walk

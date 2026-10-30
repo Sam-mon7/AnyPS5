@@ -31,6 +31,7 @@ struct DrawShaderProfileRow {
     std::uint64_t commits = 0;
     double ms[DriverDetail::DrawDriverPhaseCount] = {};
     double commitMs = 0;
+    std::uint64_t cacheHits = 0;
 };
 
 }

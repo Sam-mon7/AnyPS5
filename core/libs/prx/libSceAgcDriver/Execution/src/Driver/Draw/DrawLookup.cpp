@@ -8,9 +8,18 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool allowIndirectShaderData) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool allowIndirectShaderData, std::uint64_t& captures) {
     PerformanceTimer recorderTiming("Driver.DrawLookup", ArchB::Recorder::Phase::Proof);
     using Role = ShaderRecompiler::ProgramRole;
+    static const bool traceIndirect = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
+    if (traceIndirect && drawParameters.indirect) {
+        std::fprintf(stderr, "[indirect-cache] lookup program 0x%llx key=0x%llx entries=%u entry=%u data-entry=%u fix=%u\n", static_cast<unsigned long long>(programs.front().binary.codeAddress), static_cast<unsigned long long>(drawKey), useDrawEntries, entry != nullptr, dataEntry != nullptr, allowIndirectShaderData);
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            std::fprintf(stderr, "[indirect-cache] stage %zu user:", i);
+            for (const auto word : programs[i].userData) std::fprintf(stderr, " %08x", word);
+            std::fprintf(stderr, "\n");
+        }
+    }
     if (useDrawEntries) {
         if (pointerFree) ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbPointerFreeDrawKeys);
         if (!registerKey) {
@@ -147,7 +156,11 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                                 }
                             }
                             const auto info = variant->vertexInfo != nullptr ? std::optional(*variant->vertexInfo) : std::nullopt;
-                            if (!patchedWords.empty() && IndirectStageCacheRefusal(*variant->compiled, variant->indirectCapture.get(), programs[i], info, patchedWords, allowIndirectShaderData) != IndirectCacheRefusal::None) continue;
+                            if (!patchedWords.empty()) {
+                                const auto refusal = IndirectStageCacheRefusal(*variant->compiled, variant->indirectCapture.get(), programs[i], info, patchedWords, allowIndirectShaderData);
+                                if (traceIndirect) std::fprintf(stderr, "[indirect-cache] stage %zu variant %zu refusal=%u\n", i, rank, static_cast<unsigned>(refusal));
+                                if (refusal != IndirectCacheRefusal::None) continue;
+                            }
                         }
                         if (!pointerFree && programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh && !std::equal(variant->meshIndexDescriptor.begin(), variant->meshIndexDescriptor.end(), programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord)) {
                             if (!anyLayout) outcome = EntryOutcome::Differing;
@@ -159,6 +172,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         appendEntryRegions(*variant, regions);
                         ++compared;
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[indirect-cache] stage %zu variant %zu validation=%u\n", i, rank, static_cast<unsigned>(result));
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
@@ -257,19 +271,105 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 const auto& now = programs[i].userData;
                 const auto& was = dataEntry->decode->programs[i].userData;
                 auto& candidates = dataCandidates[i];
-                for (const auto& variant : dataEntry->stages[i]) {
+                std::vector<std::size_t> patchedWords;
+                if (allowIndirectShaderData && drawParameters.indirect) {
+                    const auto& indirect = *drawParameters.indirect;
+                    for (const auto location : {indirect.baseVertexLocation, indirect.startInstanceLocation, indirect.drawIndexEnabled ? indirect.drawIndexLocation : 0x280u}) {
+                        for (const auto& [program, word] : UserDataWords(programs, roles, location)) {
+                            if (program == i) patchedWords.push_back(word);
+                        }
+                    }
+                }
+                for (const auto& kept : dataEntry->stages[i]) {
+                    const auto variant = allowIndirectShaderData && drawParameters.indirect ? RelocateIndirectStage(kept, programs[i], was, patchedWords) : kept;
+                    if (variant == nullptr) continue;
                     bool usedEqual = true;
-                    for (std::size_t w = 0; !pointerFree && w < now.size() && usedEqual; ++w) {
+                    for (std::size_t w = 0; !pointerFree && !(allowIndirectShaderData && drawParameters.indirect) && w < now.size() && usedEqual; ++w) {
                         if (now[w] != was[w] && (w >= 64u || ((variant->userDataMask >> w) & 1u) != 0)) usedEqual = false;
                     }
                     if (!usedEqual) continue;
+                    if (!patchedWords.empty() && variant->indirectCapture != nullptr) {
+                        const auto info = variant->vertexInfo != nullptr ? std::optional(*variant->vertexInfo) : std::nullopt;
+                        const auto refusal = IndirectStageCacheRefusal(*variant->compiled, variant->indirectCapture.get(), programs[i], info, patchedWords, true);
+                        if (traceIndirect) std::fprintf(stderr, "[indirect-cache] candidate stage %zu refusal=%u\n", i, static_cast<unsigned>(refusal));
+                        if (refusal != IndirectCacheRefusal::None) continue;
+                    }
                     if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
                     std::vector<ShaderRecompiler::MemoryRegion> regions;
                     appendEntryRegions(*variant, regions);
-                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (result == EntryOutcome::Equal) candidates.emplace_back(variant, std::move(regions));
+                    std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
+                    auto* live = allowIndirectShaderData && drawParameters.indirect && drawStageDataHits() ? &liveData : nullptr;
+                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                    if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[indirect-cache] candidate stage %zu relocation=%u validation=%u\n", i, variant != kept, static_cast<unsigned>(result));
+                    if (traceIndirect && drawParameters.indirect && result == EntryOutcome::Differing) {
+                        std::size_t position = 0;
+                        for (const auto& region : regions) {
+                            std::vector<std::uint32_t> words(region.bytes.size() / sizeof(std::uint32_t));
+                            if (GuestMemory::CopyMapped(region.guestAddress, std::as_writable_bytes(std::span(words))) != GuestMemory::Compare::Equal) break;
+                            bool different = false;
+                            for (std::size_t word = 0; word < words.size(); ++word) {
+                                if (words[word] == variant->words[position + word]) continue;
+                                std::fprintf(stderr, "[indirect-cache] differing stage %zu address=0x%llx stored=0x%x live=0x%x data=%u positions=%zu\n", i, static_cast<unsigned long long>(region.guestAddress + word * sizeof(std::uint32_t)), variant->words[position + word], words[word], std::binary_search(variant->dataPositions.begin(), variant->dataPositions.end(), position + word), variant->dataPositions.size());
+                                different = true;
+                                break;
+                            }
+                            if (different) break;
+                            position += words.size();
+                        }
+                    }
+                    if (allowIndirectShaderData && drawParameters.indirect && variant != kept && result == EntryOutcome::Differing && RewalkIndirectStage(*variant, programs[i], captures)) {
+                        regions.clear();
+                        liveData.clear();
+                        appendEntryRegions(*variant, regions);
+                        result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        if (traceIndirect) std::fprintf(stderr, "[indirect-cache] rewalk stage %zu validation=%u\n", i, static_cast<unsigned>(result));
+                    }
+                    if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
+                    if (variant != kept) {
+                        applyShaderDataPatches(*variant);
+                    }
+                    if (result == EntryOutcome::EqualData) {
+                        auto& hit = stageData[i];
+                        hit.words = variant->words;
+                        for (const auto& [position, value] : liveData) hit.words[position] = value;
+                        regions.clear();
+                        appendEntryRegions(*variant, regions, &hit.words);
+                        hit.compiled = patchDataWords(*variant, hit.words);
+                    }
+                    candidates.emplace_back(variant, std::move(regions));
+                    if (allowIndirectShaderData && drawParameters.indirect) break;
                 }
+            }
+            if (allowIndirectShaderData && drawParameters.indirect) {
+                std::uint32_t cursor = 0;
+                drawHit = true;
+                for (std::size_t i = 0; i < programs.size(); ++i) {
+                    cursor = Graphics::StagePushOffset(cursor, programs[i].binary.stage, localDevice->GraphicsPipelineLibraries());
+                    const auto candidate = std::find_if(dataCandidates[i].begin(), dataCandidates[i].end(), [&](const auto& kept) { return kept.first->pushOffset == cursor; });
+                    if (candidate == dataCandidates[i].end()) {
+                        drawHit = false;
+                        break;
+                    }
+                    matched[i] = candidate->first;
+                    matchedRegions[i] = candidate->second;
+                    cursor += static_cast<std::uint32_t>(matched[i]->compiled->pushConstants.size());
+                }
+                if (drawHit) {
+                    ArchB::Recorder::Count("fix_indirect_cpu_draw_runtime_word_hits");
+                    std::lock_guard cacheLock(drawCacheMutex);
+                    ++drawEntryCounters.hits;
+                    ++drawCacheHits;
+                    if (verifyDrawEntries() || verifyDrawDataHits()) {
+                        verifyHit = true;
+                        drawHit = false;
+                    }
+                } else {
+                    ArchB::Recorder::Count("fix_indirect_cpu_draw_runtime_word_misses");
+                    std::fill(matched.begin(), matched.end(), nullptr);
+                    std::fill(stageData.begin(), stageData.end(), StageDataHit{});
+                }
+                for (auto& candidates : dataCandidates) candidates.clear();
             }
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);

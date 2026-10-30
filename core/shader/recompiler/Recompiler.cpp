@@ -1953,6 +1953,46 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     return capture;
 }
 
+std::shared_ptr<const ResourceCapture> RecaptureResources(const ResourceCapture& previous, const SrtRuntime& runtime) {
+    if (previous.plan == nullptr) throw std::invalid_argument("recapture requires a resource plan");
+    auto capture = std::make_shared<ResourceCapture>();
+    capture->plan = previous.plan;
+    capture->source = previous.source;
+    materializeCapture(*capture, runtime);
+    return capture;
+}
+
+bool RefreshCapturedImageTables(RecompileResult& result, const ResourceCapture& capture) {
+    if (capture.source == nullptr) return false;
+    std::shared_ptr<const CompiledVariant> variant;
+    {
+        std::lock_guard lock(capture.source->mutex);
+        const auto found = std::ranges::find_if(capture.source->variants, [&](const auto& candidate) { return candidate->artifact.variantId == result.variantId; });
+        if (found == capture.source->variants.end()) return false;
+        variant = *found;
+    }
+    const auto tableBinding = [](DescriptorRole role) { return role == DescriptorRole::ImageTable || role == DescriptorRole::ImageStorageTable || role == DescriptorRole::SamplerTable || role == DescriptorRole::ImageTableMap; };
+    std::vector<std::uint32_t> selected;
+    for (const auto& binding : result.bindings) selected.push_back(binding.binding);
+    const std::array<std::uint8_t, 8> exports{};
+    const DescriptorBindingBuilder builder;
+    const auto plan = builder.Prepare(variant->bindings.layout, variant->info.info, variant->info.stage, capture.snapshot, exports, variant->artifact.registrationModule, variant->artifact.registrationModule);
+    const auto tables = ResourceMaterializer::ResolveImageTablesShared(variant->info.info, capture.snapshot, result.variantId);
+    BindingAllocationResult bindings;
+    builder.Populate(bindings, variant->bindings, builder.Select(plan, selected), variant->info.userDataBase, capture.snapshot, {}, tables.get());
+    for (auto& binding : result.bindings) {
+        if (!tableBinding(binding.role)) continue;
+        const auto fresh = std::ranges::find_if(bindings.bindings, [&](const auto& candidate) { return candidate.binding == binding.binding && candidate.role == binding.role; });
+        if (fresh == bindings.bindings.end()) return false;
+        binding = *fresh;
+    }
+    result.imageTablePoison.clear();
+    for (const auto& poison : tables->poison) result.imageTablePoison.push_back({poison.words, poison.dwordCount, poison.resource, static_cast<std::uint32_t>(poison.reason)});
+    result.imageTableFaults = tables->faults;
+    result.drawKeyMemo.words.store(nullptr, std::memory_order_relaxed);
+    return true;
+}
+
 std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& request) {
     if (!request.useCache) return nullptr;
     static_cast<void>(RequestInputInfo(request));

@@ -53,7 +53,8 @@ struct DriverTestAccess {
             const auto found = Driver::Get().drawCache.find(key);
             if (found != Driver::Get().drawCache.end()) lookup.entry = found->second;
         }
-        Driver::Get().lookupDraw(submission, device, decode.state, decode.pixel, decode.programs, decode.roles, infos, true, key != 0, false, lookup.key, lookup.entry, lookup.matched, lookup.regions, lookup.hit, verify, timing, ms, nullptr, candidates, data, packet, false, allowShaderData);
+        std::uint64_t captures = 0;
+        Driver::Get().lookupDraw(submission, device, decode.state, decode.pixel, decode.programs, decode.roles, infos, true, key != 0, false, lookup.key, lookup.entry, lookup.matched, lookup.regions, lookup.hit, verify, timing, ms, nullptr, candidates, data, packet, false, allowShaderData, captures);
         Graphics::Require(!verify, "cache regression must use the ordinary hit path");
         return lookup;
     }
@@ -868,6 +869,167 @@ std::string CachedIndirectPatches(Fixture& fixture, bool storageData = false, co
     return failures;
 }
 
+std::string CrossRegisterBuiltinOffsets(Fixture& fixture) {
+    using AgcDriver::DriverDetail::Driver;
+    constexpr std::array<std::uint32_t, 15> code{
+        0x4a00100au, 0x7e020208u, 0x7e040308u, 0x7e060305u,
+        0x34081081u, 0x4a080908u, 0x4a080905u, 0x34080884u, 0xe0781000u, 0x80030004u,
+        0x7e200280u, 0x7e2202f2u, 0xf80008cfu, 0x11101010u, 0xbf810000u
+    };
+    std::vector<std::uint32_t> userData(8, 0u);
+    userData[0] = 1234u;
+    userData[2] = 0x51u;
+    const auto output = OutputDescriptor();
+    std::copy(output.begin(), output.end(), userData.begin() + 4);
+    ShaderRecompiler::ShaderVertexStageInfo info{};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {32, 8, userData, std::nullopt, std::nullopt, info, {}},
+        fixture.device->Target(), {0, 0, 0, 64}, ShaderRecompiler::GraphicsCompileContext{}
+    };
+    request.graphics->firstUserSgpr = 8;
+    request.graphics->instanceFromBase = true;
+    request.graphics->baseInstanceSgpr = 10;
+    request.graphics->vertexFromBase = true;
+    Require(Driver::IndirectBuiltinPlanSupported(request), "cross-register instance add has no complete builtin resource plan");
+    const auto vertex = ShaderRecompiler::Recompile(request);
+    Require(vertex.instanceOffsetSgpr == -1 && (vertex.userDataRegisterReads & 4u) == 0, "cross-register add retained a CPU instance word");
+    auto ordinary = request;
+    ordinary.graphics.reset();
+    const auto unfolded = ShaderRecompiler::Recompile(ordinary);
+    Require(unfolded.instanceOffsetSgpr == -1 && (unfolded.userDataRegisterReads & 4u) != 0, "cross-register fixture no longer reproduces the unfurled instance word");
+    for (const auto firstInstance : {0u, 37u, 59455u}) {
+        std::copy_n(std::array<std::uint32_t, 4>{Vertices, Instances, 29, firstInstance}.begin(), 4, fixture.Records());
+        AgcDriver::Pm4::DrawParameters draw{0, Vertices, 0, Instances, 0, false, 0, 0};
+        draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(fixture.Records()), 0x24u, 16u, 16u, 1u, false, 0u, NoLocation, 0x8eu, NoLocation, false, 0u};
+        draw.indirect->startInstanceSgpr = 10;
+        draw.indirect->instanceFromBase = true;
+        draw.indirect->vertexFromBase = true;
+        auto program = Program(userData);
+        program.binary = request.shader;
+        Require(!Driver::ClassifyIndirectDraw(vertex, fixture.State(), program, info, fixture.device, draw, false), "cross-register instance add did not select GPU indirect");
+        fixture.Draw(vertex, draw);
+        for (std::uint32_t instance = 0; instance < Instances; ++instance) {
+            for (std::uint32_t index = 0; index < Vertices; ++index) {
+                const std::array<std::uint32_t, 4> expected{firstInstance + instance, 1234u, instance, index};
+                const auto slot = (instance * Vertices + index) * 4u;
+                for (std::size_t word = 0; word < expected.size(); ++word) Require(Output[slot + word] == expected[word], "cross-register builtin slot " + std::to_string(slot) + " word " + std::to_string(word) + " read " + std::to_string(Output[slot + word]) + ", expected " + std::to_string(expected[word]));
+            }
+        }
+    }
+    std::vector<std::uint32_t> unsupported{0xf4080305u, 0xfa000000u, 0xbf8cc07fu};
+    unsupported.insert(unsupported.end(), code.begin(), code.end());
+    request.shader.code = unsupported;
+    request.shader.codeAddress = reinterpret_cast<std::uintptr_t>(unsupported.data());
+    Require(!Driver::IndirectBuiltinPlanSupported(request), "builtin instance used as an SRT pointer was admitted");
+    return {};
+}
+
+std::string RelocatedImageResources(Fixture& fixture) {
+    constexpr std::array<std::uint32_t, 18> code{0xf40c0106u, 0xfa000000u, 0xbf8cc07fu, 0x7e080280u, 0x343c0885u, 0x4a3c3d00u, 0x34063c84u, 0x7e3e0280u, 0x7e140280u, 0x7e160280u, 0x7e180280u, 0x7e1a0280u, 0xf0001f08u, 0x00010a1eu, 0xbf8c3f70u, 0xe0781000u, 0x80000a03u, 0xbf810000u};
+    std::vector<std::uint32_t> userData(14, 0u);
+    const auto output = OutputDescriptor();
+    std::copy(output.begin(), output.end(), userData.begin());
+    const auto descriptor = [](std::uint64_t address) {
+        return std::array<std::uint32_t, 8>{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (22u << 20u), 0u, 0x90000facu, 0u, 0u, 0u, 0u};
+    };
+    const auto old = descriptor(reinterpret_cast<std::uintptr_t>(Pixels.data()));
+    const auto live = descriptor(reinterpret_cast<std::uintptr_t>(Pixels.data() + 256u));
+    alignas(256) static std::array<std::uint32_t, 8> imageTable{};
+    imageTable = old;
+    const auto imageRoot = reinterpret_cast<std::uintptr_t>(imageTable.data());
+    userData[12] = static_cast<std::uint32_t>(imageRoot);
+    userData[13] = static_cast<std::uint32_t>(imageRoot >> 32u);
+    const std::array imageRegions{ShaderRecompiler::MemoryRegion{imageRoot, std::as_bytes(std::span(imageTable))}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{32, 1, 1}, 0u, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {32, 0, userData, compute, std::nullopt, std::nullopt, imageRegions}, fixture.device->Target(), {0, 0, 0, 128}
+    };
+    request.target.registrationModules = true;
+    request.shader.stage = ShaderStage::Fragment;
+    request.context.compute.reset();
+    request.context.pixel = ShaderRecompiler::ShaderPixelStageInfo{};
+    AgcDriver::ShaderMemory memory(imageRegions);
+    AgcDriver::DriverDetail::DispatchVariant original;
+    original.compiled = std::make_shared<ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
+    original.relocationCapture = memory.Capture(request);
+    Require(original.compiled->runtimeImageCount != 0, "image relocation fixture has no runtime metadata");
+    for (const bool changedFormat : {false, true}) {
+        imageTable = live;
+        if (changedFormat) imageTable[1] ^= (22u ^ 56u) << 20u;
+        AgcDriver::DriverDetail::DrawProgram program{};
+        program.binary = request.shader;
+        program.firstUserSgpr = 0;
+        program.userData = userData;
+        AgcDriver::DriverDetail::DispatchVariant candidate;
+        candidate.compiled = original.compiled;
+        candidate.relocationCapture = original.relocationCapture;
+        std::uint64_t captures = 0;
+        const auto reused = AgcDriver::DriverDetail::Driver::Get().RewalkIndirectStage(candidate, program, captures);
+        Require(reused == !changedFormat && captures == 1u, "image relocation did not distinguish an address from a format change");
+        if (!reused) continue;
+        const auto full = ShaderRecompiler::Recompile(request);
+        std::vector<std::byte> patchedBytes, fullBytes;
+        ShaderRecompiler::ShaderDiskCache::EncodeResult(*candidate.compiled, patchedBytes);
+        ShaderRecompiler::ShaderDiskCache::EncodeResult(full, fullBytes);
+        Require(patchedBytes == fullBytes, "relocated image binding or runtime metadata differs from fresh materialization");
+    }
+    constexpr std::array<std::uint32_t, 23> tableCode{0xbf068002u, 0xbf850013u, 0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x93109010u, 0xf4200406u, 0x20000004u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u, 0xbf800000u};
+    alignas(4096) static std::array<std::array<std::array<std::uint32_t, 8>, 4>, 2> heaps{};
+    alignas(4096) static std::array<std::uint32_t, 12> material{};
+    alignas(4096) static std::array<std::uint32_t, 16> srt{};
+    for (auto& heap : heaps) heap[0] = old;
+    heaps[1][0] = live;
+    const auto tableBuffer = [](const void* pointer, std::uint32_t stride, std::uint32_t records) {
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) | (stride << 16u), records, 0x01016facu};
+    };
+    const auto table = tableBuffer(heaps[0].data(), 32u, 4u);
+    const auto materials = tableBuffer(material.data(), 16u, 3u);
+    std::copy(table.begin(), table.end(), srt.begin());
+    std::copy(materials.begin(), materials.end(), srt.begin() + 8u);
+    std::copy(output.begin(), output.end(), srt.begin() + 12u);
+    const auto root = reinterpret_cast<std::uintptr_t>(srt.data());
+    userData = {static_cast<std::uint32_t>(root), static_cast<std::uint32_t>(root >> 32u), 1u};
+    request.shader = {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(tableCode.data()), tableCode, 0, {}};
+    request.context.compute = compute;
+    request.context.pixel.reset();
+    request.context.userData = userData;
+    const std::array regions{ShaderRecompiler::MemoryRegion{root, std::as_bytes(std::span(srt))}, ShaderRecompiler::MemoryRegion{reinterpret_cast<std::uintptr_t>(heaps.data()), std::as_bytes(std::span(heaps))}, ShaderRecompiler::MemoryRegion{reinterpret_cast<std::uintptr_t>(material.data()), std::as_bytes(std::span(material))}};
+    request.context.memory = regions;
+    AgcDriver::ShaderMemory tableMemory(regions);
+    original.compiled = std::make_shared<ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
+    original.relocationCapture = tableMemory.Capture(request);
+    Require(original.relocationCapture->plan->requiresSpecializationMemory && !original.relocationCapture->snapshot.tables.tables.empty(), "table relocation fixture has no image table");
+    const auto moved = tableBuffer(heaps[1].data(), 32u, 4u);
+    std::copy(moved.begin(), moved.end(), srt.begin());
+    for (const auto change : {0u, 1u, 2u}) {
+        if (change == 1u) {
+            heaps[1][0][1] ^= (22u ^ 56u) << 20u;
+            heaps[1][1] = old;
+        }
+        if (change == 2u) srt[2] = 3u;
+        AgcDriver::DriverDetail::DrawProgram program{};
+        program.binary = request.shader;
+        program.firstUserSgpr = 0;
+        program.userData = userData;
+        AgcDriver::DriverDetail::DispatchVariant candidate;
+        candidate.compiled = original.compiled;
+        candidate.relocationCapture = original.relocationCapture;
+        std::uint64_t captures = 0;
+        const auto reused = AgcDriver::DriverDetail::Driver::Get().RewalkIndirectStage(candidate, program, captures);
+        Require(reused == (change != 2u) && captures == 1u, "image table relocation accepted a changed extent or refused runtime table data");
+        if (!reused) continue;
+        const auto full = ShaderRecompiler::Recompile(request);
+        std::vector<std::byte> patchedBytes, fullBytes;
+        ShaderRecompiler::ShaderDiskCache::EncodeResult(*candidate.compiled, patchedBytes);
+        ShaderRecompiler::ShaderDiskCache::EncodeResult(full, fullBytes);
+        Require(patchedBytes == fullBytes, "relocated image table or read ranges differ from fresh materialization");
+    }
+    return {};
+}
+
 std::string BuiltinOffsets(Fixture& fixture) {
     const auto stale = fixture.UserData(0x51u, 0x62u);
     const std::array<std::uint32_t, Vertices> raw{2, 0, 1};
@@ -1089,7 +1251,7 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         if (mode == "--builtin-offsets" && (!device->DrawIndirectSupport().drawParameters || !device->DrawIndirectSupport().firstInstance)) return VulkanTestSkipped;
         Fixture fixture(device);
-        const auto failures = storageData ? CachedIndirectPatches(fixture, true, control) : mode == "--builtin-offsets" ? BuiltinOffsets(fixture) : mode == "--cpu-indirect-cache" ? CachedIndirectPatches(fixture) : mode == "--indirect-push-patch" ? IndirectPushPatches(fixture, false) : mode == "--indirect-buffer-base" ? IndirectPushPatches(fixture, true) : Run(fixture);
+        const auto failures = storageData ? CachedIndirectPatches(fixture, true, control) : mode == "--relocated-image-resources" ? RelocatedImageResources(fixture) : mode == "--cross-register-builtin" ? CrossRegisterBuiltinOffsets(fixture) : mode == "--builtin-offsets" ? BuiltinOffsets(fixture) : mode == "--cpu-indirect-cache" ? CachedIndirectPatches(fixture) : mode == "--indirect-push-patch" ? IndirectPushPatches(fixture, false) : mode == "--indirect-buffer-base" ? IndirectPushPatches(fixture, true) : Run(fixture);
         if (!failures.empty()) {
             std::cerr << "vertex and instance indices differ from the guest's:\n" << failures;
             return 1;

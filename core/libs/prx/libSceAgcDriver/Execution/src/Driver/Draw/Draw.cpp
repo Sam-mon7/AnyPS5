@@ -524,6 +524,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (key != 0 && drawParameters.indirect) {
             const auto& indirect = *drawParameters.indirect;
             for (const auto value : {static_cast<std::uint32_t>(drawParameters.indexed), indirect.baseVertexLocation, indirect.startInstanceLocation, static_cast<std::uint32_t>(indirect.drawIndexEnabled), indirect.drawIndexLocation}) key = (key ^ (static_cast<std::uint64_t>(value) + 1u)) * 0x9e3779b97f4a7c15ull;
+            if (tail.fixIndirectCpuDraw) key = (key ^ 1u) * 0x9e3779b97f4a7c15ull;
         }
         return key;
     };
@@ -595,7 +596,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 else if (traceShapes.contains(shapeKey)) ++counters.absentUserWords;
                 else ++counters.absentNewRegisters;
             }
-            if (decode == nullptr && drawDataHits() && !drawParameters.indirect) {
+            if (decode == nullptr && drawDataHits() && (!drawParameters.indirect || tail.fixIndirectCpuDraw)) {
                 if (const auto shape = drawShapes.find(shapeKey); shape != drawShapes.end()) {
                     const auto kept = drawCache.find(shape->second);
                     if (kept != drawCache.end() && kept->second->decode != nullptr && kept->second->shape == shapeKey) dataEntry = kept->second;
@@ -665,7 +666,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto recordDraws = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || !drawParameters.indirect->indexLimitKnown || arguments.firstVertexOrIndex < drawParameters.indexCount); };
     if (emptyIndirectSkip && drawParameters.indirect && !programs.empty()) {
         const auto known = cpuIndirectPrograms.find(programs.front().binary.codeAddress);
-        if (known != cpuIndirectPrograms.end() && known->second) {
+        if ((tail.fixIndirectCpuDraw && !drawParameters.indexed) || (known != cpuIndirectPrograms.end() && known->second)) {
             const auto& indirect = *drawParameters.indirect;
             recordQueuedLabelsBeforeRead(submission.queue);
             const auto readStart = std::chrono::steady_clock::now();
@@ -673,6 +674,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             bool any = false;
             for (std::uint32_t record = 0; record < count && !any; ++record) any = recordDraws(Pm4::ReadDrawArguments(indirect, record));
             if (!any) {
+                if (tail.fixIndirectCpuDraw) ArchB::Recorder::Count("fix_indirect_cpu_draw_empty_hits");
                 Graphics::CountEmptyIndirectDraw(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
                 timing.Mark("empty_indirect_skipped");
                 return drawn();
@@ -718,7 +720,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
         constexpr std::uint32_t NoLocation = 0x280u;
         const auto& front = programs.front();
-        const bool plain = fromBase && drawParameters.indexed && !indirect.drawIndexEnabled && front.binary.stage == Stage::Vertex && !front.merged && graphics.stages.path == Graphics::ShaderPath::Vertex && !graphics.stages.mesh && !graphics.stages.tessellation && !graphics.rectList &&
+        const bool plain = fromBase && (drawParameters.indexed || (tail.fixIndirectCpuDraw && indirect.indxOffset == 0)) && !indirect.drawIndexEnabled && front.binary.stage == Stage::Vertex && !front.merged && graphics.stages.path == Graphics::ShaderPath::Vertex && !graphics.stages.mesh && !graphics.stages.tessellation && !graphics.rectList &&
                            localDevice->DrawIndirectSupport().drawParameters && Graphics::DecodeVertexStageInfo(front.binary.header, front.binary.headerAddress, front.userData, nullptr, false, 8u - front.firstUserSgpr).resourcesNum == 0;
         const auto frontOnly = [&](std::uint32_t location, std::int32_t sgpr) { return location == NoLocation || (sgpr >= 0 && UserDataWords(programs, roles, location).size() == 1); };
         indirect.instanceFromBase = plain && frontOnly(indirect.startInstanceLocation, indirect.startInstanceSgpr);
@@ -758,6 +760,26 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
+    }
+    if (tail.fixIndirectCpuDraw && drawParameters.indirect && !drawParameters.indexed && (drawParameters.indirect->instanceFromBase || drawParameters.indirect->vertexFromBase)) {
+        auto& indirect = *drawParameters.indirect;
+        const auto& front = programs.front();
+        if (!vertexInfos.front()) decodeVertexInfo(0);
+        ShaderRecompiler::RecompileRequest request{
+            front.binary,
+            {graphics.stages.vertexWaveSize, front.firstUserSgpr, front.userData, std::nullopt, std::nullopt, vertexInfos.front(), memory, RegisteredFloatMode(*front.snapshot)},
+            localDevice->Target(), {0, 0, 0, Graphics::PipelinePushSlotBytes},
+            ShaderRecompiler::GraphicsCompileContext{front.firstUserSgpr, linked, {}, {}, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
+        };
+        request.graphics->instanceFromBase = indirect.instanceFromBase;
+        request.graphics->baseInstanceSgpr = indirect.instanceFromBase ? indirect.startInstanceSgpr : -1;
+        request.graphics->vertexFromBase = indirect.vertexFromBase;
+        request.graphics->baseVertexSgpr = indirect.vertexFromBase ? indirect.baseVertexSgpr : -1;
+        if (!IndirectBuiltinPlanSupported(request)) {
+            indirect.instanceFromBase = false;
+            indirect.vertexFromBase = false;
+            ArchB::Recorder::Count("fix_indirect_cpu_draw_builtin_refused_plan");
+        }
     }
     auto& shaderMemory = tail.shaderMemory;
     shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
@@ -799,7 +821,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         missesBefore = drawEntryCounters.misses;
     }
     try {
-        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree, tail.fixIndirectCpuDraw);
+        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree, tail.fixIndirectCpuDraw, captures);
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
@@ -1111,6 +1133,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), vertexInfos.front(), localDevice, drawParameters, traceIndirect);
+            if (tail.fixIndirectCpuDraw && !drawParameters.indexed && !indirectCpu && (drawParameters.indirect->instanceFromBase || drawParameters.indirect->vertexFromBase)) ArchB::Recorder::Count("fix_indirect_cpu_draw_builtin_hits");
             if (tail.ubSkipCpuIndirect && indirectCpu) {
                 ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbSkipCpuIndirect);
                 return drawn();
@@ -1348,7 +1371,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             }
             fold(*programResults[0], direct);
             if (indirect.instanceFromBase) direct.firstInstance = arguments.firstInstance;
-            if (indirect.vertexFromBase) direct.firstVertex = arguments.vertexOffset;
+            if (indirect.vertexFromBase) direct.firstVertex = drawParameters.indexed ? arguments.vertexOffset : arguments.firstVertexOrIndex;
             if (graphics.rectList && patched.contains(0)) buildRectList();
             snapshot();
             if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
