@@ -5264,6 +5264,24 @@ void StorageTexture::BumpPendingSerial() {
     pendingSerial.fetch_add(1, std::memory_order_release);
 }
 
+std::optional<bool> StorageTexture::PendingUnitsOverlap(std::uint64_t begin, std::uint64_t end, const StorageTexture* except) {
+    if (end <= begin) return false;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    bool unknown = false;
+    for (const auto* image : pending.textures) {
+        if (image == except || !image->overlaps(begin, end - begin)) continue;
+        for (std::uint32_t unit = 0; unit < image->trackedLayers; ++unit) {
+            const auto address = image->layerBegin(unit);
+            if (image->layerPending[unit] && address < end && begin < address + image->layerBytes(unit)) return true;
+        }
+    }
+    for (const auto* image : pending.flushing) {
+        if (image != except && image->overlaps(begin, end - begin)) unknown = true;
+    }
+    return unknown ? std::nullopt : std::optional<bool>(false);
+}
+
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);

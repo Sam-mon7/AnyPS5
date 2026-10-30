@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include <filesystem>
 #include <fstream>
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
@@ -585,6 +586,42 @@ void upperBoundLockTests() {
     }
 }
 
+void proofCountTests(Context context) {
+    namespace Memory = AgcDriver::GuestMemory;
+    using Counts = AgcDriver::ArchB::Recorder;
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    std::lock_guard lock(Memory::GpuMutex());
+    WatchedSurface surface(context);
+    const auto program = SampledProgram(surface.Address());
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    Counts::Boundary(true, 0, Counts::Clock::now());
+    Counts::Work work;
+    ShaderResources resources(context, shader);
+    Require(resources.Revalidate(shader), "count fixture failed its baseline proof");
+    Require(resources.Revalidate(shader), "count fixture failed its unchanged proof");
+    std::memset(reinterpret_cast<void*>(surface.Address()), 0x37, SurfaceBytes);
+    Memory::BumpCollectEpoch();
+    Require(!resources.Revalidate(shader), "count fixture accepted changed bytes");
+    auto counts = Counts::Collect(Counts::Clock::now()).counters;
+    Require(counts.at("w1_changed_fail") == 1 && counts.at("w1_changed_changed") == 1, "changed content was not classified exactly");
+    Require(counts.at("w1_sample_n_sum") == 64 && counts.at("w1_sample_objects") == 1, "sampling denominator was lost");
+    std::memset(reinterpret_cast<void*>(surface.Address()), 0x5a, SurfaceBytes);
+    Memory::BumpCollectEpoch();
+    Require(!resources.Revalidate(shader), "count fixture reused a replaced snapshot");
+    counts = Counts::Collect(Counts::Clock::now()).counters;
+    double unchanged = 0;
+    for (const auto& [name, count] : counts) {
+        if (name.starts_with("w1_") && name.ends_with("_unchanged")) unchanged += count;
+    }
+    Require(unchanged == 1, "an identical byte snapshot was not classified unchanged");
+    Counts::Boundary(false, 1, Counts::Clock::now());
+    Require(!resources.Revalidate(shader), "recorder off accepted changed bytes");
+    Require(Counts::Collect(Counts::Clock::now()).counters.at("w1_changed_fail") == 0, "recorder off measured a proof");
+}
+
 void upperBoundProofTests(Context context) {
     namespace Memory = AgcDriver::GuestMemory;
     PlaceholderImages placeholders(context);
@@ -931,17 +968,21 @@ void pendingScanTests(Context context) {
         for (std::size_t i = 0; i < queries.size(); ++i) {
             Require(queries[i].overlaps == expected[i].overlaps, "the pending scan missed an overlap for query " + std::to_string(i));
             Require(queries[i].found == expected[i].found, "the pending scan changed registration order for query " + std::to_string(i));
+            const auto units = StorageTexture::PendingUnitsOverlap(queries[i].begin, queries[i].end, queries[i].except);
+            Require(units.has_value() && (!*units || expected[i].overlaps), "pending units escaped their surface range");
         }
         for (auto& query : expected) query.pending = query.found;
         Require(StorageTexture::ScanPending(expected), "the pending scan rejected unchanged image identities");
     };
     check();
     check();
+    Require(StorageTexture::PendingUnitsOverlap(base + 2 * SurfaceBytes, base + 3 * SurfaceBytes, wide.get()) == true, "pending units missed the narrow image");
     late->MarkDirty();
     registered.push_back(late);
     check();
     Require(StorageTexture::DiscardPendingInside(base + 2 * SurfaceBytes, SurfaceBytes) >= 1 && !narrow->Dirty() && wide->Dirty(), "the pending scan fixture did not remove its narrow image while retaining the wider one");
     std::erase(registered, narrow);
+    Require(StorageTexture::PendingUnitsOverlap(base + 2 * SurfaceBytes, base + 3 * SurfaceBytes, nullptr) == false, "a clean unit was confused with its pending allocation");
     check();
     StorageTexture::DiscardPendingInside(base, BlockBytes);
     registered.clear();
@@ -1623,6 +1664,7 @@ int main(int argc, char** argv) {
         TextureDetiler detiler(context);
         context.detiler = &detiler;
         if (mode == "ub-trust-proofs") { upperBoundProofTests(context); return 0; }
+        if (mode == "proof-counts") { proofCountTests(context); return 0; }
         if (mode == "resource-epoch-draw" || mode == "resource-epoch-dispatch") {
             if (!resourceEpochTests(context, mode == "resource-epoch-draw")) return VulkanTestSkipped;
             std::puts("resource epoch proof tests passed");

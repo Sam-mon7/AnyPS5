@@ -49,6 +49,33 @@
 #include "prx/libc/include/GuestArena.hpp"
 
 namespace AgcDriver::Graphics {
+
+struct ShaderResources::ProofSample {
+    using Metric = ArchB::Recorder::ProofMetric;
+    struct Range {
+        std::uint64_t address;
+        std::vector<std::byte> bytes;
+    };
+    inline static std::atomic<std::size_t> retained{0};
+    std::vector<Range> ranges;
+    std::vector<std::uint32_t> descriptors;
+    std::size_t bytes = 0;
+    std::uint64_t allocations = 0;
+    std::uint64_t forgotten = 0;
+    HostImportsProof imports;
+    std::uint64_t recorderGeneration = ArchB::Recorder::Generation();
+    Metric result = Metric::NoBaseline;
+    bool selected = false;
+    bool valid = false;
+    bool pendingObserved = false;
+    bool pendingOverlap = false;
+    bool pendingUnknown = false;
+    bool depthObserved = false;
+    bool depthOverlap = false;
+    bool depthUnknown = false;
+    ~ProofSample() { retained.fetch_sub(bytes, std::memory_order_relaxed); }
+};
+
 namespace {
 
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
@@ -3228,12 +3255,25 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
-    if (!EpochRevalidate()) return fastRevalidateEach();
+    if (!EpochRevalidate()) return fastRevalidateEach(reason);
     const auto forgetBefore = GuestMemory::ForgetSerial();
     const auto fail = [&reason](FastFail why) {
         reason = why;
         countFastFail(why);
         return false;
+    };
+    const auto depthFail = [&](std::uint64_t address, std::size_t bytes) {
+        if (ArchB::Recorder::Enabled()) {
+            const auto pending = DepthPendingRangeOverlaps(context.device, address, bytes);
+            if (proofSample != nullptr) {
+                proofSample->depthObserved = true;
+                proofSample->depthOverlap |= pending.value_or(false);
+                proofSample->depthUnknown |= !pending.has_value();
+            }
+            ArchB::Recorder::Count(!pending.has_value() ? "w1_depth_range_unknown" : *pending ? "w1_depth_pending_range_overlap" : "w1_depth_clean_range");
+            ArchB::Recorder::Count(Recorder::SnapshotWriteOverlaps(address, bytes) ? "w1_depth_queued_range_overlap" : "w1_depth_no_queued_range_overlap");
+        }
+        return fail(FastFail::Depth);
     };
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
@@ -3262,13 +3302,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
         if (surface.depth) {
-            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
+            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return depthFail(surface.resource.baseAddress, surface.bytes);
             continue;
         }
         if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
-        if (DepthBlocksProof(context.device, address, bytes)) return fail(FastFail::Depth);
+        if (DepthBlocksProof(context.device, address, bytes)) return depthFail(address, bytes);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
         if (!surface.committed.has_value()) {
             surface.collected = GuestMemory::CollectWrites(address, bytes);
@@ -3328,7 +3368,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
         if (DepthBlocksProof(context.device, address, bytes)) {
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
-            return fail(FastFail::Depth);
+            return depthFail(address, bytes);
         }
         if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
         if (own.dccAddress != 0) {
@@ -3369,6 +3409,16 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
                 continue;
             }
             overlapping.push_back(owners[k]);
+            if (ArchB::Recorder::Enabled()) {
+                const auto units = StorageTexture::PendingUnitsOverlap(pending[k].begin, pending[k].end, pending[k].except);
+                if (proofSample != nullptr) {
+                    proofSample->pendingObserved = true;
+                    proofSample->pendingOverlap |= units.value_or(false);
+                    proofSample->pendingUnknown |= !units.has_value();
+                }
+                ArchB::Recorder::Count(!units.has_value() ? "w1_pending_range_unknown" : *units ? "w1_pending_unit_range_overlap" : "w1_pending_surface_only");
+                ArchB::Recorder::Count(Recorder::SnapshotWriteOverlaps(pending[k].begin, pending[k].end - pending[k].begin) ? "w1_pending_queued_range_overlap" : "w1_pending_no_queued_range_overlap");
+            }
         }
         if (!overlapping.empty()) {
             countPendingFail(pending);
@@ -3389,40 +3439,47 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     return true;
 }
 
-bool ShaderResources::fastRevalidateEach() {
-    if (validatedTextures.size() != textures.size()) return false;
+bool ShaderResources::fastRevalidateEach(FastFail& reason) {
+    const auto fail = [&](FastFail why) {
+        if (ArchB::Recorder::Enabled()) {
+            reason = why;
+            countFastFail(why);
+        }
+        return false;
+    };
+    if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
     const auto forgetBefore = GuestMemory::ForgetSerial();
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
-        if (!surface.valid) return false;
+        if (!surface.valid) return fail(FastFail::NoRecord);
         if (surface.depth) {
-            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return false;
+            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
             continue;
         }
-        if (textures[i]->Released()) return false;
+        if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
-        if (DepthBlocksProof(context.device, address, bytes)) return false;
-        if (!FlushDepthPlanes(address, bytes).empty()) return false;
+        if (DepthBlocksProof(context.device, address, bytes)) return fail(FastFail::Depth);
+        if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
         if (!surface.committed.has_value()) {
             surface.collected = GuestMemory::CollectWrites(address, bytes);
-            if (surface.collected == 0) return false;
+            if (surface.collected == 0) return fail(FastFail::Collect);
         }
-        if (PendingStorageOverlaps(address, bytes, surface.source)) return false;
-        if (surface.source != nullptr && surface.resource.dccAddress != 0 && surface.resource.dccAddress != surface.source->Descriptor().dccAddress) return false;
-        if (ClearSnapshotCacheEnabled() && surface.source != nullptr && surface.resource.dccAddress != 0 && IsDccClear(surface.source->FilledKeys())) return false;
-        if (surface.resource.dccAddress != 0 && TextureClearKeys(surface.resource, surface.bytes) != surface.keys) return false;
+        if (PendingStorageOverlaps(address, bytes, surface.source)) return fail(FastFail::Pending);
+        if (surface.source != nullptr && surface.resource.dccAddress != 0 && surface.resource.dccAddress != surface.source->Descriptor().dccAddress) return fail(FastFail::Keys);
+        if (ClearSnapshotCacheEnabled() && surface.source != nullptr && surface.resource.dccAddress != 0 && IsDccClear(surface.source->FilledKeys())) return fail(FastFail::Keys);
+        if (surface.resource.dccAddress != 0 && TextureClearKeys(surface.resource, surface.bytes) != surface.keys) return fail(FastFail::Keys);
         // A view made under fast-clear keys stays one only while its image still has results pending
         // over the surface (the lookup prefers them to the clear); once they are flushed the clear
         // the image cannot see wins and the lookup makes a snapshot (cachedTexture's hit rule).
-        if (surface.source != nullptr && surface.keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, surface.bytes).get() != surface.source) return false;
+        if (surface.source != nullptr && surface.keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, surface.bytes).get() != surface.source) return fail(FastFail::ClearedView);
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
-        if (storageTextures[i] != nullptr && (i >= storageKeys.size() || (storageKeys[i] != 0 && storageKeys[i] != storageTextures[i]->Descriptor().dccAddress))) return false;
+        if (storageTextures[i] != nullptr && (i >= storageKeys.size() || (storageKeys[i] != 0 && storageKeys[i] != storageTextures[i]->Descriptor().dccAddress))) return fail(FastFail::StorageKeys);
         // Consecutive elements of one mip chain share the image (see addStorageImageBinding).
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
         const auto* image = storageTextures[i].get();
-        if (image == nullptr) return false;
+        if (image == nullptr) return fail(FastFail::NoRecord);
         // StorageTexture::Refresh checks the image's own surface, not the element's descriptor (one
         // image serves every descriptor of its memory, with or without a DCC address), and compares
         // its keys with the keys it was uploaded under, which only the image knows (they move to
@@ -3431,31 +3488,33 @@ bool ShaderResources::fastRevalidateEach() {
         // the full walk. Without a DCC address both sides of that compare are Uncompressed whatever
         // happened, and the memory checks below are Refresh's.
         const auto& own = image->Descriptor();
-        if (own.dccAddress != 0) return false;
+        if (own.dccAddress != 0) return fail(FastFail::StorageKeys);
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
         if (DepthBlocksProof(context.device, address, bytes)) {
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
-            return false;
+            return fail(FastFail::Depth);
         }
-        if (GuestMemory::CollectWrites(address, bytes) == 0) return false;
-        if (PendingStorageOverlaps(address, bytes, image)) return false;
+        if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
+        if (PendingStorageOverlaps(address, bytes, image)) return fail(FastFail::Pending);
     }
-    if (!finishPartialSnapshots(forgetBefore)) return false;
+    if (!finishPartialSnapshots(forgetBefore)) return fail(FastFail::Changed);
     for (const auto& surface : validatedTextures) {
         if (surface.depth) continue;
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (surface.source != nullptr) {
-            if (!StorageImageCached(context, surface.source) || !GuestMemory::UnchangedSince(address, bytes, surface.source->GenerationFor(address, bytes))) return false;
-        } else if (!surface.committed.has_value() && !GuestMemory::UnchangedSince(address, bytes, surface.generation)) return false;
+            if (!StorageImageCached(context, surface.source)) return fail(FastFail::Evicted);
+            if (!GuestMemory::UnchangedSince(address, bytes, surface.source->GenerationFor(address, bytes))) return fail(FastFail::Changed);
+        } else if (!surface.committed.has_value() && !GuestMemory::UnchangedSince(address, bytes, surface.generation)) return fail(FastFail::Changed);
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
         const auto* image = storageTextures[i].get();
         const auto address = image->Descriptor().baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (!StorageImageCached(context, image) || !GuestMemory::UnchangedSince(address, bytes, image->GenerationFor(address, bytes))) return false;
+        if (!StorageImageCached(context, image)) return fail(FastFail::Evicted);
+        if (!GuestMemory::UnchangedSince(address, bytes, image->GenerationFor(address, bytes))) return fail(FastFail::Changed);
     }
     // Every check passed: snapshot textures are current at the collects issued before them. Storage
     // images keep their own generation: nothing was stamped above it, so the blocks a later write
@@ -3624,8 +3683,132 @@ ShaderResources::ProofExtent ShaderResources::Extent() const {
     return extent;
 }
 
+void ShaderResources::sampleProof(std::span<const CompiledShader> shaders, bool save) {
+    using Metric = ArchB::Recorder::ProofMetric;
+    auto& sample = *proofSample;
+    if (!sample.selected) { sample.result = Metric::Unsampled; return; }
+    if (save) sample.valid = false;
+    PerformanceTimer timing("Resources.ProofSample");
+    timing.RecorderCounter("w1_sample_ms");
+    sample.result = Metric::Unknown;
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
+    const auto allocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto forgotten = GuestMemory::ForgetSerial();
+    if ((forgotten & 1u) != 0) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::size_t bytes = 0;
+    const auto append = [&](std::uint64_t address, std::uint64_t size) {
+        if (size == 0) return true;
+        if (size > 8u * 1024u * 1024u - bytes || address > UINT64_MAX - size) return false;
+        const auto range = std::pair{address, address + size};
+        if (std::find(ranges.begin(), ranges.end(), range) != ranges.end()) return true;
+        if (const auto* recorder = Recorder::Active(); recorder != nullptr && (recorder->QueuedStoreOverlaps(address, size) || recorder->QueuedKeyStoreOverlaps(address, size) || recorder->PendingLabelIn(address, size))) return false;
+        if (DepthSurfaceOverlaps(context.device, address, size) || Recorder::SnapshotWriteOverlaps(address, size) || StorageTexture::AnyPendingOverlaps(std::span(&range, 1)) || AnyShadowedOverlaps(address, size)) return false;
+        ranges.push_back(range);
+        bytes += static_cast<std::size_t>(size);
+        return true;
+    };
+    if (validatedTextures.size() != textures.size()) return;
+    for (const auto& surface : validatedTextures) {
+        if (!surface.valid || surface.depth || !append(surface.resource.baseAddress, surface.bytes)) return;
+        if (surface.resource.dccAddress != 0 && !append(surface.resource.dccAddress, DccKeyBytes(surface.bytes))) return;
+    }
+    for (const auto& image : storageTextures) {
+        if (image == nullptr || !append(image->Descriptor().baseAddress, image->GuestBytes())) return;
+        if (image->Descriptor().dccAddress != 0 && !append(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()))) return;
+    }
+    std::vector<std::uint32_t> descriptors;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) return;
+        for (const auto& binding : shader.program->bindings) {
+            descriptors.push_back(static_cast<std::uint32_t>(binding.guestDescriptor.size()));
+            descriptors.insert(descriptors.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+        }
+    }
+    if (!save) {
+        if (!sample.valid) { sample.result = Metric::NoBaseline; return; }
+        if (sample.allocations != allocations || sample.forgotten != forgotten || sample.imports != HostImportsIdentity(context, false)) return;
+        if (sample.descriptors != descriptors || sample.ranges.size() != ranges.size()) { sample.result = Metric::Changed; return; }
+        sample.result = Metric::Unchanged;
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            const auto& before = sample.ranges[i];
+            if (before.address != ranges[i].first || before.bytes.size() != ranges[i].second - ranges[i].first) { sample.result = Metric::Changed; break; }
+            const auto compared = GuestMemory::CompareMapped(before.address, before.bytes);
+            ArchB::Recorder::Count("w1_compared_bytes", before.bytes.size());
+            if (compared != GuestMemory::Compare::Equal) {
+                sample.result = compared == GuestMemory::Compare::Differs ? Metric::Changed : Metric::Unknown;
+                break;
+            }
+        }
+    } else {
+        sample.valid = false;
+        const auto extra = bytes > sample.bytes ? bytes - sample.bytes : 0;
+        if (ProofSample::retained.fetch_add(extra, std::memory_order_relaxed) + extra > 64u * 1024u * 1024u) {
+            ProofSample::retained.fetch_sub(extra, std::memory_order_relaxed);
+            ArchB::Recorder::Count("w1_sample_budget_refused");
+            return;
+        }
+        if (bytes < sample.bytes) ProofSample::retained.fetch_sub(sample.bytes - bytes, std::memory_order_relaxed);
+        sample.bytes = bytes;
+        sample.ranges.clear();
+        for (const auto& [begin, end] : ranges) {
+            auto& range = sample.ranges.emplace_back(begin, std::vector<std::byte>(end - begin));
+            if (GuestMemory::CopyMapped(begin, range.bytes) != GuestMemory::Compare::Equal) return;
+        }
+        sample.descriptors = std::move(descriptors);
+        sample.allocations = allocations;
+        sample.forgotten = forgotten;
+        sample.imports = HostImportsIdentity(context, false);
+        sample.valid = true;
+        ArchB::Recorder::Count("w1_snapshot_bytes", bytes);
+    }
+    if (allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || forgotten != GuestMemory::ForgetSerial()) {
+        sample.valid = false;
+        sample.result = Metric::Unknown;
+    }
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     PerformanceTimer recorderTiming("Resources.Proof", AgcDriver::ArchB::Recorder::Phase::Proof);
+    if (!ArchB::Recorder::Enabled()) return revalidateImpl(shaders, report);
+    using Reason = ArchB::Recorder::ProofReason;
+    using Metric = ArchB::Recorder::ProofMetric;
+    if (proofSample == nullptr || proofSample->recorderGeneration != ArchB::Recorder::Generation()) {
+        proofSample = std::make_unique<ProofSample>();
+        thread_local std::uint64_t samples = 0;
+        proofSample->selected = samples++ % 64u == 0;
+        ArchB::Recorder::Count("w1_sample_candidates");
+        ArchB::Recorder::Count("w1_sample_n_sum", 64);
+        if (proofSample->selected) ArchB::Recorder::Count("w1_sample_objects");
+    }
+    sampleProof(shaders, false);
+    proofSample->pendingObserved = proofSample->pendingOverlap = proofSample->pendingUnknown = false;
+    proofSample->depthObserved = proofSample->depthOverlap = proofSample->depthUnknown = false;
+    ProofReport local;
+    if (report == nullptr) report = &local;
+    const auto start = ArchB::Recorder::Clock::now();
+    const bool ok = revalidateImpl(shaders, report);
+    const auto ms = std::chrono::duration<double, std::milli>(ArchB::Recorder::Clock::now() - start).count();
+    if (!ok && proofSample->result == Metric::Unknown) {
+        ArchB::Recorder::Count("w1_sample_after_required_work");
+        sampleProof(shaders, false);
+    }
+    const auto reason = report->failure == ProofFailure::Imports ? Reason::Imports : report->fastFail < static_cast<std::size_t>(FastFail::Count) ? static_cast<Reason>(report->fastFail) : ok ? Reason::None : Reason::Other;
+    ArchB::Recorder::CountProof(reason, Metric::Calls);
+    ArchB::Recorder::CountProof(reason, ok ? Metric::Passed : Metric::Failed);
+    ArchB::Recorder::CountProof(reason, Metric::ProofMs, ms);
+    if (!ok) {
+        ArchB::Recorder::CountProof(reason, proofSample->result);
+        if (proofSample->selected) ArchB::Recorder::CountProof(reason, Metric::Sampled);
+        if (proofSample->pendingObserved) ArchB::Recorder::Count(proofSample->pendingOverlap ? "w1_failed_pending_range_overlap" : proofSample->pendingUnknown ? "w1_failed_pending_range_unknown" : "w1_failed_pending_surface_only");
+        if (proofSample->depthObserved) ArchB::Recorder::Count(proofSample->depthOverlap ? "w1_failed_depth_pending_range_overlap" : proofSample->depthUnknown ? "w1_failed_depth_range_unknown" : "w1_failed_depth_clean_range");
+    }
+    if (ok && proofSample->result != Metric::Unchanged) sampleProof(shaders, true);
+    if (!ok) ArchB::Recorder::FailedProof(reason);
+    return ok;
+}
+
+bool ShaderResources::revalidateImpl(std::span<const CompiledShader> shaders, ProofReport* report) {
     const bool trustProofs = ArchB::Switches::Enabled(ArchB::Feature::UbTrustProofs);
     if (trustProofs && provedOnce) {
         ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbTrustProofs);
@@ -3795,6 +3978,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
     // by stage, binding by binding, so the walk repeats that order.
+    FastFail walkReason = FastFail::Count;
     const auto fullWalk = [&] {
         PerformanceTimer recorderTiming("Resources.FullWalk", AgcDriver::ArchB::Recorder::Phase::Proof);
         recorderTiming.RecorderCounter("full_walk_ms");
@@ -3877,6 +4061,17 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         captureValidation();
         return true;
     };
+    const auto measuredWalk = [&] {
+        if (!ArchB::Recorder::Enabled()) return fullWalk();
+        const auto start = ArchB::Recorder::Clock::now();
+        const bool ok = fullWalk();
+        const auto reason = walkReason == FastFail::Count ? ArchB::Recorder::ProofReason::None : static_cast<ArchB::Recorder::ProofReason>(walkReason);
+        const auto ms = std::chrono::duration<double, std::milli>(ArchB::Recorder::Clock::now() - start).count();
+        ArchB::Recorder::CountProof(reason, ok ? ArchB::Recorder::ProofMetric::FullPassed : ArchB::Recorder::ProofMetric::FullFailed);
+        ArchB::Recorder::CountProof(reason, ArchB::Recorder::ProofMetric::FullMs, ms);
+        ArchB::Recorder::CountProof(reason, ok ? ArchB::Recorder::ProofMetric::FullPassMs : ArchB::Recorder::ProofMetric::FullFailMs, ms);
+        return ok;
+    };
     bool fast = epochReused;
     if (epochReused && report != nullptr) report->path = ProofPath::Fast;
     if (epochReused) {
@@ -3892,6 +4087,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         bool accepted = false;
         markStage(1);
         fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+        const auto firstReason = reason;
         // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
         // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
         // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -3919,10 +4115,11 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             reason = FastFail::Audit;
         }
         if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
-        if (report != nullptr) report->fastFail = static_cast<std::size_t>(reason);
+        if (report != nullptr) report->fastFail = static_cast<std::size_t>(ArchB::Recorder::Enabled() && reason == FastFail::Count ? firstReason : reason);
+        walkReason = reason;
         if (!fast) {
             countFullWalk(reason);
-            if (!fullWalk()) {
+            if (!measuredWalk()) {
                 const auto failure = [&] {
                     switch (reason) {
                         case FastFail::Pending: return ProofFailure::Pending;
@@ -3947,7 +4144,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                     if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
                 }
                 for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
-                const bool same = fullWalk();
+                const bool same = measuredWalk();
                 const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
                 if (!same || moved != versions.end()) {
                     std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the T1 proof (%s) disagrees with the full walk (%s)\n", ownRefreshed ? "own-object refresh" : "accepted overlap", !same ? "another object" : "an upload");

@@ -573,7 +573,7 @@ private:
     // leaves the whole object to the full walk. Under GuestMemory::GpuMutex, as Revalidate is.
     OwnRefreshFallback refreshOwnObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> overlapping);
     // Today's per-element walk (APS5_NO_EPOCH_REVALIDATE=1).
-    bool fastRevalidateEach();
+    bool fastRevalidateEach(FastFail& reason);
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
@@ -693,6 +693,10 @@ private:
     static ResourceEpochProof currentResourceEpochProof();
     bool canRememberResourceEpoch() const;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, bool epochProofs = false);
+    bool revalidateImpl(std::span<const CompiledShader> shaders, ProofReport* report);
+    struct ProofSample;
+    std::unique_ptr<ProofSample> proofSample;
+    void sampleProof(std::span<const CompiledShader> shaders, bool save);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).

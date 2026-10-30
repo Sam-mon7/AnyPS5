@@ -2645,6 +2645,20 @@ bool DepthSurfaceBlocksMemoryProof(VkDevice device, std::uint64_t address, std::
     return false;
 }
 
+std::optional<bool> DepthPendingRangeOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
+    std::lock_guard lock(surfacesMutex());
+    bool unknown = false;
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire) || surface->retired || surface->context.device != device || !surface->Overlaps(address, bytes)) continue;
+        if (!mirrorable(surface->target) || surface->syncing || surface->target.stencilAddress != 0) {
+            unknown = true;
+            continue;
+        }
+        if ((surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || (surface->AnyStale() && anyUnit(surface->StaleUnitsIn(DescribeSurface(mirrorResource(surface->target)).guestBytes, address, address + bytes)))) return true;
+    }
+    return unknown ? std::nullopt : std::optional<bool>(false);
+}
+
 bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
     std::lock_guard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && surface->context.device == device && surface->Overlaps(address, bytes); });

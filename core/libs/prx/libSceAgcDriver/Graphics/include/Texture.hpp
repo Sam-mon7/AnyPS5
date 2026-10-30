@@ -277,6 +277,7 @@ public:
         const StorageTexture* found = nullptr;
     };
     static bool ScanPending(std::span<PendingQuery> queries);
+    static std::optional<bool> PendingUnitsOverlap(std::uint64_t begin, std::uint64_t end, const StorageTexture* except);
     // APS5_PROFILE_DRAW, for the flush hook's recorded-store attribution ([hooksync]): the pending
     // images overlapping a CPU access, whether a store of them would leave every 64 KiB block of the
     // access to the CPU (the write-back keep rule: a block of a pending layer stamped since the

@@ -148,6 +148,44 @@ void shaderTableOverflow() {
     near(sum(Recorder::Collect(start + 2s).total.ms), 0);
 }
 
+void proofAttribution() {
+    const Recorder::Clock::time_point start{};
+    Recorder::Boundary(true, 0, start);
+    Recorder::BindThread("proof attribution");
+    {
+        Recorder::Work work;
+        Recorder::Scope capture, prepare, complete, nested;
+        capture.Begin("Shader.DrawStage", start);
+        capture.Mark("capture_resources", start + 2ms);
+        capture.End(start + 3ms);
+        Recorder::FailedProof(Recorder::ProofReason::Pending);
+        prepare.Begin("Resources.Prepare", start + 3ms);
+        nested.Begin("nested", start + 4ms);
+        nested.End(start + 5ms);
+        prepare.End(start + 8ms);
+        Recorder::FailedProof(Recorder::ProofReason::Depth);
+        complete.Begin("Resources.Complete", start + 8ms);
+        complete.End(start + 11ms);
+    }
+    {
+        Recorder::Work next;
+        Recorder::Scope prepare;
+        prepare.Begin("Resources.Prepare", start + 11ms);
+        prepare.End(start + 15ms);
+    }
+    auto result = Recorder::Collect(start + 15ms);
+    near(result.counters.at("w1_pending_rebuild_prepare_ms"), 5);
+    near(result.counters.at("w1_pending_rebuild_complete_ms"), 3);
+    require(!result.counters.contains("w1_pending_rebuild_capture_ms"), "work before the proof was attributed to its failure");
+    require(!result.counters.contains("w1_depth_rebuild_complete_ms"), "a second proof double attributed rebuild work");
+    near(result.counters.at("w1_multiple_failures_in_work"), 1);
+    Recorder::Boundary(false, 1, start + 16ms);
+    Recorder::FailedProof(Recorder::ProofReason::Changed);
+    Recorder::CountProof(Recorder::ProofReason::Changed, Recorder::ProofMetric::Failed);
+    result = Recorder::Collect(start + 17ms);
+    require(!result.counters.contains("w1_changed_fail"), "disabled recorder counted a proof");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -158,6 +196,7 @@ int main(int argc, char** argv) {
         else if (name == "no_path_change") noPathChange();
         else if (name == "toggle_interval_tagged") toggleIntervalTagged();
         else if (name == "shader_table_overflow") shaderTableOverflow();
+        else if (name == "proof_attribution") proofAttribution();
         else throw std::runtime_error("unknown test case");
         return 0;
     } catch (const std::exception& error) {

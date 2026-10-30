@@ -105,7 +105,7 @@ struct Recorder::Thread {
     std::array<ShaderEntry, 1024> shaders;
     ShaderEntry other;
     std::array<PhaseEntry, 1024> phases;
-    std::array<CounterEntry, 512> counters;
+    std::array<CounterEntry, 1024> counters;
     Value phaseOverflow;
     Value counterOverflow;
 };
@@ -145,6 +145,7 @@ void Recorder::Scope::Begin(const char* scope, Clock::time_point now, Phase phas
     previous = now;
     parent = currentScope;
     work = currentWork;
+    proofReason = work != nullptr ? work->proofReason : ProofReason::None;
     category = phase != Phase::Inherit ? phase : parent != nullptr && parent->work == work ? parent->category : work != nullptr ? work->phase : Phase::Prepare;
     generation = Recorder::generation.load(std::memory_order_relaxed);
     currentScope = this;
@@ -157,11 +158,28 @@ void Recorder::Scope::Mark(const char* stage, Clock::time_point now) {
     const auto exclusive = inclusive - children;
     if (generation == Recorder::generation.load(std::memory_order_relaxed)) {
         Recorder::phase(name, stage, exclusive);
+        if (proofReason != ProofReason::None) {
+            const std::string_view scopeName(name);
+            const std::string_view stageName(stage != nullptr ? stage : "");
+            auto metric = ProofMetric::Count;
+            if (scopeName == "Resources.Prepare") metric = ProofMetric::PrepareMs;
+            else if (scopeName == "Resources.Complete") metric = ProofMetric::CompleteMs;
+            else if ((scopeName == "Shader.DrawStage" || scopeName == "Driver.Dispatch") && stageName == "capture_resources") metric = ProofMetric::CaptureMs;
+            else if ((scopeName == "Shader.DrawStage" || scopeName == "Driver.Dispatch") && stageName == "materialize") metric = ProofMetric::MaterializeMs;
+            else if (scopeName == "Vulkan.GraphicsPipeline" || scopeName == "Vulkan.ComputePipeline" || scopeName == "Vulkan.GraphicsPipelinePrebuild") metric = ProofMetric::PipelineMs;
+            if (metric != ProofMetric::Count) {
+                CountProof(proofReason, metric, milliseconds(inclusive - rebuildChildren));
+                rebuildChildren = inclusive;
+            }
+        }
         if (work != nullptr && work->generation == generation) work->elapsed[static_cast<std::size_t>(category)] += exclusive;
     }
     if (parent != nullptr) parent->children += inclusive;
+    if (parent != nullptr && parent->work == work) parent->rebuildChildren += rebuildChildren;
     previous = now;
     children = {};
+    rebuildChildren = {};
+    proofReason = work != nullptr ? work->proofReason : ProofReason::None;
 }
 
 void Recorder::Scope::End(Clock::time_point now) {
@@ -236,6 +254,29 @@ void Recorder::Count(const char* name, double value) {
 void Recorder::RegisterCounter(const char* name, const std::atomic<std::uint64_t>& counter) {
     std::lock_guard lock(state().mutex);
     state().counters.push_back({name, &counter, counter.load(std::memory_order_relaxed)});
+}
+
+void Recorder::CountProof(ProofReason reason, ProofMetric metric, double value) {
+    if (!Enabled()) return;
+    static const auto names = [] {
+        constexpr std::array reasons{"no_record", "collect", "pending", "evicted", "changed", "keys", "cleared_view", "storage_keys", "depth", "replaced", "audit", "imports", "other", "none"};
+        constexpr std::array metrics{"calls", "pass", "fail", "full_pass", "full_fail", "full_ms", "proof_ms", "sampled", "unchanged", "changed", "unknown", "no_baseline", "unsampled", "full_pass_ms", "full_fail_ms", "rebuild_prepare_ms", "rebuild_complete_ms", "rebuild_capture_ms", "rebuild_materialize_ms", "rebuild_pipeline_ms"};
+        static_assert(reasons.size() == static_cast<std::size_t>(ProofReason::Count));
+        static_assert(metrics.size() == static_cast<std::size_t>(ProofMetric::Count));
+        std::array<std::array<std::string, metrics.size()>, reasons.size()> result;
+        for (std::size_t r = 0; r < reasons.size(); ++r) {
+            for (std::size_t m = 0; m < metrics.size(); ++m) result[r][m] = std::string("w1_") + reasons[r] + '_' + metrics[m];
+        }
+        return result;
+    }();
+    Count(names.at(static_cast<std::size_t>(reason)).at(static_cast<std::size_t>(metric)).c_str(), value);
+}
+
+void Recorder::FailedProof(ProofReason reason) {
+    if (!Enabled()) return;
+    if (currentWork == nullptr) Count("w1_failure_without_work");
+    else if (currentWork->proofReason == ProofReason::None) currentWork->proofReason = reason;
+    else Count("w1_multiple_failures_in_work");
 }
 
 std::uint64_t Recorder::Digest(std::span<const std::uint32_t> code) {

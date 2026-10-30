@@ -18,6 +18,8 @@ public:
     using Clock = std::chrono::steady_clock;
     enum class Kind : std::uint8_t { Draw, Dispatch };
     enum class Phase : std::uint8_t { Prepare, Record, Proof, Bind, Inherit };
+    enum class ProofReason : std::uint8_t { NoRecord, Collect, Pending, Evicted, Changed, Keys, ClearedView, StorageKeys, Depth, Replaced, Audit, Imports, Other, None, Count };
+    enum class ProofMetric : std::uint8_t { Calls, Passed, Failed, FullPassed, FullFailed, FullMs, ProofMs, Sampled, Unchanged, Changed, Unknown, NoBaseline, Unsampled, FullPassMs, FullFailMs, PrepareMs, CompleteMs, CaptureMs, MaterializeMs, PipelineMs, Count };
     struct Key {
         Kind kind = Kind::Draw;
         std::uint64_t code = 0;
@@ -65,9 +67,11 @@ public:
         Clock::duration elapsed{};
         Clock::time_point previous{};
         Clock::duration children{};
+        Clock::duration rebuildChildren{};
         Phase category = Phase::Prepare;
         std::uint64_t generation = 0;
         bool active = false;
+        ProofReason proofReason = ProofReason::None;
     };
     class Work {
     public:
@@ -85,6 +89,8 @@ public:
         bool call;
         std::uint64_t generation;
         std::array<Clock::duration, 4> elapsed{};
+        ProofReason proofReason = ProofReason::None;
+        friend class Recorder;
     };
     static std::uint64_t Generation() { return generation.load(std::memory_order_relaxed); }
     static bool Enabled() { return enabled.load(std::memory_order_relaxed); }
@@ -92,6 +98,8 @@ public:
     static void Boundary(bool on, std::uint64_t sequence, Clock::time_point now);
     static Snapshot Collect(Clock::time_point now);
     static void Count(const char* name, double value = 1);
+    static void CountProof(ProofReason reason, ProofMetric metric, double value = 1);
+    static void FailedProof(ProofReason reason);
     static void RegisterCounter(const char* name, const std::atomic<std::uint64_t>& counter);
     static std::uint64_t Digest(std::span<const std::uint32_t> code);
     static void AddShader(Key key, std::uint64_t calls, const std::array<Clock::duration, 4>& elapsed);
