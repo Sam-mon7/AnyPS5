@@ -92,7 +92,11 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
             std::memcpy(&fresh, live.data() + i * sizeof(std::uint32_t), sizeof(fresh));
             if (stored == fresh) continue;
             const auto position = static_cast<std::uint32_t>(first + i);
-            if (!std::binary_search(data->positions.begin(), data->positions.end(), position)) return GuestMemory::Compare::Differs;
+            if (((stored ^ fresh) & ~WordMask(data->feedback, position)) == 0u) {
+                if (data->feedbackHit != nullptr) *data->feedbackHit = true;
+                continue;
+            }
+            if (data->live == nullptr || !std::binary_search(data->positions.begin(), data->positions.end(), position)) return GuestMemory::Compare::Differs;
             data->live->emplace_back(position, fresh);
         }
         return GuestMemory::Compare::Equal;
@@ -117,7 +121,8 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
         std::size_t first = 0;
         observable.clear();
         reachedPending = 0;
-        if (data != nullptr) data->live->clear();
+        if (data != nullptr && data->live != nullptr) data->live->clear();
+        if (data != nullptr && data->feedbackHit != nullptr) *data->feedbackHit = false;
         for (std::size_t i = 0, range = 0; i < captured.size(); ++i) {
             if (range < skipped.size() && i == skipped[range].begin) {
                 first += skipped[range].words;

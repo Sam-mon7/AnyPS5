@@ -165,7 +165,7 @@ void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
     waitedMsProvider.store(provider, std::memory_order_release);
 }
 
-ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits, PendingWriteQuery pendingSpan) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits), pendingSpan(pendingSpan != nullptr ? pendingSpan : pendingWrite) {
+ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits, PendingWriteQuery pendingSpan, bool traceDescriptors) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits), pendingSpan(pendingSpan != nullptr ? pendingSpan : pendingWrite), traceDescriptors(traceDescriptors) {
     const ShaderRecompiler::RequestMemoryView validated(regions);
     initial.reserve(regions.size());
     for (const auto& region : regions) initial.emplace_back(region.guestAddress, region.bytes);
@@ -699,7 +699,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.unchangedSince = &unchangedSince;
     runtime.supplyWords = &supplyWords;
     ShaderRecompiler::SrtReadTrace censusTrace;
-    if (ArchB::Recorder::Enabled()) {
+    if (traceDescriptors || ArchB::Recorder::Enabled()) {
         censusTrace.profile = true;
         runtime.readTrace = &censusTrace;
     }

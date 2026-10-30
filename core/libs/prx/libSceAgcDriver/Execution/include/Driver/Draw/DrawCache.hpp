@@ -81,9 +81,16 @@ struct DrawEntry {
     std::uint64_t shape = 0;
 };
 
-using DrawDataCandidates = std::vector<std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>>>;
+struct DrawDataCandidate {
+    std::shared_ptr<DispatchVariant> variant;
+    std::vector<ShaderRecompiler::MemoryRegion> regions;
+    bool feedbackHit = false;
+};
+
+using DrawDataCandidates = std::vector<std::vector<DrawDataCandidate>>;
 
 struct StageDataHit {
+    bool feedbackHit = false;
     std::vector<std::uint32_t> words;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
 };

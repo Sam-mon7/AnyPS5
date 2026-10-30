@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -163,6 +164,7 @@ bool Driver::pipelineDispatch() {
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    const bool feedbackMask = ArchB::Switches::Enabled(ArchB::Feature::FixTsharpFeedbackMask);
     ArchB::Recorder::Work recorderWork({ArchB::Recorder::Kind::Dispatch, 0});
     PerformanceTimer timing("Driver.Dispatch");
     const GuestMemory::ReadSiteScope handlerSite(GuestMemory::ReadSite::DispatchHandler);
@@ -212,7 +214,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (const auto found = parked.find(currentPacketOffset()); found != parked.end()) {
             ahead = std::move(found->second);
             parked.erase(found);
-            fromAhead = ahead.address == address;
+            fromAhead = ahead.address == address && ahead.feedbackMask == feedbackMask;
             if (!fromAhead) ++groupStats.addressMismatches;
         }
     }
@@ -324,14 +326,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     } probeScope{probeThis};
     const bool noDispatchCache = noDispatchCacheEnv || probeThis;
     std::uint64_t key = 0xcbf29ce484222325ull;
+    std::uint64_t feedbackKey = key;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
         key *= 0x100000001b3ull;
+        feedbackKey = (feedbackKey ^ value) * 0x100000001b3ull;
     };
     mix(address);
     mix(packet[4] & 0x8000u);
     for (const auto threads : compute.partialThreads) mix(threads);
-    for (const auto word : userData) mix(word);
+    for (const auto word : userData) key = (key ^ word) * 0x100000001b3ull;
 
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
     if (keyHygiene) {
@@ -346,6 +350,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             mix(value);
         }
     }
+    if (!keyHygiene) feedbackKey = 0;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
 
     std::shared_ptr<DispatchVariant> keepVariant;
@@ -450,7 +455,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering, feedbackMask, feedbackKey, userData);
     }
     timing.Mark("lookup_cache");
     std::vector<DrawPipeline::Range> itemWrites;
@@ -470,7 +475,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         captureMs += phaseTiming.Elapsed();
     } else if (!fromAhead) {
-        shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
+        shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan, feedbackMask);
         std::uint64_t forgetAtCapture = 0;
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
@@ -529,13 +534,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, feedbackMask, feedbackKey);
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
         parked = ResolvedDispatch{};
         parked.address = address;
         parked.key = key;
+        parked.feedbackMask = feedbackMask;
         parked.indirectArguments = indirectArguments;
         std::copy_n(packet.begin(), std::min(packet.size(), parked.packet.size()), parked.packet.begin());
         parked.registeredShader = registeredShader;
@@ -559,7 +565,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         return;
     }
-    if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
+    if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult, feedbackMask);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatch(queue, packet, submission, indirectArguments);

@@ -15,7 +15,7 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     });
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, bool feedbackMask, std::uint64_t feedbackKey) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
@@ -51,6 +51,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 break;
             }
         }
+        if (feedbackMask && !stampValidate() && capture != nullptr) RecordTsharpFeedbackMasks(*fresh, *capture);
         bool stable = true;
         if (stampValidate()) {
 
@@ -144,6 +145,10 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             entryCounters.dataLeavesMismatched += dataCounts.mismatched;
             entryCounters.dataLeavesAliased += dataCounts.aliased;
             attachVariant = fresh;
+            if (feedbackMask && feedbackKey != 0 && !fresh->feedback.userData.empty()) {
+                if (dispatchFeedbackKeys.size() >= dispatchCacheEntries()) dispatchFeedbackKeys.clear();
+                dispatchFeedbackKeys[feedbackKey] = key;
+            }
             const auto found = dispatchCache.find(key);
             if (found == dispatchCache.end()) {
                 auto created = std::make_shared<DispatchEntry>();

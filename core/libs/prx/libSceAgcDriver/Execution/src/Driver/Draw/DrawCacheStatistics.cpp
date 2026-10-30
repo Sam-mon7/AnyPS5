@@ -198,7 +198,7 @@ DrawMissDifference CompareDrawMissStage(const DispatchVariant& old, const StageC
 }
 
 void Driver::censusDrawMiss(const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& captures, const std::vector<std::vector<Graphics::DecodeRead>>& reads, const std::vector<bool>& reused, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shape) {
-    if (!ArchB::Recorder::Enabled()) return;
+    if (!missCensus()) return;
     ArchB::Recorder::Count("m1_miss_total");
     std::vector<std::shared_ptr<DrawEntry>> candidates;
     {
@@ -303,6 +303,11 @@ void Driver::censusDrawMiss(const std::vector<DrawProgram>& programs, const std:
         counter = names->emplace(name).first->c_str();
     }
     ArchB::Recorder::Count(counter);
+}
+
+bool Driver::missCensus() {
+    static const bool census = std::getenv("APS5_ARCHB_MISS_CENSUS") != nullptr;
+    return census && ArchB::Recorder::Enabled();
 }
 
 bool Driver::traceDrawCache() {

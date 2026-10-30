@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -67,6 +68,8 @@ std::size_t Driver::drawCacheEntries() {
 
 void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
     if (added) {
+        const auto masks = variant.feedback.memory.size() + variant.feedback.userData.size();
+        if (masks != 0u) ArchB::Recorder::Count("fix_tsharp_mask_positions", masks);
         ++drawCacheVariants;
         drawCacheVariantBytes += variantBytes(variant);
     } else {
@@ -170,7 +173,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         }
     }
     replacement->touched = drawCacheHits;
-    if (replacement->decode != nullptr && shape != 0) drawShapes[shape] = key;
+    if (shape != 0) drawShapes[shape] = key;
     if (found == drawCache.end()) {
         drawOrder.push_front(key);
         replacement->order = drawOrder.begin();
