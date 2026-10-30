@@ -349,7 +349,7 @@ function Wait-GateToggle($Process, [string]$Directory, [long]$Sequence, $LowSinc
 function Invoke-GateBlocks($Process, [string]$Directory, $Plan, [ref]$LowSince) {
     $blocks = [Collections.Generic.List[object]]::new()
     $script:ActiveBlocks = $blocks
-    $stages = if ($Mode -eq 'Bootstrap') { @(48) } else { @(24, 48, 96) }
+    $stages = if ($Mode -eq 'Bootstrap') { @(48) } elseif ($RecorderOverhead) { @(24, 48, 96) } else { @(12, 24, 48, 96) }
     foreach ($total in $stages) {
         while ($blocks.Count -lt $total) {
             $order = if ([Security.Cryptography.RandomNumberGenerator]::GetInt32(2)) { @('control', 'candidate') } else { @('candidate', 'control') }

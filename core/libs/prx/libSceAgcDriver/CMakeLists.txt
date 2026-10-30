@@ -576,7 +576,7 @@ if(BUILD_TESTING)
         foreach(archbStatsCase IN ITEMS frame_deltas_compute_ms gap_or_duplicate_fails aa_noise_sets_margin
                 noise_above_limit_fails sequential_pass_at_four sequential_continue_then_fail
                 clear_regression_fails_early p95_median_rule final_mode_requires_every_leg old_30_frame_telemetry_rejected
-                alternating_block_pairing alternating_settle_discard alternating_sequential_12_24 alternating_t_table
+                alternating_block_pairing alternating_settle_discard alternating_sequential_12_24 alternating_futility_at_six alternating_t_table
                 presented_denominator drop_limit fixed_margin inconclusive_48)
             add_test(NAME agc_archb_c01_stats_${archbStatsCase} COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBGateStats.py ${archbStatsCase})

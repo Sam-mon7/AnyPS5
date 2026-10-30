@@ -183,7 +183,7 @@ def bootstrap(pairs, alternating=False):
 
 
 def sequential(pairs, margin=0.02, alternating=False):
-    stages = (12, 24, 48) if alternating else (4, 8)
+    stages = (6, 12, 24, 48) if alternating else (4, 8)
     if len(pairs) not in stages:
         raise GateError(24, f"Child requires {stages} pairs")
     margin = 0.02
@@ -194,6 +194,8 @@ def sequential(pairs, margin=0.02, alternating=False):
     lower, upper = mean - radius, mean + radius
     threshold = math.log1p(margin)
     decision = "pass" if upper <= threshold else "fail" if lower > threshold else "inconclusive" if len(pairs) == stages[-1] else "continue"
+    if alternating and len(pairs) == stages[0] and decision == "pass":
+        decision = "continue"
     return {"code": {"pass": 0, "continue": 0, "fail": 1, "inconclusive": 3}[decision], "verdict": decision,
             "d_i": deltas, "LB": lower, "UB": upper, "threshold": threshold, "m": margin,
             "stage": len(pairs), "speedup": math.exp(-mean),
