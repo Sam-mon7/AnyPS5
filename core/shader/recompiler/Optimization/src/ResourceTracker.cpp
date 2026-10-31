@@ -92,6 +92,43 @@ std::uint32_t possibleU32Bits(const IrValue* value) {
     }
 }
 
+std::uint32_t bitScanKeyCount(const IrValue* value, std::uint32_t depth = 4u) {
+    value = value->Resolve();
+    if (value->HasImmediate()) {
+        if (value->Type() != IrType::U32) return 0u;
+        const auto immediate = value->ImmediateU32();
+        return immediate == std::numeric_limits<std::uint32_t>::max() ? 1u : immediate < 64u ? immediate + 1u : 0u;
+    }
+    if (depth == 0u) return 0u;
+    switch (value->Opcode()) {
+        case IrOpcode::FindILsb32:
+            return 32u;
+        case IrOpcode::ReadFirstLane:
+            return value->ArgumentCount() >= 1u ? bitScanKeyCount(value->Argument(0), depth - 1u) : 0u;
+        case IrOpcode::SelectU32: {
+            if (value->ArgumentCount() != 3u) return 0u;
+            const auto left = bitScanKeyCount(value->Argument(1), depth - 1u);
+            const auto right = bitScanKeyCount(value->Argument(2), depth - 1u);
+            return left == 0u || right == 0u ? 0u : std::max(left, right);
+        }
+        default:
+            return 0u;
+    }
+}
+
+bool isBitScanKey(const IrValue* value, std::uint32_t depth = 4u) {
+    value = value->Resolve();
+    if (value->HasImmediate() || depth == 0u) return false;
+    if (value->Opcode() == IrOpcode::FindILsb32) return true;
+    if (value->Opcode() == IrOpcode::ReadFirstLane && value->ArgumentCount() >= 1u) return isBitScanKey(value->Argument(0), depth - 1u);
+    if (value->Opcode() == IrOpcode::SelectU32 && value->ArgumentCount() == 3u) return isBitScanKey(value->Argument(1), depth - 1u) || isBitScanKey(value->Argument(2), depth - 1u);
+    return false;
+}
+
+std::uint32_t bitScanKeys(const IrValue* key) {
+    return isBitScanKey(key) ? bitScanKeyCount(key) : 0u;
+}
+
 std::uint32_t byteExtent(const MemoryInfo& memory) {
     const auto bytes = std::max((memory.dataBits + 7u) / 8u, 1u);
     const auto count = std::max(memory.dataDwords, 1u);
@@ -717,6 +754,7 @@ private:
         column.offset = first;
         column.dwordCount = words;
         column.maxKey = possibleU32Bits(key);
+        column.bitScanKeys = masked ? 0u : bitScanKeys(key);
         column.sampler = sampler;
         column.address = address;
         column.foldedAddend = folded ? baseAddend : 0u;
@@ -741,6 +779,7 @@ private:
         plan.keyDomain = domain;
         auto& shared = *m_sources[plan.source].tableColumn;
         shared.maxKey = std::max(shared.maxKey, column.maxKey);
+        shared.bitScanKeys = shared.bitScanKeys == 0u || column.bitScanKeys == 0u ? 0u : std::max(shared.bitScanKeys, column.bitScanKeys);
         if (!domain.has_value()) {
             shared.unkeyed = true;
             shared.keyDomains.clear();
@@ -888,6 +927,7 @@ private:
         column.offset = first;
         column.dwordCount = words;
         column.maxKey = possibleU32Bits(key);
+        column.bitScanKeys = bitScanKeys(key);
         column.sampler = sampler;
         column.indirect = true;
         column.indirectOffset = descriptorOffset;
@@ -901,6 +941,7 @@ private:
         plan.keyDomain = domain;
         auto& shared = *m_sources[plan.source].tableColumn;
         shared.maxKey = std::max(shared.maxKey, column.maxKey);
+        shared.bitScanKeys = shared.bitScanKeys == 0u || column.bitScanKeys == 0u ? 0u : std::max(shared.bitScanKeys, column.bitScanKeys);
         if (!domain.has_value()) {
             shared.unkeyed = true;
             shared.keyDomains.clear();

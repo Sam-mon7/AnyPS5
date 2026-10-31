@@ -701,7 +701,10 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     static const bool tableCensus = std::getenv("APS5_IMAGE_TABLE_CENSUS") != nullptr;
     static const bool verifyTables = std::getenv("APS5_VERIFY_IMAGE_TABLE_SNAPSHOT_REUSE") != nullptr;
     ShaderRecompiler::ImageTableSnapshotCounts tableCounts;
-    if (tableCensus || imageTableSnapshotReuse || imageTableSnapshotCounts != nullptr) runtime.imageTableCounts = &tableCounts;
+    static const bool verifyBitScanKeys = std::getenv("APS5_VERIFY_IMAGE_TABLE_BITSCAN_KEYS") != nullptr;
+    if (tableCensus || imageTableSnapshotReuse || imageTableBitScanKeys || imageTableSnapshotCounts != nullptr) runtime.imageTableCounts = &tableCounts;
+    runtime.imageTableBitScanKeys = imageTableBitScanKeys;
+    runtime.verifyImageTableBitScanKeys = imageTableBitScanKeys && verifyBitScanKeys;
     runtime.imageTableCensus = tableCensus;
     runtime.imageTableSnapshotReuse = imageTableSnapshotReuse;
     runtime.verifyImageTableSnapshotReuse = imageTableSnapshotReuse && verifyTables;
@@ -715,6 +718,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
             return invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
         } catch (...) {
             if (tableCounts.verifyMismatches != 0u) ArchB::Recorder::Count("fix_its_verify_mismatches", static_cast<double>(tableCounts.verifyMismatches));
+            if (tableCounts.bitScanVerifyMismatches != 0u) ArchB::Recorder::Count("fix_bitscan_keys_verify_mismatches", static_cast<double>(tableCounts.bitScanVerifyMismatches));
             throw;
         }
     }();
@@ -729,6 +733,17 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
         ArchB::Recorder::Count("fix_its_verify_mismatches", static_cast<double>(tableCounts.verifyMismatches));
         ArchB::Recorder::Count("fix_its_ns", static_cast<double>(tableCounts.ns));
         ArchB::Recorder::Count("fix_its_verify_ns", static_cast<double>(tableCounts.verifyNs));
+    }
+    if (imageTableBitScanKeys) {
+        ArchB::Recorder::Count("fix_bitscan_keys_bounded", static_cast<double>(tableCounts.bitScanBounded));
+        ArchB::Recorder::Count("fix_bitscan_keys_skipped_keys", static_cast<double>(tableCounts.bitScanSkippedKeys));
+        ArchB::Recorder::Count("fix_bitscan_keys_refused_no_bound", static_cast<double>(tableCounts.bitScanRefusedNoBound));
+        ArchB::Recorder::Count("fix_bitscan_keys_refused_not_narrower", static_cast<double>(tableCounts.bitScanRefusedNotNarrower));
+        ArchB::Recorder::Count("fix_bitscan_keys_refused_stride", static_cast<double>(tableCounts.bitScanRefusedStride));
+        ArchB::Recorder::Count("fix_bitscan_keys_snapshot_ns", static_cast<double>(tableCounts.ns));
+        ArchB::Recorder::Count("fix_bitscan_keys_verified", static_cast<double>(tableCounts.bitScanVerified));
+        ArchB::Recorder::Count("fix_bitscan_keys_verify_mismatches", static_cast<double>(tableCounts.bitScanVerifyMismatches));
+        ArchB::Recorder::Count("fix_bitscan_keys_verify_ns", static_cast<double>(tableCounts.bitScanVerifyNs));
     }
     if (tableCensus) {
         static constexpr const char* names[3][13] = {
