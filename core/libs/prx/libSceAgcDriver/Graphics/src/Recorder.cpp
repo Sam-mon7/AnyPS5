@@ -1743,6 +1743,8 @@ void Recorder::MarkCovered(VkAccessFlags access) {
 }
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
+    using R = AgcDriver::ArchB::Recorder;
+    R::Timer phases("H2.PassStart");
     EndComputeChain();
     ensureOpen();
     auto& pass = open->renderPass;
@@ -1752,7 +1754,13 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
         open->passHazards.BeginPass();
         return {commands, false, true};
     }
+    phases.Mark("setup", R::Metric::PassSetupNs);
+    if (auto* census = R::CurrentDraw()) {
+        census->Count(R::Metric::PassHazardCheck);
+        census->Count(R::Metric::PassCompatibility);
+    }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
+    phases.Mark("hazards", R::Metric::PassHazardNs);
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;

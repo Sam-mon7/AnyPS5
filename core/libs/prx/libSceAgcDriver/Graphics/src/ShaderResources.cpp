@@ -1650,6 +1650,10 @@ StorageTexture::RefreshPreparation PrepareStorageSurface(const Context& context,
 }
 
 std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource, StorageTexture::RefreshPreparation* preparation) {
+    using R = AgcDriver::ArchB::Recorder;
+    auto* census = R::TargetDraw();
+    R::Timer phases(census != nullptr ? "H2.TargetLookup" : nullptr, R::Metric::TargetLookupNs);
+    if (census != nullptr) census->Count(R::Metric::TargetLookup);
     if (preparation != nullptr && preparation->ready && preparation->device == context.device &&
         resource.dimension == TextureDimension::k2D && resource.mipCount == 1 && resource.depthOrLastArray == 0 && resource.baseArray == 0 &&
         preparation->storageSerial == ExtendedChains().serial.load(std::memory_order_acquire) &&
@@ -1677,6 +1681,10 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
 }
 
 std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, const GuestTextureResource& resource, std::uint32_t firstLayer, std::uint32_t layerCount) {
+    using R = AgcDriver::ArchB::Recorder;
+    auto* census = R::TargetDraw();
+    R::Timer phases(census != nullptr ? "H2.TargetLayerLookup" : nullptr, R::Metric::TargetLookupNs);
+    if (census != nullptr) census->Count(R::Metric::TargetLookup);
     return cachedStorageTexture(context, {}, resource, 0, 0, false, std::pair{firstLayer, layerCount});
 }
 

@@ -384,6 +384,7 @@ public:
         const auto aspects = pendingClear & (VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u));
         pendingClear = 0;
         if (aspects == 0) return;
+        if (auto* census = AgcDriver::ArchB::Recorder::TargetDraw()) census->Count(AgcDriver::ArchB::Recorder::Metric::TargetDepthClear);
         RecordClear(aspects);
     }
 
@@ -871,6 +872,7 @@ public:
     }
 
     void SyncFromMemory(const GuestTextureResource& resource) {
+        if (auto* census = AgcDriver::ArchB::Recorder::TargetDraw()) census->Count(AgcDriver::ArchB::Recorder::Metric::TargetDepthSync);
         std::uint64_t generation = 0;
         const auto changed = WrittenUnits(resource, generation);
         if ((pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !anyUnit(changed)) {
@@ -1986,11 +1988,16 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten) {
+    using R = AgcDriver::ArchB::Recorder;
+    auto* census = R::TargetDraw();
+    R::Timer phases(census != nullptr ? "H2.TargetDepth" : nullptr);
+    if (census != nullptr) census->Count(R::Metric::TargetDepthLookup);
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);
     std::unique_lock lock(surfacesMutex());
     const bool cleared = takeClearedHtile(target);
+    phases.Mark("metadata", R::Metric::TargetDepthClearNs);
     DepthSurface* surface = nullptr;
     for (const auto& candidate : surfaces()) {
         if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
@@ -2001,6 +2008,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     const bool created = surface == nullptr;
     GuestAllocations::Lease creationLease;
     if (created) {
+        if (census != nullptr) census->Count(R::Metric::TargetDepthCreated);
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto depthBytes = target.samples == 1u ? DepthSliceBytes(target.extent, d16 ? 2u : 4u) : MultisampledDepthBytes_nid_no_patch(target.extent, d16 ? 2u : 4u, target.samples);
         const auto stencilBytes = target.stencilAddress == 0u ? 0u : target.samples == 1u ? DepthSliceBytes(target.extent, 1u) : MultisampledDepthBytes_nid_no_patch(target.extent, 1u, target.samples);
@@ -2032,6 +2040,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     const bool inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
     surface->clearDepth = target.clearDepth;
     surface->clearStencil = target.clearStencil;
+    phases.Mark("lookup", R::Metric::TargetDepthLookupNs);
     takePlanes(*surface, created, htileCleared | (cleared ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u));
     if (created && !inherits && target.htileAddress == 0) surface->TakeStorage();
     if (cleared && (!created || inherits)) {
@@ -2039,8 +2048,11 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
+    phases.Mark("planes", R::Metric::TargetDepthPlanesNs);
     if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
+    phases.Mark("sync", R::Metric::TargetDepthSyncNs);
     surface->ApplyFastClear();
+    phases.Mark("clear", R::Metric::TargetDepthClearNs);
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
     surface->NoteMemory();
@@ -2062,6 +2074,8 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         noteStalePlane(plane, plane + planeBytes);
     }
     drawnDepth = surface;
+    if (census != nullptr) census->Count(R::Metric::TargetDepthBookkeeping);
+    phases.Mark("bookkeeping", R::Metric::TargetDepthBookkeepingNs);
     return surface->view;
 }
 

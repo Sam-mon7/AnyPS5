@@ -334,7 +334,13 @@ void storeSingleTexels(const Context& context, const ColorTarget& color) {
 
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
     if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
+    using R = AgcDriver::ArchB::Recorder;
+    auto* census = R::TargetDraw();
+    R::Timer phases(census != nullptr ? "H2.TargetClearKeys" : nullptr, R::Metric::TargetKeysNs);
+    if (census != nullptr) census->Count(R::Metric::TargetKeys);
     if (ProvedCurrentDccKeys(color.dccAddress, color.bytes, resident.TargetKeyProof()) != DccKeys::ClearRegister) return;
+    phases.Mark("keys", R::Metric::TargetKeysNs);
+    phases.Finish();
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
     const bool pendingKeysKnown = KnownPendingDccKeys(color.dccAddress, color.bytes) == DccKeys::ClearRegister;
@@ -1806,6 +1812,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>(StorageTexture::RefreshPreparation*)>& lookup, StorageTexture::RefreshPreparation* preparation) {
+    using R = AgcDriver::ArchB::Recorder;
+    R::Timer phases("H2.TargetColor");
     const auto lookupStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::optional<LookupOutcomes> before;
@@ -1841,7 +1849,10 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             const auto surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
             StorageTexture::ProfilePendingAccess(surface, DescribeSurface(surface).guestBytes, reads ? StorageTexture::PendingAccess::Read : StorageTexture::PendingAccess::Partial, &access);
         }
+        phases.Mark("profile", R::Metric::TargetRefreshNs);
         resident = lookup(preparation);
+        phases.Mark("refresh", R::Metric::TargetRefreshNs);
+        if (auto* census = R::CurrentDraw()) census->Count(R::Metric::TargetClearCheck);
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
         static AgcDriver::Mutex reportMutex;
@@ -1850,6 +1861,8 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
     if (resident != nullptr) materializeCmaskClear(context, color, resident);
+    phases.Mark("clear", R::Metric::TargetClearNs);
+    phases.Finish();
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;
@@ -2426,6 +2439,7 @@ bool WriteOnlyPasses() {
 }
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
+    using R = AgcDriver::ArchB::Recorder;
     AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.Record");
     auto recordLap = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto recordPhase = [&](RecordPhase phase) {
@@ -2495,6 +2509,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     recordPhase(RecordAccess);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
     recordPhase(RecordBindings);
+    R::Timer passTiming("H2.Pass");
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -2523,8 +2538,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
+    passTiming.Mark("access", R::Metric::PassAccessNs);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || (gpuIndirect && !inPassIndirect) || meshIndirect || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    passTiming.Mark("start", R::Metric::PassSetupNs);
+    passTiming.Finish();
     recordPhase(RecordPass);
+    R::Timer beginTiming("H2.Begin");
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2569,7 +2588,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
+        beginTiming.Mark("setup", R::Metric::PassBeginNs);
         record.pipeline->Continue(commands, state);
+        beginTiming.Mark("pipeline_state", R::Metric::PipelineStateNs);
         if (inPassIndirect) {
             recorder->NotePendingRead(args->arguments, static_cast<std::size_t>(args->RangeBytes()), Recorder::ReadKind::Indirect);
             argumentBuffer = record.indirect->argumentImport->buffer;
@@ -2606,9 +2627,13 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             for (auto& object : kept) recorder->Keep(std::move(object));
         }
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
+        beginTiming.Mark("setup", R::Metric::PassBeginNs);
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        beginTiming.Mark("pipeline_begin", R::Metric::PassBeginNs);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
+    beginTiming.Mark("bookkeeping", R::Metric::PassBeginNs);
+    beginTiming.Finish();
     recordPhase(RecordBegin);
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
@@ -3625,6 +3650,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawPreparation* preparation) {
+    using R = AgcDriver::ArchB::Recorder;
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
@@ -3668,10 +3694,14 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
+        R::Timer lookupTiming("H2.TargetLookup");
+        if (auto* census = R::CurrentDraw()) census->Count(R::Metric::TargetLookup);
         timer.phase(PhaseSetup);
         if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
+        lookupTiming.Mark("cache", R::Metric::TargetLookupNs);
+        lookupTiming.Finish();
         auto* targetPreparation = preparation != nullptr && preparation->device == context.device && index < preparation->targets.size() ? &preparation->targets[index] : nullptr;
         auto resident = refreshResidentTarget(context, state, state.colors[index], draw, shaders, outcome, profile, [&](StorageTexture::RefreshPreparation* targetProof) {
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);

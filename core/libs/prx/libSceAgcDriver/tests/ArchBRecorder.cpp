@@ -194,6 +194,57 @@ void hitCensus(bool enabled) {
     near(toggled.counters.at("H1.Hit.calls"), 0);
 }
 
+void targetsCensus(bool enabled) {
+    const Recorder::Clock::time_point start{};
+    Recorder::BindThread("h2 fixture");
+    Recorder::Boundary(enabled, 800, start);
+    {
+        Recorder::Draw draw(Recorder::DrawOutcome::Hit);
+        require(Recorder::TargetDraw() == nullptr, "target work escaped its scope");
+        Recorder::Scope outer, collect;
+        outer.Begin("H2.TargetRefresh", start);
+        require((Recorder::TargetDraw() != nullptr) == enabled, "target scope ignored recorder gating");
+        if (auto* census = Recorder::TargetDraw()) census->Count(Recorder::Metric::TargetRefresh);
+        collect.Measure(Recorder::Metric::TargetCollectNs);
+        collect.Begin("H2.TargetCollect", start + 10ms);
+        if (auto* census = Recorder::TargetDraw()) census->Count(Recorder::Metric::TargetCollect);
+        collect.End(start + 30ms);
+        outer.Measure(Recorder::Metric::TargetProofNs);
+        outer.Mark("proof", start + 40ms);
+        outer.Measure(Recorder::Metric::TargetKeysNs);
+        outer.End(start + 50ms);
+        require(Recorder::TargetDraw() == nullptr, "target work survived scope end");
+    }
+    const auto result = Recorder::Collect(start + 1s);
+    if (!enabled) {
+        require(!result.counters.contains("H1.Hit.target_refresh"), "disabled targets census published data");
+        return;
+    }
+    const auto& values = result.threadCounters.at("h2 fixture");
+    near(values.at("H1.Hit.target_refresh"), 1);
+    near(values.at("H1.Hit.target_collect"), 1);
+    near(values.at("H1.Hit.target_collect_ns"), 20000000);
+    near(values.at("H1.Hit.target_proof_ns"), 20000000);
+    near(values.at("H1.Hit.target_keys_ns"), 10000000);
+    near(result.phases.at("h2 fixture").at("H1.Hit.Outside.targets_pass"), 50);
+    near(result.accountedMs, 50);
+    Recorder::Boundary(false, 801, start + 2s);
+    {
+        Recorder::Draw draw(Recorder::DrawOutcome::Hit);
+        Recorder::Timer timer("H2.TargetRefresh", Recorder::Metric::TargetRefreshNs);
+        require(Recorder::TargetDraw() == nullptr, "disabled interval retained a target scope");
+    }
+    Recorder::Boundary(true, 802, start + 3s);
+    {
+        Recorder::Draw draw(Recorder::DrawOutcome::Hit);
+        Recorder::Scope scope;
+        scope.Measure(Recorder::Metric::TargetProofNs);
+        scope.Begin("H2.TargetRefresh", start + 3s);
+        scope.End(start + 3s + 10ms);
+    }
+    near(Recorder::Collect(start + 4s).counters.at("H1.Hit.target_proof_ns"), 10000000);
+}
+
 void shaderTableOverflow() {
     const Recorder::Clock::time_point start{};
     Recorder::Boundary(true, 0, start);
@@ -223,6 +274,8 @@ int main(int argc, char** argv) {
         else if (name == "shader_table_overflow") shaderTableOverflow();
         else if (name == "hit_census") hitCensus(true);
         else if (name == "hit_census_disabled") hitCensus(false);
+        else if (name == "targets_census") targetsCensus(true);
+        else if (name == "targets_census_disabled") targetsCensus(false);
         else throw std::runtime_error("unknown test case");
         return 0;
     } catch (const std::exception& error) {

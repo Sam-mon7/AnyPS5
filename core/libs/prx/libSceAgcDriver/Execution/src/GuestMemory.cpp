@@ -1611,6 +1611,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 }
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
+    using R = AgcDriver::ArchB::Recorder;
+    auto* census = R::TargetDraw();
+    R::Timer phases(census != nullptr ? "H2.TargetCollect" : nullptr, R::Metric::TargetCollectNs);
+    if (census != nullptr) census->Count(R::Metric::TargetCollect);
     return collectWrites(address, bytes, true);
 }
 

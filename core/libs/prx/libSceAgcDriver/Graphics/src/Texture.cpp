@@ -1437,6 +1437,7 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format) {
 }
 
 std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) {
+    if (auto* census = AgcDriver::ArchB::Recorder::TargetDraw()) census->Count(AgcDriver::ArchB::Recorder::Metric::TargetCreated);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     static const bool unwatchHooked = [] {
@@ -1988,6 +1989,8 @@ VkImageView StorageTexture::elementLayerView(std::uint32_t level, std::uint32_t 
 }
 
 VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layers, std::uint32_t layer) {
+    AgcDriver::ArchB::Recorder::Timer phases(AgcDriver::ArchB::Recorder::TargetDraw() != nullptr ? "H2.TargetView" : nullptr, AgcDriver::ArchB::Recorder::Metric::TargetLookupNs);
+    if (auto* census = AgcDriver::ArchB::Recorder::TargetDraw()) census->Count(AgcDriver::ArchB::Recorder::Metric::TargetView);
     Require(attachable, "storage image cannot be a color attachment");
     Require(mip < descriptor.mipCount, "attachment mip exceeds the storage image");
     const bool volume = descriptor.dimension == TextureDimension::k3D;
@@ -2248,12 +2251,17 @@ bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, RefreshPreparation* preparation) {
+    using R = AgcDriver::ArchB::Recorder;
+    auto* census = R::TargetDraw();
+    R::Timer phases(census != nullptr ? "H2.TargetRefresh" : nullptr, R::Metric::TargetRefreshNs);
+    if (census != nullptr) census->Count(R::Metric::TargetRefresh);
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
     const bool epochProofs = ShaderResources::EpochProofs();
     const auto epoch = epochProofs ? GuestMemory::CollectEpoch() : 0;
     if (epoch != 0 && provedEpoch.load(std::memory_order_relaxed) == epoch && provedProof.load(std::memory_order_relaxed) == GuestMemory::ProofSerial() && provedPending.load(std::memory_order_relaxed) == PendingSerial()) {
+        if (census != nullptr) census->Count(R::Metric::TargetRefreshProved);
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         epochRefreshes.fetch_add(1, std::memory_order_relaxed);
@@ -2264,14 +2272,17 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, 
     auto stepStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
+    phases.Mark("wait", R::Metric::TargetWaitNs);
     if (profile) stepStart = LookupOutcomes::Add(LookupOutcomes::RefreshWait, stepStart);
     const auto collectBefore = profile ? ThreadLookupOutcomes().ms[LookupOutcomes::RefreshCollect] : 0;
     const bool proved = refreshProved(preparation);
+    phases.Mark("proof", R::Metric::TargetProofNs);
     if (profile) {
         LookupOutcomes::Add(LookupOutcomes::RefreshProofCheck, stepStart);
         ThreadLookupOutcomes().ms[LookupOutcomes::RefreshProofCheck] -= ThreadLookupOutcomes().ms[LookupOutcomes::RefreshCollect] - collectBefore;
     }
     if (proved) {
+        if (census != nullptr) census->Count(R::Metric::TargetRefreshProved);
         layerBehind.clear();
         if (epoch != 0) {
             provedEpoch.store(epoch, std::memory_order_relaxed);
@@ -2328,8 +2339,12 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, 
     handedOver.clear();
     handedUnits.clear();
     const auto handOverKeys = alias == nullptr && !scoped ? clearHandOver() : std::nullopt;
+    if (census != nullptr) census->Count(R::Metric::TargetAliasCheck);
+    phases.Mark("aliases", R::Metric::TargetAliasNs);
     if (profile) stepStart = std::chrono::steady_clock::now();
     const bool flushed = !handOverKeys.has_value() && FlushPending(scopeBegin, scopeBytes, alias.get(), "storage refresh", PublishScope::None);
+    if (census != nullptr && !handOverKeys.has_value()) census->Count(R::Metric::TargetFlush);
+    phases.Mark("flush", R::Metric::TargetFlushNs);
     if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshFlush, stepStart);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
@@ -2344,6 +2359,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, 
         for (auto layer = firstLayer; layer < lastLayer; ++layer) collected[layer] = collectedLayerGeneration(layer, 0);
     }
     if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshCollect, stepStart);
+    phases.Mark("collect", R::Metric::TargetCollectNs);
     const auto currentFor = [&](std::uint32_t layer) {
         if (scoped && (layer < firstLayer || layer >= lastLayer)) return current;
         return scopedCurrent != 0 ? scopedCurrent : collected[layer];
@@ -2396,6 +2412,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, 
         };
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = handOverKeys.has_value() ? *handOverKeys : ProvedKeys();
+        phases.Mark("keys", R::Metric::TargetKeysNs);
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
         if (profile) stepStart = std::chrono::steady_clock::now();
         if (keys != uploadedKeys) {
@@ -2486,6 +2503,8 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, 
         }
     }
     if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshValidate, stepStart);
+    if (census != nullptr) census->Count(R::Metric::TargetValidate);
+    phases.Mark("validate", R::Metric::TargetValidateNs);
     const bool outsideChanged = std::any_of(outside.begin(), outside.end(), [](bool value) { return value; });
     if (scoped) noteLayersBehind(firstLayer, lastLayer, outside);
     else layerBehind.clear();
@@ -2611,6 +2630,10 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, 
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
+    using R = AgcDriver::ArchB::Recorder;
+    auto* census = R::TargetDraw();
+    R::Timer phases(census != nullptr ? "H2.TargetKeys" : nullptr, R::Metric::TargetKeysNs);
+    if (census != nullptr) census->Count(R::Metric::TargetKeys);
     std::optional<DccKeys> keys;
     if (descriptor.dccAddress != 0 && uploadedKeys == DccKeys::Uncompressed) keys = WaitForKeyWriters(descriptor, guestBytes);
     if (keys.has_value()) keyProof = {};
@@ -2628,6 +2651,10 @@ std::uint64_t StorageTexture::SlabRetiles() {
 }
 
 bool StorageTexture::otherPendingOverlaps() const {
+    using R = AgcDriver::ArchB::Recorder;
+    auto* census = R::TargetDraw();
+    R::Timer phases(census != nullptr ? "H2.TargetAliases" : nullptr, R::Metric::TargetAliasNs);
+    if (census != nullptr) census->Count(R::Metric::TargetAliasCheck);
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     const auto other = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
@@ -2876,6 +2903,10 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
 }
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
+    using R = AgcDriver::ArchB::Recorder;
+    auto* census = R::TargetDraw();
+    R::Timer phases(census != nullptr ? "H2.TargetUpload" : nullptr, R::Metric::TargetUploadNs);
+    if (census != nullptr) census->Count(R::Metric::TargetUpload);
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));

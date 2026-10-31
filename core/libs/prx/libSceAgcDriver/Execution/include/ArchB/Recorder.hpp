@@ -26,7 +26,11 @@ public:
         Calls, Continuations, VulkanCalls, VkcmdCalls, DescriptorWrites, DescriptorElements, ImageElements, BufferElements,
         DescriptorSets, DescriptorBinds, PipelineBinds, DistinctPipelines, DynamicCalls, PushCalls, DrawCalls,
         PassBegins, PassEnds, PassContinued, Barriers, ImageBarriers, LayoutTransitions, SnapshotBytes,
-        BindingPreparations, BindingRewrites, PlainStages, OrderedAccess, DescriptorSetRequests, SnapshotCopiedBytes, RedundantPipelineBinds, RedundantDynamicCalls, RedundantPushCalls, Count
+        BindingPreparations, BindingRewrites, PlainStages, OrderedAccess, DescriptorSetRequests, SnapshotCopiedBytes, RedundantPipelineBinds, RedundantDynamicCalls, RedundantPushCalls,
+        TargetLookup, TargetView, TargetDepthLookup, TargetDepthCreated, TargetRefresh, TargetRefreshProved, TargetCollect, TargetAliasCheck, TargetFlush, TargetKeys, TargetValidate, TargetUpload,
+        TargetClearCheck, TargetDepthClear, TargetDepthSync, TargetDepthBookkeeping, PassHazardCheck, PassCompatibility, RenderingInfo, FramebufferLookup, TargetCreated, TargetShadowCheck, TargetClears, TargetLayoutTransitions,
+        TargetLookupNs, TargetRefreshNs, TargetWaitNs, TargetProofNs, TargetCollectNs, TargetAliasNs, TargetFlushNs, TargetKeysNs, TargetValidateNs, TargetUploadNs, TargetClearNs,
+        TargetDepthLookupNs, TargetDepthPlanesNs, TargetDepthSyncNs, TargetDepthClearNs, TargetDepthBookkeepingNs, PassAccessNs, PassHazardNs, PassSetupNs, PassBeginNs, PipelineStateNs, Count
     };
     enum class State : std::uint8_t { Pipeline, Descriptors, Targets, Dynamic, Push, Count };
     struct Sequence {
@@ -131,7 +135,9 @@ public:
         void SetPhase(Phase phase) { category = phase; }
         bool Active() const { return active; }
         void Repeated(bool value) { repeated = value; }
+        void Measure(Metric value) { metric = value; }
     private:
+        friend class Recorder;
         Scope* parent = nullptr;
         Work* work = nullptr;
         const char* name = nullptr;
@@ -143,6 +149,7 @@ public:
         Clock::duration heldChildren{};
         bool repeated = false;
         Bucket bucket = Bucket::Bookkeeping;
+        Metric metric = Metric::Count;
         Draw* draw = nullptr;
         Phase category = Phase::Prepare;
         std::uint64_t generation = 0;
@@ -151,11 +158,17 @@ public:
     class Timer {
     public:
         explicit Timer(const char* name, Phase phase = Phase::Inherit) { Begin(name, phase); }
+        Timer(const char* name, Metric metric) { scope.Measure(metric); Begin(name); }
         ~Timer() { Finish(); }
         Timer(const Timer&) = delete;
         Timer& operator=(const Timer&) = delete;
         void Begin(const char* name, Phase phase = Phase::Inherit) { if (name != nullptr && CurrentDraw() != nullptr) scope.Begin(name, Clock::now(), phase); }
         void Mark(const char* stage) { if (scope.Active()) scope.Mark(stage, Clock::now()); }
+        void Mark(const char* stage, Metric metric) {
+            scope.Measure(metric);
+            Mark(stage);
+            scope.Measure(Metric::Count);
+        }
         void Finish() { if (scope.Active()) scope.End(Clock::now()); }
     private:
         Scope scope;
@@ -180,6 +193,7 @@ public:
     static std::uint64_t Generation() { return generation.load(std::memory_order_relaxed); }
     static bool Enabled() { return enabled.load(std::memory_order_relaxed); }
     static Draw* CurrentDraw() { return currentDraw; }
+    static Draw* TargetDraw() { return currentDraw != nullptr && currentScope != nullptr && currentScope->bucket == Bucket::Targets ? currentDraw : nullptr; }
     static void GpuLock(bool held, Clock::time_point now);
     static void BindThread(const char* name);
     static void Boundary(bool on, std::uint64_t sequence, Clock::time_point now);
@@ -211,6 +225,7 @@ extern "C" void AgcDriverRecorderScopeBegin_nid_no_patch(AgcDriver::ArchB::Recor
 extern "C" void AgcDriverRecorderScopeMark_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* stage, std::int64_t now);
 extern "C" void AgcDriverRecorderScopeEnd_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, std::int64_t now);
 extern "C" AgcDriver::ArchB::Recorder::Draw* AgcDriverRecorderDraw_nid_no_patch();
+extern "C" bool AgcDriverRecorderTargets_nid_no_patch();
 extern "C" void AgcDriverRecorderVulkanBegin_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* name);
 
 #endif

@@ -13,7 +13,8 @@ namespace AgcDriver::ArchB {
 namespace {
 
 constexpr const char* bucketNames[] = {"lookup_proof", "mutex_wait", "targets_pass", "descriptors", "pipeline", "dynamic_state", "push_constants", "draw_commands", "barriers", "data_refresh", "bookkeeping"};
-constexpr const char* metricNames[] = {"calls", "continuations", "vulkan_calls", "vkcmd_calls", "descriptor_writes", "descriptor_elements", "image_elements", "buffer_elements", "descriptor_sets", "descriptor_binds", "pipeline_binds", "distinct_pipelines", "dynamic_calls", "push_calls", "draw_calls", "pass_begins", "pass_ends", "pass_continued", "barriers", "image_barriers", "layout_transitions", "snapshot_bytes", "binding_preparations", "binding_rewrites", "plain_stages", "ordered_access", "descriptor_set_requests", "snapshot_copied_bytes", "redundant_pipeline_binds", "redundant_dynamic_calls", "redundant_push_calls"};
+constexpr const char* metricNames[] = {"calls", "continuations", "vulkan_calls", "vkcmd_calls", "descriptor_writes", "descriptor_elements", "image_elements", "buffer_elements", "descriptor_sets", "descriptor_binds", "pipeline_binds", "distinct_pipelines", "dynamic_calls", "push_calls", "draw_calls", "pass_begins", "pass_ends", "pass_continued", "barriers", "image_barriers", "layout_transitions", "snapshot_bytes", "binding_preparations", "binding_rewrites", "plain_stages", "ordered_access", "descriptor_set_requests", "snapshot_copied_bytes", "redundant_pipeline_binds", "redundant_dynamic_calls", "redundant_push_calls", "target_lookup", "target_view", "target_depth_lookup", "target_depth_created", "target_refresh", "target_refresh_proved", "target_collect", "target_alias_check", "target_flush", "target_keys", "target_validate", "target_upload", "target_clear_check", "target_depth_clear", "target_depth_sync", "target_depth_bookkeeping", "pass_hazard_check", "pass_compatibility", "rendering_info", "framebuffer_lookup", "target_created", "target_shadow_check", "target_clears", "target_layout_transitions", "target_lookup_ns", "target_refresh_ns", "target_wait_ns", "target_proof_ns", "target_collect_ns", "target_alias_ns", "target_flush_ns", "target_keys_ns", "target_validate_ns", "target_upload_ns", "target_clear_ns", "target_depth_lookup_ns", "target_depth_planes_ns", "target_depth_sync_ns", "target_depth_clear_ns", "target_depth_bookkeeping_ns", "pass_access_ns", "pass_hazard_ns", "pass_setup_ns", "pass_begin_ns", "pipeline_state_ns"};
+static_assert(std::size(metricNames) == static_cast<std::size_t>(Recorder::Metric::Count));
 constexpr const char* stateNames[] = {"pipeline", "descriptors", "targets", "dynamic", "push"};
 constexpr const char* outcomeNames[] = {"Unclassified", "Hit", "Miss"};
 
@@ -21,7 +22,7 @@ Recorder::Bucket bucketOf(std::string_view name, std::string_view stage, Recorde
     using B = Recorder::Bucket;
     if (name == "GpuMutex.wait") return B::Wait;
     if (name == "Driver.DrawLookup" || name == "Draw.Key" || name == "Draw.Lookup" || name == "Resources.Proof" || name == "Resources.FullWalk") return B::Lookup;
-    if (name == "Draw.Targets" || name == "Vulkan.Pass") return B::Targets;
+    if (name == "Draw.Targets" || name.starts_with("H2.") || name == "Vulkan.Pass") return B::Targets;
     if (name == "Draw.Acquire") return stage == "pipeline" ? B::Pipeline : B::Targets;
     if (name == "Resources.Bind" || name == "Draw.Descriptors" || name == "Vulkan.Descriptors") return B::Descriptors;
     if (name == "Vulkan.Pipeline") return B::Pipeline;
@@ -217,6 +218,7 @@ void Recorder::Scope::Mark(const char* stage, Clock::time_point now) {
             const auto index = static_cast<std::size_t>(bucketOf(name, stage != nullptr ? stage : "", bucket));
             draw->elapsed[0][index] += exclusive - exclusiveHeld;
             draw->elapsed[1][index] += exclusiveHeld;
+            if (metric != Metric::Count) draw->Count(metric, static_cast<std::uint64_t>(std::max<std::int64_t>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(exclusive).count())));
             if (std::string_view(name).starts_with("Vulkan.")) draw->emission[index] += exclusive;
             if (repeated) draw->redundantEmission[index] += exclusive;
         }
@@ -569,12 +571,17 @@ extern "C" AgcDriver::ArchB::Recorder::Draw* AgcDriverRecorderDraw_nid_no_patch(
     return AgcDriver::ArchB::Recorder::CurrentDraw();
 }
 
+extern "C" bool AgcDriverRecorderTargets_nid_no_patch() {
+    return AgcDriver::ArchB::Recorder::TargetDraw() != nullptr;
+}
+
 extern "C" void AgcDriverRecorderVulkanBegin_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* name) {
     using Recorder = AgcDriver::ArchB::Recorder;
     auto* draw = Recorder::CurrentDraw();
     if (draw == nullptr) return;
     using M = Recorder::Metric;
     const std::string_view operation(name);
+    if (operation.starts_with("vkCmdClear") && Recorder::TargetDraw() != nullptr) draw->Count(M::TargetClears);
     draw->Count(M::VulkanCalls);
     const char* phase = "Vulkan.Other";
     if (operation.starts_with("vkCmd")) draw->Count(M::VkcmdCalls);

@@ -806,6 +806,8 @@ VkPipelineLayout Pipeline::Layout() const {
 }
 
 std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<void>> owners, VkExtent2D extent, std::uint32_t layers) {
+    AgcDriver::ArchB::Recorder::Timer phases("H2.Framebuffer", AgcDriver::ArchB::Recorder::Metric::TargetLookupNs);
+    if (auto* census = AgcDriver::ArchB::Recorder::CurrentDraw()) census->Count(AgcDriver::ArchB::Recorder::Metric::FramebufferLookup);
     Require(targets.size() == attachments && owners.size() == colorAttachments, "render targets do not match the pipeline's attachments");
     bool resident = true;
     for (const auto& owner : owners) resident = resident && owner != nullptr;
@@ -858,6 +860,9 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
 }
 
 void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
+    using R = AgcDriver::ArchB::Recorder;
+    R::Timer phases("H2.RenderingInfo", R::Metric::PassBeginNs);
+    if (auto* census = R::CurrentDraw()) census->Count(R::Metric::RenderingInfo);
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -907,6 +912,7 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
 }
 
 void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
+    AgcDriver::ArchB::Recorder::Timer phases("H2.PipelineState", AgcDriver::ArchB::Recorder::Metric::PipelineStateNs);
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);

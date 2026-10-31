@@ -186,7 +186,10 @@ struct RecordedVulkanCall<TResult(VKAPI_PTR*)(TArgs...)> {
             draw->Count(M::ImageBarriers, std::get<8>(arguments));
             for (std::uint32_t i = 0; i < std::get<8>(arguments); ++i) {
                 const auto& barrier = std::get<9>(arguments)[i];
-                if (barrier.oldLayout != barrier.newLayout) draw->Count(M::LayoutTransitions);
+                if (barrier.oldLayout != barrier.newLayout) {
+                    draw->Count(M::LayoutTransitions);
+                    if (AgcDriverRecorderTargets_nid_no_patch()) draw->Count(M::TargetLayoutTransitions);
+                }
             }
         } else if constexpr (std::is_same_v<Function, PFN_vkCmdBindPipeline>) {
             const auto begin = draw->StateSize(S::Pipeline);
