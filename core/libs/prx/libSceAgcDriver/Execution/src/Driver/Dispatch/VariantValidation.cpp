@@ -98,9 +98,46 @@ namespace {
 // Whether the calling thread's last validateVariant reached the byte compare (the shadow tells a
 // decision taken on the bytes from a refusal by a gate or a serial).
 thread_local bool variantCompared = false;
+// Whether the calling thread's last validateVariant proved the guest bytes of every run equal to the
+// variant's words exactly (Equal with no live data word, no masked feedback bit and no pending GPU
+// write over a run): only then may a since move (CompareAndRestamp).
+thread_local bool variantExact = false;
+
+// Slice S7 (GEN_DRAW_VALIDATION): the generation verdict over the variant's runs at its since and
+// the calling thread's ticket. Clean needs every block tracked, covered by a resetting walk that
+// started at or after the thread's latest ordering point (a CPU store ordered before it was found
+// and stamped by such a walk or an earlier one; blocks no sweep covered at the ticket are
+// unknown_not_swept, never Clean), and every kind (data, cpu, meta, pending) at most the since; a
+// GPU write announced over a run and still pending makes it Pending (the byte compare then decides
+// with the known values it carries).
+GuestMemory::Gen::DrawGen generationVerdict(const DispatchVariant& variant, const PendingView& pending) {
+    namespace Gen = GuestMemory::Gen;
+    const auto verdict = Gen::CheckRuns(Gen::Global(), variant.runs, variant.genSince.load(std::memory_order_acquire), Gen::Required(), variant.genProvenTicket.load(std::memory_order_acquire));
+    if (verdict != Gen::DrawGen::Unknown && std::ranges::any_of(variant.runs, [&](const auto& run) { return pending.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); })) return Gen::DrawGen::Pending;
+    return verdict;
+}
 }
 
-GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer consumer, const DispatchVariant& variant, EntryOutcome outcome, std::uint64_t before) {
+bool VariantValidationExact() {
+    return variantExact;
+}
+
+void RestampVariant(const DispatchVariant& variant, std::uint64_t since, std::uint64_t ticket) {
+    const auto raise = [](std::atomic<std::uint64_t>& field, std::uint64_t value) {
+        auto current = field.load(std::memory_order_relaxed);
+        while (current < value && !field.compare_exchange_weak(current, value, std::memory_order_release, std::memory_order_relaxed)) {}
+    };
+    raise(variant.genSince, since);
+    raise(variant.genProvenTicket, ticket);
+}
+
+bool CapturedOverPendingWrite(std::span<const ShaderRecompiler::MemoryRegion> regions) {
+    PendingView pending;
+    pending.Load();
+    return std::ranges::any_of(regions, [&](const ShaderRecompiler::MemoryRegion& region) { return pending.Overlaps(region.guestAddress, region.bytes.size()); });
+}
+
+GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer consumer, const DispatchVariant& variant, EntryOutcome outcome, std::uint64_t before, bool exact) {
     namespace Gen = GuestMemory::Gen;
     const auto since = variant.genSince.load(std::memory_order_acquire);
     auto& table = Gen::Global();
@@ -153,15 +190,18 @@ GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer cons
         Gen::CountVerify(consumer, verified);
         if (verified == Gen::Outcome::Unsafe) Gen::ReportUnsafe(consumer, first.first, first.second, since, slow != verdict ? "verify: exhaustive verdict differs" : "verify: clean while the byte compare found a change");
     }
-    if (verdict != Gen::Verdict::Clean && outcome == EntryOutcome::Equal && before != 0) {
+    if (verdict != Gen::Verdict::Clean && outcome == EntryOutcome::Equal && before != 0 && exact) {
         Gen::CountRestamp(consumer);
-        variant.genSince.store(before, std::memory_order_release);
+        // GEN_DRAW_VALIDATION restamps in validateVariant itself (with a since taken right before the compare).
+        if (!Gen::DrawValidationActive()) RestampVariant(variant, before);
     }
     return verdict;
 }
 
-EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit, bool bufferBases) {
+EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit, bool bufferBases, GuestMemory::Gen::Consumer consumer) {
+    namespace Gen = GuestMemory::Gen;
     variantCompared = false;
+    variantExact = false;
     if (live != nullptr) live->clear();
     if (feedbackHit != nullptr) *feedbackHit = false;
     if (DrawPipeline::Active()) {
@@ -229,10 +269,57 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     pending.Load();
     bool unmapped = false;
     variantCompared = true;
-    if (!validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked || feedback ? &mask : nullptr, vouched)) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
+    // Slice S7 (GEN_DRAW_VALIDATION), after every gate above (drains, pending syncs, image flushes,
+    // queued labels), where the byte compare would run: a Clean generation verdict means the guest
+    // bytes of every run are the variant's words, which is what an exact compare would find (Equal,
+    // no live data word, no feedback bit), so the compare is skipped. Otherwise the compare runs and,
+    // when exact, moves the since to a generation taken before it (CompareAndRestamp) so the next
+    // validation can be Clean. Verify mode compares a sampled Clean verdict's bytes anyway.
+    const bool generations = Gen::DrawValidationActive() && !validateLegacy();
+    auto verdict = Gen::DrawGen::Unknown;
+    bool verifying = false;
+    std::uint64_t before = 0;
+    std::uint64_t ticket = 0;
+    if (generations) {
+        verdict = generationVerdict(variant, pending);
+        before = Gen::CaptureSince();
+        ticket = Gen::Required();
+        if (verdict == Gen::DrawGen::Clean) {
+            verifying = Gen::VerifySample();
+            if (!verifying) {
+                if (Graphics::Recorder::PublishGeneration() != publish) return EntryOutcome::PublishMoved;
+                if (Graphics::StorageTexture::PendingSerial() != pendingSerial) return EntryOutcome::PendingMoved;
+                if (GuestMemory::ForgetSerial() != forget) return EntryOutcome::ForgetMoved;
+                Gen::CountDrawGen(consumer, Gen::DrawGen::Clean);
+                variantCompared = false;
+                variantExact = true;
+                return EntryOutcome::Equal;
+            }
+        }
+    }
+    const auto compared = validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked || feedback ? &mask : nullptr, vouched);
+    const bool exact = compared && (live == nullptr || live->empty()) && (feedbackHit == nullptr || !*feedbackHit);
+    if (verifying) {
+        Gen::CountDrawGen(consumer, exact ? Gen::DrawGen::Verified : Gen::DrawGen::Unsafe);
+        Gen::CountVerify(consumer, exact ? Gen::Outcome::AgreeClean : Gen::Outcome::Unsafe);
+        const auto first = variant.runs.front();
+        if (!exact) Gen::ReportUnsafe(consumer, first.first, first.second, variant.genSince.load(std::memory_order_relaxed), "draw validation: clean while the byte compare found a change");
+    }
+    if (!compared) {
+        if (generations && !verifying) Gen::CountDrawGen(consumer, verdict);
+        return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
+    }
     if (Graphics::Recorder::PublishGeneration() != publish) return EntryOutcome::PublishMoved;
     if (Graphics::StorageTexture::PendingSerial() != pendingSerial) return EntryOutcome::PendingMoved;
     if (GuestMemory::ForgetSerial() != forget) return EntryOutcome::ForgetMoved;
+    variantExact = exact && verdict != Gen::DrawGen::Pending && !std::ranges::any_of(variant.runs, [&](const auto& run) { return pending.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); });
+    if (generations && !verifying) {
+        Gen::CountDrawGen(consumer, verdict);
+        if (variantExact && before != 0) {
+            RestampVariant(variant, before, ticket);
+            Gen::CountDrawGen(consumer, Gen::DrawGen::Restamped);
+        }
+    }
     return masked && !live->empty() ? EntryOutcome::EqualData : EntryOutcome::Equal;
 }
 

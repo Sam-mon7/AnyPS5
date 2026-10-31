@@ -622,6 +622,13 @@ const char* LockFreeApiName(LockFreeApi api) {
     return index < std::size(names) ? names[index] : "?";
 }
 
+const char* DrawGenName(DrawGen outcome) {
+    static constexpr const char* names[] = {"clean", "restamped", "changed", "pending", "unknown", "verified", "unsafe"};
+    static_assert(std::size(names) == static_cast<std::size_t>(DrawGen::Count));
+    const auto index = static_cast<std::size_t>(outcome);
+    return index < std::size(names) ? names[index] : "?";
+}
+
 const char* ConsumerName(Consumer consumer) {
     static constexpr const char* names[] = {"draw_validate", "dispatch_validate", "dispatch_spans", "resource_proof", "texture_lookup", "storage_refresh", "prelock", "snapshot", "draw_input", "mirror", "presentation", "other"};
     static_assert(std::size(names) == static_cast<std::size_t>(Consumer::Count));
@@ -651,9 +658,12 @@ constexpr const char* WaitNames[] = {"gpu_label", "inheritable", "inheritable_ta
 constexpr std::size_t LockFreeCount = static_cast<std::size_t>(LockFreeApi::Count);
 // Counters a gate may require: their recorder names keep the name as is (no 'gen.' dot prefix;
 // queue 0 gets 'gen_q0_'), since the gate accepts only [A-Za-z_]\w* counter names.
-constexpr const char* PlainNames[] = {"gen_lockfree_fast", "gen_lockfree_slow", "gen_lockfree_verified", "gen_lockfree_raced", "gen_lockfree_unsafe"};
+constexpr const char* PlainNames[] = {"gen_lockfree_fast", "gen_lockfree_slow", "gen_lockfree_verified", "gen_lockfree_raced", "gen_lockfree_unsafe",
+    "gen_draw_clean", "gen_draw_restamped", "gen_draw_changed", "gen_draw_pending", "gen_draw_unknown", "gen_draw_verified", "gen_draw_unsafe"};
 constexpr std::size_t PlainCount = std::size(PlainNames);
-enum PlainCounter : std::size_t { LockFreeFast, LockFreeSlow, LockFreeVerified, LockFreeRaced, LockFreeUnsafe };
+enum PlainCounter : std::size_t { LockFreeFast, LockFreeSlow, LockFreeVerified, LockFreeRaced, LockFreeUnsafe, DrawGenFirst };
+constexpr std::size_t DrawGenCount = static_cast<std::size_t>(DrawGen::Count);
+static_assert(DrawGenFirst + DrawGenCount == PlainCount, "one plain counter per draw-validation outcome");
 constexpr std::size_t WaitCount = std::size(WaitNames);
 
 constexpr std::size_t EventBase = 0;
@@ -673,7 +683,8 @@ constexpr std::size_t GlobalOnly = SerialFrames + 1;
 constexpr std::size_t WaitBase = GlobalOnly + 1;
 constexpr std::size_t UnsafeLogged = WaitBase + WaitCount;
 constexpr std::size_t LockFreeBase = UnsafeLogged + 1;
-constexpr std::size_t PlainBase = LockFreeBase + 2 * LockFreeCount;
+constexpr std::size_t VariantBase = LockFreeBase + 2 * LockFreeCount;
+constexpr std::size_t PlainBase = VariantBase + ConsumerCount * DrawGenCount;
 constexpr std::size_t CounterCount = PlainBase + PlainCount;
 
 const std::vector<std::string>& counterNames() {
@@ -709,6 +720,9 @@ const std::vector<std::string>& counterNames() {
         for (std::size_t a = 0; a < LockFreeCount; ++a) {
             n[LockFreeBase + 2 * a] = std::string("gen_lockfree.") + LockFreeApiName(static_cast<LockFreeApi>(a)) + ".fast";
             n[LockFreeBase + 2 * a + 1] = std::string("gen_lockfree.") + LockFreeApiName(static_cast<LockFreeApi>(a)) + ".slow";
+        }
+        for (std::size_t c = 0; c < ConsumerCount; ++c) {
+            for (std::size_t o = 0; o < DrawGenCount; ++o) n[VariantBase + c * DrawGenCount + o] = std::string("gen_variant.") + ConsumerName(static_cast<Consumer>(c)) + "." + DrawGenName(static_cast<DrawGen>(o));
         }
         for (std::size_t p = 0; p < PlainCount; ++p) n[PlainBase + p] = PlainNames[p];
         for (const auto& name : n) {
@@ -852,6 +866,48 @@ void CountLockFree(LockFreeApi api, bool fast) noexcept {
     };
     bump(LockFreeBase + 2 * static_cast<std::size_t>(api) + (fast ? 0 : 1));
     bump(PlainBase + (fast ? LockFreeFast : LockFreeSlow));
+}
+
+bool DrawValidationActive() noexcept {
+    if (!ArchB::Switches::Enabled(ArchB::Feature::GenDrawValidation)) return false;
+    noteConsumer();
+    return Active();
+}
+
+Generation CaptureSince() noexcept {
+    return Active() ? detail::StableTrackerGeneration() : 0;
+}
+
+DrawGen CheckRuns(const Table& table, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, Generation since, Ticket required, Ticket proven) noexcept {
+    if (runs.empty()) return DrawGen::Clean;
+    if (since == 0 || required == 0) return DrawGen::Unknown;
+    // Proven at or after the ticket: the reading of the bytes covers the CPU stores a sweep would.
+    // Check's coverage test also honours the reset floor's swept floor; a since below the reset
+    // floor reads Unknown either way.
+    const Ticket need = proven >= required && table.SweptFloor() <= proven ? 0 : required;
+    constexpr auto kinds = static_cast<std::uint8_t>(Data | Cpu | Meta | Pending);
+    auto verdict = DrawGen::Clean;
+    for (const auto& [begin, end] : runs) {
+        switch (table.Check(begin, end, since, need, kinds)) {
+        case Verdict::Changed: return DrawGen::Changed;
+        case Verdict::Unknown: verdict = DrawGen::Unknown; break;
+        case Verdict::PendingOnly:
+            if (verdict == DrawGen::Clean) verdict = DrawGen::Pending;
+            break;
+        case Verdict::Clean: break;
+        }
+    }
+    return verdict;
+}
+
+void CountDrawGen(Consumer consumer, DrawGen outcome) noexcept {
+    auto& counters = local();
+    const auto bump = [&](std::size_t counter) {
+        auto& slot = counters.values[counter];
+        slot.store(slot.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    };
+    bump(VariantBase + static_cast<std::size_t>(consumer) * DrawGenCount + static_cast<std::size_t>(outcome));
+    bump(PlainBase + DrawGenFirst + static_cast<std::size_t>(outcome));
 }
 
 void CountLockFreeVerify(LockFreeApi api, LockFreeVerify outcome, std::uint64_t address, std::uint64_t bytes, std::uint64_t since) noexcept {

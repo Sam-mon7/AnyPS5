@@ -2460,6 +2460,10 @@ namespace Gen::detail {
 std::uint64_t CurrentTrackerGeneration() noexcept {
     return Tracker().generation.load(std::memory_order_relaxed);
 }
+
+std::uint64_t StableTrackerGeneration() noexcept {
+    return Tracker().stable.load(std::memory_order_acquire);
+}
 }
 
 std::uint64_t CollectEpochBumps() {

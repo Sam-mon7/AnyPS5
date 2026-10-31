@@ -79,10 +79,16 @@ struct DispatchVariant {
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};
-    // Write-generation shadow (APS5_ARCHB_GEN_SHADOW): the GenClock value taken before the capture
-    // read the guest bytes (rule V6), moved to a value taken before an equal compare when the table
-    // said Changed (what CompareAndRestamp would do). Read by the census only; 0 without the table.
+    // Write generations: the generation taken before the capture read the guest bytes (rule V6,
+    // Gen::CaptureSince; 0 when the capture read memory a GPU write was announced over), only ever
+    // raised to one taken before an exactly equal byte compare (CompareAndRestamp). While every
+    // watched block is at most it, the guest bytes of `runs` are `words`: the shadow census
+    // (GEN_SHADOW) classifies against it and GEN_DRAW_VALIDATION skips the byte compare on it.
     mutable std::atomic<std::uint64_t> genSince{0};
+    // The newest ticket in effect when the capture or an exact compare read the bytes (only raised):
+    // checks at that ticket or an older one need no sweep (GEN_DRAW_VALIDATION). Any since paired
+    // with any proven ticket is evidence: both come from readings that found the words.
+    mutable std::atomic<std::uint64_t> genProvenTicket{0};
 };
 
 struct DispatchEntry {
@@ -145,9 +151,19 @@ enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel
 // would say over its runs at its genSince, classified against the validation's decision when that
 // decision came from the byte compare (Equal: unchanged; EqualData, Differing or Inaccessible after
 // the compare: changed); refusals before or around the compare (pending sync, flushes, queued
-// labels, moved serials) are counted as refused. `before` is GenClock read before the validation.
+// labels, moved serials) are counted as refused. `before` is Gen::CaptureSince read before the
+// validation; an Equal outcome restamps the since to it only when `exact` (VariantValidationExact).
 // Returns the verdict (Clean feeds the queue-0 hit-run histogram).
-GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer consumer, const DispatchVariant& variant, EntryOutcome outcome, std::uint64_t before);
+GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer consumer, const DispatchVariant& variant, EntryOutcome outcome, std::uint64_t before, bool exact);
+// Whether the calling thread's last validateVariant proved the guest bytes of every run equal to the
+// variant's words exactly (Equal with no live data word, no masked feedback bit, no pending GPU write
+// over a run): only then may a since move.
+bool VariantValidationExact();
+// Raises the variant's since to `since` and its proven ticket to `ticket` (never lowers either).
+void RestampVariant(const DispatchVariant& variant, std::uint64_t since, std::uint64_t ticket = 0);
+// Whether a GPU write announced over any region is still pending (a capture over it may hold known
+// or raw values rather than the guest bytes: its since is not evidence).
+bool CapturedOverPendingWrite(std::span<const ShaderRecompiler::MemoryRegion> regions);
 
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
 
