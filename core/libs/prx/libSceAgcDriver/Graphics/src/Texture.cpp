@@ -290,6 +290,15 @@ VkImageType ImageTypeFor(TextureDimension dimension) {
     return dimension == TextureDimension::k1D || dimension == TextureDimension::k1DArray ? VK_IMAGE_TYPE_1D : dimension == TextureDimension::k3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
 }
 
+std::uint32_t ClampImageMipLevels(VkImageCreateInfo& info) {
+    const auto height = info.imageType == VK_IMAGE_TYPE_1D ? 1u : info.extent.height;
+    const auto depth = info.imageType == VK_IMAGE_TYPE_3D ? info.extent.depth : 1u;
+    const auto levels = static_cast<std::uint32_t>(std::bit_width(std::max({info.extent.width, height, depth})));
+    Require(info.mipLevels != 0 && levels != 0, "image mip chain is empty");
+    info.mipLevels = std::min(info.mipLevels, levels);
+    return info.mipLevels;
+}
+
 VkImageViewType ViewTypeFor(TextureDimension dimension, [[maybe_unused]] std::uint32_t viewLayerCount) {
     switch (dimension) {
         case TextureDimension::k1D: return VK_IMAGE_VIEW_TYPE_1D;
@@ -312,7 +321,7 @@ void ChainMinLod(const Context& context, const GuestTextureResource& descriptor,
     const auto clamp = EffectiveMinLod(descriptor);
     if (clamp == 0.0f) return;
     Require(context.imageViewMinLod, "guest texture descriptor uses a minimum LOD clamp, which needs VK_EXT_image_view_min_lod");
-    minLod.minLod = clamp;
+    minLod.minLod = std::min(clamp, static_cast<float>(viewInfo.subresourceRange.baseMipLevel + viewInfo.subresourceRange.levelCount - 1u));
     minLod.pNext = viewInfo.pNext;
     viewInfo.pNext = &minLod;
 }
@@ -321,6 +330,7 @@ struct ExpandImage {
     VkImage image = VK_NULL_HANDLE;
     std::shared_ptr<OwnedImage> owned;
     VkDeviceSize bytes = 0;
+    std::uint32_t levels = 0;
 };
 
 ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource& descriptor, std::uint32_t depth, std::uint32_t layers) {
@@ -329,8 +339,9 @@ ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource
     imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u);
     imageInfo.imageType = ImageTypeFor(descriptor.dimension);
     imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-    imageInfo.extent = {descriptor.width, descriptor.height, depth};
+    imageInfo.extent = {descriptor.width, imageInfo.imageType == VK_IMAGE_TYPE_1D ? 1u : descriptor.height, depth};
     imageInfo.mipLevels = descriptor.mipCount;
+    result.levels = ClampImageMipLevels(imageInfo);
     imageInfo.arrayLayers = layers;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -350,10 +361,10 @@ ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource
     return result;
 }
 
-void RecordExpandBlit(const Context& context, VkCommandBuffer commands, VkImage source, VkImageLayout sourceLayout, VkImage target, const GuestTextureResource& descriptor, std::uint32_t depth, std::uint32_t layers) {
+void RecordExpandBlit(const Context& context, VkCommandBuffer commands, VkImage source, VkImageLayout sourceLayout, VkImage target, const GuestTextureResource& descriptor, std::uint32_t depth, std::uint32_t layers, std::uint32_t levels) {
     std::vector<VkImageBlit> regions;
-    for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
-        const VkOffset3D end{static_cast<std::int32_t>(std::max(descriptor.width >> level, 1u)), static_cast<std::int32_t>(std::max(descriptor.height >> level, 1u)), static_cast<std::int32_t>(descriptor.dimension == TextureDimension::k3D ? std::max(depth >> level, 1u) : 1u)};
+    for (std::uint32_t level = 0; level < levels; ++level) {
+        const VkOffset3D end{static_cast<std::int32_t>(std::max(descriptor.width >> level, 1u)), static_cast<std::int32_t>(std::max((ImageTypeFor(descriptor.dimension) == VK_IMAGE_TYPE_1D ? 1u : descriptor.height) >> level, 1u)), static_cast<std::int32_t>(descriptor.dimension == TextureDimension::k3D ? std::max(depth >> level, 1u) : 1u)};
         VkImageBlit region{};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, layers};
         region.srcOffsets[1] = end;
@@ -406,14 +417,13 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         const auto linearBytes = sliceLinearBytes * arrayLayers;
 
         const bool depth1D = depthCompare && (descriptor.dimension == TextureDimension::k1D || descriptor.dimension == TextureDimension::k1DArray);
-        static const bool unclampedLevels = std::getenv("APS5_NO_TEXTURE_LEVEL_CLAMP") != nullptr;
-        const auto imageLevels = unclampedLevels ? descriptor.mipCount : std::min(descriptor.mipCount, static_cast<std::uint32_t>(std::bit_width(std::max({descriptor.width, descriptor.height, geometry.imageDepth}))));
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageInfo.flags = (descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u) | (SrgbTwinFormat(context, vkFormat) != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0u);
         imageInfo.imageType = depth1D ? VK_IMAGE_TYPE_2D : ImageTypeFor(descriptor.dimension);
         imageInfo.format = vkFormat;
-        imageInfo.extent = {descriptor.width, depth1D ? 1u : descriptor.height, geometry.imageDepth};
-        imageInfo.mipLevels = imageLevels;
+        imageInfo.extent = {descriptor.width, depth1D || imageInfo.imageType == VK_IMAGE_TYPE_1D ? 1u : descriptor.height, geometry.imageDepth};
+        imageInfo.mipLevels = descriptor.mipCount;
+        const auto imageLevels = ClampImageMipLevels(imageInfo);
         Require(geometry.imageLayers <= context.limits.maxImageArrayLayers, "a texture array with more layers than maxImageArrayLayers is not implemented");
         imageInfo.arrayLayers = geometry.imageLayers;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -494,7 +504,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 const auto guestLayerOffset = geometry.GuestLayerOffset(layer);
                 const auto linearLayerOffset = geometry.LinearLayerOffset(layer);
-                for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                for (std::uint32_t level = 0; level < imageLevels; ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
                     detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled->Handle(), guestLayerOffset + mip.tiledOffset, linear->Handle(), linearLayerOffset + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
@@ -503,7 +513,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             if (IsRepackedTextureFormat(descriptor.format)) {
                 RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
                 for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-                    for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                    for (std::uint32_t level = 0; level < imageLevels; ++level) {
                         if (!geometry.HasLayer(level, layer)) continue;
                         const auto offset = geometry.LinearLayerOffset(layer) + mips[level].linearOffset;
                         detiler.DispatchRepack(commands, linear->Handle(), offset, linear->Handle(), offset, mips[level].linearSize);
@@ -532,7 +542,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearReadBarrier, 1, &toTransferDst);
 
             std::vector<VkBufferImageCopy> regions;
-            regions.reserve(static_cast<std::size_t>(arrayLayers) * mips.size());
+            regions.reserve(static_cast<std::size_t>(arrayLayers) * imageLevels);
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 const auto linearLayerOffset = static_cast<std::uint64_t>(layer) * sliceLinearBytes;
                 for (std::uint32_t level = 0; level < imageLevels; ++level) {
@@ -544,7 +554,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                     region.bufferImageHeight = 0;
                     region.imageSubresource = {aspect, level, geometry.CopyLayer(layer), 1};
                     region.imageOffset = {0, 0, geometry.CopyDepth(layer)};
-                    region.imageExtent = {std::max(descriptor.width >> level, 1u), std::max(descriptor.height >> level, 1u), 1u};
+                    region.imageExtent = {std::max(imageInfo.extent.width >> level, 1u), std::max(imageInfo.extent.height >> level, 1u), 1u};
                     regions.push_back(region);
                 }
             }
@@ -559,7 +569,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 toBlit[1] = toTransferDst;
                 toBlit[1].image = image;
                 context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, toBlit.data());
-                RecordExpandBlit(context, commands, uploadImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, descriptor, geometry.imageDepth, geometry.imageLayers);
+                RecordExpandBlit(context, commands, uploadImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, descriptor, geometry.imageDepth, geometry.imageLayers, imageLevels);
             }
             std::unique_ptr<Buffer> dump;
             if (dumpWanted) {
@@ -692,8 +702,10 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         imageInfo.flags = descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u;
         imageInfo.imageType = ImageTypeFor(descriptor.dimension);
         imageInfo.format = format;
-        imageInfo.extent = {descriptor.width, descriptor.height, 1u};
+        imageInfo.extent = {descriptor.width, imageInfo.imageType == VK_IMAGE_TYPE_1D ? 1u : descriptor.height, 1u};
         imageInfo.mipLevels = copyLevels;
+        copyLevels = ClampImageMipLevels(imageInfo);
+        copyHeight = imageInfo.extent.height;
         imageInfo.arrayLayers = copyLayers;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -711,7 +723,9 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory repacked copy", true);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory repacked copy");
 
-        const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
+        const auto viewLastLevel = std::min(descriptor.lastLevel, copyLevels - 1u);
+        const auto viewBaseLevel = std::min(descriptor.baseLevel, viewLastLevel);
+        const auto viewLevelCount = viewLastLevel - viewBaseLevel + 1u;
         const auto viewLayerCount = geometry.imageLayers - descriptor.baseArray;
         if (descriptor.dimension == TextureDimension::kCube) {
             Require(viewLayerCount >= 6u, "guest cube texture view holds fewer than 6 array slices");
@@ -722,7 +736,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         viewInfo.format = format;
         viewFormat = format;
         viewInfo.components = components;
-        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, viewBaseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView repacked copy");
@@ -750,8 +764,10 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
         imageInfo.format = blockFormat;
-        imageInfo.extent = {descriptor.width, descriptor.height, 1u};
+        imageInfo.extent = {descriptor.width, imageInfo.imageType == VK_IMAGE_TYPE_1D ? 1u : descriptor.height, 1u};
         imageInfo.mipLevels = copyLevels;
+        copyLevels = ClampImageMipLevels(imageInfo);
+        copyHeight = imageInfo.extent.height;
         imageInfo.arrayLayers = copyLayers;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -770,7 +786,9 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory block copy", true);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory block copy");
 
-        const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
+        const auto viewLastLevel = std::min(descriptor.lastLevel, copyLevels - 1u);
+        const auto viewBaseLevel = std::min(descriptor.baseLevel, viewLastLevel);
+        const auto viewLevelCount = viewLastLevel - viewBaseLevel + 1u;
         const auto viewLayerCount = geometry.imageLayers - descriptor.baseArray;
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = image;
@@ -778,7 +796,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         viewInfo.format = blockFormat;
         viewFormat = blockFormat;
         viewInfo.components = components;
-        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, viewBaseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView block copy");
@@ -812,6 +830,8 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         imageInfo.format = depthFormat;
         imageInfo.extent = {descriptor.width, depth1D ? 1u : descriptor.height, 1u};
         imageInfo.mipLevels = copyLevels;
+        copyLevels = ClampImageMipLevels(imageInfo);
+        copyHeight = imageInfo.extent.height;
         imageInfo.arrayLayers = copyLayers;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -829,7 +849,9 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory depth copy", true);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory depth copy");
 
-        const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
+        const auto viewLastLevel = std::min(descriptor.lastLevel, copyLevels - 1u);
+        const auto viewBaseLevel = std::min(descriptor.baseLevel, viewLastLevel);
+        const auto viewLevelCount = viewLastLevel - viewBaseLevel + 1u;
         const auto viewLayerCount = geometry.imageLayers - descriptor.baseArray;
         if (descriptor.dimension == TextureDimension::kCube) {
             Require(viewLayerCount >= 6u, "guest cube texture view holds fewer than 6 array slices");
@@ -839,7 +861,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         viewInfo.viewType = depth1D ? (descriptor.dimension == TextureDimension::k1DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D) : ViewTypeFor(descriptor.dimension, viewLayerCount);
         viewInfo.format = depthFormat;
         viewInfo.components = VkComponentMapping{};
-        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, viewBaseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth copy");
@@ -874,8 +896,11 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         image = expanded.image;
         owned = std::move(expanded.owned);
         allocationBytes = expanded.bytes;
+        copyLevels = expanded.levels;
 
-        const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
+        const auto viewLastLevel = std::min(descriptor.lastLevel, copyLevels - 1u);
+        const auto viewBaseLevel = std::min(descriptor.baseLevel, viewLastLevel);
+        const auto viewLevelCount = viewLastLevel - viewBaseLevel + 1u;
         const auto viewLayerCount = geometry.imageLayers - descriptor.baseArray;
         if (descriptor.dimension == TextureDimension::kCube) {
             Require(viewLayerCount % 6u == 0, "guest cube texture view does not contain a multiple of 6 array slices");
@@ -886,7 +911,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         viewInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
         viewFormat = viewInfo.format;
         viewInfo.components = components;
-        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, viewBaseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView sRGB copy");
@@ -926,7 +951,7 @@ bool Texture::refreshSrgbExpand() {
     toTransferDst.image = image;
     toTransferDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, copyLevels, 0, copyLayers};
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &produced, 0, nullptr, 1, &toTransferDst);
-    RecordExpandBlit(context, commands, storageSource->Image(), VK_IMAGE_LAYOUT_GENERAL, image, sourceDescriptor, 1u, copyLayers);
+    RecordExpandBlit(context, commands, storageSource->Image(), VK_IMAGE_LAYOUT_GENERAL, image, sourceDescriptor, 1u, copyLayers, copyLevels);
     VkImageMemoryBarrier toShaderRead = toTransferDst;
     toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1098,7 +1123,9 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
 #endif
         // Storage images stay in the general layout; the view samples them there.
         layout = VK_IMAGE_LAYOUT_GENERAL;
-        const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
+        const auto viewLastLevel = std::min({descriptor.lastLevel, descriptor.mipCount - 1u, source->ImageLevels() - 1u});
+        const auto viewBaseLevel = std::min(descriptor.baseLevel, viewLastLevel);
+        const auto viewLevelCount = viewLastLevel - viewBaseLevel + 1u;
         const auto viewLayerCount = std::min(geometry.imageLayers, source->ImageLayers()) - descriptor.baseArray;
         if (descriptor.dimension == TextureDimension::kCube) {
             Require(viewLayerCount >= 6u, "guest cube texture view holds fewer than 6 array slices");
@@ -1112,7 +1139,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         viewInfo.format = vkFormat;
         viewFormat = vkFormat;
         viewInfo.components = components;
-        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, viewBaseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView storage view");
@@ -1183,7 +1210,7 @@ void Texture::prepareSrgbView(const GuestTextureResource& descriptor, VkImageVie
     viewInfo.pNext = nullptr;
     viewInfo.format = format;
     srgbInfo = viewInfo;
-    srgbMinLod = EffectiveMinLod(descriptor);
+    srgbMinLod = std::min(EffectiveMinLod(descriptor), static_cast<float>(viewInfo.subresourceRange.baseMipLevel + viewInfo.subresourceRange.levelCount - 1u));
 }
 
 VkImageView Texture::SrgbView(bool firstLayer, bool baseLevel) const {
@@ -1480,27 +1507,30 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         guestBytes = geometry.guestBytes;
         // Storage images in heaps the guest commits on demand only read and store committed pages.
         Require(!GuestMemory::CommittedRanges(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), true).empty(), "storage texture has no committed guest pages");
+        sliceLinearBytes = geometry.sliceLinearBytes;
+        const auto linearBytes = sliceLinearBytes * arrayLayers;
+
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageInfo.flags = (descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u) | (descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0u) | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        imageInfo.imageType = ImageTypeFor(descriptor.dimension);
+        imageInfo.format = vkFormat;
+        imageInfo.extent = {descriptor.width, imageInfo.imageType == VK_IMAGE_TYPE_1D ? 1u : descriptor.height, geometry.imageDepth};
+        imageInfo.mipLevels = descriptor.mipCount;
+        imageLevels = ClampImageMipLevels(imageInfo);
+        if (imageInfo.imageType == VK_IMAGE_TYPE_1D) {
+            for (auto& mip : mips) mip.height = 1u;
+        }
         // Write stamps are per 64 KiB block, so only 64 KiB-aligned layer slices can be told apart.
         const bool layered = geometry.layers >= 2 && !geometry.thick && geometry.imageDepth == 1 && geometry.layers == geometry.imageLayers && geometry.layerBytes * geometry.layers == guestBytes && geometry.layerBytes % 65536 == 0 && descriptor.baseAddress % 65536 == 0;
         // Tile blocks divide the stamp blocks, so at an aligned base every unit is whole tile blocks
         // of its (layer, mip) slices (sliceWindows).
-        blockUnits = LayerTrackingEnabled() && BlockTrackingEnabled() && !geometry.thick && descriptor.tileMode != TextureTileMode::kLinear && descriptor.baseAddress % 65536 == 0;
+        blockUnits = imageLevels == descriptor.mipCount && LayerTrackingEnabled() && BlockTrackingEnabled() && !geometry.thick && descriptor.tileMode != TextureTileMode::kLinear && descriptor.baseAddress % 65536 == 0;
         trackedLayers = blockUnits ? static_cast<std::uint32_t>((guestBytes + 65535) / 65536) : layered && LayerTrackingEnabled() ? geometry.layers : 1u;
         trackedLayerBytes = blockUnits ? 65536 : guestBytes / trackedLayers;
         layerGeneration.assign(trackedLayers, 0);
         layerPending.assign(trackedLayers, false);
         layerOriginal.assign(trackedLayers, true);
         savedTicket.assign(trackedLayers, 0);
-        sliceLinearBytes = geometry.sliceLinearBytes;
-        const auto linearBytes = sliceLinearBytes * arrayLayers;
-
-        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        // Sampled views of other same-size formats (sRGB, reinterpretations) read the image directly.
-        imageInfo.flags = (descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u) | (descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0u) | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-        imageInfo.imageType = ImageTypeFor(descriptor.dimension);
-        imageInfo.format = vkFormat;
-        imageInfo.extent = {descriptor.width, descriptor.height, geometry.imageDepth};
-        imageInfo.mipLevels = descriptor.mipCount;
         Require(geometry.imageLayers <= context.limits.maxImageArrayLayers, "a texture array with more layers than maxImageArrayLayers is not implemented");
         imageInfo.arrayLayers = geometry.imageLayers;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1936,6 +1966,7 @@ bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<c
 
 VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFormat format) const {
     Require(mip < descriptor.mipCount, "storage texture mip level is outside the texture");
+    mip = std::min(mip, imageLevels - 1u);
     Require(!firstLayer || descriptor.dimension == TextureDimension::k2DArray, "a first-layer storage view needs a 2D array surface");
     const auto viewLayerCount = firstLayer ? 1u : geometry.imageLayers - descriptor.baseArray;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
@@ -1990,6 +2021,7 @@ VkImageView StorageTexture::elementLayerView(std::uint32_t level, std::uint32_t 
 VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layers, std::uint32_t layer) {
     Require(attachable, "storage image cannot be a color attachment");
     Require(mip < descriptor.mipCount, "attachment mip exceeds the storage image");
+    mip = std::min(mip, imageLevels - 1u);
     const bool volume = descriptor.dimension == TextureDimension::k3D;
     const bool array = !volume && descriptor.dimension == TextureDimension::k2DArray;
     Require((depthSlice == 0 && layers == 1) || (volume && mip == 0 && layers != 0 && depthSlice + layers - 1u <= descriptor.depthOrLastArray) || (array && depthSlice == 0 && layers != 0), "attachment slice is outside the storage image");
@@ -2947,7 +2979,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         toClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toClear.image = image;
-        toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+        toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
         context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
         VkImageMemoryBarrier toGeneral = toClear;
@@ -3037,7 +3069,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             recordDirectUploadBarrier(commands, layers == nullptr);
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 if (layers != nullptr && !(*layers)[layer]) continue;
-                for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                for (std::uint32_t level = 0; level < imageLevels; ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
                     detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
@@ -3056,7 +3088,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             if (layers != nullptr && !(*layers)[layer]) continue;
-            for (std::uint32_t level = 0; level < mips.size(); ++level) {
+            for (std::uint32_t level = 0; level < imageLevels; ++level) {
                 if (!geometry.HasLayer(level, layer)) continue;
                 const auto& mip = mips[level];
                 detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
@@ -3072,7 +3104,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransfer.image = image;
-        toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+        toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
         const auto regions = CopyRegions(layers);
         context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
@@ -3137,7 +3169,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 if (selectedCpu && !cpuLayers[layer]) continue;
-                for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                for (std::uint32_t level = 0; level < imageLevels; ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
                     detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled.Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
@@ -3152,7 +3184,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toTransfer.image = image;
-            toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+            toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (selectedCpu ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : 0u), VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
             const auto regions = CopyRegions(selectedCpu ? &cpuLayers : nullptr);
             context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear.Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
@@ -3189,7 +3221,7 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<
     const auto block = ThinBlockLayout(descriptor.tileMode, elementBytes);
     for (const auto& [runBegin, runEnd] : runs) {
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-            for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+            for (std::uint32_t level = 0; level < imageLevels; ++level) {
                 if (!geometry.HasLayer(level, layer)) continue;
                 const auto& mip = mips[level];
                 const auto sliceBegin = geometry.GuestLayerOffset(layer) + mip.tiledOffset;
@@ -3279,7 +3311,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::uncoveredBy
     if (!geometry.thick) {
         const auto elementBytes = BytesPerElement(descriptor.format);
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-            for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+            for (std::uint32_t level = 0; level < imageLevels; ++level) {
                 if (!geometry.HasLayer(level, layer)) continue;
                 const auto sliceBegin = geometry.GuestLayerOffset(layer) + mips[level].tiledOffset;
                 for (const auto& [begin, end] : CoveredMipBytes(descriptor.tileMode, elementBytes, mips[level])) covered.emplace_back(sliceBegin + begin, sliceBegin + end);
@@ -3408,7 +3440,7 @@ void StorageTexture::recordDirectUploadBarrier(VkCommandBuffer commands, bool di
     toWrite.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toWrite.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toWrite.image = image;
-    toWrite.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    toWrite.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &sourceReady, 0, nullptr, 1, &toWrite);
 }
 
@@ -3421,7 +3453,7 @@ void StorageTexture::recordDirectUploadDone(VkCommandBuffer commands) {
     written.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     written.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     written.image = image;
-    written.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    written.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &written);
 }
 
@@ -3431,7 +3463,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     // blocks moved whole by one window each; the windows are built per piece.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> tailBlocks;
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-        for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+        for (std::uint32_t level = 0; level < imageLevels; ++level) {
             if (!geometry.HasLayer(level, layer)) continue;
             const auto& mip = mips[level];
             if (!mip.tail) continue;
@@ -3551,7 +3583,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toTransfer.image = image;
-    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
     context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
     VkImageMemoryBarrier toGeneral = toTransfer;
@@ -3832,7 +3864,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     toSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toSource.image = image;
-    toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
     if (!direct) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
     if (profile && !direct) ThreadLookupOutcomes().work[LookupOutcomes::LayoutTransitions] += 2;
     if (!seeds.empty() || !padding.copies.empty() || !holeCopies.empty()) {
@@ -3944,7 +3976,7 @@ std::vector<VkBufferImageCopy> StorageTexture::CopyRegions(const std::vector<boo
     std::vector<VkBufferImageCopy> regions;
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
         if (layers != nullptr && !(*layers)[layer]) continue;
-        for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+        for (std::uint32_t level = 0; level < imageLevels; ++level) {
             if (!geometry.HasLayer(level, layer)) continue;
             const auto& mip = mips[level];
             VkBufferImageCopy region{};
@@ -3952,7 +3984,7 @@ std::vector<VkBufferImageCopy> StorageTexture::CopyRegions(const std::vector<boo
             region.bufferRowLength = mip.pitchBytes / BytesPerElement(descriptor.format) * BlockWidth(descriptor.format);
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1};
             region.imageOffset = {0, 0, geometry.CopyDepth(layer)};
-            region.imageExtent = {std::max(descriptor.width >> level, 1u), std::max(descriptor.height >> level, 1u), 1u};
+            region.imageExtent = {std::max(descriptor.width >> level, 1u), std::max((ImageTypeFor(descriptor.dimension) == VK_IMAGE_TYPE_1D ? 1u : descriptor.height) >> level, 1u), 1u};
             regions.push_back(region);
         }
     }
@@ -4303,7 +4335,7 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
     toSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toSource.image = image;
-    toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
     const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &importReady, 0, nullptr, 1, &toSource);
     VkBufferImageCopy region{};
@@ -5613,7 +5645,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     toClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toClear.image = image;
-    toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
     context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
     VkImageMemoryBarrier toGeneral = toClear;
@@ -5749,7 +5781,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     toClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toClear.image = image;
-    toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, layer == WholeImage ? 0u : layer, layer == WholeImage ? geometry.imageLayers : 1u};
+    toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, layer == WholeImage ? 0u : layer, layer == WholeImage ? geometry.imageLayers : 1u};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
     context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
     VkImageMemoryBarrier toGeneral = toClear;
@@ -5870,7 +5902,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
     }
     barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -5881,14 +5913,14 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
     std::vector<VkImageCopy> regions;
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-        for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+        for (std::uint32_t level = 0; level < imageLevels; ++level) {
             if (!geometry.HasLayer(level, layer)) continue;
             VkImageCopy region{};
             region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1};
             region.srcOffset = {0, 0, geometry.CopyDepth(layer)};
             region.dstSubresource = region.srcSubresource;
             region.dstOffset = region.srcOffset;
-            region.extent = {std::max(descriptor.width >> level, 1u), std::max(descriptor.height >> level, 1u), 1u};
+            region.extent = {std::max(descriptor.width >> level, 1u), std::max((ImageTypeFor(descriptor.dimension) == VK_IMAGE_TYPE_1D ? 1u : descriptor.height) >> level, 1u), 1u};
             regions.push_back(region);
         }
     }
@@ -6195,7 +6227,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
         barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
     }
     barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -6539,7 +6571,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         toSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toSource.image = image;
-        toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+        toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
         if (!padding.copies.empty()) {
             // The current bytes of the copied ranges no element holds go under the retile (every
@@ -6559,7 +6591,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             if (storedLayers != nullptr && !(*storedLayers)[layer]) continue;
-            for (std::uint32_t level = 0; level < mips.size(); ++level) {
+            for (std::uint32_t level = 0; level < imageLevels; ++level) {
                 if (!geometry.HasLayer(level, layer)) continue;
                 const auto& mip = mips[level];
                 detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiledScratch->Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
@@ -6690,7 +6722,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     toSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toSource.image = image;
-    toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, imageLevels, 0, geometry.imageLayers};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
     const auto regions = CopyRegions();
     if (profile) {
@@ -6702,7 +6734,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     const VkBufferMemoryBarrier toShader[] = {WholeBufferBarrier(linear.Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT), WholeBufferBarrier(tiled.Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, toShader, 0, nullptr);
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-        for (std::uint32_t level = 0; level < mips.size(); ++level) {
+        for (std::uint32_t level = 0; level < imageLevels; ++level) {
             if (!geometry.HasLayer(level, layer)) continue;
             const auto& mip = mips[level];
             detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiled.Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});

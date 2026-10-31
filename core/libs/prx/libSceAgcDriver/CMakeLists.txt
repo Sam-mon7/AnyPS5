@@ -1641,6 +1641,21 @@ add_custom_command(
         VERBATIM
 )
 
+foreach(agcMipDimension IN ITEMS 1D 1DArray 3D)
+    set(agcMipShaderSpv ${agcTestShaderGeneratedRoot}/Sample${agcMipDimension}.spv)
+    set(agcMipShaderHeader ${agcTestShaderGeneratedRoot}/Sample${agcMipDimension}_spv.h)
+    add_custom_command(
+        OUTPUT "${agcMipShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -DMIP_CHAIN_${agcMipDimension}=1 -o "${agcMipShaderSpv}" "${agcSampleArrayShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcMipShaderSpv} -DOUTPUT=${agcMipShaderHeader}
+        -DSYMBOL=SAMPLE_${agcMipDimension}_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcSampleArrayShaderSource}" glslang-standalone
+        VERBATIM
+    )
+    list(APPEND agcMipChainShaderHeaders ${agcMipShaderHeader})
+endforeach()
+
 foreach(agcTriangleStage IN ITEMS vert frag)
     set(agcTriangleSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/Triangle.${agcTriangleStage})
     set(agcTriangleSpv ${agcTestShaderGeneratedRoot}/Triangle_${agcTriangleStage}.spv)
@@ -1716,6 +1731,7 @@ add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         ${agcTriangleHeaders}
         ${agcSampleLodShaderHeader}
         ${agcSampleArrayShaderHeader}
+        ${agcMipChainShaderHeaders}
         ${agcCoverShaderHeaders}
         ${agcBufferUpdateHeader}
 )
@@ -1873,6 +1889,17 @@ if(BUILD_TESTING)
         set_property(TEST agc_driver_texture_level_clamp APPEND PROPERTY ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    foreach(agcMipCase IN ITEMS 1d 2d 3d cube array 1d_array depth1d copies tiled)
+        add_test(NAME agc_driver_texture_mip_chain_${agcMipCase} COMMAND agc_driver_recorder_tests --texture-mip-chain ${agcMipCase})
+        set_tests_properties(agc_driver_texture_mip_chain_${agcMipCase} PROPERTIES
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation"
+            FAIL_REGULAR_EXPRESSION "VUID-;[Vv]alidation [Ee]rror;was not found but was requested by env var VK_INSTANCE_LAYERS"
+            TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_driver_texture_mip_chain_${agcMipCase} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_sampled_storage_base_level_usage COMMAND agc_driver_recorder_tests --sampled-storage-base-level-usage-only)
     set_tests_properties(agc_sampled_storage_base_level_usage PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)
