@@ -4,10 +4,51 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include <set>
+#include <cstring>
 
 namespace AgcDriver::Graphics {
 
 struct VertexInputLayout;
+class Pipeline;
+
+class PipelineStateReuse {
+public:
+    void Invalidate(const char* counter);
+    bool Bind(VkPipeline value, VkPipelineLayout layout, bool libraries);
+    bool Dynamic(std::size_t slot, std::span<const std::byte> bytes);
+    template<typename... TValues>
+    bool Dynamic(std::size_t slot, const TValues&... values) {
+        std::array<std::byte, (sizeof(TValues) + ...)> bytes;
+        std::size_t offset = 0;
+        const auto append = [&](const auto& value) {
+            std::memcpy(bytes.data() + offset, &value, sizeof(value));
+            offset += sizeof(value);
+        };
+        (append(values), ...);
+        return Dynamic(slot, std::span<const std::byte>(bytes));
+    }
+    bool Push(VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::span<const std::byte, PipelinePushSlotBytes> bytes);
+    bool SameInputs(const Pipeline* pipeline, std::span<const std::byte> bytes, std::uint32_t calls) const;
+    void RememberInputs(const Pipeline* pipeline, std::span<const std::byte> bytes);
+
+private:
+    struct DynamicValue {
+        std::array<std::byte, 32> bytes{};
+        std::size_t size = 0;
+    };
+    struct PushValue {
+        std::array<std::byte, PipelinePushSlotBytes> bytes{};
+        VkShaderStageFlags stages = 0;
+    };
+    std::array<DynamicValue, 21> dynamic{};
+    std::array<PushValue, 2> push{};
+    VkPipeline bound = VK_NULL_HANDLE;
+    VkPipelineLayout pushLayout = VK_NULL_HANDLE;
+    bool boundLibraries = false;
+    const Pipeline* inputPipeline = nullptr;
+    std::array<std::byte, 256> inputs{};
+    std::size_t inputSize = 0;
+};
 
 void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline);
 
@@ -49,10 +90,10 @@ public:
     VkPipelineLayout Layout() const;
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<void>> owners, VkExtent2D extent, std::uint32_t layers = 1);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
-    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
+    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, PipelineStateReuse* reuse = nullptr) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
     // construction: the attachment formats alone decide).
-    void Continue(VkCommandBuffer commands, const State& state) const;
+    void Continue(VkCommandBuffer commands, const State& state, PipelineStateReuse* reuse = nullptr) const;
     bool SplitsFaces() const { return backFaces != VK_NULL_HANDLE; }
     bool Optimized() const { return optimized != nullptr && optimized->handle.load() != VK_NULL_HANDLE; }
     void ContinueBackFaces(VkCommandBuffer commands, const State& state) const;
@@ -62,7 +103,7 @@ public:
     bool ReordersSamples() const { return Graphics::ReordersSamples(sampleOrder); }
     bool SampleLocationsEnabled() const { return sampleLocationsEnabled; }
     VkExtent2D HostSampleLocationGrid() const { return sampleLocationGrid; }
-    void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
+    void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes, PipelineStateReuse* reuse = nullptr) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
 
@@ -77,7 +118,7 @@ private:
         std::shared_ptr<Framebuffer> framebuffer;
     };
     void release() noexcept;
-    void setLibraryState(VkCommandBuffer commands, const State& state) const;
+    void setLibraryState(VkCommandBuffer commands, const State& state, PipelineStateReuse* reuse) const;
     Context context;
     std::vector<VkShaderModule> _modules;
     VkPipelineLayout layout = VK_NULL_HANDLE;

@@ -287,7 +287,7 @@ public:
     bool RefreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder = nullptr);
     // Walks the write watch over every image surface of a completed object (no device lock: the
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
-    void PrecollectSurfaces() const;
+    void PrecollectSurfaces(bool memoVirtualQuery = false) const;
     bool Reusable() const { return reusable; }
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }

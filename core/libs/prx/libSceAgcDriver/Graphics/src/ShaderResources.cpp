@@ -4941,10 +4941,10 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
     context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer.Handle(), 0, size, patched.data());
 }
 
-void ShaderResources::PrecollectSurfaces() const {
+void ShaderResources::PrecollectSurfaces(bool memoVirtualQuery) const {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) {
-        for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
+        for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes), memoVirtualQuery);
         return;
     }
     struct Counts {
@@ -4964,7 +4964,7 @@ void ShaderResources::PrecollectSurfaces() const {
     const auto walked = GuestMemory::ThreadCollectedBytes();
     for (const auto& range : describedRanges) {
         const auto start = std::chrono::steady_clock::now();
-        const auto generation = GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
+        const auto generation = GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes), memoVirtualQuery);
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         ++count.ranges;
         count.requested += range.bytes;

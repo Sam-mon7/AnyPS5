@@ -1,16 +1,25 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, bool feedbackMask, std::uint64_t feedbackKey, std::span<const std::uint32_t> userData) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
         std::unique_lock cacheLock(dispatchCacheMutex);
         ++entryCounters.lookups;
-        const auto found = dispatchCache.find(key);
+        auto found = dispatchCache.find(key);
+        bool aliasLookup = false;
+        if (found == dispatchCache.end() && feedbackMask && feedbackKey != 0 && !stampValidate()) {
+            const auto alias = dispatchFeedbackKeys.find(feedbackKey);
+            if (alias != dispatchFeedbackKeys.end()) {
+                found = dispatchCache.find(alias->second);
+                if (found != dispatchCache.end()) { key = alias->second; aliasLookup = true; }
+            }
+        }
         std::shared_ptr<DispatchEntry> entry = found != dispatchCache.end() ? found->second : nullptr;
         if (entry == nullptr) ++entryCounters.absent;
         if (validateUnlocked) cacheLock.unlock();
@@ -23,6 +32,8 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             std::size_t rank = 0;
             const auto generation = variants.front()->generation.load(std::memory_order_acquire);
             bool current = false;
+            bool feedbackHit = false;
+            if (feedbackMask && stampValidate()) ArchB::Recorder::Count("fix_tsharp_mask_refused_stamp");
             std::uint64_t restamped = 0;
 
             auto outcome = EntryOutcome::Differing;
@@ -37,13 +48,16 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 std::optional<SampledReadScope> sampling;
 
                 for (std::size_t i = 0; i < variants.size(); ++i) {
+                    if (aliasLookup && variants[i]->userData.empty()) continue;
+                    bool userFeedback = false, memoryFeedback = false;
+                    if (feedbackMask && !variants[i]->userData.empty() && !FeedbackWordsEqual(variants[i]->userData, userData, variants[i]->feedback.userData, &userFeedback)) continue;
                     regions.clear();
                     appendEntryRegions(*variants[i], regions);
                     ++compared;
-                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
+                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback);
 
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
-                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
+                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback);
                         ++(result == EntryOutcome::Equal || result == EntryOutcome::EqualData ? retriesEqual : retriesMoved);
                     }
                     if (i == 0) outcome = result;
@@ -52,6 +66,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                         variant = variants[i];
                         rank = i;
                         dataHit = result == EntryOutcome::EqualData;
+                        feedbackHit = userFeedback || memoryFeedback;
                         break;
                     }
                 }
@@ -121,6 +136,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 case EntryOutcome::ForgetMoved: ++counters.forgetMoved; break;
             }
             if (current) {
+                if (feedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");
                 ++counters.variantHitsByRank[rank];
                 compiledResult = variant->compiled;
                 if (dataHit) {

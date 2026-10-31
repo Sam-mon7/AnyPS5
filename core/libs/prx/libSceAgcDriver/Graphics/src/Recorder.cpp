@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -1713,7 +1714,21 @@ void Recorder::EndComputeChain(bool syncPoint) {
     }
 }
 
+PipelineStateReuse* Recorder::ReusePipelineState(bool enabled) {
+    if (!enabled) {
+        InvalidatePipelineState("fix_pso_reuse_invalidations_off");
+        return nullptr;
+    }
+    if (pipelineStateReuse == nullptr) pipelineStateReuse = std::make_unique<PipelineStateReuse>();
+    return pipelineStateReuse.get();
+}
+
+void Recorder::InvalidatePipelineState(const char* counter) {
+    if (pipelineStateReuse != nullptr) pipelineStateReuse->Invalidate(counter);
+}
+
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+    InvalidatePipelineState("fix_pso_reuse_invalidations_commands");
     EndComputeChain();
     ensureOpen();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
@@ -1781,6 +1796,7 @@ void Recorder::SealPassWriteOnly() {
 }
 
 void Recorder::endOpenRenderPass(bool barrier) {
+    InvalidatePipelineState("fix_pso_reuse_invalidations_pass_end");
     auto& pass = open->renderPass;
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
@@ -1885,6 +1901,7 @@ void Recorder::ensureOpen() {
             }
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            InvalidatePipelineState("fix_pso_reuse_invalidations_begin");
             Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands, &begin), "vkBeginCommandBuffer recorder");
             if (DrawProfiled()) {
                 auto state = std::make_shared<WaitBatch>();
@@ -2372,6 +2389,7 @@ void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
 }
 
 bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup, bool chained) {
+    InvalidatePipelineState("fix_pso_reuse_invalidations_helper");
     constexpr std::uint32_t PushBytes = 48;
     if (dispatchArgumentState == 0) {
         dispatchArgumentState = -1;
@@ -2712,6 +2730,7 @@ void Recorder::recordQueuedDumps(VkCommandBuffer commands, std::span<const Batch
 }
 
 void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, std::uint32_t dumps, std::uint32_t firstSegment, std::uint32_t lastSegment) {
+    InvalidatePipelineState("fix_pso_reuse_invalidations_helper");
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, dumpPipeline);
     struct {
@@ -2740,6 +2759,7 @@ void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, 
 }
 
 void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end, std::uint32_t& dumpIndex, std::uint32_t& consumed) {
+    InvalidatePipelineState("fix_pso_reuse_invalidations_helper");
     std::uint32_t count = 0, segments = consumed;
     for (std::size_t i = first; i < end; ++i) {
         if (writes[i].dumpTarget == 0) continue;
@@ -2850,6 +2870,7 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
 }
 
 bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules) {
+    InvalidatePipelineState("fix_pso_reuse_invalidations_helper");
     constexpr std::uint32_t PushBytes = 48;
     if (meshArgumentState == 0) {
         meshArgumentState = -1;

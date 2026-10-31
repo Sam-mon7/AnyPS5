@@ -147,7 +147,7 @@ static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: upda
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
-static_assert(fieldCount<IrResourcePlan>() == 24, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(fieldCount<IrResourcePlan>() == 26, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
@@ -1176,6 +1176,8 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
     writer.Value(plan.srtGuardOffset);
     writer.Values(std::span<const std::uint8_t>(plan.cleanFlatSlots));
     writer.Values(std::span<const std::uint8_t>(plan.pureFlatSlots));
+    writer.Values(std::span<const std::uint8_t>(plan.shaderFlatSlots));
+    writer.Value(plan.shaderUserWords);
     writer.Value(plan.denseValueIds);
     writer.Value(plan.requiresSpecializationMemory);
     writer.Value(plan.srtPlanComplete);
@@ -1339,6 +1341,8 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     reader.Value(plan.srtGuardOffset);
     reader.Values(plan.cleanFlatSlots);
     reader.Values(plan.pureFlatSlots);
+    reader.Values(plan.shaderFlatSlots);
+    reader.Value(plan.shaderUserWords);
     reader.Value(plan.denseValueIds);
     reader.Value(plan.requiresSpecializationMemory);
     reader.Value(plan.srtPlanComplete);

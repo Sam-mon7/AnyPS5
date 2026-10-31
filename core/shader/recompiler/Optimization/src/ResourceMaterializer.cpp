@@ -2593,6 +2593,34 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     plan.descriptorSources = source.descriptorSources;
     plan.controlFlow = source.controlFlow;
     plan.srtReads = source.srtReads;
+    plan.shaderFlatSlots.assign(plan.srtReads.size(), 0u);
+    std::unordered_set<const IrValue*> shaderValues;
+    const auto shaderUse = [&](auto&& self, const IrValue* value) -> void {
+        if (value == nullptr) return;
+        value = value->Resolve();
+        if (!shaderValues.insert(value).second) return;
+        if (value->Opcode() == IrOpcode::GetImageResource || value->Opcode() == IrOpcode::GetSamplerResource || value->Opcode() == IrOpcode::GetBufferResource || value->Opcode() == IrOpcode::ReferenceU32) return;
+        if (value->Opcode() == IrOpcode::GetUserData && value->ArgumentCount() == 1u) {
+            const auto reg = value->Argument(0)->Register().index;
+            const auto word = reg - plan.userDataBase;
+            plan.shaderUserWords |= reg >= plan.userDataBase && word < 64u ? std::uint64_t{1} << word : ~std::uint64_t{0};
+            return;
+        }
+        if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() == 2u && value->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource) {
+            const auto* slot = value->Argument(1)->Resolve();
+            if (slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < plan.shaderFlatSlots.size()) plan.shaderFlatSlots[slot->ImmediateU32()] = 1u;
+            else std::fill(plan.shaderFlatSlots.begin(), plan.shaderFlatSlots.end(), 1u);
+            return;
+        }
+        for (const auto* argument : value->Arguments()) self(self, argument);
+    };
+    for (const auto& block : program.Blocks()) {
+        for (const auto* value : block->Instructions()) if (value->MayHaveSideEffects()) shaderUse(shaderUse, value);
+    }
+    for (const auto& block : program.Metadata().blockInfo) {
+        shaderUse(shaderUse, block.condition);
+        shaderUse(shaderUse, block.indirectTarget);
+    }
     plan.cleanFlatSlots = source.cleanFlatSlots;
     plan.requiresSpecializationMemory = source.requiresSpecializationMemory;
     plan.srtPlanComplete = source.srtPlanComplete;

@@ -1450,19 +1450,27 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 #ifdef _WIN32
 std::atomic<FreshCollectHook> freshCollectHook{nullptr};
 
-bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t stop, bool armedOnly) {
+bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t stop, bool armedOnly, bool memoVirtualQuery = false) {
     auto& tracker = runs.tracker;
     const bool fresh = runs.kind == StampKind::Fresh;
     if (fresh) {
         if (const auto hook = freshCollectHook.load(std::memory_order_acquire)) return hook(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
     }
     const auto collect = fresh ? &GuestArena::GuestArenaCollectFreshWrites_nid_postfix : armedOnly ? &GuestArena::GuestArenaCollectArmedWrites_nid_postfix : &GuestArena::GuestArenaCollectWrites_nid_postfix;
+    static const bool verifyMemo = [] {
+        const auto* value = std::getenv("APS5_VERIFY_VQ_MEMO");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    const GuestArena::QueryMemoContext memo{&UnwatchSerial, &ForgetSerial, verifyMemo, [](const char* name) { AgcDriver::ArchB::Recorder::Count(name); }};
     static const bool singlePass = std::getenv("APS5_NO_SINGLE_PASS_COLLECT") == nullptr;
     const auto walk = [&](bool clear) {
         auto cursor = first;
         while (cursor < stop) {
             std::size_t count = tracker.pages.size();
-            if (!collect(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, clear)) return false;
+            const bool collected = memoVirtualQuery && !fresh ?
+                GuestArena::GuestArenaCollectWritesMemo_nid_no_patch(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, clear, armedOnly, &memo) :
+                collect(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, clear);
+            if (!collected) return false;
             for (std::size_t i = 0; i < count; ++i) {
                 const auto page = reinterpret_cast<std::uintptr_t>(tracker.pages[i]);
                 stampWrittenRun(&runs, page, page + WritePageBytes);
@@ -1495,14 +1503,15 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 }
 #endif
 
-bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
+bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool memoVirtualQuery = false) {
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window};
 #ifdef _WIN32
-    if (collectWindowsWrites(runs, first, stop, armedOnly)) return true;
+    if (collectWindowsWrites(runs, first, stop, armedOnly, memoVirtualQuery)) return true;
     noteRefusedWalk(tracker, first, stop);
     return false;
 #else
+    static_cast<void>(memoVirtualQuery);
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
     const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
@@ -1511,7 +1520,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
-std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
+std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery = false) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -1581,7 +1590,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return fail();
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, memoVirtualQuery)) return fail();
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
@@ -1610,8 +1619,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 
 }
 
-std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
-    return collectWrites(address, bytes, true);
+std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, bool memoVirtualQuery) {
+    return collectWrites(address, bytes, true, memoVirtualQuery);
 }
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {

@@ -70,7 +70,7 @@ using FreshCollectHook = bool (*)(std::uintptr_t address, std::size_t bytes, voi
 void SetFreshCollectHook(FreshCollectHook hook);
 #endif
 bool Watched(std::uint64_t address, std::size_t bytes);
-std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
+std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, bool memoVirtualQuery = false);
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // UnchangedSince for several ranges under one tracker lock: true only when every one holds.
 struct UnchangedQuery {

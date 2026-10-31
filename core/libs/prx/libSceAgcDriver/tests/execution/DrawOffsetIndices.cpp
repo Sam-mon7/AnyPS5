@@ -36,6 +36,7 @@ struct DriverTestAccess {
     static Lookup Find(const std::shared_ptr<VulkanDevice>& device, const DrawDecode& decode, const ShaderRecompiler::ShaderVertexStageInfo& vertexInfo, const Pm4::DrawParameters& packet, std::uint64_t key = 0) {
         Lookup lookup;
         lookup.key = key;
+        std::uint64_t shapeKey = 0;
         Submission submission{};
         std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos{vertexInfo};
         DrawDataCandidates candidates(1);
@@ -48,7 +49,7 @@ struct DriverTestAccess {
             const auto found = Driver::Get().drawCache.find(key);
             if (found != Driver::Get().drawCache.end()) lookup.entry = found->second;
         }
-        Driver::Get().lookupDraw(submission, device, decode.state, decode.pixel, decode.programs, decode.roles, infos, true, key != 0, false, lookup.key, lookup.entry, lookup.matched, lookup.regions, lookup.hit, verify, timing, ms, nullptr, candidates, data, packet);
+        Driver::Get().lookupDraw(submission, device, decode.state, decode.pixel, decode.programs, decode.roles, infos, true, key != 0, false, lookup.key, shapeKey, lookup.entry, lookup.matched, lookup.regions, lookup.hit, verify, timing, ms, nullptr, candidates, data, packet, false, false);
         Graphics::Require(!verify, "cache regression must use the ordinary hit path");
         return lookup;
     }

@@ -69,6 +69,16 @@ public:
         std::uint64_t generation = 0;
         bool active = false;
     };
+    class Timer {
+    public:
+        explicit Timer(const char* name) { if (Enabled()) scope.Begin(name, Clock::now()); }
+        ~Timer() { if (scope.Active()) scope.End(Clock::now()); }
+        Timer(const Timer&) = delete;
+        Timer& operator=(const Timer&) = delete;
+        void Mark(const char* stage) { if (scope.Active()) scope.Mark(stage, Clock::now()); }
+    private:
+        Scope scope;
+    };
     class Work {
     public:
         explicit Work(Key key = {Kind::Draw, 0}, Phase phase = Phase::Prepare, bool call = true);
