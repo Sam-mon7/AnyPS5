@@ -1,4 +1,6 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -21,13 +23,18 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace AgcDriver {
@@ -251,6 +258,100 @@ std::uint32_t Dword(const std::uint8_t* bytes) {
     return value;
 }
 
+bool ComputeSyncStress(AgcDriver::VulkanDevice& device) {
+    namespace G = AgcDriver::GuestMemory;
+    using R = AgcDriver::Graphics::Recorder;
+    using A = AgcDriver::ArchB::Recorder;
+    const bool enabled = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixComputeSyncUnlocked);
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    if (!context.bufferDeviceAddress) return false;
+    Block target(16 * BlockBytes), input(BlockBytes), output(BlockBytes);
+    std::memset(target.data, 0, target.bytes);
+    std::memset(input.data, 0, input.bytes);
+    std::memset(output.data, 0, output.bytes);
+    std::memcpy(input.data, &Drawn, sizeof(Drawn));
+    const auto color = DecodeTarget(target);
+    const auto program = Program(0, true);
+    A::Boundary(true, 0, A::Clock::now());
+    A::BindThread("compute sync stress");
+    G::TagGpuLockThread(0x20);
+    std::unique_lock lock(G::GpuMutex());
+    Draw(device, color, program, {{0, 0}, {Width, Height}});
+    Dispatch(device, input.Address(), output.Address());
+    device.WaitIdle();
+    for (unsigned iteration = 0; iteration < 3; ++iteration) {
+        R::ComputeSyncScope scope(enabled);
+        auto* recorder = R::Active();
+        Require(recorder != nullptr, "missing stress recorder");
+        Require(recorder->HasTimeline(), "stress requires timeline semaphores");
+        VkSemaphoreTypeCreateInfoKHR type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR};
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE_KHR;
+        VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        info.pNext = &type;
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        AgcDriver::Graphics::Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &semaphore), "create stress semaphore");
+        Dispatch(device, input.Address(), output.Address());
+        const std::uint64_t value = 1;
+        const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkTimelineSemaphoreSubmitInfoKHR timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+        timeline.waitSemaphoreValueCount = 1;
+        timeline.pWaitSemaphoreValues = &value;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.pNext = &timeline;
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &semaphore;
+        submit.pWaitDstStageMask = &stage;
+        AgcDriver::Graphics::Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, VK_NULL_HANDLE), "submit stress semaphore wait");
+        std::vector<unsigned> completions;
+        recorder->OnComplete([&] { Require(G::GpuMutex().HeldByThisThread(), "stress completion ran unlocked"); completions.push_back(1); });
+        const auto serial = recorder->OpenSerial();
+        std::mutex progress;
+        std::condition_variable wake;
+        bool drawn = false, drewBeforeSignal = false;
+        std::exception_ptr failure;
+        std::thread draw([&] {
+            try {
+                G::TagGpuLockThread(0);
+                std::lock_guard gpu(G::GpuMutex());
+                Draw(device, color, program, {{0, 0}, {Width, Height}});
+                recorder->OnComplete([&] { completions.push_back(2); });
+            } catch (...) { failure = std::current_exception(); }
+            {
+                std::lock_guard state(progress);
+                drawn = true;
+            }
+            wake.notify_one();
+        });
+        std::thread signal([&] {
+            {
+                std::unique_lock state(progress);
+                drewBeforeSignal = wake.wait_for(state, std::chrono::seconds(1), [&] { return drawn; });
+            }
+            VkSemaphoreSignalInfoKHR signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR};
+            signal.semaphore = semaphore;
+            signal.value = value;
+            context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal);
+        });
+        if (enabled) Require(recorder->FinishComputeSyncUnlocked(serial), "stress compute wait did not unlock");
+        else recorder->Sync();
+        lock.unlock();
+        draw.join();
+        signal.join();
+        lock.lock();
+        device.WaitIdle();
+        context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, semaphore, nullptr);
+        if (failure) std::rethrow_exception(failure);
+        Require(drewBeforeSignal == enabled, "queue zero did not progress during the enabled compute wait");
+        Require(completions == std::vector<unsigned>({1, 2}), "stress completion order changed");
+        Require(Dword(output.data) == Drawn, "stress compute copy changed");
+        const auto offset = (static_cast<std::size_t>(ReadY) * Width + ReadX) * 16u + 8u;
+        Require(Dword(target.data + offset) == Drawn, "stress queue zero draw changed");
+    }
+    const auto counters = A::Collect(A::Clock::now()).counters;
+    if (enabled) Require(counters.at("fix_csync_unlocked_waits") == 3, "stress did not exercise three compute waits");
+    return true;
+}
+
 bool Expect(AgcDriver::VulkanDevice& device) {
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     if (!context.bufferDeviceAddress) {
@@ -286,11 +387,13 @@ bool Expect(AgcDriver::VulkanDevice& device) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (!Expect(*device)) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--compute-sync") {
+            if (!ComputeSyncStress(*device)) return VulkanTestSkipped;
+        } else if (!Expect(*device)) return VulkanTestSkipped;
         std::puts("linear target dispatch access tests passed");
         return 0;
     } catch (const std::exception& error) {
