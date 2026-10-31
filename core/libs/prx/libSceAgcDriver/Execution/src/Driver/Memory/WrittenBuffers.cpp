@@ -84,7 +84,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const S
             if (Graphics::IsNullTextureResource(words)) continue;
             try {
                 const auto resource = Graphics::DecodeTextureResource(words);
-                const auto surfaceBytes = Graphics::DescribeSurface(resource).guestBytes;
+                const auto surfaceBytes = Graphics::SurfaceGuestBytes(resource);
                 if (surfaceBytes == 0) bounded = false;
                 add(resource.baseAddress, surfaceBytes);
                 if (resource.dccAddress != 0 && surfaceBytes != 0) add(resource.dccAddress, Graphics::DccKeyCount(resource, surfaceBytes));

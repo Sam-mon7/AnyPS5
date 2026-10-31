@@ -82,6 +82,7 @@ void toggleCase(const std::string& name) {
     const bool imageTable = name == "ImageTableSnapshot";
     const bool bitScanKeys = name == "ImageTableBitScanKeys";
     if (name == "VqMemo" || imageTable || bitScanKeys) setEnvironment(bitScanKeys ? "APS5_ARCHB_FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "APS5_ARCHB_FIX_VQ_MEMO", nullptr);
+    if (name == "AllocChurn") setEnvironment("APS5_ARCHB_FIX_ALLOC_CHURN", nullptr);
     Switches::Initialize();
     const auto write = [&](const std::string& line, bool poll = true) {
         std::ofstream(path, std::ios::binary | std::ios::trunc) << line << '\n';
@@ -104,6 +105,42 @@ void toggleCase(const std::string& name) {
         check(selected && !Switches::Enabled(feature), "runtime fix did not preserve the selected path across a toggle");
         write("3 " + token + "=1");
         check(Switches::Enabled(feature), "runtime fix did not turn back on");
+    } else if (name == "AllocChurn") {
+        using AgcDriver::ArchB::AllocChurnActive;
+        using AgcDriver::ArchB::AllocChurnScope;
+        bool listed = false;
+        for (const auto& entry : Switches::Table()) {
+            if (entry.feature != Feature::FixAllocChurn) continue;
+            listed = true;
+            check(std::string(entry.name) == "FIX_ALLOC_CHURN" && !entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "allocation churn switch contract");
+        }
+        check(listed, "allocation churn switch is listed");
+        check(!Switches::Enabled(Feature::FixAllocChurn), "allocation churn must default off");
+        write("1 FIX_ALLOC_CHURN=1");
+        check(Switches::Enabled(Feature::FixAllocChurn), "allocation churn did not turn on");
+        // The sites read the value sampled into the thread's scope, not the live switch.
+        check(!AllocChurnActive(), "allocation churn is active outside a draw scope");
+        {
+            const AllocChurnScope draw(Switches::Enabled(Feature::FixAllocChurn));
+            check(AllocChurnActive(), "a draw scope did not take the sampled value");
+            write("2 FIX_ALLOC_CHURN=0");
+            check(!Switches::Enabled(Feature::FixAllocChurn) && AllocChurnActive(), "a runtime toggle changed the path inside a draw");
+            bool otherThread = true;
+            std::thread([&] { otherThread = AllocChurnActive(); }).join();
+            check(!otherThread, "a draw scope leaked to another thread");
+            {
+                const AllocChurnScope nested(false);
+                check(!AllocChurnActive(), "a nested scope did not take its value");
+            }
+            check(AllocChurnActive(), "a nested scope did not restore the outer value");
+        }
+        check(!AllocChurnActive(), "a draw scope did not restore the value outside it");
+        {
+            const AllocChurnScope draw(Switches::Enabled(Feature::FixAllocChurn));
+            check(!AllocChurnActive(), "the next draw did not sample the toggled switch");
+        }
+        write("3 FIX_ALLOC_CHURN=1");
+        check(Switches::Enabled(Feature::FixAllocChurn), "allocation churn did not turn back on");
     } else if (name == "SeqMonotonic") {
         write("2 GATE_NOOP=1 GATE_DELAY_US=7000");
         check(Switches::Enabled(Feature::GateNoop) && Switches::GateDelayMicros() == 7000, "initial toggle");

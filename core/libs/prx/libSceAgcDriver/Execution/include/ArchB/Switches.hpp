@@ -26,6 +26,7 @@ enum class Feature : std::uint8_t {
     FixImageTableSnapshotReuse,
     FixImageTableBitScanKeys,
     FixBufferBaseRefresh,
+    FixAllocChurn,
     Count
 };
 
@@ -50,6 +51,22 @@ public:
     static std::string Describe();
     static std::span<const SwitchInfo> Table();
     static void CountUpperBoundHit(Feature feature);
+};
+
+// FIX_ALLOC_CHURN is sampled once per draw or dispatch into the calling thread (AllocChurnScope);
+// the allocation sites below it read AllocChurnActive(), so a runtime toggle changes their path only
+// between draws. It is off on a thread outside any scope. Every site keeps its results identical
+// either way (only where scratch memory comes from differs), so nested or mixed scopes are safe.
+bool AllocChurnActive() noexcept;
+class AllocChurnScope {
+public:
+    explicit AllocChurnScope(bool active) noexcept;
+    ~AllocChurnScope();
+    AllocChurnScope(const AllocChurnScope&) = delete;
+    AllocChurnScope& operator=(const AllocChurnScope&) = delete;
+
+private:
+    bool previous;
 };
 
 }

@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1801,11 +1802,32 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     return inputs;
 }
 
+// A non-owning reference to a target lookup callable that outlives the call. Under
+// APS5_ARCHB_FIX_ALLOC_CHURN it refers to the draw's lambda itself; otherwise to a std::function made
+// from it, as before (its captures need a heap block once per color target).
+class TargetLookup {
+public:
+    template<typename TLookup>
+    explicit TargetLookup(const TLookup& lookup) : object(&lookup), call([](const void* target, StorageTexture::RefreshPreparation* preparation) { return std::shared_ptr<StorageTexture>((*static_cast<const TLookup*>(target))(preparation)); }) {}
+    std::shared_ptr<StorageTexture> operator()(StorageTexture::RefreshPreparation* preparation) const { return call(object, preparation); }
+
+private:
+    const void* object;
+    std::shared_ptr<StorageTexture> (*call)(const void*, StorageTexture::RefreshPreparation*);
+};
+
+template<typename TLookup, typename TRefresh>
+std::shared_ptr<StorageTexture> withTargetLookup(const TLookup& lookup, const TRefresh& refresh) {
+    if (AgcDriver::ArchB::AllocChurnActive()) return refresh(TargetLookup(lookup));
+    const std::function<std::shared_ptr<StorageTexture>(StorageTexture::RefreshPreparation*)> owned = lookup;
+    return refresh(TargetLookup(owned));
+}
+
 // The resident-target proof of one attachment (StorageTexture::Refresh: FlushPending, CollectWrites
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
-std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>(StorageTexture::RefreshPreparation*)>& lookup, StorageTexture::RefreshPreparation* preparation) {
+std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, bool profile, const TargetLookup& lookup, StorageTexture::RefreshPreparation* preparation) {
     const auto lookupStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::optional<LookupOutcomes> before;
@@ -1839,7 +1861,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             }
             const bool reads = access.blend || state.colorRop != CopyRop || color.partialWriteMask != 0;
             const auto surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
-            StorageTexture::ProfilePendingAccess(surface, DescribeSurface(surface).guestBytes, reads ? StorageTexture::PendingAccess::Read : StorageTexture::PendingAccess::Partial, &access);
+            StorageTexture::ProfilePendingAccess(surface, SurfaceGuestBytes(surface), reads ? StorageTexture::PendingAccess::Read : StorageTexture::PendingAccess::Partial, &access);
         }
         resident = lookup(preparation);
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
@@ -2374,7 +2396,13 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
             addSample(snapshot.address, bytes.size(), snapshot.buffer->Handle(), snapshot.offset, bytes.data());
         }
     }
-    for (const auto& [begin, end] : resources.InPlaceReads()) {
+    // APS5_ARCHB_FIX_ALLOC_CHURN: the in-place reads in a per-thread scratch that keeps its capacity;
+    // off, a vector of this call (as the by-value InPlaceReads made).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ownedReads;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+    auto& inPlaceReads = AgcDriver::ArchB::AllocChurnActive() ? ShaderRecompiler::ThreadOwned(readsSlot) : ownedReads;
+    resources.InPlaceReads(inPlaceReads);
+    for (const auto& [begin, end] : inPlaceReads) {
         Require(end >= begin, "invalid capture input range");
         const auto bytes = static_cast<std::size_t>(end - begin);
         if (bytes == 0 || bytes > 512) continue;
@@ -2545,7 +2573,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
     if (!continued && Recorder::BarrierValidate()) {
-        auto reads = resources.InPlaceReads();
+        // APS5_ARCHB_FIX_ALLOC_CHURN: a per-thread scratch (NoteAccess reads it before returning).
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ownedReads;
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+        auto& reads = AgcDriver::ArchB::AllocChurnActive() ? ShaderRecompiler::ThreadOwned(readsSlot) : ownedReads;
+        resources.InPlaceReads(reads);
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
         if (gpuIndirect) {
             reads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
@@ -2872,7 +2904,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
             auto* targetPreparation = prepared.preparation != nullptr && prepared.preparation->device == context.device && index < prepared.preparation->targets.size() ? &prepared.preparation->targets[index] : nullptr;
-            binding.resident = refreshResidentTarget(context, state, color, draw, shaders, outcome, profile, [&](StorageTexture::RefreshPreparation* targetProof) {
+            const auto lookup = [&](StorageTexture::RefreshPreparation* targetProof) {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -2889,7 +2921,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
-            }, targetPreparation);
+            };
+            binding.resident = withTargetLookup(lookup, [&](const TargetLookup& target) { return refreshResidentTarget(context, state, color, draw, shaders, outcome, profile, target, targetPreparation); });
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
@@ -3288,7 +3321,11 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     // The draw's [gputime] class range: from its first barrier to the download barrier.
     const auto drawTiming = recorded ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
     if (recorded && Recorder::BarrierValidate()) {
-        auto reads = resources->InPlaceReads();
+        // APS5_ARCHB_FIX_ALLOC_CHURN: a per-thread scratch (NoteAccess reads it before returning).
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ownedReads;
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+        auto& reads = AgcDriver::ArchB::AllocChurnActive() ? ShaderRecompiler::ThreadOwned(readsSlot) : ownedReads;
+        resources->InPlaceReads(reads);
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
         if (gpuIndirect) {
             reads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
@@ -3555,7 +3592,7 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
             try {
                 const auto requested = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
                 const auto surface = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
-                described.emplace(surface, DescribeSurface(surface).guestBytes);
+                described.emplace(surface, SurfaceGuestBytes(surface));
             } catch (const std::runtime_error&) {
                 continue;
             }
@@ -3662,11 +3699,12 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto* targetPreparation = preparation != nullptr && preparation->device == context.device && index < preparation->targets.size() ? &preparation->targets[index] : nullptr;
-        auto resident = refreshResidentTarget(context, state, state.colors[index], draw, shaders, outcome, profile, [&](StorageTexture::RefreshPreparation* targetProof) {
+        const auto lookup = [&](StorageTexture::RefreshPreparation* targetProof) {
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
             else stored->Refresh(targetProof);
             return stored;
-        }, targetPreparation);
+        };
+        auto resident = withTargetLookup(lookup, [&](const TargetLookup& target) { return refreshResidentTarget(context, state, state.colors[index], draw, shaders, outcome, profile, target, targetPreparation); });
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
         targets.push_back(std::move(resident));
