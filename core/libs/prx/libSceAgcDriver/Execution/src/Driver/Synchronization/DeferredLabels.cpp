@@ -221,6 +221,7 @@ bool Driver::recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queu
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!deferredLabels().labels.empty()) {
+        if (Graphics::Recorder::ComputeSyncEnabled()) Graphics::StorageTexture::PrepareReadbackBeforeLabel(true);
         recordDeferredLabels(localDevice, queue);
         ++packetLockRecords;
         if (profile) packetLockRecordUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());

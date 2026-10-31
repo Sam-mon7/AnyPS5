@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -48,6 +49,8 @@ struct MockDevice {
     std::map<VkFence, std::uint64_t> serials;
     std::thread::id waitingThread;
     std::function<void()> duringWait;
+    std::function<void()> duringFenceWait;
+    VkResult fenceResult = VK_SUCCESS;
     VkResult timelineResult = VK_SUCCESS;
     std::uint64_t timelineWaits = 0;
     std::string commands;
@@ -57,6 +60,7 @@ struct MockDevice {
 
 MockDevice mock;
 std::atomic<bool> timelineWaitInProgress{false};
+std::atomic<VkFence> pinnedFence{VK_NULL_HANDLE};
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer* commands) {
     *commands = reinterpret_cast<VkCommandBuffer>(mock.next++);
@@ -76,6 +80,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateFence(VkDevice, const VkFenceCreateInfo
 }
 
 VKAPI_ATTR void VKAPI_CALL mockDestroyFence(VkDevice, VkFence fence, const VkAllocationCallbacks*) {
+    Expect(pinnedFence.load() != fence, "an unlocked wait's fence was destroyed");
     Expect(!mock.lostSubmissionPending, "a fence was destroyed before the lost submission finished");
     mock.signaled.erase(fence);
     mock.serials.erase(fence);
@@ -86,12 +91,24 @@ VKAPI_ATTR VkResult VKAPI_CALL mockGetFenceStatus(VkDevice, VkFence fence) {
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockWaitForFences(VkDevice, std::uint32_t count, const VkFence* fences, VkBool32, std::uint64_t) {
+    if (mock.duringFenceWait && std::this_thread::get_id() == mock.waitingThread) {
+        Expect(!AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "compute fence wait retained the GPU mutex");
+        for (const auto& [fence, serial] : mock.serials) {
+            if (serial <= mock.serials.at(fences[0])) mock.signaled.at(fence) = true;
+        }
+        pinnedFence = fences[0];
+        struct Clear { ~Clear() { pinnedFence = VK_NULL_HANDLE; } } clear;
+        auto action = std::exchange(mock.duringFenceWait, {});
+        action();
+        return mock.fenceResult;
+    }
     for (std::uint32_t i = 0; i < count; ++i) mock.signaled.at(fences[i]) = true;
     ++mock.fenceWaits;
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockResetFences(VkDevice, std::uint32_t count, const VkFence* fences) {
+    for (std::uint32_t i = 0; i < count; ++i) Expect(pinnedFence.load() != fences[i], "an unlocked wait's fence was recycled");
     Expect(!mock.lostSubmissionPending, "a fence was reset before the lost submission finished");
     for (std::uint32_t i = 0; i < count; ++i) mock.signaled.at(fences[i]) = false;
     return VK_SUCCESS;
@@ -611,10 +628,159 @@ void UnlockedWaitFailure(bool exception) {
     Expect(recorder.InFlightBatches() == 1, "a failed wait retired work before reporting the error");
 }
 
+void ComputeSyncMutation(bool retire, bool replace) {
+    namespace G = AgcDriver::GuestMemory;
+    using R = AgcDriver::ArchB::Recorder;
+    mock = MockDevice{};
+    mock.waitingThread = std::this_thread::get_id();
+    R::Boundary(true, 0, R::Clock::now());
+    R::BindThread("compute sync test");
+    static_cast<void>(R::Collect(R::Clock::now()));
+    G::TagGpuLockThread(0x20);
+    G::TagGpuLockSite(G::GpuLockSite::Dispatch);
+    std::lock_guard gpu(G::GpuMutex());
+    Recorder::ComputeSyncScope scope(true);
+    std::optional<Recorder> recorder;
+    const auto context = mockContext();
+    recorder.emplace(context, false);
+    recorder->Activate();
+    std::array<std::uint32_t, 2> memory{};
+    const auto address = reinterpret_cast<std::uintptr_t>(memory.data());
+    std::vector<int> order;
+    std::atomic<bool> eop{false};
+    recorder->NotePendingWrite(address, 4);
+    recorder->OnComplete([&] {
+        Expect(G::GpuMutex().HeldByThisThread(), "compute completion ran unlocked");
+        Expect(Recorder::SnapshotWriteOverlaps(address, 4), "compute write retired before publication");
+        memory[0] = 11;
+        order.push_back(1);
+    });
+    recorder->Submit();
+    const std::uint32_t label = 7;
+    recorder->AfterCompletions(address + 4, std::as_bytes(std::span(&label, 1)), 1, 0x20, false);
+    recorder->OnComplete([&] {
+        Expect(memory[0] == 11 && memory[1] == label, "compute writeback, label and EOP changed order");
+        order.push_back(2);
+        eop = true;
+    });
+    const auto target = recorder->OpenSerial();
+    G::BumpCollectEpoch();
+    const auto epoch = G::ThreadCollectEpoch();
+    std::thread producer;
+    mock.duringFenceWait = [&] {
+        Expect(Recorder::SnapshotWriteOverlaps(address, 4), "unlocked wait lost its pending snapshot");
+        producer = std::thread([&] {
+            G::TagGpuLockThread(0);
+            std::lock_guard lock(G::GpuMutex());
+            if (replace) {
+                recorder.reset();
+                recorder.emplace(context, false);
+                recorder->Activate();
+            } else if (retire) recorder->Reap();
+            recorder->NotePendingWrite(address, 4);
+            recorder->OnComplete([&] { memory[0] = 22; order.push_back(3); });
+            recorder->Submit();
+        });
+        if (retire || replace) {
+            while (!eop.load()) std::this_thread::yield();
+        } else producer.join();
+    };
+    bool tornDown = false;
+    try {
+        Expect(recorder->FinishComputeSyncUnlocked(target), "eligible compute fence did not unlock");
+    } catch (const std::runtime_error& error) {
+        tornDown = std::string_view(error.what()).find("torn down") != std::string_view::npos;
+        Expect(tornDown && replace, "unexpected compute wait exception");
+    }
+    if (producer.joinable()) producer.join();
+    Expect(tornDown == replace, "compute teardown was not detected");
+    Expect(G::GpuMutex().DepthOnThisThread() == 1, "compute wait lost the mutex");
+    if (epoch != 0) Expect(G::ThreadCollectEpoch() > epoch, "compute wait retained a pre-wait proof epoch");
+    Expect(order == std::vector<int>({1, 2}), "compute wait ran newer completions or repeated old ones");
+    Expect(Recorder::SnapshotWriteOverlaps(address, 4), "compute relock lost the new pending writer");
+    recorder->SyncThrough(address, 4);
+    Expect(memory[0] == 22 && order == std::vector<int>({1, 2, 3}), "revalidation did not publish the new writer in order");
+    Expect(!Recorder::SnapshotWriteOverlaps(address, 4), "revalidation left a completed write pending");
+    const auto counters = R::Collect(R::Clock::now()).counters;
+    Expect(counters.at("fix_csync_unlocked_waits") == 1, "compute wait counter disagrees with the wait");
+    if (replace) Expect(counters.at("fix_csync_torn_down") == 1, "compute teardown counter missing");
+    recorder.reset();
+}
+
+void ComputeSyncActiveReplacement() {
+    namespace G = AgcDriver::GuestMemory;
+    mock = MockDevice{};
+    mock.waitingThread = std::this_thread::get_id();
+    std::lock_guard gpu(G::GpuMutex());
+    Recorder::ComputeSyncScope scope(true);
+    Recorder original(mockContext(), false);
+    original.Activate();
+    bool completed = false;
+    original.OnComplete([&] { completed = true; });
+    const auto serial = original.OpenSerial();
+    std::unique_ptr<Recorder> replacement;
+    mock.duringFenceWait = [&] {
+        std::thread activate([&] {
+            std::lock_guard lock(G::GpuMutex());
+            replacement = std::make_unique<Recorder>(mockContext(), false);
+            replacement->Activate();
+        });
+        activate.join();
+    };
+    bool rejected = false;
+    try { original.FinishComputeSyncUnlocked(serial); } catch (const std::runtime_error&) { rejected = true; }
+    Expect(rejected && !completed && Recorder::Active() == replacement.get(), "compute wait resumed with a different active recorder");
+    replacement.reset();
+    original.Activate();
+    original.Sync();
+    Expect(completed, "replaced active recorder lost its completion");
+}
+
+void ComputeSyncFallbacks() {
+    namespace G = AgcDriver::GuestMemory;
+    mock = MockDevice{};
+    mock.waitingThread = std::this_thread::get_id();
+    std::lock_guard gpu(G::GpuMutex());
+    Recorder recorder(mockContext(), false);
+    recorder.Keep(std::make_shared<int>(1));
+    const auto target = recorder.OpenSerial();
+    {
+        Recorder::ComputeSyncScope disabled(false);
+        Expect(!recorder.FinishComputeSyncUnlocked(target) && mock.submits == 0, "disabled compute wait changed the batch");
+    }
+    Recorder::ComputeSyncScope enabled(true);
+    {
+        std::lock_guard nested(G::GpuMutex());
+        Expect(!recorder.FinishComputeSyncUnlocked(target) && mock.submits == 0, "nested compute wait changed the batch");
+    }
+    recorder.OnComplete([&] { Expect(!recorder.FinishComputeSyncUnlocked(0), "completion compute wait unlocked"); });
+    for (const bool exception : {false, true}) {
+        mock.fenceResult = VK_ERROR_DEVICE_LOST;
+        mock.duringFenceWait = [exception] { if (exception) throw std::runtime_error("injected fence failure"); };
+        for (auto& [fence, signaled] : mock.signaled) signaled = false;
+        bool failed = false;
+        try { recorder.FinishComputeSyncUnlocked(target); } catch (const std::runtime_error&) { failed = true; }
+        Expect(failed && G::GpuMutex().DepthOnThisThread() == 1, "failed compute wait did not relock");
+        Expect(recorder.InFlightBatches() == 1, "failed compute wait retired its batch");
+    }
+    mock.fenceResult = VK_SUCCESS;
+    for (auto& [fence, signaled] : mock.signaled) signaled = true;
+    Expect(!recorder.FinishComputeSyncUnlocked(target), "signaled compute fence unnecessarily unlocked");
+    recorder.Sync();
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--compute-sync") {
+            ComputeSyncMutation(false, false);
+            ComputeSyncMutation(true, false);
+            ComputeSyncMutation(false, true);
+            ComputeSyncActiveReplacement();
+            ComputeSyncFallbacks();
+            return failures == 0 ? 0 : 1;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--compute-chains") {
             ComputeChainTests();
             return failures == 0 ? 0 : 1;
