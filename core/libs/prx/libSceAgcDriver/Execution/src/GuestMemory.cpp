@@ -582,7 +582,7 @@ void PageStates::initialize() {
             auto cursor = start;
             for (;;) {
                 MEMORY_BASIC_INFORMATION memory{};
-                if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) || memory.AllocationBase != module || memory.RegionSize == 0 || memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - cursor) break;
+                if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) || memory.AllocationBase != module || memory.RegionSize == 0 || memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - cursor) break;
                 cursor += memory.RegionSize;
             }
             image.base = start;
@@ -643,7 +643,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             static_cast<void>(emit(PageRun{cursor, end, false, false}));
             return true;
         }
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
+        if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
         // Debug aid: APS5_TRACE_QUERY prints every 16th page query with its cost.
         static const bool traceQuery = std::getenv("APS5_TRACE_QUERY") != nullptr;
         if (traceQuery) {
@@ -1061,6 +1061,7 @@ struct WriteTracker {
     }
 
     void notePages(std::unordered_map<std::uint64_t, CpuPages>& pages, std::uint64_t begin, std::uint64_t end, std::uint32_t stampGeneration) {
+        const GuestArena::CensusTimer census(GuestArena::CensusOperation::PageStamps, GuestArena::CensusTimer::Pages(begin, end - begin));
         for (auto block = blockOf(begin); block <= blockOf(end - 1); ++block) {
             const auto blockStart = blockBegin(block);
             const auto from = std::max(begin, blockStart) - blockStart;
@@ -1269,11 +1270,13 @@ struct WriteTracker {
     }
 
     void stamp(std::uint64_t block, std::uint32_t stampGeneration, StampKind kind) {
+        GuestArena::CensusTimer census(GuestArena::CensusOperation::BlockStamps, WritePagesPerBlock);
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
         auto& leaf = leafFor(block);
         if (stored) {
             leaf.blocks[block % LeafBlocks] = stampGeneration;
+            const GuestArena::CensusTimer coarseCensus(GuestArena::CensusOperation::CoarseStamps, WritePagesPerBlock * WriteTracker::CoarseBlocks);
             auto& coarse = leaf.coarseBlocks[(block % LeafBlocks) / CoarseBlocks];
             coarse = std::max(coarse, stampGeneration);
         }
@@ -1496,6 +1499,7 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 #endif
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
+    const GuestArena::CensusTimer census(GuestArena::CensusOperation::Collection, GuestArena::CensusTimer::Pages(first, stop - first));
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window};
 #ifdef _WIN32
@@ -1526,6 +1530,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto epoch = currentCollectEpoch();
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    GuestArena::CensusTimer memoCensus(GuestArena::CensusOperation::EpochMemo, GuestArena::CensusTimer::Pages(first, stop - first));
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
@@ -1558,9 +1563,15 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             return 0;
         }
     }
+    memoCensus.Finish();
     const auto failedFirst = first;
     const auto failedStop = stop;
+    bool walkAttempted = false;
     const auto fail = [&]() -> std::uint64_t {
+        if (!walkAttempted) {
+            GuestArena::CensusTimer refusedCensus(GuestArena::CensusOperation::EpochMiss);
+            refusedCensus.Result(GuestArena::CensusTimer::Pages(failedFirst, failedStop - failedFirst), 0, true);
+        }
         if (census != nullptr) census->Count(M::H3CollectRefused);
         if (memoFailures) epochCollectMap(epoch).failedRanges[failedFirst] = {failedFirst, failedStop, epoch, unwatched, mapping};
         return 0;
@@ -1578,6 +1589,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
+    GuestArena::CensusTimer missCensus(GuestArena::CensusOperation::EpochMiss, GuestArena::CensusTimer::Pages(first, stop - first));
+    walkAttempted = true;
     const TimedAccess timed(CounterCollect, bytes);
 #ifndef _WIN32
     if (useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bytes <= WriteBlockBytes) {
@@ -1590,7 +1603,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
 #endif
     if (census != nullptr) census->Count(M::H3CollectWalkBytes, stop - first);
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return fail();
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
+        missCensus.Result(GuestArena::CensusTimer::Pages(first, stop - first), 0, true);
+        return fail();
+    }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
@@ -2188,6 +2204,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
     if (memoized) {
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
     } else {
+        const GuestArena::CensusTimer missCensus(GuestArena::CensusOperation::EpochMiss, GuestArena::CensusTimer::Pages(first, stop - first));
         const TimedAccess timed(CounterCollect, bytes);
         if (!walkHints(tracker, first, stop)) return 0;
         if (collectMemoEnabled()) threadHintMemo.entries[threadHintMemo.next++ % threadHintMemo.entries.size()] = {first, stop, epoch, unwatched, mapping};

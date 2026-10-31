@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <atomic>
@@ -217,7 +218,7 @@ void registerImage(const void* image) {
     bool registered = false;
     for (;;) {
         MEMORY_BASIC_INFORMATION memory{};
-        require(VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) == sizeof(memory), "cannot query a guest image");
+        require(GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) == sizeof(memory), "cannot query a guest image");
         if (memory.AllocationBase != image) break;
         require(memory.Type == MEM_IMAGE && (memory.State == MEM_COMMIT || memory.State == MEM_RESERVE), "unsupported guest image mapping");
         require(reinterpret_cast<std::uintptr_t>(memory.BaseAddress) == cursor && memory.RegionSize != 0 && memory.RegionSize <= std::numeric_limits<std::uintptr_t>::max() - cursor, "invalid guest image range");

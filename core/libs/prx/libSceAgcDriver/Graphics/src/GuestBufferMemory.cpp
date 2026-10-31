@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -1922,7 +1923,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     MEMORY_BASIC_INFORMATION refused{};
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return failedImport();
+        if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return failedImport();
         const auto protection = info.Protect & 0xffu;
         const bool pageWritable = (info.Type == MEM_PRIVATE || info.Type == MEM_IMAGE) && (protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_WRITECOPY);
         const bool pageReadOnly = info.Type != MEM_MAPPED && (protection == PAGE_READONLY || protection == PAGE_EXECUTE_READ);
@@ -2008,7 +2009,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
         for (std::uint64_t cursor = base; trace && cursor < base + bytes;) {
             MEMORY_BASIC_INFORMATION info{};
-            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) break;
+            if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) break;
             const auto regionEnd = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
             std::fprintf(stderr, "[gpu]   0x%llx+0x%llx state 0x%lx protect 0x%lx type 0x%lx allocation 0x%llx\n", static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(std::min(regionEnd, base + bytes) - cursor), info.State, info.Protect, info.Type, reinterpret_cast<unsigned long long>(info.AllocationBase));
             cursor = regionEnd;
@@ -3609,7 +3610,7 @@ ImportProbe ProbeImportWriteProtection(const Context& context) {
     const auto collect = [&](std::uint32_t& pages) {
         ULONG_PTR count = written.size();
         DWORD granularity = 0;
-        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(base), static_cast<SIZE_T>(bytes), written.data(), &count, &granularity) != 0) return false;
+        if (GuestArena::GuestArenaCensusGetWriteWatch_nid_no_patch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(base), static_cast<SIZE_T>(bytes), written.data(), &count, &granularity) != 0) return false;
         pages = static_cast<std::uint32_t>(count);
         return true;
     };
@@ -4631,6 +4632,7 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
 }
 
 void GuestBufferMemory::Upload(bool addressable) {
+    const AgcDriver::ArchB::Recorder::WatchScope watchCaller(AgcDriver::ArchB::Recorder::WatchCaller::Uploads);
     UploadPrepare(addressable);
     UploadFinish(addressable);
 }
@@ -4887,6 +4889,7 @@ void GuestBufferMemory::resolveOverlays() {
 }
 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
+    const AgcDriver::ArchB::Recorder::WatchScope watchCaller(AgcDriver::ArchB::Recorder::WatchCaller::Uploads);
     Require(!prepared && !uploaded, "guest memory was already uploaded");
     prepared = true;
     resolveOverlays();
@@ -5077,6 +5080,7 @@ void GuestBufferMemory::completeSpaceWrites() const {
 }
 
 void GuestBufferMemory::UploadFinish(bool addressable) {
+    const AgcDriver::ArchB::Recorder::WatchScope watchCaller(AgcDriver::ArchB::Recorder::WatchCaller::Uploads);
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
@@ -6156,6 +6160,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceRe
 }
 
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
+    const AgcDriver::ArchB::Recorder::WatchScope watchCaller(AgcDriver::ArchB::Recorder::WatchCaller::Uploads);
     ResidentBuffer::FlushChanged(context);
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

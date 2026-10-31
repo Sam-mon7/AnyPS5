@@ -821,7 +821,7 @@ extern "C" bool GuestCopyOut_nid_no_patch(void* destination, const void* source,
 #ifdef _WIN32
     for (auto address = start; address < start + bytes;) {
         MEMORY_BASIC_INFORMATION memory{};
-        if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT ||
+        if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<LPCVOID>(address), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT ||
             (memory.Protect & PAGE_GUARD) != 0 ||
             (memory.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) return false;
         address = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;

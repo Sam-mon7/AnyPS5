@@ -3,10 +3,63 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 
 // Guest virtual memory is placed inside one reserved arena below the PS5 application map limit
 // absolute address and breaks on host addresses outside that range.
 namespace GuestArena {
+
+enum class CensusOperation : std::uint8_t {
+    Query, QueryReset, Reset, VirtualQuery, VirtualProtect, Collection, Walk,
+    PageStamps, BlockStamps, CoarseStamps, EpochMemo, EpochMiss, Count
+};
+using CensusCallback = std::uint64_t (*)(CensusOperation, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, bool);
+extern "C" void GuestArenaSetCensusCallback_nid_no_patch(CensusCallback callback);
+extern "C" CensusCallback GuestArenaCensusCallback_nid_no_patch();
+
+class CensusTimer {
+public:
+    using Clock = std::chrono::steady_clock;
+    explicit CensusTimer(CensusOperation operation, std::uint64_t pages = 0) : callback(GuestArenaCensusCallback_nid_no_patch()), operation(operation), pages(pages) {
+        if (callback != nullptr) {
+            children = callback(CensusOperation::Count, 0, 0, 0, 0, false);
+            start = Clock::now();
+        }
+    }
+    ~CensusTimer() { Finish(); }
+    CensusTimer(const CensusTimer&) = delete;
+    CensusTimer& operator=(const CensusTimer&) = delete;
+    bool Active() const { return callback != nullptr; }
+    void Result(std::uint64_t covered, std::uint64_t dirty = 0, bool failed = false) {
+        pages = covered;
+        reported = dirty;
+        error = failed;
+    }
+    void Finish() {
+        if (callback == nullptr) return;
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+        callback(operation, pages, reported, ns, children, error);
+        callback = nullptr;
+    }
+    static std::uint64_t Pages(std::uint64_t address, std::uint64_t bytes) {
+        return bytes == 0 ? 0 : bytes / 4096 + ((address % 4096 + bytes % 4096 + 4095) / 4096);
+    }
+private:
+    CensusCallback callback;
+    CensusOperation operation;
+    std::uint64_t pages;
+    std::uint64_t reported = 0;
+    std::uint64_t children = 0;
+    bool error = false;
+    Clock::time_point start{};
+};
+
+#ifdef _WIN32
+extern "C" unsigned int GuestArenaCensusGetWriteWatch_nid_no_patch(unsigned long flags, void* address, std::size_t bytes, void** pages, std::uintptr_t* count, unsigned long* granularity);
+extern "C" unsigned int GuestArenaCensusResetWriteWatch_nid_no_patch(void* address, std::size_t bytes);
+extern "C" std::size_t GuestArenaCensusVirtualQuery_nid_no_patch(const void* address, void* info, std::size_t bytes);
+extern "C" int GuestArenaCensusVirtualProtect_nid_no_patch(void* address, std::size_t bytes, unsigned long protection, unsigned long* previous);
+#endif
 
 #ifdef ANYPS5_ENABLE_ASAN
 inline constexpr std::uintptr_t GuestAddressOffset = 0x0000100000000000ull;

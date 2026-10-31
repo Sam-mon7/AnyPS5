@@ -576,7 +576,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
         const auto access = FrameRangeAccess::Readable | (allocation->writable ? FrameRangeAccess::Writable : 0u) | (allocation->gpu ? FrameRangeAccess::Gpu : 0u);
         for (auto address = first; address < end;) {
             MEMORY_BASIC_INFORMATION info{};
-            if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), &info, sizeof(info)) == 0) throw std::runtime_error("frame capture: VirtualQuery failed inside the guest arena");
+            if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), &info, sizeof(info)) == 0) throw std::runtime_error("frame capture: VirtualQuery failed inside the guest arena");
             const auto regionEnd = std::min<std::uint64_t>(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
             if (info.State == MEM_COMMIT) {
                 Range range;

@@ -97,7 +97,7 @@ public:
                     invalidate(*mapped->second.page);
                 }
                 DWORD previous;
-                if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                if (!GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
                 cursor = stop;
             }
         }
@@ -166,7 +166,7 @@ public:
                 }
                 remember(freshRanges, base, base + runBytes);
                 DWORD previous;
-                if (protection != PAGE_READWRITE && !VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect resident guest pages");
+                if (protection != PAGE_READWRITE && !GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect resident guest pages");
                 done += runBytes;
                 continue;
             }
@@ -208,7 +208,7 @@ public:
             split(base, runBytes);
             mapRun(base, runBytes, section, offset + done);
             DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect shared guest pages");
+            if (!GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect shared guest pages");
             collectableRanges.clear();
             for (std::size_t at = 0; at < runBytes; at += pageBytes) {
                 auto& [slot, shared] = pages[at / pageBytes];
@@ -449,6 +449,7 @@ public:
 
     bool WritesClean(std::uintptr_t address, std::size_t bytes) {
         const CollectTimer timer;
+        const CensusTimer census(CensusOperation::Walk, CensusTimer::Pages(address, bytes));
         std::lock_guard lock(mutex);
         if (bytes == 0 || address + bytes < address || address + bytes > UINTPTR_MAX - 4095) return false;
         const auto end = (address + bytes + 4095) & ~std::uintptr_t{4095};
@@ -478,6 +479,7 @@ public:
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
         const CollectTimer timer;
+        const CensusTimer census(CensusOperation::Walk, CensusTimer::Pages(address, bytes));
         std::lock_guard lock(mutex);
         const auto capacity = *count;
         *count = 0;
@@ -761,9 +763,9 @@ private:
     };
 
     static UINT queryWrites(DWORD flags, void* address, SIZE_T bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
-        if (!profileWrites()) return GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        if (!profileWrites()) return GuestArena::GuestArenaCensusGetWriteWatch_nid_no_patch(flags, address, bytes, pages, count, granularity);
         const auto start = std::chrono::steady_clock::now();
-        const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        const auto result = GuestArena::GuestArenaCensusGetWriteWatch_nid_no_patch(flags, address, bytes, pages, count, granularity);
         timing.queryUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
         return result;
     }
@@ -789,7 +791,7 @@ private:
         auto next = written.begin();
         std::uintptr_t resetFrom = 0;
         const auto flushReset = [&](std::uintptr_t to) {
-            if (resetFrom != 0 && ResetWriteWatch(reinterpret_cast<void*>(resetFrom), to - resetFrom) != 0) fail("reset resident guest writes");
+            if (resetFrom != 0 && GuestArena::GuestArenaCensusResetWriteWatch_nid_no_patch(reinterpret_cast<void*>(resetFrom), to - resetFrom) != 0) fail("reset resident guest writes");
             resetFrom = 0;
         };
         for (auto at = first; at < stop; at += 4096) {
@@ -854,11 +856,11 @@ private:
         if (!map(section, GetCurrentProcess(), page, offset, sectionBytes, MEM_REPLACE_PLACEHOLDER, viewProtection, nullptr, 0)) fail("map shared guest page");
         if (!committed && query(base).State == MEM_RESERVE && !VirtualAlloc(page, viewBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
         DWORD previous;
-        if (!VirtualProtect(page, viewBytes, protection, &previous)) fail("protect shared guest page");
+        if (!GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(page, viewBytes, protection, &previous)) fail("protect shared guest page");
         if (viewBytes == pageBytes) return;
         void* zeros = reinterpret_cast<void*>(base + viewBytes);
         if (!allocate(GetCurrentProcess(), zeros, pageBytes - viewBytes, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) fail("replace guest placeholder past the end of a file with zero pages");
-        if (!VirtualProtect(zeros, pageBytes - viewBytes, protection, &previous)) fail("protect guest pages past the end of a file");
+        if (!GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(zeros, pageBytes - viewBytes, protection, &previous)) fail("protect guest pages past the end of a file");
     }
 
     void mapRun(std::uintptr_t base, std::size_t bytes, HANDLE section, std::uint64_t offset) {
@@ -897,7 +899,7 @@ private:
             if (!part.committed) continue;
             for (const auto [from, to] : {std::pair{part.base, std::min(part.end, at)}, std::pair{std::max(part.base, at), part.end}}) {
                 DWORD previous;
-                if (from < to && !VirtualProtect(reinterpret_cast<void*>(from), to - from, part.protection, &previous)) fail("protect a split run of shared guest pages");
+                if (from < to && !GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(reinterpret_cast<void*>(from), to - from, part.protection, &previous)) fail("protect a split run of shared guest pages");
             }
         }
     }
@@ -915,7 +917,7 @@ private:
         const auto start = run->first;
         const auto stop = run->second.end;
         DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
+        if (!GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
         const auto section = views.at(start).section;
         auto window = open(section->handle, views.at(start).offset, stop - start);
         if (query(reinterpret_cast<std::uintptr_t>(window.bytes)).State == MEM_RESERVE && !VirtualAlloc(window.bytes, stop - start, MEM_COMMIT, PAGE_READWRITE)) fail("commit direct memory pages");
@@ -952,7 +954,7 @@ private:
         const auto start = run->first;
         const auto stop = run->second.end;
         DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("open resident guest pages");
+        if (!GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("open resident guest pages");
         std::shared_ptr<Saved> saved;
         for (auto page = start; page < stop; page += pageBytes) {
             const auto found = views.find(page);
@@ -1050,7 +1052,7 @@ private:
             auto stop = sub + 1;
             while (stop < subpages && (mask & (1u << stop)) != 0 && stop * subpageBytes != viewBytes) ++stop;
             DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
+            if (!GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
             sub = stop;
         }
     }
@@ -1089,7 +1091,7 @@ private:
 #ifdef APS5_COUNT_MAPPING_QUERIES
         queries.fetch_add(1, std::memory_order_relaxed);
 #endif
-        if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) != sizeof(memory)) fail("query guest memory");
+        if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<void*>(address), &memory, sizeof(memory)) != sizeof(memory)) fail("query guest memory");
         return memory;
     }
 

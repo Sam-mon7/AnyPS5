@@ -6093,6 +6093,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     refreshTiming.Mark("setup");
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         AgcDriver::ArchB::Recorder::Timer snapshotTiming("Draw.Snapshot");
+        const AgcDriver::ArchB::Recorder::WatchScope watchCaller(AgcDriver::ArchB::Recorder::WatchCaller::SnapshotCollection);
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {

@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <cstdio>
@@ -76,7 +77,7 @@ struct Sampler {
         const auto* module = moduleOf(context.Rip - (leaf ? 0 : 1));
         if (module == nullptr) {
             MEMORY_BASIC_INFORMATION memory{};
-            if (VirtualQuery(reinterpret_cast<LPCVOID>(context.Rip), &memory, sizeof(memory)) != 0 && memory.Type == MEM_IMAGE) pendingModule = reinterpret_cast<std::uint64_t>(memory.AllocationBase);
+            if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<LPCVOID>(context.Rip), &memory, sizeof(memory)) != 0 && memory.Type == MEM_IMAGE) pendingModule = reinterpret_cast<std::uint64_t>(memory.AllocationBase);
             return DwarfFrames::Step::Failed;
         }
         DwarfFrames::Registers registers{context.Rax, context.Rdx, context.Rcx, context.Rbx, context.Rsi, context.Rdi, context.Rbp, context.Rsp, context.R8, context.R9, context.R10, context.R11, context.R12, context.R13, context.R14, context.R15, context.Rip};
@@ -305,7 +306,7 @@ void StartCallingThreadSampler(const char* path, std::jthread& slot) {
     sampler->keepStacks = true;
     const auto* block = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
     MEMORY_BASIC_INFORMATION stack{};
-    if (VirtualQuery(block->StackLimit, &stack, sizeof(stack)) != 0) {
+    if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(block->StackLimit, &stack, sizeof(stack)) != 0) {
         sampler->stackLow = reinterpret_cast<std::uint64_t>(stack.AllocationBase);
         sampler->stackHigh = reinterpret_cast<std::uint64_t>(block->StackBase);
     }

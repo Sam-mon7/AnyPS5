@@ -31,6 +31,69 @@
 #endif
 
 namespace GuestArena {
+#ifdef _WIN32
+UINT GuestArenaCensusGetWriteWatch_nid_no_patch(DWORD flags, void* address, SIZE_T bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
+    CensusTimer timer(flags & WRITE_WATCH_FLAG_RESET ? CensusOperation::QueryReset : CensusOperation::Query);
+    const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
+    if (timer.Active()) {
+        const auto error = GetLastError();
+        timer.Result(CensusTimer::Pages(reinterpret_cast<std::uintptr_t>(address), bytes), result == 0 ? *count : 0, result != 0);
+        timer.Finish();
+        SetLastError(error);
+    }
+    return result;
+}
+
+UINT GuestArenaCensusResetWriteWatch_nid_no_patch(void* address, SIZE_T bytes) {
+    CensusTimer timer(CensusOperation::Reset);
+    const auto result = ResetWriteWatch(address, bytes);
+    if (timer.Active()) {
+        const auto error = GetLastError();
+        timer.Result(CensusTimer::Pages(reinterpret_cast<std::uintptr_t>(address), bytes), 0, result != 0);
+        timer.Finish();
+        SetLastError(error);
+    }
+    return result;
+}
+
+SIZE_T GuestArenaCensusVirtualQuery_nid_no_patch(const void* address, void* data, SIZE_T bytes) {
+    auto* info = static_cast<MEMORY_BASIC_INFORMATION*>(data);
+    CensusTimer timer(CensusOperation::VirtualQuery);
+    const auto result = VirtualQuery(address, info, bytes);
+    if (timer.Active()) {
+        const auto error = GetLastError();
+        timer.Result(result == sizeof(*info) ? CensusTimer::Pages(reinterpret_cast<std::uintptr_t>(info->BaseAddress), info->RegionSize) : 0, 0, result == 0);
+        timer.Finish();
+        SetLastError(error);
+    }
+    return result;
+}
+
+BOOL GuestArenaCensusVirtualProtect_nid_no_patch(void* address, SIZE_T bytes, DWORD protection, DWORD* previous) {
+    CensusTimer timer(CensusOperation::VirtualProtect);
+    const auto result = VirtualProtect(address, bytes, protection, previous);
+    if (timer.Active()) {
+        const auto error = GetLastError();
+        timer.Result(CensusTimer::Pages(reinterpret_cast<std::uintptr_t>(address), bytes), 0, result == 0);
+        timer.Finish();
+        SetLastError(error);
+    }
+    return result;
+}
+#endif
+
+namespace {
+std::atomic<CensusCallback> censusCallback{nullptr};
+}
+
+void GuestArenaSetCensusCallback_nid_no_patch(CensusCallback callback) {
+    censusCallback.store(callback, std::memory_order_release);
+}
+
+CensusCallback GuestArenaCensusCallback_nid_no_patch() {
+    return censusCallback.load(std::memory_order_acquire);
+}
+
 namespace {
 
 std::atomic<void (*)(std::uintptr_t, std::size_t)> hostReadHook{nullptr};
@@ -183,7 +246,7 @@ private:
         std::uint32_t retries = 0;
         for (std::uintptr_t cursor = ArenaStart; cursor < end;) {
             MEMORY_BASIC_INFORMATION info{};
-            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "query the guest arena range");
+            if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "query the guest arena range");
             const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
             const auto first = info.State == MEM_FREE ? std::min(regionEnd, alignUp(cursor, granularity)) : regionEnd;
             const auto last = std::max(first, regionEnd & ~(granularity - 1));

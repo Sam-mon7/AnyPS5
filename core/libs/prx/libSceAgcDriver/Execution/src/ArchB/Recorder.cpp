@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include <algorithm>
@@ -16,6 +17,13 @@ constexpr const char* bucketNames[] = {"lookup_proof", "mutex_wait", "targets_pa
 constexpr const char* metricNames[] = {"calls", "continuations", "vulkan_calls", "vkcmd_calls", "descriptor_writes", "descriptor_elements", "image_elements", "buffer_elements", "descriptor_sets", "descriptor_binds", "pipeline_binds", "distinct_pipelines", "dynamic_calls", "push_calls", "draw_calls", "pass_begins", "pass_ends", "pass_continued", "barriers", "image_barriers", "layout_transitions", "snapshot_bytes", "binding_preparations", "binding_rewrites", "plain_stages", "ordered_access", "descriptor_set_requests", "snapshot_copied_bytes", "redundant_pipeline_binds", "redundant_dynamic_calls", "redundant_push_calls", "h3_prelock_targets_ns", "h3_prelock_lookup_ns", "h3_prelock_surfaces_ns", "h3_prelock_proof_ns", "h3_binding_setup_ns", "h3_binding_selection_ns", "h3_snapshot_words_ns", "h3_snapshot_eligibility_ns", "h3_snapshot_unwritten_ns", "h3_snapshot_collect_ns", "h3_snapshot_lookup_ns", "h3_snapshot_copy_ns", "h3_snapshot_keep_ns", "h3_complete_images_ns", "h3_complete_upload_ns", "h3_complete_bda_ns", "h3_complete_descriptors_ns", "h3_complete_proof_ns", "h3_prelock_target_ranges", "h3_prelock_target_bytes", "h3_prelock_surface_ranges", "h3_prelock_surface_bytes", "h3_prelock_walked_bytes", "h3_binding_allocations", "h3_binding_read_ranges", "h3_snapshot_guest_ranges", "h3_snapshot_moved_ranges", "h3_snapshot_word_ranges", "h3_snapshot_word_bytes", "h3_snapshot_word_reused", "h3_snapshot_unwritten_hits", "h3_snapshot_collects", "h3_snapshot_reusable_hits", "h3_snapshot_uploads", "h3_snapshot_allocations", "h3_snapshot_pending_queries", "h3_bindings_previous", "h3_bindings_same", "h3_bindings_changed", "h3_bindings_expired", "h3_collect_requests", "h3_collect_memo_hits", "h3_collect_failed_memo_hits", "h3_collect_walk_bytes", "h3_collect_refused", "h3_complete_builds"};
 constexpr const char* stateNames[] = {"pipeline", "descriptors", "targets", "dynamic", "push"};
 constexpr const char* outcomeNames[] = {"Unclassified", "Hit", "Miss"};
+constexpr std::array watchCallerNames{"other", "prelock_targets", "prelock_surfaces", "target_collection", "snapshot_collection", "proofs", "dispatch", "uploads", "presents"};
+constexpr std::array watchOperationNames{"query", "query_reset", "reset", "virtual_query", "virtual_protect", "collection", "walk", "page_stamps", "block_stamps", "coarse_stamps", "epoch_memo", "epoch_miss"};
+constexpr std::array watchMetricNames{"calls", "pages", "dirty", "errors", "self_ms", "inclusive_ms"};
+static_assert(watchCallerNames.size() == static_cast<std::size_t>(Recorder::WatchCaller::Count));
+static_assert(watchOperationNames.size() == static_cast<std::size_t>(GuestArena::CensusOperation::Count));
+std::array<std::array<std::atomic<double>, watchMetricNames.size()>, watchOperationNames.size()> unboundWatch{};
+static_assert(std::atomic<double>::is_always_lock_free);
 
 Recorder::Bucket bucketOf(std::string_view name, std::string_view stage, Recorder::Bucket fallback) {
     using B = Recorder::Bucket;
@@ -166,6 +174,7 @@ struct Recorder::Thread {
     ShaderEntry other;
     std::array<PhaseEntry, 1024> phases;
     std::array<CounterEntry, 512> counters;
+    std::array<std::array<std::array<Value, watchMetricNames.size()>, watchOperationNames.size()>, watchCallerNames.size()> watch;
     Value phaseOverflow;
     Value counterOverflow;
     struct Census {
@@ -215,6 +224,41 @@ void Recorder::Boundary(bool on, std::uint64_t sequence, Clock::time_point now) 
     s.on = on;
     s.sequence = sequence;
     enabled.store(on, std::memory_order_relaxed);
+    static const bool census = [] { const auto* value = std::getenv("APS5_ARCHB_WRITE_WATCH_CENSUS"); return value != nullptr && std::string_view(value) == "1"; }();
+    watchEnabled.store(on && census, std::memory_order_relaxed);
+    GuestArena::GuestArenaSetCensusCallback_nid_no_patch(on && census ? &watchEvent : nullptr);
+}
+
+std::uint64_t Recorder::watchEvent(GuestArena::CensusOperation operation, std::uint64_t pages, std::uint64_t dirty, std::uint64_t ns, std::uint64_t children, bool error) {
+    if (operation == GuestArena::CensusOperation::Count) return watchMeasuredNs;
+    const auto nested = watchMeasuredNs - children;
+    const auto self = ns > nested ? ns - nested : 0;
+    watchMeasuredNs += self;
+    if (!watchEnabled.load(std::memory_order_relaxed) || !Enabled()) return watchMeasuredNs;
+    auto caller = watchCaller;
+    if (caller == WatchCaller::Other) {
+        for (const auto* scope = currentScope; scope != nullptr; scope = scope->parent) {
+            const std::string_view name(scope->name);
+            if (name == "Resources.Proof" || name == "Resources.FullWalk") { caller = WatchCaller::Proofs; break; }
+            if (name == "Vulkan.Present" || name == "Vulkan.QueuePresent" || name == "Vulkan.Acquire") { caller = WatchCaller::Presents; break; }
+            if (name.find("Dispatch") != std::string_view::npos) { caller = WatchCaller::Dispatch; break; }
+        }
+        if (caller == WatchCaller::Other && currentWork != nullptr && currentWork->Identity().kind == Kind::Dispatch) caller = WatchCaller::Dispatch;
+    }
+    if (local == nullptr) {
+        auto& row = unboundWatch[static_cast<std::size_t>(operation)];
+        const std::array values{1.0, static_cast<double>(pages), static_cast<double>(dirty), error ? 1.0 : 0.0, static_cast<double>(self) / 1e6, static_cast<double>(ns) / 1e6};
+        for (std::size_t i = 0; i < values.size(); ++i) row[i].fetch_add(values[i], std::memory_order_relaxed);
+        return watchMeasuredNs;
+    }
+    auto& row = local->watch[static_cast<std::size_t>(caller)][static_cast<std::size_t>(operation)];
+    row[0].Add(1);
+    row[1].Add(static_cast<double>(pages));
+    row[2].Add(static_cast<double>(dirty));
+    row[3].Add(error ? 1 : 0);
+    row[4].Add(static_cast<double>(self) / 1e6);
+    row[5].Add(static_cast<double>(ns) / 1e6);
+    return watchMeasuredNs;
 }
 
 void Recorder::Scope::Begin(const char* scope, Clock::time_point now, Phase phase) {
@@ -461,6 +505,19 @@ Recorder::Snapshot Recorder::Collect(Clock::time_point now) {
                 result.threadCounters[t.name][name] += value;
             }
             result.counters["recorder_counter_overflow"] += t.counterOverflow.Take();
+            for (std::size_t caller = 0; caller < t.watch.size(); ++caller) {
+                for (std::size_t operation = 0; operation < t.watch[caller].size(); ++operation) {
+                    auto& row = t.watch[caller][operation];
+                    if (row[0].published.load(std::memory_order_relaxed) == 0) continue;
+                    const auto prefix = std::string("ww.") + watchCallerNames[caller] + "." + watchOperationNames[operation] + ".";
+                    for (std::size_t metric = 0; metric < row.size(); ++metric) {
+                        const auto name = prefix + watchMetricNames[metric];
+                        const auto value = row[metric].Take();
+                        result.counters[name] += value;
+                        result.threadCounters[t.name][name] += value;
+                    }
+                }
+            }
             for (std::size_t outcome = 0; outcome < t.census.size(); ++outcome) {
                 auto& row = t.census[outcome];
                 if (row.counters[0].local == 0 && row.counters[1].local == 0) continue;
@@ -509,6 +566,16 @@ Recorder::Snapshot Recorder::Collect(Clock::time_point now) {
             merge(result.threadShaders[t.name], other);
         }
     }
+    for (std::size_t operation = 0; operation < unboundWatch.size(); ++operation) {
+        auto& row = unboundWatch[operation];
+        for (std::size_t metric = 0; metric < row.size(); ++metric) {
+            const auto value = row[metric].exchange(0, std::memory_order_relaxed);
+            if (value == 0) continue;
+            const auto name = std::string("ww.other.") + watchOperationNames[operation] + "." + watchMetricNames[metric];
+            result.counters[name] += value;
+            result.threadCounters["unbound"][name] += value;
+        }
+    }
     std::sort(result.shaders.begin(), result.shaders.end(), [](const auto& a, const auto& b) { return cost(a) > cost(b); });
     for (std::size_t i = 40; i < result.shaders.size(); ++i) add(result.other, result.shaders[i]);
     if (result.shaders.size() > 40) result.shaders.resize(40);
@@ -527,7 +594,9 @@ std::string Recorder::Snapshot::Json() const {
         for (const auto& [name, value] : entries) {
             if (!first) out << ',';
             first = false;
-            out << quoted(name) << ':' << value;
+            out << quoted(name) << ':';
+            if (name.starts_with("ww.") && !name.ends_with("_ms")) out << static_cast<std::uint64_t>(value);
+            else out << value;
         }
         out << '}';
     };

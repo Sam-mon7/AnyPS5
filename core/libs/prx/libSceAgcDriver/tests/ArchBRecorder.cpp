@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "ArchBRecorderHandoff.hpp"
@@ -6,6 +7,10 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#undef near
+#endif
 
 using AgcDriver::ArchB::Recorder;
 using namespace std::chrono_literals;
@@ -266,6 +271,95 @@ void shaderTableOverflow() {
     near(sum(Recorder::Collect(start + 2s).total.ms), 0);
 }
 
+void writeWatchCensus(bool recorder, bool census) {
+#ifdef _WIN32
+    Recorder::Boundary(recorder, 0, Recorder::Clock::now());
+    const bool active = recorder && census;
+    require((GuestArena::GuestArenaCensusCallback_nid_no_patch() != nullptr) == active, "write-watch census gating failed");
+    const auto exercise = [](const char* role) {
+        Recorder::BindThread(role);
+        auto* memory = static_cast<volatile unsigned char*>(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE));
+        require(memory != nullptr, "write-watch allocation failed");
+        auto* base = const_cast<unsigned char*>(memory);
+        require(ResetWriteWatch(base, 65536) == 0, "initial reset failed");
+        for (unsigned caller = 0; caller < static_cast<unsigned>(Recorder::WatchCaller::Count); ++caller) {
+            const Recorder::WatchScope scope(static_cast<Recorder::WatchCaller>(caller));
+            memory[0] = 1;
+            memory[4096] = 2;
+            void* pages[16]{};
+            ULONG_PTR count = 16;
+            DWORD granularity = 0;
+            require(GuestArena::GuestArenaCensusGetWriteWatch_nid_no_patch(WRITE_WATCH_FLAG_RESET, base, 65536, pages, &count, &granularity) == 0 && count == 2, "query/reset changed dirty results");
+            count = 16;
+            require(GuestArena::GuestArenaCensusGetWriteWatch_nid_no_patch(0, base, 65536, pages, &count, &granularity) == 0 && count == 0, "reset left dirty pages");
+            memory[8192] = 3;
+            count = 16;
+            require(GuestArena::GuestArenaCensusGetWriteWatch_nid_no_patch(0, base, 65536, pages, &count, &granularity) == 0 && count == 1, "query missed a plain store");
+            require(GuestArena::GuestArenaCensusResetWriteWatch_nid_no_patch(base, 65536) == 0, "explicit reset failed");
+            MEMORY_BASIC_INFORMATION info{};
+            require(GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(base, &info, sizeof(info)) == sizeof(info), "page query failed");
+            DWORD previous = 0;
+            require(GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(base, 4096, PAGE_READONLY, &previous), "page protection failed");
+            require(GuestArena::GuestArenaCensusVirtualProtect_nid_no_patch(base, 4096, previous, &previous), "page restoration failed");
+            {
+                const GuestArena::CensusTimer outer(GuestArena::CensusOperation::Collection, 16);
+                const GuestArena::CensusTimer inner(GuestArena::CensusOperation::PageStamps, 2);
+                std::this_thread::sleep_for(1ms);
+            }
+        }
+        require(VirtualFree(base, 0, MEM_RELEASE), "fixture allocation release failed");
+    };
+    std::thread graphics([&] { exercise("queue worker 0x0"); });
+    std::thread compute([&] { exercise("queue worker 0x40"); });
+    graphics.join();
+    compute.join();
+    std::thread unbound([] {
+        void* pages[16]{};
+        ULONG_PTR count = 16;
+        DWORD granularity = 0;
+        require(GuestArena::GuestArenaCensusGetWriteWatch_nid_no_patch(0, reinterpret_cast<void*>(4096), 4096, pages, &count, &granularity) != 0, "invalid write-watch region succeeded");
+    });
+    unbound.join();
+    Recorder::BindThread("precision");
+    { const GuestArena::CensusTimer count(GuestArena::CensusOperation::PageStamps, 123456789); }
+    const auto result = Recorder::Collect(Recorder::Clock::now());
+    if (!active) {
+        for (const auto& [name, value] : result.counters) require(!name.starts_with("ww."), "disabled census published counters");
+        return;
+    }
+    require(result.Json().find("\"ww.other.page_stamps.pages\":123456789") != std::string::npos, "large census count lost precision in JSON");
+    near(result.threadCounters.at("unbound").at("ww.other.query.calls"), 1);
+    near(result.threadCounters.at("unbound").at("ww.other.query.errors"), 1);
+    require(!result.threadCounters.at("unbound").contains("ww.other.query.dirty"), "failed query counted input capacity as dirty pages");
+    for (const auto* role : {"queue worker 0x0", "queue worker 0x40"}) {
+        const auto& rows = result.threadCounters.at(role);
+        for (const auto* caller : {"other", "prelock_targets", "prelock_surfaces", "target_collection", "snapshot_collection", "proofs", "dispatch", "uploads", "presents"}) {
+            const auto prefix = std::string("ww.") + caller + ".";
+            near(rows.at(prefix + "query_reset.calls"), 1);
+            near(rows.at(prefix + "query_reset.pages"), 16);
+            near(rows.at(prefix + "query_reset.dirty"), 2);
+            near(rows.at(prefix + "query.calls"), 2);
+            near(rows.at(prefix + "query.pages"), 32);
+            near(rows.at(prefix + "query.dirty"), 1);
+            near(rows.at(prefix + "reset.calls"), 1);
+            near(rows.at(prefix + "reset.pages"), 16);
+            near(rows.at(prefix + "virtual_query.calls"), 1);
+            near(rows.at(prefix + "virtual_protect.calls"), 2);
+            near(rows.at(prefix + "collection.self_ms") + rows.at(prefix + "page_stamps.self_ms"), rows.at(prefix + "collection.inclusive_ms"));
+            require(rows.at(prefix + "query_reset.inclusive_ms") > 0, "OS timer did not record");
+        }
+    }
+    Recorder::Boundary(false, 1, Recorder::Clock::now());
+    require(GuestArena::GuestArenaCensusCallback_nid_no_patch() == nullptr, "recorder toggle left census active");
+    exercise("disabled");
+    for (const auto& [name, value] : Recorder::Collect(Recorder::Clock::now()).counters) if (name.starts_with("ww.")) near(value, 0);
+    require(GuestArena::CensusTimer::Pages(4095, 2) == 2 && GuestArena::CensusTimer::Pages(4096, 4096) == 1, "unaligned page accounting failed");
+#else
+    static_cast<void>(recorder);
+    static_cast<void>(census);
+#endif
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -278,6 +372,9 @@ int main(int argc, char** argv) {
         else if (name == "shader_table_overflow") shaderTableOverflow();
         else if (name == "refresh_census") refreshCensus(true);
         else if (name == "refresh_census_disabled") refreshCensus(false);
+        else if (name == "write_watch_census") writeWatchCensus(true, true);
+        else if (name == "write_watch_no_recorder") writeWatchCensus(false, true);
+        else if (name == "write_watch_no_switch") writeWatchCensus(true, false);
         else if (name == "hit_census") hitCensus(true);
         else if (name == "hit_census_disabled") hitCensus(false);
         else throw std::runtime_error("unknown test case");

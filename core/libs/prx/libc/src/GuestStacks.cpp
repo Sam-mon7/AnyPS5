@@ -50,7 +50,7 @@ bool RegisteredBounds(std::uintptr_t stackPointer, StackBounds& bounds) {
 
 bool HostBounds(std::uintptr_t stackPointer, StackBounds& bounds) {
     MEMORY_BASIC_INFORMATION memory{};
-    if (VirtualQuery(reinterpret_cast<const void*>(stackPointer), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT) return false;
+    if (GuestArena::GuestArenaCensusVirtualQuery_nid_no_patch(reinterpret_cast<const void*>(stackPointer), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT) return false;
     const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
     bounds = {base + memory.RegionSize, base, reinterpret_cast<std::uintptr_t>(memory.AllocationBase)};
     return true;

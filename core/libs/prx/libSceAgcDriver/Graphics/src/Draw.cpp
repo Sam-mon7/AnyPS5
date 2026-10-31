@@ -1356,6 +1356,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 }
 
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
+    const AgcDriver::ArchB::Recorder::WatchScope watchCaller(AgcDriver::ArchB::Recorder::WatchCaller::SnapshotCollection);
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
     if (recorder != nullptr && bytes != 0) {
@@ -1419,6 +1420,7 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
 }
 
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
+    const AgcDriver::ArchB::Recorder::WatchScope watchCaller(AgcDriver::ArchB::Recorder::WatchCaller::SnapshotCollection);
     const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
     InPlaceIndices indices;
     if (bytes < Recorder::KeptIndexRangeIndices * indexSize) {
@@ -2841,6 +2843,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     timing.Mark("index_upload");
     const int dumpLimit = prepared.dumpLimit = DumpTargetLimit();
     AgcDriver::ArchB::Recorder::Timer targetTiming("Draw.Targets");
+    AgcDriver::ArchB::Recorder::WatchScope targetCaller(AgcDriver::ArchB::Recorder::WatchCaller::TargetCollection);
     auto& targets = prepared.targets;
     targets.resize(state.colors.size());
     auto& targetViews = prepared.targetViews;
@@ -2951,6 +2954,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
     targetTiming.Finish();
+    targetCaller.Finish();
     resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.preparation);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
@@ -3545,6 +3549,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 
 DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe) {
     AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.Prelock");
+    AgcDriver::ArchB::Recorder::WatchScope watchCaller(AgcDriver::ArchB::Recorder::WatchCaller::PrelockTargets);
     DrawPreparation prepared;
     auto* census = AgcDriver::ArchB::Recorder::CurrentDraw();
     using M = AgcDriver::ArchB::Recorder::Metric;
@@ -3589,6 +3594,7 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         }
     }
     recorderTiming.Mark("targets");
+    watchCaller.Set(AgcDriver::ArchB::Recorder::WatchCaller::Other);
     std::shared_ptr<ShaderResources> cached;
     if (recipe != nullptr && recipe->device == context.device) {
         cached = recipe->templateRef.lock();
@@ -3598,8 +3604,10 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         cached = SharedResourceCache().Find(prepared.resourceKey);
     }
     recorderTiming.Mark("lookup");
+    watchCaller.Set(AgcDriver::ArchB::Recorder::WatchCaller::PrelockSurfaces);
     if (cached != nullptr && collect) cached->PrecollectSurfaces();
     recorderTiming.Mark("surfaces");
+    watchCaller.Set(AgcDriver::ArchB::Recorder::WatchCaller::Proofs);
     if (collect && residentTargets && context.detiler != nullptr && StorageTexture::DrawTargetPrelockEnabled()) {
         const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         prepared.targets.resize(state.colors.size());
@@ -3677,6 +3685,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // (FlushPending, the whole-surface collect and UnchangedSince, the key scan). An image gone
     // from the cache is a miss: the ordinary path looks up anew.
     AgcDriver::ArchB::Recorder::Timer targetTiming("Draw.Targets");
+    AgcDriver::ArchB::Recorder::WatchScope targetCaller(AgcDriver::ArchB::Recorder::WatchCaller::TargetCollection);
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
@@ -3706,6 +3715,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // key leaves to a hit repeated; a failure removes the template from the cache (the batch keeps
     // it) and the caller rebuilds.
     targetTiming.Finish();
+    targetCaller.Finish();
     auto resources = recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");

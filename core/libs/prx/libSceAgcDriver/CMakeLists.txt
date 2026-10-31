@@ -533,6 +533,16 @@ if(BUILD_TESTING)
         endif()
     endforeach()
 
+    if(WIN32)
+        foreach(w3Case IN ITEMS write_watch_census write_watch_no_recorder write_watch_no_switch)
+            add_test(NAME agc_archb_w3_${w3Case} COMMAND agc_archb_c09a_recorder_tests ${w3Case})
+            set_tests_properties(agc_archb_w3_${w3Case} PROPERTIES TIMEOUT 30
+                ENVIRONMENT "APS5_ARCHB_WRITE_WATCH_CENSUS=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endforeach()
+        set_tests_properties(agc_archb_w3_write_watch_no_switch PROPERTIES ENVIRONMENT "APS5_ARCHB_WRITE_WATCH_CENSUS=0")
+    endif()
+
     if(Python3_Interpreter_FOUND)
         add_test(NAME agc_archb_c09a_stats_reads_recorder COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBRecorderStats.py)
@@ -947,11 +957,9 @@ configure_windows_unwind(agc_locks_tests)
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
-        Execution/src/GuestMemory.cpp
-        Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_write_tracking_tests PRIVATE shader_recompiler_agc_driver libc)
+target_link_libraries(agc_write_tracking_tests PRIVATE libSceAgcDriver libc)
 set_target_properties(agc_write_tracking_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_write_tracking_tests)
 if(BUILD_TESTING)

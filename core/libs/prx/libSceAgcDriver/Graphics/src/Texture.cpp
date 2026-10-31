@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -2876,6 +2877,7 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
 }
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
+    const AgcDriver::ArchB::Recorder::WatchScope watchCaller(AgcDriver::ArchB::Recorder::WatchCaller::Uploads);
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));

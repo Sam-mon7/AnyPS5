@@ -12,12 +12,26 @@
 #include <span>
 #include <string>
 #include <vector>
+namespace GuestArena { enum class CensusOperation : std::uint8_t; }
 
 namespace AgcDriver::ArchB {
 
 class Recorder {
 public:
     using Clock = std::chrono::steady_clock;
+    enum class WatchCaller : std::uint8_t { Other, PrelockTargets, PrelockSurfaces, TargetCollection, SnapshotCollection, Proofs, Dispatch, Uploads, Presents, Count };
+    class WatchScope {
+    public:
+        explicit WatchScope(WatchCaller caller) : previous(watchCaller), active(watchEnabled.load(std::memory_order_relaxed)) { if (active) watchCaller = caller; }
+        ~WatchScope() { Finish(); }
+        WatchScope(const WatchScope&) = delete;
+        WatchScope& operator=(const WatchScope&) = delete;
+        void Set(WatchCaller caller) { if (active) watchCaller = caller; }
+        void Finish() { if (active) watchCaller = previous; active = false; }
+    private:
+        WatchCaller previous;
+        bool active;
+    };
     enum class Kind : std::uint8_t { Draw, Dispatch };
     enum class Phase : std::uint8_t { Prepare, Record, Proof, Bind, Inherit };
     enum class DrawOutcome : std::uint8_t { Unclassified, Hit, Miss };
@@ -143,6 +157,7 @@ public:
         bool Active() const { return active; }
         void Repeated(bool value) { repeated = value; }
     private:
+        friend class Recorder;
         Scope* parent = nullptr;
         Work* work = nullptr;
         const char* name = nullptr;
@@ -201,6 +216,10 @@ public:
     static void AddShader(Key key, std::uint64_t calls, const std::array<Clock::duration, 4>& elapsed);
 
 private:
+    static std::uint64_t watchEvent(GuestArena::CensusOperation operation, std::uint64_t pages, std::uint64_t dirty, std::uint64_t ns, std::uint64_t children, bool error);
+    inline static std::atomic<bool> watchEnabled{false};
+    inline static thread_local WatchCaller watchCaller = WatchCaller::Other;
+    inline static thread_local std::uint64_t watchMeasuredNs = 0;
     struct Thread;
     static Thread& thread();
     static Clock::duration heldTime(Clock::time_point now);
