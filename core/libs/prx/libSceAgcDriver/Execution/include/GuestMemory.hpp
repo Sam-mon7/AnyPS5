@@ -27,6 +27,8 @@ struct Commitment {
     bool whole = false;
 };
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable = false);
+// DescribeCommitted into the caller's vector (cleared first, its capacity kept); returns `whole`.
+bool DescribeCommittedInto(std::uint64_t address, std::size_t bytes, bool writable, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 void CopyGuestBytes(void* destination, const void* source, std::size_t bytes);
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment = 1);
 // Variants for resources in heaps the guest commits on demand (partially resident textures, GPU
@@ -82,6 +84,9 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
 bool UnchangedSinceClean(std::span<const UnchangedQuery> queries);
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
+// CollectCommittedWrites that fills `ranges` in place (keeping its capacity, for a reused scratch)
+// instead of replacing it with a fresh vector; the same ranges and generation, empty on 0.
+std::uint64_t CollectCommittedWritesInPlace(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 std::uint64_t WriteGeneration();
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written);
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);

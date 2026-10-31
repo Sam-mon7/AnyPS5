@@ -2,11 +2,13 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include <string>
 #include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 
 namespace AgcDriver::Graphics {
@@ -130,13 +132,15 @@ std::uint32_t TexelLevelDimension(std::uint32_t guestDimension, std::uint32_t le
     return std::max((std::max(guestDimension >> level, 1u) + texelScale - 1u) / texelScale, 1u);
 }
 
-std::vector<TileMipLayout> ComputeLinearMipLayout(std::uint32_t bytesPerElement, std::uint32_t texelWidth, std::uint32_t texelHeight, std::uint32_t width, std::uint32_t height, std::uint32_t mipCount) {
+// The mip layouts fill `mips` (one element per level, mipCount of them): a vector for the callers
+// that keep the chain, or stack storage for the size-only DescribeSurfaceGuestBytes.
+void FillLinearMipLayout(std::span<TileMipLayout> mips, std::uint32_t bytesPerElement, std::uint32_t texelWidth, std::uint32_t texelHeight, std::uint32_t width, std::uint32_t height) {
+    const auto mipCount = static_cast<std::uint32_t>(mips.size());
     const auto compressed = texelWidth != 1u || texelHeight != 1u;
     const auto elementsWidth0 = (width + texelWidth - 1u) / texelWidth;
     const auto elementsHeight0 = (height + texelHeight - 1u) / texelHeight;
     const auto blockWidth = CalcLinearBlockWidth(bytesPerElement);
 
-    std::vector<TileMipLayout> mips(mipCount);
     std::uint64_t offset = 0;
     for (auto level = mipCount; level-- > 0;) {
         const auto elementsLevelWidth = std::max(ShiftCeil(elementsWidth0, level), 1u);
@@ -162,10 +166,16 @@ std::vector<TileMipLayout> ComputeLinearMipLayout(std::uint32_t bytesPerElement,
         mip.tailY = 0;
         offset += size;
     }
+}
+
+std::vector<TileMipLayout> ComputeLinearMipLayout(std::uint32_t bytesPerElement, std::uint32_t texelWidth, std::uint32_t texelHeight, std::uint32_t width, std::uint32_t height, std::uint32_t mipCount) {
+    std::vector<TileMipLayout> mips(mipCount);
+    FillLinearMipLayout(mips, bytesPerElement, texelWidth, texelHeight, width, height);
     return mips;
 }
 
-std::vector<TileMipLayout> ComputeTiledMipLayout(TextureTileMode tileMode, std::uint32_t bytesPerElement, std::uint32_t texelWidth, std::uint32_t texelHeight, std::uint32_t width, std::uint32_t height, std::uint32_t mipCount) {
+void FillTiledMipLayout(std::span<TileMipLayout> mips, TextureTileMode tileMode, std::uint32_t bytesPerElement, std::uint32_t texelWidth, std::uint32_t texelHeight, std::uint32_t width, std::uint32_t height) {
+    const auto mipCount = static_cast<std::uint32_t>(mips.size());
     const auto block = GetBlockLayout(tileMode, bytesPerElement);
     const auto elementsWidth0 = (width + texelWidth - 1u) / texelWidth;
     const auto elementsHeight0 = (height + texelHeight - 1u) / texelHeight;
@@ -183,7 +193,6 @@ std::vector<TileMipLayout> ComputeTiledMipLayout(TextureTileMode tileMode, std::
         }
     }
 
-    std::vector<TileMipLayout> mips(mipCount);
     std::uint64_t blockSliceSize = 0;
 
     for (std::uint32_t level = 0; level < firstTailLevel; ++level) {
@@ -239,6 +248,11 @@ std::vector<TileMipLayout> ComputeTiledMipLayout(TextureTileMode tileMode, std::
         Require(mip.width != 0 && mip.height != 0, "computed a zero-sized tiled texture mip level");
         Require(mip.tiledSize != 0 && mip.linearSize != 0, "computed a zero-sized tiled texture mip level");
     }
+}
+
+std::vector<TileMipLayout> ComputeTiledMipLayout(TextureTileMode tileMode, std::uint32_t bytesPerElement, std::uint32_t texelWidth, std::uint32_t texelHeight, std::uint32_t width, std::uint32_t height, std::uint32_t mipCount) {
+    std::vector<TileMipLayout> mips(mipCount);
+    FillTiledMipLayout(mips, tileMode, bytesPerElement, texelWidth, texelHeight, width, height);
     return mips;
 }
 
@@ -254,6 +268,20 @@ std::vector<TileMipLayout> ComputeMipLayout(TextureTileMode tileMode, std::uint3
 
     if (tileMode == TextureTileMode::kLinear) return ComputeLinearMipLayout(bytesPerElement, texelWidth, texelHeight, width, height, mipCount);
     return ComputeTiledMipLayout(tileMode, bytesPerElement, texelWidth, texelHeight, width, height, mipCount);
+}
+
+std::span<const TileMipLayout> ComputeMipLayoutInto(MipLayoutStorage& storage, TextureTileMode tileMode, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t mipCount) {
+    Require(width != 0 && height != 0, "cannot compute mip layout for a zero-sized texture");
+    Require(mipCount != 0 && mipCount <= 16u, "texture mip count is out of range");
+
+    const auto bytesPerElement = BytesPerElement(format);
+    const auto texelWidth = BlockWidth(format);
+    const auto texelHeight = BlockHeight(format);
+
+    const auto mips = std::span<TileMipLayout>(storage.data(), mipCount);
+    if (tileMode == TextureTileMode::kLinear) FillLinearMipLayout(mips, bytesPerElement, texelWidth, texelHeight, width, height);
+    else FillTiledMipLayout(mips, tileMode, bytesPerElement, texelWidth, texelHeight, width, height);
+    return mips;
 }
 
 std::array<std::uint32_t, 3> ThickBlockExtent(TextureTileMode tileMode, std::uint32_t bytesPerElement) {
@@ -447,6 +475,21 @@ SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor) {
     return geometry;
 }
 
+std::uint64_t DescribeSurfaceGuestBytes(const GuestTextureResource& descriptor) {
+    // Multisampled and 3D surfaces (rare) take DescribeSurface itself, checks and all.
+    const bool multisampled = descriptor.samples != 1u && descriptor.tileMode != TextureTileMode::kLinear;
+    if (multisampled || descriptor.dimension == TextureDimension::k3D || (descriptor.dimension == TextureDimension::k2DMsaa && descriptor.tileMode != TextureTileMode::kLinear)) return DescribeSurface(descriptor).guestBytes;
+    // DescribeSurface's thin path, with the chain on the stack.
+    MipLayoutStorage storage{};
+    const auto mips = ComputeMipLayoutInto(storage, descriptor.tileMode, descriptor.format, descriptor.width, descriptor.height, descriptor.mipCount);
+    const bool layered = descriptor.dimension == TextureDimension::k2DArray || descriptor.dimension == TextureDimension::k1DArray || descriptor.dimension == TextureDimension::kCube;
+    return ComputeSurfaceSize(mips, layered ? descriptor.depthOrLastArray + 1u : 1u);
+}
+
+std::uint64_t SurfaceGuestBytes(const GuestTextureResource& descriptor) {
+    return AgcDriver::ArchB::AllocChurnActive() ? DescribeSurfaceGuestBytes(descriptor) : DescribeSurface(descriptor).guestBytes;
+}
+
 bool LevelsFitAllocation(const GuestTextureResource& surface, std::uint32_t levels) {
     Require(levels >= surface.mipCount && levels <= 16u, "a view's mip chain must cover the surface's levels and at most 16");
     auto view = surface;
@@ -514,7 +557,7 @@ std::vector<TileMipLayout> ComputeElementMipLayout(TextureTileMode tileMode, std
     return ComputeTiledMipLayout(tileMode, bytesPerElement, 1u, 1u, width, height, mipCount);
 }
 
-std::uint64_t ComputeSurfaceSize(const std::vector<TileMipLayout>& mips, std::uint32_t arrayLayers) {
+std::uint64_t ComputeSurfaceSize(std::span<const TileMipLayout> mips, std::uint32_t arrayLayers) {
     Require(!mips.empty(), "cannot compute surface size for an empty mip chain");
     Require(arrayLayers != 0, "cannot compute surface size for zero array layers");
 

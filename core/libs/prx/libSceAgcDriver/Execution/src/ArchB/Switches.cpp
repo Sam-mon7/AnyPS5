@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 
 #include <array>
 #include <atomic>
@@ -46,6 +47,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixPipelineStateReuse, "FIX_PIPELINE_STATE_REUSE", false, true, {}},
     {Feature::FixVqMemo, "FIX_VQ_MEMO", false, true, {}},
     {Feature::FixAllocDepot, "FIX_ALLOC_DEPOT", false, false, {}},
+    {Feature::FixAllocChurn, "FIX_ALLOC_CHURN", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
@@ -219,6 +221,22 @@ void Switches::Initialize() {
 bool Switches::Enabled(Feature feature) {
     Initialize();
     return values.at(static_cast<std::size_t>(feature)).load(std::memory_order_acquire);
+}
+
+namespace {
+struct AllocChurnSlot {};
+}
+
+bool AllocChurnActive() noexcept {
+    return HostThreadSlot<bool, AllocChurnSlot>::Get();
+}
+
+AllocChurnScope::AllocChurnScope(bool active) noexcept : previous(HostThreadSlot<bool, AllocChurnSlot>::Get()) {
+    HostThreadSlot<bool, AllocChurnSlot>::Set(active);
+}
+
+AllocChurnScope::~AllocChurnScope() {
+    HostThreadSlot<bool, AllocChurnSlot>::Set(previous);
 }
 
 void Switches::CountUpperBoundHit(Feature feature) {
