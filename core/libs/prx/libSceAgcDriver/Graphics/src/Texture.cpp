@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -4547,11 +4548,12 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         try {
             recorder->Reap();
             if (const auto writer = recorder->PendingWriterSerial(address, bytes, ownNotes); writer == recorder->OpenSerial()) {
-                Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
+                Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3, __builtin_return_address(0));
                 if (profile) ++ThreadLookupOutcomes().work[LookupOutcomes::FlushWaits];
                 recorder->Sync();
             } else if (writer != 0) {
                 if (profile) ++ThreadLookupOutcomes().work[LookupOutcomes::FlushWaits];
+                Recorder::AnnounceSyncSite(__builtin_return_address(0));
                 recorder->FinishUpTo(writer);
             }
         } catch (...) {
@@ -4841,13 +4843,20 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
     return stored;
 }
 
-void StorageTexture::PrepareReadbackBeforeLabel() {
+void StorageTexture::PrepareReadbackBeforeLabel(bool computeSync) {
     static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
     if (disabled) return;
     static const bool unlocked = std::getenv("APS5_UNLOCKED_LABEL_WAITS") != nullptr;
-    if (!unlocked || GuestMemory::GpuMutex().DepthOnThisThread() != 1 || Recorder::InCompletion()) return;
+    if (!unlocked && !computeSync) return;
+    if (GuestMemory::GpuMutex().DepthOnThisThread() != 1 || Recorder::InCompletion()) {
+        if (computeSync) ArchB::Recorder::Count("fix_csync_refused_nested");
+        return;
+    }
     auto* recorder = Recorder::Active();
-    if (recorder == nullptr || !recorder->HasTimeline()) return;
+    if (recorder == nullptr || (!computeSync && !recorder->HasTimeline())) {
+        if (computeSync) ArchB::Recorder::Count("fix_csync_refused_recorder");
+        return;
+    }
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     {
         auto& pending = Pending();
@@ -4873,7 +4882,10 @@ void StorageTexture::PrepareReadbackBeforeLabel() {
         if (flush.size() != 1 || ExistingHostImportFor(flush.front()->context, flush.front()->descriptor.baseAddress, static_cast<std::size_t>(flush.front()->guestBytes)) == nullptr) ownNotes.clear();
         target = std::max(target, recorder->PendingWriterSerial(address, bytes, ownNotes));
     }
-    if (target != 0) static_cast<void>(recorder->FinishUpToUnlocked(target));
+    if (target != 0) {
+        if (computeSync) static_cast<void>(recorder->FinishComputeSyncUnlocked(target));
+        else static_cast<void>(recorder->FinishUpToUnlocked(target));
+    }
 }
 
 void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {

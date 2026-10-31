@@ -27,6 +27,7 @@ enum class Feature : std::uint8_t {
     FixImageTableBitScanKeys,
     FixBufferBaseRefresh,
     FixAllocChurn,
+    FixComputeSyncUnlocked,
     Count
 };
 

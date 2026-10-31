@@ -46,6 +46,7 @@ namespace AgcDriver::Graphics {
 namespace {
 
 Recorder* activeRecorder = nullptr;
+thread_local bool computeSyncEnabled = false;
 std::atomic<std::uint64_t> computeHostEpoch{0};
 std::atomic<std::uint64_t> computeChains{0}, computeChainDispatches{0}, computeChainBarriers{0}, computeChainHazards{0}, computeChainBoundaries{0}, computeChainRejected{0};
 std::array<std::atomic<std::uint64_t>, 3> computeChainAvoided{};
@@ -196,6 +197,11 @@ void CountSiteWait(double ms) {
     auto& entry = syncSites[activeSyncSite];
     ++entry.batches;
     entry.waitedMs += ms;
+}
+
+void CountComputeSyncWait(int source, bool signaled) {
+    static_cast<void>(source);
+    if (computeSyncEnabled && !signaled) ArchB::Recorder::Count(GuestMemory::GpuMutex().DepthOnThisThread() > 1 ? "fix_csync_refused_nested" : "fix_csync_refused_mutable_caller");
 }
 
 // The sites by wait, longest first, as "source@+offset syncs/batches/wait" (offsets symbolize with
@@ -3100,6 +3106,11 @@ void Recorder::BoundKeptBytes() {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
+    struct Site {
+        std::size_t previous;
+        ~Site() { activeSyncSite = previous; }
+    } site{activeSyncSite};
+    if (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) BeginSyncSite(4, __builtin_return_address(0));
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
@@ -4249,6 +4260,90 @@ void Recorder::FlushDeferredReleases() {
     ReleaseDeferredKeeps();
 }
 
+Recorder::ComputeSyncScope::ComputeSyncScope(bool enabled) : previous(std::exchange(computeSyncEnabled, enabled)) {}
+
+Recorder::ComputeSyncScope::~ComputeSyncScope() {
+    computeSyncEnabled = previous;
+}
+
+bool Recorder::ComputeSyncEnabled() {
+    return computeSyncEnabled;
+}
+
+bool Recorder::FinishComputeSyncUnlocked(std::uint64_t serial) {
+    auto& mutex = GuestMemory::GpuMutex();
+    if (!computeSyncEnabled) return false;
+    if (mutex.DepthOnThisThread() != 1 || completionDepth != 0 || !finishing.empty()) {
+        ArchB::Recorder::Count("fix_csync_refused_nested");
+        return false;
+    }
+    if (serial == 0) return true;
+    if (serial > submissions) Submit();
+    const auto target = std::find_if(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return batch->serial == serial; });
+    if (target == inFlight.end()) {
+        ArchB::Recorder::Count("fix_csync_refused_batch");
+        return false;
+    }
+    if (fenceStatus((*target)->fence) == VK_SUCCESS) {
+        ArchB::Recorder::Count("fix_csync_refused_signaled");
+        return false;
+    }
+    const auto myId = id;
+    const auto device = context.device;
+    const auto fence = (*target)->fence;
+    const bool wasActive = Active() == this;
+    const auto waitFences = function(waitForFences, "vkWaitForFences");
+    if ((*target)->fenceWaiters == nullptr) (*target)->fenceWaiters = std::make_shared<std::atomic<unsigned>>(0);
+    const auto pins = (*target)->fenceWaiters;
+    const auto snapshot = PendingWriteSnapshot();
+    const auto lockSite = GuestMemory::GpuLockHoldSite();
+    auto start = std::chrono::steady_clock::now();
+    auto waited = start;
+    VkResult result = VK_SUCCESS;
+    std::exception_ptr failure;
+    {
+        const UnlockedWaiter waiter{myId};
+        struct Pin {
+            std::shared_ptr<std::atomic<unsigned>> count;
+            explicit Pin(std::shared_ptr<std::atomic<unsigned>> value) : count(std::move(value)) { count->fetch_add(1, std::memory_order_acq_rel); }
+            ~Pin() { count->fetch_sub(1, std::memory_order_acq_rel); }
+        } pin{pins};
+        mutex.unlock();
+        start = std::chrono::steady_clock::now();
+        try {
+            Timeline::GpuWaitScope timelineWait(serial, myId);
+            result = waitFences(device, 1, &fence, VK_TRUE, 5'000'000'000ull);
+            for (int seconds = 5; result == VK_TIMEOUT; seconds += 5) {
+                std::fprintf(stderr, "[gpu] compute sync batch %llu still running after %d s\n", static_cast<unsigned long long>(serial), seconds);
+                result = waitFences(device, 1, &fence, VK_TRUE, 5'000'000'000ull);
+            }
+            timelineWait.result = static_cast<std::uint32_t>(result);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        waited = std::chrono::steady_clock::now();
+    }
+    GuestMemory::TagGpuLockSite(lockSite);
+    mutex.lock();
+    ArchB::Recorder::Count("fix_csync_unlocked_waits");
+    const auto ms = std::chrono::duration<double, std::milli>(waited - start).count();
+    ArchB::Recorder::Count("fix_csync_unlocked_ms", ms);
+    ArchB::Recorder::Count("fix_csync_relock_ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waited).count());
+    GuestMemory::NoteUnlockedGpuWait(lockSite, ms);
+    GuestMemory::BumpCollectEpoch();
+    if (!RecorderAlive(myId) || (wasActive && Active() != this)) {
+        ArchB::Recorder::Count("fix_csync_torn_down");
+        throw std::runtime_error("AGC compute sync recorder was torn down or replaced during the wait");
+    }
+    if (failure) std::rethrow_exception(failure);
+    Check(result, "vkWaitForFences compute sync");
+    const auto owned = std::find_if(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return batch->serial == serial; });
+    if (owned != inFlight.end() && ((*owned)->fence != fence || (*owned)->fenceWaiters != pins)) throw std::runtime_error("AGC compute sync batch changed during the wait");
+    if (PendingWriteSnapshot() != snapshot) ArchB::Recorder::Count("fix_csync_pending_changed");
+    FinishUpTo(serial);
+    return true;
+}
+
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     EndComputeChain();
     if (bytes == 0) return;
@@ -4560,7 +4655,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         const auto waitStart = std::chrono::steady_clock::now();
         // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
-        const bool signaledAtStart = !profile || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
+        const bool signaledAtStart = !(profile || computeSyncEnabled) || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
+        CountComputeSyncWait(source, signaledAtStart);
         struct Report {
             bool enabled;
             int source;
@@ -4723,6 +4819,9 @@ void Recorder::removeLabels(Batch& batch) {
 }
 
 void Recorder::release(Batch& batch) noexcept {
+    if (batch.fenceWaiters != nullptr) {
+        while (batch.fenceWaiters->load(std::memory_order_acquire) != 0) std::this_thread::yield();
+    }
     if (DrawProfiled()) {
         auto& profile = WaitLabels();
         std::lock_guard lock(profile.mutex);

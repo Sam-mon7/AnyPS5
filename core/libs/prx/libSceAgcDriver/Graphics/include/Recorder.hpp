@@ -271,6 +271,17 @@ public:
     // front only; tolerates batches another thread finished meanwhile. Later batches stay in flight.
     void FinishUpTo(std::uint64_t serial);
     bool FinishUpToUnlocked(std::uint64_t serial);
+    class ComputeSyncScope {
+    public:
+        explicit ComputeSyncScope(bool enabled);
+        ~ComputeSyncScope();
+        ComputeSyncScope(const ComputeSyncScope&) = delete;
+        ComputeSyncScope& operator=(const ComputeSyncScope&) = delete;
+    private:
+        bool previous;
+    };
+    static bool ComputeSyncEnabled();
+    bool FinishComputeSyncUnlocked(std::uint64_t serial);
     // Submits and waits for every batch, running completions in order.
     void Sync();
     void CountSamples();
@@ -612,6 +623,7 @@ private:
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
+        std::shared_ptr<std::atomic<unsigned>> fenceWaiters;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;

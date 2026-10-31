@@ -50,6 +50,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixImageTableBitScanKeys, "FIX_IMAGE_TABLE_BITSCAN_KEYS", false, true, {}},
     {Feature::FixBufferBaseRefresh, "FIX_BUFFER_BASE_REFRESH", false, true, {}},
     {Feature::FixAllocChurn, "FIX_ALLOC_CHURN", false, true, {}},
+    {Feature::FixComputeSyncUnlocked, "FIX_COMPUTE_SYNC_UNLOCKED", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

@@ -1,5 +1,7 @@
 # Environment variables
 
+The ArchB switch table also constructs runtime environment names from APS5_ARCHB_ and each feature name. APS5_ARCHB_FIX_COMPUTE_SYNC_UNLOCKED=1 enables fence waits without the GPU mutex before compute dispatch label recording; it defaults to off and is sampled once per dispatch. Fence lifetime is retained through the wait. Completion, pending-write publication and the subsequent label readback rescan run under the mutex. Nested waits, resource-build waits and depth-conversion waits retain their locked path. With the recorder enabled, `fix_csync_*` counters report unlocked waits, wait and relock milliseconds, refusals and teardown.
+
 The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetting`, `MaskFromEnvironment`, `EnvInt`, `GetEnvironmentVariableA`, `GetEnvironmentVariableW` with a wide literal, `configured`, `PipelineSwitch`, `environmentCount`, `EnvironmentNumber` and `addWideString` (the wide names the Windows entry stub reads). This table lists every `APS5_*` and `ANYPS5_*` name it reads, its kind, the value used when it is unset and what it does, one table per library. Regenerate the names with `python3 tools/env_reference.py --table`; the Conventions check fails when a name the code reads has no row here, or a row's name is no longer read.
 
 ### core/libs

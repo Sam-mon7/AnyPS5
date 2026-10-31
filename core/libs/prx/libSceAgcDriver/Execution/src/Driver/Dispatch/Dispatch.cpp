@@ -166,6 +166,7 @@ bool Driver::pipelineDispatch() {
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     const bool imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     const bool imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
+    const bool computeSync = ArchB::Switches::Enabled(ArchB::Feature::FixComputeSyncUnlocked) && submission.queue != 0;
     const bool feedbackMask = ArchB::Switches::Enabled(ArchB::Feature::FixTsharpFeedbackMask);
     // APS5_ARCHB_FIX_ALLOC_CHURN, once per dispatch (the pipelined commit takes the same value).
     const bool allocChurn = ArchB::Switches::Enabled(ArchB::Feature::FixAllocChurn);
@@ -624,7 +625,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, allocChurn, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion] {
+        DrawPipeline::Queue0().Enqueue([this, allocChurn, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion, computeSync] {
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             const ArchB::AllocChurnScope allocChurnScope(allocChurn);
             PerformanceTimer recorderTiming("Driver.DispatchCommit");
@@ -642,6 +643,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     if (recipeHit == nullptr || VulkanDevice::VerifyRecipes() || htileClearCompletion.has_value()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    Graphics::Recorder::ComputeSyncScope computeSyncScope(computeSync);
                     recordLabelsForPacket(localDevice.get(), queueId);
                     if (noteWrites && writerKeyedEvidence() && !writersNoted) {
                         noteWrittenBuffers(address, queueId, compiledCommit);
@@ -742,6 +744,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         phaseTiming.Phase(PhaseLockWait);
+        Graphics::Recorder::ComputeSyncScope computeSyncScope(computeSync);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(PhaseLabels);
