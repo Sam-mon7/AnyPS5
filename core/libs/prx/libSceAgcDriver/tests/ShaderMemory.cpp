@@ -2580,7 +2580,7 @@ void verifyImageTableContentReuse(bool identityOnly) {
     require(otherVariant != baseline && !same(*otherVariant, *baseline) && same(*otherVariant, ShaderRecompiler::ResourceMaterializer::ResolveImageTables(otherInfo, snapshot)), "image table content reuse: distinct compiled variants shared a resolution");
 }
 
-void verifyTableSnapshotReuse() {
+void verifyTableSnapshotReuse(bool snapshotIndex = false) {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
     constexpr std::uint32_t Records = 4096;
@@ -2624,7 +2624,10 @@ void verifyTableSnapshotReuse() {
         const auto suppliedBefore = AgcDriver::ShaderMemory::Supplies();
         Outcome outcome;
         AgcDriver::ShaderMemory memory({}, pending);
+        ImageTableSnapshotCounts counts;
+        memory.SetImageTableSnapshotReuse(snapshotIndex, &counts);
         outcome.tables = memory.Capture(request)->snapshot.tables;
+        if (snapshotIndex) require(counts.verified == (counts.reused != 0u || counts.pageReused != 0u ? counts.calls : 0u) && counts.verifyMismatches == 0u, "snapshot indexing: rebuilt snapshot differs after invalidation");
         const auto regions = memory.Regions();
         const auto suppliedAfter = AgcDriver::ShaderMemory::Supplies();
         outcome.supplied = {suppliedAfter.shared - suppliedBefore.shared, suppliedAfter.copied - suppliedBefore.copied, suppliedAfter.spilled - suppliedBefore.spilled};
@@ -2994,6 +2997,94 @@ void verifyTableSnapshotReuse() {
     const auto pagedRemapped = capture(pagedRequest, paged, PagedBytes, nullptr);
     require(pagedRemapped.reuse.unwritten == 0u && pagedRemapped.reuse.shared == 0u && pagedRemapped.reuse.columns == 1u && !sharesColumn(pagedRemapped, pagedFresh) && heldRecords(pagedRemapped, paged, PagedRecords), "table snapshot reuse: a table mapped again with new contents was not read again");
     std::cout << "table snapshot reuse " << (watched ? "with" : "without") << " write watching passed\n";
+}
+
+void verifyImageTableSnapshotRecords() {
+    using namespace ShaderRecompiler;
+    alignas(4096) static std::array<std::uint32_t, 2048> words;
+    const auto descriptor = TableT(reinterpret_cast<void*>(0x100000000ull), TableFormat8888UNorm, TableType2D);
+    for (std::size_t record = 0; record < words.size() / 8u; ++record) std::copy(descriptor.begin(), descriptor.end(), words.begin() + record * 8u);
+    struct Memory {
+        std::span<const std::uint32_t> words;
+        bool mapped = true;
+    } memory{words};
+    const auto base = reinterpret_cast<std::uintptr_t>(words.data());
+    IrValue low(IrOpcode::Void, IrType::U32, 0u), high(IrOpcode::Void, IrType::U32, 1u);
+    low.SetImmediateU32(static_cast<std::uint32_t>(base));
+    high.SetImmediateU32(static_cast<std::uint32_t>(base >> 32u));
+    IrResourcePlan plan;
+    plan.srtPlanComplete = true;
+    plan.resourceTrackingComplete = true;
+    plan.userDataCount = 0u;
+    plan.shaderHash = 1u;
+    DescriptorSource pointer;
+    pointer.dwordCount = 2u;
+    pointer.dwords[0] = &low;
+    pointer.dwords[1] = &high;
+    plan.descriptorSources.push_back(pointer);
+    DescriptorSource source;
+    source.dwordCount = 8u;
+    source.tableColumn = TableColumn{};
+    source.tableColumn->address = true;
+    source.tableColumn->stride = 32u;
+    source.tableColumn->dwordCount = 8u;
+    source.tableColumn->maxKey = 255u;
+    plan.descriptorSources.push_back(source);
+    ImageResource image;
+    image.source = 1u;
+    image.table = 0u;
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.dimension = RdnaImageDimension::Dim2D;
+    image.read = true;
+    plan.info.images.push_back(image);
+    ResourceMaterializer::PrepareImageModes(plan.info);
+    SrtRuntime runtime;
+    runtime.userContext = &memory;
+    runtime.accessible = [](void* context, std::uint64_t address, std::uint64_t bytes) {
+        const auto& memory = *static_cast<const Memory*>(context);
+        const auto begin = reinterpret_cast<std::uintptr_t>(memory.words.data());
+        return memory.mapped && address >= begin && address - begin <= memory.words.size_bytes() && bytes <= memory.words.size_bytes() - (address - begin);
+    };
+    runtime.readMemory = [](void* context, std::uint64_t address, std::uint32_t* out) {
+        const auto& memory = *static_cast<const Memory*>(context);
+        const auto begin = reinterpret_cast<std::uintptr_t>(memory.words.data());
+        if (!memory.mapped || address < begin || address - begin >= memory.words.size_bytes() || (address - begin) % 4u != 0u) return false;
+        *out = memory.words[(address - begin) / 4u];
+        return true;
+    };
+    runtime.imageTableSnapshotReuse = true;
+    runtime.verifyImageTableSnapshotReuse = true;
+    ImageTableSnapshotCounts counts;
+    runtime.imageTableCounts = &counts;
+    const auto capture = [&] {
+        counts = {};
+        ResourceSnapshot snapshot;
+        ResourceMaterializer{}.Materialize(plan, runtime, snapshot);
+        require(counts.verifyMismatches == 0u, "snapshot indexing: rebuilt snapshot mismatch");
+        return snapshot.tables;
+    };
+    const auto first = capture();
+    require(counts.reused == 255u && counts.rebuilt == 1u && counts.noPrevious == 1u && counts.pageReused > 250u && counts.verified == 1u, "snapshot indexing: repeated records or page lookups were rebuilt");
+    require(first.tables.at(0).words.size() == 1u, "snapshot indexing: equal records have different indices");
+    words[8] ^= 1u;
+    const auto changed = capture();
+    require(changed != first && counts.changed > 0u, "snapshot indexing: changed record was reused");
+    runtime.imageTableSnapshotReuse = false;
+    require(capture() == changed && counts.reused == 0u && counts.pageReused == 0u && counts.verified == 0u, "snapshot indexing: off path consumed local reuse state");
+    runtime.imageTableSnapshotReuse = true;
+    require(capture() == changed, "snapshot indexing: on/off/on changed the snapshot");
+    plan.shaderHash = 2u;
+    plan.descriptorSources[1].tableColumn->stride = 64u;
+    plan.descriptorSources[1].tableColumn->maxKey = 127u;
+    const auto otherPlan = capture();
+    require(otherPlan.tables.at(0).keys == 128u && otherPlan.tables.at(0).words.size() == 1u, "snapshot indexing: another plan reused record indices");
+    memory.mapped = false;
+    if (std::getenv("APS5_IMAGE_TABLE_STRICT") != nullptr) {
+        expectFailure([&] { static_cast<void>(capture()); }, "APS5_IMAGE_TABLE_STRICT", "snapshot indexing: strict mode accepted an inaccessible table");
+    } else {
+        const auto unmapped = capture();
+        require(unmapped != otherPlan && counts.pageQueries != 0u && counts.reused == 0u, "snapshot indexing: a prior page lookup survived a mapping change");
+    }
 }
 
 std::atomic<int> tableRacePhase{0};
@@ -9123,6 +9214,14 @@ int main(int argc, char** argv) {
             verifyWaterfallImageTable();
             verifySplitWaterfallImageTable();
             std::cout << "Image table keys, maps, records and registration passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--image-table-snapshot-records") {
+            verifyImageTableSnapshotRecords();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--image-table-snapshot-rules") {
+            verifyTableSnapshotReuse(true);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--table-snapshot-reuse") {

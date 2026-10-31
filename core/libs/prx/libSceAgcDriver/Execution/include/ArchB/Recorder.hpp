@@ -122,5 +122,7 @@ private:
 extern "C" void AgcDriverRecorderScopeBegin_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* name, std::int64_t now, std::uint8_t phase);
 extern "C" void AgcDriverRecorderScopeMark_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* stage, std::int64_t now);
 extern "C" void AgcDriverRecorderScopeEnd_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, std::int64_t now);
+extern "C" void AgcDriverRecorderReplayBegin_nid_no_patch();
+extern "C" void AgcDriverRecorderReplayEnd_nid_no_patch(std::uint64_t pass, std::uint64_t frames);
 
 #endif

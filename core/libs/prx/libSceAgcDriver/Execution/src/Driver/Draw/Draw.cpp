@@ -143,6 +143,7 @@ struct DrawTail {
     bool feedbackMask = false;
     bool pipelineStateReuse = false;
     bool memoVirtualQuery = false;
+    bool imageTableSnapshotReuse = false;
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
@@ -432,6 +433,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.feedbackMask = ArchB::Switches::Enabled(ArchB::Feature::FixTsharpFeedbackMask);
     tail.pipelineStateReuse = ArchB::Switches::Enabled(ArchB::Feature::FixPipelineStateReuse);
     tail.memoVirtualQuery = ArchB::Switches::Enabled(ArchB::Feature::FixVqMemo);
+    tail.imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
     auto& phaseLap = tail.phaseLap;
@@ -765,6 +767,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     auto& shaderMemory = tail.shaderMemory;
     shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan, tail.feedbackMask);
+    shaderMemory->SetImageTableSnapshotReuse(tail.imageTableSnapshotReuse);
     auto& results = tail.results;
     auto& compiledStages = tail.compiledStages;
     compiledStages.reserve(programs.size());

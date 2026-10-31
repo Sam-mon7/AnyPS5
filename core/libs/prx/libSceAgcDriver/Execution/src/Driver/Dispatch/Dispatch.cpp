@@ -164,6 +164,7 @@ bool Driver::pipelineDispatch() {
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    const bool imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     const bool feedbackMask = ArchB::Switches::Enabled(ArchB::Feature::FixTsharpFeedbackMask);
     ArchB::Recorder::Work recorderWork({ArchB::Recorder::Kind::Dispatch, 0});
     PerformanceTimer timing("Driver.Dispatch");
@@ -476,6 +477,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         captureMs += phaseTiming.Elapsed();
     } else if (!fromAhead) {
         shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan, feedbackMask);
+        shaderMemory->SetImageTableSnapshotReuse(imageTableSnapshotReuse);
         std::uint64_t forgetAtCapture = 0;
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;

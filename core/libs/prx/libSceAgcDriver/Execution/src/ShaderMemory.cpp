@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -697,12 +698,48 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.stampWrites = &stampWrites;
     runtime.unchangedSince = &unchangedSince;
     runtime.supplyWords = &supplyWords;
+    static const bool tableCensus = std::getenv("APS5_IMAGE_TABLE_CENSUS") != nullptr;
+    static const bool verifyTables = std::getenv("APS5_VERIFY_IMAGE_TABLE_SNAPSHOT_REUSE") != nullptr;
+    ShaderRecompiler::ImageTableSnapshotCounts tableCounts;
+    if (tableCensus || imageTableSnapshotReuse || imageTableSnapshotCounts != nullptr) runtime.imageTableCounts = &tableCounts;
+    runtime.imageTableCensus = tableCensus;
+    runtime.imageTableSnapshotReuse = imageTableSnapshotReuse;
+    runtime.verifyImageTableSnapshotReuse = imageTableSnapshotReuse && verifyTables;
     ShaderRecompiler::SrtReadTrace descriptorTrace;
     if (traceDescriptors) {
         descriptorTrace.profile = true;
         runtime.readTrace = &descriptorTrace;
     }
-    auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+    auto capture = [&] {
+        try {
+            return invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+        } catch (...) {
+            if (tableCounts.verifyMismatches != 0u) ArchB::Recorder::Count("fix_its_verify_mismatches", static_cast<double>(tableCounts.verifyMismatches));
+            throw;
+        }
+    }();
+    if (imageTableSnapshotCounts != nullptr) *imageTableSnapshotCounts = tableCounts;
+    if (imageTableSnapshotReuse) {
+        ArchB::Recorder::Count("fix_its_reused", static_cast<double>(tableCounts.reused));
+        ArchB::Recorder::Count("fix_its_rebuilt", static_cast<double>(tableCounts.rebuilt));
+        ArchB::Recorder::Count("fix_its_page_reused", static_cast<double>(tableCounts.pageReused));
+        ArchB::Recorder::Count("fix_its_refused_no_previous", static_cast<double>(tableCounts.noPrevious));
+        ArchB::Recorder::Count("fix_its_refused_changed_record", static_cast<double>(tableCounts.changed));
+        ArchB::Recorder::Count("fix_its_verified", static_cast<double>(tableCounts.verified));
+        ArchB::Recorder::Count("fix_its_verify_mismatches", static_cast<double>(tableCounts.verifyMismatches));
+        ArchB::Recorder::Count("fix_its_ns", static_cast<double>(tableCounts.ns));
+        ArchB::Recorder::Count("fix_its_verify_ns", static_cast<double>(tableCounts.verifyNs));
+    }
+    if (tableCensus) {
+        static constexpr const char* names[3][13] = {
+            {"fix_its_dispatch_materialize", "fix_its_dispatch_calls", "fix_its_dispatch_tables", "fix_its_dispatch_columns", "fix_its_dispatch_records", "fix_its_dispatch_words", "fix_its_dispatch_page_queries", "fix_its_dispatch_previous", "fix_its_dispatch_identical", "fix_its_dispatch_unwritten", "fix_its_dispatch_compared", "fix_its_dispatch_ns", "fix_its_dispatch_materialize_ns"},
+            {"fix_its_draw_hit_materialize", "fix_its_draw_hit_calls", "fix_its_draw_hit_tables", "fix_its_draw_hit_columns", "fix_its_draw_hit_records", "fix_its_draw_hit_words", "fix_its_draw_hit_page_queries", "fix_its_draw_hit_previous", "fix_its_draw_hit_identical", "fix_its_draw_hit_unwritten", "fix_its_draw_hit_compared", "fix_its_draw_hit_ns", "fix_its_draw_hit_materialize_ns"},
+            {"fix_its_draw_build_materialize", "fix_its_draw_build_calls", "fix_its_draw_build_tables", "fix_its_draw_build_columns", "fix_its_draw_build_records", "fix_its_draw_build_words", "fix_its_draw_build_page_queries", "fix_its_draw_build_previous", "fix_its_draw_build_identical", "fix_its_draw_build_unwritten", "fix_its_draw_build_compared", "fix_its_draw_build_ns", "fix_its_draw_build_materialize_ns"},
+        };
+        const auto path = request.shader.stage == ShaderRecompiler::ShaderStage::Compute ? 0u : imageTableDrawHit ? 1u : 2u;
+        const std::uint64_t values[] = {1, tableCounts.calls, tableCounts.tables, tableCounts.columns, tableCounts.records, tableCounts.words, tableCounts.pageQueries, tableCounts.previous, tableCounts.identical, tableCounts.unwritten, tableCounts.compared, tableCounts.ns, tableCounts.materializeNs};
+        for (std::size_t index = 0; index < std::size(values); ++index) ArchB::Recorder::Count(names[path][index], static_cast<double>(values[index]));
+    }
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;

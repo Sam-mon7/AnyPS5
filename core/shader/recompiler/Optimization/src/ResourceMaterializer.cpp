@@ -691,7 +691,7 @@ struct TableRecordsTag {};
 
 class TableSnapshotter {
 public:
-    TableSnapshotter(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, const std::vector<std::uint8_t>& activeSources, ImageTableSnapshot& tables) : plan(plan), runtime(runtime), walker(walker), activeSources(activeSources), tables(tables) {}
+    TableSnapshotter(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, const std::vector<std::uint8_t>& activeSources, ImageTableSnapshot& tables, bool rebuilding = false) : plan(plan), runtime(runtime), walker(walker), activeSources(activeSources), tables(tables), rebuilding(rebuilding) {}
 
     void Run() {
         tables = ImageTableSnapshot{};
@@ -721,6 +721,34 @@ public:
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
         counters.tables.fetch_add(count, std::memory_order_relaxed);
         counters.nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+        if (runtime.imageTableCounts != nullptr) {
+            auto& counts = *runtime.imageTableCounts;
+            counts.calls++;
+            counts.tables += count;
+            counts.ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        }
+        if (runtime.imageTableCensus && runtime.imageTableCounts != nullptr) {
+            auto& counts = *runtime.imageTableCounts;
+            struct Previous {
+                const IrResourcePlan* plan;
+                ImageTableSnapshot tables;
+            };
+            struct CensusTag {};
+            auto& previous = HostThreadLocal<std::vector<Previous>, CensusTag>();
+            const auto found = std::find_if(previous.begin(), previous.end(), [&](const Previous& entry) {
+                return entry.plan == &plan && entry.tables.shader == tables.shader && entry.tables.tables.size() == tables.tables.size() &&
+                    std::equal(entry.tables.tables.begin(), entry.tables.tables.end(), tables.tables.begin(), [](const auto& a, const auto& b) { return a.base == b.base; });
+            });
+            if (found != previous.end()) {
+                counts.previous++;
+                counts.identical += found->tables == tables;
+                found->tables = tables;
+                std::rotate(previous.begin(), found, found + 1);
+            } else {
+                previous.insert(previous.begin(), {&plan, tables});
+                if (previous.size() > 256u) previous.pop_back();
+            }
+        }
         if (TableStrict()) {
             for (std::uint32_t table = 0; table < tables.tables.size(); table++) {
                 const auto& column = tables.tables[table];
@@ -737,6 +765,7 @@ private:
     static constexpr std::uint64_t PageBytes = 4096u;
 
     bool Accessible(std::uint64_t address, std::uint64_t bytes) const {
+        if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->pageQueries++;
         return runtime.accessible == nullptr || runtime.accessible(runtime.userContext, address, bytes);
     }
 
@@ -751,13 +780,11 @@ private:
     }
 
     bool AddressAccessible(std::uint64_t address) {
-        const auto page = address & ~(PageBytes - 1u);
-        const auto [found, inserted] = wholePages.try_emplace(page, false);
-        if (inserted) found->second = Accessible(page, PageBytes);
-        return found->second || Accessible(address, sizeof(std::uint32_t));
+        return WholePageAccessible(address) || Accessible(address, sizeof(std::uint32_t));
     }
 
     std::uint32_t Read(std::uint64_t address) const {
+        if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->words++;
         std::uint32_t word = 0;
         if (!runtime.readMemory(runtime.userContext, address, &word)) {
             throw std::runtime_error("image table: failed to read guest memory at 0x" + hexText(address));
@@ -821,6 +848,7 @@ private:
                 }
                 if (keyWords.size() < words) keyWords.resize(words);
                 if (!runtime.readWords(runtime.userContext, base + first, keyWords.data(), words)) throw std::runtime_error("image table: failed to read guest memory at 0x" + hexText(base + first));
+                if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->words += words;
                 const auto step = static_cast<std::size_t>(domain.stride / 4u);
                 values.reserve(values.size() + positions);
                 for (std::size_t index = 0; index < words; index += step) values.push_back(keyWords[index]);
@@ -901,12 +929,24 @@ private:
     }
 
     std::uint32_t WordsIndex(ColumnRecords& records, const DescriptorValue& value) {
+        if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->records++;
+        if (runtime.imageTableSnapshotReuse) {
+            const bool previous = lastWords != std::numeric_limits<std::uint32_t>::max();
+            if (previous && records.distinct[lastWords] == value) {
+                if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->reused++;
+                return lastWords;
+            }
+            if (runtime.imageTableCounts != nullptr) {
+                runtime.imageTableCounts->rebuilt++;
+                (previous ? runtime.imageTableCounts->changed : runtime.imageTableCounts->noPrevious)++;
+            }
+        }
         const auto hash = hashWords(value.dwords, (static_cast<std::uint64_t>(value.dwordCount) << 8u) | value.availableDwordMask);
-        if (const auto found = wordsIndex.Find(hash, [&](std::uint32_t index) { return records.distinct[index] == value; })) return *found;
+        if (const auto found = wordsIndex.Find(hash, [&](std::uint32_t index) { return records.distinct[index] == value; })) return lastWords = *found;
         const auto index = static_cast<std::uint32_t>(records.distinct.size());
         records.distinct.push_back(value);
         wordsIndex.Insert(hash, index);
-        return index;
+        return lastWords = index;
     }
 
     void Seal(ColumnRecords& records) {
@@ -935,7 +975,7 @@ private:
         contents.words = SharedValues<DescriptorValue>(std::move(records.distinct));
         contents.readRanges = SharedValues<std::pair<std::uint64_t, std::uint64_t>>(std::move(records.readRanges));
         records.sealed = true;
-        tableReuseTotals().columns.fetch_add(1, std::memory_order_relaxed);
+        if (!rebuilding) tableReuseTotals().columns.fetch_add(1, std::memory_order_relaxed);
     }
 
     ColumnRecords& Column(std::uint32_t source) {
@@ -943,12 +983,18 @@ private:
             return found->second;
         }
         auto& records = columns[source];
+        if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->columns++;
         ReadColumn(*plan.descriptorSources.at(source).tableColumn, source, records);
         if (!records.sealed) Seal(records);
+        if (runtime.imageTableCensus) {
+            const auto& column = *plan.descriptorSources.at(source).tableColumn;
+            std::fprintf(stderr, "[its-column] shader=%llx source=%u base=%llx keys=%u distinct=%zu address=%u indirect=%u selected=%u narrowed=%u\n", static_cast<unsigned long long>(plan.shaderHash), source, static_cast<unsigned long long>(records.base), records.keys, records.contents.words.size(), column.address, column.indirect, column.selected, records.narrowed);
+        }
         return records;
     }
 
     void ReadColumn(const TableColumn& column, std::uint32_t source, ColumnRecords& records) {
+        lastWords = std::numeric_limits<std::uint32_t>::max();
         stamp = {};
         comparedRuns.clear();
         comparedWords.clear();
@@ -1034,7 +1080,7 @@ private:
             }
             return;
         }
-        const bool memoized = TableSnapshotReuse() && !records.narrowed && records.keys != 0u;
+        const bool memoized = !rebuilding && TableSnapshotReuse() && !records.narrowed && records.keys != 0u;
         const ColumnKey key{records.base, records.size, records.records, records.keys, column.stride, column.addend, column.offset, column.dwordCount, column.maxKey, column.foldedAddend, column.foldedCarry, column.address, column.sampler};
         if (memoized && Reuse(key, column, records, false)) return;
         if (memoized && !column.address && records.size != 0u && runtime.stampWrites != nullptr) {
@@ -1062,9 +1108,7 @@ private:
         };
         const auto wholeAccessible = [&](std::uint64_t address) {
             if (!column.address) return accessible(address);
-            const auto [found, inserted] = wholePages.try_emplace(address & ~(PageBytes - 1u), false);
-            if (inserted) found->second = Accessible(address & ~(PageBytes - 1u), PageBytes);
-            return found->second;
+            return WholePageAccessible(address);
         };
         const auto locate = [&](std::uint32_t offset, std::uint32_t immediate) -> std::optional<std::uint64_t> {
             if (column.address) return ImageTableAbi::ScalarAddressDword(records.base, offset, immediate);
@@ -1157,19 +1201,26 @@ private:
         std::size_t at = 0;
         for (const auto& [address, count] : runs) {
             if (runtime.readWords != nullptr) {
+                if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->words += count;
                 if (!runtime.readWords(runtime.userContext, address, read.data() + at, count)) throw std::runtime_error("image table: failed to read guest memory at 0x" + hexText(address));
             } else {
                 for (std::uint32_t word = 0; word < count; word++) read[at + word] = Read(address + word * 4u);
             }
             at += count;
         }
-        tableReuseTotals().wordsRead.fetch_add(read.size(), std::memory_order_relaxed);
+        if (!rebuilding) tableReuseTotals().wordsRead.fetch_add(read.size(), std::memory_order_relaxed);
     }
 
     bool WholePageAccessible(std::uint64_t address) {
-        const auto [found, inserted] = wholePages.try_emplace(address & ~(PageBytes - 1u), false);
-        if (inserted) found->second = Accessible(address & ~(PageBytes - 1u), PageBytes);
-        return found->second;
+        const auto page = address & ~(PageBytes - 1u);
+        if (runtime.imageTableSnapshotReuse && page == lastPage) {
+            if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->pageReused++;
+            return lastPageAccessible;
+        }
+        const auto [found, inserted] = wholePages.try_emplace(page, false);
+        if (inserted) found->second = Accessible(page, PageBytes);
+        lastPage = page;
+        return lastPageAccessible = found->second;
     }
 
     bool Unwritten(const ColumnMemo& memo) const {
@@ -1212,9 +1263,11 @@ private:
         auto& counters = tableCounters();
         auto& totals = tableReuseTotals();
         if (!compare && Unwritten(*found)) {
+            if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->unwritten++;
             counters.reusedUnwritten.fetch_add(1, std::memory_order_relaxed);
             totals.unwritten.fetch_add(1, std::memory_order_relaxed);
         } else if (compare && Compared(column, records, *found)) {
+            if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->compared++;
             counters.reusedCompared.fetch_add(1, std::memory_order_relaxed);
             totals.compared.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -1287,6 +1340,10 @@ private:
     SrtWalker& walker;
     const std::vector<std::uint8_t>& activeSources;
     ImageTableSnapshot& tables;
+    bool rebuilding = false;
+    std::uint32_t lastWords = std::numeric_limits<std::uint32_t>::max();
+    std::uint64_t lastPage = std::numeric_limits<std::uint64_t>::max();
+    bool lastPageAccessible = false;
     std::map<std::uint32_t, ColumnRecords> columns;
     HashScratchIndex wordsIndex{threadScratch<HashSlot, WordsIndexTag>()};
     std::unordered_map<std::uint64_t, bool> pages;
@@ -2684,15 +2741,36 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     if (plan.requiresSpecializationMemory && runtime.readMemory == nullptr) {
         throw std::runtime_error("ResourceMaterializer::Materialize requires runtime memory access for image tables");
     }
-    const auto materializeStarted = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto materializeStarted = MaterializeProfiled() || runtime.imageTableCounts != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SrtWalker walker;
     ResourceSnapshot nextSnapshot;
     struct ActiveSourcesStorage {};
     auto& activeSources = HostThreadLocal<std::vector<std::uint8_t>, ActiveSourcesStorage>();
     activeSources.clear();
+    std::uint64_t verifyNs = 0;
     try {
         materializeSnapshot(plan, runtime, walker, nextSnapshot, activeSources);
         TableSnapshotter(plan, runtime, walker, activeSources, nextSnapshot.tables).Run();
+        const bool reused = runtime.imageTableCounts == nullptr || runtime.imageTableCounts->reused != 0u || runtime.imageTableCounts->pageReused != 0u;
+        if (runtime.imageTableSnapshotReuse && runtime.verifyImageTableSnapshotReuse && reused && !nextSnapshot.tables.tables.empty()) {
+            const auto verifyStarted = std::chrono::steady_clock::now();
+            auto reference = runtime;
+            reference.imageTableCounts = nullptr;
+            reference.imageTableCensus = false;
+            reference.imageTableSnapshotReuse = false;
+            reference.verifyImageTableSnapshotReuse = false;
+            SrtWalker referenceWalker;
+            ImageTableSnapshot rebuilt;
+            TableSnapshotter(plan, reference, referenceWalker, activeSources, rebuilt, true).Run();
+            const bool mismatch = rebuilt != nextSnapshot.tables;
+            verifyNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - verifyStarted).count());
+            if (runtime.imageTableCounts != nullptr) {
+                runtime.imageTableCounts->verified++;
+                runtime.imageTableCounts->verifyMismatches += mismatch;
+                runtime.imageTableCounts->verifyNs += verifyNs;
+            }
+            if (mismatch) throw std::runtime_error("image table snapshot reuse verification mismatch");
+        }
     } catch (...) {
         reportTables();
         throw;
@@ -2703,6 +2781,7 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     materializeSrtGuards(plan, nextSnapshot);
     if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     snapshot = std::move(nextSnapshot);
+    if (runtime.imageTableCounts != nullptr) runtime.imageTableCounts->materializeNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - materializeStarted).count()) - verifyNs;
     reportTables();
     if (MaterializeProfiled()) materializeNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - materializeStarted).count()), std::memory_order_relaxed);
 }
