@@ -7,6 +7,10 @@
 
 ### Unknown function info
 
+- [Host allocator releases](../../../core/libs/prx/libSceAgcDriver/Execution/src/HostAllocator.cpp) cannot infer the original rounded class for small non-multiple sizes: Windows libstdc++ can allocate unrounded storage, including 92-byte `std::filesystem::current_path()` buffers, that reaches the driver's sized delete, so unsized and unrounded releases keep the `_msize` query.
+- [Host allocator depot](../../../core/libs/prx/libSceAgcDriver/Execution/src/HostAllocator.cpp) `APS5_ARCHB_FIX_ALLOC_DEPOT` raises the kept-list limit for classes up to 256 bytes from 8 to 128, which can retain up to about 17 MiB of free small blocks in the depots. Cold zoo replay varies between switch-off runs, so pixel equivalence is not established; live zoo timing and main-versus-change validation remain unverified.
+- [Host allocator thread-destructor tests](../../../core/libs/prx/libSceAgcDriver/tests/HostAllocator.cpp) use native FLS callbacks: on WinLibs 15.2.0, initializing C++ streams before C++ thread-local destructor stress reproduces heap corruption with the original allocator and with the stock runtime allocator. That runtime interaction remains unresolved.
+
 - [Presentation counters](../../../core/libs/prx/libSceAgcDriver/Execution/include/PresentCounterBook.hpp) have unit coverage for failed acquires and successful queue results, but the driver test seam cannot inject acquire failures without a window. Device-level out-of-date and unavailable-image accounting still needs live verification.
 - [Arch-B upper-bound switches](../../../core/libs/prx/libSceAgcDriver/Execution/src/ArchB/Switches.cpp) deliberately skip resource proofs, GPU-lock invalidation, draw user-data key checks or CPU indirect draws. They can render incorrectly, crash or lose the device; all five default off and exist only for measurement on this branch. Live switch-off rendering equivalence, experiment stability and recorder attribution require verification after integration.
 

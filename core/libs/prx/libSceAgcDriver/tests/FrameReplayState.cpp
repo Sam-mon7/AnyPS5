@@ -324,6 +324,7 @@ void testShaderCode(const std::filesystem::path& directory, bool host) {
 }
 
 void writeInspectionCapture(const std::filesystem::path& directory) {
+    constexpr std::uint32_t ReadWrite = 0x04;
     constexpr std::uint64_t Commands = 0x1000000001ull;
     constexpr std::uint64_t Header = 0x2000000000ull;
     constexpr std::uint64_t Code = 0x2000010000ull;

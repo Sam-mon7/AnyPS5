@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "ArchBRecorderHandoff.hpp"
 #include <cmath>
@@ -131,6 +132,27 @@ void toggleIntervalTagged() {
     require(Recorder::Collect(start + 10s).toggled, "configuration transition was not tagged");
 }
 
+void allocatorCounters() {
+    using namespace AgcDriver::HostAllocator;
+    const auto keeps = static_cast<std::size_t>(Event::DepotKeep);
+    const auto mallocs = static_cast<std::size_t>(Event::Malloc);
+    const auto queries = static_cast<std::size_t>(Event::SizeQuery);
+    Recorder::Boundary(true, 0, Recorder::Clock::now());
+    counters[keeps][1].fetch_add(7, std::memory_order_relaxed);
+    counters[mallocs][0].fetch_add(3, std::memory_order_relaxed);
+    counters[mallocs][Classes].fetch_add(5, std::memory_order_relaxed);
+    counters[queries][0].fetch_add(11, std::memory_order_relaxed);
+    const auto first = Recorder::Collect(Recorder::Clock::now());
+    near(first.counters.at("host_allocator_depot_keeps_32"), 7);
+    near(first.counters.at("host_allocator_malloc_fallthroughs_16"), 3);
+    near(first.counters.at("host_allocator_malloc_fallthroughs_large"), 5);
+    near(first.counters.at("host_allocator_size_queries"), 11);
+    require(!first.counters.contains("host_allocator_depot_takes_16"), "zero allocator counters are not exported");
+    const auto second = Recorder::Collect(Recorder::Clock::now());
+    require(!second.counters.contains("host_allocator_depot_keeps_32") || second.counters.at("host_allocator_depot_keeps_32") == 0, "allocator counters export deltas");
+    require(!second.counters.contains("host_allocator_malloc_fallthroughs_16") || second.counters.at("host_allocator_malloc_fallthroughs_16") == 0, "allocator counters export deltas");
+}
+
 void shaderTableOverflow() {
     const Recorder::Clock::time_point start{};
     Recorder::Boundary(true, 0, start);
@@ -158,6 +180,7 @@ int main(int argc, char** argv) {
         else if (name == "no_path_change") noPathChange();
         else if (name == "toggle_interval_tagged") toggleIntervalTagged();
         else if (name == "shader_table_overflow") shaderTableOverflow();
+        else if (name == "allocator_counters") allocatorCounters();
         else throw std::runtime_error("unknown test case");
         return 0;
     } catch (const std::exception& error) {

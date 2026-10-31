@@ -1,8 +1,10 @@
 #ifdef _WIN32
 
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <intrin.h>
 #include <malloc.h>
@@ -11,20 +13,60 @@
 
 namespace {
 
-constexpr std::size_t Granule = 16;
-constexpr std::size_t LargestCached = 1024;
-constexpr std::size_t Classes = LargestCached / Granule;
+using namespace AgcDriver::HostAllocator;
+
+bool Flag(const char* name) noexcept {
+    const auto* value = std::getenv(name);
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+std::atomic<signed char> census{-1};
+std::atomic<signed char> depotFix{-1};
+
+bool Resolve(std::atomic<signed char>& state, const char* name) noexcept {
+    auto value = state.load(std::memory_order_relaxed);
+    if (value < 0) {
+        value = Flag(name) ? 1 : 0;
+        state.store(value, std::memory_order_relaxed);
+    }
+    return value > 0;
+}
+
+bool Census() noexcept {
+    return Resolve(census, "APS5_ARCHB_ALLOCATOR_CENSUS");
+}
+
+[[gnu::noinline]] void CountSlow(Event event, std::size_t bucket) noexcept {
+    if (Census()) counters[static_cast<std::size_t>(event)][bucket].fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void Count(Event event, std::size_t bucket = 0) noexcept {
+    if (census.load(std::memory_order_relaxed) != 0) [[unlikely]] CountSlow(event, bucket);
+}
+
+struct CensusSummary {
+    ~CensusSummary() {
+        if (!Census()) return;
+        for (std::size_t event = 0; event < std::size(Names); ++event) {
+            const auto buckets = event < BucketedEvents ? Classes + 1 : 1;
+            for (std::size_t bucket = 0; bucket < buckets; ++bucket) {
+                const auto value = counters[event][bucket].load(std::memory_order_relaxed);
+                if (value == 0) continue;
+                std::fprintf(stderr, "[host-allocator] %s bucket=%zu count=%llu\n", Names[event],
+                    event < BucketedEvents ? (bucket + 1) * Granule : 0, static_cast<unsigned long long>(value));
+            }
+        }
+    }
+} censusSummary;
 
 constexpr std::uint16_t Depth(std::size_t sizeClass) {
-    return sizeClass < 256 / Granule ? 64 : 16;
+    return sizeClass < SmallClasses ? 64 : 16;
 }
 
 struct Cache {
     void* heads[Classes];
     std::uint16_t counts[Classes];
 };
-
-constexpr std::uint16_t KeptLists = 8;
 
 struct Depot {
     SRWLOCK lock = SRWLOCK_INIT;
@@ -36,8 +78,9 @@ Depot depots[Classes];
 
 bool KeepList(std::size_t sizeClass, void* list) noexcept {
     auto& depot = depots[sizeClass];
+    const auto capacity = AgcDriver::HostAllocator::DepotCapacity(sizeClass);
     AcquireSRWLockExclusive(&depot.lock);
-    const bool kept = depot.count < KeptLists;
+    const bool kept = depot.count < capacity;
     if (kept) {
         static_cast<void**>(list)[1] = depot.lists;
         depot.lists = list;
@@ -151,18 +194,22 @@ void* TryAllocate(std::size_t bytes) noexcept {
         if (auto* cache = CurrentCache()) {
             if (cache->heads[sizeClass] == nullptr) {
                 if (void* list = TakeList(sizeClass)) {
+                    Count(Event::DepotTake, sizeClass);
                     cache->heads[sizeClass] = list;
                     cache->counts[sizeClass] = Depth(sizeClass);
                 }
             }
             if (void* block = cache->heads[sizeClass]) {
+                Count(Event::CacheHit, sizeClass);
                 cache->heads[sizeClass] = *static_cast<void**>(block);
                 --cache->counts[sizeClass];
                 return block;
             }
         }
+        Count(Event::Malloc, sizeClass);
         return std::malloc((sizeClass + 1) * Granule);
     }
+    Count(Event::Malloc, Classes);
     return std::malloc(bytes);
 }
 
@@ -177,11 +224,15 @@ void* Allocate(std::size_t bytes) {
 
 void Release(void* block, std::size_t bytes = 0) noexcept {
     if (block == nullptr) return;
+    if (bytes == 0) Count(Event::UnsizedRelease);
     if (auto* cache = CurrentCache()) {
-        const auto usable = bytes != 0 && bytes % Granule == 0 ? bytes : _msize(block);
+        const bool known = bytes != 0 && bytes % Granule == 0;
+        if (!known) Count(Event::SizeQuery);
+        const auto usable = known ? bytes : _msize(block);
         if (usable >= Granule && usable < LargestCached + Granule) {
             const auto sizeClass = usable / Granule - 1;
             if (cache->counts[sizeClass] == Depth(sizeClass) && KeepList(sizeClass, cache->heads[sizeClass])) {
+                Count(Event::DepotKeep, sizeClass);
                 cache->heads[sizeClass] = nullptr;
                 cache->counts[sizeClass] = 0;
             }
@@ -191,9 +242,28 @@ void Release(void* block, std::size_t bytes = 0) noexcept {
                 ++cache->counts[sizeClass];
                 return;
             }
+            Count(Event::DepotFullFree, sizeClass);
         }
+    } else {
+        Count(Event::NoCacheFree);
     }
     std::free(block);
+}
+
+}
+
+namespace AgcDriver::HostAllocator {
+
+std::size_t DepotCapacity(std::size_t sizeClass) noexcept {
+    return sizeClass < SmallClasses && Resolve(depotFix, "APS5_ARCHB_FIX_ALLOC_DEPOT") ? KeptSmallListsWithFix : KeptLists;
+}
+
+std::size_t DepotLists(std::size_t sizeClass) noexcept {
+    auto& depot = depots[sizeClass];
+    AcquireSRWLockShared(&depot.lock);
+    const std::size_t count = depot.count;
+    ReleaseSRWLockShared(&depot.lock);
+    return count;
 }
 
 }

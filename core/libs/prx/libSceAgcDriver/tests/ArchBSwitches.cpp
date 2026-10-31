@@ -80,6 +80,7 @@ void toggleCase(const std::string& name) {
     setEnvironment("APS5_ARCHB_TEST_RUNTIME_DEPENDENT", "0");
     setEnvironment("APS5_ARCHB_CONTROL_FILE", name == "NoFileNoCost" ? nullptr : path.string().c_str());
     if (name == "VqMemo") setEnvironment("APS5_ARCHB_FIX_VQ_MEMO", nullptr);
+    if (name == "AllocDepot") setEnvironment("APS5_ARCHB_FIX_ALLOC_DEPOT", nullptr);
     Switches::Initialize();
     const auto write = [&](const std::string& line, bool poll = true) {
         std::ofstream(path, std::ios::binary | std::ios::trunc) << line << '\n';
@@ -88,7 +89,18 @@ void toggleCase(const std::string& name) {
             Switches::PollControl();
         }
     };
-    if (name == "VqMemo") {
+    if (name == "AllocDepot") {
+        bool listed = false;
+        for (const auto& entry : Switches::Table()) {
+            if (entry.feature != Feature::FixAllocDepot) continue;
+            listed = true;
+            check(std::string(entry.name) == "FIX_ALLOC_DEPOT" && !entry.defaultOn && !entry.runtime && entry.prerequisites.empty(), "allocator depot switch contract");
+        }
+        check(listed, "allocator depot switch is listed");
+        check(!Switches::Enabled(Feature::FixAllocDepot), "allocator depot must default off");
+        write("1 FIX_ALLOC_DEPOT=1");
+        check(!Switches::Enabled(Feature::FixAllocDepot) && Switches::Sequence() == 0, "startup-only allocator depot refuses runtime changes");
+    } else if (name == "VqMemo") {
         for (const auto& entry : Switches::Table()) {
             if (entry.feature == Feature::FixVqMemo) check(!entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "query memo switch contract");
         }

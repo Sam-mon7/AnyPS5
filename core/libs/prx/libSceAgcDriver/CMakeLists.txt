@@ -510,6 +510,11 @@ if(BUILD_TESTING)
     target_include_directories(agc_archb_c09a_recorder_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(agc_archb_c09a_recorder_tests PRIVATE libc)
     configure_windows_unwind(agc_archb_c09a_recorder_tests)
+    if(WIN32)
+        add_test(NAME agc_archb_fix_alloc_depot_recorder_counters COMMAND agc_archb_c09a_recorder_tests allocator_counters)
+        set_tests_properties(agc_archb_fix_alloc_depot_recorder_counters PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     foreach(recorderCase IN ITEMS reconciles no_path_change toggle_interval_tagged shader_table_overflow)
         add_test(NAME agc_archb_c09a_recorder_${recorderCase} COMMAND agc_archb_c09a_recorder_tests ${recorderCase})
         set_tests_properties(agc_archb_c09a_recorder_${recorderCase} PROPERTIES TIMEOUT 30)
@@ -552,6 +557,12 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_archb_c01_switches COMMAND agc_archb_c01_switches_tests)
     add_test(NAME agc_archb_fix_v1_switch COMMAND agc_archb_c01_switches_tests --toggle VqMemo)
+    add_test(NAME agc_archb_fix_alloc_depot_switch COMMAND agc_archb_c01_switches_tests --toggle AllocDepot)
+    set_tests_properties(agc_archb_fix_alloc_depot_switch PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_fix_alloc_depot_switch PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_archb_fix_v1_switch PROPERTIES ENVIRONMENT_MODIFICATION
@@ -773,11 +784,26 @@ endif()
 
 if(BUILD_TESTING AND WIN32)
     add_test_executable(agc_driver_host_allocator_tests tests/HostAllocator.cpp Execution/src/HostAllocator.cpp)
+    target_include_directories(agc_driver_host_allocator_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_driver_host_allocator_tests PRIVATE libc)
     configure_windows_unwind(agc_driver_host_allocator_tests)
     add_test(NAME agc_driver_host_allocator COMMAND agc_driver_host_allocator_tests)
     set_tests_properties(agc_driver_host_allocator PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
         "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    foreach(depotMode IN ITEMS 0 1)
+        add_test(NAME agc_archb_fix_alloc_depot_allocator_${depotMode} COMMAND agc_driver_host_allocator_tests --focused)
+        set_tests_properties(agc_archb_fix_alloc_depot_allocator_${depotMode} PROPERTIES TIMEOUT 60
+            ENVIRONMENT "APS5_ARCHB_FIX_ALLOC_DEPOT=${depotMode};APS5_ARCHB_ALLOCATOR_CENSUS=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        add_test(NAME agc_archb_fix_alloc_depot_thread_exit_${depotMode} COMMAND agc_driver_host_allocator_tests --thread-exit)
+        set_tests_properties(agc_archb_fix_alloc_depot_thread_exit_${depotMode} PROPERTIES TIMEOUT 30
+            ENVIRONMENT "APS5_ARCHB_FIX_ALLOC_DEPOT=${depotMode};APS5_ARCHB_ALLOCATOR_CENSUS=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        add_test(NAME agc_archb_fix_alloc_depot_census_off_${depotMode} COMMAND agc_driver_host_allocator_tests --disabled)
+        set_tests_properties(agc_archb_fix_alloc_depot_census_off_${depotMode} PROPERTIES TIMEOUT 60
+            ENVIRONMENT "APS5_ARCHB_FIX_ALLOC_DEPOT=${depotMode};APS5_ARCHB_ALLOCATOR_CENSUS=0;APS5_ARCHB_RECORDER=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endforeach()
 endif()
 
 add_test_executable(agc_driver_key_miss_tests EXCLUDE_FROM_ALL tests/KeyMiss.cpp)

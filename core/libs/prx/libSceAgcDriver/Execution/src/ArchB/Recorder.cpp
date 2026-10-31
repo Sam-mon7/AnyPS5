@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <mutex>
@@ -245,6 +246,30 @@ std::uint64_t Recorder::Digest(std::span<const std::uint32_t> code) {
 }
 
 Recorder::Snapshot Recorder::Collect(Clock::time_point now) {
+#ifdef _WIN32
+    static const auto allocatorNames = [] {
+        std::array<std::array<std::array<char, 80>, HostAllocator::Classes + 1>, std::size(HostAllocator::Names)> names{};
+        for (std::size_t event = 0; event < names.size(); ++event) {
+            for (std::size_t bucket = 0; bucket < names[event].size(); ++bucket) {
+                auto& name = names[event][bucket];
+                if (event >= HostAllocator::BucketedEvents) std::snprintf(name.data(), name.size(), "%s", HostAllocator::Names[event]);
+                else if (bucket == HostAllocator::Classes) std::snprintf(name.data(), name.size(), "%s_large", HostAllocator::Names[event]);
+                else std::snprintf(name.data(), name.size(), "%s_%zu", HostAllocator::Names[event], (bucket + 1) * HostAllocator::Granule);
+            }
+        }
+        return names;
+    }();
+    static std::array<std::array<std::uint64_t, HostAllocator::Classes + 1>, std::size(HostAllocator::Names)> allocatorPrevious{};
+    for (std::size_t event = 0; event < allocatorPrevious.size(); ++event) {
+        const auto buckets = event < HostAllocator::BucketedEvents ? HostAllocator::Classes + 1 : 1;
+        for (std::size_t bucket = 0; bucket < buckets; ++bucket) {
+            const auto current = HostAllocator::counters[event][bucket].load(std::memory_order_relaxed);
+            const auto delta = current - allocatorPrevious[event][bucket];
+            allocatorPrevious[event][bucket] = current;
+            if (delta != 0) Count(allocatorNames[event][bucket].data(), static_cast<double>(delta));
+        }
+    }
+#endif
     auto& s = state();
     Snapshot result;
     result.frames = s.frames;
