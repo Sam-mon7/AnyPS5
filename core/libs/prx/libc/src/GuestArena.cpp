@@ -32,6 +32,17 @@
 
 namespace GuestArena {
 #ifdef _WIN32
+namespace {
+std::atomic<std::uint64_t> queryProtectionSerial{1};
+std::atomic<std::uint32_t> queryProtectionWriters{0};
+}
+
+std::uint64_t GuestArenaQueryProtectionSerial_nid_no_patch() {
+    if (queryProtectionWriters.load(std::memory_order_acquire) != 0) return 0;
+    const auto serial = queryProtectionSerial.load(std::memory_order_acquire);
+    return queryProtectionWriters.load(std::memory_order_acquire) == 0 ? serial : 0;
+}
+
 UINT GuestArenaCensusGetWriteWatch_nid_no_patch(DWORD flags, void* address, SIZE_T bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
     CensusTimer timer(flags & WRITE_WATCH_FLAG_RESET ? CensusOperation::QueryReset : CensusOperation::Query);
     const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
@@ -71,7 +82,10 @@ SIZE_T GuestArenaCensusVirtualQuery_nid_no_patch(const void* address, void* data
 
 BOOL GuestArenaCensusVirtualProtect_nid_no_patch(void* address, SIZE_T bytes, DWORD protection, DWORD* previous) {
     CensusTimer timer(CensusOperation::VirtualProtect);
+    queryProtectionWriters.fetch_add(1, std::memory_order_acq_rel);
     const auto result = VirtualProtect(address, bytes, protection, previous);
+    queryProtectionSerial.fetch_add(1, std::memory_order_release);
+    queryProtectionWriters.fetch_sub(1, std::memory_order_release);
     if (timer.Active()) {
         const auto error = GetLastError();
         timer.Result(CensusTimer::Pages(reinterpret_cast<std::uintptr_t>(address), bytes), 0, result == 0);
@@ -500,6 +514,10 @@ bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* pro
 
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear);
+}
+
+bool GuestArenaCollectWritesMemo_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, bool armed, const QueryMemoContext* memo) {
+    return WindowsMappings::Get().Collect(address, bytes, pages, count, clear, armed ? WindowsMappings::Collection::Armed : WindowsMappings::Collection::All, memo);
 }
 
 bool GuestArenaCollectArmedWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {

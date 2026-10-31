@@ -376,7 +376,7 @@ public:
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).
-    Graphics::DrawPreparation PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawRecipe* recipe = nullptr);
+    Graphics::DrawPreparation PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawRecipe* recipe = nullptr, bool memoVirtualQuery = false);
     RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace = nullptr, Graphics::DrawPreparation* preparation = nullptr);
     // The indirect draw features the device enabled, for the driver's decision whether an indirect
     // draw's records can be read by the GPU (Graphics::Draw) or must be resolved on the CPU.

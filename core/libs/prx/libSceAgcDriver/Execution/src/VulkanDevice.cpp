@@ -4339,8 +4339,8 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
     return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
 }
 
-Graphics::DrawPreparation VulkanDevice::PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawRecipe* recipe) {
-    return Graphics::PrepareDraw(graphicsContext(), graphics, draw, shaders, recipe);
+Graphics::DrawPreparation VulkanDevice::PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery) {
+    return Graphics::PrepareDraw(graphicsContext(), graphics, draw, shaders, recipe, memoVirtualQuery);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const DrawTraceContext* trace, Graphics::DrawPreparation* preparation) {

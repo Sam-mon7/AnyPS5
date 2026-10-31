@@ -55,10 +55,18 @@ private:
 };
 
 #ifdef _WIN32
+struct QueryMemoContext {
+    std::uint64_t (*unwatch)() = nullptr;
+    std::uint64_t (*forget)() = nullptr;
+    bool verify = false;
+    void (*count)(const char*) = nullptr;
+};
+extern "C" bool GuestArenaCollectWritesMemo_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, bool armed, const QueryMemoContext* memo);
 extern "C" unsigned int GuestArenaCensusGetWriteWatch_nid_no_patch(unsigned long flags, void* address, std::size_t bytes, void** pages, std::uintptr_t* count, unsigned long* granularity);
 extern "C" unsigned int GuestArenaCensusResetWriteWatch_nid_no_patch(void* address, std::size_t bytes);
 extern "C" std::size_t GuestArenaCensusVirtualQuery_nid_no_patch(const void* address, void* info, std::size_t bytes);
 extern "C" int GuestArenaCensusVirtualProtect_nid_no_patch(void* address, std::size_t bytes, unsigned long protection, unsigned long* previous);
+extern "C" std::uint64_t GuestArenaQueryProtectionSerial_nid_no_patch();
 #endif
 
 #ifdef ANYPS5_ENABLE_ASAN

@@ -43,7 +43,7 @@ struct DrawPreparation {
 };
 
 bool DrawPrelockEnabled();
-DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe = nullptr);
+DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe = nullptr, bool memoVirtualQuery = false);
 void RecheckDrawPreparation(const Context& context, DrawPreparation& preparation);
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw

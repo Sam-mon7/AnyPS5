@@ -3547,7 +3547,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 
 }
 
-DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe) {
+DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery) {
     AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.Prelock");
     AgcDriver::ArchB::Recorder::WatchScope watchCaller(AgcDriver::ArchB::Recorder::WatchCaller::PrelockTargets);
     DrawPreparation prepared;
@@ -3605,7 +3605,7 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
     }
     recorderTiming.Mark("lookup");
     watchCaller.Set(AgcDriver::ArchB::Recorder::WatchCaller::PrelockSurfaces);
-    if (cached != nullptr && collect) cached->PrecollectSurfaces();
+    if (cached != nullptr && collect) cached->PrecollectSurfaces(memoVirtualQuery);
     recorderTiming.Mark("surfaces");
     watchCaller.Set(AgcDriver::ArchB::Recorder::WatchCaller::Proofs);
     if (collect && residentTargets && context.detiler != nullptr && StorageTexture::DrawTargetPrelockEnabled()) {

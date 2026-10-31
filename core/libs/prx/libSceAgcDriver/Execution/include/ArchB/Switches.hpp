@@ -21,6 +21,7 @@ enum class Feature : std::uint8_t {
     UbSkipCpuIndirect,
     UbSkipDispatchProofWalk,
     FixTsharpFeedbackMask,
+    FixVqMemo,
     Count
 };
 
