@@ -96,6 +96,14 @@ struct ImageTableSnapshotCounts {
     std::uint64_t verified = 0;
     std::uint64_t verifyMismatches = 0;
     std::uint64_t verifyNs = 0;
+    std::uint64_t bitScanBounded = 0;
+    std::uint64_t bitScanSkippedKeys = 0;
+    std::uint64_t bitScanRefusedNoBound = 0;
+    std::uint64_t bitScanRefusedNotNarrower = 0;
+    std::uint64_t bitScanRefusedStride = 0;
+    std::uint64_t bitScanVerified = 0;
+    std::uint64_t bitScanVerifyMismatches = 0;
+    std::uint64_t bitScanVerifyNs = 0;
 };
 
 struct SrtRuntime {
@@ -116,6 +124,8 @@ struct SrtRuntime {
     bool imageTableCensus = false;
     bool imageTableSnapshotReuse = false;
     bool verifyImageTableSnapshotReuse = false;
+    bool imageTableBitScanKeys = false;
+    bool verifyImageTableBitScanKeys = false;
 };
 
 enum class RuntimeValueType {

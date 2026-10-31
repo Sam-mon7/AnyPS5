@@ -151,7 +151,7 @@ static_assert(fieldCount<IrResourcePlan>() == 26, "IrResourcePlan changed: updat
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
-static_assert(fieldCount<TableColumn>() == 18, "TableColumn changed: update the plan encoder");
+static_assert(fieldCount<TableColumn>() == 19, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 5, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
@@ -1139,6 +1139,7 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Value(column.offset);
         out.Value(column.dwordCount);
         out.Value(column.maxKey);
+        out.Value(column.bitScanKeys);
         out.Value(column.sampler);
         out.Value(column.address);
         out.List(column.keyDomains, [](Writer& domains, const KeyDomain& domain) {
@@ -1303,6 +1304,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         in.Value(column.offset);
         in.Value(column.dwordCount);
         in.Value(column.maxKey);
+        in.Value(column.bitScanKeys);
         in.Value(column.sampler);
         in.Value(column.address);
         in.List(column.keyDomains, 13, [](Reader& domains, KeyDomain& domain) {

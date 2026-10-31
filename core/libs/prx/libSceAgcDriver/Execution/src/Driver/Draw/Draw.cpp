@@ -144,6 +144,7 @@ struct DrawTail {
     bool pipelineStateReuse = false;
     bool memoVirtualQuery = false;
     bool imageTableSnapshotReuse = false;
+    bool imageTableBitScanKeys = false;
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
@@ -434,6 +435,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.pipelineStateReuse = ArchB::Switches::Enabled(ArchB::Feature::FixPipelineStateReuse);
     tail.memoVirtualQuery = ArchB::Switches::Enabled(ArchB::Feature::FixVqMemo);
     tail.imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
+    tail.imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
     auto& phaseLap = tail.phaseLap;
@@ -768,6 +770,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& shaderMemory = tail.shaderMemory;
     shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan, tail.feedbackMask);
     shaderMemory->SetImageTableSnapshotReuse(tail.imageTableSnapshotReuse);
+    shaderMemory->SetImageTableBitScanKeys(tail.imageTableBitScanKeys);
     auto& results = tail.results;
     auto& compiledStages = tail.compiledStages;
     compiledStages.reserve(programs.size());
@@ -801,15 +804,90 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
     const bool stageEntries = tail.stageEntries;
     std::array<std::uint64_t, static_cast<std::size_t>(DrawMiss::Count)> missesBefore{};
-    if (DrawShaderProfileEnabled()) {
+    static const std::uint64_t censusShader = [] {
+        const char* text = std::getenv("APS5_IMAGE_TABLE_CENSUS_SHADER");
+        return text != nullptr && std::getenv("APS5_IMAGE_TABLE_CENSUS") != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+    }();
+    std::size_t censusStage = programs.size();
+    for (std::size_t i = 0; censusShader != 0u && i < programs.size(); ++i) {
+        if (programs[i].binary.codeAddress == censusShader) censusStage = i;
+    }
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawMiss::Count)> censusMisses{};
+    if (DrawShaderProfileEnabled() || censusStage < programs.size()) {
         std::lock_guard cacheLock(drawCacheMutex);
         missesBefore = drawEntryCounters.misses;
+        censusMisses = drawEntryCounters.misses;
     }
     try {
         lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, shapeKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree, tail.feedbackMask);
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
+    }
+    if (censusStage < programs.size()) {
+        const char* reason = drawHit ? "hit" : verifyHit ? "verify" : entry == nullptr ? "absent" : "miss-other";
+        {
+            std::lock_guard cacheLock(drawCacheMutex);
+            constexpr const char* names[] = {"front", "fragment", "other", "layout", "gate", "stages"};
+            for (std::size_t r = 0; r < censusMisses.size(); ++r) {
+                if (drawEntryCounters.misses[r] != censusMisses[r]) reason = names[r];
+            }
+        }
+        struct CensusTag {};
+        auto& seen = HostThreadLocal<std::unordered_map<std::uint64_t, std::vector<std::uint32_t>>, CensusTag>();
+        const auto& user = programs[censusStage].userData;
+        std::string userDiff;
+        if (const auto was = seen.find(censusShader); was != seen.end()) {
+            for (std::size_t w = 0; w < std::max(user.size(), was->second.size()); ++w) {
+                const auto now = w < user.size() ? user[w] : 0u, then = w < was->second.size() ? was->second[w] : 0u;
+                if (now == then) continue;
+                char text[48];
+                std::snprintf(text, sizeof(text), " u%zu:%x->%x", w, then, now);
+                userDiff += text;
+            }
+        } else {
+            userDiff = " (first)";
+        }
+        seen[censusShader] = user;
+        std::string stagesText;
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            char text[48];
+            std::snprintf(text, sizeof(text), "%s%llx/r%u", i == 0 ? "" : ",", static_cast<unsigned long long>(programs[i].binary.codeAddress), static_cast<unsigned>(roles[i]));
+            stagesText += text;
+        }
+        std::fprintf(stderr, "[its-draw] serial=%llu queue=0x%x packet=0x%zx indirect=%u stage=%zu stages=%s key=%llx outcome=%s user=%zu diff:%s\n", static_cast<unsigned long long>(submission.serial), submission.queue, packetOffset, drawParameters.indirect ? 1u : 0u, censusStage, stagesText.c_str(), static_cast<unsigned long long>(drawKey), reason, user.size(), userDiff.c_str());
+        if (!drawHit && entry != nullptr && censusStage < entry->stages.size()) {
+            for (std::size_t rank = 0; rank < entry->stages[censusStage].size(); ++rank) {
+                const auto& variant = *entry->stages[censusStage][rank];
+                std::vector<ShaderRecompiler::MemoryRegion> regions;
+                appendEntryRegions(variant, regions);
+                std::uint64_t bytes = 0, differing = 0;
+                std::string first;
+                for (const auto& region : regions) {
+                    bytes += region.bytes.size();
+                    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(region.guestAddress), region.bytes.size())) {
+                        ++differing;
+                        if (first.size() < 600) first += " [unmapped " + std::to_string(region.bytes.size()) + "B]";
+                        continue;
+                    }
+                    const auto* live = reinterpret_cast<const std::uint32_t*>(region.guestAddress);
+                    const auto* kept = reinterpret_cast<const std::uint32_t*>(region.bytes.data());
+                    std::size_t words = 0, firstWord = 0;
+                    for (std::size_t w = 0; w < region.bytes.size() / 4u; ++w) {
+                        if (live[w] == kept[w]) continue;
+                        if (words++ == 0) firstWord = w;
+                    }
+                    if (words == 0) continue;
+                    ++differing;
+                    if (first.size() < 600) {
+                        char text[128];
+                        std::snprintf(text, sizeof(text), " [0x%llx+0x%zx: %zu words, first +0x%zx %x->%x]", static_cast<unsigned long long>(region.guestAddress), region.bytes.size(), words, firstWord * 4u, kept[firstWord], live[firstWord]);
+                        first += text;
+                    }
+                }
+                std::fprintf(stderr, "[its-draw-variant] serial=%llu packet=0x%zx rank=%zu regions=%zu bytes=%llu differing=%llu user=%zu%s\n", static_cast<unsigned long long>(submission.serial), packetOffset, rank, regions.size(), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(differing), variant.userData.size(), first.c_str());
+            }
+        }
     }
     if (DrawShaderProfileEnabled()) {
         std::lock_guard cacheLock(drawCacheMutex);

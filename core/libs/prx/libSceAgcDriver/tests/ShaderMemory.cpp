@@ -4112,6 +4112,232 @@ void verifyScalarAddressRule() {
     }
 }
 
+void verifyImageTableBitScanKeyRecords() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    alignas(4096) static std::array<std::uint32_t, 65536u * 8u> words;
+    for (std::size_t record = 0; record < words.size() / 8u; ++record) {
+        const auto descriptor = TableT(reinterpret_cast<void*>(0x100000000ull + record * 0x1000u), TableFormat8888UNorm, TableType2D);
+        std::copy(descriptor.begin(), descriptor.end(), words.begin() + record * 8u);
+    }
+    struct Memory {
+        std::span<const std::uint32_t> words;
+        bool mapped = true;
+    } memory{words};
+    const auto base = reinterpret_cast<std::uintptr_t>(words.data());
+    IrValue low(IrOpcode::Void, IrType::U32, 0u), high(IrOpcode::Void, IrType::U32, 1u);
+    low.SetImmediateU32(static_cast<std::uint32_t>(base));
+    high.SetImmediateU32(static_cast<std::uint32_t>(base >> 32u));
+    IrResourcePlan plan;
+    plan.srtPlanComplete = true;
+    plan.resourceTrackingComplete = true;
+    plan.userDataCount = 0u;
+    plan.shaderHash = 1u;
+    DescriptorSource pointer;
+    pointer.dwordCount = 2u;
+    pointer.dwords[0] = &low;
+    pointer.dwords[1] = &high;
+    plan.descriptorSources.push_back(pointer);
+    DescriptorSource source;
+    source.dwordCount = 8u;
+    source.tableColumn = TableColumn{};
+    source.tableColumn->address = true;
+    source.tableColumn->stride = 32u;
+    source.tableColumn->dwordCount = 8u;
+    source.tableColumn->bitScanKeys = 32u;
+    plan.descriptorSources.push_back(source);
+    ImageResource image;
+    image.source = 1u;
+    image.table = 0u;
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.dimension = RdnaImageDimension::Dim2D;
+    image.read = true;
+    plan.info.images.push_back(image);
+    ResourceMaterializer::PrepareImageModes(plan.info);
+    SrtRuntime runtime;
+    runtime.userContext = &memory;
+    runtime.accessible = [](void* context, std::uint64_t address, std::uint64_t bytes) {
+        const auto& memory = *static_cast<const Memory*>(context);
+        const auto begin = reinterpret_cast<std::uintptr_t>(memory.words.data());
+        return memory.mapped && address >= begin && address - begin <= memory.words.size_bytes() && bytes <= memory.words.size_bytes() - (address - begin);
+    };
+    runtime.readMemory = [](void* context, std::uint64_t address, std::uint32_t* out) {
+        const auto& memory = *static_cast<const Memory*>(context);
+        const auto begin = reinterpret_cast<std::uintptr_t>(memory.words.data());
+        if (!memory.mapped || address < begin || address - begin >= memory.words.size_bytes() || (address - begin) % 4u != 0u) return false;
+        *out = memory.words[(address - begin) / 4u];
+        return true;
+    };
+    runtime.verifyImageTableBitScanKeys = true;
+    ImageTableSnapshotCounts counts;
+    runtime.imageTableCounts = &counts;
+    const auto capture = [&](bool bounded) {
+        counts = {};
+        runtime.imageTableBitScanKeys = bounded;
+        ResourceSnapshot snapshot;
+        ResourceMaterializer{}.Materialize(plan, runtime, snapshot);
+        require(counts.bitScanVerifyMismatches == 0u, "bit-scan keys: the bounded snapshot differs from the full one");
+        return snapshot.tables;
+    };
+    const auto record = [](const ImageTableSnapshot& tables, std::uint32_t key) {
+        const auto& column = tables.tables.at(0);
+        const auto code = column.codes[key];
+        return (code & Abi::PoisonFlag) != 0u ? std::pair<std::uint32_t, DescriptorValue>{code, {}} : std::pair<std::uint32_t, DescriptorValue>{0u, column.words.at(code)};
+    };
+    const auto samePrefix = [&](const ImageTableSnapshot& bounded, const ImageTableSnapshot& full) {
+        const auto& a = bounded.tables.at(0);
+        const auto& b = full.tables.at(0);
+        if (a.base != b.base || a.records != b.records || a.keys > b.keys) return false;
+        for (std::uint32_t key = 0; key < a.keys; key++) {
+            if (record(bounded, key) != record(full, key)) return false;
+        }
+        return true;
+    };
+
+    const auto full = capture(false);
+    require(full.tables.at(0).keys == Abi::MaxKeys && full.tables.at(0).outside && counts.bitScanBounded == 0u && counts.bitScanVerified == 0u, "bit-scan keys: the off path bounded the column");
+    const auto bounded = capture(true);
+    const auto& column = bounded.tables.at(0);
+    require(column.keys == 32u && column.codes.size() == 32u && column.outside && column.records == full.tables.at(0).records, "bit-scan keys: the column was not bounded to the scan's keys");
+    require(counts.bitScanBounded == 1u && counts.bitScanSkippedKeys == Abi::MaxKeys - 32u && counts.bitScanVerified == 1u, "bit-scan keys: the bound was not counted or verified");
+    require(counts.words == 32u * 8u && counts.records == 32u, "bit-scan keys: records past the bound were read");
+    require(samePrefix(bounded, full), "bit-scan keys: a kept key differs from the full snapshot");
+    require(bounded.ranges == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{base, 32u * 32u}}, "bit-scan keys: the snapshot range covers records past the bound");
+
+    words[3u * 8u] ^= 1u;
+    const auto written = capture(true);
+    require(record(written, 3u) != record(bounded, 3u) && samePrefix(written, capture(false)), "bit-scan keys: a written kept record was not read again");
+    words[40u * 8u] ^= 1u;
+    const auto past = capture(true);
+    const auto pastFull = capture(false);
+    require(past == written && record(pastFull, 40u) != record(full, 40u) && samePrefix(past, pastFull), "bit-scan keys: a record past the bound changed the bounded snapshot");
+    require(capture(true) == past && capture(false) == pastFull && capture(true) == past, "bit-scan keys: on/off/on changed a snapshot");
+
+    memory.mapped = false;
+    if (std::getenv("APS5_IMAGE_TABLE_STRICT") != nullptr) {
+        expectFailure([&] { static_cast<void>(capture(true)); }, "APS5_IMAGE_TABLE_STRICT", "bit-scan keys: strict mode accepted an inaccessible bounded table");
+    } else {
+        const auto unmapped = capture(true);
+        require(unmapped.tables.at(0).keys == 32u && samePrefix(unmapped, capture(false)) && record(unmapped, 0u).first == Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::Unmapped)), "bit-scan keys: an unmapped bounded table was not poisoned like the full one");
+    }
+    memory.mapped = true;
+
+    const auto refused = [&](std::uint32_t stride, std::uint32_t keys, std::uint64_t ImageTableSnapshotCounts::*reason, const char* message) {
+        plan.shaderHash++;
+        plan.descriptorSources[1].tableColumn->stride = stride;
+        plan.descriptorSources[1].tableColumn->bitScanKeys = keys;
+        const auto off = capture(false);
+        const auto on = capture(true);
+        require(on == off && counts.*reason == 1u && counts.bitScanBounded == 0u && counts.bitScanVerified == 0u, message);
+    };
+    refused(32u, 0u, &ImageTableSnapshotCounts::bitScanRefusedNoBound, "bit-scan keys: a column without a bit-scan key was bounded");
+    refused(32u, Abi::MaxKeys, &ImageTableSnapshotCounts::bitScanRefusedNotNarrower, "bit-scan keys: a bound wider than the column was applied");
+    if (std::getenv("APS5_IMAGE_TABLE_STRICT") == nullptr) refused(130150528u, 32u, &ImageTableSnapshotCounts::bitScanRefusedStride, "bit-scan keys: a stride that wraps the all-ones key into the bound was accepted");
+}
+
+void verifyImageTableBitScanKeyShader() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    constexpr std::uint32_t Palette = 0x40;
+    constexpr std::size_t Committed = 0x220000;
+    constexpr std::size_t Reserved = 0x400000;
+    static TableTexture textures[2];
+    void* block = nullptr;
+#ifdef _WIN32
+    block = VirtualAlloc(nullptr, Reserved, MEM_RESERVE, PAGE_NOACCESS);
+    require(block != nullptr && VirtualAlloc(block, Committed, MEM_COMMIT, PAGE_READWRITE) == block, "bit-scan key shader: cannot map the root");
+#else
+    block = mmap(nullptr, Reserved, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    require(block != MAP_FAILED && mprotect(block, Committed, PROT_READ | PROT_WRITE) == 0, "bit-scan key shader: cannot map the root");
+#endif
+    auto* root = static_cast<std::uint32_t*>(block);
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(root));
+    static std::array<std::uint32_t, 8> keys{};
+    static std::array<std::uint32_t, 4> output{};
+    const auto keysV = TableV(keys.data(), 0u, static_cast<std::uint32_t>(sizeof(keys)));
+    const auto outputV = TableV(output.data(), 0u, static_cast<std::uint32_t>(sizeof(output)));
+    std::copy(keysV.begin(), keysV.end(), root);
+    std::copy(outputV.begin(), outputV.end(), root + 4);
+    const auto entry = [&](std::uint32_t index, std::array<std::uint32_t, 8> words) {
+        std::copy(words.begin(), words.end(), root + (Palette + index * 32u) / 4u);
+    };
+    entry(0, TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D));
+    entry(1, TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D));
+    entry(4, {0x1234u, 0x5678u, 0x9abcu, 0x1000ffacu, 0u, 0u, 0u, 0u});
+    entry(31, TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D));
+    entry(32, TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D));
+    entry(300, TableT(textures[0].bytes.data(), TableFormat32UInt, TableType2D));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u)};
+    const auto request = [&](const std::vector<std::uint32_t>& code, std::uint64_t at) {
+        auto made = TableRequest(code, userData);
+        made.shader.codeAddress = at;
+        return made;
+    };
+    const std::vector<std::uint32_t> scanCode{0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x7e200500u, 0xbe911310u, 0x8f128511u, 0xf40c0900u,
+        0x24000040u, 0xf09c0f08u, 0x01090000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+    const auto scan = request(scanCode, 0x3a000u);
+    const auto plan = GetResourcePlan(scan);
+    require(plan->info.images.size() == 1u && plan->info.images[0].table == 0u, "bit-scan key shader: the T# was not planned as a table");
+    const auto& column = *plan->descriptorSources.at(plan->info.images[0].source).tableColumn;
+    require(column.address && column.stride == 32u && column.offset == Palette && column.maxKey == 0xffffffffu && column.unkeyed && column.bitScanKeys == 32u, "bit-scan key shader: the scan key was not bounded");
+    const std::vector<std::uint32_t> laneCode{0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x7e220500u, 0x8f128511u, 0xf40c0900u, 0x24000040u,
+        0xf09c0f08u, 0x01090000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+    const auto lanePlan = GetResourcePlan(request(laneCode, 0x3b000u));
+    require(lanePlan->descriptorSources.at(lanePlan->info.images.at(0).source).tableColumn->bitScanKeys == 0u, "bit-scan key shader: a lane key was bounded");
+
+    const auto compile = [&](bool bounded, ImageTableSnapshotCounts& counts) {
+        TableCompiled out;
+        AgcDriver::ShaderMemory memory({});
+        memory.SetImageTableBitScanKeys(bounded);
+        memory.SetImageTableSnapshotReuse(false, &counts);
+        auto made = scan;
+        out.capture = memory.Capture(made);
+        out.regions = memory.Regions();
+        made.context.memory = out.regions;
+        out.result = Recompile(made, *out.capture);
+        return out;
+    };
+    ImageTableSnapshotCounts fullCounts, boundedCounts;
+    const auto full = compile(false, fullCounts);
+    const auto bounded = compile(true, boundedCounts);
+    const auto& fullColumn = full.capture->snapshot.tables.tables.at(0);
+    const auto& boundedColumn = bounded.capture->snapshot.tables.tables.at(0);
+    require(fullColumn.keys == Abi::MaxKeys && boundedColumn.keys == 32u && boundedColumn.outside && boundedCounts.bitScanBounded == 1u && fullCounts.bitScanBounded == 0u, "bit-scan key shader: the capture was not bounded");
+    require(std::getenv("APS5_VERIFY_IMAGE_TABLE_BITSCAN_KEYS") == nullptr || (boundedCounts.bitScanVerified == 1u && boundedCounts.bitScanVerifyMismatches == 0u), "bit-scan key shader: the bounded capture was not verified");
+    for (std::uint32_t key = 0; key < 32u; key++) {
+        const auto a = boundedColumn.codes[key];
+        const auto b = fullColumn.codes[key];
+        require(((a & Abi::PoisonFlag) != 0u ? a == b : boundedColumn.words.at(a) == fullColumn.words.at(b)), "bit-scan key shader: a kept record differs from the full capture");
+    }
+    require(bounded.capture->snapshot.tables.ranges == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{base + Palette, 32u * 32u}}, "bit-scan key shader: the bounded range is wrong");
+    require(boundedCounts.words == 32u * 8u && boundedCounts.records == 32u && fullCounts.words == Abi::MaxKeys * 8u, "bit-scan key shader: the bounded capture read records past the bound");
+    if (std::getenv("APS5_VERIFY_IMAGE_TABLE_BITSCAN_KEYS") == nullptr) require(TableCovered(bounded.regions, root + Palette / 4u, 32u * 32u) && !TableTouched(bounded.regions, root + (Palette + 32u * 32u) / 4u, Committed - Palette - 32u * 32u), "bit-scan key shader: the bounded capture holds records past the bound");
+    const auto& fullMap = TableMap(*full.result);
+    const auto& boundedMap = TableMap(*bounded.result);
+    const auto fullCodes = TableCodes(fullMap, 0);
+    const auto boundedCodes = TableCodes(boundedMap, 0);
+    require(boundedCodes.size() == 32u && fullCodes.size() == Abi::MaxKeys, "bit-scan key shader: the resolved key counts are wrong");
+    for (std::uint32_t key = 0; key < 32u; key++) {
+        const auto a = boundedCodes[key];
+        const auto b = fullCodes[key];
+        const bool special = (a & Abi::PoisonFlag) != 0u || a == Abi::NullCode;
+        require(special ? a == b : std::equal(boundedMap.begin() + a, boundedMap.begin() + a + Abi::ImageRecordWords, fullMap.begin() + b), "bit-scan key shader: a reachable key resolves differently");
+        if (!special && (boundedMap[a + Abi::ImageRecordFlags] & Abi::PoisonFlag) != 0u) {
+            const auto poison = boundedMap[a + Abi::ImageRecordFlags] & ~Abi::PoisonFlag;
+            require(bounded.result->imageTablePoison.at(poison).reason == full.result->imageTablePoison.at(poison).reason && bounded.result->imageTablePoison.at(poison).words == full.result->imageTablePoison.at(poison).words, "bit-scan key shader: a reachable key has other poison");
+        }
+    }
+    require(boundedMap[Abi::HeaderElementCount] == 2u && fullMap[Abi::HeaderElementCount] >= boundedMap[Abi::HeaderElementCount], "bit-scan key shader: the bounded table resolved other elements");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ValidateAndOptimizeSpirv(bounded.result->spirv, scan.target.vulkanVersion, scan.target.spirvVersion));
+#endif
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    munmap(block, Reserved);
+#endif
+}
+
 void verifyPointerImageTable() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -9218,6 +9444,12 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--image-table-snapshot-records") {
             verifyImageTableSnapshotRecords();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--image-table-bitscan-keys") {
+            verifyImageTableBitScanKeyRecords();
+            verifyImageTableBitScanKeyShader();
+            std::cout << "image table bit-scan keys passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--image-table-snapshot-rules") {
