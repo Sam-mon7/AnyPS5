@@ -1070,6 +1070,9 @@ struct WriteTracker {
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint64_t> generation{1};
     std::atomic<std::uint64_t> stable{1};
+    // Set once initialize() found a write-watched arena the generation table can mirror: the
+    // GEN_LOCKFREE answers then need nothing initialize() sets up under the mutex.
+    std::atomic<bool> ready{false};
     // A new tracker generation (under the mutex). With APS5_ARCHB_GEN_TABLE=1 it comes from the
     // write-generation clock (GenClock), so the stamps and the generations handed to consumers are
     // values of that clock and every table event is ordered against them; only values change, the
@@ -1117,6 +1120,9 @@ struct WriteTracker {
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
         GuestArena::GuestArenaSetHostWriteObserver_nid_no_patch(&noteHostWriteGen);
+        // Lock-free answers (slice S2) index the generation table by absolute 64 KiB blocks, which
+        // are the tracker's blocks only when the arena starts on a block boundary.
+        ready.store(base % WriteBlockBytes == 0, std::memory_order_release);
 #else
         watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
         if (watched) leaves.resize(LeafCount);
@@ -1320,27 +1326,42 @@ struct WriteTracker {
     }
 
     static constexpr std::size_t UnstampedSlots = 1u << 16;
-    std::vector<std::uint64_t> unstampedStores;
+    // Driver stores outside write watching, hashed by absolute block. Written under the mutex, read
+    // without it by the GEN_LOCKFREE answers: allocated once and published with release.
+    std::atomic<std::atomic<std::uint64_t>*> unstampedStores{nullptr};
 
     void noteUnstampedStore(std::uint64_t address, std::uint64_t end) {
-        if (unstampedStores.empty()) unstampedStores.assign(UnstampedSlots, 0);
+        auto* slots = unstampedStores.load(std::memory_order_relaxed);
+        if (slots == nullptr) {
+            slots = new std::atomic<std::uint64_t>[UnstampedSlots]();
+            unstampedStores.store(slots, std::memory_order_release);
+        }
+        const auto value = generation.load(std::memory_order_relaxed);
         const auto first = address / WriteBlockBytes;
         const auto last = (end - 1) / WriteBlockBytes;
         if (last - first >= UnstampedSlots) {
-            std::fill(unstampedStores.begin(), unstampedStores.end(), generation);
+            for (std::size_t i = 0; i < UnstampedSlots; ++i) slots[i].store(value, std::memory_order_release);
             return;
         }
-        for (auto block = first; block <= last; ++block) unstampedStores[block % UnstampedSlots] = generation;
+        for (auto block = first; block <= last; ++block) slots[block % UnstampedSlots].store(value, std::memory_order_release);
+    }
+
+    std::uint64_t newestUnstamped(std::uint64_t address, std::uint64_t end) const {
+        const auto* slots = unstampedStores.load(std::memory_order_acquire);
+        if (slots == nullptr || end <= address) return 0;
+        std::uint64_t newest = 0;
+        const auto first = address / WriteBlockBytes;
+        const auto last = (end - 1) / WriteBlockBytes;
+        if (last - first >= UnstampedSlots) {
+            for (std::size_t i = 0; i < UnstampedSlots; ++i) newest = std::max(newest, slots[i].load(std::memory_order_acquire));
+        } else {
+            for (auto block = first; block <= last; ++block) newest = std::max(newest, slots[block % UnstampedSlots].load(std::memory_order_acquire));
+        }
+        return newest;
     }
 
     std::uint64_t newestStamp(std::uint64_t address, std::uint64_t end) const {
-        std::uint64_t newest = 0;
-        if (!unstampedStores.empty()) {
-            const auto first = address / WriteBlockBytes;
-            const auto last = (end - 1) / WriteBlockBytes;
-            if (last - first >= UnstampedSlots) newest = *std::max_element(unstampedStores.begin(), unstampedStores.end());
-            else for (auto block = first; block <= last; ++block) newest = std::max(newest, unstampedStores[block % UnstampedSlots]);
-        }
+        std::uint64_t newest = newestUnstamped(address, end);
         if (!watched) return newest;
 #ifdef _WIN32
         address = std::max<std::uint64_t>(address, base);
@@ -1648,16 +1669,20 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     if (!tracker.watched || bytes == 0 || bytes > tracker.size || address < tracker.base || address - tracker.base > tracker.size - bytes) return;
-    tracker.coverage.Restore(address, bytes, generation);
+    // The generation first, published to the table before the coverage it restores and before the
+    // tracker's stamps: a lock-free reader that sees the restored coverage also sees the new data.
     tracker.bump();
+    const bool gen = Gen::Active();
+    if (gen) static_cast<void>(Gen::Note(Gen::Event::WatchMapping, address, address + bytes, Gen::Data | Gen::Cpu | Gen::Meta, tracker.generation.load(std::memory_order_relaxed)));
+    tracker.coverage.Restore(address, bytes, generation);
     tracker.noteCpuStore(address, address + bytes, tracker.generation);
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(address + bytes - 1); ++block) {
         if (const auto& leaf = tracker.leaves[block / WriteTracker::LeafBlocks]; leaf != nullptr) leaf->hintBlocks[block % WriteTracker::LeafBlocks] = 0;
         if (const auto found = tracker.driverPieces.find(block); found != tracker.driverPieces.end()) found->second.dropped = std::max<std::uint64_t>(found->second.dropped, tracker.generation);
         tracker.stamp(block, tracker.generation, StampKind::Cpu);
     }
-    if (Gen::Active()) {
-        static_cast<void>(Gen::NoteState(Gen::Event::WatchMapping, address, address + bytes, Gen::BlockState::Tracked, Gen::Data | Gen::Cpu | Gen::Meta, tracker.generation.load(std::memory_order_relaxed)));
+    if (gen) {
+        static_cast<void>(Gen::Global().SetState(address, address + bytes, Gen::BlockState::Tracked, true));
         Gen::Global().DropCoverage(address, address + bytes);
     }
     unwatchSerial.fetch_add(1, std::memory_order_release);
@@ -2029,16 +2054,18 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
     else tracker.noteWalkStore(begin, end, generation);
+    // The table's event first, then the tracker's stamp (both under the tracker mutex): a reader
+    // without the mutex (GEN_LOCKFREE) never sees a tracker stamp the table does not hold.
     const bool gen = Gen::Active();
     if (runs.window != nullptr) {
         for (auto page = begin; page < end; page += WritePageBytes) {
             const auto pageKind = runs.window->Holds(page) ? StampKind::ImportWindow : kind;
-            tracker.stamp(tracker.blockOf(page), generation, pageKind);
             if (gen) noteStampGen(pageKind, page, page + WritePageBytes, generation);
+            tracker.stamp(tracker.blockOf(page), generation, pageKind);
         }
     } else {
-        for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, kind);
         if (gen) noteStampGen(kind, begin, end, generation);
+        for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, kind);
     }
 #ifndef _WIN32
     collectDirtyRuns.fetch_add(1, std::memory_order_relaxed);
@@ -2108,9 +2135,13 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     const bool gen = Gen::Active();
     pagesOf(&GuestArena::GuestArenaComparedPages_nid_no_patch, [&](std::uintptr_t page) {
+        // Compared-when-shared pages: the block reads Unknown(compared) until a walk tracks it again,
+        // and its refusal is a per-block table field (lock-free answers), stored before the map's.
+        if (gen) {
+            Gen::Global().Refuse(page, page + WritePageBytes, generation);
+            static_cast<void>(Gen::NoteState(Gen::Event::Refused, page, page + WritePageBytes, Gen::BlockState::Compared, Gen::Meta, generation));
+        }
         tracker.refused[tracker.blockOf(page)] = generation;
-        // Compared-when-shared pages: the block reads Unknown(compared) until a walk tracks it again.
-        if (gen) static_cast<void>(Gen::NoteState(Gen::Event::Refused, page, page + WritePageBytes, Gen::BlockState::Compared, Gen::Meta, generation));
     });
 }
 #endif
@@ -2576,15 +2607,20 @@ void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         if (tracker.coverage.Covers(begin, bytes)) continue;
         GuestArena::GuestArenaCompareWhenShared_nid_no_patch(static_cast<std::uintptr_t>(begin), bytes);
-        if (!walkWrites(tracker, begin, end, StampKind::Cpu) || !tracker.coverage.Restore(begin, bytes)) continue;
+        if (!walkWrites(tracker, begin, end, StampKind::Cpu)) continue;
+        // The new generation reaches the table before the restored coverage (see watchPrivateMapping);
+        // a restore that changes nothing leaves only a spare generation behind.
         tracker.bump();
+        const bool gen = Gen::Active();
+        if (gen) static_cast<void>(Gen::Note(Gen::Event::Rewatch, begin, end, Gen::Data | Gen::Cpu | Gen::Meta, tracker.generation.load(std::memory_order_relaxed)));
+        if (!tracker.coverage.Restore(begin, bytes)) continue;
         tracker.noteCpuStore(begin, end, tracker.generation);
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) {
             tracker.driverPieces.erase(block);
             tracker.stamp(block, tracker.generation, StampKind::Cpu);
         }
-        if (Gen::Active()) {
-            static_cast<void>(Gen::NoteState(Gen::Event::Rewatch, begin, end, Gen::BlockState::Tracked, Gen::Data | Gen::Cpu | Gen::Meta, tracker.generation.load(std::memory_order_relaxed)));
+        if (gen) {
+            static_cast<void>(Gen::Global().SetState(begin, end, Gen::BlockState::Tracked, true));
             Gen::Global().DropCoverage(begin, end);
         }
         restored = true;
@@ -2680,6 +2716,47 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     return true;
 }
 
+namespace {
+// Slice S2 (APS5_ARCHB_GEN_LOCKFREE, requires GEN_TABLE): answers of the tracker's query APIs taken
+// from the generation table without the tracker mutex when they are conclusive. The table mirrors
+// the tracker from above: every tracker stamp and refusal is published to the table, with the same
+// generation, before the tracker stores it (both under the mutex), so at every instant each block's
+// table data and refusal generations are at least the tracker's (coverage restores come after their
+// table event too). "Every block at most `since`" therefore implies the tracker's own answer; any
+// other table answer is inconclusive and the locked path decides, except the answers that need no
+// stamp at all (a generation of 0, a range outside write watching), which the locked path gives
+// without looking at a stamp either. Coverage (WriteWatchCoverage) and the unstamped-store slots
+// are atomics written under the mutex, the arena's host regions are fixed. See the debt notes.
+enum class FastAnswer : std::uint8_t { Inconclusive, True, False };
+
+FastAnswer fastUnchanged(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t since) {
+    if (since == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return FastAnswer::False;
+    return Gen::Global().DataAtMost(address, address + bytes, since) ? FastAnswer::True : FastAnswer::Inconclusive;
+}
+
+// Whether the calling query may use the lock-free answers at all.
+bool lockFree(const WriteTracker& tracker) {
+#ifdef _WIN32
+    return Gen::LockFreeActive() && tracker.ready.load(std::memory_order_acquire);
+#else
+    // Write watching outside Windows answers coverage through libc under the tracker mutex.
+    static_cast<void>(tracker);
+    return false;
+#endif
+}
+
+// Verify mode (APS5_ARCHB_GEN_VERIFY=N) for a sampled fast answer, under the tracker mutex: every
+// tracker section is complete there, so the table's answer must imply the tracker's (unsafe
+// otherwise); a lock-free answer that differs while the table under the mutex agrees saw a stamp
+// land in between (raced).
+void verifyFast(Gen::LockFreeApi api, bool fast, FastAnswer underLock, bool locked, std::uint64_t address, std::uint64_t bytes, std::uint64_t since) {
+    Gen::LockFreeVerify outcome = Gen::LockFreeVerify::Agree;
+    if (underLock != FastAnswer::Inconclusive && (underLock == FastAnswer::True) != locked) outcome = Gen::LockFreeVerify::Unsafe;
+    else if (fast != locked) outcome = Gen::LockFreeVerify::Raced;
+    Gen::CountLockFreeVerify(api, outcome, address, bytes, since);
+}
+}
+
 bool WriteWatched() {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
@@ -2695,9 +2772,31 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
 
+namespace {
+bool lockedUnchangedSince(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+    return tracker.rangeUnchanged(address, bytes, generation);
+}
+}
+
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
+    if (lockFree(tracker)) {
+        if (const auto fast = fastUnchanged(tracker, address, bytes, generation); fast != FastAnswer::Inconclusive) {
+            Gen::CountLockFree(Gen::LockFreeApi::UnchangedSince, true);
+            const bool answer = fast == FastAnswer::True;
+            const bool shadow = Gen::ShadowActive();
+            const bool verify = Gen::VerifyPeriod() != 0 && Gen::VerifySample();
+            if (shadow || verify) {
+                const auto lock = lockTracker(tracker);
+                if (verify) verifyFast(Gen::LockFreeApi::UnchangedSince, answer, fastUnchanged(tracker, address, bytes, generation), lockedUnchangedSince(tracker, address, bytes, generation), address, bytes, generation);
+                if (shadow) shadowQuery(tracker, address, bytes, generation, generation != 0 && tracker.covers(address, bytes), answer, site);
+            }
+            return answer;
+        }
+        Gen::CountLockFree(Gen::LockFreeApi::UnchangedSince, false);
+    }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     const bool shadow = Gen::ShadowActive();
@@ -2742,18 +2841,49 @@ void shadowQueries(const WriteTracker& tracker, std::span<const UnchangedQuery> 
 }
 }
 
+namespace {
+bool lockedUnchangedSinceAll(const WriteTracker& tracker, std::span<const UnchangedQuery> queries) {
+    if (!tracker.watched) return false;
+    for (const auto& [address, bytes, generation] : queries) {
+        if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+        if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
+    }
+    return true;
+}
+
+// False as soon as one query is conclusively false (the conjunction is false whatever the others
+// say), true only when every query is conclusively true.
+FastAnswer fastUnchangedAll(const WriteTracker& tracker, std::span<const UnchangedQuery> queries) {
+    bool inconclusive = false;
+    for (const auto& [address, bytes, generation] : queries) {
+        const auto answer = fastUnchanged(tracker, address, bytes, generation);
+        if (answer == FastAnswer::False) return FastAnswer::False;
+        inconclusive = inconclusive || answer == FastAnswer::Inconclusive;
+    }
+    return inconclusive ? FastAnswer::Inconclusive : FastAnswer::True;
+}
+}
+
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries, std::source_location site) {
     auto& tracker = Tracker();
+    if (lockFree(tracker)) {
+        if (const auto fast = fastUnchangedAll(tracker, queries); fast != FastAnswer::Inconclusive) {
+            Gen::CountLockFree(Gen::LockFreeApi::UnchangedSinceAll, true);
+            const bool answer = fast == FastAnswer::True;
+            const bool shadow = Gen::ShadowActive();
+            const bool verify = Gen::VerifyPeriod() != 0 && Gen::VerifySample();
+            if (shadow || verify) {
+                const auto lock = lockTracker(tracker);
+                if (verify) verifyFast(Gen::LockFreeApi::UnchangedSinceAll, answer, fastUnchangedAll(tracker, queries), lockedUnchangedSinceAll(tracker, queries), queries.empty() ? 0 : queries.front().address, queries.empty() ? 0 : queries.front().bytes, queries.empty() ? 0 : queries.front().generation);
+                if (shadow) shadowQueries(tracker, queries, answer, site);
+            }
+            return answer;
+        }
+        Gen::CountLockFree(Gen::LockFreeApi::UnchangedSinceAll, false);
+    }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    const auto answer = [&]() {
-        if (!tracker.watched) return false;
-        for (const auto& [address, bytes, generation] : queries) {
-            if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
-            if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
-        }
-        return true;
-    }();
+    const auto answer = lockedUnchangedSinceAll(tracker, queries);
     if (Gen::ShadowActive()) shadowQueries(tracker, queries, answer, site);
     return answer;
 }
@@ -2816,18 +2946,32 @@ std::uint64_t CollectCommittedWritesInPlace(std::uint64_t address, std::size_t b
     return generation;
 }
 
+namespace {
+bool lockedUnchangedCommittedSince(const WriteTracker& tracker, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation) {
+    if (!tracker.watched || generation == 0) return false;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin || !tracker.covers(begin, static_cast<std::size_t>(end - begin)) || tracker.newestStamp(begin, end) > generation || tracker.refusedSince(begin, end, generation)) return false;
+    }
+    return true;
+}
+
+// newestStamp also reads the unstamped-store slots (driver stores outside write watching, hashed by
+// block); they are atomics, read here as the locked path reads them.
+FastAnswer fastUnchangedCommittedSince(const WriteTracker& tracker, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation) {
+    if (generation == 0) return FastAnswer::False;
+    bool inconclusive = false;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin || !tracker.covers(begin, static_cast<std::size_t>(end - begin))) return FastAnswer::False;
+        if (!inconclusive && (!Gen::Global().DataAtMost(begin, end, generation) || tracker.newestUnstamped(begin, end) > generation)) inconclusive = true;
+    }
+    return inconclusive ? FastAnswer::Inconclusive : FastAnswer::True;
+}
+}
+
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation, std::source_location site) {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
-    tracker.initialize();
-    const auto answer = [&]() {
-        if (!tracker.watched || generation == 0) return false;
-        for (const auto& [begin, end] : ranges) {
-            if (end <= begin || !tracker.covers(begin, static_cast<std::size_t>(end - begin)) || tracker.newestStamp(begin, end) > generation || tracker.refusedSince(begin, end, generation)) return false;
-        }
-        return true;
-    }();
-    if (Gen::ShadowActive() && !ranges.empty()) {
+    const auto shadowFast = [&](bool answer) {
+        if (!Gen::ShadowActive() || ranges.empty()) return;
         auto& shadow = shadowScratch();
         shadow.clear();
         for (const auto& [begin, end] : ranges) {
@@ -2836,7 +2980,26 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
             shadow.push_back({begin, bytes, generation, covered});
         }
         shadowRanges(tracker, shadow, answer, site);
+    };
+    if (lockFree(tracker)) {
+        if (const auto fast = fastUnchangedCommittedSince(tracker, ranges, generation); fast != FastAnswer::Inconclusive) {
+            Gen::CountLockFree(Gen::LockFreeApi::UnchangedCommittedSince, true);
+            const bool answer = fast == FastAnswer::True;
+            const bool shadow = Gen::ShadowActive();
+            const bool verify = Gen::VerifyPeriod() != 0 && Gen::VerifySample();
+            if (shadow || verify) {
+                const auto lock = lockTracker(tracker);
+                if (verify) verifyFast(Gen::LockFreeApi::UnchangedCommittedSince, answer, fastUnchangedCommittedSince(tracker, ranges, generation), lockedUnchangedCommittedSince(tracker, ranges, generation), ranges.empty() ? 0 : ranges.front().first, ranges.empty() ? 0 : ranges.front().second - ranges.front().first, generation);
+                shadowFast(answer);
+            }
+            return answer;
+        }
+        Gen::CountLockFree(Gen::LockFreeApi::UnchangedCommittedSince, false);
     }
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    const auto answer = lockedUnchangedCommittedSince(tracker, ranges, generation);
+    shadowFast(answer);
     return answer;
 }
 
@@ -2896,9 +3059,9 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
     if (bytes == 0) return 0;
     tracker.bump();
     if (!tracker.watched || !tracker.covers(address, bytes)) {
+        noteDriverStoreGen(address, address + bytes, tracker.generation.load(std::memory_order_relaxed));
         tracker.noteUnstampedStore(address, address + bytes);
         if (tracker.watched) tracker.stampWatchedPart(address, address + bytes, tracker.generation, complete);
-        noteDriverStoreGen(address, address + bytes, tracker.generation.load(std::memory_order_relaxed));
         return 0;
     }
     {
@@ -2915,19 +3078,22 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
             beforeUnwatch(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             lock.Resume();
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
-            tracker.noteUnstampedStore(address, address + bytes);
+            // Another holder may have published the generation bumped above while the mutex was
+            // released (TrackerGeneration, collect memo hits): stamp with a fresh one.
+            tracker.bump();
             noteDriverStoreGen(address, address + bytes, tracker.generation.load(std::memory_order_relaxed));
+            tracker.noteUnstampedStore(address, address + bytes);
             return 0;
         }
         if (runs.stamped != 0) tracker.bump();
     }
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
+    noteDriverStoreGen(address, address + bytes, tracker.generation.load(std::memory_order_relaxed));
     for (auto block = first; block <= last; ++block) {
         tracker.stamp(block, tracker.generation, StampKind::Driver);
         tracker.noteDriverStore(block, address, address + bytes, tracker.generation, complete);
     }
-    noteDriverStoreGen(address, address + bytes, tracker.generation.load(std::memory_order_relaxed));
     return tracker.generation;
 }
 
@@ -2941,15 +3107,40 @@ std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes, std:
     return markWritten(address, bytes, false);
 }
 
-bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
-    auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
-    tracker.initialize();
+namespace {
+bool lockedStoredOver(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return true;
 #ifdef _WIN32
     if (bookkeeping::hostRegionOverlaps(address, bytes)) return true;
 #endif
     return tracker.storedOver(address, address + bytes, generation, false);
+}
+
+// storedOver only looks at blocks stamped after the generation: none (every block at most it) is
+// "not stored over".
+FastAnswer fastStoredOver(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return FastAnswer::True;
+    return Gen::Global().DataAtMost(address, address + bytes, generation) ? FastAnswer::False : FastAnswer::Inconclusive;
+}
+}
+
+bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    auto& tracker = Tracker();
+    if (lockFree(tracker)) {
+        if (const auto fast = fastStoredOver(tracker, address, bytes, generation); fast != FastAnswer::Inconclusive) {
+            Gen::CountLockFree(Gen::LockFreeApi::StoredOver, true);
+            const bool answer = fast == FastAnswer::True;
+            if (Gen::VerifyPeriod() != 0 && Gen::VerifySample()) {
+                const auto lock = lockTracker(tracker);
+                verifyFast(Gen::LockFreeApi::StoredOver, answer, fastStoredOver(tracker, address, bytes, generation), lockedStoredOver(tracker, address, bytes, generation), address, bytes, generation);
+            }
+            return answer;
+        }
+        Gen::CountLockFree(Gen::LockFreeApi::StoredOver, false);
+    }
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    return lockedStoredOver(tracker, address, bytes, generation);
 }
 
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
@@ -2959,15 +3150,7 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
     tracker.initialize();
     if (!tracker.watched || !tracker.covers(address, bytes)) return false;
     const auto end = address + bytes;
-    if (!tracker.unstampedStores.empty()) {
-        const auto first = address / WriteBlockBytes;
-        const auto last = (end - 1u) / WriteBlockBytes;
-        if (last - first >= WriteTracker::UnstampedSlots) {
-            if (std::ranges::any_of(tracker.unstampedStores, [&](auto stamp) { return stamp > generation; })) return false;
-        } else {
-            for (auto block = first; block <= last; ++block) if (tracker.unstampedStores[block % WriteTracker::UnstampedSlots] > generation) return false;
-        }
-    }
+    if (tracker.newestUnstamped(address, end) > generation) return false;
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(end - 1u); ++block) {
         const auto found = tracker.driverPieces.find(block);
         if (found == tracker.driverPieces.end()) return false;
@@ -2981,6 +3164,15 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();
+    // GEN_LOCKFREE: the generation published at the last mutex release (TrackerLock::publish), which
+    // is what the locked read returns once the section running now (if any) has finished: every
+    // stamp at or below it is complete and a walk still running stamps above it. Not GenClock's
+    // current value: a walk takes its generation before its OS query, so a clock value read while
+    // it runs would let it stamp stores made after the read with a generation not newer than it.
+    if (Gen::LockFreeActive()) {
+        Gen::CountLockFree(Gen::LockFreeApi::TrackerGeneration, true);
+        return tracker.stable.load(std::memory_order_acquire);
+    }
     // Under the mutex: a collect bumps the generation before its walk, and a walk still running
     // when the value is read absorbs stores made after it with a stamp not newer than the value.
     const auto lock = lockTracker(tracker);
@@ -2995,6 +3187,9 @@ void AdvanceTrackerGenerationForTest(std::uint64_t generation) {
 
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
+    // A value, compared for equality as a cache key: the table's newest data is an upper bound of
+    // the tracker's stamp, not the stamp, so no lock-free answer is conclusive (counted slow).
+    if (lockFree(tracker)) Gen::CountLockFree(Gen::LockFreeApi::NewestStamp, false);
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     return bytes == 0 ? 0 : tracker.newestStamp(address, address + bytes);
@@ -3082,10 +3277,8 @@ bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint
     return true;
 }
 
-bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
-    auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
-    tracker.initialize();
+namespace {
+bool lockedWrittenSince(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
@@ -3095,10 +3288,101 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
     return false;
 }
 
+FastAnswer fastWrittenSince(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return FastAnswer::False;
+    return Gen::Global().DataAtMost(address, address + bytes, generation) ? FastAnswer::False : FastAnswer::Inconclusive;
+}
+}
+
+bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    auto& tracker = Tracker();
+    if (lockFree(tracker)) {
+        if (const auto fast = fastWrittenSince(tracker, address, bytes, generation); fast != FastAnswer::Inconclusive) {
+            Gen::CountLockFree(Gen::LockFreeApi::WrittenSince, true);
+            const bool answer = fast == FastAnswer::True;
+            if (Gen::VerifyPeriod() != 0 && Gen::VerifySample()) {
+                const auto lock = lockTracker(tracker);
+                verifyFast(Gen::LockFreeApi::WrittenSince, answer, fastWrittenSince(tracker, address, bytes, generation), lockedWrittenSince(tracker, address, bytes, generation), address, bytes, generation);
+            }
+            return answer;
+        }
+        Gen::CountLockFree(Gen::LockFreeApi::WrittenSince, false);
+    }
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    return lockedWrittenSince(tracker, address, bytes, generation);
+}
+
+namespace {
+// Per block: a generation of 0 reads written without a stamp; a block whose table data is at most
+// its generation is unchanged and not CPU-written (every table cpu event also bumps data, and the
+// tracker's cpu stamps are a subset of its stamps). Any other block makes the whole call
+// inconclusive (its outputs are refilled by the locked path).
+FastAnswer fastChangedBlocks(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu) {
+    if (bytes == 0 || !tracker.covers(address, bytes)) return FastAnswer::False;
+    auto& table = Gen::Global();
+    const auto floor = table.ResetFloor();
+    const auto first = tracker.blockOf(address);
+    const auto last = tracker.blockOf(address + bytes - 1);
+    for (auto block = first; block <= last; ++block) {
+        const auto k = block - first;
+        if (k >= generations.size() || k >= changed.size()) break;
+        const auto generation = generations[k];
+        if (generation == 0) {
+            changed[k] = BlockWritten;
+            if (k < cpu.size()) cpu[k] = 1;
+            continue;
+        }
+        if (floor > generation || table.DataOf(tracker.blockBegin(block)) > generation) return FastAnswer::Inconclusive;
+        changed[k] = BlockUnchanged;
+        if (k < cpu.size()) cpu[k] = 0;
+    }
+    return FastAnswer::True;
+}
+}
+
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu, std::source_location site) {
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
     auto& tracker = Tracker();
+    if (lockFree(tracker)) {
+        const auto fast = fastChangedBlocks(tracker, address, bytes, generations, changed, cpu);
+        if (fast != FastAnswer::Inconclusive) {
+            Gen::CountLockFree(Gen::LockFreeApi::ChangedBlocks, true);
+            const bool shadow = Gen::ShadowActive() && fast == FastAnswer::True;
+            const bool verify = Gen::VerifyPeriod() != 0 && Gen::VerifySample();
+            if (shadow || verify) {
+                const auto lock = lockTracker(tracker);
+                const auto end = address + bytes;
+                const auto first = tracker.blockOf(address);
+                bool unsafe = false;
+                bool raced = false;
+                for (auto block = first; fast == FastAnswer::True && block <= tracker.blockOf(end - 1); ++block) {
+                    const auto k = block - first;
+                    if (k >= generations.size() || k >= changed.size()) break;
+                    const auto generation = generations[k];
+                    if (verify) {
+                        const bool written = generation == 0 || tracker.stampOf(block) > generation;
+                        const bool cpuWritten = generation == 0 || tracker.cpuStampOf(block) > generation;
+                        const bool tableClean = generation != 0 && Gen::Global().ResetFloor() <= generation && Gen::Global().DataOf(tracker.blockBegin(block)) <= generation;
+                        const bool mismatch = written != (changed[k] == BlockWritten) || (k < cpu.size() && cpuWritten != (cpu[k] != 0));
+                        if (mismatch && tableClean) unsafe = true;
+                        else if (mismatch) raced = true;
+                    }
+                    if (shadow) {
+                        const auto from = std::max<std::uint64_t>(address, tracker.blockBegin(block));
+                        const auto to = std::min<std::uint64_t>(end, tracker.blockBegin(block) + WriteBlockBytes);
+                        shadowQuery(tracker, from, static_cast<std::size_t>(to - from), generation, generation != 0, changed[k] == BlockUnchanged, site);
+                    }
+                }
+                if (verify) Gen::CountLockFreeVerify(Gen::LockFreeApi::ChangedBlocks, unsafe ? Gen::LockFreeVerify::Unsafe : raced ? Gen::LockFreeVerify::Raced : Gen::LockFreeVerify::Agree, address, bytes, generations.empty() ? 0 : generations.front());
+            }
+            return fast == FastAnswer::True;
+        }
+        Gen::CountLockFree(Gen::LockFreeApi::ChangedBlocks, false);
+        std::fill(changed.begin(), changed.end(), BlockWritten);
+        std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
+    }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || !tracker.covers(address, bytes)) return false;

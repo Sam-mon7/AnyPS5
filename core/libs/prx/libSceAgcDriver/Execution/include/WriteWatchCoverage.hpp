@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -12,12 +13,17 @@
 
 namespace AgcDriver::GuestMemory {
 
+// Pages of the write-watched arena excluded from write watching. Every mutation (Initialize,
+// Exclude, Restore) runs under the write tracker's mutex; Covers and ExcludedSpan may also run
+// without it (slice S2, GEN_LOCKFREE): the masks and chunk pointers are atomics, chunks are only
+// freed by the next Initialize (made once, before any lock-free reader), and a reader racing a
+// mutation sees each block's mask before or after it.
 class WriteWatchCoverage {
 public:
     void Initialize(std::uint64_t address, std::size_t bytes) {
         const auto blocks = bytes / BlockBytes + (bytes % BlockBytes != 0);
-        std::vector<std::unique_ptr<MaskChunk>> replacement(blocks / ChunkBlocks + (blocks % ChunkBlocks != 0));
-        excluded.swap(replacement);
+        Chunks replacement(blocks / ChunkBlocks + (blocks % ChunkBlocks != 0));
+        excluded.Swap(replacement);
         base = address;
         size = bytes;
         excludedGenerations.clear();
@@ -34,8 +40,8 @@ public:
         for (auto block = first + 1; block < last;) {
             const auto index = block / ChunkBlocks;
             const auto stop = std::min<std::size_t>(last, (index + 1) * ChunkBlocks);
-            const auto& chunk = excluded[index];
-            if (chunk != nullptr && std::any_of(chunk->begin() + block % ChunkBlocks, chunk->begin() + (stop - index * ChunkBlocks), [](auto mask) { return mask != 0; })) return false;
+            const auto* chunk = excluded.Get(index);
+            if (chunk != nullptr && std::any_of(chunk->begin() + block % ChunkBlocks, chunk->begin() + (stop - index * ChunkBlocks), [](const auto& mask) { return mask.load(std::memory_order_acquire) != 0; })) return false;
             block = stop;
         }
         return true;
@@ -53,19 +59,17 @@ public:
         std::size_t first = 0;
         std::size_t last = 0;
         if (!excludedBlocks(address, bytes, first, last)) return false;
-        for (auto index = first / ChunkBlocks; index <= last / ChunkBlocks; ++index) {
-            if (excluded[index] == nullptr) excluded[index] = std::make_unique<MaskChunk>();
-        }
+        for (auto index = first / ChunkBlocks; index <= last / ChunkBlocks; ++index) excluded.Ensure(index);
         for (auto block = first; block <= last; ++block) excludedGenerations.try_emplace(block, 0);
         bool changed = false;
         for (auto block = first; block <= last; ++block) {
             const auto pages = (std::min<std::uint64_t>(BlockBytes, size - block * BlockBytes) + PageBytes - 1) / PageBytes;
             const auto mask = pageMask(0, pages);
-            auto& value = (*excluded[block / ChunkBlocks])[block % ChunkBlocks];
-            changed = changed || value != mask;
+            auto& value = (*excluded.Get(block / ChunkBlocks))[block % ChunkBlocks];
+            changed = changed || value.load(std::memory_order_relaxed) != mask;
             auto& stamp = excludedGenerations.at(block);
             stamp = std::max(stamp, std::max<std::uint64_t>(generation, 1));
-            value = mask;
+            value.store(mask, std::memory_order_release);
         }
         return changed;
     }
@@ -91,9 +95,10 @@ public:
             const auto mask = pageMask(block == first ? firstPage % PagesPerBlock : 0, block == last ? (endPage - 1) % PagesPerBlock + 1 : PagesPerBlock);
             if ((excludedMask(block) & mask) != 0 && excludedGenerations.at(block) < generation) {
                 changed = true;
-                auto& value = (*excluded[block / ChunkBlocks])[block % ChunkBlocks];
-                value &= static_cast<std::uint16_t>(~mask);
-                if (value == 0) excludedGenerations.erase(block);
+                auto& value = (*excluded.Get(block / ChunkBlocks))[block % ChunkBlocks];
+                const auto remaining = static_cast<std::uint16_t>(value.load(std::memory_order_relaxed) & ~mask);
+                value.store(remaining, std::memory_order_release);
+                if (remaining == 0) excludedGenerations.erase(block);
             }
         }
         return changed;
@@ -101,8 +106,8 @@ public:
 
 private:
     std::uint16_t excludedMask(std::size_t block) const {
-        const auto& chunk = excluded[block / ChunkBlocks];
-        return chunk != nullptr ? (*chunk)[block % ChunkBlocks] : 0;
+        const auto* chunk = excluded.Get(block / ChunkBlocks);
+        return chunk != nullptr ? (*chunk)[block % ChunkBlocks].load(std::memory_order_acquire) : 0;
     }
     static std::uint16_t pageMask(std::size_t first, std::size_t end) {
         return static_cast<std::uint16_t>(((1u << end) - 1u) & ~((1u << first) - 1u));
@@ -125,10 +130,34 @@ private:
     static constexpr std::size_t PageBytes = 4096;
     static constexpr std::size_t PagesPerBlock = BlockBytes / PageBytes;
     static constexpr std::size_t ChunkBlocks = 4096;
-    using MaskChunk = std::array<std::uint16_t, ChunkBlocks>;
+    using MaskChunk = std::array<std::atomic<std::uint16_t>, ChunkBlocks>;
+    // Chunk pointers published with release (allocated on the first exclusion that needs them).
+    class Chunks {
+    public:
+        Chunks() = default;
+        explicit Chunks(std::size_t count) : count(count), slots(count != 0 ? new std::atomic<MaskChunk*>[count]() : nullptr) {}
+        ~Chunks() {
+            for (std::size_t i = 0; i < count; ++i) delete slots[i].load(std::memory_order_relaxed);
+        }
+        Chunks(const Chunks&) = delete;
+        Chunks& operator=(const Chunks&) = delete;
+        void Swap(Chunks& other) noexcept {
+            std::swap(count, other.count);
+            slots.swap(other.slots);
+        }
+        const MaskChunk* Get(std::size_t index) const { return slots[index].load(std::memory_order_acquire); }
+        MaskChunk* Get(std::size_t index) { return slots[index].load(std::memory_order_acquire); }
+        void Ensure(std::size_t index) {
+            if (slots[index].load(std::memory_order_relaxed) == nullptr) slots[index].store(new MaskChunk(), std::memory_order_release);
+        }
+
+    private:
+        std::size_t count = 0;
+        std::unique_ptr<std::atomic<MaskChunk*>[]> slots;
+    };
     std::uint64_t base = 0;
     std::size_t size = 0;
-    std::vector<std::unique_ptr<MaskChunk>> excluded;
+    Chunks excluded;
     std::unordered_map<std::uint64_t, std::uint64_t> excludedGenerations;
 };
 

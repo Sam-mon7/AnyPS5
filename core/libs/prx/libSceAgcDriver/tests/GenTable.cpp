@@ -326,6 +326,77 @@ void stress() {
     Require(cleans.load() != 0 && changes.load() != 0, "the stress test did not exercise both verdicts");
 }
 
+// Slice S2: the lock-free data test (DataAtMost, DataOf, Refuse). Data and refusals above `since`
+// fail it, pending and meta do not; a whole coarse unit skips on its summary only when everything in
+// it is old enough; the reset floor refuses older generations. Under concurrency a writer publishes
+// a generation and then a flag (the tracker stamping before it releases its mutex): a reader that
+// sees the flag never finds the block at most a generation below it.
+void lockfree() {
+    Table table;
+    const auto since = table.Bump();
+    Require(table.DataAtMost(Base, Base + 8 * Block, since), "an untouched range (no leaf) is not at most since");
+    table.Apply(Base + Block, Base + 2 * Block, Pending | Meta, table.Bump());
+    Require(table.DataAtMost(Base, Base + 8 * Block, since), "pending or meta failed the data test");
+    const auto data = table.Bump();
+    table.Apply(Base + 3 * Block, Base + 3 * Block + Page, Data, data);
+    Require(!table.DataAtMost(Base, Base + 8 * Block, since) && table.DataAtMost(Base, Base + 3 * Block, since) && table.DataAtMost(Base + 3 * Block, Base + 4 * Block, data), "a data event is misread");
+    Require(table.DataOf(Base + 3 * Block + 100) == data && table.DataOf(Base) == 0, "DataOf is wrong");
+    const auto refused = table.Bump();
+    table.Refuse(Base + 5 * Block, Base + 5 * Block + Page, refused);
+    Require(!table.DataAtMost(Base + 5 * Block, Base + 6 * Block, refused - 1) && table.DataAtMost(Base + 5 * Block, Base + 6 * Block, refused), "a refusal is misread");
+    // Coarse units: a blanket data event over a whole unit, and a unit whose summary moved on meta only.
+    const auto unitBase = Base + 64 * Block;
+    const auto blanket = table.Bump();
+    table.Apply(unitBase, unitBase + 64 * Block, Data, blanket);
+    Require(!table.DataAtMost(unitBase + 7 * Block, unitBase + 8 * Block, blanket - 1) && table.DataOf(unitBase + 9 * Block) == blanket, "a unit blanket is not read per block");
+    const auto metaUnit = Base + 128 * Block;
+    table.Apply(metaUnit, metaUnit + 64 * Block, Meta, table.Bump());
+    Require(table.DataAtMost(metaUnit, metaUnit + 64 * Block, since), "a unit with meta only fails the data test");
+    Require(!table.DataAtMost(Base, Base + Block, 0), "since 0 passed");
+    Require(table.Complete(), "a table without failed allocations is not complete");
+    const auto floor = table.Reset(table.Now());
+    Require(!table.DataAtMost(Base, Base + Block, floor - 1) && table.DataAtMost(Base, Base + Block, floor), "the reset floor is not applied");
+
+    constexpr std::size_t Blocks = 64;
+    std::vector<std::atomic<std::uint64_t>> flags(Blocks);
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> violations{0};
+    std::atomic<std::uint64_t> checks{0};
+    std::vector<std::thread> threads;
+    const auto stressBase = Base + 256 * Block;
+    for (int w = 0; w < 4; ++w) {
+        threads.emplace_back([&, w] {
+            std::mt19937_64 random(static_cast<std::uint64_t>(w) * 17u + 3u);
+            while (!stop.load(std::memory_order_relaxed)) {
+                const auto block = random() % Blocks;
+                const auto generation = table.Bump();
+                if ((random() & 1u) == 0) table.Apply(stressBase + block * Block, stressBase + block * Block + Page, Data, generation);
+                else table.Refuse(stressBase + block * Block, stressBase + block * Block + Page, generation);
+                auto current = flags[block].load(std::memory_order_relaxed);
+                while (current < generation && !flags[block].compare_exchange_weak(current, generation, std::memory_order_release, std::memory_order_relaxed)) {}
+            }
+        });
+    }
+    for (int r = 0; r < 4; ++r) {
+        threads.emplace_back([&, r] {
+            std::mt19937_64 random(static_cast<std::uint64_t>(r) * 29u + 1u);
+            while (!stop.load(std::memory_order_relaxed)) {
+                const auto first = random() % (Blocks - 4);
+                std::uint64_t newest = 0;
+                for (std::size_t i = 0; i < 4; ++i) newest = std::max(newest, flags[first + i].load(std::memory_order_acquire));
+                if (newest == 0) continue;
+                if (table.DataAtMost(stressBase + first * Block, stressBase + (first + 4) * Block, newest - 1)) ++violations;
+                ++checks;
+            }
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    stop = true;
+    for (auto& thread : threads) thread.join();
+    std::cout << "lockfree: checks " << checks.load() << " violations " << violations.load() << "\n";
+    Require(checks.load() != 0 && violations.load() == 0, "a published data or refusal generation was not visible to the lock-free test");
+}
+
 // Shadow classification: the outcome table, and an injected decision that the table calls Clean
 // while the byte compare found a change is counted unsafe.
 void shadowClassify() {
@@ -379,6 +450,7 @@ int main(int argc, char** argv) {
         else if (mode == "--journal") journal();
         else if (mode == "--check") check();
         else if (mode == "--stress") stress();
+        else if (mode == "--lockfree") lockfree();
         else if (mode == "--shadow-classify") shadowClassify();
         else {
             std::cerr << "unknown mode\n";
