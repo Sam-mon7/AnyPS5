@@ -407,3 +407,20 @@ void PerformanceTrace::StopOutput() {
 }
 
 }
+
+extern "C" void AgcDriverRecorderReplayBegin_nid_no_patch() {
+    using namespace AgcDriver::ArchB;
+    if (!Switches::Enabled(Feature::Recorder)) return;
+    const auto now = Recorder::Clock::now();
+    static_cast<void>(Recorder::Collect(now));
+    Recorder::Boundary(true, Switches::Sequence(), now);
+}
+
+extern "C" void AgcDriverRecorderReplayEnd_nid_no_patch(std::uint64_t pass, std::uint64_t frames) {
+    using namespace AgcDriver::ArchB;
+    if (!Recorder::Enabled()) return;
+    auto snapshot = Recorder::Collect(Recorder::Clock::now());
+    snapshot.frames = frames;
+    snapshot.presented = frames;
+    std::fprintf(stderr, "[archb-replay] pass=%llu %s\n", static_cast<unsigned long long>(pass), snapshot.Json().c_str());
+}

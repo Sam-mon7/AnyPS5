@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -163,6 +164,8 @@ bool Driver::pipelineDispatch() {
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    const bool imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
+    const bool imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
     ArchB::Recorder::Work recorderWork({ArchB::Recorder::Kind::Dispatch, 0});
     PerformanceTimer timing("Driver.Dispatch");
     const GuestMemory::ReadSiteScope handlerSite(GuestMemory::ReadSite::DispatchHandler);
@@ -471,6 +474,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         captureMs += phaseTiming.Elapsed();
     } else if (!fromAhead) {
         shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
+        shaderMemory->SetImageTableSnapshotReuse(imageTableSnapshotReuse);
+        shaderMemory->SetImageTableBitScanKeys(imageTableBitScanKeys);
         std::uint64_t forgetAtCapture = 0;
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;

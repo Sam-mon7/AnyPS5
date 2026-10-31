@@ -79,6 +79,8 @@ void toggleCase(const std::string& name) {
     setEnvironment("APS5_ARCHB_GATE_DELAY_US", "0");
     setEnvironment("APS5_ARCHB_TEST_RUNTIME_DEPENDENT", "0");
     setEnvironment("APS5_ARCHB_CONTROL_FILE", name == "NoFileNoCost" ? nullptr : path.string().c_str());
+    const bool imageTable = name == "ImageTableSnapshot";
+    if (imageTable) setEnvironment("APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE", nullptr);
     Switches::Initialize();
     const auto write = [&](const std::string& line, bool poll = true) {
         std::ofstream(path, std::ios::binary | std::ios::trunc) << line << '\n';
@@ -87,7 +89,21 @@ void toggleCase(const std::string& name) {
             Switches::PollControl();
         }
     };
-    if (name == "SeqMonotonic") {
+    if (imageTable) {
+        const auto feature = Feature::FixImageTableSnapshotReuse;
+        const std::string token = "FIX_IMAGE_TABLE_SNAPSHOT_REUSE";
+        for (const auto& entry : Switches::Table()) {
+            if (entry.feature == feature) check(!entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "runtime fix switch contract");
+        }
+        check(!Switches::Enabled(feature), "runtime fix must default off");
+        write("1 " + token + "=1");
+        const auto selected = Switches::Enabled(feature);
+        check(selected, "runtime fix did not turn on");
+        write("2 " + token + "=0");
+        check(selected && !Switches::Enabled(feature), "runtime fix did not preserve the selected path across a toggle");
+        write("3 " + token + "=1");
+        check(Switches::Enabled(feature), "runtime fix did not turn back on");
+    } else if (name == "SeqMonotonic") {
         write("2 GATE_NOOP=1 GATE_DELAY_US=7000");
         check(Switches::Enabled(Feature::GateNoop) && Switches::GateDelayMicros() == 7000, "initial toggle");
         const auto start = std::chrono::steady_clock::now();

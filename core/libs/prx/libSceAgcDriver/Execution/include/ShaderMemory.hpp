@@ -18,6 +18,7 @@ struct SourceHandle;
 class PreparedShaderInvocation;
 struct SrtWriteStamp;
 struct SrtGuestWords;
+struct ImageTableSnapshotCounts;
 }
 
 namespace AgcDriver {
@@ -86,8 +87,13 @@ public:
     };
     static VouchCounts Vouches();
     static bool Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp);
+    void SetImageTableDrawHit(bool hit) { imageTableDrawHit = hit; }
+    void SetImageTableSnapshotReuse(bool enabled, ShaderRecompiler::ImageTableSnapshotCounts* counts = nullptr) { imageTableSnapshotReuse = enabled; imageTableSnapshotCounts = counts; }
 
 private:
+    bool imageTableDrawHit = false;
+    bool imageTableSnapshotReuse = false;
+    ShaderRecompiler::ImageTableSnapshotCounts* imageTableSnapshotCounts = nullptr;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
     static constexpr std::size_t PageBytes = 4096;
     static constexpr std::size_t PageWords = PageBytes / sizeof(std::uint32_t);

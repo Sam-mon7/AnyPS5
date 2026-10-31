@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -1090,6 +1091,7 @@ int run(const Options& options) {
     }
     std::vector<Pass> passes;
     for (std::size_t pass = 0; pass < options.repeat && (pass == 0 || replay.unfinished == 0); ++pass) {
+        AgcDriverRecorderReplayBegin_nid_no_patch();
         if (pass > 0) {
             resetMemory(reader, replay.skipped);
             replay.pass = pass;
@@ -1124,6 +1126,7 @@ int run(const Options& options) {
         measured.paceTimeouts = replay.paceTimeouts.load() - measured.paceTimeouts;
         measured.synthesized = replay.syntheticReleases.load() - measured.synthesized;
         passes.push_back(measured);
+        AgcDriverRecorderReplayEnd_nid_no_patch(pass, measured.frames);
         if (drawProfile) {
             AgcDriverWaitIdle_nid_postfix();
             drawProfile->Write(pass);
