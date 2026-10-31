@@ -485,6 +485,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         shaderMemory->SetImageTableSnapshotReuse(imageTableSnapshotReuse);
         shaderMemory->SetImageTableBitScanKeys(imageTableBitScanKeys);
         std::uint64_t forgetAtCapture = 0;
+        std::uint64_t genAtCapture = 0;
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         try {
@@ -498,6 +499,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             const auto captureWaitedBefore = splitCapture ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
+            genAtCapture = GuestMemory::Gen::Active() ? GuestMemory::Gen::Global().Now() : 0;
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
                 return CaptureInvocation(*shaderMemory, snapshot, codeOffset, request, invocation);
@@ -542,7 +544,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, feedbackMask, feedbackKey);
+        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, genAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, feedbackMask, feedbackKey);
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
@@ -623,13 +625,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (pipelined) {
         const auto recipe = keepVariant->recipe.load(std::memory_order_acquire);
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        const auto ticket = GuestMemory::Gen::Required();
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, allocChurn, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion, computeSync] {
+        DrawPipeline::Queue0().Enqueue([this, allocChurn, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, computeSync] {
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             const ArchB::AllocChurnScope allocChurnScope(allocChurn);
             PerformanceTimer recorderTiming("Driver.DispatchCommit");
-            DrawPipeline::FollowEpoch(epoch);
+            DrawPipeline::FollowEpoch(epoch, ticket);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();

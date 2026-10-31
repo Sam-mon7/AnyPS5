@@ -85,6 +85,13 @@ void toggleCase(const std::string& name) {
     if (name == "VqMemo" || imageTable || bitScanKeys) setEnvironment(bitScanKeys ? "APS5_ARCHB_FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "APS5_ARCHB_FIX_VQ_MEMO", nullptr);
     if (bookkeeping) setEnvironment("APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING", nullptr);
     if (name == "AllocChurn") setEnvironment("APS5_ARCHB_FIX_ALLOC_CHURN", nullptr);
+    const bool genTable = name == "GenTable";
+    const bool genShadow = name == "GenShadow";
+    if (genTable || genShadow) {
+        setEnvironment("APS5_ARCHB_GEN_TABLE", nullptr);
+        // GEN_SHADOW from the environment without GEN_TABLE: refused at startup (prerequisite).
+        setEnvironment("APS5_ARCHB_GEN_SHADOW", genShadow ? "1" : nullptr);
+    }
     Switches::Initialize();
     const auto write = [&](const std::string& line, bool poll = true) {
         std::ofstream(path, std::ios::binary | std::ios::trunc) << line << '\n';
@@ -111,6 +118,30 @@ void toggleCase(const std::string& name) {
         check(selected && !Switches::Enabled(feature), "runtime fix did not preserve the selected path across a toggle");
         write("3 " + token + "=1");
         check(Switches::Enabled(feature), "runtime fix did not turn back on");
+    } else if (genTable || genShadow) {
+        // Write generations, slice S1: GEN_TABLE runtime and default off; GEN_SHADOW runtime, default
+        // off, and requires GEN_TABLE (named alone it is refused, and it drops when GEN_TABLE does).
+        int listed = 0;
+        for (const auto& entry : Switches::Table()) {
+            if (entry.feature == Feature::GenTable) {
+                ++listed;
+                check(std::string(entry.name) == "GEN_TABLE" && !entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "GEN_TABLE switch contract");
+            }
+            if (entry.feature == Feature::GenShadow) {
+                ++listed;
+                check(std::string(entry.name) == "GEN_SHADOW" && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::GenTable, "GEN_SHADOW switch contract");
+            }
+        }
+        check(listed == 2, "write-generation switches are listed");
+        check(!Switches::Enabled(Feature::GenTable) && !Switches::Enabled(Feature::GenShadow), "write-generation switches must start off (GEN_SHADOW without GEN_TABLE refused)");
+        write("1 GEN_SHADOW=1");
+        check(!Switches::Enabled(Feature::GenShadow), "GEN_SHADOW turned on without GEN_TABLE");
+        write("2 GEN_TABLE=1 GEN_SHADOW=1");
+        check(Switches::Enabled(Feature::GenTable) && Switches::Enabled(Feature::GenShadow), "GEN_TABLE and GEN_SHADOW did not turn on together");
+        write("3 GEN_TABLE=0");
+        check(!Switches::Enabled(Feature::GenTable) && !Switches::Enabled(Feature::GenShadow), "GEN_SHADOW stayed on after GEN_TABLE turned off");
+        write("4 GEN_TABLE=1");
+        check(Switches::Enabled(Feature::GenTable) && !Switches::Enabled(Feature::GenShadow), "GEN_TABLE alone did not turn on alone");
     } else if (name == "AllocChurn") {
         using AgcDriver::ArchB::AllocChurnActive;
         using AgcDriver::ArchB::AllocChurnScope;

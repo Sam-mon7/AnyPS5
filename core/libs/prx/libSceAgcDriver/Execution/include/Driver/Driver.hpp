@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRIVER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory/GenTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
@@ -164,7 +165,7 @@ private:
     void classifyDiffering(std::uint64_t program, std::uint64_t key, const DispatchVariant& old, const DispatchVariant& fresh, const ShaderRecompiler::ResourceCapture* capture, EntryCounters& counters);
     void reportDispatchCache(EntryCounters& counters);
     void lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, bool feedbackMask, std::uint64_t feedbackKey, std::span<const std::uint32_t> userData);
-    void insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, bool feedbackMask, std::uint64_t feedbackKey);
+    void insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::uint64_t genAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, bool feedbackMask, std::uint64_t feedbackKey);
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched, bool feedbackMask);
     static bool drawEntries();
@@ -349,7 +350,8 @@ private:
     static WaitOutcomes& waitOutcomes();
     static Graphics::Recorder::LateStatistics& lateCountsSeen();
     static EpochBumps& epochBumps();
-    static void bumpEpoch(std::uint64_t EpochBumps::*counter);
+    // `reason` names the write-generation ticket (Other: derived from the counter).
+    static void bumpEpoch(std::uint64_t EpochBumps::*counter, GuestMemory::Gen::TicketReason reason = GuestMemory::Gen::TicketReason::Other);
     static std::chrono::steady_clock::time_point& lastEpochBump();
     static std::deque<const std::uint32_t*>& releasedTails();
     void noteReleasedTails(const Submission& submission);

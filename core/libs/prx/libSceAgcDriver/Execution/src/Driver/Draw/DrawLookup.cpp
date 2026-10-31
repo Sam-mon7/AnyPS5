@@ -140,6 +140,10 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             if (eligible && maskedUser) { entry = feedbackEntry; feedbackAlias = true; }
         }
         if (entry == nullptr) ArchB::Recorder::Count("draw_cache_miss_absent");
+        const bool genShadow = GuestMemory::Gen::ShadowActive();
+        const bool genQueue0 = genShadow && GuestMemory::GpuLockThreadTag() == 0;
+        bool genAllClean = true;
+        if (entry == nullptr && genShadow) GuestMemory::Gen::NoteDrawLookup(genQueue0, false, false);
         if (entry != nullptr) {
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             std::optional<DrawMiss> miss;
@@ -191,11 +195,14 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         regions.clear();
                         appendEntryRegions(*variant, regions);
                         ++compared;
+                        const auto genBefore = genShadow ? GuestMemory::Gen::Global().Now() : 0;
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
+                        const auto genVerdict = genShadow ? ShadowValidatedVariant(GuestMemory::Gen::Consumer::DrawValidate, *variant, result, genBefore) : GuestMemory::Gen::Verdict::Unknown;
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
+                        if (genVerdict != GuestMemory::Gen::Verdict::Clean) genAllClean = false;
                         if (result == EntryOutcome::EqualData) {
                             auto& hit = stageData[i];
                             hit.words = variant->words;
@@ -223,6 +230,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
             }
             drawHit = !miss;
+            if (genShadow) GuestMemory::Gen::NoteDrawLookup(genQueue0, drawHit, drawHit && genAllClean);
             const bool feedbackHit = drawHit && std::any_of(stageData.begin(), stageData.end(), [](const auto& stage) { return stage.feedbackHit; });
             if (feedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");
             constexpr const char* recorderMisses[] = {"draw_cache_miss_front", "draw_cache_miss_fragment", "draw_cache_miss_other", "draw_cache_miss_layout", "draw_cache_miss_gate", "draw_cache_miss_stages"};

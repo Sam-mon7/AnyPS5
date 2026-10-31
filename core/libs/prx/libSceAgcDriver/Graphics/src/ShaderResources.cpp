@@ -734,6 +734,7 @@ void reportGuestAllocation(const GuestTextureResource& resource, std::uint64_t g
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::TextureLookup);
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (resource.baseAddress != requested.baseAddress) guestBytes = 0;
     if (resource.dimension == TextureDimension::k2DMsaa) {
@@ -3656,6 +3657,7 @@ ShaderResources::ProofExtent ShaderResources::Extent() const {
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     PerformanceTimer recorderTiming("Resources.Proof", AgcDriver::ArchB::Recorder::Phase::Proof);
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::ResourceProof);
     const bool trustProofs = ArchB::Switches::Enabled(ArchB::Feature::UbTrustProofs);
     if (trustProofs && provedOnce) {
         ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbTrustProofs);
@@ -3680,7 +3682,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             noteEpochProof(true, false, false);
             return true;
         }
+        // Write-generation shadow: a memo refused only because a global serial moved (same collect
+        // epoch), whose re-proof then passed on the tracker's footprint evidence (gen_shadow.
+        // resource_proof.global_only_refusals: what footprint-local evidence would have kept).
+        const bool globalOnly = epoch != 0 && provedEpoch == epoch && (provedProof != proof || provedPending != pending);
         const bool ok = revalidateFull(shaders, report);
+        if (globalOnly && ok && GuestMemory::Gen::ShadowActive()) GuestMemory::Gen::NoteGlobalOnlyRefusal();
         noteEpochProof(false, false, false);
         if (ok) {
             provedEpoch = epoch;
@@ -5176,6 +5183,7 @@ bool ShaderResources::precollectImages() {
 }
 
 std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::TextureLookup);
     if (record.texture == nullptr || record.texture->RefreshedPerUse() || record.texture->IsDepthCopy()) return nullptr;
     struct Outcome {
         bool profile;

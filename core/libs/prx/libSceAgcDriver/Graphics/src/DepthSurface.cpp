@@ -2015,6 +2015,12 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         lock.lock();
         releaseRetired(context);
         surfacesSerial.fetch_add(1, std::memory_order_release);
+        // Write generations: a new depth representation over its planes (meta, range-qualified).
+        if (GuestMemory::Gen::Active()) {
+            static_cast<void>(GuestMemory::Gen::Note(GuestMemory::Gen::Event::Representation, target.address, target.address + depthBytes, GuestMemory::Gen::Meta, 0, false));
+            if (stencilBytes != 0u) static_cast<void>(GuestMemory::Gen::Note(GuestMemory::Gen::Event::Representation, target.stencilAddress, target.stencilAddress + stencilBytes, GuestMemory::Gen::Meta, 0, false));
+            if (metadataBytes != 0u) static_cast<void>(GuestMemory::Gen::Note(GuestMemory::Gen::Event::Representation, target.htileAddress, target.htileAddress + metadataBytes, GuestMemory::Gen::Meta, 0, false));
+        }
         surfaces().push_back(std::make_unique<DepthSurface>(context, target, std::move(sampling)));
         ++mirrorEpoch;
         auto& fresh = *surfaces().back();

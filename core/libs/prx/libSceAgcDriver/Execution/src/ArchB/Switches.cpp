@@ -30,6 +30,7 @@ namespace {
 constexpr Feature TestPrerequisites[] = {Feature::GateRun};
 constexpr Feature TestRuntimePrerequisites[] = {Feature::GateNoop};
 #endif
+constexpr Feature GenShadowPrerequisites[] = {Feature::GenTable};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -52,6 +53,8 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixAllocChurn, "FIX_ALLOC_CHURN", false, true, {}},
     {Feature::FixComputeSyncUnlocked, "FIX_COMPUTE_SYNC_UNLOCKED", false, true, {}},
     {Feature::FixWriteTrackingBookkeeping, "FIX_WRITE_TRACKING_BOOKKEEPING", false, true, {}},
+    {Feature::GenTable, "GEN_TABLE", false, true, {}},
+    {Feature::GenShadow, "GEN_SHADOW", false, true, GenShadowPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

@@ -146,12 +146,24 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     } waitTrace{traceGpu, queue, awaited, std::chrono::steady_clock::now()};
     bool warned = false;
 
+    // The ticket reason (write generations): a value read from memory (CPU), a label another
+    // queue recorded or stored (GPU label), or a value held at submission.
     struct EpochPoint {
         bool bump;
+        GuestMemory::Gen::TicketReason reason = GuestMemory::Gen::TicketReason::WaitCpu;
         ~EpochPoint() {
-            if (bump) bumpEpoch(&EpochBumps::waits);
+            if (bump) bumpEpoch(&EpochBumps::waits, reason);
         }
     } epochPoint{!heldAtSubmit || requireMemory || !epochCovered};
+    // V5 census (APS5_ARCHB_GEN_SHADOW): whether ticket inheritance would admit a wait satisfied by
+    // another queue's label: from the recorder table without reading memory, or from memory when the
+    // label's last writer is that store and no CPU store reached its block since (the late path has
+    // just collected the label's pages; the history path is judged without a sweep, an upper bound).
+    const auto noteInheritable = [&](bool fromTable, std::optional<std::uint64_t> storeGeneration) {
+        if (!GuestMemory::Gen::ShadowActive()) return;
+        const bool admitted = fromTable || (storeGeneration.has_value() && *storeGeneration != 0 && GuestMemory::Gen::Global().Fields(awaited).cpu <= *storeGeneration);
+        GuestMemory::Gen::NoteWaitInheritance(fromTable, admitted);
+    };
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::optional<Graphics::Recorder::WaitProfile> waitProfile;
@@ -176,14 +188,21 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         return;
     }
     if (heldAtSubmit) {
+        epochPoint.reason = GuestMemory::Gen::TicketReason::WaitEntry;
         finishProfile(Graphics::Recorder::WaitEnd::Held);
         return;
     }
     std::optional<std::uint64_t> historyGeneration;
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
         submitWriter(writer);
-        if (writer != queue) notePendingWait(packet, queue, received);
-        else epochPoint.bump = false;
+        if (writer != queue) {
+            notePendingWait(packet, queue, received);
+            epochPoint.reason = GuestMemory::Gen::TicketReason::WaitGpuLabel;
+            noteInheritable(false, historyGeneration);
+        } else {
+            epochPoint.bump = false;
+            if (GuestMemory::Gen::Active()) GuestMemory::Gen::NoteTicket(GuestMemory::Gen::TicketReason::WaitOwn);
+        }
         finishProfile(Graphics::Recorder::WaitEnd::History);
         return;
     }
@@ -225,9 +244,14 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
-            if (!hit->late) epochPoint.bump = false;
+            if (!hit->late) {
+                epochPoint.bump = false;
+                if (GuestMemory::Gen::Active()) GuestMemory::Gen::NoteTicket(GuestMemory::Gen::TicketReason::WaitOwn);
+            }
         } else {
             notePendingWait(packet, queue, received);
+            epochPoint.reason = GuestMemory::Gen::TicketReason::WaitGpuLabel;
+            noteInheritable(!hit->late, hit->late ? std::optional<std::uint64_t>(hit->generation) : std::nullopt);
         }
         if (Timeline::Enabled) {
             for (std::size_t offset = 0; offset < awaitedBytes; offset += 4) Timeline::Emit(Timeline::Kind::WaitSource,

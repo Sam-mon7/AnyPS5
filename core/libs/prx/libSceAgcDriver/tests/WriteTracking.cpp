@@ -2646,6 +2646,115 @@ void CheckGenerationWrap() {
     Require(changed[0] == BlockUnchanged && changed[2] == BlockWritten && cpu[0] == 0 && cpu[2] == 1, "per-block changes after 2^32 were misreported");
 }
 
+// Write generations, slice S1 (APS5_ARCHB_GEN_TABLE=1 APS5_ARCHB_GEN_SHADOW=1 APS5_ARCHB_GEN_VERIFY=1):
+// the shadow over real tracker answers. Agreeing answers, the sweep model at tickets, an excluded
+// range, the reset floor when the table is turned on again; no answer may be unsafe.
+std::uint64_t genCounter(const std::string& name) {
+    return Gen::CounterForTest(name.c_str());
+}
+
+std::uint64_t genUnsafeTotal() {
+    std::uint64_t total = 0;
+    for (std::size_t c = 0; c < static_cast<std::size_t>(Gen::Consumer::Count); ++c) {
+        const std::string consumer = Gen::ConsumerName(static_cast<Gen::Consumer>(c));
+        total += genCounter("gen_shadow." + consumer + ".unsafe") + genCounter("gen_verify." + consumer + ".unsafe");
+    }
+    return total;
+}
+
+void CheckGenShadow() {
+    Require(Gen::ShadowActive(), "the shadow test needs APS5_ARCHB_GEN_TABLE=1 and APS5_ARCHB_GEN_SHADOW=1");
+    constexpr std::size_t bytes = 8 * Block;
+    void* memory = AllocateWatched(bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x5a, bytes);
+    BumpCollectEpoch(Gen::TicketReason::Submission);
+    const auto ticket = Gen::Required();
+    Require(ticket != 0 && genCounter("gen_tickets.submission") >= 1, "an ordering point issued no ticket");
+    const auto calls = genCounter("gen_sweep_model.calls");
+    const auto sweeps = genCounter("gen_sweep_model.sweeps");
+    const auto since = CollectWrites(base, bytes);
+    Require(since >= Gen::Global().ResetFloor() && since <= Gen::Global().Now(), "the tracker's generation is not a GenClock value above the floor");
+    Require(genCounter("gen_sweep_model.calls") == calls + 1 && genCounter("gen_sweep_model.sweeps") == sweeps + 1, "the first collect after a ticket was not modeled as a sweep");
+    Require(Gen::Global().Covered(base, base + bytes, ticket), "a completed walk did not cover its range at the ticket read before it");
+    const auto covered = genCounter("gen_sweep_model.covered");
+    static_cast<void>(CollectWrites(base + Block, Block));
+    Require(genCounter("gen_sweep_model.covered") == covered + 1, "a collect inside a covering sweep was not modeled covered");
+    {
+        const Gen::ConsumerScope scope(Gen::Consumer::ResourceProof);
+        const auto agree = genCounter("gen_shadow.resource_proof.agree_clean");
+        Require(UnchangedSince(base, bytes, since), "an unwritten range reads changed");
+        Require(genCounter("gen_shadow.resource_proof.agree_clean") == agree + 1, "an agreeing clean answer was not counted");
+        {
+            const Gen::ConsumerScope inner(Gen::Consumer::TextureLookup);
+            Require(Gen::CurrentConsumer() == Gen::Consumer::ResourceProof, "an inner consumer scope took over the outer decision");
+        }
+        static_cast<volatile std::uint8_t*>(memory)[3 * Block + 5] = 0x11;
+        BumpCollectEpoch(Gen::TicketReason::WaitCpu);
+        Require(!Gen::Global().Covered(base, base + bytes, Gen::Required()), "a sweep made before a new ticket still covers it");
+        static_cast<void>(CollectWrites(base, bytes));
+        const auto changed = genCounter("gen_shadow.resource_proof.agree_changed");
+        Require(!UnchangedSince(base, bytes, since), "the tracker missed a CPU store");
+        Require(genCounter("gen_shadow.resource_proof.agree_changed") == changed + 1, "an agreeing changed answer was not counted");
+        const std::array<UnchangedQuery, 2> queries{UnchangedQuery{base, Block, since}, UnchangedQuery{base + 3 * Block, Block, since}};
+        Require(!UnchangedSinceAll(queries), "a query set over a written block reads unchanged");
+        std::array<std::uint64_t, 4> generations{since, since, since, since};
+        std::array<std::uint8_t, 4> blocks{};
+        Require(ChangedBlocks(base, 4 * Block, generations, blocks) && blocks[3] == BlockWritten && blocks[0] == BlockUnchanged, "per-block changes misreported");
+        Require(genCounter("gen_shadow.resource_proof.agree_changed") >= changed + 3, "the query set and the written block were not classified as changed");
+    }
+    {
+        const auto since2 = CollectWrites(base, bytes);
+        const Gen::ConsumerScope scope(Gen::Consumer::Snapshot);
+        const auto excluded = genCounter("gen_shadow.snapshot.unknown_excluded");
+        Unwatch(base + 6 * Block, 2 * Block);
+        Require(!UnchangedSince(base + 6 * Block, Block, since2), "an unwatched range reads unchanged");
+        Require(genCounter("gen_shadow.snapshot.unknown_excluded") == excluded + 1, "an excluded range was not unknown_excluded");
+        Require(Gen::Global().Fields(base + 6 * Block).state == Gen::BlockState::Excluded, "an unwatched block is not Excluded in the table");
+    }
+    {
+        const Gen::ConsumerScope scope(Gen::Consumer::Mirror);
+        const auto since3 = CollectWrites(base, 4 * Block);
+        Gen::ResetActivationForTest();
+        Require(Gen::Active(), "the table did not activate again");
+        Require(Gen::Global().ResetFloor() > since3, "turning the table on again did not raise the floor above the handed-out generations");
+        const auto reset = genCounter("gen_shadow.mirror.unknown_reset");
+        const auto conservative = genCounter("gen_shadow.mirror.conservative");
+        Require(UnchangedSince(base, 4 * Block, since3), "the tracker's own answer changed with the floor");
+        Require(genCounter("gen_shadow.mirror.unknown_reset") == reset + 1 && genCounter("gen_shadow.mirror.conservative") == conservative + 1, "a since before the floor was not unknown_reset and conservative");
+        Require(CollectWritesUncached(base, 4 * Block) > Gen::Global().ResetFloor(), "a generation handed out after the floor is not above it");
+        Require(genCounter("gen_tickets.uncached") >= 1, "an uncached collect issued no private ticket");
+    }
+    Require(genCounter("gen_events.cpu_sweep.count") >= 1 && genCounter("gen_events.unwatch.count") >= 1 && genCounter("gen_verify.resource_proof.agree_clean") >= 1, "events or verification were not counted");
+    Require(genUnsafeTotal() == 0, "the shadow reported an unsafe disagreement");
+}
+
+// An event the table misses (a driver store with its table event suppressed through the test hook)
+// leaves the tracker's answer 'changed' and the table's 'clean': the shadow counts it unsafe and the
+// verifier (APS5_ARCHB_GEN_VERIFY=1) finds the missed stamp.
+void CheckGenVerifyCatches() {
+    Require(Gen::ShadowActive() && Gen::VerifyPeriod() == 1, "the verify test needs GEN_TABLE, GEN_SHADOW and GEN_VERIFY=1");
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x33, bytes);
+    BumpCollectEpoch(Gen::TicketReason::Submission);
+    const auto since = CollectWrites(base, bytes);
+    Gen::SuppressEventForTest(Gen::Event::DriverStore, true);
+    static_cast<void>(MarkWritten(base + Block + 64, 16));
+    Gen::SuppressEventForTest(Gen::Event::DriverStore, false);
+    const Gen::ConsumerScope scope(Gen::Consumer::TextureLookup);
+    const auto unsafe = genCounter("gen_shadow.texture_lookup.unsafe");
+    const auto verified = genCounter("gen_verify.texture_lookup.unsafe");
+    Require(!UnchangedSince(base, bytes, since), "the tracker missed the driver store");
+    Require(genCounter("gen_shadow.texture_lookup.unsafe") == unsafe + 1, "the shadow did not count the missed event unsafe");
+    Require(genCounter("gen_verify.texture_lookup.unsafe") == verified + 1, "the verifier did not catch the missed tracker stamp");
+    // With the event published, the same question agrees again.
+    const auto stored = MarkWritten(base + Block + 64, 16);
+    Require(Gen::Global().Fields(base + Block).data == stored, "the table did not take the driver store's generation");
+    Require(!UnchangedSince(base, bytes, since) && genCounter("gen_shadow.texture_lookup.unsafe") == unsafe + 1, "a published driver store was counted unsafe");
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2681,6 +2790,16 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--alloc-churn-memo") {
             CheckAllocChurnMemo();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--gen-shadow") {
+            CheckGenShadow();
+            std::cout << "write-generation shadow test passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--gen-verify-catches") {
+            CheckGenVerifyCatches();
+            std::cout << "write-generation verify test passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--gen-tracker-wrap") {

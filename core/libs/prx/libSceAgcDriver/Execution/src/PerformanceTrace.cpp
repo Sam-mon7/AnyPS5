@@ -411,6 +411,8 @@ void PerformanceTrace::StopOutput() {
 
 extern "C" void AgcDriverRecorderReplayBegin_nid_no_patch() {
     using namespace AgcDriver::ArchB;
+    // Write generations: the serials' baseline before the census resets, so the pass's moves count.
+    if (AgcDriver::GuestMemory::Gen::ShadowActive()) AgcDriver::GuestMemory::Gen::detail::SampleDriverSerials();
     AgcDriver::GuestMemory::ResetWriteCensus();
     if (!Switches::Enabled(Feature::Recorder)) return;
     const auto now = Recorder::Clock::now();
@@ -420,6 +422,7 @@ extern "C" void AgcDriverRecorderReplayBegin_nid_no_patch() {
 
 extern "C" void AgcDriverRecorderReplayEnd_nid_no_patch(std::uint64_t pass, std::uint64_t frames) {
     using namespace AgcDriver::ArchB;
+    if (AgcDriver::GuestMemory::Gen::ShadowActive()) AgcDriver::GuestMemory::Gen::detail::SampleDriverSerials();
     AgcDriver::GuestMemory::ReportWriteCensus(pass, frames);
     if (!Recorder::Enabled()) return;
     auto snapshot = Recorder::Collect(Recorder::Clock::now());

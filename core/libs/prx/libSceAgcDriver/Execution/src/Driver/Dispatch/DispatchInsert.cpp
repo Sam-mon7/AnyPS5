@@ -15,12 +15,13 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     });
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, bool feedbackMask, std::uint64_t feedbackKey) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::uint64_t genAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, bool feedbackMask, std::uint64_t feedbackKey) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
         fresh->shader = registeredShader;
         fresh->forgetSerial = forgetAtCapture;
+        fresh->genSince.store(genAtCapture, std::memory_order_relaxed);
 
         std::vector<ShaderRecompiler::MemoryRegion> srtRegions;
         std::size_t capturedWords = 0;

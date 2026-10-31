@@ -2257,6 +2257,7 @@ StorageTexture::RefreshPreparation StorageTexture::PrepareRefresh() {
 }
 
 bool StorageTexture::Refresh(RefreshPreparation* preparation) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::StorageRefresh);
     return refresh(0, trackedLayers, preparation);
 }
 
@@ -4013,6 +4014,9 @@ bool StorageTexture::keysFillMatches(std::uint64_t address, std::size_t bytes, b
 }
 
 void StorageTexture::MarkDirty() {
+    // Write generations: the storage image's results stay on the GPU until flushed (the pending
+    // registry), announced over its guest range.
+    if (GuestMemory::Gen::Active() && guestBytes != 0) GuestMemory::Gen::NotePending(descriptor.baseAddress, descriptor.baseAddress + guestBytes, reinterpret_cast<std::uintptr_t>(this));
     if (descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
         MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
