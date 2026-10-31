@@ -72,6 +72,9 @@ std::uint64_t lastModified = 0;
 std::uint64_t controlPolls = 0;
 #endif
 std::once_flag initialized;
+// Set once the table is read: Enabled() then skips std::call_once, which with MinGW's libstdc++
+// stores two emulated thread-locals on every call (about 30 ns per switch read).
+std::atomic<bool> initializedFast{false};
 
 std::string describe() {
     std::string text = "[archb] switches";
@@ -218,11 +221,12 @@ void Switches::Initialize() {
             if (const char* path = std::getenv("APS5_ARCHB_CONTROL_FILE")) controlFile = path;
         }
         std::fprintf(stderr, "%s\n", describe().c_str());
+        initializedFast.store(true, std::memory_order_release);
     });
 }
 
 bool Switches::Enabled(Feature feature) {
-    Initialize();
+    if (!initializedFast.load(std::memory_order_acquire)) Initialize();
     return values.at(static_cast<std::size_t>(feature)).load(std::memory_order_acquire);
 }
 
