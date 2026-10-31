@@ -800,6 +800,7 @@ private:
 
     void Narrow(const TableColumn& column, ColumnRecords& records) {
         const auto skip = [&](NarrowSkip reason) {
+            narrowSkip = static_cast<int>(reason);
             auto& counters = tableCounters();
             counters.narrowSkipped.fetch_add(1, std::memory_order_relaxed);
             counters.narrowSkips[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -988,9 +989,50 @@ private:
         if (!records.sealed) Seal(records);
         if (runtime.imageTableCensus) {
             const auto& column = *plan.descriptorSources.at(source).tableColumn;
-            std::fprintf(stderr, "[its-column] shader=%llx source=%u base=%llx keys=%u distinct=%zu address=%u indirect=%u selected=%u narrowed=%u\n", static_cast<unsigned long long>(plan.shaderHash), source, static_cast<unsigned long long>(records.base), records.keys, records.contents.words.size(), column.address, column.indirect, column.selected, records.narrowed);
+            std::string domains;
+            for (const auto& domain : column.keyDomains) domains += (domains.empty() ? "" : ",") + std::string(domain.value ? "v" : "b") + std::to_string(domain.source) + "+" + std::to_string(domain.offset) + "/" + std::to_string(domain.stride);
+            std::fprintf(stderr, "[its-column] shader=%llx source=%u base=%llx keys=%u distinct=%zu address=%u indirect=%u selected=%u narrowed=%u stride=%u addend=%u offset=%u dwords=%u maxKey=%u records=%u unkeyed=%u domains=[%s] skip=%s\n", static_cast<unsigned long long>(plan.shaderHash), source, static_cast<unsigned long long>(records.base), records.keys, records.contents.words.size(), column.address, column.indirect, column.selected, records.narrowed, column.stride, column.addend, column.offset, column.dwordCount, column.maxKey, records.records, column.unkeyed, domains.c_str(), narrowSkip < 0 ? "none" : NarrowSkipNames[static_cast<std::size_t>(narrowSkip)]);
+            static const char* dump = std::getenv("APS5_IMAGE_TABLE_CENSUS_DUMP");
+            if (dump != nullptr && records.keys >= 4096u) {
+                static std::atomic<std::uint32_t> sequence{0};
+                char name[512];
+                std::snprintf(name, sizeof(name), "%s/its-%llx-%u-%04u.bin", dump, static_cast<unsigned long long>(plan.shaderHash), source, sequence.fetch_add(1, std::memory_order_relaxed));
+                if (auto* file = std::fopen(name, "wb")) {
+                    const std::uint64_t header[4] = {records.base, records.keys, records.contents.words.size(), column.stride};
+                    std::fwrite(header, sizeof(header), 1, file);
+                    std::fwrite(records.contents.codes.data(), sizeof(std::uint32_t), records.contents.codes.size(), file);
+                    for (const auto& value : records.contents.words) {
+                        std::uint32_t row[9];
+                        std::copy_n(value.dwords.begin(), 8, row);
+                        row[8] = value.availableDwordMask | (value.dwordCount << 8u);
+                        std::fwrite(row, sizeof(row), 1, file);
+                    }
+                    std::fclose(file);
+                }
+            }
         }
         return records;
+    }
+
+    void BoundBitScanKeys(const TableColumn& column, ColumnRecords& records) const {
+        auto* counts = runtime.imageTableCounts;
+        if (column.bitScanKeys == 0u) {
+            if (counts != nullptr) counts->bitScanRefusedNoBound++;
+            return;
+        }
+        if (column.bitScanKeys >= records.keys) {
+            if (counts != nullptr) counts->bitScanRefusedNotNarrower++;
+            return;
+        }
+        if (column.stride == 0u || (static_cast<std::uint64_t>(column.bitScanKeys) + 1u) * column.stride > (std::uint64_t{1} << 32u)) {
+            if (counts != nullptr) counts->bitScanRefusedStride++;
+            return;
+        }
+        if (counts != nullptr) {
+            counts->bitScanBounded++;
+            counts->bitScanSkippedKeys += records.keys - column.bitScanKeys;
+        }
+        records.keys = column.bitScanKeys;
     }
 
     void ReadColumn(const TableColumn& column, std::uint32_t source, ColumnRecords& records) {
@@ -1026,6 +1068,7 @@ private:
         }
         records.records = std::min(records.records, ImageTableAbi::KeyRecords(column.maxKey, column.stride));
         records.keys = std::min(records.records, ImageTableAbi::MaxKeys);
+        if (runtime.imageTableBitScanKeys) BoundBitScanKeys(column, records);
         records.outside = records.keys < records.records;
         if (!column.keyDomains.empty() && records.keys != 0u) {
             Narrow(column, records);
@@ -1341,6 +1384,7 @@ private:
     const std::vector<std::uint8_t>& activeSources;
     ImageTableSnapshot& tables;
     bool rebuilding = false;
+    int narrowSkip = -1;
     std::uint32_t lastWords = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t lastPage = std::numeric_limits<std::uint64_t>::max();
     bool lastPageAccessible = false;
@@ -1813,6 +1857,25 @@ std::size_t resolutionMemoVariantEntries() {
 std::size_t resolutionMemoWords() {
     static const std::size_t words = positiveSetting(std::getenv("APS5_TABLE_RESOLUTION_MEMO_MIB"), 32u) * (std::size_t{1} << 20u) / sizeof(std::uint32_t);
     return words;
+}
+
+bool BitScanPrefixMatches(const ImageTableSnapshot& bounded, const ImageTableSnapshot& full) {
+    if (bounded.shader != full.shader || bounded.tables.size() != full.tables.size()) return false;
+    for (std::size_t index = 0; index < bounded.tables.size(); index++) {
+        const auto& a = bounded.tables[index];
+        const auto& b = full.tables[index];
+        if (a.base != b.base || a.size != b.size || a.records != b.records || a.fault != b.fault || a.keys > b.keys || a.codes.size() != a.keys || b.codes.size() != b.keys) return false;
+        if (a.keys < b.keys && !a.outside) return false;
+        if (a.keys == b.keys && a.outside != b.outside) return false;
+        for (std::uint32_t key = 0; key < a.keys; key++) {
+            const auto left = a.codes[key];
+            const auto right = b.codes[key];
+            const bool poisoned = (left & ImageTableAbi::PoisonFlag) != 0u;
+            if (poisoned != ((right & ImageTableAbi::PoisonFlag) != 0u)) return false;
+            if (poisoned ? left != right : a.words.at(left) != b.words.at(right)) return false;
+        }
+    }
+    return true;
 }
 
 bool sameColumns(const std::vector<ImageTableColumnSnapshot>& left, const std::vector<ImageTableColumnSnapshot>& right, bool contents) {
@@ -2770,6 +2833,26 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
                 runtime.imageTableCounts->verifyNs += verifyNs;
             }
             if (mismatch) throw std::runtime_error("image table snapshot reuse verification mismatch");
+        }
+        if (runtime.imageTableBitScanKeys && runtime.verifyImageTableBitScanKeys && runtime.imageTableCounts != nullptr && runtime.imageTableCounts->bitScanBounded != 0u) {
+            const auto verifyStarted = std::chrono::steady_clock::now();
+            auto reference = runtime;
+            reference.imageTableCounts = nullptr;
+            reference.imageTableCensus = false;
+            reference.imageTableSnapshotReuse = false;
+            reference.verifyImageTableSnapshotReuse = false;
+            reference.imageTableBitScanKeys = false;
+            reference.verifyImageTableBitScanKeys = false;
+            SrtWalker referenceWalker;
+            ImageTableSnapshot rebuilt;
+            TableSnapshotter(plan, reference, referenceWalker, activeSources, rebuilt, true).Run();
+            const bool mismatch = !BitScanPrefixMatches(nextSnapshot.tables, rebuilt);
+            const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - verifyStarted).count());
+            verifyNs += elapsed;
+            runtime.imageTableCounts->bitScanVerified++;
+            runtime.imageTableCounts->bitScanVerifyMismatches += mismatch;
+            runtime.imageTableCounts->bitScanVerifyNs += elapsed;
+            if (mismatch) throw std::runtime_error("image table bit-scan key bound verification mismatch");
         }
     } catch (...) {
         reportTables();

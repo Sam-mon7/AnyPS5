@@ -2948,6 +2948,18 @@ if(BUILD_TESTING)
         set_tests_properties(agc_archb_fix_a2_switch agc_archb_fix_a2_rules agc_archb_fix_a2_records agc_archb_fix_a2_strict PROPERTIES
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_archb_fix_bitscan_keys_switch COMMAND agc_archb_c01_switches_tests --toggle ImageTableBitScanKeys)
+    add_test(NAME agc_archb_fix_bitscan_keys COMMAND agc_shader_memory_tests --image-table-bitscan-keys)
+    add_test(NAME agc_archb_fix_bitscan_keys_verify COMMAND agc_shader_memory_tests --image-table-bitscan-keys)
+    add_test(NAME agc_archb_fix_bitscan_keys_strict COMMAND agc_shader_memory_tests --image-table-bitscan-keys)
+    set_tests_properties(agc_archb_fix_bitscan_keys_switch agc_archb_fix_bitscan_keys agc_archb_fix_bitscan_keys_verify agc_archb_fix_bitscan_keys_strict PROPERTIES
+        TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_property(TEST agc_archb_fix_bitscan_keys_verify agc_archb_fix_bitscan_keys_strict APPEND PROPERTY ENVIRONMENT "APS5_VERIFY_IMAGE_TABLE_BITSCAN_KEYS=1")
+    set_property(TEST agc_archb_fix_bitscan_keys_strict APPEND PROPERTY ENVIRONMENT "APS5_IMAGE_TABLE_STRICT=1")
+    if(WIN32)
+        set_tests_properties(agc_archb_fix_bitscan_keys_switch agc_archb_fix_bitscan_keys agc_archb_fix_bitscan_keys_verify agc_archb_fix_bitscan_keys_strict PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_shader_table_snapshot_reuse COMMAND agc_shader_memory_tests --table-snapshot-reuse)
     set_tests_properties(agc_shader_table_snapshot_reuse PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME agc_shader_table_snapshot_reuse_unmasked COMMAND agc_shader_memory_tests --table-snapshot-reuse)

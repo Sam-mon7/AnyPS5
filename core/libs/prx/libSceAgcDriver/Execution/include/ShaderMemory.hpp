@@ -89,10 +89,12 @@ public:
     static bool Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp);
     void SetImageTableDrawHit(bool hit) { imageTableDrawHit = hit; }
     void SetImageTableSnapshotReuse(bool enabled, ShaderRecompiler::ImageTableSnapshotCounts* counts = nullptr) { imageTableSnapshotReuse = enabled; imageTableSnapshotCounts = counts; }
+    void SetImageTableBitScanKeys(bool enabled) { imageTableBitScanKeys = enabled; }
 
 private:
     bool imageTableDrawHit = false;
     bool imageTableSnapshotReuse = false;
+    bool imageTableBitScanKeys = false;
     ShaderRecompiler::ImageTableSnapshotCounts* imageTableSnapshotCounts = nullptr;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
     static constexpr std::size_t PageBytes = 4096;
