@@ -40,12 +40,16 @@ std::string localTimestamp() {
     return text;
 }
 
+// Empty when no name is free or the folder cannot be queried.
 std::filesystem::path unusedPath(const std::filesystem::path& folder, const std::string& stem) {
     for (int index = 0; index < 1000; ++index) {
         const auto path = folder / (index == 0 ? stem + ".png" : stem + "-" + std::to_string(index) + ".png");
-        if (!std::filesystem::exists(path)) return path;
+        std::error_code error;
+        const bool exists = std::filesystem::exists(path, error);
+        if (error) return {};
+        if (!exists) return path;
     }
-    throw std::runtime_error("Screenshot: no unused file name for " + stem + " in " + folder.string());
+    return {};
 }
 
 }
@@ -69,13 +73,20 @@ std::filesystem::path AgcDriver::Screenshot::Write(std::string_view titleId, std
         rgb[pixel * 3 + 2] = std::to_integer<std::uint8_t>(bgra[pixel * 4]);
     }
     const auto png = Decoder::Png::Encode(rgb, width, height, 3);
+    // File-system failures return an empty path instead of throwing: the frame-dump worker runs in a
+    // driver built without unwind tables, where an exception cannot be delivered and aborts the title.
     const auto folder = directory();
-    std::filesystem::create_directories(folder);
+    std::error_code error;
+    std::filesystem::create_directories(folder, error);
+    if (error) return {};
     const auto path = unusedPath(folder, std::string(titleId) + "-" + localTimestamp());
-    std::ofstream file;
-    file.exceptions(std::ios::failbit | std::ios::badbit);
-    file.open(path, std::ios::binary);
+    if (path.empty()) return {};
+    std::ofstream file(path, std::ios::binary);
     file.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
     file.close();
+    if (!file) {
+        std::filesystem::remove(path, error);
+        return {};
+    }
     return path;
 }

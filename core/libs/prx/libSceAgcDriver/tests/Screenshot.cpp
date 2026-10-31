@@ -71,6 +71,21 @@ void rejectsInvalidFrames() {
 
 }
 
+// A folder that cannot be created (a file sits at its path) or a path beyond the platform limit returns an
+// empty path; the frame-dump worker cannot deliver exceptions in the driver.
+void unwritableFolderReturnsEmpty(const std::filesystem::path& root) {
+    const std::array<std::byte, 4> pixel{};
+    const auto blocker = root / "blocker";
+    std::filesystem::create_directories(root);
+    std::ofstream(blocker) << "not a folder";
+    setScreenshotDirectory(blocker / "shots");
+    require(AgcDriver::Screenshot::Write("TEST00001", 1, 1, pixel).empty(), "a folder blocked by a file yields an empty path");
+    // With long-path support enabled the write may succeed; either way it must not throw.
+    setScreenshotDirectory(root / std::string(300, 'x') / "shots");
+    const auto longPath = AgcDriver::Screenshot::Write("TEST00001", 1, 1, pixel);
+    require(longPath.empty() || std::filesystem::exists(longPath), "an over-long folder path writes or yields an empty path");
+}
+
 int main() try {
     const auto root = std::filesystem::temp_directory_path() / ("anyps5_screenshot-" + std::to_string(std::random_device{}()));
     const auto directory = root / std::filesystem::path(u8"nested-a\u00e7\u00e3o-\u65e5\u672c");
@@ -79,6 +94,7 @@ int main() try {
     requestsMerge();
     writesRgbPng(directory);
     rejectsInvalidFrames();
+    unwritableFolderReturnsEmpty(root);
     std::filesystem::remove_all(root);
     std::cout << "agc screenshot tests passed\n";
     return 0;
