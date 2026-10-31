@@ -22,6 +22,7 @@ enum class Feature : std::uint8_t {
     UbSkipDispatchProofWalk,
     FixTsharpFeedbackMask,
     FixPipelineStateReuse,
+    FixBufferBaseRefresh,
     Count
 };
 

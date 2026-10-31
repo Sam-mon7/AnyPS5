@@ -296,6 +296,7 @@ void MissCensus() {
         fresh.regions.push_back({moved ? 0x2000u : 0x1000u, std::as_bytes(std::span(currentWords))});
         const auto difference = CompareDrawMissStage(old, fresh, {});
         Require(std::string_view(difference.Class()) == expected, "miss census assigned the wrong primary class");
+        return difference;
     };
     check({{0, 0x100}, {1, 1}}, "m1_miss_image_address");
     for (std::size_t w = 1; w < 7; ++w) check({{w, 1u << 20u}}, "m1_miss_image_fields");
@@ -307,11 +308,27 @@ void MissCensus() {
     check({{8, 1}}, "m1_miss_sampler_specialized", false, false, true);
     check({{0, 0x100}, {8, 1}}, "m1_miss_image_sampler_independent");
     check({{2, 1}, {8, 1}}, "m1_miss_image_sampler_specialized");
-    check({{12, 1}}, "m1_miss_buffer");
+    const auto base = check({{12, 1}}, "m1_miss_buffer");
+    Require(base.bufferChanges == std::array<std::uint32_t, 4>{1, 0, 0, 0} && base.buffers.size() == 1 && base.buffers[0].role == DrawMissDifference::StorageBuffer, "buffer census lost a base-address change or storage role");
+    Require(!base.shaderChanged && !base.specializationChanged && base.layoutParts == 0 && base.layoutKeys[0].first == base.layoutKeys[0].second, "buffer base change was classified as a shader or layout change");
+    plan->info.buffers[0].scalar = true;
+    Require(check({{14, 4}}, "m1_miss_buffer").buffers[0].role == DrawMissDifference::ScalarBuffer, "buffer census lost the scalar constant role");
+    plan->info.buffers[0].written = true;
+    Require(check({{14, 4}}, "m1_miss_buffer").buffers[0].role == (DrawMissDifference::ScalarBuffer | DrawMissDifference::StorageBuffer), "buffer census hid mixed scalar/storage use");
+    plan->info.buffers[0].scalar = plan->info.buffers[0].written = false;
+    for (std::size_t w = 0; w < 4; ++w) {
+        for (std::uint32_t bit = 0; bit < 32; ++bit) {
+            std::array<std::uint32_t, 4> expected{};
+            expected[w] = 1u << bit;
+            Require(check({{12 + w, 1u << bit}}, "m1_miss_buffer").bufferChanges == expected, "buffer census lost or misassigned a descriptor bit");
+        }
+    }
+    Require(check({{12, 1}}, "m1_miss_buffer", true).specializationChanged, "buffer census hid a pipeline specialization change");
     check({{16, 1}}, "m1_miss_data");
     check({{0, 0x100}, {16, 1}}, "m1_miss_data");
     check({{17, 1}}, "m1_miss_other");
-    check({{0, 0x100}}, "m1_miss_layout", false, true);
+    const auto moved = check({{0, 0x100}}, "m1_miss_layout", false, true);
+    Require((moved.layoutParts & DrawMissDifference::ReadSet) && moved.layoutKeys[0].first != moved.layoutKeys[0].second, "layout census lost a captured-address change");
     IrValue computed(IrOpcode::IAdd32, IrType::U32, 20);
     computed.AddArgument(plan->descriptorSources[0].dwords[0]);
     auto* original = plan->descriptorSources[0].dwords[0];
@@ -334,6 +351,179 @@ void MissCensus() {
     plan->info.buffers[0].imageAlias = 0;
     plan->info.buffers[0].source = 0;
     check({{0, 0x100}}, "m1_miss_image_address");
+}
+
+void MissCensusLayouts() {
+    using namespace ShaderRecompiler;
+    using namespace AgcDriver::DriverDetail;
+    auto capture = std::make_shared<ResourceCapture>();
+    capture->plan = std::make_shared<IrResourcePlan>();
+    auto compiled = std::make_shared<RecompileResult>();
+    DispatchVariant old;
+    old.censusCapture = capture;
+    old.compiled = compiled;
+    const auto check = [&](auto change, std::uint32_t parts) {
+        auto nextCapture = std::make_shared<ResourceCapture>(*capture);
+        auto nextCompiled = std::make_shared<RecompileResult>(*compiled);
+        StageCapture fresh;
+        fresh.capture = nextCapture;
+        fresh.compiled = nextCompiled;
+        change(*nextCapture, *nextCompiled, fresh);
+        const auto difference = CompareDrawMissStage(old, fresh, {});
+        Require(difference.layoutParts == parts, "layout census assigned the wrong component");
+        return difference;
+    };
+    check([](auto& c, auto&, auto&) { c.plan = std::make_shared<IrResourcePlan>(); }, DrawMissDifference::Plan);
+    check([](auto&, auto&, auto& s) { s.pushOffset = 16; }, DrawMissDifference::PushOffset);
+    check([](auto& c, auto&, auto&) { c.snapshot.buffers.resize(1); }, DrawMissDifference::DescriptorShape);
+    check([](auto& c, auto&, auto&) { c.snapshot.nullRootReads = 1; }, DrawMissDifference::Tables);
+    check([](auto& c, auto&, auto&) { c.snapshot.userData.resize(1); }, DrawMissDifference::UserSize);
+    check([](auto&, auto& c, auto&) { c.vertexAttributes.resize(1); }, DrawMissDifference::VertexLayout);
+    check([](auto&, auto& c, auto&) { c.bindings.resize(1); }, DrawMissDifference::Bindings);
+    check([](auto&, auto& c, auto&) { c.specialization.push_back({1, 2}); }, DrawMissDifference::Specialization);
+    const auto shader = check([](auto&, auto& c, auto&) { c.spirv = std::vector<std::uint32_t>{1}; }, DrawMissDifference::Specialization);
+    Require(shader.shaderChanged && !shader.specializationChanged, "layout census conflated shader and pipeline specialization");
+    capture->snapshot.userData = {1};
+    capture->userDataUse.asBase = 1;
+    check([](auto& c, auto&, auto&) { c.snapshot.userData[0] = 2; }, DrawMissDifference::UserPointer);
+    compiled->vertexAttributes.push_back({0, 4, {{0x1000, 16u << 16u, 128, 0}}, 0, 4});
+    const auto vertex = check([](auto&, auto& c, auto&) { c.vertexAttributes[0].resource.fields[0] = 0x2000; }, 0);
+    Require(vertex.buffers.size() == 1 && vertex.buffers[0].role == DrawMissDifference::VertexBuffer && vertex.bufferChanges[0] == 0x3000, "buffer census lost a vertex base-address change");
+}
+
+void BufferBaseProofs() {
+    using namespace ShaderRecompiler;
+    using namespace AgcDriver::DriverDetail;
+    auto plan = std::make_shared<IrResourcePlan>();
+    plan->srtPlanComplete = plan->resourceTrackingComplete = true;
+    plan->valueStorage.Reserve(8);
+    plan->descriptorSources.resize(1);
+    plan->descriptorSources[0].dwordCount = 4;
+    plan->info.buffers.push_back({.source = 0, .read = true});
+    ResourceCapture capture;
+    capture.plan = plan;
+    capture.snapshot.buffers.push_back({{0x2000, 0, 64, 0x30016fac}, 4, 15});
+    DispatchVariant variant;
+    variant.words = {0x2000, 0, 64, 0x30016fac};
+    variant.runs.emplace_back(0x1000, 0x1010);
+    auto compiled = std::make_shared<RecompileResult>();
+    compiled->bindings.resize(2);
+    compiled->bindings[0].role = DescriptorRole::GuestBuffers;
+    compiled->bindings[0].count = 1;
+    compiled->bindings[1].role = DescriptorRole::FlattenedSrt;
+    for (auto& binding : compiled->bindings) binding.guestDescriptor = variant.words;
+    variant.compiled = compiled;
+    for (std::uint32_t w = 0; w < 4; ++w) {
+        auto* value = plan->valueStorage.Create(IrOpcode::LoadAddressU32, IrType::U32, w);
+        plan->descriptorSources[0].dwords[w] = value;
+        plan->srtReads.push_back({.value = value, .flatOffset = w});
+        capture.readTrace.slotReads.emplace_back(value, 0x1000 + w * 4);
+    }
+    RecordBufferBasePatches(variant, capture);
+    Require(variant.bufferBaseMasks == WordBitMasks{{0, 0xfffffffcu}, {1, 0xffffu}}, "base proof did not preserve alignment and descriptor metadata");
+    auto changed = variant.words;
+    changed[0] = 0x3000;
+    changed[1] = 1;
+    auto result = *compiled;
+    Require(PatchBufferBases(variant, changed, result), "base-only patch was refused");
+    Require(result.bindings[0].guestDescriptor == changed && result.bindings[1].guestDescriptor == changed && compiled->bindings[0].guestDescriptor == variant.words, "base patch left a stale descriptor or mutated the cached result");
+    for (const auto& [w, bits] : std::array<std::pair<std::size_t, std::uint32_t>, 9>{{{0, 1}, {1, 1u << 16}, {1, 1u << 31}, {2, 64}, {3, 1}, {3, 1u << 12}, {3, 1u << 21}, {3, 1u << 23}, {3, 1u << 30}}}) {
+        changed = variant.words;
+        changed[w] ^= bits;
+        result = *compiled;
+        Require(!PatchBufferBases(variant, changed, result), "base patch accepted alignment, stride, size, selector, format, swizzle or type changes");
+    }
+    changed = variant.words;
+    changed[0] = 0;
+    Require(!PatchBufferBases(variant, changed, result), "base patch accepted a null-buffer transition");
+    plan->controlFlow.resize(1);
+    plan->controlFlow[0].condition = plan->descriptorSources[0].dwords[0];
+    RecordBufferBasePatches(variant, capture);
+    Require(WordMask(variant.bufferBaseMasks, 0) == 0, "base proof accepted a capture control-flow dependency");
+    plan->controlFlow.clear();
+    auto* alias = plan->valueStorage.Create(IrOpcode::LoadAddressU32, IrType::U32, 4);
+    capture.readTrace.slotReads.emplace_back(alias, 0x1000);
+    RecordBufferBasePatches(variant, capture);
+    Require(WordMask(variant.bufferBaseMasks, 0) == 0, "base proof accepted an aliased capture read");
+    capture.readTrace.slotReads.pop_back();
+    plan->info.buffers[0].scalar = true;
+    RecordBufferBasePatches(variant, capture);
+    Require(variant.bufferBaseMasks.empty(), "base proof accepted a scalar buffer");
+    plan->info.buffers[0].scalar = false;
+    plan->info.buffers[0].written = true;
+    RecordBufferBasePatches(variant, capture);
+    Require(variant.bufferBaseMasks.empty(), "base proof accepted a writable buffer");
+}
+
+void BufferBasePath(const std::filesystem::path& control, bool indirect, bool recorder) {
+    using namespace AgcDriver::DriverDetail;
+    using R = AgcDriver::ArchB::Recorder;
+    using S = AgcDriver::ArchB::Switches;
+    using F = AgcDriver::ArchB::Feature;
+    alignas(256) static constexpr std::array<std::uint32_t, 11> code{0xf4080100u, 0xfa000000u, 0xbf8cc07fu, 0xe0300000u, 0x80010000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+    alignas(8) static Header header{};
+    alignas(256) static std::array<std::uint32_t, 4> descriptor{};
+    alignas(256) static std::array<std::array<float, 64>, 4> data{};
+    alignas(256) static const std::array<std::uint32_t, 4> arguments{3, 1, 0, 0};
+    R::Boundary(true, 0, R::Clock::now());
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(header, code.data(), sizeof(code), 1);
+    for (std::size_t i = 0; i < data.size(); ++i) data[i][0] = i == 0 ? 0.25f : 1.0f;
+    const auto point = [&](std::size_t index) {
+        const auto address = reinterpret_cast<std::uintptr_t>(data[index].data());
+        descriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 64, 0x30016fac};
+    };
+    const auto draw = [&](std::size_t count) {
+        const auto address = reinterpret_cast<std::uintptr_t>(descriptor.data());
+        auto commands = Draws(32.0f, TriangleVertexCode.data(), 0, code.data(), 2, std::vector<std::vector<std::uint32_t>>(count, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)}));
+        if (indirect) {
+            std::vector<std::uint32_t> changed;
+            const auto records = reinterpret_cast<std::uintptr_t>(arguments.data());
+            Append(changed, 0x11, {1, static_cast<std::uint32_t>(records), static_cast<std::uint32_t>(records >> 32u)});
+            for (std::size_t offset = 0; offset < commands.size();) {
+                const auto size = ((commands[offset] >> 16u) & 0x3fffu) + 2u;
+                if (((commands[offset] >> 8u) & 0xffu) == 0x2d) Append(changed, 0x24, {0, 0x8c, 0, 2});
+                else changed.insert(changed.end(), commands.begin() + offset, commands.begin() + offset + size);
+                offset += size;
+            }
+            commands = std::move(changed);
+        }
+        return Submit(std::move(commands));
+    };
+    std::array<std::byte, ColorMemory.size()> reference{};
+    unsigned sequence = 0;
+    for (const bool enabled : {true, false, true}) {
+        std::ofstream(control, std::ios::trunc) << ++sequence << " RECORDER=" << recorder << " FIX_BUFFER_BASE_REFRESH=" << enabled << '\n';
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        S::PollControl();
+        Require(S::Enabled(F::FixBufferBaseRefresh) == enabled, "runtime buffer refresh toggle did not apply");
+        R::Boundary(recorder, sequence, R::Clock::now());
+        point(0);
+        const auto before = draw(3);
+        Require(BrightestColorByte() == 64, "initial buffer rendered " + std::to_string(BrightestColorByte()) + ", expected 64");
+        R::Collect(R::Clock::now());
+        point(sequence);
+        ColorMemory.fill(std::byte{0});
+        const auto after = draw(1);
+        Require(BrightestColorByte() == 255, "base-only hit did not read the new buffer");
+        Require(after.hits - before.hits == (enabled ? 1u : 0u), "base change took the wrong cache path");
+        if (sequence == 1) reference = ColorMemory;
+        else Require(reference == ColorMemory, "on/off/on buffer refresh changed frame bytes");
+        const auto counts = R::Collect(R::Clock::now()).counters;
+        const auto hit = counts.find("fix_buffer_base_hits");
+        Require((hit != counts.end() && hit->second > 0) == (enabled && recorder), "buffer base refresh was not exercised");
+        if (enabled && recorder && std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr) {
+            const auto verified = counts.find("fix_buffer_base_verified");
+            Require(verified != counts.end() && verified->second == hit->second && !counts.contains("fix_buffer_base_verify_mismatches"), "base refresh was not verified against a full build");
+        }
+    }
+    for (const auto& [word, bits] : std::array<std::pair<std::size_t, std::uint32_t>, 3>{{{1, 4u << 16}, {2, 32}, {3, 1u << 12}}}) {
+        point(0);
+        const auto before = draw(2);
+        descriptor[word] ^= bits;
+        const auto after = draw(1);
+        Require(after.hits == before.hits, "stride, size or format change was accepted by the base-only path");
+    }
 }
 
 void TsharpMaskProofs() {
@@ -678,7 +868,11 @@ void PipelineStateReusePath(const std::filesystem::path& control) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-state-reuse") {
+        if (argc == 2 && std::string_view(argv[1]) == "--buffer-base-proof") {
+            BufferBaseProofs();
+            return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--pipeline-state-reuse" || std::string_view(argv[1]).starts_with("--buffer-base"))) {
             struct Control {
                 std::filesystem::path path = std::filesystem::temp_directory_path() / ("agc-h4-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
                 ~Control() { std::filesystem::remove(path); }
@@ -692,7 +886,8 @@ int main(int argc, char** argv) {
 #endif
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
-            PipelineStateReusePath(control.path);
+            if (std::string_view(argv[1]).starts_with("--buffer-base")) BufferBasePath(control.path, std::string_view(argv[1]) == "--buffer-base-indirect", std::string_view(argv[1]) != "--buffer-base-no-recorder");
+            else PipelineStateReusePath(control.path);
             AgcDriverShutdown_nid_postfix();
             return 0;
         }
@@ -730,6 +925,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--miss-census") {
             MissCensus();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--m4-miss-census") {
+            MissCensus();
+            MissCensusLayouts();
             return 0;
         }
         const bool census = argc == 2 && std::string_view(argv[1]) == "--miss-census-path";

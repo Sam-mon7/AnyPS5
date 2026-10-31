@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/ShaderStageInputInfo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -28,7 +29,7 @@ DrawMissDifference CompareDrawMissStage(const DispatchVariant& old, const StageC
         result.imageChanges[word] |= changed;
         if ((changed & ~addressMasks[word]) != 0) result.kinds |= Difference::ImageFields;
     };
-    const auto layout = [&] { result.kinds |= Difference::Layout; ++result.layout; };
+    const auto layout = [&](std::uint32_t part) { result.kinds |= Difference::Layout; result.layoutParts |= part; ++result.layout; };
     if (old.censusCapture == nullptr || fresh.capture == nullptr || old.compiled == nullptr || fresh.compiled == nullptr) {
         result.kinds = Difference::Other;
         result.layout = 1;
@@ -36,12 +37,46 @@ DrawMissDifference CompareDrawMissStage(const DispatchVariant& old, const StageC
     }
     const auto& before = *old.censusCapture;
     const auto& after = *fresh.capture;
-    if (before.plan != after.plan || old.pushOffset != fresh.pushOffset) layout();
+    if (before.plan != after.plan || old.pushOffset != fresh.pushOffset) {
+        layout((before.plan != after.plan ? Difference::Plan : 0u) | (old.pushOffset != fresh.pushOffset ? Difference::PushOffset : 0u));
+    }
+    const auto bufferChange = [&](const auto& a, const auto& b, std::uint32_t role, std::size_t index) {
+        Difference::BufferChange change;
+        std::copy_n(a.begin(), 4, change.before.begin());
+        std::copy_n(b.begin(), 4, change.after.begin());
+        if (change.before == change.after) return;
+        change.role = role;
+        change.index = index;
+        change.stage = after.plan != nullptr ? static_cast<std::uint32_t>(after.plan->stage) : 0;
+        if (role != Difference::VertexBuffer && after.plan != nullptr && index < after.plan->info.buffers.size()) {
+            const auto& buffer = after.plan->info.buffers[index];
+            change.readOnly = buffer.read && !buffer.written && !buffer.atomic;
+            if (buffer.source < after.plan->descriptorSources.size()) {
+                const auto& source = after.plan->descriptorSources[buffer.source];
+                for (std::size_t w = 0; w < 2; ++w) {
+                    const auto* value = source.dwords[w];
+                    if (value != nullptr && value->Resolve()->Opcode() == ShaderRecompiler::IrOpcode::GetUserData) change.userBaseWords |= 1u << w;
+                }
+            }
+        }
+        result.buffers.push_back(change);
+        for (std::size_t w = 0; w < 4; ++w) result.bufferChanges[w] |= a[w] ^ b[w];
+    };
     const auto descriptors = [&](const auto& a, const auto& b, std::uint32_t kind) {
-        if (a.size() != b.size()) layout();
+        if (a.size() != b.size()) layout(Difference::DescriptorShape);
         for (std::size_t i = 0; i < std::min(a.size(), b.size()); ++i) {
             if (a[i] == b[i]) continue;
-            if (a[i].dwordCount != b[i].dwordCount || a[i].availableDwordMask != b[i].availableDwordMask) layout();
+            if (a[i].dwordCount != b[i].dwordCount || a[i].availableDwordMask != b[i].availableDwordMask) layout(Difference::DescriptorShape);
+            if (kind == Difference::Buffer) {
+                std::uint32_t role = 0;
+                for (const auto* capture : {&before, &after}) {
+                    if (capture->plan == nullptr || i >= capture->plan->info.buffers.size()) { role |= Difference::UnknownBuffer; continue; }
+                    const auto& buffer = capture->plan->info.buffers[i];
+                    if (buffer.scalar) role |= Difference::ScalarBuffer;
+                    if (!buffer.scalar || buffer.written || buffer.atomic || buffer.formatted || std::any_of(capture->plan->memoryInfo.begin(), capture->plan->memoryInfo.end(), [i](const auto& memory) { return memory.kind == ShaderRecompiler::ResourceKind::Buffer && memory.resource == i; })) role |= Difference::StorageBuffer;
+                }
+                bufferChange(a[i].dwords, b[i].dwords, role, i);
+            }
             if (kind != Difference::Image) continue;
             for (std::size_t w = 0; w < a[i].dwords.size(); ++w) {
                 imageChange(w, a[i].dwords[w] ^ b[i].dwords[w]);
@@ -51,23 +86,29 @@ DrawMissDifference CompareDrawMissStage(const DispatchVariant& old, const StageC
     descriptors(before.snapshot.images, after.snapshot.images, Difference::Image);
     descriptors(before.snapshot.samplers, after.snapshot.samplers, Difference::Sampler);
     descriptors(before.snapshot.buffers, after.snapshot.buffers, Difference::Buffer);
-    if (before.snapshot.tables != after.snapshot.tables || before.snapshot.srtPoison != after.snapshot.srtPoison || before.snapshot.nullRootReads != after.snapshot.nullRootReads) layout();
-    if (before.snapshot.userData.size() != after.snapshot.userData.size()) layout();
+    if (before.snapshot.tables != after.snapshot.tables || before.snapshot.srtPoison != after.snapshot.srtPoison || before.snapshot.nullRootReads != after.snapshot.nullRootReads) layout(Difference::Tables);
+    if (before.snapshot.userData.size() != after.snapshot.userData.size()) layout(Difference::UserSize);
     const auto& a = *old.compiled;
     const auto& b = *fresh.compiled;
-    if (a.vertexAttributes.size() != b.vertexAttributes.size()) layout();
+    if (a.vertexAttributes.size() != b.vertexAttributes.size()) layout(Difference::VertexLayout);
     for (std::size_t i = 0; i < std::min(a.vertexAttributes.size(), b.vertexAttributes.size()); ++i) {
         if (a.vertexAttributes[i].resource.fields != b.vertexAttributes[i].resource.fields) result.kinds |= Difference::Buffer;
+        bufferChange(a.vertexAttributes[i].resource.fields, b.vertexAttributes[i].resource.fields, Difference::VertexBuffer, i);
     }
-    if (a.spirv.ContentHash() != b.spirv.ContentHash() || a.specialization != b.specialization) result.kinds |= Difference::Specialized;
+    result.shaderChanged = a.spirv.ContentHash() != b.spirv.ContentHash();
+    result.specializationChanged = a.specialization != b.specialization;
+    if (result.shaderChanged || result.specializationChanged) result.kinds |= Difference::Specialized;
     const auto sameBinding = [](const auto& x, const auto& y) {
         return x.kind == y.kind && x.role == y.role && x.descriptorSet == y.descriptorSet && x.binding == y.binding && x.count == y.count;
     };
-    if (a.bindings.size() != b.bindings.size() || !std::equal(a.bindings.begin(), a.bindings.end(), b.bindings.begin(), sameBinding)) layout();
+    if (a.bindings.size() != b.bindings.size() || !std::equal(a.bindings.begin(), a.bindings.end(), b.bindings.begin(), sameBinding)) layout(Difference::Bindings);
     for (std::size_t i = 0; i < std::min(a.bindings.size(), b.bindings.size()); ++i) {
         const auto& x = a.bindings[i];
         const auto& y = b.bindings[i];
-        if (x.imageShape != y.imageShape || x.imageShapes != y.imageShapes || x.imageSamplers != y.imageSamplers || x.Flags() != y.Flags()) result.kinds |= Difference::Specialized;
+        if (x.imageShape != y.imageShape || x.imageShapes != y.imageShapes || x.imageSamplers != y.imageSamplers || x.Flags() != y.Flags()) {
+            result.kinds |= Difference::Specialized;
+            result.bindingFlagsChanged = true;
+        }
     }
     std::map<std::uint64_t, std::uint32_t> was, now;
     std::set<std::uint64_t> refreshable;
@@ -91,6 +132,8 @@ DrawMissDifference CompareDrawMissStage(const DispatchVariant& old, const StageC
     std::map<std::size_t, std::uint32_t> userRoles;
     std::map<std::uint64_t, std::uint8_t> imageWords;
     std::map<std::size_t, std::uint8_t> userImageWords;
+    std::map<std::uint64_t, std::uint8_t> bufferWords;
+    std::map<std::size_t, std::uint8_t> userBufferWords;
     std::set<std::uint64_t> observed, pointers;
     const auto mark = [&](const ShaderRecompiler::ResourceCapture& capture) {
         if (capture.plan == nullptr) return;
@@ -134,12 +177,14 @@ DrawMissDifference CompareDrawMissStage(const DispatchVariant& old, const StageC
                         if (reg >= capture.plan->userDataBase) {
                             userRoles[reg - capture.plan->userDataBase] |= kind;
                             if (kind == Difference::Image) userImageWords[reg - capture.plan->userDataBase] |= static_cast<std::uint8_t>(1u << w);
+                            if (kind == Difference::Buffer && w < 4) userBufferWords[reg - capture.plan->userDataBase] |= static_cast<std::uint8_t>(1u << w);
                         }
                     }
                     if (const auto found = addresses.find(value); found != addresses.end()) {
                         for (const auto address : found->second) {
                             roles[address] |= kind;
                             if (kind == Difference::Image) imageWords[address] |= static_cast<std::uint8_t>(1u << w);
+                            if (kind == Difference::Buffer && w < 4) bufferWords[address] |= static_cast<std::uint8_t>(1u << w);
                         }
                     }
                 }
@@ -171,29 +216,62 @@ DrawMissDifference CompareDrawMissStage(const DispatchVariant& old, const StageC
         if (const auto found = userImageWords.find(w); found != userImageWords.end()) {
             for (std::size_t i = 0; i < 8; ++i) if (found->second & (1u << i)) imageChange(i, before.snapshot.userData[w] ^ after.snapshot.userData[w]);
         }
-        if (w < 64 && ((before.userDataUse.asBase | after.userDataUse.asBase) & (std::uint64_t{1} << w))) layout();
+        if (const auto found = userBufferWords.find(w); found != userBufferWords.end()) {
+            for (std::size_t i = 0; i < 4; ++i) if (found->second & (1u << i)) result.bufferChanges[i] |= before.snapshot.userData[w] ^ after.snapshot.userData[w];
+        }
+        if (w < 64 && ((before.userDataUse.asBase | after.userDataUse.asBase) & (std::uint64_t{1} << w))) layout(Difference::UserPointer);
         else if (const auto role = userRoles.find(w); role != userRoles.end()) result.kinds |= role->second;
         else { result.kinds |= Difference::Data; ++result.userDataWords; }
     }
     for (const auto& [slot, address] : after.readTrace.leaves) if (!roles.contains(address)) roles[address] = Difference::Data;
     for (const auto& [address, value] : now) {
         const auto found = was.find(address);
-        if (found == was.end()) { layout(); continue; }
+        if (found == was.end()) { layout(Difference::ReadSet); continue; }
         if (found->second == value) continue;
         ++result.words;
         if (const auto image = imageWords.find(address); image != imageWords.end()) {
             for (std::size_t i = 0; i < 8; ++i) if (image->second & (1u << i)) imageChange(i, found->second ^ value);
         }
+        if (const auto buffer = bufferWords.find(address); buffer != bufferWords.end()) {
+            for (std::size_t i = 0; i < 4; ++i) if (buffer->second & (1u << i)) result.bufferChanges[i] |= found->second ^ value;
+        }
         const auto role = roles.find(address);
         result.kinds |= role == roles.end() ? Difference::Other : role->second;
-        if (role != roles.end() && (role->second & Difference::Layout)) ++result.layout;
+        if (role != roles.end() && (role->second & Difference::Layout)) { ++result.layout; result.layoutParts |= Difference::PointerValue; }
         if (role != roles.end() && (role->second & Difference::Data)) {
             ++result.dataWords;
             if (refreshable.contains(address)) ++result.refreshableDataWords;
         }
     }
-    for (const auto& [address, value] : was) if (!now.contains(address)) layout();
-    if ((result.kinds & Difference::Specialized) && !(result.kinds & (Difference::Image | Difference::Sampler | Difference::Buffer | Difference::Data))) layout();
+    for (const auto& [address, value] : was) if (!now.contains(address)) layout(Difference::ReadSet);
+    if ((result.kinds & Difference::Specialized) && !(result.kinds & (Difference::Image | Difference::Sampler | Difference::Buffer | Difference::Data))) layout(Difference::Specialization);
+    const auto layoutKey = [&](const auto& capture, const auto& compiled, std::uint32_t push, const auto& memory) {
+        const auto& snapshot = capture.snapshot;
+        if (!snapshot.tables.tables.empty() || !snapshot.srtPoison.empty() || snapshot.nullRootReads != 0) return std::uint64_t{0};
+        std::uint64_t key = 0xcbf29ce484222325ull;
+        const auto mix = [&](std::uint64_t value) { key = (key ^ value) * 0x100000001b3ull; };
+        mix(reinterpret_cast<std::uintptr_t>(capture.plan.get()));
+        mix(push);
+        mix(snapshot.userData.size());
+        for (const auto* descriptors : {&snapshot.buffers, &snapshot.images, &snapshot.samplers}) {
+            mix(descriptors->size());
+            for (const auto& descriptor : *descriptors) { mix(descriptor.dwordCount); mix(descriptor.availableDwordMask); }
+        }
+        mix(compiled.vertexAttributes.size());
+        mix(compiled.bindings.size());
+        for (const auto& binding : compiled.bindings) {
+            mix(static_cast<std::uint32_t>(binding.kind));
+            mix(static_cast<std::uint32_t>(binding.role));
+            mix(binding.descriptorSet); mix(binding.binding); mix(binding.count);
+        }
+        for (std::size_t w = 0; w < snapshot.userData.size() && w < 64; ++w) {
+            if (capture.userDataUse.asBase & (std::uint64_t{1} << w)) { mix(w); mix(snapshot.userData[w]); }
+        }
+        mix(memory.size());
+        for (const auto& [address, value] : memory) { mix(address); if (pointers.contains(address)) mix(value); }
+        return key;
+    };
+    result.layoutKeys.emplace_back(layoutKey(before, a, old.pushOffset, was), layoutKey(after, b, fresh.pushOffset, now));
     return result;
 }
 
@@ -221,9 +299,10 @@ void Driver::censusDrawMiss(const std::vector<DrawProgram>& programs, const std:
     const auto score = [](const DrawMissDifference& value) { return std::pair(value.layout, value.words); };
     DrawMissDifference closest;
     closest.layout = std::numeric_limits<std::size_t>::max();
+    std::uint64_t closestShape = 0;
     for (const auto& candidate : candidates) {
         DrawMissDifference difference;
-        if (shape != 0 && candidate->shape != shape) { difference.kinds |= DrawMissDifference::Layout; ++difference.layout; }
+        if (shape != 0 && candidate->shape != shape) { difference.kinds |= DrawMissDifference::Layout; difference.layoutParts |= DrawMissDifference::Shape; ++difference.layout; }
         for (std::size_t i = 0; i < programs.size(); ++i) {
             if (candidate->decode->roles[i] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
             StageCapture current = captures[i];
@@ -241,16 +320,23 @@ void Driver::censusDrawMiss(const std::vector<DrawProgram>& programs, const std:
                 const auto change = CompareDrawMissStage(*variant, current, currentReads);
                 if (score(change) < score(best)) best = change;
             }
-            if (best.layout == std::numeric_limits<std::size_t>::max()) { best.kinds = DrawMissDifference::Layout; best.layout = 1; }
+            if (best.layout == std::numeric_limits<std::size_t>::max()) { best.kinds = DrawMissDifference::Layout; best.layout = 1; best.layoutParts = DrawMissDifference::MissingStage; }
             difference.kinds |= best.kinds;
+            difference.layoutParts |= best.layoutParts;
             difference.words += best.words;
             difference.layout += best.layout;
             difference.dataWords += best.dataWords;
             difference.refreshableDataWords += best.refreshableDataWords;
             difference.userDataWords += best.userDataWords;
             for (std::size_t w = 0; w < difference.imageChanges.size(); ++w) difference.imageChanges[w] |= best.imageChanges[w];
+            for (std::size_t w = 0; w < difference.bufferChanges.size(); ++w) difference.bufferChanges[w] |= best.bufferChanges[w];
+            difference.buffers.insert(difference.buffers.end(), best.buffers.begin(), best.buffers.end());
+            difference.layoutKeys.insert(difference.layoutKeys.end(), best.layoutKeys.begin(), best.layoutKeys.end());
+            difference.shaderChanged |= best.shaderChanged;
+            difference.specializationChanged |= best.specializationChanged;
+            difference.bindingFlagsChanged |= best.bindingFlagsChanged;
         }
-        if (score(difference) < score(closest)) closest = difference;
+        if (score(difference) < score(closest)) { closest = std::move(difference); closestShape = candidate->shape; }
     }
     ArchB::Recorder::Count(closest.Class());
     if (closest.kinds & DrawMissDifference::Image) ArchB::Recorder::Count("m1_diff_image");
@@ -303,6 +389,77 @@ void Driver::censusDrawMiss(const std::vector<DrawProgram>& programs, const std:
         counter = names->emplace(name).first->c_str();
     }
     ArchB::Recorder::Count(counter);
+    if (closest.kinds & (DrawMissDifference::Buffer | DrawMissDifference::Layout)) {
+        const auto& v = closest.bufferChanges;
+        std::uint32_t roles = 0;
+        bool advance = false, retreat = false, overlapping = false, alignment = false, size = false;
+        for (const auto& change : closest.buffers) {
+            roles |= change.role;
+            const ShaderRecompiler::ShaderBufferResource a{change.before}, b{change.after};
+            advance |= b.Base48() > a.Base48();
+            retreat |= b.Base48() < a.Base48();
+            overlapping |= a.Base48() != b.Base48() && a.Base48() < b.Base48() + b.GetSize() && b.Base48() < a.Base48() + a.GetSize();
+            alignment |= (a.Base48() & 3u) != (b.Base48() & 3u);
+            size |= a.GetSize() != b.GetSize();
+        }
+        const auto count = [&](const char* suffix, bool value) {
+            if (!value) return;
+            const char* key;
+            {
+                std::lock_guard lock(namesMutex);
+                key = names->emplace(std::string("m4_") + suffix).first->c_str();
+            }
+            ArchB::Recorder::Count(key);
+        };
+        const bool buffer = std::string_view(closest.Class()) == "m1_miss_buffer";
+        const bool base = v[0] || (v[1] & 0xffffu);
+        const bool fields = (v[1] & 0xffff0000u) || v[3];
+        count("buffer_base", buffer && base);
+        count("buffer_base_only", buffer && base && !v[2] && !fields);
+        count("buffer_base_records_only", buffer && (base || v[2]) && !fields);
+        count("buffer_stride", buffer && (v[1] & 0x3fff0000u));
+        count("buffer_num_records", buffer && v[2]);
+        count("buffer_dst_sel", buffer && (v[3] & 0xfffu));
+        count("buffer_format", buffer && (v[3] & 0x7f000u));
+        count("buffer_swizzle", buffer && (v[1] & 0x80000000u));
+        count("buffer_add_tid", buffer && (v[3] & 0x800000u));
+        count("buffer_index_stride", buffer && (v[3] & 0x600000u));
+        count("buffer_type", buffer && (v[3] & 0xc0000000u));
+        count("buffer_oob", buffer && (v[3] & 0x30000000u));
+        count("buffer_other_bits", buffer && ((v[1] & 0x40000000u) || (v[3] & 0x0f180000u)));
+        count("buffer_scalar", buffer && (roles & DrawMissDifference::ScalarBuffer));
+        count("buffer_storage", buffer && (roles & DrawMissDifference::StorageBuffer));
+        count("buffer_vertex", buffer && (roles & DrawMissDifference::VertexBuffer));
+        count("buffer_unknown", buffer && (!roles || (roles & DrawMissDifference::UnknownBuffer)));
+        count("buffer_user_base", buffer && std::any_of(closest.buffers.begin(), closest.buffers.end(), [](const auto& change) { return change.userBaseWords != 0; }));
+        count("buffer_read_only", buffer && !closest.buffers.empty() && std::all_of(closest.buffers.begin(), closest.buffers.end(), [](const auto& change) { return change.readOnly; }));
+        count("buffer_advance", buffer && advance);
+        count("buffer_retreat", buffer && retreat);
+        count("buffer_overlapping_ranges", buffer && overlapping);
+        count("buffer_alignment", buffer && alignment);
+        count("buffer_size", buffer && size);
+        count("buffer_shader_changed", buffer && closest.shaderChanged);
+        count("buffer_specialization_changed", buffer && closest.specializationChanged);
+        count("buffer_binding_flags_changed", buffer && closest.bindingFlagsChanged);
+        count("buffer_same_shader_pipeline", buffer && !(closest.kinds & DrawMissDifference::Specialized));
+        count("buffer_base_records_same_shader_pipeline", buffer && (base || v[2]) && !fields && !(closest.kinds & (DrawMissDifference::Specialized | DrawMissDifference::Data | DrawMissDifference::Other | DrawMissDifference::Image | DrawMissDifference::Sampler)));
+        constexpr const char* parts[]{"layout_plan", "layout_push_offset", "layout_descriptor_shape", "layout_tables", "layout_user_size", "layout_vertex", "layout_bindings", "layout_user_pointer", "layout_read_set", "layout_pointer_value", "layout_specialization", "layout_shape", "layout_missing_stage"};
+        for (std::size_t i = 0; i < std::size(parts); ++i) count(parts[i], closest.layoutParts & (1u << i));
+        std::string detail;
+        char item[256];
+        for (const auto& change : closest.buffers) {
+            const auto& a = change.before;
+            const auto& b = change.after;
+            std::snprintf(item, sizeof item, " %x:%u:%zu:%08x,%08x,%08x,%08x>%08x,%08x,%08x,%08x", change.role, change.stage, change.index, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+            detail += item;
+        }
+        std::string keys;
+        for (const auto& [a, b] : closest.layoutKeys) {
+            std::snprintf(item, sizeof item, " %016llx>%016llx", static_cast<unsigned long long>(a), static_cast<unsigned long long>(b));
+            keys += item;
+        }
+        std::fprintf(stderr, "[m4-miss] program=%016llx class=%s kinds=%x layout=%x vbits=%08x,%08x,%08x,%08x shader=%u spec=%u flags=%u shape=%016llx>%016llx layouts=%s buffers=%s\n", static_cast<unsigned long long>(code), closest.Class(), closest.kinds, closest.layoutParts, v[0], v[1], v[2], v[3], static_cast<unsigned>(closest.shaderChanged), static_cast<unsigned>(closest.specializationChanged), static_cast<unsigned>(closest.bindingFlagsChanged), static_cast<unsigned long long>(closestShape), static_cast<unsigned long long>(shape), keys.c_str(), detail.c_str());
+    }
 }
 
 bool Driver::missCensus() {

@@ -21,12 +21,15 @@ void Driver::appendEntryRegions(const DispatchVariant& variant, std::vector<Shad
     }
 }
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(const DispatchVariant& variant, const std::vector<std::uint32_t>& words) {
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(const DispatchVariant& variant, const std::vector<std::uint32_t>& words, bool bufferBases) {
     auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
-    auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
-    for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
-        if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
+    if (!variant.dataPositions.empty()) {
+        auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
+        for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
+            if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
+        }
     }
+    if (bufferBases && !variant.bufferBaseMasks.empty() && !PatchBufferBases(variant, words, *patched)) return nullptr;
     return patched;
 }
 
@@ -91,23 +94,26 @@ bool Driver::vouchedValidation() {
     return enabled;
 }
 
-EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit) {
+EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit, bool bufferBases) {
     if (live != nullptr) live->clear();
     if (feedbackHit != nullptr) *feedbackHit = false;
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy() && pipeline.OverlapsAny(variant.runs)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
     }
-    const bool masked = live != nullptr && !variant.dataPositions.empty();
+    const bool refreshBuffers = bufferBases && live != nullptr && !validateLegacy() && !variant.bufferBaseMasks.empty();
+    const bool masked = live != nullptr && (!variant.dataPositions.empty() || refreshBuffers);
     const bool feedback = feedbackMask && !validateLegacy() && !variant.feedback.memory.empty();
     if (feedbackMask && validateLegacy() && !variant.feedback.memory.empty()) ArchB::Recorder::Count("fix_tsharp_mask_refused_legacy");
-    const DataMask mask{masked ? std::span<const std::uint32_t>(variant.dataPositions) : std::span<const std::uint32_t>{}, live, feedback ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, feedbackHit};
+    const DataMask mask{masked ? std::span<const std::uint32_t>(variant.dataPositions) : std::span<const std::uint32_t>{}, live, feedback ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, feedbackHit, refreshBuffers ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.bufferBaseMasks) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}};
+    if (bufferBases && validateLegacy() && !variant.bufferBaseMasks.empty()) ArchB::Recorder::Count("fix_buffer_base_refused_legacy");
     thread_local std::vector<VouchedRegions>* vouchedSlot = nullptr;
     auto& vouched = ShaderRecompiler::ThreadOwned(vouchedSlot);
     vouched.clear();
     if (!variant.shared.empty() && vouchedValidation() && !validateLegacy() && variant.runs.size() == regions.size()) VouchSharedRegions(variant.shared, regions.size(), &QueryPendingSpan, vouched);
     PendingView pending;
     pending.Load();
+    if (refreshBuffers && std::ranges::any_of(variant.runs, [&](const auto& run) { return pending.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); })) ArchB::Recorder::Count("fix_buffer_base_pending");
     if (feedback && std::ranges::any_of(variant.runs, [&](const auto& run) { return pending.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); })) ArchB::Recorder::Count("fix_tsharp_mask_refused_pending");
     std::erase_if(vouched, [&](const VouchedRegions& range) { return pending.Overlaps(range.low, static_cast<std::size_t>(range.high - range.low)); });
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* checkedSlot = nullptr;

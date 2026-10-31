@@ -91,6 +91,7 @@ using DrawDataCandidates = std::vector<std::vector<DrawDataCandidate>>;
 
 struct StageDataHit {
     bool feedbackHit = false;
+    bool bufferBaseHit = false;
     std::vector<std::uint32_t> words;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
 };
@@ -146,10 +147,27 @@ struct StageCapture {
 
 struct DrawMissDifference {
     enum : std::uint32_t { Image = 1, Sampler = 2, Buffer = 4, Data = 8, Layout = 16, Other = 32, ImageFields = 64, Specialized = 128 };
+    enum LayoutPart : std::uint32_t { Plan = 1, PushOffset = 2, DescriptorShape = 4, Tables = 8, UserSize = 16, VertexLayout = 32, Bindings = 64, UserPointer = 128, ReadSet = 256, PointerValue = 512, Specialization = 1024, Shape = 2048, MissingStage = 4096 };
+    enum BufferRole : std::uint32_t { ScalarBuffer = 1, StorageBuffer = 2, VertexBuffer = 4, UnknownBuffer = 8 };
+    struct BufferChange {
+        std::array<std::uint32_t, 4> before{}, after{};
+        std::uint32_t role = UnknownBuffer;
+        std::size_t index = 0;
+        std::uint32_t stage = 0;
+        std::uint32_t userBaseWords = 0;
+        bool readOnly = false;
+    };
     std::uint32_t kinds = 0;
+    std::uint32_t layoutParts = 0;
     std::size_t words = 0;
     std::size_t layout = 0;
     std::array<std::uint32_t, 8> imageChanges{};
+    std::array<std::uint32_t, 4> bufferChanges{};
+    std::vector<BufferChange> buffers;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> layoutKeys;
+    bool shaderChanged = false;
+    bool specializationChanged = false;
+    bool bindingFlagsChanged = false;
     std::size_t dataWords = 0;
     std::size_t refreshableDataWords = 0;
     std::size_t userDataWords = 0;

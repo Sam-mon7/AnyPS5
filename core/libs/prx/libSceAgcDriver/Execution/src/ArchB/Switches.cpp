@@ -44,6 +44,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::UbSkipDispatchProofWalk, "UB_SKIP_DISPATCH_PROOF_WALK", false, true, {}},
     {Feature::FixTsharpFeedbackMask, "FIX_TSHARP_FEEDBACK_MASK", false, true, {}},
     {Feature::FixPipelineStateReuse, "FIX_PIPELINE_STATE_REUSE", false, true, {}},
+    {Feature::FixBufferBaseRefresh, "FIX_BUFFER_BASE_REFRESH", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
