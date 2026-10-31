@@ -80,7 +80,8 @@ void toggleCase(const std::string& name) {
     setEnvironment("APS5_ARCHB_TEST_RUNTIME_DEPENDENT", "0");
     setEnvironment("APS5_ARCHB_CONTROL_FILE", name == "NoFileNoCost" ? nullptr : path.string().c_str());
     const bool imageTable = name == "ImageTableSnapshot";
-    if (imageTable) setEnvironment("APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE", nullptr);
+    const bool bitScanKeys = name == "ImageTableBitScanKeys";
+    if (imageTable || bitScanKeys) setEnvironment(bitScanKeys ? "APS5_ARCHB_FIX_IMAGE_TABLE_BITSCAN_KEYS" : "APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE", nullptr);
     Switches::Initialize();
     const auto write = [&](const std::string& line, bool poll = true) {
         std::ofstream(path, std::ios::binary | std::ios::trunc) << line << '\n';
@@ -89,9 +90,9 @@ void toggleCase(const std::string& name) {
             Switches::PollControl();
         }
     };
-    if (imageTable) {
-        const auto feature = Feature::FixImageTableSnapshotReuse;
-        const std::string token = "FIX_IMAGE_TABLE_SNAPSHOT_REUSE";
+    if (imageTable || bitScanKeys) {
+        const auto feature = bitScanKeys ? Feature::FixImageTableBitScanKeys : Feature::FixImageTableSnapshotReuse;
+        const std::string token = bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : "FIX_IMAGE_TABLE_SNAPSHOT_REUSE";
         for (const auto& entry : Switches::Table()) {
             if (entry.feature == feature) check(!entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "runtime fix switch contract");
         }

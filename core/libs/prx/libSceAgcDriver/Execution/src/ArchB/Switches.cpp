@@ -43,6 +43,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::UbSkipCpuIndirect, "UB_SKIP_CPU_INDIRECT", false, true, {}},
     {Feature::UbSkipDispatchProofWalk, "UB_SKIP_DISPATCH_PROOF_WALK", false, true, {}},
     {Feature::FixImageTableSnapshotReuse, "FIX_IMAGE_TABLE_SNAPSHOT_REUSE", false, true, {}},
+    {Feature::FixImageTableBitScanKeys, "FIX_IMAGE_TABLE_BITSCAN_KEYS", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
