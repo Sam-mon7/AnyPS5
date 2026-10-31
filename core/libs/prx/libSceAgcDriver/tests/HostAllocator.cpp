@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -473,10 +474,104 @@ void ThreadsEndWithCachedBlocks(bool lateRelease = false) {
     delete[] after;
 }
 
+#ifdef _WIN32
+using AgcDriver::HostAllocator::SiteKind;
+
+// Allocation-site census helpers: small noinline functions, so a caller address inside [function, function + 0x100)
+// is theirs.
+[[gnu::noinline, gnu::noclone]] void AllocateSmall(void** blocks, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) blocks[i] = ::operator new(32);
+    asm volatile("" ::: "memory");
+}
+
+[[gnu::noinline, gnu::noclone]] void AllocateSmallOuter(void** blocks, std::size_t count) {
+    AllocateSmall(blocks, count);
+    asm volatile("" ::: "memory");
+}
+
+[[gnu::noinline, gnu::noclone]] void FreeSmall(void** blocks, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) ::operator delete(blocks[i], 32);
+    asm volatile("" ::: "memory");
+}
+
+[[gnu::noinline, gnu::noclone]] void FreeSmallOuter(void** blocks, std::size_t count) {
+    FreeSmall(blocks, count);
+    asm volatile("" ::: "memory");
+}
+
+std::uint64_t SamplesIn(SiteKind kind, void (*function)(void**, std::size_t), bool parent = false) {
+    const auto* begin = reinterpret_cast<const unsigned char*>(function);
+    return AgcDriver::HostAllocator::SiteSamples(kind, begin, begin + 0x100, parent);
+}
+
+void SiteCensus(bool enabled) {
+    constexpr std::size_t count = 1u << 20;
+    const auto blocks = std::make_unique<void*[]>(count);
+    // Blocks allocated here and freed on another thread: allocations miss the cache once its lists run out and frees
+    // overflow the freeing thread's cache, so both heap outcomes are exercised.
+    const auto start = std::chrono::steady_clock::now();
+    AllocateSmallOuter(blocks.get(), count);
+    std::thread([&] { FreeSmallOuter(blocks.get(), count); }).join();
+    const auto elapsed = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
+    std::printf("site census %s: %.1f ns per cross-thread allocation and free of 32 bytes\n", enabled ? "on" : "off", elapsed / count);
+    const auto totals = AgcDriver::HostAllocator::SiteCensusTotals();
+    const auto allocated = SamplesIn(SiteKind::AllocCached, AllocateSmall) + SamplesIn(SiteKind::AllocHeap, AllocateSmall);
+    const auto freed = SamplesIn(SiteKind::FreeCached, FreeSmall) + SamplesIn(SiteKind::FreeHeap, FreeSmall);
+    if (!enabled) {
+        Check(totals.entries == 0 && totals.walks == 0 && allocated == 0 && freed == 0, "a disabled site census records nothing");
+        return;
+    }
+    const double expected = static_cast<double>(count) / AgcDriver::HostAllocator::SiteMeanInterval;
+    std::printf("site census: %llu allocation and %llu free samples at the helpers (about %.0f expected), %llu entries, %llu walks, %llu dropped\n",
+        static_cast<unsigned long long>(allocated), static_cast<unsigned long long>(freed), expected, static_cast<unsigned long long>(totals.entries),
+        static_cast<unsigned long long>(totals.walks), static_cast<unsigned long long>(totals.dropped));
+    Check(allocated > expected * 0.8 && allocated < expected * 1.25, "sampled allocations are attributed to the allocating function at the mean rate");
+    Check(freed > expected * 0.8 && freed < expected * 1.25, "sampled frees are attributed to the freeing function at the mean rate");
+    Check(SamplesIn(SiteKind::AllocHeap, AllocateSmall) > 0 && SamplesIn(SiteKind::FreeHeap, FreeSmall) > 0, "heap outcomes of cross-thread blocks are sampled");
+    const auto walked = SamplesIn(SiteKind::Count, AllocateSmallOuter, true);
+    Check(walked > allocated / 8, "walked samples name the allocating function's caller as a parent");
+    const auto walkedFrees = SamplesIn(SiteKind::Count, FreeSmallOuter, true);
+    std::printf("site census: %llu allocation and %llu free samples name the helpers' callers\n", static_cast<unsigned long long>(walked), static_cast<unsigned long long>(walkedFrees));
+    Check(walkedFrees > freed / 8, "walked samples name the freeing function's caller as a parent");
+    Check(totals.dropped == 0, "the site table does not overflow in the test");
+    const auto path = (std::filesystem::temp_directory_path() / ("alloc-site-census-test-" + std::to_string(GetCurrentProcessId()) + ".tsv")).string();
+    Check(AgcDriver::HostAllocator::WriteSiteCensus(path.c_str()), "the site census can be written");
+    std::FILE* file = std::fopen(path.c_str(), "r");
+    Check(file != nullptr, "the written site census can be read back");
+    if (file == nullptr) return;
+    char line[1024];
+    int sites = 0, modules = 0, threads = 0;
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        sites += std::strncmp(line, "site ", 5) == 0;
+        modules += std::strncmp(line, "module ", 7) == 0;
+        threads += std::strncmp(line, "thread ", 7) == 0;
+    }
+    std::fclose(file);
+    std::remove(path.c_str());
+    Check(sites > 0 && modules > 0 && threads >= 2, "the site census lists sites, modules and both threads");
+}
+#endif
+
 }
 
 int main(int argc, char** argv) {
     const bool depotFix = DepotFixRequested();
+#ifdef _WIN32
+    if (argc > 1 && std::strcmp(argv[1], "--site-census") == 0) {
+        const bool enabled = Requested("APS5_ARCHB_ALLOC_SITE_CENSUS");
+        SiteCensus(enabled);
+        EverySizeRoundTrips();
+        SizedDeletesKeepTheirClass();
+        BlocksCrossIntoLibstdcxx();
+        BlocksMoveBetweenThreads();
+        if (failures != 0) {
+            std::fprintf(stderr, "%d host allocator checks failed\n", failures);
+            return 1;
+        }
+        std::printf("Host allocator site census tests passed\n");
+        return 0;
+    }
+#endif
     if (argc > 1 && std::strcmp(argv[1], "--thread-exit") == 0) {
         ThreadsEndWithCachedBlocks(true);
         Check(Count(Event::NoCacheFree) >= static_cast<std::uint64_t>(exitedThreads.load()), "late releases work after the thread cache closes");
@@ -509,6 +604,12 @@ int main(int argc, char** argv) {
         for (const auto& event : AgcDriver::HostAllocator::counters) {
             for (const auto& bucket : event) Check(bucket.load(std::memory_order_relaxed) == 0, "disabled census performs no counter updates");
         }
+#ifdef _WIN32
+        if (!Requested("APS5_ARCHB_ALLOC_SITE_CENSUS")) {
+            const auto sites = AgcDriver::HostAllocator::SiteCensusTotals();
+            Check(sites.entries == 0 && sites.walks == 0 && sites.dropped == 0, "a disabled site census records nothing");
+        }
+#endif
     }
     if (failures != 0) {
         std::fprintf(stderr, "%d host allocator checks failed\n", failures);

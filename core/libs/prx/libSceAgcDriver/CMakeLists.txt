@@ -804,6 +804,12 @@ if(BUILD_TESTING AND WIN32)
             ENVIRONMENT "APS5_ARCHB_FIX_ALLOC_DEPOT=${depotMode};APS5_ARCHB_ALLOCATOR_CENSUS=0;APS5_ARCHB_RECORDER=1"
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endforeach()
+    foreach(siteCensus IN ITEMS 0 1)
+        add_test(NAME agc_archb_alloc_site_census_${siteCensus} COMMAND agc_driver_host_allocator_tests --site-census)
+        set_tests_properties(agc_archb_alloc_site_census_${siteCensus} PROPERTIES TIMEOUT 60
+            ENVIRONMENT "APS5_ARCHB_ALLOC_SITE_CENSUS=${siteCensus};APS5_ARCHB_ALLOC_SITE_CENSUS_PATH=${CMAKE_CURRENT_BINARY_DIR}/agc_archb_alloc_site_census.tsv"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endforeach()
 endif()
 
 add_test_executable(agc_driver_key_miss_tests EXCLUDE_FROM_ALL tests/KeyMiss.cpp)
