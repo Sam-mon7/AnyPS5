@@ -26,6 +26,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <exception>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -2323,7 +2324,7 @@ void recordStencilReplay(const Context& context, VkCommandBuffer commands, const
     }
 }
 
-void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false) {
+void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, PipelineStateReuse* reuse = nullptr) {
     AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.PushConstants");
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
@@ -2338,7 +2339,7 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
         std::memcpy(block.data() + ShaderRecompiler::TessellationLevelPushOffsetBytes, levels.data(), sizeof(levels));
     }
     if (!state.stages.mesh) {
-        pipeline.PushConstants(commands, stages, block);
+        pipeline.PushConstants(commands, stages, block, reuse);
         return;
     }
     const auto firstVertex = draw.indirect ? draw.indirect->vertexConstant : draw.firstVertex;
@@ -2346,7 +2347,7 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
     const std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4> words{draw.indexCount, firstVertex, firstInstance, draw.indexed ? draw.indexSize | (restartTable ? ShaderRecompiler::MeshIndexRestartTable : 0u) : 0u, static_cast<std::uint32_t>(meshArguments), static_cast<std::uint32_t>(meshArguments >> 32u)};
     static_assert(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes == PipelinePushSlotBytes);
     std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
-    pipeline.PushConstants(commands, stages | VK_SHADER_STAGE_MESH_BIT_EXT, block);
+    pipeline.PushConstants(commands, stages | VK_SHADER_STAGE_MESH_BIT_EXT, block, reuse);
 }
 
 // The record of a draw whose targets are all resident (`lean`: recorded into the device's open
@@ -2438,7 +2439,7 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
-void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
+void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr, bool pipelineStateReuse = false) {
     using R = AgcDriver::ArchB::Recorder;
     AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.Record");
     auto recordLap = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2452,6 +2453,20 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     };
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
+    struct ReuseGuard {
+        Recorder* recorder;
+        int exceptions = std::uncaught_exceptions();
+        ~ReuseGuard() {
+            if (std::uncaught_exceptions() != exceptions) recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_exception");
+        }
+    } reuseGuard{recorder};
+    if (!pipelineStateReuse) recorder->ReusePipelineState(false);
+    const bool tracked = record.stencilReplay.empty() && !state.stencilReplayReference && !record.pipeline->SplitsFaces() && !record.pipeline->SplitsSecondChannel();
+    if (pipelineStateReuse && !tracked) {
+        R::Count("fix_pso_reuse_refused_helper_draw");
+        recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_helper");
+    }
+    auto* reuse = pipelineStateReuse && tracked ? recorder->ReusePipelineState(true) : nullptr;
     auto& resources = *record.resources;
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
@@ -2589,7 +2604,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
         beginTiming.Mark("setup", R::Metric::PassBeginNs);
-        record.pipeline->Continue(commands, state);
+        record.pipeline->Continue(commands, state, reuse);
         beginTiming.Mark("pipeline_state", R::Metric::PipelineStateNs);
         if (inPassIndirect) {
             recorder->NotePendingRead(args->arguments, static_cast<std::size_t>(args->RangeBytes()), Recorder::ReadKind::Indirect);
@@ -2628,7 +2643,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
         beginTiming.Mark("setup", R::Metric::PassBeginNs);
-        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, reuse);
         beginTiming.Mark("pipeline_begin", R::Metric::PassBeginNs);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
@@ -2645,7 +2660,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), reuse);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     else {
@@ -2778,6 +2793,7 @@ struct PreparedDraw {
     PreparedDraw& operator=(const PreparedDraw&) = delete;
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
+    bool pipelineStateReuse = false;
     std::vector<std::uint32_t> stencilReferences;
     std::optional<PerformanceTimer> timing;
     AgcDriver::ArchB::Recorder::Timer releaseTiming{nullptr};
@@ -3259,7 +3275,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.reordered = reordered;
         record.reorderPass = reorderPass;
         record.depthLocations = depthLocations;
-        recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace);
+        recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace, prepared.pipelineStateReuse);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
@@ -3316,6 +3332,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    if (prepared.pipelineStateReuse) AgcDriver::ArchB::Recorder::Count("fix_pso_reuse_refused_untracked_draw");
+    if (context.recorder != nullptr) context.recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_untracked_writer");
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
     if (recorded) recorder->PrepareSampleSlot();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
@@ -3637,7 +3655,8 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
     return prepared;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, DrawPreparation* preparation) {
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, DrawPreparation* preparation, bool pipelineStateReuse) {
+    if (!pipelineStateReuse && context.recorder != nullptr) context.recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_off");
     if (preparation != nullptr) RecheckDrawPreparation(context, *preparation);
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3645,11 +3664,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.preparation = preparation;
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
+    prepared.pipelineStateReuse = pipelineStateReuse;
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
     prepared.releaseTiming.Begin("Draw.ResourceRelease");
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawPreparation* preparation) {
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawPreparation* preparation, bool pipelineStateReuse) {
+    if (!pipelineStateReuse && context.recorder != nullptr) context.recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_off");
     using R = AgcDriver::ArchB::Recorder;
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
@@ -3785,7 +3806,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.pushBytes = &recipe.pushBytes;
     record.pushStages = recipe.pushStages;
     record.depthLocations = passDepthLocations(context, state, *record.pipeline);
-    recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace);
+    recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace, pipelineStateReuse);
     if (profile) {
         result.recordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();
         auto& stats = Profile();
