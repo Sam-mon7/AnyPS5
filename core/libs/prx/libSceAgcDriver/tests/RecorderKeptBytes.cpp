@@ -611,10 +611,77 @@ void UnlockedWaitFailure(bool exception) {
     Expect(recorder.InFlightBatches() == 1, "a failed wait retired work before reporting the error");
 }
 
+void OwnershipPending() {
+    using D2 = AgcDriver::ArchB::OwnershipCensus;
+    using R = AgcDriver::ArchB::Recorder;
+    namespace G = AgcDriver::GuestMemory;
+    mock = MockDevice{};
+    R::Boundary(true, 0, R::Clock::now());
+    R::BindThread("ownership completion");
+    G::TagGpuLockThread(0x20);
+    std::array<std::uint32_t, 4> memory{};
+    const auto address = reinterpret_cast<std::uintptr_t>(memory.data());
+    std::atomic<bool> callback{false}, observed{false};
+    bool interrupted = false;
+    std::weak_ptr<int> lifetime;
+    std::thread observer([&] {
+        while (!callback.load()) std::this_thread::yield();
+        Expect(Recorder::SnapshotWriteOverlaps(address, 4), "paused callback retains observable write");
+        Expect(!lifetime.expired(), "paused callback retains imported owner");
+        observed = true;
+    });
+    {
+        G::TagGpuLockSite(G::GpuLockSite::Dispatch);
+        std::lock_guard gpu(G::GpuMutex());
+        Recorder recorder(mockContext(), true);
+        recorder.Activate();
+        auto kept = std::make_shared<int>(1);
+        lifetime = kept;
+        {
+            D2::Command command(0x20, true);
+            G::SetCurrentPacket(0x15, 0x20);
+            recorder.NotePendingRead(address + 12, 4, Recorder::ReadKind::DrawInput);
+            recorder.Keep(kept);
+            kept.reset();
+            recorder.NotePendingWrite(address, 4);
+            recorder.OnComplete([&] {
+                callback = true;
+                while (!observed.load()) std::this_thread::yield();
+                memory[0] = 11;
+            });
+        }
+        {
+            D2::Command command(0x28, true);
+            const std::uint32_t first = 3, second = 7;
+            recorder.AfterCompletions(address + 4, std::as_bytes(std::span(&first, 1)), 1, 0x28, false);
+            recorder.AfterCompletions(address + 4, std::as_bytes(std::span(&second, 1)), 2, 0x28, false);
+            recorder.OnComplete([&] {
+                Expect(memory[0] == 11 && memory[1] == 7, "copied writeback precedes repeated label and EOP");
+                interrupted = true;
+            });
+        }
+        Expect(memory[0] == 0 && memory[1] == 0 && !interrupted, "open batch has no published completion effects");
+        recorder.Submit();
+        Expect(memory[0] == 0 && !interrupted, "submission alone does not publish callbacks");
+        recorder.Sync();
+        Expect(interrupted && !Recorder::SnapshotWriteOverlaps(address, 4), "pending writes retire after publication");
+    }
+    observer.join();
+    const auto result = R::Collect(R::Clock::now());
+    Expect(result.counters.at("d2_mixed_batches") == 1, "mixed command producers counted");
+    Expect(result.threadCounters.at("d2 origin q0x20/buffer").at("d2_accesses") == 2, "the read that opens a batch retains its producer");
+    for (const auto* name : {"d2_pending_shadow_mismatches", "d2_early_retirement", "d2_overflow"}) Expect(result.counters.at(name) == 0, name);
+    std::printf("%s\n", result.Json().c_str());
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--ownership") {
+            OwnershipPending();
+            return failures == 0 ? 0 : 1;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--compute-chains") {
             ComputeChainTests();
             return failures == 0 ? 0 : 1;

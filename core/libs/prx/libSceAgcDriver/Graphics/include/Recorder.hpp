@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
@@ -46,6 +47,7 @@ class PipelineStateReuse;
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
 class Recorder {
 public:
+    void ObserveOwnership(ArchB::OwnershipCensus::Access access);
     enum class WaitStage : std::uint8_t { Unknown, Deferred, Recorded, Submitted, GpuComplete, Retired, Cpu, Discarded };
     enum class WaitEnd : std::uint8_t { Entry, Polled, Recorder, Fence, History, Held, Aborted };
     struct WaitBatch {
@@ -610,6 +612,7 @@ public:
 
 private:
     struct Batch {
+        std::uint64_t ownershipId = 0;
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
@@ -863,6 +866,7 @@ private:
     bool signaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
     void publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions = {}) const;
+    void checkOwnership(const Batch& batch) const;
     // Appends one range to the open batch; returns whether the snapshot must be rebuilt for it.
     // `ownLabel`: the range is a label's own store (NoteLabel, AfterCompletions), which does not
     // overwrite the table entries it covers; any other range flags them (table mutex, briefly).

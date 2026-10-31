@@ -232,6 +232,98 @@ private:
     inline static thread_local Clock::duration gpuElapsed{};
 };
 
+class OwnershipCensus {
+public:
+    using Clock = Recorder::Clock;
+    enum class Resource : std::uint8_t { Buffer, Image, Upload, Conversion, Label, Host, Bda, Implicit, Count };
+    enum AccessFlags : std::uint8_t { Read = 1, Write = 2, Layout = 4, Label = 8, Host = 16 };
+    enum class Conflict : std::uint8_t { Raw, War, Waw, Layout, Label, Host, Independent, Unknown, Count };
+    enum class Phase : std::uint8_t { Other, Labels, Writers, Resources, Record, Bookkeeping, Seal, Submit, GpuWait, Callbacks, Publish, Release, Count };
+    enum class Life : std::uint8_t { Open, Submitted, Finishing, Published, Discarded, Failed };
+    struct Access {
+        std::uint64_t begin = 0, end = 0;
+        std::uint64_t backing = 0, epoch = 0, representation = 0;
+        std::uint32_t layout = 0, mip = 0, layer = 0;
+        Resource resource = Resource::Implicit;
+        std::uint8_t flags = 0;
+        bool complete = false;
+    };
+    struct Origin {
+        std::uint32_t queue = UINT32_MAX;
+        std::uint64_t command = 0, recorder = 0, batch = 0, note = 0, serial = 0;
+    };
+    struct Observation { Access access; Origin origin; };
+    struct Summary {
+        std::array<Observation, 512> accesses;
+        std::size_t size = 0;
+        bool complete = false;
+        bool overflow = false;
+        void Add(Access access, Origin origin);
+        void Add(Access access) { Add(access, Origin{}); }
+    };
+    struct Classification {
+        Conflict conflict = Conflict::Unknown;
+        Resource resource = Resource::Implicit;
+        std::uint32_t queue = UINT32_MAX;
+        std::uint32_t tags = 0;
+    };
+    class Command {
+    public:
+        explicit Command(std::uint32_t queue, bool dispatch = false);
+        ~Command();
+        Command(const Command&) = delete;
+        Command& operator=(const Command&) = delete;
+        Summary* Requested() { return requested; }
+    private:
+        friend class OwnershipCensus;
+        Command* previous = nullptr;
+        Summary* requested = nullptr;
+        Origin origin;
+        std::size_t slot = 0;
+        bool active = false;
+    };
+    class Coverage {
+    public:
+        explicit Coverage(Resource resource);
+        ~Coverage();
+    private:
+        Resource previous;
+    };
+    class PhaseScope {
+    public:
+        explicit PhaseScope(Phase phase, bool syncOnly = false);
+        ~PhaseScope();
+        void Mark(Phase phase);
+    private:
+        Phase previous = Phase::Other;
+        bool active = false;
+    };
+    class Sync {
+    public:
+        Sync();
+        ~Sync();
+    private:
+        bool active = false;
+        Phase previous = Phase::Other;
+    };
+    static bool Enabled();
+    static Origin CurrentOrigin(std::uint32_t fallback = UINT32_MAX);
+    static Classification Classify(const Summary& requested, const Summary& observed);
+    static std::uint64_t Open(std::uint64_t recorder);
+    static void Observe(std::uint64_t batch, Access access, std::uint64_t note = 0, std::uint32_t queue = UINT32_MAX);
+    static void Transition(std::uint64_t batch, Life life, std::uint64_t serial = 0);
+    static void Retire(std::uint64_t batch);
+    static Observation Inspect(std::uint64_t batch, std::size_t index);
+    static void Check(std::uint64_t batch, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes,
+                      std::span<const std::uint64_t> notes, std::span<const std::pair<std::uint64_t, std::uint64_t>> snapshot, bool observable);
+    static void CheckSnapshot(std::uint64_t recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> snapshot);
+    static void HoldBegin(std::uint32_t queue, bool compute, Clock::time_point now);
+    static void HoldEnd(Clock::time_point now);
+    static int WaitBegin(Clock::time_point now, Clock::time_point* measured = nullptr);
+    static void WaitEnd(int waiter, Clock::time_point now, std::uint64_t expected);
+    static void Collect(Recorder::Snapshot& snapshot);
+};
+
 }
 
 extern "C" void AgcDriverRecorderScopeBegin_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* name, std::int64_t now, std::uint8_t phase);

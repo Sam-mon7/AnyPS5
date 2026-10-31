@@ -285,13 +285,145 @@ void shaderTableOverflow() {
     near(sum(Recorder::Collect(start + 2s).total.ms), 0);
 }
 
+void ownershipClassification() {
+    using D2 = AgcDriver::ArchB::OwnershipCensus;
+    D2::Summary requested, observed;
+    requested.complete = observed.complete = true;
+    const D2::Access buffer{.begin = 100, .end = 200, .backing = 1, .epoch = 7, .resource = D2::Resource::Buffer, .flags = D2::Read, .complete = true};
+    requested.Add(buffer, {0, 1});
+    auto producer = buffer;
+    producer.flags = D2::Write;
+    observed.Add(producer, {0x28, 2});
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Raw, "RAW classification");
+    requested.accesses[0].access.flags = D2::Write;
+    observed.accesses[0].access.flags = D2::Read;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::War, "WAR classification");
+    observed.accesses[0].access.flags = D2::Write;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Waw, "WAW classification");
+    observed.accesses[0].access.begin = 200;
+    observed.accesses[0].access.end = 300;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Independent, "disjoint qualified ranges");
+    observed.accesses[0].access.backing = 0;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Unknown, "different guest addresses do not establish backing independence");
+    observed.accesses[0].access.backing = 1;
+    observed.accesses[0].access.epoch = 8;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Unknown, "mapping reuse is not independent backing");
+    observed.accesses[0].access = producer;
+    observed.accesses[0].access.resource = D2::Resource::Bda;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Unknown, "BDA remains unknown even with a mapping identity");
+    observed.accesses[0].access.complete = false;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Unknown, "a leased heap is not a known WAR or WAW footprint");
+    observed.accesses[0].access = producer;
+    observed.accesses[0].access.flags |= D2::Label | D2::Host;
+    auto result = D2::Classify(requested, observed);
+    require(result.conflict == D2::Conflict::Label && result.tags == ((1u << static_cast<unsigned>(D2::Conflict::Label)) | (1u << static_cast<unsigned>(D2::Conflict::Host)) | (1u << static_cast<unsigned>(D2::Conflict::Waw))), "exclusive precedence with overlapping tags");
+    require(result.queue == 0x28, "producer queue retained");
+    observed.accesses[0].access.flags &= ~D2::Label;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Host, "host publication classification");
+    requested.accesses[0].access = {.begin = 100, .end = 150, .representation = 9, .layout = 1, .mip = 2, .resource = D2::Resource::Image, .flags = D2::Read | D2::Layout};
+    observed.accesses[0].access = {.begin = 125, .end = 200, .representation = 9, .layout = 2, .mip = 2, .resource = D2::Resource::Image, .flags = D2::Write | D2::Layout};
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Layout, "storage to sampling layout transition");
+    observed.accesses[0].access.representation = 10;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Raw, "partial image alias still overlaps guest backing");
+    observed.accesses[0].access.begin = 200;
+    observed.accesses[0].access.end = 250;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Unknown, "depth storage alias provenance is unknown");
+    requested.complete = false;
+    observed.accesses[0].access = producer;
+    requested.accesses[0].access = buffer;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Raw, "known conflict survives unknown extra coverage");
+    requested.accesses[0].access.begin = 250;
+    requested.accesses[0].access.end = 300;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Unknown, "incomplete prelock request never independent");
+    requested.complete = observed.complete = true;
+    requested.accesses[0].access = buffer;
+    observed.accesses[0].access = producer;
+    observed.accesses[0].access.begin = 250;
+    observed.accesses[0].access.end = 300;
+    requested.overflow = true;
+    require(D2::Classify(requested, observed).conflict == D2::Conflict::Unknown, "overflow never qualifies as independent");
+}
+
+void ownershipLifecycle() {
+    using D2 = AgcDriver::ArchB::OwnershipCensus;
+    require(D2::Enabled(), "ownership census disabled");
+    Recorder::Boundary(true, 0, Recorder::Clock::now());
+    const auto batch = D2::Open(55);
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> writes{{{100, 200}, {300, 400}}};
+    const std::array<std::uint64_t, 2> notes{17, 18};
+    {
+        D2::Command command(0x20, true);
+        D2::Observe(batch, {.begin = 100, .end = 200, .resource = D2::Resource::Buffer, .flags = D2::Write}, 17);
+    }
+    {
+        D2::Command command(0x28, true);
+        D2::Observe(batch, {.begin = 300, .end = 400, .resource = D2::Resource::Label, .flags = D2::Write | D2::Label}, 18);
+    }
+    const auto a = D2::Inspect(batch, 0), b = D2::Inspect(batch, 1);
+    require(a.origin.queue == 0x20 && b.origin.queue == 0x28 && a.origin.command != b.origin.command, "mixed batch command origins");
+    require(a.origin.serial == 0 && b.origin.serial == 0 && a.origin.batch == b.origin.batch && a.origin.recorder == 55 && a.origin.note == 17, "open access has no submitted serial");
+    D2::Check(batch, writes, notes, writes, true);
+    D2::Transition(batch, D2::Life::Submitted, 9);
+    require(D2::Inspect(batch, 0).origin.serial == 9 && D2::Inspect(batch, 1).origin.serial == 9, "actual submitted serial installed per command");
+    D2::Transition(batch, D2::Life::Finishing);
+    std::thread callback([&] {
+        D2::Check(batch, writes, notes, writes, true);
+        std::this_thread::sleep_for(2ms);
+        D2::Check(batch, writes, notes, writes, true);
+    });
+    callback.join();
+    D2::Transition(batch, D2::Life::Published);
+    D2::Check(batch, writes, notes, {}, true);
+    D2::Retire(batch);
+    const auto reused = D2::Open(55);
+    require(reused != batch, "batch identity survives pool reuse");
+    D2::Transition(reused, D2::Life::Discarded);
+    D2::Retire(reused);
+    const auto bda = D2::Open(55);
+    for (unsigned commandIndex = 0; commandIndex < 2; ++commandIndex) {
+        D2::Command command(0x28, true);
+        for (unsigned range = 0; range < 2048; ++range) D2::Observe(bda, {.begin = range * 4096ull, .end = (range + 1) * 4096ull, .resource = D2::Resource::Bda, .flags = D2::Read});
+    }
+    require(D2::Inspect(bda, 0).access.end == 0 && D2::Inspect(bda, 1).access.end == 0, "BDA lease coverage remains unknown without filling the ledger");
+    require(D2::Inspect(bda, 0).origin.command != D2::Inspect(bda, 1).origin.command, "compressed unknown coverage preserves per-command origins");
+    D2::Transition(bda, D2::Life::Discarded);
+    D2::Retire(bda);
+    {
+        D2::Command request(0);
+        request.Requested()->Add({.begin = 300, .end = 400, .resource = D2::Resource::Buffer, .flags = D2::Read});
+        const auto start = Recorder::Clock::now();
+        D2::HoldBegin(0x28, true, start);
+        const auto waiter = D2::WaitBegin(start + 10ns);
+        request.Requested()->Add({.begin = 100, .end = 200, .resource = D2::Resource::Buffer, .flags = D2::Read});
+        const auto late = D2::Open(55);
+        {
+            D2::Command producer(0x28, true);
+            D2::Observe(late, {.begin = 100, .end = 200, .resource = D2::Resource::Buffer, .flags = D2::Write});
+        }
+        D2::HoldEnd(start + 20ns);
+        D2::WaitEnd(waiter, start + 30ns, 10);
+        D2::Transition(late, D2::Life::Discarded);
+        D2::Retire(late);
+    }
+    const auto result = Recorder::Collect(Recorder::Clock::now());
+    near(result.counters.at("d2_unknown_ns"), 10);
+    near(result.counters.at("d2_conflict_raw_ns"), 0);
+    near(result.counters.at("d2_mixed_batches"), 1);
+    near(result.counters.at("d2_pending_shadow_mismatches"), 0);
+    near(result.counters.at("d2_early_retirement"), 0);
+    near(result.counters.at("d2_overflow"), 0);
+    std::cout << result.Json() << '\n';
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         require(argc == 2, "expected one test case");
         const std::string_view name = argv[1];
-        if (name == "mutex_phases") mutexPhases();
+        if (name == "ownership_classification") ownershipClassification();
+        else if (name == "ownership_lifecycle") ownershipLifecycle();
+        else if (name == "mutex_phases") mutexPhases();
         else if (name == "reconciles") reconciles();
         else if (name == "no_path_change") noPathChange();
         else if (name == "toggle_interval_tagged") toggleIntervalTagged();

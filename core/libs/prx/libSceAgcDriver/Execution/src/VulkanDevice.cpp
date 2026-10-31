@@ -2615,6 +2615,7 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    ArchB::OwnershipCensus::Command ownership(queue);
     if (state->recorder != nullptr) state->recorder->EndComputeChain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct LabelTiming {
@@ -4356,6 +4357,11 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     if (traceDraws) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
     const auto context = graphicsContext();
     Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, trace, preparation, pipelineStateReuse);
+    if (ArchB::OwnershipCensus::Enabled() && state->recorder != nullptr) {
+        using D2 = ArchB::OwnershipCensus;
+        for (const auto& color : graphics.colors) state->recorder->ObserveOwnership({.begin = color.address, .end = color.address + color.bytes, .mip = color.mip, .layer = color.arraySlice, .resource = D2::Resource::Image, .flags = D2::Read | D2::Write});
+        if (graphics.depth) state->recorder->ObserveOwnership({.begin = graphics.depth->address, .resource = D2::Resource::Image, .flags = D2::Read | D2::Write});
+    }
     if (traceDraws) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 
@@ -4967,6 +4973,11 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
     const auto context = graphicsContext();
     if (preparation != nullptr) Graphics::RecheckDrawPreparation(context, *preparation);
     const auto outcome = Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, *recipe, trace, preparation, pipelineStateReuse);
+    if (outcome.recorded && ArchB::OwnershipCensus::Enabled() && state->recorder != nullptr) {
+        using D2 = ArchB::OwnershipCensus;
+        for (const auto& color : graphics.colors) state->recorder->ObserveOwnership({.begin = color.address, .end = color.address + color.bytes, .mip = color.mip, .layer = color.arraySlice, .resource = D2::Resource::Image, .flags = D2::Read | D2::Write});
+        if (graphics.depth) state->recorder->ObserveOwnership({.begin = graphics.depth->address, .resource = D2::Resource::Image, .flags = D2::Read | D2::Write});
+    }
     if (!outcome.recorded) {
         switch (outcome.miss) {
             case Graphics::DrawRecipeMiss::NotRecordable: counters.precheckMisses[MissNotRecordable].fetch_add(1, std::memory_order_relaxed); break;
@@ -5361,6 +5372,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
 }
 
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
+    ArchB::OwnershipCensus::PhaseScope ownershipPhase(ArchB::OwnershipCensus::Phase::Record);
     PerformanceTimer recorderTiming("Vulkan.RecordDispatch", ArchB::Recorder::Phase::Record);
     auto& d = Dispatches();
     auto& recorder = *state->recorder;

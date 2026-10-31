@@ -9,6 +9,7 @@
 #include <string_view>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
@@ -257,9 +258,85 @@ void MutexCensus() {
     }
 }
 
+void OwnershipContention() {
+    using R = AgcDriver::ArchB::Recorder;
+    using D2 = AgcDriver::ArchB::OwnershipCensus;
+    namespace G = AgcDriver::GuestMemory;
+    using namespace std::chrono_literals;
+    R::Boundary(true, 0, R::Clock::now());
+    R::BindThread("ownership q0");
+    G::TagGpuLockThread(0);
+    std::array<std::uint32_t, 2> bytes{};
+    const auto batch = D2::Open(31);
+    for (unsigned kind = 0; kind < 4; ++kind) {
+        std::atomic<bool> held{false}, waiting{false};
+        const auto address = reinterpret_cast<std::uintptr_t>(bytes.data());
+        D2::Command request(0);
+        request.Requested()->Add({.begin = address + (kind == 3 ? 4 : 0), .end = address + (kind == 3 ? 8 : 4), .resource = D2::Resource::Buffer,
+            .flags = static_cast<std::uint8_t>(kind == 0 ? D2::Read : D2::Write)});
+        std::thread holder([&] {
+            const auto queue = kind % 2 == 0 ? 0x20u : 0x28u;
+            R::BindThread(queue == 0x20 ? "ownership q20" : "ownership q28");
+            G::TagGpuLockThread(queue);
+            G::TagGpuLockSite(G::GpuLockSite::Dispatch);
+            D2::Command command(queue, true);
+            std::lock_guard lock(G::GpuMutex());
+            D2::Observe(batch, {.begin = address, .end = address + 4, .resource = D2::Resource::Buffer, .flags = static_cast<std::uint8_t>(kind == 1 ? D2::Read : D2::Write)});
+            held = true;
+            while (!waiting.load()) std::this_thread::yield();
+            {
+                const auto until = R::Clock::now() + 3ms;
+                D2::PhaseScope changing(D2::Phase::Resources);
+                while (R::Clock::now() < until) {
+                    changing.Mark(D2::Phase::Record);
+                    changing.Mark(D2::Phase::Resources);
+                }
+            }
+            D2::Sync sync;
+            D2::PhaseScope phase(D2::Phase::Seal, true);
+            for (const auto current : {D2::Phase::Seal, D2::Phase::Submit, D2::Phase::GpuWait, D2::Phase::Callbacks, D2::Phase::Publish, D2::Phase::Release}) {
+                phase.Mark(current);
+                std::this_thread::sleep_for(1ms);
+            }
+            if (kind != 1) bytes[0] = 8;
+            else Check(bytes[0] == 8, "delayed reader saw preceding writer bytes");
+        });
+        while (!held.load()) std::this_thread::yield();
+        waiting = true;
+        G::TagGpuLockSite(G::GpuLockSite::Draw);
+        {
+            std::lock_guard lock(G::GpuMutex());
+            if (kind == 0) Check(bytes[0] == 8, "RAW draw read final compute bytes");
+            else bytes[kind == 3 ? 1 : 0] = 9;
+        }
+        holder.join();
+    }
+    Check(bytes[0] == 8 && bytes[1] == 9, "overlap and disjoint final bytes");
+    D2::Transition(batch, D2::Life::Submitted, 4);
+    D2::Transition(batch, D2::Life::Finishing);
+    D2::Transition(batch, D2::Life::Published);
+    D2::Retire(batch);
+    const auto result = R::Collect(R::Clock::now());
+    double behind = 0, exclusive = 0, phases = 0;
+    for (const auto& [name, value] : result.counters) {
+        if (name.starts_with("M2.WaitBehind.q0x20.") || name.starts_with("M2.WaitBehind.q0x28.")) behind += value * 1e6;
+        if (name.starts_with("d2_conflict_") || name == "d2_candidate_independent_ns" || name == "d2_unknown_ns") exclusive += value;
+        if (name.starts_with("d2_wait_phase_ns.")) phases += value;
+    }
+    Check(std::abs(behind - result.counters.at("d2_q0_wait_compute_ns")) < 1, "D2 exact clipped wait reconciles to M2");
+    Check(exclusive == phases && exclusive == result.counters.at("d2_q0_wait_compute_ns"), "D2 exclusive category and phase sums reconcile");
+    for (const auto* name : {"d2_conflict_raw_ns", "d2_conflict_war_ns", "d2_conflict_waw_ns", "d2_unknown_ns", "d2_sync_seal_ns", "d2_sync_submit_ns", "d2_sync_gpu_wait_ns", "d2_sync_callbacks_ns", "d2_sync_publish_ns", "d2_sync_release_ns"}) Check(result.counters.at(name) > 0, name);
+    for (const auto* name : {"d2_pending_shadow_mismatches", "d2_early_retirement", "d2_overflow", "d2_m2_reconciliation_mismatches", "d2_candidate_independent_ns"}) Check(result.counters.at(name) == 0, name);
+    std::printf("%s\n", result.Json().c_str());
+}
+
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "ownership") {
+        OwnershipContention();
+        return failures != 0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "census") {
         MutexCensus();
         return failures != 0;

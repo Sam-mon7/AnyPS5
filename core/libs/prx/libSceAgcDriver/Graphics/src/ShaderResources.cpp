@@ -6282,6 +6282,21 @@ void ShaderResources::WriteBack() {
 }
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+    ArchB::OwnershipCensus::Coverage ownershipCoverage(usesBda ? ArchB::OwnershipCensus::Resource::Bda : ArchB::OwnershipCensus::Resource::Buffer);
+    if (ArchB::OwnershipCensus::Enabled()) {
+        using D2 = ArchB::OwnershipCensus;
+        if (usesBda) recorder.ObserveOwnership({.resource = D2::Resource::Bda, .flags = static_cast<std::uint8_t>(D2::Read | (bdaReadOnly ? 0 : D2::Write))});
+        const auto image = [&](const StorageTexture& texture, bool written, std::uint32_t mip) {
+            recorder.ObserveOwnership({.begin = texture.Descriptor().baseAddress, .end = texture.Descriptor().baseAddress + texture.GuestBytes(),
+                .representation = reinterpret_cast<std::uintptr_t>(texture.Image()), .layout = VK_IMAGE_LAYOUT_GENERAL, .mip = mip,
+                .resource = D2::Resource::Image, .flags = static_cast<std::uint8_t>(D2::Read | D2::Layout | (written ? D2::Write : 0))});
+        };
+        for (std::size_t i = 0; i < storageTextures.size(); ++i) if (storageTextures[i] != nullptr) image(*storageTextures[i], storageWritten[i], storageMips[i]);
+        for (const auto& texture : textures) if (texture != nullptr) {
+            if (texture->StorageSource() != nullptr) image(*texture->StorageSource(), false, 0);
+            else recorder.ObserveOwnership({.resource = D2::Resource::Image, .flags = D2::Read});
+        }
+    }
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
@@ -6302,6 +6317,11 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
     guestMemory.RecordCopyBacks(recorder);
+    if (ArchB::OwnershipCensus::Enabled() && !usesBda && guestMemory.HasCopiedWrites()) {
+        for (const auto& [begin, end] : guestMemory.Writes()) if (guestMemory.CopiedWritesOverlap(begin, end - begin)) {
+            recorder.ObserveOwnership({.begin = begin, .end = end, .resource = ArchB::OwnershipCensus::Resource::Host, .flags = ArchB::OwnershipCensus::Write | ArchB::OwnershipCensus::Host});
+        }
+    }
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
@@ -6317,6 +6337,57 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     const auto elements = counters.elements.load();
     const auto readOnly = counters.readOnly.load();
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] descriptor elements bound (cumulative): %llu total, %llu written, %llu read-only; %llu pending-write notes skipped\n", static_cast<unsigned long long>(elements), static_cast<unsigned long long>(elements - readOnly), static_cast<unsigned long long>(readOnly), static_cast<unsigned long long>(counters.notesSkipped.load()));
+}
+
+void ShaderResources::OwnershipRequest(ArchB::OwnershipCensus::Summary& summary, std::span<const CompiledShader> shaders) {
+    using D2 = ArchB::OwnershipCensus;
+    if (!D2::Enabled()) return;
+    struct ImageExtent {
+        std::array<std::uint32_t, 8> words{};
+        std::uint64_t begin = 0, end = 0;
+        bool valid = false;
+    };
+    static thread_local std::array<ImageExtent, 128> imageExtents;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) { summary.Add({}); continue; }
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) summary.Add({.resource = D2::Resource::Bda, .flags = D2::Read | D2::Write});
+            if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+                if (binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4) { summary.Add({.resource = D2::Resource::Buffer}); continue; }
+                for (std::uint32_t i = 0; i < binding.count; ++i) {
+                    const auto* words = binding.guestDescriptor.data() + i * 4;
+                    const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+                    const auto begin = descriptor.Base48();
+                    const auto bytes = descriptor.GetSize();
+                    const bool read = i >= binding.Flags().bufferRead.size() || binding.Flags().bufferRead[i];
+                    const bool write = i >= binding.Flags().bufferWritten.size() || binding.Flags().bufferWritten[i];
+                    if (begin != 0 && bytes != 0 && bytes <= UINT64_MAX - begin) summary.Add({.begin = begin, .end = begin + bytes, .resource = D2::Resource::Buffer, .flags = static_cast<std::uint8_t>((read ? D2::Read : 0) | (write ? D2::Write : 0))});
+                }
+            }
+            if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage || binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
+                if (binding.count == 0 || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 8) { summary.Add({.resource = D2::Resource::Image}); continue; }
+                for (std::uint32_t i = 0; i < binding.count; ++i) {
+                    const auto words = std::span(binding.guestDescriptor).subspan(i * 8, 8);
+                    if (IsNullTextureResource(words)) continue;
+                    auto& extent = imageExtents[ArchB::Recorder::Digest(words) % imageExtents.size()];
+                    if (!extent.valid || !std::equal(words.begin(), words.end(), extent.words.begin())) {
+                        extent = {};
+                        std::copy(words.begin(), words.end(), extent.words.begin());
+                        try {
+                            const auto resource = DecodeTextureResource(words);
+                            const auto bytes = DescribeSurface(resource).guestBytes;
+                            extent.begin = resource.baseAddress;
+                            extent.end = bytes <= UINT64_MAX - resource.baseAddress ? resource.baseAddress + bytes : 0;
+                        } catch (const std::exception&) {}
+                        extent.valid = true;
+                    }
+                    const bool write = binding.kind == ShaderRecompiler::DescriptorKind::StorageImage && (i >= binding.Flags().imageWritten.size() || binding.Flags().imageWritten[i]);
+                    summary.Add({.begin = extent.begin, .end = extent.end, .resource = D2::Resource::Image,
+                        .flags = static_cast<std::uint8_t>(D2::Read | D2::Layout | (write ? D2::Write : 0))});
+                }
+            }
+        }
+    }
 }
 
 void ShaderResources::CheckFaults() const {

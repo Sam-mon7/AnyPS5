@@ -2414,6 +2414,7 @@ struct MutexCensusRow {
     GpuLockSite site = GpuLockSite::Other;
     std::array<std::string, 8> counters;
     std::string behind;
+    std::uint32_t queue = UINT32_MAX;
 };
 struct MutexCensusState {
     struct Hold {
@@ -2451,6 +2452,7 @@ MutexCensusRow* CensusRow(GpuLockSite site, std::source_location location) {
     row.thread = CurrentThreadToken();
     row.location = location;
     row.site = site;
+    row.queue = LockStats().tag;
     const std::string_view file(location.file_name());
     const auto name = std::string(GpuLockSiteNames[static_cast<std::size_t>(site)]) + "." + std::string(file.substr(file.find_last_of("/\\") + 1)) + ":" + std::to_string(location.line());
     constexpr const char* suffixes[] = {"acquires", "recursive", "try_failed", "wait_ms", "holds", "hold_ms", "post_acquire_ms", "contended"};
@@ -2472,6 +2474,7 @@ struct MutexCensusAttempt {
     std::uint64_t generation = 0, sequence = 0;
     bool recursive = false;
     bool contended = false;
+    int ownershipWaiter = -1;
     explicit MutexCensusAttempt(GpuMutexType& mutex) {
         if (!ArchB::Recorder::MutexCensusEnabled()) return;
         const auto location = std::exchange(censusLocation, {});
@@ -2488,6 +2491,7 @@ struct MutexCensusAttempt {
         std::lock_guard lock(state.mutex);
         sequence = state.sequence;
         begin = CensusClock::now();
+        if (LockStats().tag == 0) ownershipWaiter = ArchB::OwnershipCensus::WaitBegin(begin, &begin);
     }
     void Acquired() {
         if (row == nullptr) return;
@@ -2495,6 +2499,7 @@ struct MutexCensusAttempt {
         if (recursive) return;
         auto& state = MutexCensus();
         double covered = 0;
+        std::uint64_t computeNs = 0;
         {
             std::lock_guard lock(state.mutex);
             if (contended && LockStats().tag == 0) {
@@ -2507,8 +2512,13 @@ struct MutexCensusAttempt {
                     const auto ms = std::chrono::duration<double, std::milli>(overlap).count();
                     ArchB::Recorder::Count(hold.row->behind.c_str(), ms);
                     covered += ms;
+                    if (hold.row->queue != 0 && hold.row->queue < 0xfffffffeu && (hold.row->site == GpuLockSite::Dispatch || hold.row->site == GpuLockSite::Indirect)) {
+                        computeNs += std::chrono::duration_cast<std::chrono::nanoseconds>(overlap).count();
+                    }
                 }
             }
+            ArchB::OwnershipCensus::WaitEnd(ownershipWaiter, acquired, computeNs);
+            ArchB::OwnershipCensus::HoldBegin(row->queue, row->queue != 0 && row->queue < 0xfffffffeu && (row->site == GpuLockSite::Dispatch || row->site == GpuLockSite::Indirect), acquired);
         }
         censusHold = row;
         censusHoldStart = acquired;
@@ -2546,6 +2556,7 @@ void CensusRelease() {
     auto& state = MutexCensus();
     {
         std::lock_guard lock(state.mutex);
+        ArchB::OwnershipCensus::HoldEnd(now);
         state.holds[state.sequence++ % state.holds.size()] = {censusHold, censusHoldStart, now};
     }
     if (censusHoldGeneration == ArchB::Recorder::Generation()) {

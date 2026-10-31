@@ -39,6 +39,16 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
+void OwnershipDrawRequest(ArchB::OwnershipCensus::Summary& requested, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) {
+    using D2 = ArchB::OwnershipCensus;
+    requested.size = 0;
+    requested.overflow = false;
+    Graphics::ShaderResources::OwnershipRequest(requested, shaders);
+    for (const auto& color : graphics.colors) requested.Add({.begin = color.address, .end = color.address + color.bytes, .mip = color.mip, .layer = color.arraySlice, .resource = D2::Resource::Image, .flags = D2::Read | D2::Write | D2::Layout});
+    if (graphics.depth) requested.Add({.begin = graphics.depth->address, .resource = D2::Resource::Image, .flags = D2::Read | D2::Write | D2::Layout});
+    if (draw.indexed) requested.Add({.begin = draw.indexAddress, .end = draw.indexAddress + static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, .resource = D2::Resource::Buffer, .flags = D2::Read});
+}
+
 bool TraceShaderCorrelation() {
     static const bool enabled = std::getenv("APS5_TRACE_SHADER_CORRELATION") != nullptr;
     return enabled && AgcDriver::CaptureTrace::Enabled();
@@ -1260,6 +1270,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     snapshot();
     timing.Mark("post_compile_prepare");
     DrawLockTiming lockTiming{profile};
+    ArchB::OwnershipCensus::Command ownership(submission.queue);
     ArchB::Recorder::MutexTimer acquireTiming("M2.Draw.AcquireInterval");
     const auto prepareForDraw = [&](const Pm4::DrawParameters& parameters, const DrawRecipe* recipe = nullptr) {
         if (gpuLock.owns_lock() || !Graphics::DrawPrelockEnabled()) return;
@@ -1277,6 +1288,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         acquireTiming.Mark("before_lock");
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        if (ownership.Requested() != nullptr) OwnershipDrawRequest(*ownership.Requested(), graphics, drawParameters, stages);
         gpuLock.lock();
         lockTiming.Start();
         acquireTiming.Mark("lock_call_tail");
@@ -1482,6 +1494,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
 }
 
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, bool pipelineStateReuse) {
+    ArchB::OwnershipCensus::Command ownership(queue);
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawLockTiming lockTiming{profile};
@@ -1491,6 +1504,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         if (profile) lockTiming.prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+    if (ownership.Requested() != nullptr) OwnershipDrawRequest(*ownership.Requested(), graphics, drawParameters, stages);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     lockTiming.Start();
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);

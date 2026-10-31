@@ -633,15 +633,23 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     std::shared_ptr<PreparedDispatch> prepared;
                     if (recipeHit == nullptr || VulkanDevice::VerifyRecipes() || htileClearCompletion.has_value()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                    ArchB::OwnershipCensus::Command ownership(queueId, true);
+                    if (ownership.Requested() != nullptr) {
+                        const Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &compiledCommit, 0};
+                        Graphics::ShaderResources::OwnershipRequest(*ownership.Requested(), std::span(&shader, 1));
+                    }
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    ArchB::OwnershipCensus::PhaseScope ownershipPhase(ArchB::OwnershipCensus::Phase::Labels);
                     ArchB::Recorder::MutexTimer mutexTiming("M2.DispatchCommit.Held");
                     recordLabelsForPacket(localDevice.get(), queueId);
                     mutexTiming.Mark("labels");
+                    ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Writers);
                     if (noteWrites && writerKeyedEvidence() && !writersNoted) {
                         noteWrittenBuffers(address, queueId, compiledCommit);
                         writersNoted = true;
                     }
                     mutexTiming.Mark("writers");
+                    ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Resources);
                     if (recipeHit != nullptr) {
                         VulkanDevice::IndirectOutcome outcome{0, 0};
                         const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
@@ -736,13 +744,20 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         auto privateDispatch = indirectArguments == 0 ? localDevice->PreparePrivateDispatch(compiled, groups[0], groups[1], groups[2], prepared, recipeHit) : nullptr;
         if (privateDispatch != nullptr) phaseTiming.Phase(PhasePrepareOther);
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
+        ArchB::OwnershipCensus::Command ownership(submission.queue, true);
+        if (ownership.Requested() != nullptr) {
+            const Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &compiled, 0};
+            Graphics::ShaderResources::OwnershipRequest(*ownership.Requested(), std::span(&shader, 1));
+        }
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        ArchB::OwnershipCensus::PhaseScope ownershipPhase(ArchB::OwnershipCensus::Phase::Labels);
         phaseTiming.Phase(PhaseLockWait);
         ArchB::Recorder::MutexTimer mutexTiming("M2.Dispatch.Held");
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(PhaseLabels);
         mutexTiming.Mark("labels");
+        ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Writers);
         if (noteWrites && writerKeyedEvidence() && !writersNoted) {
             noteWrittenBuffers(address, submission.queue, compiled);
             writersNoted = true;
@@ -751,6 +766,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         auto* const keysRecorder = filledKeys ? Graphics::Recorder::Active() : nullptr;
         const auto keysNoteBefore = keysRecorder != nullptr ? keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes) : 0;
         mutexTiming.Mark("writers");
+        ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Resources);
         try {
             const GuestMemory::ReadSiteScope deviceSite(GuestMemory::ReadSite::DispatchDevice);
             if (recipeHit != nullptr) {
@@ -773,6 +789,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (rethrow(error)) return;
         }
         mutexTiming.Mark("device");
+        ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Bookkeeping);
         if (keysRecorder != nullptr && keysRecorder == Graphics::Recorder::Active()) {
             const auto note = keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes);
             if (note != 0 && note != keysNoteBefore) Graphics::NoteKeysFillOnGpu(keysFill->base, keysFill->bytes, *filledKeys);

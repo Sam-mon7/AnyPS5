@@ -1928,6 +1928,7 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
+        open->ownershipId = ArchB::OwnershipCensus::Open(id);
         if (PerformanceTrace::Recording()) {
             static std::atomic<std::uint64_t> traceIds{0};
             open->traceId = traceIds.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2352,6 +2353,11 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
 }
 
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
+    if (ArchB::OwnershipCensus::Enabled()) {
+        using D2 = ArchB::OwnershipCensus;
+        if (key == ClassKey(CommandClass::StagingIn) || key == ClassKey(CommandClass::StorageUpload)) ObserveOwnership({.resource = D2::Resource::Upload, .flags = D2::Read | D2::Write});
+        if (key == ClassKey(CommandClass::StorageWriteBack) || key == ClassKey(CommandClass::StagingOut) || key == ClassKey(CommandClass::Copy) || key == ClassKey(CommandClass::ShadowPublish)) ObserveOwnership({.resource = D2::Resource::Conversion, .flags = D2::Read | D2::Write});
+    }
     if (!GpuTimingEnabled()) return NoTiming;
     if (open == nullptr || !open->computeRecording) Commands();
     return beginTiming(key);
@@ -3309,6 +3315,7 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
 
 void Recorder::OnComplete(std::function<void()> action) {
     ensureOpen();
+    ObserveOwnership({.resource = ArchB::OwnershipCensus::Resource::Host, .flags = ArchB::OwnershipCensus::Host});
     open->completions.push_back(std::move(action));
     ++open->writeBackCompletionCount;
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
@@ -3325,6 +3332,8 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
+    ArchB::OwnershipCensus::Observe(open->ownershipId, {.begin = address, .end = end, .resource = ownLabel ? ArchB::OwnershipCensus::Resource::Label : ArchB::OwnershipCensus::Resource::Buffer,
+        .flags = static_cast<std::uint8_t>(ArchB::OwnershipCensus::Write | (ownLabel ? ArchB::OwnershipCensus::Label : 0))}, writeNoteCount, GuestMemory::CurrentPacket().queue);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     open->writeWords.push_back(word);
@@ -3354,6 +3363,8 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
+    ArchB::OwnershipCensus::Observe(batch.ownershipId, {.begin = address, .end = address + bytes, .resource = ownLabel ? ArchB::OwnershipCensus::Resource::Label : ArchB::OwnershipCensus::Resource::Buffer,
+        .flags = static_cast<std::uint8_t>(ArchB::OwnershipCensus::Write | (ownLabel ? ArchB::OwnershipCensus::Label : 0))}, writeNoteCount, GuestMemory::CurrentPacket().queue);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
     batch.writeValues.push_back(-1);
     batch.writeWords.push_back(-1);
@@ -3408,6 +3419,7 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
 }
 
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
+    ArchB::OwnershipCensus::PhaseScope ownershipPhase(ArchB::OwnershipCensus::Phase::Publish, true);
     if (activeRecorder != this) {
         publishedWriteRangesValid = false;
         return;
@@ -3454,9 +3466,27 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     publishedWriteRanges = merged;
     published = merged;
     pendingWrites.store(std::move(merged), std::memory_order_release);
+    if (ArchB::OwnershipCensus::Enabled()) {
+        if (!extend) ArchB::OwnershipCensus::CheckSnapshot(id, *pendingWrites.load(std::memory_order_acquire));
+        if (open != nullptr) checkOwnership(*open);
+        for (const auto& batch : inFlight) checkOwnership(*batch);
+        for (const auto* batch : finishing) checkOwnership(*batch);
+    }
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+}
+
+void Recorder::checkOwnership(const Batch& batch) const {
+    if (!ArchB::OwnershipCensus::Enabled()) return;
+    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
+    const std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges = snapshot != nullptr ? std::span(*snapshot) : std::span<const std::pair<std::uint64_t, std::uint64_t>>{};
+    ArchB::OwnershipCensus::Check(batch.ownershipId, batch.writes, batch.writeNotes, ranges, activeRecorder == this);
+}
+
+void Recorder::ObserveOwnership(ArchB::OwnershipCensus::Access access) {
+    if (!ArchB::OwnershipCensus::Enabled() || open == nullptr) return;
+    ArchB::OwnershipCensus::Observe(open->ownershipId, access, 0, GuestMemory::CurrentPacket().queue);
 }
 
 bool Recorder::overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end) {
@@ -3571,6 +3601,8 @@ bool Recorder::ReadTracking() {
 }
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
+    if (ArchB::OwnershipCensus::Enabled() && bytes != 0 && ReadTrackingEnabled()) ensureOpen();
+    if (bytes != 0) ObserveOwnership({.begin = address, .end = address + bytes, .resource = kind == ReadKind::AddressBased ? ArchB::OwnershipCensus::Resource::Bda : kind == ReadKind::StorageUpload ? ArchB::OwnershipCensus::Resource::Upload : ArchB::OwnershipCensus::Resource::Buffer, .flags = ArchB::OwnershipCensus::Read});
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
@@ -3579,6 +3611,10 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
+    if (ArchB::OwnershipCensus::Enabled() && !ranges.empty() && ReadTrackingEnabled()) ensureOpen();
+    if (ArchB::OwnershipCensus::Enabled()) for (const auto& [begin, end] : ranges) {
+        if (end > begin) ObserveOwnership({.begin = begin, .end = end, .resource = kind == ReadKind::AddressBased ? ArchB::OwnershipCensus::Resource::Bda : kind == ReadKind::StorageUpload ? ArchB::OwnershipCensus::Resource::Upload : ArchB::OwnershipCensus::Resource::Buffer, .flags = ArchB::OwnershipCensus::Read});
+    }
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
@@ -3603,6 +3639,9 @@ void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadK
         return;
     }
     ensureOpen();
+    if (ArchB::OwnershipCensus::Enabled()) for (const auto& [begin, end] : *ranges) {
+        ObserveOwnership({.begin = begin, .end = end, .resource = kind == ReadKind::AddressBased ? ArchB::OwnershipCensus::Resource::Bda : ArchB::OwnershipCensus::Resource::Buffer, .flags = ArchB::OwnershipCensus::Read});
+    }
     readsNoted.fetch_add(ranges->size(), std::memory_order_relaxed);
     for (const auto& note : open->readLists) {
         if (note.ranges == ranges && note.kind == kind) return;
@@ -3870,6 +3909,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     EndComputeChain();
     Require(open != nullptr || !inFlight.empty(), "no batch to append a completion label to");
     Batch& batch = open != nullptr ? *open : *inFlight.back();
+    ArchB::OwnershipCensus::Observe(batch.ownershipId, {.begin = address, .end = address + bytes.size(), .resource = ArchB::OwnershipCensus::Resource::Label, .flags = ArchB::OwnershipCensus::Write | ArchB::OwnershipCensus::Label}, 0, queue);
     std::vector<std::byte> copy(bytes.begin(), bytes.end());
     // The store bypasses the flush hook: it runs inside finish() under the mutex, and the hook would
     // find this very range noted (or a later label to it) and sync re-entrantly. Stamped like every
@@ -3880,6 +3920,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         return writtenBackSequence;
     }();
     auto store = [this, address, copy = std::move(copy), sequence, storedOnGpu](auto&& visible) {
+        ArchB::OwnershipCensus::PhaseScope ownershipPhase(ArchB::OwnershipCensus::Phase::Publish, true);
         if (storedOnGpu && !always && !writtenBackSince(sequence, address, address + copy.size())) {
             completionStoresSkipped.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -3923,6 +3964,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
 bool Recorder::AfterRecordedWork(std::function<void()> action) {
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
+    ArchB::OwnershipCensus::Observe(batch.ownershipId, {.resource = ArchB::OwnershipCensus::Resource::Label, .flags = ArchB::OwnershipCensus::Label | ArchB::OwnershipCensus::Host}, 0, GuestMemory::CurrentPacket().queue);
     batch.completions.push_back(std::move(action));
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
@@ -3982,6 +4024,7 @@ void Recorder::HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value) {
 }
 
 void Recorder::Submit() {
+    ArchB::OwnershipCensus::PhaseScope ownershipPhase(ArchB::OwnershipCensus::Phase::Seal, true);
     EndComputeChain();
     PerformanceTimer frameTiming("Recorder.Submit");
     AgcDriver::ArchB::Recorder::Count("flushes");
@@ -4058,7 +4101,9 @@ void Recorder::Submit() {
     DestroyDeferredAtIdle(context);
     const auto submitStart = std::chrono::steady_clock::now();
     Timeline::Emit(Timeline::Kind::SubmitBegin, serial, id, 0, 0, batch->timelineId);
+    ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Submit);
     const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Release);
     Timeline::Emit(Timeline::Kind::SubmitEnd, serial, id, 0, 0, batch->timelineId, static_cast<std::uint32_t>(result));
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
@@ -4067,6 +4112,7 @@ void Recorder::Submit() {
     Check(result, "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
+    ArchB::OwnershipCensus::Transition(batch->ownershipId, ArchB::OwnershipCensus::Life::Submitted, batch->serial);
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
         std::lock_guard lock(WaitLabels().mutex);
@@ -4204,10 +4250,12 @@ void Recorder::FinishUpTo(std::uint64_t serial) {
 }
 
 void Recorder::Sync() {
+    ArchB::OwnershipCensus::Sync ownershipSync;
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
     Submit();
+    ArchB::OwnershipCensus::PhaseScope ownershipPhase(ArchB::OwnershipCensus::Phase::Release, true);
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
     const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
@@ -4537,12 +4585,18 @@ bool Recorder::Reap() {
 }
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
+    ArchB::OwnershipCensus::PhaseScope ownershipPhase(ArchB::OwnershipCensus::Phase::Release, true);
+    ArchB::OwnershipCensus::Transition(batch->ownershipId, ArchB::OwnershipCensus::Life::Finishing);
+    checkOwnership(*batch);
     inFlightKeptBytes -= batch->keptBytes;
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;
         const Batch* batch;
+        bool published = false;
         ~Finishing() {
+            recorder.checkOwnership(*batch);
+            if (!published) ArchB::OwnershipCensus::Transition(batch->ownershipId, ArchB::OwnershipCensus::Life::Failed);
             auto& list = recorder.finishing;
             list.erase(std::remove(list.begin(), list.end(), batch), list.end());
             // The batch's completion labels have landed, or never will (fence failure below).
@@ -4556,6 +4610,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 recorder.publishPendingWrites();
             } catch (...) {
             }
+            ArchB::OwnershipCensus::Retire(batch->ownershipId);
         }
     } finishingScope{*this, batch.get()};
     finishing.push_back(batch.get());
@@ -4598,6 +4653,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         } report{profile, source, waitStart, *this, signaledAtStart};
         Timeline::GpuWaitScope timelineWait(batch->serial, id, batch->timelineId);
         const auto waitFences = function(waitForFences, "vkWaitForFences");
+        ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::GpuWait);
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
@@ -4605,6 +4661,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         timelineWait.result = static_cast<std::uint32_t>(result);
+        ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Release);
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
@@ -4641,12 +4698,14 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // reaped or synced the batch. Inside them the flush hook makes no pending-write wait (SyncThrough).
     const bool profile = DrawProfiled();
     const auto completionStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Callbacks);
     {
         struct InCompletion {
             InCompletion() { ++completionDepth; }
             ~InCompletion() { --completionDepth; }
         } inCompletion;
         for (auto& action : batch->completions) {
+            checkOwnership(*batch);
             try {
                 action();
             } catch (const BdaUnalignedAccess& error) {
@@ -4664,6 +4723,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         }
     }
+    checkOwnership(*batch);
+    ArchB::OwnershipCensus::Transition(batch->ownershipId, ArchB::OwnershipCensus::Life::Published);
+    finishingScope.published = true;
+    ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Release);
     if (!batch->completions.empty()) KernelWakeSleepers_nid_no_patch();
     if (profile) holdCounters.completions += batch->completions.size();
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -4703,6 +4766,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
+    ArchB::OwnershipCensus::Transition(batch->ownershipId, ArchB::OwnershipCensus::Life::Discarded);
+    ArchB::OwnershipCensus::Retire(batch->ownershipId);
     Timeline::Emit(Timeline::Kind::BatchDiscard, batch->serial, 0, 0, 0, batch->timelineId);
     removeLabels(*batch);
     if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
