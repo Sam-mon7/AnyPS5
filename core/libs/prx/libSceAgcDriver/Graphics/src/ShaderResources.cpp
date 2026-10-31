@@ -51,6 +51,41 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+void censusDescriptors(std::span<const VkWriteDescriptorSet> writes, VkDescriptorSetLayout first, VkDescriptorSetLayout second) {
+    using R = AgcDriver::ArchB::Recorder;
+    auto* draw = R::CurrentDraw();
+    if (draw == nullptr) return;
+    const auto word = [&](std::uint64_t value) { draw->Word(R::State::Descriptors, value); };
+    word(reinterpret_cast<std::uintptr_t>(first));
+    word(reinterpret_cast<std::uintptr_t>(second));
+    word(writes.size());
+    const auto firstSet = writes.empty() ? VK_NULL_HANDLE : writes.front().dstSet;
+    for (const auto& write : writes) {
+        if (draw->StateSize(R::State::Descriptors) >= 512) { draw->Unknown(R::State::Descriptors); return; }
+        word(write.dstSet == firstSet);
+        word(write.dstBinding);
+        word(write.dstArrayElement);
+        word(write.descriptorType);
+        word(write.descriptorCount);
+        if (write.pNext != nullptr) { draw->Unknown(R::State::Descriptors); return; }
+        for (std::uint32_t i = 0; i < write.descriptorCount; ++i) {
+            if (draw->StateSize(R::State::Descriptors) >= 512) { draw->Unknown(R::State::Descriptors); return; }
+            if (write.pBufferInfo != nullptr) {
+                const auto& buffer = write.pBufferInfo[i];
+                word(reinterpret_cast<std::uintptr_t>(buffer.buffer));
+                word(buffer.offset);
+                word(buffer.range);
+            } else if (write.pImageInfo != nullptr) {
+                const auto& image = write.pImageInfo[i];
+                word(reinterpret_cast<std::uintptr_t>(image.sampler));
+                word(reinterpret_cast<std::uintptr_t>(image.imageView));
+                word(image.imageLayout);
+            } else if (write.pTexelBufferView != nullptr) word(reinterpret_cast<std::uintptr_t>(write.pTexelBufferView[i]));
+            else draw->Unknown(R::State::Descriptors);
+        }
+    }
+}
+
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
 }
@@ -6019,6 +6054,9 @@ std::size_t ShaderResources::DrawUploadLimit() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
+    AgcDriver::ArchB::Recorder::Timer refreshTiming("Draw.BindingRefresh");
+    auto* census = AgcDriver::ArchB::Recorder::CurrentDraw();
+    if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::BindingPreparations);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
@@ -6048,6 +6086,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             } else {
                 buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
                 std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+                if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::SnapshotCopiedBytes, override->size);
                 for (const auto& patch : dataPatches) {
                     if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
                 }
@@ -6094,6 +6133,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
+                if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::SnapshotCopiedBytes, bytes);
                 buffer = std::move(slice.buffer);
                 offset = slice.offset;
             } else {
@@ -6102,6 +6142,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (buffer == nullptr) {
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                    if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::SnapshotCopiedBytes, bytes);
                     recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
                 }
             }
@@ -6111,9 +6152,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         selected.push_back(index);
         keep({begin, std::move(buffer), offset, bytes});
         totalSnapshotBytes += bytes;
+        if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::SnapshotBytes, bytes);
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
+    refreshTiming.Finish();
+    AgcDriver::ArchB::Recorder::Timer descriptorTiming("Draw.Descriptors");
+    if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::BindingRewrites);
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
@@ -6134,11 +6179,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result->cache = context.descriptorCache;
     if (described[0] || splitSets) {
+        if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::DescriptorSetRequests);
         result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
         result->layout = _layout;
         Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     if (described[1] || splitSets) {
+        if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::DescriptorSetRequests);
         result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
         result->fragmentLayout = fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
@@ -6171,6 +6218,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    censusDescriptors(writes, _layout, fragment.layout);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
@@ -6193,6 +6241,7 @@ bool ShaderResources::RecordPrivateDescriptors(VkDescriptorSet destination, cons
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     PerformanceTimer recorderTiming("Resources.Bind", AgcDriver::ArchB::Recorder::Phase::Bind);
+    censusDescriptors(descriptorWrites, _layout, fragment.layout);
     if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
     if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);
 }

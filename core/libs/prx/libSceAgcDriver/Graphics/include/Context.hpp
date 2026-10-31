@@ -18,6 +18,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <tuple>
+#include <type_traits>
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -151,6 +154,90 @@ inline std::uint64_t& DeviceProcLookups() {
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
+template<typename TFunction> struct RecordedVulkanCall;
+
+template<typename TResult, typename... TArgs>
+struct RecordedVulkanCall<TResult(VKAPI_PTR*)(TArgs...)> {
+    using Function = TResult(VKAPI_PTR*)(TArgs...);
+    Function function = nullptr;
+    const char* name = nullptr;
+    operator Function() const { return function; }
+    TResult operator()(TArgs... args) const {
+        using Recorder = AgcDriver::ArchB::Recorder;
+        if (!Recorder::Enabled()) return function(args...);
+        auto* draw = AgcDriverRecorderDraw_nid_no_patch();
+        if (draw == nullptr) return function(args...);
+        Recorder::Scope scope;
+        using M = Recorder::Metric;
+        using S = Recorder::State;
+        const auto arguments = std::tie(args...);
+        const std::string_view operation(name);
+        bool repeated = false;
+        if constexpr (std::is_same_v<Function, PFN_vkUpdateDescriptorSets>) {
+            draw->Count(M::DescriptorWrites, std::get<1>(arguments));
+            for (std::uint32_t i = 0; i < std::get<1>(arguments); ++i) {
+                const auto& write = std::get<2>(arguments)[i];
+                draw->Count(M::DescriptorElements, write.descriptorCount);
+                if (write.pImageInfo != nullptr) draw->Count(M::ImageElements, write.descriptorCount);
+                if (write.pBufferInfo != nullptr) draw->Count(M::BufferElements, write.descriptorCount);
+            }
+        } else if constexpr (std::is_same_v<Function, PFN_vkCmdPipelineBarrier>) {
+            draw->Count(M::Barriers, std::get<4>(arguments) + std::get<6>(arguments) + std::get<8>(arguments));
+            draw->Count(M::ImageBarriers, std::get<8>(arguments));
+            for (std::uint32_t i = 0; i < std::get<8>(arguments); ++i) {
+                const auto& barrier = std::get<9>(arguments)[i];
+                if (barrier.oldLayout != barrier.newLayout) draw->Count(M::LayoutTransitions);
+            }
+        } else if constexpr (std::is_same_v<Function, PFN_vkCmdBindPipeline>) {
+            const auto begin = draw->StateSize(S::Pipeline);
+            draw->Word(S::Pipeline, reinterpret_cast<std::uintptr_t>(std::get<2>(arguments)));
+            repeated = draw->SameOperation(S::Pipeline, begin);
+            if (repeated) draw->Count(M::RedundantPipelineBinds);
+        }
+        if (operation.starts_with("vkCmdSet") || operation == "vkCmdPushConstants") {
+            const auto state = operation == "vkCmdPushConstants" ? S::Push : S::Dynamic;
+            const auto begin = draw->StateSize(state);
+            draw->Bytes(state, name, operation.size());
+            if constexpr (std::is_same_v<Function, PFN_vkCmdPushConstants>) {
+                draw->Word(state, reinterpret_cast<std::uintptr_t>(std::get<1>(arguments)));
+                draw->Word(state, std::get<2>(arguments));
+                draw->Word(state, std::get<3>(arguments));
+                draw->Bytes(state, std::get<5>(arguments), std::get<4>(arguments));
+            } else {
+                [&]<std::size_t... I>(std::index_sequence<I...>) {
+                    const auto capture = [&]<std::size_t Index>(std::integral_constant<std::size_t, Index>) {
+                        if constexpr (Index != 0) {
+                            const auto value = std::get<Index>(arguments);
+                            using T = std::remove_cvref_t<decltype(value)>;
+                            if constexpr (std::is_arithmetic_v<T> || std::is_enum_v<T>) draw->Bytes(state, &value, sizeof(value));
+                            else if constexpr (std::is_same_v<T, const VkViewport*> || std::is_same_v<T, const VkRect2D*>) {
+                                draw->Bytes(state, value, std::get<2>(arguments) * sizeof(*value));
+                            } else draw->Unknown(state);
+                        }
+                    };
+                    (capture(std::integral_constant<std::size_t, I>{}), ...);
+                }(std::index_sequence_for<TArgs...>{});
+            }
+            repeated = draw->SameOperation(state, begin);
+            if (repeated) draw->Count(state == S::Push ? M::RedundantPushCalls : M::RedundantDynamicCalls);
+        }
+        AgcDriverRecorderVulkanBegin_nid_no_patch(&scope, name);
+        scope.Repeated(repeated);
+        const auto finish = [&] { AgcDriverRecorderScopeEnd_nid_no_patch(&scope, Recorder::Clock::now().time_since_epoch().count()); };
+        if constexpr (std::is_void_v<TResult>) {
+            function(args...);
+            finish();
+        } else {
+            const auto result = function(args...);
+            if constexpr (std::is_same_v<Function, PFN_vkAllocateDescriptorSets>) {
+                if (result == VK_SUCCESS) draw->Count(M::DescriptorSets, std::get<1>(arguments)->descriptorSetCount);
+            }
+            finish();
+            return result;
+        }
+    }
+};
+
 struct Context {
     VkDevice device;
     VkPhysicalDevice physical;
@@ -282,18 +369,18 @@ struct Context {
     VertexInputCache* vertexInputs = nullptr;
 
     template<typename TFunction>
-    TFunction Function(const char* name) const {
+    RecordedVulkanCall<TFunction> Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
         ++DeviceProcLookups();
         const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
-        return function;
+        return {function, name};
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.
     template<typename TFunction>
-    TFunction Resolved(TFunction DeviceFunctions::*member, const char* name) const {
-        if (functions != nullptr && functions->*member != nullptr) return functions->*member;
+    RecordedVulkanCall<TFunction> Resolved(TFunction DeviceFunctions::*member, const char* name) const {
+        if (functions != nullptr && functions->*member != nullptr) return {functions->*member, name};
         return Function<TFunction>(name);
     }
 

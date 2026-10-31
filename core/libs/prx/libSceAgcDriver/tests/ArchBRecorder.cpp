@@ -131,6 +131,69 @@ void toggleIntervalTagged() {
     require(Recorder::Collect(start + 10s).toggled, "configuration transition was not tagged");
 }
 
+void hitCensus(bool enabled) {
+    const Recorder::Clock::time_point start{};
+    Recorder::BindThread("h1 fixture");
+    Recorder::Boundary(enabled, 700, start);
+    const auto run = [&](Recorder::DrawOutcome outcome, std::uint64_t pipeline, std::uint64_t batch, bool unknown) {
+        Recorder::Draw draw;
+        Recorder::Scope outer, proof, bind;
+        outer.Begin("fixture", start);
+        proof.Begin("Resources.Proof", start + 10ms);
+        proof.End(start + 20ms);
+        Recorder::GpuLock(true, start + 30ms);
+        bind.Begin("Vulkan.Descriptors", start + 40ms);
+        bind.End(start + 60ms);
+        Recorder::GpuLock(false, start + 80ms);
+        outer.End(start + 100ms);
+        draw.Classify(outcome);
+        draw.Count(Recorder::Metric::DescriptorWrites, 3);
+        draw.Word(Recorder::State::Pipeline, pipeline);
+        draw.Commands(12, batch);
+        if (unknown) draw.Unknown(Recorder::State::Pipeline);
+        return draw.SameOperation(Recorder::State::Pipeline, 0);
+    };
+    require(!run(Recorder::DrawOutcome::Hit, 1, 1, false), "first operation compared equal");
+    require(run(Recorder::DrawOutcome::Hit, 1, 1, false) == enabled, "unchanged operation comparison disagrees");
+    require(!run(Recorder::DrawOutcome::Hit, 1, 2, false), "new batch compared equal");
+    require(!run(Recorder::DrawOutcome::Hit, 2, 2, false), "changed pipeline compared equal");
+    require(!run(Recorder::DrawOutcome::Hit, 2, 2, true), "unknown pipeline compared equal");
+    require(!run(Recorder::DrawOutcome::Miss, 2, 2, false), "miss compared equal");
+    require(!run(Recorder::DrawOutcome::Hit, 2, 2, false), "hit after miss compared equal");
+    const auto result = Recorder::Collect(start + 1s);
+    if (!enabled) {
+        require(!result.counters.contains("H1.Hit.calls"), "disabled census published data");
+        return;
+    }
+    const auto& values = result.threadCounters.at("h1 fixture");
+    near(values.at("H1.Hit.calls"), 6);
+    near(values.at("H1.Hit.descriptor_writes"), 18);
+    near(values.at("H1.Hit.consecutive_hits"), 4);
+    near(values.at("H1.Hit.same_pipeline"), 2);
+    near(values.at("H1.Hit.same_commands_pipeline"), 1);
+    near(values.at("H1.Hit.unknown_pipeline"), 1);
+    near(values.at("H1.Hit.emission_descriptors_ms"), 120);
+    const auto& phases = result.phases.at("h1 fixture");
+    near(phases.at("H1.Hit.Outside.lookup_proof"), 60);
+    near(phases.at("H1.Hit.Locked.descriptors"), 120);
+    near(phases.at("H1.Hit.Locked.bookkeeping"), 180);
+    near(phases.at("H1.Hit.Outside.bookkeeping"), 240);
+    near(result.accountedMs, 700);
+    Recorder::Sequence first, second;
+    first.Add(1);
+    second.Add(1);
+    require(first.Same(second), "equal bounded state did not compare");
+    for (std::size_t i = 0; i <= 512; ++i) first.Add(i);
+    require(first.overflow && !first.Same(second), "overflow state compared equal");
+    {
+        Recorder::Draw crossing;
+        crossing.Classify(Recorder::DrawOutcome::Hit);
+        Recorder::Boundary(false, 701, start + 2s);
+    }
+    const auto toggled = Recorder::Collect(start + 3s);
+    near(toggled.counters.at("H1.Hit.calls"), 0);
+}
+
 void shaderTableOverflow() {
     const Recorder::Clock::time_point start{};
     Recorder::Boundary(true, 0, start);
@@ -158,6 +221,8 @@ int main(int argc, char** argv) {
         else if (name == "no_path_change") noPathChange();
         else if (name == "toggle_interval_tagged") toggleIntervalTagged();
         else if (name == "shader_table_overflow") shaderTableOverflow();
+        else if (name == "hit_census") hitCensus(true);
+        else if (name == "hit_census_disabled") hitCensus(false);
         else throw std::runtime_error("unknown test case");
         return 0;
     } catch (const std::exception& error) {

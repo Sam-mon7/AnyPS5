@@ -1479,6 +1479,7 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.Inputs");
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1913,6 +1914,7 @@ struct ResolvedResources {
 };
 
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, DrawPreparation* preparation) {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.ResolveResources");
     ResolvedResources resolved;
     auto lookupLap = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lookupPhase = [&](LookupPhase phase) {
@@ -2179,6 +2181,7 @@ struct Kept {
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.KeepResources");
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
@@ -2308,6 +2311,7 @@ void recordStencilReplay(const Context& context, VkCommandBuffer commands, const
 }
 
 void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false) {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.PushConstants");
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
         resources.PatchPushConstants(block);
@@ -2422,8 +2426,11 @@ bool WriteOnlyPasses() {
 }
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.Record");
     auto recordLap = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto recordPhase = [&](RecordPhase phase) {
+        constexpr const char* names[] = {"access", "bindings", "pass", "begin", "commands", "leave", "keep"};
+        recorderTiming.Mark(names[phase]);
         if (!timer.profile) return;
         const auto now = std::chrono::steady_clock::now();
         outcome.recordUs[phase] += std::chrono::duration<double, std::micro>(now - recordLap).count();
@@ -2523,6 +2530,20 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = start.commands;
+    if (auto* census = AgcDriver::ArchB::Recorder::CurrentDraw()) {
+        using R = AgcDriver::ArchB::Recorder;
+        census->Commands(reinterpret_cast<std::uintptr_t>(commands), recorder->Submissions());
+        if (continued) census->Count(R::Metric::PassContinued);
+        census->Count(R::Metric::OrderedAccess);
+        if (shaders.size() == 2 && shaders.front().stage == ShaderRecompiler::ShaderStage::Vertex && shaders.back().stage == ShaderRecompiler::ShaderStage::Fragment) census->Count(R::Metric::PlainStages);
+        const auto word = [&](std::uint64_t value) { census->Word(R::State::Targets, value); };
+        word(record.targetViews.size());
+        for (const auto view : record.targetViews) word(reinterpret_cast<std::uintptr_t>(view));
+        word(state.renderExtent.width);
+        word(state.renderExtent.height);
+        word(state.renderLayers);
+        word(passKey);
+    }
     if (!continued) recorder->PrepareSampleSlot();
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
@@ -2734,6 +2755,7 @@ struct PreparedDraw {
     const DrawTraceContext* trace = nullptr;
     std::vector<std::uint32_t> stencilReferences;
     std::optional<PerformanceTimer> timing;
+    AgcDriver::ArchB::Recorder::Timer releaseTiming{nullptr};
     DrawTimer timer;
     DrawOutcome outcome;
     const ShaderResources::BuildTiming* built = nullptr;
@@ -2792,6 +2814,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     if (state.quadList || StripPatches(state, shaders)) recipeOut = nullptr;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     auto& timing = prepared.timing.emplace("Graphics.Draw", AgcDriver::ArchB::Recorder::Phase::Prepare);
+    timing.RecorderCounter("graphics_draw_cpu_ms");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& timer = prepared.timer;
@@ -2817,6 +2840,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     timing.Mark("validate");
     timing.Mark("index_upload");
     const int dumpLimit = prepared.dumpLimit = DumpTargetLimit();
+    AgcDriver::ArchB::Recorder::Timer targetTiming("Draw.Targets");
     auto& targets = prepared.targets;
     targets.resize(state.colors.size());
     auto& targetViews = prepared.targetViews;
@@ -2926,6 +2950,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
+    targetTiming.Finish();
     resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.preparation);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
@@ -3083,6 +3108,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         resolved.moved.clear();
     }
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
+    AgcDriver::ArchB::Recorder::Timer acquisitionTiming("Draw.Acquire");
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto& masked = prepared.masked;
@@ -3123,8 +3149,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         owners.push_back(binding.resident);
         framebufferOwners.push_back(binding.multisampled ? binding.multisampleOwner : binding.resident);
     }
+    acquisitionTiming.Mark("pipeline");
     auto& framebuffer = prepared.framebuffer;
     framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+    acquisitionTiming.Mark("framebuffer");
     auto& reordered = prepared.reordered;
     auto& reorderPass = prepared.reorderPass;
     if (pipeline->ReordersSamples()) {
@@ -3516,6 +3544,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 }
 
 DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe) {
+    AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.Prelock");
     DrawPreparation prepared;
     if (!DrawPrelockEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return prepared;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3592,6 +3621,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
+    prepared.releaseTiming.Begin("Draw.ResourceRelease");
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawPreparation* preparation) {
@@ -3599,6 +3629,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe", AgcDriver::ArchB::Recorder::Phase::Record);
+    timing.RecorderCounter("graphics_draw_cpu_ms");
+    AgcDriver::ArchB::Recorder::Timer releaseTiming{nullptr};
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
     DrawRecipeOutcome result;
@@ -3632,6 +3664,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // what the lookup would return, and Refresh brings it up to date exactly as the lookup's does
     // (FlushPending, the whole-surface collect and UnchangedSince, the key scan). An image gone
     // from the cache is a miss: the ordinary path looks up anew.
+    AgcDriver::ArchB::Recorder::Timer targetTiming("Draw.Targets");
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
@@ -3660,6 +3693,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
     // key leaves to a hit repeated; a failure removes the template from the cache (the batch keeps
     // it) and the caller rebuilds.
+    targetTiming.Finish();
     auto resources = recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
@@ -3695,13 +3729,17 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // or its eviction bound drops it: a miss). The framebuffer is the recipe's while the pipeline's
     // list holds it: the views are the stored targets' (stable while they live, and they are the
     // same objects), so AcquireFramebuffer only runs when the list evicted it.
+    AgcDriver::ArchB::Recorder::Timer acquisitionTiming("Draw.Acquire");
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
+    acquisitionTiming.Mark("pipeline");
     auto framebuffer = recipe.framebuffer.lock();
     if (framebuffer == nullptr) {
         const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
         framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
     }
+    acquisitionTiming.Mark("framebuffer");
+    acquisitionTiming.Finish();
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;
@@ -3727,6 +3765,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     timing.Mark("draw_and_resource_release");
     reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, " recorded from recipe");
     result.recorded = true;
+    releaseTiming.Begin("Draw.ResourceRelease");
     return result;
 }
 

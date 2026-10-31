@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <numeric>
 #include <sstream>
@@ -10,6 +11,34 @@
 namespace AgcDriver::ArchB {
 
 namespace {
+
+constexpr const char* bucketNames[] = {"lookup_proof", "mutex_wait", "targets_pass", "descriptors", "pipeline", "dynamic_state", "push_constants", "draw_commands", "barriers", "data_refresh", "bookkeeping"};
+constexpr const char* metricNames[] = {"calls", "continuations", "vulkan_calls", "vkcmd_calls", "descriptor_writes", "descriptor_elements", "image_elements", "buffer_elements", "descriptor_sets", "descriptor_binds", "pipeline_binds", "distinct_pipelines", "dynamic_calls", "push_calls", "draw_calls", "pass_begins", "pass_ends", "pass_continued", "barriers", "image_barriers", "layout_transitions", "snapshot_bytes", "binding_preparations", "binding_rewrites", "plain_stages", "ordered_access", "descriptor_set_requests", "snapshot_copied_bytes", "redundant_pipeline_binds", "redundant_dynamic_calls", "redundant_push_calls"};
+constexpr const char* stateNames[] = {"pipeline", "descriptors", "targets", "dynamic", "push"};
+constexpr const char* outcomeNames[] = {"Unclassified", "Hit", "Miss"};
+
+Recorder::Bucket bucketOf(std::string_view name, std::string_view stage, Recorder::Bucket fallback) {
+    using B = Recorder::Bucket;
+    if (name == "GpuMutex.wait") return B::Wait;
+    if (name == "Driver.DrawLookup" || name == "Draw.Key" || name == "Draw.Lookup" || name == "Resources.Proof" || name == "Resources.FullWalk") return B::Lookup;
+    if (name == "Draw.Targets" || name == "Vulkan.Pass") return B::Targets;
+    if (name == "Draw.Acquire") return stage == "pipeline" ? B::Pipeline : B::Targets;
+    if (name == "Resources.Bind" || name == "Draw.Descriptors" || name == "Vulkan.Descriptors") return B::Descriptors;
+    if (name == "Vulkan.Pipeline") return B::Pipeline;
+    if (name == "Draw.PushConstants" || name == "Vulkan.Push") return B::Push;
+    if (name == "Vulkan.Dynamic") return B::Dynamic;
+    if (name == "Vulkan.Draw") return B::Draw;
+    if (name == "Vulkan.Barriers") return B::Barriers;
+    if (name == "Draw.Inputs" || name == "Draw.Prelock" || name == "Draw.ResolveResources" || name == "Resources.Prepare" || name == "Resources.Complete" || name == "Draw.BindingRefresh" || name == "Draw.UserPatch") return B::Refresh;
+    if (name == "Draw.Record") {
+        if (stage == "bindings") return B::Refresh;
+        if (stage == "pass" || stage == "begin") return B::Targets;
+        if (stage == "commands") return B::Draw;
+        return B::Bookkeeping;
+    }
+    if (name == "Draw.KeepResources" || name == "Draw.ResourceRelease" || name.starts_with("Recorder.") || name.starts_with("Label")) return B::Bookkeeping;
+    return fallback;
+}
 
 struct Value {
     double local = 0;
@@ -108,6 +137,25 @@ struct Recorder::Thread {
     std::array<CounterEntry, 512> counters;
     Value phaseOverflow;
     Value counterOverflow;
+    struct Census {
+        std::array<std::array<Value, static_cast<std::size_t>(Bucket::Count)>, 2> elapsed;
+        std::array<Value, static_cast<std::size_t>(Metric::Count)> counters;
+        std::array<Value, static_cast<std::size_t>(State::Count)> same;
+        std::array<Value, static_cast<std::size_t>(State::Count)> sameCommands;
+        std::array<Value, static_cast<std::size_t>(State::Count)> unknown;
+        std::array<Value, static_cast<std::size_t>(State::Count)> sameMs;
+        std::array<Value, static_cast<std::size_t>(State::Count)> sameEmissionMs;
+        std::array<Value, static_cast<std::size_t>(Bucket::Count)> emission;
+        std::array<Value, static_cast<std::size_t>(Bucket::Count)> redundantEmission;
+        Value pairs;
+    };
+    std::array<Census, 3> census;
+    std::array<Sequence, static_cast<std::size_t>(State::Count)> previousStates;
+    std::uint64_t previousGeneration = 0;
+    std::uint64_t previousCommands = 0;
+    std::uint64_t previousBatch = 0;
+    bool previousHit = false;
+    Value censusPublishMs;
 };
 
 Recorder::Thread& Recorder::thread() {
@@ -143,7 +191,12 @@ void Recorder::Scope::Begin(const char* scope, Clock::time_point now, Phase phas
     active = true;
     name = scope;
     previous = now;
+    draw = currentDraw;
     parent = currentScope;
+    if (draw != nullptr) {
+        heldBefore = heldTime(now);
+        bucket = bucketOf(scope, {}, parent != nullptr && parent->draw == draw ? parent->bucket : Bucket::Bookkeeping);
+    }
     work = currentWork;
     category = phase != Phase::Inherit ? phase : parent != nullptr && parent->work == work ? parent->category : work != nullptr ? work->phase : Phase::Prepare;
     generation = Recorder::generation.load(std::memory_order_relaxed);
@@ -155,13 +208,28 @@ void Recorder::Scope::Mark(const char* stage, Clock::time_point now) {
     const auto inclusive = now - previous;
     elapsed += inclusive;
     const auto exclusive = inclusive - children;
+    const auto held = draw != nullptr ? heldTime(now) : Clock::duration{};
+    const auto inclusiveHeld = held - heldBefore;
+    const auto exclusiveHeld = std::clamp(inclusiveHeld - heldChildren, Clock::duration{}, std::max(Clock::duration{}, exclusive));
     if (generation == Recorder::generation.load(std::memory_order_relaxed)) {
         Recorder::phase(name, stage, exclusive);
+        if (draw != nullptr && draw == currentDraw && draw->generation == generation) {
+            const auto index = static_cast<std::size_t>(bucketOf(name, stage != nullptr ? stage : "", bucket));
+            draw->elapsed[0][index] += exclusive - exclusiveHeld;
+            draw->elapsed[1][index] += exclusiveHeld;
+            if (std::string_view(name).starts_with("Vulkan.")) draw->emission[index] += exclusive;
+            if (repeated) draw->redundantEmission[index] += exclusive;
+        }
         if (work != nullptr && work->generation == generation) work->elapsed[static_cast<std::size_t>(category)] += exclusive;
     }
-    if (parent != nullptr) parent->children += inclusive;
+    if (parent != nullptr) {
+        parent->children += inclusive;
+        parent->heldChildren += inclusiveHeld;
+    }
     previous = now;
     children = {};
+    heldBefore = held;
+    heldChildren = {};
 }
 
 void Recorder::Scope::End(Clock::time_point now) {
@@ -175,11 +243,80 @@ void Recorder::Scope::End(Clock::time_point now) {
 Recorder::Work::Work(Key key, Phase phase, bool call)
     : previous(currentWork), key(key), phase(phase), call(call), generation(Recorder::generation.load(std::memory_order_relaxed)) {
     currentWork = this;
+    if (key.kind == Kind::Dispatch && local != nullptr) local->previousCommands = 0;
 }
 
 Recorder::Work::~Work() {
     if (Enabled() && generation == Recorder::generation.load(std::memory_order_relaxed)) AddShader(key, call ? 1 : 0, elapsed);
     currentWork = previous;
+}
+
+Recorder::Draw::Draw(DrawOutcome outcome, bool call) : outcome(outcome) {
+    static const bool requested = [] { const auto* value = std::getenv("APS5_ARCHB_HIT_CENSUS"); return value != nullptr && std::string_view(value) == "1"; }();
+    if (!requested || !Enabled()) return;
+    active = true;
+    previous = currentDraw;
+    currentDraw = this;
+    generation = Generation();
+    Count(call ? Metric::Calls : Metric::Continuations);
+    auto& t = thread();
+    if (t.previousHit && generation == t.previousGeneration) {
+        priorStates = &t.previousStates;
+        priorCommands = t.previousCommands;
+        priorBatch = t.previousBatch;
+    }
+}
+
+Recorder::Draw::~Draw() {
+    if (!active) return;
+    currentDraw = previous;
+    if (!Enabled() || generation != Generation()) return;
+    const auto start = Clock::now();
+    auto& t = thread();
+    auto& row = t.census[static_cast<std::size_t>(outcome)];
+    const auto& pipelines = states[static_cast<std::size_t>(State::Pipeline)];
+    for (std::size_t i = 0; i < pipelines.size; ++i) {
+        if (std::find(pipelines.words.begin(), pipelines.words.begin() + i, pipelines.words[i]) == pipelines.words.begin() + i) Count(Metric::DistinctPipelines);
+    }
+    for (std::size_t lock = 0; lock < elapsed.size(); ++lock) {
+        for (std::size_t i = 0; i < elapsed[lock].size(); ++i) row.elapsed[lock][i].Add(milliseconds(elapsed[lock][i]));
+    }
+    for (std::size_t i = 0; i < counters.size(); ++i) row.counters[i].Add(static_cast<double>(counters[i]));
+    for (std::size_t i = 0; i < emission.size(); ++i) {
+        row.emission[i].Add(milliseconds(emission[i]));
+        row.redundantEmission[i].Add(milliseconds(redundantEmission[i]));
+    }
+    const bool pair = outcome == DrawOutcome::Hit && t.previousHit && generation == t.previousGeneration;
+    if (pair) row.pairs.Add(1);
+    constexpr Bucket stateBuckets[] = {Bucket::Pipeline, Bucket::Descriptors, Bucket::Targets, Bucket::Dynamic, Bucket::Push};
+    for (std::size_t i = 0; i < states.size(); ++i) {
+        if (states[i].overflow) row.unknown[i].Add(1);
+        if (pair && states[i].Same(t.previousStates[i])) {
+            row.same[i].Add(1);
+            const auto b = static_cast<std::size_t>(stateBuckets[i]);
+            row.sameMs[i].Add(milliseconds(elapsed[0][b] + elapsed[1][b]));
+            row.sameEmissionMs[i].Add(milliseconds(emission[b]));
+            if (!multipleCommands && commands != 0 && commands == t.previousCommands && batch == t.previousBatch) row.sameCommands[i].Add(1);
+        }
+        t.previousStates[i].size = states[i].size;
+        t.previousStates[i].overflow = states[i].overflow;
+        std::copy_n(states[i].words.begin(), states[i].size, t.previousStates[i].words.begin());
+    }
+    t.previousHit = outcome == DrawOutcome::Hit;
+    t.previousGeneration = generation;
+    t.previousCommands = multipleCommands ? 0 : commands;
+    t.previousBatch = batch;
+    t.censusPublishMs.Add(milliseconds(Clock::now() - start));
+}
+
+Recorder::Clock::duration Recorder::heldTime(Clock::time_point now) {
+    return gpuElapsed + (gpuHeld ? now - gpuSince : Clock::duration{});
+}
+
+void Recorder::GpuLock(bool held, Clock::time_point now) {
+    gpuElapsed = heldTime(now);
+    gpuSince = now;
+    gpuHeld = held;
 }
 
 void Recorder::phase(const char* name, const char* stage, Clock::duration elapsed) {
@@ -291,6 +428,33 @@ Recorder::Snapshot Recorder::Collect(Clock::time_point now) {
                 result.threadCounters[t.name][name] += value;
             }
             result.counters["recorder_counter_overflow"] += t.counterOverflow.Take();
+            for (std::size_t outcome = 0; outcome < t.census.size(); ++outcome) {
+                auto& row = t.census[outcome];
+                if (row.counters[0].local == 0 && row.counters[1].local == 0) continue;
+                const auto prefix = std::string("H1.") + outcomeNames[outcome] + ".";
+                const auto counter = [&](const std::string& name, Value& value) {
+                    const auto delta = value.Take();
+                    result.counters[prefix + name] += delta;
+                    result.threadCounters[t.name][prefix + name] += delta;
+                };
+                for (std::size_t lock = 0; lock < row.elapsed.size(); ++lock) {
+                    for (std::size_t i = 0; i < row.elapsed[lock].size(); ++i) result.phases[t.name][prefix + (lock ? "Locked." : "Outside.") + bucketNames[i]] += row.elapsed[lock][i].Take();
+                }
+                for (std::size_t i = 0; i < row.counters.size(); ++i) counter(metricNames[i], row.counters[i]);
+                counter("consecutive_hits", row.pairs);
+                for (std::size_t i = 0; i < row.emission.size(); ++i) {
+                    counter(std::string("emission_") + bucketNames[i] + "_ms", row.emission[i]);
+                    counter(std::string("redundant_emission_") + bucketNames[i] + "_ms", row.redundantEmission[i]);
+                }
+                for (std::size_t i = 0; i < row.same.size(); ++i) {
+                    counter(std::string("same_") + stateNames[i], row.same[i]);
+                    counter(std::string("same_commands_") + stateNames[i], row.sameCommands[i]);
+                    counter(std::string("unknown_") + stateNames[i], row.unknown[i]);
+                    counter(std::string("same_") + stateNames[i] + "_bucket_ms", row.sameMs[i]);
+                    counter(std::string("same_") + stateNames[i] + "_emission_ms", row.sameEmissionMs[i]);
+                }
+            }
+            if (t.censusPublishMs.local != 0) result.threadCounters[t.name]["h1_publish_ms"] += t.censusPublishMs.Take();
             const auto take = [](auto& row) {
                 Shader value;
                 value.key = row.key;
@@ -399,4 +563,32 @@ extern "C" void AgcDriverRecorderScopeMark_nid_no_patch(AgcDriver::ArchB::Record
 
 extern "C" void AgcDriverRecorderScopeEnd_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, std::int64_t now) {
     scope->End(AgcDriver::ArchB::Recorder::Clock::time_point(AgcDriver::ArchB::Recorder::Clock::duration(now)));
+}
+
+extern "C" AgcDriver::ArchB::Recorder::Draw* AgcDriverRecorderDraw_nid_no_patch() {
+    return AgcDriver::ArchB::Recorder::CurrentDraw();
+}
+
+extern "C" void AgcDriverRecorderVulkanBegin_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* name) {
+    using Recorder = AgcDriver::ArchB::Recorder;
+    auto* draw = Recorder::CurrentDraw();
+    if (draw == nullptr) return;
+    using M = Recorder::Metric;
+    const std::string_view operation(name);
+    draw->Count(M::VulkanCalls);
+    const char* phase = "Vulkan.Other";
+    if (operation.starts_with("vkCmd")) draw->Count(M::VkcmdCalls);
+    if (operation.starts_with("vkCmdDraw")) {
+        draw->Count(M::DrawCalls);
+        phase = "Vulkan.Draw";
+    } else if (operation.starts_with("vkCmdPipelineBarrier")) phase = "Vulkan.Barriers";
+    else if (operation == "vkCmdBindPipeline") { draw->Count(M::PipelineBinds); phase = "Vulkan.Pipeline"; }
+    else if (operation == "vkCmdBindDescriptorSets") { draw->Count(M::DescriptorBinds); phase = "Vulkan.Descriptors"; }
+    else if (operation == "vkUpdateDescriptorSets" || operation == "vkAllocateDescriptorSets") phase = "Vulkan.Descriptors";
+    else if (operation.starts_with("vkCmdSet") || operation == "vkCmdPushConstants") {
+        draw->Count(operation == "vkCmdPushConstants" ? M::PushCalls : M::DynamicCalls);
+        phase = operation == "vkCmdPushConstants" ? "Vulkan.Push" : "Vulkan.Dynamic";
+    } else if (operation.starts_with("vkCmdBeginRender")) { draw->Count(M::PassBegins); phase = "Vulkan.Pass"; }
+    else if (operation.starts_with("vkCmdEndRender")) { draw->Count(M::PassEnds); phase = "Vulkan.Pass"; }
+    scope->Begin(phase, Recorder::Clock::now(), Recorder::Phase::Record);
 }

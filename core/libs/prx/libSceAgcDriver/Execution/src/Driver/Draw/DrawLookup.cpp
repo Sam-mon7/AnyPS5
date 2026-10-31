@@ -197,6 +197,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         anyLayout = true;
                         if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
                         if (result == EntryOutcome::EqualData) {
+                            ArchB::Recorder::Timer patchTiming("Draw.UserPatch");
                             auto& hit = stageData[i];
                             hit.words = variant->words;
                             for (const auto& [position, value] : liveData) hit.words[position] = value;
