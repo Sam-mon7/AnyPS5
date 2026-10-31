@@ -164,6 +164,7 @@ bool Driver::pipelineDispatch() {
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    const bool computeSync = ArchB::Switches::Enabled(ArchB::Feature::FixComputeSyncUnlocked) && submission.queue != 0;
     const bool feedbackMask = ArchB::Switches::Enabled(ArchB::Feature::FixTsharpFeedbackMask);
     ArchB::Recorder::Work recorderWork({ArchB::Recorder::Kind::Dispatch, 0});
     PerformanceTimer timing("Driver.Dispatch");
@@ -617,7 +618,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion] {
+        DrawPipeline::Queue0().Enqueue([this, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion, computeSync] {
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             PerformanceTimer recorderTiming("Driver.DispatchCommit");
             DrawPipeline::FollowEpoch(epoch);
@@ -641,6 +642,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     ArchB::OwnershipCensus::PhaseScope ownershipPhase(ArchB::OwnershipCensus::Phase::Labels);
                     ArchB::Recorder::MutexTimer mutexTiming("M2.DispatchCommit.Held");
+                    Graphics::Recorder::ComputeSyncScope computeSyncScope(computeSync);
                     recordLabelsForPacket(localDevice.get(), queueId);
                     mutexTiming.Mark("labels");
                     ownershipPhase.Mark(ArchB::OwnershipCensus::Phase::Writers);
@@ -753,6 +755,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         ArchB::OwnershipCensus::PhaseScope ownershipPhase(ArchB::OwnershipCensus::Phase::Labels);
         phaseTiming.Phase(PhaseLockWait);
         ArchB::Recorder::MutexTimer mutexTiming("M2.Dispatch.Held");
+        Graphics::Recorder::ComputeSyncScope computeSyncScope(computeSync);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(PhaseLabels);

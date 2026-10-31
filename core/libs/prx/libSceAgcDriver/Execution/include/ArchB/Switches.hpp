@@ -24,6 +24,7 @@ enum class Feature : std::uint8_t {
     FixTsharpFeedbackMask,
     FixPipelineStateReuse,
     FixBufferBaseRefresh,
+    FixComputeSyncUnlocked,
     Count
 };
 
