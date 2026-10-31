@@ -81,7 +81,9 @@ void toggleCase(const std::string& name) {
     setEnvironment("APS5_ARCHB_CONTROL_FILE", name == "NoFileNoCost" ? nullptr : path.string().c_str());
     const bool imageTable = name == "ImageTableSnapshot";
     const bool bitScanKeys = name == "ImageTableBitScanKeys";
+    const bool bookkeeping = name == "WriteTrackingBookkeeping";
     if (name == "VqMemo" || imageTable || bitScanKeys) setEnvironment(bitScanKeys ? "APS5_ARCHB_FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "APS5_ARCHB_FIX_VQ_MEMO", nullptr);
+    if (bookkeeping) setEnvironment("APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING", nullptr);
     if (name == "AllocChurn") setEnvironment("APS5_ARCHB_FIX_ALLOC_CHURN", nullptr);
     Switches::Initialize();
     const auto write = [&](const std::string& line, bool poll = true) {
@@ -91,12 +93,16 @@ void toggleCase(const std::string& name) {
             Switches::PollControl();
         }
     };
-    if (name == "VqMemo" || imageTable || bitScanKeys) {
-        const auto feature = bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
-        const std::string token = bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
+    if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping) {
+        const auto feature = bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
+        const std::string token = bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
+        bool listed = false;
         for (const auto& entry : Switches::Table()) {
-            if (entry.feature == feature) check(!entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "runtime fix switch contract");
+            if (entry.feature != feature) continue;
+            listed = true;
+            check(token == entry.name && !entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "runtime fix switch contract");
         }
+        check(listed, "runtime fix switch is listed");
         check(!Switches::Enabled(feature), "runtime fix must default off");
         write("1 " + token + "=1");
         const auto selected = Switches::Enabled(feature);

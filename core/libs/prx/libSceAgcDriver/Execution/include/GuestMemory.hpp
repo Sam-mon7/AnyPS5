@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <source_location>
 #include <span>
 #include <utility>
 #include <vector>
@@ -72,7 +73,7 @@ using FreshCollectHook = bool (*)(std::uintptr_t address, std::size_t bytes, voi
 void SetFreshCollectHook(FreshCollectHook hook);
 #endif
 bool Watched(std::uint64_t address, std::size_t bytes);
-std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, bool memoVirtualQuery = false);
+std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, bool memoVirtualQuery = false, std::source_location site = std::source_location::current());
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // UnchangedSince for several ranges under one tracker lock: true only when every one holds.
 struct UnchangedQuery {
@@ -82,18 +83,18 @@ struct UnchangedQuery {
 };
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
-bool UnchangedSinceClean(std::span<const UnchangedQuery> queries);
-std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
+bool UnchangedSinceClean(std::span<const UnchangedQuery> queries, std::source_location site = std::source_location::current());
+std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::source_location site = std::source_location::current());
 // CollectCommittedWrites that fills `ranges` in place (keeping its capacity, for a reused scratch)
 // instead of replacing it with a fresh vector; the same ranges and generation, empty on 0.
-std::uint64_t CollectCommittedWritesInPlace(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
+std::uint64_t CollectCommittedWritesInPlace(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::source_location site = std::source_location::current());
 std::uint64_t WriteGeneration();
-std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written);
+std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::source_location site = std::source_location::current());
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):
 // UnchangedSince(range, it) holds until the next store over the range.
-std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes);
-std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes);
+std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes, std::source_location site = std::source_location::current());
+std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes, std::source_location site = std::source_location::current());
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source);
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
@@ -124,19 +125,24 @@ std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();
-std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
+std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes, std::source_location site = std::source_location::current());
+// Write-tracking census (APS5_ARCHB_WRITE_TRACKING_CENSUS=1): per queue thread and calling site, the
+// collections, their walks (repeats within one collect epoch), OS write-watch calls, pages and time.
+// The frame replay prints it per pass ([wt-census] lines) and resets it at the start of each pass.
+void ReportWriteCensus(std::uint64_t pass, std::uint64_t frames);
+void ResetWriteCensus();
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
-std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
+std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes, std::source_location site = std::source_location::current());
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
 // range's pages first (a game store not collected yet becomes a block stamp), then the compare over
 // the stamps collects make (dirty pages), not the MarkWritten stamps of the driver's own GPU label
 // records, which share the title's label blocks. False when the arena is not write-watched.
-bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site = std::source_location::current());
 // Per 64 KiB tracker block of [address, address + bytes) (block 0 holds `address`): `changed[k]`
 // receives whether the block was stamped after generations[k] (UnchangedSince over that block
 // alone), `cpu[k]`, when given, whether a collect stamped it after (a CPU store, as

@@ -59,6 +59,66 @@ void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("AGC driver: ") + reason);
 }
 
+// APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING: cheaper bookkeeping around the write tracker with the same
+// answers: a per-thread exact-range table in front of the collect memo, page-state runs compared a
+// word (eight pages) at a time inside each chunk, and the host-region overlap test by binary search.
+// APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING=1 also takes the original path every time, counts every
+// disagreement (fix_wt_bookkeeping_mismatches) and uses the original answer. The path counters are
+// added in batches of 256 per thread, so the recorder never sees a hit cost more than a few loads.
+namespace bookkeeping {
+
+enum Counter : std::uint8_t { Hits, Runs, Regions, Verified, CounterCount };
+constexpr const char* CounterNames[CounterCount] = {"fix_wt_bookkeeping_hits", "fix_wt_bookkeeping_runs", "fix_wt_bookkeeping_regions", "fix_wt_bookkeeping_verified"};
+constexpr std::uint32_t CountBatch = 256;
+
+struct Pending {
+    std::array<std::uint32_t, CounterCount> counts{};
+};
+struct PendingSlot {};
+
+bool active() {
+    return ArchB::Switches::Enabled(ArchB::Feature::FixWriteTrackingBookkeeping);
+}
+
+bool verify() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+void count(Counter counter) {
+    auto* pending = HostThreadSlot<Pending*, PendingSlot>::Get();
+    if (pending == nullptr) {
+        ShaderRecompiler::ThreadOwned(pending);
+        HostThreadSlot<Pending*, PendingSlot>::Set(pending);
+    }
+    if (++pending->counts[counter] < CountBatch) return;
+    pending->counts[counter] = 0;
+    ArchB::Recorder::Count(CounterNames[counter], CountBatch);
+}
+
+void mismatch(const char* what) {
+    ArchB::Recorder::Count("fix_wt_bookkeeping_mismatches");
+    ArchB::Recorder::Count(what);
+}
+
+#ifdef _WIN32
+bool hostRegionOverlaps(std::uintptr_t address, std::size_t bytes) {
+    if (!active()) return GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes);
+    const bool sorted = GuestArena::GuestArenaHostRegionOverlapsSorted_nid_no_patch(address, bytes);
+    count(Regions);
+    if (!verify()) return sorted;
+    const bool scanned = GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes);
+    count(Verified);
+    if (sorted != scanned) mismatch("fix_wt_bookkeeping_region_mismatches");
+    return scanned;
+}
+#endif
+
+}
+
 // A code address relative to its module, for symbolizing debug traces with nm.
 unsigned long long ModuleOffset(const void* address) {
 #ifdef _WIN32
@@ -443,6 +503,65 @@ struct PageSpan {
 
     // End of the run of pages equal to `value` that starts at `address`, at most `limit`.
     std::uintptr_t runEnd(std::uintptr_t address, std::uint8_t value, std::uintptr_t limit) const {
+        if (!bookkeeping::active()) return runEndScan(address, value, limit);
+        const auto wide = runEndWide(address, value, limit);
+        bookkeeping::count(bookkeeping::Runs);
+        if (!bookkeeping::verify()) return wide;
+        const auto scanned = runEndScan(address, value, limit);
+        bookkeeping::count(bookkeeping::Verified);
+        if (wide != scanned) bookkeeping::mismatch("fix_wt_bookkeeping_run_mismatches");
+        return scanned;
+    }
+
+    // runEnd with the chunk looked up once per chunk and eight pages compared per load once aligned
+    // (four loads per step), the first differing page found from the differing bytes.
+    std::uintptr_t runEndWide(std::uintptr_t address, std::uint8_t value, std::uintptr_t limit) const {
+        auto index = (address - base) / PageBytes;
+        const auto stop = std::min<std::uintptr_t>((std::min(limit, base + size) - base + PageBytes - 1) / PageBytes, size / PageBytes);
+        const std::uint64_t wide = 0x0101010101010101ull * value;
+        const auto finish = [&](std::size_t at) { return std::min(limit, base + at * PageBytes); };
+        while (index < stop) {
+            std::uint8_t* data = pages;
+            std::size_t first = 0;
+            std::size_t chunkEnd = stop;
+            if (chunks != nullptr) {
+                const auto chunk = index / ChunkEntries;
+                first = chunk * ChunkEntries;
+                chunkEnd = std::min<std::size_t>(stop, first + ChunkEntries);
+                data = chunkData(chunk, false);
+                if (data == nullptr) {
+                    if (value != 0) break;
+                    index = chunkEnd;
+                    continue;
+                }
+            }
+            // Entries of this chunk by page index (`first` is the chunk's first page).
+            const auto byteAt = [&](std::size_t at) { return std::atomic_ref<std::uint8_t>(data[at - first]).load(std::memory_order_relaxed); };
+            const auto wordAt = [&](std::size_t at) { return std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(data + (at - first))).load(std::memory_order_relaxed); };
+            for (; index < chunkEnd && index % 8 != 0; ++index) {
+                if (byteAt(index) != value) return finish(index);
+            }
+            for (; index + 32 <= chunkEnd; index += 32) {
+                const auto a = wordAt(index) ^ wide;
+                const auto b = wordAt(index + 8) ^ wide;
+                const auto c = wordAt(index + 16) ^ wide;
+                const auto d = wordAt(index + 24) ^ wide;
+                if ((a | b | c | d) == 0) continue;
+                const auto differing = a != 0 ? a : b != 0 ? b : c != 0 ? c : d;
+                const std::size_t word = a != 0 ? 0 : b != 0 ? 8 : c != 0 ? 16 : 24;
+                return finish(index + word + static_cast<std::size_t>(std::countr_zero(differing)) / 8);
+            }
+            for (; index + 8 <= chunkEnd; index += 8) {
+                if (const auto differing = wordAt(index) ^ wide; differing != 0) return finish(index + static_cast<std::size_t>(std::countr_zero(differing)) / 8);
+            }
+            for (; index < chunkEnd; ++index) {
+                if (byteAt(index) != value) return finish(index);
+            }
+        }
+        return finish(index);
+    }
+
+    std::uintptr_t runEndScan(std::uintptr_t address, std::uint8_t value, std::uintptr_t limit) const {
         auto index = (address - base) / PageBytes;
         const auto stop = std::min<std::uintptr_t>((std::min(limit, base + size) - base + PageBytes - 1) / PageBytes, size / PageBytes);
         const std::uint64_t wide = 0x0101010101010101ull * value;
@@ -971,7 +1090,7 @@ struct WriteTracker {
 
     bool covers(std::uint64_t address, std::size_t bytes) const {
 #ifdef _WIN32
-        return coverage.Covers(address, bytes) && !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+        return coverage.Covers(address, bytes) && !bookkeeping::hostRegionOverlaps(static_cast<std::uintptr_t>(address), bytes);
 #else
         return address + bytes <= LeafCount * LeafBlocks * WriteBlockBytes && GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
 #endif
@@ -1012,7 +1131,7 @@ struct WriteTracker {
         for (auto block = blockOf(first); block <= blockOf(stop - 1); ++block) {
             if (hintOf(block) == 0 || coverage.Covers(blockBegin(block), static_cast<std::size_t>(std::min<std::uint64_t>(WriteBlockBytes, base + size - blockBegin(block))))) return false;
         }
-        return !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
+        return !bookkeeping::hostRegionOverlaps(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
     }
 
     std::uint32_t newestHint(std::uint64_t first, std::uint64_t stop) const {
@@ -1294,11 +1413,20 @@ WriteTracker& Tracker() {
 
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
+namespace census {
+bool enabled();
+bool timeLock(AgcDriver::Mutex& mutex);
+}
+
 class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         if (!profile) {
+            if (census::enabled() && census::timeLock(tracker.mutex)) {
+                lock = std::unique_lock<AgcDriver::Mutex>(tracker.mutex, std::adopt_lock);
+                return;
+            }
             lock.lock();
             return;
         }
@@ -1436,6 +1564,260 @@ bool sharedCollectMemo() {
     return shared;
 }
 
+// Write-tracking census (APS5_ARCHB_WRITE_TRACKING_CENSUS=1, see ReportWriteCensus): the outermost
+// tracking entry on a thread opens a scope keyed by queue tag, entry and calling site; the libc
+// write-watch work done inside it (GuestArenaWriteWatchCensus deltas) and each walk's overlap with
+// the walks of the same collect epoch on that thread are added to it.
+namespace census {
+
+bool enabled() {
+    static const bool on = [] {
+        const auto* value = std::getenv("APS5_ARCHB_WRITE_TRACKING_CENSUS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return on;
+}
+
+struct Row {
+    std::uint64_t calls = 0;
+    std::uint64_t walks = 0;
+    std::uint64_t exact = 0;
+    std::uint64_t covered = 0;
+    std::uint64_t partial = 0;
+    std::uint64_t walkPages = 0;
+    std::uint64_t repeatPages = 0;
+    std::uint64_t unbumped = 0;
+    std::uint64_t collects = 0;
+    std::uint64_t queries = 0;
+    std::uint64_t resets = 0;
+    std::uint64_t osPages = 0;
+    std::uint64_t dirty = 0;
+    std::uint64_t osNs = 0;
+    std::uint64_t ns = 0;
+    std::uint64_t widenCovered = 0;
+    std::uint64_t widenCalls = 0;
+    std::uint64_t widenPages = 0;
+    std::uint64_t lockWaits = 0;
+    std::uint64_t lockNs = 0;
+
+    void add(const Row& other) {
+        lockWaits += other.lockWaits;
+        lockNs += other.lockNs;
+        widenCovered += other.widenCovered;
+        widenCalls += other.widenCalls;
+        widenPages += other.widenPages;
+        calls += other.calls;
+        walks += other.walks;
+        exact += other.exact;
+        covered += other.covered;
+        partial += other.partial;
+        walkPages += other.walkPages;
+        repeatPages += other.repeatPages;
+        unbumped += other.unbumped;
+        collects += other.collects;
+        queries += other.queries;
+        resets += other.resets;
+        osPages += other.osPages;
+        dirty += other.dirty;
+        osNs += other.osNs;
+        ns += other.ns;
+    }
+};
+
+struct Key {
+    std::uint32_t tag;
+    const char* entry;
+    const char* file;
+    std::uint32_t line;
+    const char* function;
+    bool operator<(const Key& other) const {
+        return std::tie(tag, entry, file, line) < std::tie(other.tag, other.entry, other.file, other.line);
+    }
+};
+
+std::mutex& tableMutex() {
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+
+std::map<Key, Row>& table() {
+    static auto* rows = new std::map<Key, Row>;
+    return *rows;
+}
+
+struct EpochWalks {
+    std::uint64_t epoch = 0;
+    std::map<std::uint64_t, std::uint64_t> pages;
+    std::map<std::uint64_t, std::uint64_t> widened;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> exact;
+};
+
+std::uint64_t overlapPages(const std::map<std::uint64_t, std::uint64_t>& ranges, std::uint64_t first, std::uint64_t stop) {
+    std::uint64_t seen = 0;
+    auto it = ranges.upper_bound(first);
+    if (it != ranges.begin()) --it;
+    for (; it != ranges.end() && it->first < stop; ++it) {
+        const auto from = std::max(first, it->first);
+        const auto to = std::min(stop, it->second);
+        if (from < to) seen += (to - from) / WritePageBytes;
+    }
+    return seen;
+}
+
+void insertRange(std::map<std::uint64_t, std::uint64_t>& ranges, std::uint64_t begin, std::uint64_t end) {
+    auto merge = ranges.lower_bound(begin);
+    if (merge != ranges.begin() && std::prev(merge)->second >= begin) --merge;
+    while (merge != ranges.end() && merge->first <= end) {
+        begin = std::min(begin, merge->first);
+        end = std::max(end, merge->second);
+        merge = ranges.erase(merge);
+    }
+    ranges.emplace(begin, end);
+}
+
+class Scope;
+thread_local Scope* active = nullptr;
+
+class Scope {
+public:
+    Scope(const char* entry, const std::source_location* site = nullptr) {
+        if (!enabled() || active != nullptr) return;
+        on = true;
+        active = this;
+        key = {GpuLockThreadTag(), entry, site != nullptr ? site->file_name() : "", site != nullptr ? site->line() : 0u, site != nullptr ? site->function_name() : ""};
+#ifdef _WIN32
+        before = GuestArena::GuestArenaWriteWatchCensus_nid_no_patch();
+#endif
+        start = std::chrono::steady_clock::now();
+    }
+    ~Scope() {
+        if (!on) return;
+        active = nullptr;
+        row.calls = 1;
+        row.ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+#ifdef _WIN32
+        const auto after = GuestArena::GuestArenaWriteWatchCensus_nid_no_patch();
+        row.collects = after.collects - before.collects;
+        row.queries = after.queries - before.queries;
+        row.resets = after.resets - before.resets;
+        row.osPages = after.pages - before.pages;
+        row.dirty = after.dirty - before.dirty;
+        row.osNs = after.ns - before.ns;
+#endif
+        std::lock_guard lock(tableMutex());
+        table()[key].add(row);
+    }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+    Row row;
+
+private:
+    bool on = false;
+    Key key{};
+#ifdef _WIN32
+    GuestArena::WriteWatchCensus before{};
+#endif
+    std::chrono::steady_clock::time_point start{};
+};
+
+std::uint64_t threadEpoch() {
+    return HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
+}
+
+thread_local EpochWalks epochWalks;
+
+EpochWalks* currentWalks() {
+    const auto epoch = threadEpoch();
+    if (epoch == 0) return nullptr;
+    auto& walks = epochWalks;
+    if (walks.epoch != epoch) {
+        walks.epoch = epoch;
+        walks.pages.clear();
+        walks.widened.clear();
+        walks.exact.clear();
+    }
+    return &walks;
+}
+
+// A walk of [first, stop) (4 KiB aligned): repeats are measured against this thread's completed
+// clearing walks of the same collect epoch (exact range, fully covered by their union, or
+// overlapping it), the evidence a collect memo of the epoch could reuse.
+void noteWalk(std::uint64_t first, std::uint64_t stop) {
+    if (active == nullptr || stop <= first) return;
+    auto& row = active->row;
+    ++row.walks;
+    const auto pages = (stop - first) / WritePageBytes;
+    row.walkPages += pages;
+    auto* current = currentWalks();
+    if (current == nullptr) {
+        ++row.unbumped;
+        return;
+    }
+    auto& walks = *current;
+    if (std::find(walks.exact.begin(), walks.exact.end(), std::pair{first, stop}) != walks.exact.end()) ++row.exact;
+    std::uint64_t seen = 0;
+    auto it = walks.pages.upper_bound(first);
+    if (it != walks.pages.begin()) --it;
+    for (; it != walks.pages.end() && it->first < stop; ++it) {
+        const auto from = std::max(first, it->first);
+        const auto to = std::min(stop, it->second);
+        if (from < to) seen += (to - from) / WritePageBytes;
+    }
+    row.repeatPages += seen;
+    if (seen == pages) ++row.covered;
+    else if (seen != 0) ++row.partial;
+    if (seen != pages && overlapPages(walks.widened, first, stop) == pages) ++row.widenCovered;
+}
+
+// A completed clearing walk (all pages, stamped as CPU or driver stores).
+void noteWalked(std::uint64_t first, std::uint64_t stop) {
+    if (active == nullptr || stop <= first) return;
+    auto* current = currentWalks();
+    if (current == nullptr) return;
+    auto& walks = *current;
+    if (walks.exact.size() < 4096) walks.exact.emplace_back(first, stop);
+    // What widening a small walk to its 64 KiB blocks would have covered (the extra pages it queries).
+    if (stop - first <= WriteBlockBytes) {
+        const auto wideFirst = first & ~std::uint64_t{WriteBlockBytes - 1};
+        const auto wideStop = (stop + WriteBlockBytes - 1) & ~std::uint64_t{WriteBlockBytes - 1};
+        ++active->row.widenCalls;
+        active->row.widenPages += (wideStop - wideFirst - (stop - first)) / WritePageBytes;
+        insertRange(walks.widened, wideFirst, wideStop);
+    } else insertRange(walks.widened, first, stop);
+    auto begin = first;
+    auto end = stop;
+    auto merge = walks.pages.lower_bound(begin);
+    if (merge != walks.pages.begin() && std::prev(merge)->second >= begin) --merge;
+    while (merge != walks.pages.end() && merge->first <= end) {
+        begin = std::min(begin, merge->first);
+        end = std::max(end, merge->second);
+        merge = walks.pages.erase(merge);
+    }
+    walks.pages.emplace(begin, end);
+}
+
+// A contended tracker lock acquisition inside a census scope: the time spent waiting.
+bool timeLock(AgcDriver::Mutex& mutex) {
+    if (active == nullptr) return false;
+    if (mutex.try_lock()) return true;
+    const auto start = std::chrono::steady_clock::now();
+    mutex.lock();
+    ++active->row.lockWaits;
+    active->row.lockNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    return true;
+}
+
+void noteBump() {
+    if (!enabled()) return;
+    Row row;
+    row.calls = 1;
+    std::lock_guard lock(tableMutex());
+    table()[Key{GpuLockThreadTag(), "epoch_bump", "", 0, ""}].add(row);
+}
+
+}
+
 struct StampRuns {
     WriteTracker& tracker;
     StampKind kind;
@@ -1465,7 +1847,16 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 #ifdef _WIN32
 std::atomic<FreshCollectHook> freshCollectHook{nullptr};
 
+bool collectWindowsWritesWalk(StampRuns& runs, std::uint64_t first, std::uint64_t stop, bool armedOnly, bool memoVirtualQuery);
+
 bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t stop, bool armedOnly, bool memoVirtualQuery = false) {
+    census::noteWalk(first, stop);
+    const bool collected = collectWindowsWritesWalk(runs, first, stop, armedOnly, memoVirtualQuery);
+    if (collected && !armedOnly && (runs.kind == StampKind::Cpu || runs.kind == StampKind::Driver)) census::noteWalked(first, stop);
+    return collected;
+}
+
+bool collectWindowsWritesWalk(StampRuns& runs, std::uint64_t first, std::uint64_t stop, bool armedOnly, bool memoVirtualQuery) {
     auto& tracker = runs.tracker;
     const bool fresh = runs.kind == StampKind::Fresh;
     if (fresh) {
@@ -1535,7 +1926,41 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
-std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery = false) {
+// APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING: the ranges this thread collected in its current epoch, by
+// exact page-rounded range, in a direct-mapped table reached through a TEB slot. An entry is made
+// only where the original memo answers for that range (a completed walk of it, or a hit in the epoch
+// maps or the ring), with the epoch and the unwatch and mapping serials that answer was given for,
+// so a repeat that matches all of them is the memo hit the maps would find, without their lookups
+// (the epoch map's thread-local and probe, the ring's 64 compares). An epoch boundary (a submission,
+// a CPU-satisfiable wait, a drain or a reap) gives the thread a new epoch, so no entry made before
+// it ever matches again: the next collect walks and takes fresh evidence.
+struct CollectHitCache {
+    static constexpr std::size_t Entries = 512;
+    std::array<WriteTracker::Memo, Entries> entries{};
+
+    static std::size_t index(std::uint64_t first, std::uint64_t stop) {
+        auto key = (first >> 12) * 0x9e3779b97f4a7c15ull ^ (stop >> 12) * 0xc2b2ae3d27d4eb4full;
+        key ^= key >> 29;
+        return static_cast<std::size_t>(key % Entries);
+    }
+
+    WriteTracker::Memo& at(std::uint64_t first, std::uint64_t stop) {
+        return entries[index(first, stop)];
+    }
+};
+
+CollectHitCache& collectHitCache() {
+    struct Slot {};
+    auto* cache = HostThreadSlot<CollectHitCache*, Slot>::Get();
+    if (cache == nullptr) {
+        ShaderRecompiler::ThreadOwned(cache);
+        HostThreadSlot<CollectHitCache*, Slot>::Set(cache);
+    }
+    return *cache;
+}
+
+std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery, const std::source_location& site) {
+    const census::Scope censusScope(memoized ? "collect" : "collect_uncached", &site);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -1548,14 +1973,33 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
+    // Only a thread that bumps its epoch reuses anything (an unbumped thread's epoch is fresh per call).
+    WriteTracker::Memo* cached = nullptr;
+    bool verifyHit = false;
+    if (useMemo && !sharedCollectMemo() && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bookkeeping::active()) {
+        cached = &collectHitCache().at(first, stop);
+        if (cached->begin == first && cached->end == stop && cached->epoch == epoch && cached->unwatched == unwatched && cached->mapping == mapping) {
+            if (!bookkeeping::verify()) {
+                bookkeeping::count(bookkeeping::Hits);
+                if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                return tracker.stable.load(std::memory_order_acquire);
+            }
+            verifyHit = true;
+        }
+    }
+    const auto memoHit = [&] {
+        if (cached != nullptr) *cached = {first, stop, epoch, unwatched, mapping};
+        if (verifyHit) bookkeeping::count(bookkeeping::Verified);
+        collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        return tracker.stable.load(std::memory_order_acquire);
+    };
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
             if (const auto* found = map.ranges.Find(first); found != nullptr && found->unwatched == unwatched && found->mapping == mapping && stop <= found->end) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                return tracker.stable.load(std::memory_order_acquire);
+                return memoHit();
             }
         }
         for (const auto& entry : threadCollectMemo().entries) {
@@ -1563,11 +2007,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                return tracker.stable.load(std::memory_order_acquire);
+                return memoHit();
             }
         }
     }
+    // A table entry the memo does not confirm (verification only): the original path continues.
+    if (verifyHit) bookkeeping::mismatch("fix_wt_bookkeeping_hit_mismatches");
     const bool memoFailures = useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && !sharedCollectMemo() && epochCollectMapEnabled() && failedCollectMemoEnabled();
     if (memoFailures) {
         const auto& failed = epochCollectMap(epoch).failedRanges;
@@ -1627,6 +2072,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 }
             }
             memo.entries[memo.next++ % memo.entries.size()] = merged;
+            if (cached != nullptr) *cached = {failedFirst, failedStop, epoch, serial, mapping};
             if (epochCollectMapEnabled()) {
                 EpochMemoMap<WriteTracker::Memo>::SlotState state;
                 auto& entry = epochCollectMap(epoch).ranges.Slot(first, state);
@@ -1642,19 +2088,20 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 
 }
 
-std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, bool memoVirtualQuery) {
-    return collectWrites(address, bytes, true, memoVirtualQuery);
+std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, bool memoVirtualQuery, std::source_location site) {
+    return collectWrites(address, bytes, true, memoVirtualQuery, site);
 }
 
-std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
-    return collectWrites(address, bytes, false);
+std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes, std::source_location site) {
+    return collectWrites(address, bytes, false, false, site);
 }
 
 std::uint64_t WriteGeneration() {
     return Tracker().generation.load(std::memory_order_acquire);
 }
 
-std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written) {
+std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::source_location site) {
+    const census::Scope censusScope("written_blocks", &site);
     written.clear();
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
@@ -1716,6 +2163,7 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
 }
 
 void BumpCollectEpoch() {
+    census::noteBump();
     const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
@@ -1738,6 +2186,42 @@ void AdoptLatestCollectEpoch() {
 
 std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
+}
+
+void ResetWriteCensus() {
+    if (!census::enabled()) return;
+    std::lock_guard lock(census::tableMutex());
+    census::table().clear();
+}
+
+void ReportWriteCensus(std::uint64_t pass, std::uint64_t frames) {
+    if (!census::enabled()) return;
+    std::map<census::Key, census::Row> rows;
+    {
+        std::lock_guard lock(census::tableMutex());
+        rows.swap(census::table());
+    }
+    const auto base = [](const char* path) {
+        const char* name = path;
+        for (const char* at = path; *at != 0; ++at) if (*at == '/' || *at == '\\') name = at + 1;
+        return name;
+    };
+    for (const auto& [key, row] : rows) {
+        std::fprintf(stderr, "[wt-census] pass=%llu frames=%llu tag=0x%x entry=%s site=%s:%u calls=%llu walks=%llu lock_waits=%llu lock_ns=%llu widen_covered=%llu widen_calls=%llu widen_pages=%llu exact=%llu covered=%llu partial=%llu walk_pages=%llu repeat_pages=%llu unbumped=%llu collects=%llu queries=%llu resets=%llu os_pages=%llu dirty=%llu os_ns=%llu ns=%llu fn=%s\n",
+            static_cast<unsigned long long>(pass), static_cast<unsigned long long>(frames), key.tag, key.entry, base(key.file), key.line,
+            static_cast<unsigned long long>(row.calls), static_cast<unsigned long long>(row.walks), static_cast<unsigned long long>(row.lockWaits), static_cast<unsigned long long>(row.lockNs), static_cast<unsigned long long>(row.widenCovered), static_cast<unsigned long long>(row.widenCalls), static_cast<unsigned long long>(row.widenPages), static_cast<unsigned long long>(row.exact), static_cast<unsigned long long>(row.covered),
+            static_cast<unsigned long long>(row.partial), static_cast<unsigned long long>(row.walkPages), static_cast<unsigned long long>(row.repeatPages), static_cast<unsigned long long>(row.unbumped),
+            static_cast<unsigned long long>(row.collects), static_cast<unsigned long long>(row.queries), static_cast<unsigned long long>(row.resets), static_cast<unsigned long long>(row.osPages),
+            static_cast<unsigned long long>(row.dirty), static_cast<unsigned long long>(row.osNs), static_cast<unsigned long long>(row.ns), key.function);
+    }
+#ifdef _WIN32
+    const auto sweep = GuestArena::GuestArenaWriteWatchSweep_nid_no_patch();
+    std::fprintf(stderr, "[wt-census-sweep] pass=%llu regions=%llu bytes=%llu dirty=%llu refused=%llu queries=%llu resident_runs=%llu resident_bytes=%llu walk_ns=%llu query_ns=%llu\n",
+        static_cast<unsigned long long>(pass), static_cast<unsigned long long>(sweep.regions), static_cast<unsigned long long>(sweep.bytes), static_cast<unsigned long long>(sweep.dirty),
+        static_cast<unsigned long long>(sweep.refused), static_cast<unsigned long long>(sweep.queries), static_cast<unsigned long long>(sweep.residentRuns), static_cast<unsigned long long>(sweep.residentBytes),
+        static_cast<unsigned long long>(sweep.walkNs), static_cast<unsigned long long>(sweep.queryNs));
+#endif
+    std::fflush(stderr);
 }
 
 namespace {
@@ -1830,6 +2314,7 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
 
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
 #ifdef _WIN32
+    const census::Scope censusScope("rewatch");
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -1857,6 +2342,7 @@ void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
 
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched, bool importMayWriteGuest) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return import();
+    const census::Scope censusScope("import_watched");
     if (!staysWatched) {
         constexpr std::uint64_t page = 4096;
         const auto first = address & ~(page - 1);
@@ -1975,8 +2461,9 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     return true;
 }
 
-bool UnchangedSinceClean(std::span<const UnchangedQuery> queries) {
+bool UnchangedSinceClean(std::span<const UnchangedQuery> queries, std::source_location site) {
 #ifdef _WIN32
+    const census::Scope censusScope("unchanged_clean", &site);
     if (queries.empty()) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
@@ -1993,11 +2480,13 @@ bool UnchangedSinceClean(std::span<const UnchangedQuery> queries) {
     return mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && committed == GuestArena::GuestArenaCommitGeneration_nid_postfix() && forgotten == ForgetSerial();
 #else
     static_cast<void>(queries);
+    static_cast<void>(site);
     return false;
 #endif
 }
 
-std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::source_location site) {
+    const census::Scope censusScope("committed", &site);
     ranges.clear();
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !WriteWatched()) return 0;
     auto committed = CommittedRanges(address, bytes);
@@ -2010,7 +2499,8 @@ std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, s
     return generation;
 }
 
-std::uint64_t CollectCommittedWritesInPlace(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+std::uint64_t CollectCommittedWritesInPlace(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::source_location site) {
+    const census::Scope censusScope("committed", &site);
     ranges.clear();
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !WriteWatched()) return 0;
     static_cast<void>(DescribeCommittedInto(address, bytes, false, ranges));
@@ -2038,6 +2528,7 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
+    const census::Scope censusScope("store_own");
     BreakProofs();
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
@@ -2122,11 +2613,13 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
     return tracker.generation;
 }
 
-std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes, std::source_location site) {
+    const census::Scope censusScope("mark_written", &site);
     return markWritten(address, bytes, true);
 }
 
-std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes) {
+std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes, std::source_location site) {
+    const census::Scope censusScope("mark_written", &site);
     return markWritten(address, bytes, false);
 }
 
@@ -2136,7 +2629,7 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return true;
 #ifdef _WIN32
-    if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return true;
+    if (bookkeeping::hostRegionOverlaps(address, bytes)) return true;
 #endif
     return tracker.storedOver(address, address + bytes, generation, false);
 }
@@ -2189,6 +2682,7 @@ namespace {
 thread_local ThreadCollectMemo threadHintMemo;
 
 bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
+    census::noteWalk(first, stop);
     auto cursor = first;
     bool marked = false;
     while (cursor < stop) {
@@ -2207,8 +2701,9 @@ bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
 }
 #endif
 
-std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
+std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes, std::source_location site) {
 #ifdef _WIN32
+    const census::Scope censusScope("untracked_hint", &site);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     constexpr std::uint64_t page = 4096;
     const auto first = address & ~(page - 1);
@@ -2234,11 +2729,13 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
+    static_cast<void>(site);
     return 0;
 #endif
 }
 
-bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
+    const census::Scope censusScope("unchanged_since_collected", &site);
     if (CollectWritesUncached(address, bytes) == 0) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);

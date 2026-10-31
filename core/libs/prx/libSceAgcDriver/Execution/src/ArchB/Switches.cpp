@@ -51,6 +51,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixBufferBaseRefresh, "FIX_BUFFER_BASE_REFRESH", false, true, {}},
     {Feature::FixAllocChurn, "FIX_ALLOC_CHURN", false, true, {}},
     {Feature::FixComputeSyncUnlocked, "FIX_COMPUTE_SYNC_UNLOCKED", false, true, {}},
+    {Feature::FixWriteTrackingBookkeeping, "FIX_WRITE_TRACKING_BOOKKEEPING", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
