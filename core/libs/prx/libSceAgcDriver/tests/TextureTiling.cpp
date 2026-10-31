@@ -8,6 +8,7 @@
 #include <array>
 #include <bit>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -140,9 +141,97 @@ void requireSliceAddresses(const GuestTextureResource& resource, std::uint32_t b
     }
 }
 
+bool sameMip(const TileMipLayout& a, const TileMipLayout& b) {
+    return a.tiledOffset == b.tiledOffset && a.tiledSize == b.tiledSize && a.linearOffset == b.linearOffset && a.linearSize == b.linearSize && a.width == b.width && a.height == b.height && a.blocksPerRow == b.blocksPerRow && a.pitchBytes == b.pitchBytes && a.tail == b.tail && a.tailX == b.tailX && a.tailY == b.tailY;
+}
+
+// APS5_ARCHB_FIX_ALLOC_CHURN's size-only path: ComputeMipLayoutInto equals ComputeMipLayout level by
+// level, and DescribeSurfaceGuestBytes equals DescribeSurface(...).guestBytes (or rejects alike) over
+// a sweep of formats, tilings, dimensions, extents and mip counts.
+void RunSizeOnlySurfaceTests() {
+    constexpr TextureTileMode modes[] = {TextureTileMode::kLinear, TextureTileMode::kStandard256B, TextureTileMode::kStandard4KB, TextureTileMode::kStandard64KB, TextureTileMode::kZ64KBX, TextureTileMode::kS64KBX, TextureTileMode::kD64KBX, TextureTileMode::kR64KBX, TextureTileMode::kD256B, TextureTileMode::kD4KB, TextureTileMode::kD64KB, TextureTileMode::kS64KBT, TextureTileMode::kD64KBT, TextureTileMode::kS4KBX, TextureTileMode::kD4KBX};
+    constexpr TextureDimension dimensions[] = {TextureDimension::k1D, TextureDimension::k2D, TextureDimension::k2DArray, TextureDimension::kCube, TextureDimension::k3D, TextureDimension::k1DArray, TextureDimension::k2DMsaa};
+    constexpr std::uint32_t widths[] = {1, 7, 64, 333, 1024};
+    constexpr std::uint32_t heights[] = {1, 5, 64, 200};
+    constexpr std::uint32_t mipCounts[] = {1, 2, 5, 11, 16};
+    constexpr std::uint32_t samples[] = {1, 4};
+    std::size_t formats = 0;
+    std::size_t compared = 0;
+    std::size_t rejected = 0;
+    for (std::uint32_t format = 0; format < 256; ++format) {
+        try {
+            static_cast<void>(BytesPerElement(format));
+        } catch (const std::exception&) {
+            continue;
+        }
+        ++formats;
+        for (const auto mode : modes) {
+            for (const auto width : widths) {
+                for (const auto height : heights) {
+                    for (const auto mipCount : mipCounts) {
+                        bool chained = false;
+                        std::vector<TileMipLayout> full;
+                        try {
+                            full = ComputeMipLayout(mode, format, width, height, mipCount);
+                            chained = true;
+                        } catch (const std::exception&) {
+                        }
+                        MipLayoutStorage storage{};
+                        std::span<const TileMipLayout> into;
+                        bool intoChained = false;
+                        try {
+                            into = ComputeMipLayoutInto(storage, mode, format, width, height, mipCount);
+                            intoChained = true;
+                        } catch (const std::exception&) {
+                        }
+                        Require(intoChained == chained, "ComputeMipLayoutInto accepts or rejects unlike ComputeMipLayout");
+                        Require(!chained || (into.size() == full.size() && std::equal(into.begin(), into.end(), full.begin(), sameMip)), "ComputeMipLayoutInto differs from ComputeMipLayout");
+                        for (const auto dimension : dimensions) {
+                            for (const std::uint32_t layers : {0u, 5u}) {
+                                for (const auto sampleCount : samples) {
+                                    GuestTextureResource resource{};
+                                    resource.width = width;
+                                    resource.height = height;
+                                    resource.depthOrLastArray = layers;
+                                    resource.mipCount = mipCount;
+                                    resource.allocatedMipCount = mipCount;
+                                    resource.lastLevel = mipCount - 1;
+                                    resource.tileMode = mode;
+                                    resource.dimension = dimension;
+                                    resource.format = format;
+                                    resource.samples = sampleCount;
+                                    std::uint64_t expected = 0;
+                                    std::string expectedError;
+                                    try {
+                                        expected = DescribeSurface(resource).guestBytes;
+                                    } catch (const std::exception& error) {
+                                        expectedError = error.what();
+                                    }
+                                    std::uint64_t bytes = 0;
+                                    std::string error;
+                                    try {
+                                        bytes = DescribeSurfaceGuestBytes(resource);
+                                    } catch (const std::exception& failure) {
+                                        error = failure.what();
+                                    }
+                                    Require(error == expectedError, "DescribeSurfaceGuestBytes rejects unlike DescribeSurface: " + error + " / " + expectedError);
+                                    Require(!error.empty() || bytes == expected, "DescribeSurfaceGuestBytes differs from DescribeSurface");
+                                    ++(error.empty() ? compared : rejected);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Require(formats > 20 && compared > 100000 && rejected > 0, "the size-only sweep covered too little");
+}
+
 }
 
 void RunTextureTilingTests() {
+    RunSizeOnlySurfaceTests();
     {
         const auto mips = ComputeMipLayout(TextureTileMode::kLinear, 1, 4, 4, 2);
         Require(mips.size() == 2, "linear mip chain must contain the requested mip count");

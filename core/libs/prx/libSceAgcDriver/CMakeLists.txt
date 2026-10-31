@@ -535,6 +535,18 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    add_test_executable(agc_epoch_memo_map_tests tests/EpochMemoMap.cpp)
+    target_include_directories(agc_epoch_memo_map_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_epoch_memo_map_tests PRIVATE libc)
+    set_target_properties(agc_epoch_memo_map_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_epoch_memo_map_tests)
+    add_test(NAME agc_archb_fix_alloc_churn_memo_map COMMAND agc_epoch_memo_map_tests)
+    set_tests_properties(agc_archb_fix_alloc_churn_memo_map PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_fix_alloc_churn_memo_map PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(agc_archb_c01_switches_tests tests/ArchBSwitches.cpp
         Execution/src/ArchB/Switches.cpp ../libSceVideoOut/src/Telemetry.cpp)
     target_include_directories(agc_archb_c01_switches_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
@@ -550,6 +562,12 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_archb_c01_switches COMMAND agc_archb_c01_switches_tests)
+    add_test(NAME agc_archb_fix_alloc_churn_switch COMMAND agc_archb_c01_switches_tests --toggle AllocChurn)
+    set_tests_properties(agc_archb_fix_alloc_churn_switch PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_fix_alloc_churn_switch PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_archb_c01_switches PROPERTIES TIMEOUT 30)
     foreach(archbToggleCase IN ITEMS SeqMonotonic RefusesStartupOnly RefusesUnknown PrerequisiteCascades
             NoFileNoCost AppliesAtBoundaryOnly ScreenshotToken)
@@ -931,11 +949,9 @@ configure_windows_unwind(agc_locks_tests)
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
-        Execution/src/GuestMemory.cpp
-        Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_write_tracking_tests PRIVATE shader_recompiler_agc_driver libc)
+target_link_libraries(agc_write_tracking_tests PRIVATE libSceAgcDriver libc)
 set_target_properties(agc_write_tracking_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_write_tracking_tests)
 if(BUILD_TESTING)
@@ -947,6 +963,11 @@ if(BUILD_TESTING)
     set_tests_properties(agc_failed_collect_memo agc_failed_collect_memo_off PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     set_tests_properties(agc_failed_collect_memo_off PROPERTIES ENVIRONMENT "APS5_NO_FAILED_COLLECT_MEMO=1")
+    add_test(NAME agc_write_tracking_alloc_churn COMMAND agc_write_tracking_tests)
+    add_test(NAME agc_failed_collect_memo_alloc_churn COMMAND agc_write_tracking_tests --failed-collect-memo)
+    add_test(NAME agc_archb_fix_alloc_churn_memo COMMAND agc_write_tracking_tests --alloc-churn-memo)
+    set_tests_properties(agc_write_tracking_alloc_churn agc_failed_collect_memo_alloc_churn agc_archb_fix_alloc_churn_memo PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "APS5_ARCHB_FIX_ALLOC_CHURN=1" ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     if(WIN32)
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
