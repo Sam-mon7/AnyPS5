@@ -24,6 +24,7 @@ using namespace AgcDriver::Graphics;
 namespace {
 
 int failures = 0;
+bool dispatchWaitTest = false;
 
 void Expect(bool condition, const std::string& what) {
     if (condition) return;
@@ -521,10 +522,10 @@ void UnlockedWaitMutation(bool retire, bool submitNew) {
         });
         producer.join();
     };
-    Expect(recorder.FinishUpToUnlocked(target), "an eligible wait did not unlock");
+    Expect(recorder.FinishUpToUnlocked(target, dispatchWaitTest), "an eligible wait did not unlock");
     Expect(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 1, "the unlocked wait did not restore the outer hold");
     if (epoch != 0) Expect(AgcDriver::GuestMemory::ThreadCollectEpoch() > epoch, "the unlocked wait reused its pre-wait collect epoch");
-    if (std::getenv("APS5_PROFILE_DRAW") != nullptr) Expect(AgcDriver::GuestMemory::GpuLockHoldSite() == AgcDriver::GuestMemory::GpuLockSite::Label, "the unlocked wait changed its profile site");
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr) Expect(AgcDriver::GuestMemory::GpuLockHoldSite() == (dispatchWaitTest ? AgcDriver::GuestMemory::GpuLockSite::Dispatch : AgcDriver::GuestMemory::GpuLockSite::Label), "the unlocked wait changed its profile site");
     Expect(mock.timelineWaits == 1 && mock.submits == (submitNew ? 3u : 1u), "the unlocked wait did not allow another producer or submitted new work");
     Expect(completions == std::vector<int>{1}, "the waiter reran an old completion or finished newly submitted work");
     Expect(recorder.InFlightBatches() == (submitNew ? 2u : 0u) && recorder.PendingWriterSerial(0x1000, 4) == 2, "the waiter lost the new writer of the same range");
@@ -563,7 +564,7 @@ void UnlockedWaitReplacement() {
         while (!teardown.load()) std::this_thread::yield();
     };
     auto* original = &*recorder;
-    Expect(original->FinishUpToUnlocked(target), "the teardown wait did not unlock");
+    Expect(original->FinishUpToUnlocked(target, dispatchWaitTest), "the teardown wait did not unlock");
     replacement.join();
     Expect(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 1, "replacement lost the waiter's mutex hold");
     Expect(Recorder::Active() == &*recorder && recorder->InFlightBatches() == 1 && !newCompletion, "the waiter touched the replacement recorder at the same address");
@@ -580,13 +581,13 @@ void UnlockedWaitFallbacks(bool enabled) {
         recorder.Keep(std::make_shared<int>(1));
         {
             std::lock_guard nested(AgcDriver::GuestMemory::GpuMutex());
-            Expect(!recorder.FinishUpToUnlocked(recorder.OpenSerial()), "a nested hold was released");
+            Expect(!recorder.FinishUpToUnlocked(recorder.OpenSerial(), dispatchWaitTest), "a nested hold was released");
             Expect(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 2, "the nested hold's depth changed");
         }
-        if (!enabled || !timeline) Expect(!recorder.FinishUpToUnlocked(recorder.OpenSerial()), "a disabled or timeline-free wait unlocked");
+        if (!enabled || !timeline) Expect(!recorder.FinishUpToUnlocked(recorder.OpenSerial(), dispatchWaitTest), "a disabled or timeline-free wait unlocked");
         Expect(recorder.Recording() && mock.timelineWaits == 0, "a fallback changed the recorder before returning");
         recorder.OnComplete([&] {
-            Expect(!recorder.FinishUpToUnlocked(0), "a completion action was allowed to unlock");
+            Expect(!recorder.FinishUpToUnlocked(0, dispatchWaitTest), "a completion action was allowed to unlock");
             Expect(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 1, "a completion action changed its hold depth");
         });
         recorder.Sync();
@@ -603,7 +604,7 @@ void UnlockedWaitFailure(bool exception) {
     else mock.timelineResult = VK_ERROR_DEVICE_LOST;
     bool failed = false;
     try {
-        recorder.FinishUpToUnlocked(recorder.OpenSerial());
+        recorder.FinishUpToUnlocked(recorder.OpenSerial(), dispatchWaitTest);
     } catch (const std::runtime_error&) {
         failed = true;
     }
@@ -619,8 +620,9 @@ int main(int argc, char** argv) {
             ComputeChainTests();
             return failures == 0 ? 0 : 1;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--unlocked-waits") {
-            const bool enabled = std::getenv("APS5_UNLOCKED_LABEL_WAITS") != nullptr;
+        if (argc == 2 && (std::string_view(argv[1]) == "--unlocked-waits" || std::string_view(argv[1]) == "--dispatch-waits")) {
+            dispatchWaitTest = std::string_view(argv[1]) == "--dispatch-waits";
+            const bool enabled = dispatchWaitTest || std::getenv("APS5_UNLOCKED_LABEL_WAITS") != nullptr;
             UnlockedWaitFallbacks(enabled);
             if (enabled) {
                 for (const bool retire : {false, true}) {

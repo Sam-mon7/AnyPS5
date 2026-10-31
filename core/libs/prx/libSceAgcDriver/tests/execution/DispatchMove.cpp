@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -462,6 +463,103 @@ void RunPrivateRecording(AgcDriver::VulkanDevice& device, const GuestBlock& gues
     }
 }
 
+void RunUnlockedPreparation(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+    using R = AgcDriver::ArchB::Recorder;
+    using G = AgcDriver::Graphics::Recorder;
+    R::Boundary(true, 0, R::Clock::now());
+    AgcDriver::GuestMemory::TagGpuLockThread(0x28);
+    Fill(guest.InputA(), 0x1000u);
+    const auto compiled = Compile(device, guest.InputA(), Bytes, guest.OutputO());
+    const auto address = reinterpret_cast<std::uintptr_t>(guest.InputA());
+    const auto counts = [] {
+        auto result = R::Collect(R::Clock::now()).counters;
+        for (const auto& [name, value] : result) if (name.starts_with("fix_dispatch_unlocked_")) std::cout << name << '=' << value << '\n';
+        return result;
+    };
+    auto unchanged = device.PrepareDispatchWaits(compiled);
+    Require(unchanged != nullptr, "unlocked prep did not prepare a descriptor dispatch");
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        device.CompleteDispatchWaits(unchanged);
+    }
+    Require(counts()["fix_dispatch_unlocked_prep_hits"] == 1, "unchanged pending snapshot was not reused");
+    auto stale = device.PrepareDispatchWaits(compiled);
+    std::thread producer([&] {
+        AgcDriver::GuestMemory::TagGpuLockThread(0);
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = G::Active();
+        recorder->Keep(std::make_shared<int>(1));
+        recorder->NotePendingWrite(address, 4);
+    });
+    producer.join();
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        device.CompleteDispatchWaits(stale);
+        device.WaitIdle();
+    }
+    Require(counts()["fix_dispatch_unlocked_prep_redo_pending_writes"] == 1, "a concurrent producer did not invalidate the prepared snapshot");
+    std::array<std::uint32_t, Words> reference{};
+    for (const bool enabled : {true, false, true}) {
+        Reset(guest.OutputO());
+        auto preparation = enabled ? device.PrepareDispatchWaits(compiled) : nullptr;
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            if (enabled) device.CompleteDispatchWaits(preparation);
+            device.Dispatch(compiled, 1, 1, 1);
+            device.WaitIdle();
+        }
+        Expect(guest.InputA(), guest.OutputO(), Constant, "unlocked preparation on/off/on");
+        if (reference.front() == 0) std::copy_n(guest.OutputO(), Words, reference.begin());
+        else Require(std::equal(reference.begin(), reference.end(), guest.OutputO()), "unlocked preparation on/off/on changed output bytes");
+    }
+    counts();
+    if (!device.CanWaitUnlocked()) return;
+    SubmissionGate gate(device);
+    const std::uint32_t first = 0x4000u, second = 0x5000u;
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = G::Active();
+        recorder->Keep(std::make_shared<int>(2));
+        recorder->AfterCompletions(address, std::as_bytes(std::span(&first, 1)), 1, 0, false);
+        gate.Arm();
+    }
+    auto preparation = device.PrepareDispatchWaits(compiled);
+    std::promise<void> entered;
+    auto entry = entered.get_future();
+    std::atomic<bool> resumed{false};
+    std::exception_ptr failure;
+    std::thread consumer([&] {
+        try {
+            AgcDriver::GuestMemory::TagGpuLockThread(0x28);
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            entered.set_value();
+            device.CompleteDispatchWaits(preparation);
+            resumed.store(true);
+            device.Dispatch(compiled, 1, 1, 1);
+            device.WaitIdle();
+        } catch (...) { failure = std::current_exception(); }
+    });
+    entry.wait();
+    std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!lock.try_lock() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    const bool released = lock.owns_lock() && !resumed.load();
+    if (released) {
+        auto* recorder = G::Active();
+        recorder->Keep(std::make_shared<int>(3));
+        recorder->AfterCompletions(address, std::as_bytes(std::span(&second, 1)), 2, 0, false);
+    }
+    if (lock.owns_lock()) lock.unlock();
+    gate.Release();
+    consumer.join();
+    if (failure) std::rethrow_exception(failure);
+    Require(released, "GPU wait kept the global mutex");
+    const auto waited = counts();
+    Require(waited.contains("fix_dispatch_unlocked_sync_hits") && waited.at("fix_dispatch_unlocked_sync_hits") == 1, "the gated GPU wait did not unlock");
+    Require(waited.contains("fix_dispatch_unlocked_prep_redo_after_wait") && waited.at("fix_dispatch_unlocked_prep_redo_after_wait") == 1, "GPU-wait reacquisition lost the new writer");
+    Require(guest.OutputO()[0] == second + Constant, "the dispatch did not consume the newer completion write");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -469,6 +567,11 @@ int main(int argc, char** argv) {
         GuestBlock guest;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string(argv[1]) == "--unlocked-prep") {
+            RunUnlockedPreparation(*device, guest);
+            std::puts("dispatch unlocked preparation tests passed");
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--private-compute") {
             RunPrivateRecording(*device, guest);
             std::puts("private compute recording and fallback tests passed");

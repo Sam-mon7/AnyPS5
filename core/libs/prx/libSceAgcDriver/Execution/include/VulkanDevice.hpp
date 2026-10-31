@@ -36,6 +36,7 @@ struct RecipeHit;
 struct RecordedDispatch;
 struct DispatchCompletion;
 struct PrivateDispatch;
+struct DispatchWaitPreparation;
 // The module, layout and pipeline a compute dispatch binds (VulkanDevice::createComputePipeline).
 struct ComputePipelineObjects;
 
@@ -55,6 +56,8 @@ DeviceQueuePlan PlanDeviceQueues(std::span<const VkQueueFamilyProperties> famili
 
 class VulkanDevice {
 public:
+    std::shared_ptr<DispatchWaitPreparation> PrepareDispatchWaits(const ShaderRecompiler::RecompileResult& shader) const;
+    void CompleteDispatchWaits(const std::shared_ptr<DispatchWaitPreparation>& preparation);
     explicit VulkanDevice(const PresentationWindow* window = nullptr);
     struct CompileOnly {};
     explicit VulkanDevice(CompileOnly);

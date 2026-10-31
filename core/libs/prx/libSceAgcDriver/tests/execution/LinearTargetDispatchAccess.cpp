@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -25,9 +27,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <future>
 #include <iostream>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace AgcDriver {
@@ -222,12 +228,19 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     device.Draw(state, draw, shaders);
 }
 
-void Dispatch(AgcDriver::VulkanDevice& device, std::uint64_t source, std::uint64_t destination) {
+ShaderRecompiler::RecompileResult CompileDispatch(AgcDriver::VulkanDevice& device, std::uint64_t source, std::uint64_t destination, bool descriptor = false) {
     constexpr std::uint32_t waveSize = 64;
-    const std::array<std::uint32_t, 4> userData{static_cast<std::uint32_t>(source), static_cast<std::uint32_t>(source >> 32u), static_cast<std::uint32_t>(destination), static_cast<std::uint32_t>(destination >> 32u)};
-    const std::span<const std::uint32_t> code(CopyCode);
+    std::vector<std::uint32_t> userData{static_cast<std::uint32_t>(source), static_cast<std::uint32_t>(source >> 32u), static_cast<std::uint32_t>(destination), static_cast<std::uint32_t>(destination >> 32u)};
+    const std::array<std::uint32_t, 7> bufferCode{0x7e000280u, 0xe0301000u, 0x80000100u, 0xbf8c3f70u, 0xe0701000u, 0x80010100u, 0xbf810000u};
+    if (descriptor) {
+        const auto input = BufferDescriptor(reinterpret_cast<const void*>(source), 4, 1);
+        const auto output = BufferDescriptor(reinterpret_cast<const void*>(destination), 4, 1);
+        userData.assign(input.begin(), input.end());
+        userData.insert(userData.end(), output.begin(), output.end());
+    }
+    const std::span<const std::uint32_t> code(descriptor ? bufferCode : CopyCode);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
-    const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{descriptor ? 1u : Threads, 1, 1}, 0u, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {waveSize, 0, userData, compute, std::nullopt, std::nullopt, memory},
@@ -235,8 +248,12 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::uint64_t source, std::uint64
         {0, 0, 0, 128}
     };
     request.useCache = false;
-    const auto result = ShaderRecompiler::Recompile(request);
-    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+    return ShaderRecompiler::Recompile(request);
+}
+
+void Dispatch(AgcDriver::VulkanDevice& device, std::uint64_t source, std::uint64_t destination) {
+    const auto result = CompileDispatch(device, source, destination);
+    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(CopyCode.data()));
 }
 
 std::string Hex(std::uint32_t value) {
@@ -284,10 +301,87 @@ bool Expect(AgcDriver::VulkanDevice& device) {
     return true;
 }
 
+void ConcurrentDrawDispatch(AgcDriver::VulkanDevice& device, const std::filesystem::path& control) {
+    using R = AgcDriver::ArchB::Recorder;
+    using S = AgcDriver::ArchB::Switches;
+    using F = AgcDriver::ArchB::Feature;
+    R::Boundary(true, 0, R::Clock::now());
+    Block target(BlockBytes), output(BlockBytes);
+    std::fill_n(target.data, target.bytes, std::uint8_t{0});
+    const auto color = DecodeTarget(target);
+    const auto blueOffset = (static_cast<std::size_t>(ReadY) * Width + ReadX) * 16u + 8u;
+    const auto compiled = CompileDispatch(device, target.Address() + blueOffset, output.Address(), true);
+    const auto pixel = Program(1, true);
+    unsigned sequence = 0;
+    std::vector<std::uint8_t> reference;
+    for (const bool enabled : {true, false, true}) {
+        std::ofstream(control, std::ios::trunc) << ++sequence << " FIX_DISPATCH_UNLOCKED_PREP=" << enabled << '\n';
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        S::PollControl();
+        for (unsigned round = 0; round < 4; ++round) {
+            std::fill_n(output.data, output.bytes, std::uint8_t{0xcc});
+            std::promise<void> held, prepared;
+            auto acquired = held.get_future();
+            auto ready = prepared.get_future();
+            std::exception_ptr failure;
+            std::jthread draw([&] {
+                try {
+                    AgcDriver::GuestMemory::TagGpuLockThread(0);
+                    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                    held.set_value();
+                    ready.wait();
+                    Draw(device, color, pixel, {{0, 0}, {Width, Height}});
+                } catch (...) { failure = std::current_exception(); }
+            });
+            acquired.wait();
+            AgcDriver::GuestMemory::TagGpuLockThread(0x28);
+            const bool selected = S::Enabled(F::FixDispatchUnlockedPrep);
+            Require(selected == enabled, "dispatch runtime switch did not toggle");
+            auto dependencies = selected ? device.PrepareDispatchWaits(compiled) : nullptr;
+            prepared.set_value();
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                if (selected) device.CompleteDispatchWaits(dependencies);
+                device.Dispatch(compiled, 1, 1, 1);
+                device.WaitIdle();
+            }
+            draw.join();
+            if (failure) std::rethrow_exception(failure);
+            Require(Dword(output.data) == Drawn, "concurrent dispatch did not observe the draw");
+            std::vector<std::uint8_t> bytes(target.data, target.data + TargetBytes);
+            bytes.insert(bytes.end(), output.data, output.data + output.bytes);
+            if (reference.empty()) reference = bytes;
+            else Require(reference == bytes, "draw/dispatch on/off/on changed target or buffer bytes");
+        }
+        auto counters = R::Collect(R::Clock::now()).counters;
+        for (const auto& [name, value] : counters) if (name.starts_with("fix_dispatch_unlocked_")) std::cout << name << '=' << value << '\n';
+        const auto attempts = counters["fix_dispatch_unlocked_prep_hits"] + counters["fix_dispatch_unlocked_prep_redo_pending_writes"];
+        Require(attempts == (enabled ? 4 : 0), "draw/dispatch stress did not use the selected preparation path");
+    }
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--unlocked-prep") {
+            struct Control {
+                std::filesystem::path path = std::filesystem::temp_directory_path() / ("agc-m3-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+                ~Control() { std::filesystem::remove(path); }
+            } control;
+#ifdef _WIN32
+            _putenv_s("APS5_ARCHB_GATE_RUN", "1");
+            _putenv_s("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str());
+#else
+            setenv("APS5_ARCHB_GATE_RUN", "1", 1);
+            setenv("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str(), 1);
+#endif
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            ConcurrentDrawDispatch(*device, control.path);
+            std::puts("two-queue draw/dispatch on/off/on bytes match");
+            return 0;
+        }
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         if (!Expect(*device)) return VulkanTestSkipped;

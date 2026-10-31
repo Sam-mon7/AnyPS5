@@ -4219,10 +4219,10 @@ void Recorder::Sync() {
     activeSyncSite = previousSite;
 }
 
-bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
+bool Recorder::FinishUpToUnlocked(std::uint64_t serial, bool dispatchPreparation) {
     static const bool enabled = std::getenv("APS5_UNLOCKED_LABEL_WAITS") != nullptr;
     auto& mutex = GuestMemory::GpuMutex();
-    if (!enabled || timeline == VK_NULL_HANDLE || mutex.DepthOnThisThread() != 1 || completionDepth != 0) return false;
+    if ((!enabled && !dispatchPreparation) || timeline == VK_NULL_HANDLE || mutex.DepthOnThisThread() != 1 || completionDepth != 0) return false;
     if (serial == 0) return true;
     if (serial > submissions) Submit();
     if (serial > submissions) throw std::runtime_error("AGC recorder: unlocked wait for an unrecorded batch");
@@ -4231,7 +4231,7 @@ bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
     const auto semaphore = timeline;
     const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
     const bool profile = DrawProfiled();
-    const auto lockSite = profile ? GuestMemory::GpuLockHoldSite() : GuestMemory::GpuLockSite::Other;
+    const auto lockSite = dispatchPreparation ? GuestMemory::GpuLockSite::Dispatch : profile ? GuestMemory::GpuLockHoldSite() : GuestMemory::GpuLockSite::Other;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     VkResult result = VK_SUCCESS;
     try {

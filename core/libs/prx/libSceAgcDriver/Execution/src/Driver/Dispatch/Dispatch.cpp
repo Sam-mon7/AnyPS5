@@ -163,8 +163,9 @@ bool Driver::pipelineDispatch() {
     return DispatchItemsEnabled();
 }
 
-void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, std::optional<bool> unlockedPreparation) {
     const bool feedbackMask = ArchB::Switches::Enabled(ArchB::Feature::FixTsharpFeedbackMask);
+    const bool unlockedPrep = unlockedPreparation.has_value() ? *unlockedPreparation : ArchB::Switches::Enabled(ArchB::Feature::FixDispatchUnlockedPrep);
     ArchB::Recorder::Work recorderWork({ArchB::Recorder::Kind::Dispatch, 0});
     PerformanceTimer timing("Driver.Dispatch");
     const GuestMemory::ReadSiteScope handlerSite(GuestMemory::ReadSite::DispatchHandler);
@@ -568,7 +569,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult, feedbackMask);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
-        dispatch(queue, packet, submission, indirectArguments);
+        dispatch(queue, packet, submission, indirectArguments, unlockedPrep);
         return;
     }
     phaseTiming.Phase(PhaseQueuedLabels);
@@ -601,7 +602,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto rethrow = [&](const std::exception& error) {
         if (fromAhead) {
             ++groupStats.deviceRejects;
-            dispatch(queue, packet, submission, indirectArguments);
+            dispatch(queue, packet, submission, indirectArguments, unlockedPrep);
             return true;
         }
         char where[64];
@@ -617,7 +618,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion] {
+        DrawPipeline::Queue0().Enqueue([this, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion, unlockedPrep] {
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             PerformanceTimer recorderTiming("Driver.DispatchCommit");
             DrawPipeline::FollowEpoch(epoch);
@@ -630,12 +631,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 RecipeBuildFailure recipeFailure = RecipeBuildFailure::NotAttempted;
                 bool writersNoted = false;
                 for (;;) {
+                    auto dependencies = unlockedPrep ? localDevice->PrepareDispatchWaits(compiledCommit) : nullptr;
                     std::shared_ptr<PreparedDispatch> prepared;
                     if (recipeHit == nullptr || VulkanDevice::VerifyRecipes() || htileClearCompletion.has_value()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     ArchB::Recorder::MutexTimer mutexTiming("M2.DispatchCommit.Held");
                     recordLabelsForPacket(localDevice.get(), queueId);
+                    if (unlockedPrep) localDevice->CompleteDispatchWaits(dependencies);
                     mutexTiming.Mark("labels");
                     if (noteWrites && writerKeyedEvidence() && !writersNoted) {
                         noteWrittenBuffers(address, queueId, compiledCommit);
@@ -708,6 +711,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     for (;;) {
 
+        auto dependencies = unlockedPrep ? localDevice->PrepareDispatchWaits(compiled) : nullptr;
         std::shared_ptr<PreparedDispatch> prepared;
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
             try {
@@ -741,6 +745,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         ArchB::Recorder::MutexTimer mutexTiming("M2.Dispatch.Held");
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
+        if (unlockedPrep) localDevice->CompleteDispatchWaits(dependencies);
         phaseTiming.Phase(PhaseLabels);
         mutexTiming.Mark("labels");
         if (noteWrites && writerKeyedEvidence() && !writersNoted) {

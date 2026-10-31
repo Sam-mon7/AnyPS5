@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "BdaAbi.hpp"
+#include "Optimization/ShaderStageInputInfo.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
@@ -4986,6 +4987,103 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
         reportRecipes();
     }
     return RecipeOutcome::Recorded;
+}
+
+struct DispatchWaitPreparation {
+    Graphics::Recorder::WriteRanges buffers;
+    std::shared_ptr<const Graphics::Recorder::WriteRanges> pending;
+    std::uint64_t writes = 0;
+    std::uint64_t published = 0;
+    bool overlaps = false;
+};
+
+std::shared_ptr<DispatchWaitPreparation> VulkanDevice::PrepareDispatchWaits(const ShaderRecompiler::RecompileResult& shader) const {
+    PerformanceTimer timing("Dispatch.UnlockedDependencies", ArchB::Recorder::Phase::Prepare);
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        ArchB::Recorder::Count("fix_dispatch_unlocked_prep_refused_locked");
+        return nullptr;
+    }
+    auto prepared = std::make_shared<DispatchWaitPreparation>();
+    for (const auto& binding : shader.bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) {
+            ArchB::Recorder::Count("fix_dispatch_unlocked_prep_refused_address_tables");
+            return nullptr;
+        }
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+        if (binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) {
+            ArchB::Recorder::Count("fix_dispatch_unlocked_prep_refused_descriptor");
+            return nullptr;
+        }
+        for (std::size_t element = 0; element < binding.count; ++element) {
+            const auto* words = binding.guestDescriptor.data() + element * 4u;
+            const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1] & ~0x40000000u, words[2], words[3]}};
+            const auto address = descriptor.Base48();
+            const auto bytes = descriptor.GetSize();
+            if (address == 0 || bytes == 0) continue;
+            if (descriptor.Type() != 0 || bytes > state->properties.limits.maxStorageBufferRange || address + bytes < address) {
+                ArchB::Recorder::Count("fix_dispatch_unlocked_prep_refused_buffer_extent");
+                return nullptr;
+            }
+            prepared->buffers.emplace_back(address, address + bytes);
+        }
+    }
+    if (prepared->buffers.empty()) {
+        ArchB::Recorder::Count("fix_dispatch_unlocked_prep_refused_no_buffers");
+        return nullptr;
+    }
+    prepared->writes = Graphics::Recorder::WriteGeneration();
+    prepared->published = Graphics::Recorder::PublishGeneration();
+    prepared->pending = Graphics::Recorder::PendingWriteSnapshot();
+    prepared->overlaps = std::ranges::any_of(prepared->buffers, [&](const auto& range) {
+        return Graphics::Recorder::SnapshotOverlaps(prepared->pending.get(), range.first, static_cast<std::size_t>(range.second - range.first));
+    });
+    return prepared;
+}
+
+void VulkanDevice::CompleteDispatchWaits(const std::shared_ptr<DispatchWaitPreparation>& preparation) {
+    if (preparation == nullptr) return;
+    GuestMemory::AssertGpuLockHeld("VulkanDevice::CompleteDispatchWaits");
+    PerformanceTimer timing("Dispatch.DependencyCommit");
+    auto* recorder = state->recorder.get();
+    if (recorder == nullptr || recorder != Graphics::Recorder::Active()) {
+        ArchB::Recorder::Count("fix_dispatch_unlocked_prep_refused_recorder");
+        return;
+    }
+    const bool current = preparation->writes == Graphics::Recorder::WriteGeneration() &&
+        preparation->published == Graphics::Recorder::PublishGeneration() &&
+        preparation->pending == Graphics::Recorder::PendingWriteSnapshot();
+    if (current) ArchB::Recorder::Count("fix_dispatch_unlocked_prep_hits");
+    else ArchB::Recorder::Count("fix_dispatch_unlocked_prep_redo_pending_writes");
+    if (current && !preparation->overlaps) return;
+    const auto context = graphicsContext();
+    const auto target = [&] {
+        std::uint64_t serial = 0;
+        for (const auto& range : preparation->buffers) {
+            const auto bytes = static_cast<std::size_t>(range.second - range.first);
+            const auto writer = recorder->PendingWriterSerial(range.first, bytes);
+            if (writer == 0) continue;
+            if (Graphics::PendingCpuWrites(context, range.first, bytes) || Graphics::StorageTexture::AnyPendingOverlaps(std::span(&range, 1))) serial = std::max(serial, writer);
+        }
+        return serial;
+    };
+    const auto serial = target();
+    if (serial == 0) return;
+    if (!recorder->HasTimeline()) {
+        ArchB::Recorder::Count("fix_dispatch_unlocked_prep_refused_no_timeline");
+        return;
+    }
+    if (GuestMemory::GpuMutex().DepthOnThisThread() != 1 || Graphics::Recorder::InCompletion()) {
+        ArchB::Recorder::Count("fix_dispatch_unlocked_prep_refused_nested");
+        return;
+    }
+    if (recorder->FinishUpToUnlocked(serial, true)) {
+        ArchB::Recorder::Count("fix_dispatch_unlocked_sync_hits");
+        if (recorder != Graphics::Recorder::Active()) {
+            ArchB::Recorder::Count("fix_dispatch_unlocked_prep_refused_recorder");
+            return;
+        }
+        if (target() != 0) ArchB::Recorder::Count("fix_dispatch_unlocked_prep_redo_after_wait");
+    }
 }
 
 std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> surfaces) {
