@@ -55,14 +55,14 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     appendEntryRegions(*variants[i], regions);
                     ++compared;
                     const bool genShadow = GuestMemory::Gen::ShadowActive();
-                    const auto genBefore = genShadow ? GuestMemory::Gen::Global().Now() : 0;
-                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback);
+                    const auto genBefore = genShadow ? GuestMemory::Gen::CaptureSince() : 0;
+                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback, false, GuestMemory::Gen::Consumer::DispatchValidate);
 
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
-                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback);
+                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback, false, GuestMemory::Gen::Consumer::DispatchValidate);
                         ++(result == EntryOutcome::Equal || result == EntryOutcome::EqualData ? retriesEqual : retriesMoved);
                     }
-                    if (genShadow) static_cast<void>(ShadowValidatedVariant(GuestMemory::Gen::Consumer::DispatchValidate, *variants[i], result, genBefore));
+                    if (genShadow) static_cast<void>(ShadowValidatedVariant(GuestMemory::Gen::Consumer::DispatchValidate, *variants[i], result, genBefore, VariantValidationExact()));
                     if (i == 0) outcome = result;
                     if (result == EntryOutcome::Equal || result == EntryOutcome::EqualData) {
                         outcome = result;

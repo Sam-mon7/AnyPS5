@@ -102,7 +102,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     const auto captureWaitedBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
-    stageCapture.genSince = GuestMemory::Gen::Active() ? GuestMemory::Gen::Global().Now() : 0;
+    stageCapture.genSince = GuestMemory::Gen::CaptureSince();
+    stageCapture.genTicket = GuestMemory::Gen::Required();
     stageCapture.pushOffset = pushOffset;
     const auto named = [&](const std::exception& error, std::span<const ShaderRecompiler::MemoryRegion> regions) {
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
@@ -134,6 +135,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     const auto exportWaitedBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
+    // Write generations: a capture over a pending GPU write may hold its known value, not the bytes.
+    if (stageCapture.genSince != 0 && CapturedOverPendingWrite(stageCapture.regions)) stageCapture.genSince = 0;
     stageCapture.supplied = shaderMemory.SuppliedBlocks();
     stageCapture.userDataUse = capture->userDataUse;
     recompiled[i] = true;
@@ -275,6 +278,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             variant->shader = programs[i].snapshot;
             variant->forgetSerial = stageCapture.forgetSerial;
             variant->genSince.store(stageCapture.genSince, std::memory_order_relaxed);
+            variant->genProvenTicket.store(stageCapture.genSince != 0 ? stageCapture.genTicket : 0, std::memory_order_relaxed);
             variant->pushOffset = stageCapture.pushOffset;
             variant->userDataMask = stageCapture.userDataMask;
             if (cpuIndirect && stageCapture.capture != nullptr) {

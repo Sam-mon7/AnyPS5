@@ -499,13 +499,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             const auto captureWaitedBefore = splitCapture ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
-            genAtCapture = GuestMemory::Gen::Active() ? GuestMemory::Gen::Global().Now() : 0;
+            genAtCapture = GuestMemory::Gen::CaptureSince();
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
                 return CaptureInvocation(*shaderMemory, snapshot, codeOffset, request, invocation);
             }();
             if (splitCapture) captureMarks[2] = std::chrono::steady_clock::now();
             captured = shaderMemory->Regions();
+            // Write generations: a capture over a pending GPU write may hold its known value, not the bytes.
+            if (genAtCapture != 0 && CapturedOverPendingWrite(captured)) genAtCapture = 0;
             request.context.memory = captured;
             if (splitCapture) {
                 captureMarks[3] = std::chrono::steady_clock::now();

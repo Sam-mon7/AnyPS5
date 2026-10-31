@@ -91,7 +91,7 @@ void toggleCase(const std::string& name) {
         const char* name;
         Feature feature;
         const char* token;
-    } genDependents[] = {{"GenShadow", Feature::GenShadow, "GEN_SHADOW"}, {"GenLockfree", Feature::GenLockfree, "GEN_LOCKFREE"}};
+    } genDependents[] = {{"GenShadow", Feature::GenShadow, "GEN_SHADOW"}, {"GenLockfree", Feature::GenLockfree, "GEN_LOCKFREE"}, {"GenDrawValidation", Feature::GenDrawValidation, "GEN_DRAW_VALIDATION"}};
     const GenDependent* genDependent = nullptr;
     for (const auto& dependent : genDependents) if (name == dependent.name) genDependent = &dependent;
     const bool genShadow = genDependent != nullptr;

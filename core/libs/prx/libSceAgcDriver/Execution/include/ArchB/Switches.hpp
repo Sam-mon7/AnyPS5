@@ -32,6 +32,7 @@ enum class Feature : std::uint8_t {
     GenTable,
     GenShadow,
     GenLockfree,
+    GenDrawValidation,
     Count
 };
 

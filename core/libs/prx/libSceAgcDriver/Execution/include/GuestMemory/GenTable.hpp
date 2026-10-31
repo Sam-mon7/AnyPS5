@@ -202,6 +202,12 @@ void CountLockFree(LockFreeApi api, bool fast) noexcept;
 enum class LockFreeVerify : std::uint8_t { Agree, Raced, Unsafe };
 void CountLockFreeVerify(LockFreeApi api, LockFreeVerify outcome, std::uint64_t address, std::uint64_t bytes, std::uint64_t since) noexcept;
 
+// A "since" for evidence recorded now and checked later (rule V6): the tracker generation published
+// at its last mutex release. Every tracker stamp at or below it is complete, and a walk still
+// running stamps above it (its generation is taken before its OS query, so a GenClock value read
+// while it runs could hide a store it reports). 0 while the table is off.
+Generation CaptureSince() noexcept;
+
 // Ordering points (rule V1): the calling context's required ticket.
 enum class TicketReason : std::uint8_t { Submission, Packet, WaitEntry, WaitCpu, WaitGpuLabel, WaitOwn, Drain, Reap, UnlockedWait, Committer, Present, Uncached, Other, Count };
 const char* TicketReasonName(TicketReason reason);
@@ -244,6 +250,23 @@ public:
 private:
     std::uint8_t previous;
 };
+
+// Slice S7, GEN_DRAW_VALIDATION (requires GEN_TABLE): draw-cache and multi-variant dispatch variants
+// are validated from generations first (VariantValidation.cpp): Clean skips the byte compare, an
+// exactly equal byte compare moves the variant's since (CompareAndRestamp).
+bool DrawValidationActive() noexcept;
+enum class DrawGen : std::uint8_t { Clean, Restamped, Changed, Pending, Unknown, Verified, Unsafe, Count };
+const char* DrawGenName(DrawGen outcome);
+void CountDrawGen(Consumer consumer, DrawGen outcome) noexcept;
+// The generation verdict of a footprint captured at `since`, checked at ticket `required`: Clean
+// when every block is tracked, every kind (data, cpu, meta, pending) is at most `since`, and the
+// CPU stores ordered before `required` are accounted for: either every block is covered by a
+// resetting walk started at or after `required` (blocks no such sweep covered are
+// unknown_not_swept), or the bytes were read and found equal after `required` was issued
+// (`proven` >= `required`: the capture or an exact compare, which saw every such store). Changed
+// when data, cpu or meta moved; Pending when only pending moved; Unknown otherwise (no since, no
+// ticket, an untracked block). An empty footprint is Clean (there are no bytes to compare). Lock-free.
+DrawGen CheckRuns(const Table& table, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, Generation since, Ticket required, Ticket proven = 0) noexcept;
 
 // The classification of one decision: `verdict` is what Check would have said, `unchanged` is the
 // decision taken (true: the evidence was reused / the bytes matched). unsafe = Clean while the
@@ -294,6 +317,8 @@ void ResetActivationForTest() noexcept;
 namespace detail {
 // Implemented by GuestMemory.cpp: the tracker generation (relaxed), for the activation floor.
 std::uint64_t CurrentTrackerGeneration() noexcept;
+// Implemented by GuestMemory.cpp: the tracker generation published at its last mutex release (acquire).
+std::uint64_t StableTrackerGeneration() noexcept;
 // Implemented by VulkanDevice.cpp: samples the global serials into SampleSerials (per present, and
 // at the start and end of each frame-replay pass).
 void SampleDriverSerials() noexcept;

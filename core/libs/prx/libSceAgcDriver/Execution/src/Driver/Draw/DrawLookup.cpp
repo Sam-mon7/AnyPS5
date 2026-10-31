@@ -195,10 +195,10 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         regions.clear();
                         appendEntryRegions(*variant, regions);
                         ++compared;
-                        const auto genBefore = genShadow ? GuestMemory::Gen::Global().Now() : 0;
+                        const auto genBefore = genShadow ? GuestMemory::Gen::CaptureSince() : 0;
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
-                        const auto genVerdict = genShadow ? ShadowValidatedVariant(GuestMemory::Gen::Consumer::DrawValidate, *variant, result, genBefore) : GuestMemory::Gen::Verdict::Unknown;
+                        const auto genVerdict = genShadow ? ShadowValidatedVariant(GuestMemory::Gen::Consumer::DrawValidate, *variant, result, genBefore, VariantValidationExact()) : GuestMemory::Gen::Verdict::Unknown;
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;

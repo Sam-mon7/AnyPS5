@@ -397,6 +397,129 @@ void lockfree() {
     Require(checks.load() != 0 && violations.load() == 0, "a published data or refusal generation was not visible to the lock-free test");
 }
 
+// Slice S7 (GEN_DRAW_VALIDATION): the generation verdict of a variant's runs. Clean needs tracked
+// blocks covered by a sweep at the checking ticket and every kind at most the since; data/cpu/meta
+// read Changed, pending alone Pending, a missing since, ticket or sweep Unknown. An exactly equal
+// compare restamps the since (never lowering it), after which the runs read Clean again. Under
+// concurrency, writers store a version, take a generation and publish it (O2), a sweeper covers the
+// runs at fresh tickets, and checkers take a ticket and a since, read the versions, then check: a
+// Clean verdict never hides a version published before the check.
+void drawValidation() {
+    Table table;
+    const std::uint64_t at = Base + 0x100000000ull;
+    using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    const Runs runs{{at + 0x100, at + 0x180}, {at + 3 * Block + 0x40, at + 3 * Block + 0x80}};
+    auto required = table.Issue();
+    table.RecordSweep(at, at + 8 * Block, table.Issue(), 1);
+    auto since = table.Now();
+    Require(CheckRuns(table, runs, since, required) == DrawGen::Clean, "covered, unchanged runs are not clean");
+    Require(CheckRuns(table, runs, 0, required) == DrawGen::Unknown && CheckRuns(table, runs, since, 0) == DrawGen::Unknown, "a missing since or ticket is not unknown");
+    Require(CheckRuns(table, Runs{}, 0, 0) == DrawGen::Clean, "an empty footprint is not clean");
+    // Ticket rule: a sweep made before the checking ticket does not cover it (unknown_not_swept).
+    required = table.Issue();
+    Require(CheckRuns(table, runs, since, required) == DrawGen::Unknown, "a sweep older than the ticket made the runs clean");
+    // Proven at a ticket (the bytes read and found equal after it was issued): no sweep needed for
+    // checks at that ticket or older ones; a newer ticket needs a sweep again.
+    Require(CheckRuns(table, runs, since, required, required) == DrawGen::Clean && CheckRuns(table, runs, since, required, required - 1) == DrawGen::Unknown, "a reading at the ticket did not stand for a sweep");
+    // Proven or swept, every kind still has to be at most the since.
+    table.SetState(at + 7 * Block, at + 8 * Block, BlockState::Excluded, false);
+    Require(CheckRuns(table, Runs{{at + 7 * Block, at + 7 * Block + 64}}, since, required, required) == DrawGen::Unknown, "a proven reading made an excluded block clean");
+
+    table.RecordSweep(at, at + 4 * Block, table.Issue(), 1);
+    Require(CheckRuns(table, runs, since, required) == DrawGen::Clean, "a sweep after the ticket did not cover the runs");
+    // A partial sweep covers only its pages.
+    required = table.Issue();
+    table.RecordSweep(at, at + Page, table.Issue(), 1);
+    Require(CheckRuns(table, Runs{{at + 0x100, at + 0x180}}, since, required) == DrawGen::Clean && CheckRuns(table, runs, since, required) == DrawGen::Unknown, "a page sweep covered pages it did not walk");
+    table.RecordSweep(at, at + 4 * Block, table.Issue(), 1);
+    // Pending alone, then a data event.
+    table.Apply(at + 3 * Block, at + 3 * Block + Page, Pending, table.Bump());
+    Require(CheckRuns(table, runs, since, required) == DrawGen::Pending, "a pending write over a run is not pending");
+    table.Apply(at, at + Page, Data | Cpu, table.Bump());
+    Require(CheckRuns(table, runs, since, required) == DrawGen::Changed, "a CPU store over a run is not changed");
+    // CompareAndRestamp: a since taken before an exactly equal compare.
+    AgcDriver::DriverDetail::DispatchVariant variant;
+    variant.runs = runs;
+    variant.genSince.store(since);
+    const auto before = table.Now();
+    AgcDriver::DriverDetail::RestampVariant(variant, before);
+    Require(variant.genSince.load() == before && CheckRuns(table, variant.runs, variant.genSince.load(), required) == DrawGen::Clean, "a restamped variant is not clean");
+    AgcDriver::DriverDetail::RestampVariant(variant, since);
+    Require(variant.genSince.load() == before, "a restamp lowered the since");
+    // Meta (a mapping or representation change) and excluded blocks.
+    table.Apply(at + 3 * Block, at + 4 * Block, Meta, table.Bump());
+    Require(CheckRuns(table, variant.runs, before, required) == DrawGen::Changed, "a meta event over a run is not changed");
+    table.SetState(at + 5 * Block, at + 6 * Block, BlockState::Excluded, false);
+    Require(CheckRuns(table, Runs{{at + 5 * Block, at + 5 * Block + 64}}, table.Now(), required) == DrawGen::Unknown, "an excluded block is not unknown");
+
+    constexpr std::size_t Blocks = 64;
+    const auto stressBase = Base + 0x200000000ull;
+    std::vector<std::atomic<std::uint64_t>> versions(Blocks);
+    std::vector<std::atomic<std::uint64_t>> published(Blocks);
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> violations{0};
+    std::atomic<std::uint64_t> cleans{0};
+    std::atomic<std::uint64_t> others{0};
+    std::vector<std::thread> threads;
+    for (int w = 0; w < 3; ++w) {
+        threads.emplace_back([&, w] {
+            std::mt19937_64 random(static_cast<std::uint64_t>(w) * 37u + 9u);
+            while (!stop.load(std::memory_order_relaxed)) {
+                const auto block = random() % Blocks;
+                const auto version = versions[block].fetch_add(1, std::memory_order_acq_rel) + 1;
+                table.Apply(stressBase + block * Block, stressBase + block * Block + Page, Data | Cpu, table.Bump());
+                auto current = published[block].load(std::memory_order_relaxed);
+                while (current < version && !published[block].compare_exchange_weak(current, version, std::memory_order_release, std::memory_order_relaxed)) {}
+                for (int spin = 0; spin < 200; ++spin) std::this_thread::yield();
+            }
+        });
+    }
+    threads.emplace_back([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            const auto ticket = table.LatestTicket();
+            table.RecordSweep(stressBase, stressBase + Blocks * Block, ticket, 2);
+            std::this_thread::yield();
+        }
+    });
+    for (int c = 0; c < 4; ++c) {
+        threads.emplace_back([&, c] {
+            std::mt19937_64 random(static_cast<std::uint64_t>(c) * 53u + 2u);
+            std::vector<std::uint64_t> seen;
+            std::vector<std::uint64_t> latest;
+            Runs footprint;
+            while (!stop.load(std::memory_order_relaxed)) {
+                const auto first = random() % (Blocks - 4);
+                const auto count = random() % 4 + 1;
+                const auto ticket = table.Issue();
+                const auto capture = table.Now();
+                footprint.clear();
+                seen.assign(count, 0);
+                for (std::size_t i = 0; i < count; ++i) {
+                    seen[i] = versions[first + i].load(std::memory_order_acquire);
+                    footprint.emplace_back(stressBase + (first + i) * Block + 0x40, stressBase + (first + i) * Block + 0x80);
+                }
+                std::this_thread::yield();
+                latest.assign(count, 0);
+                for (std::size_t i = 0; i < count; ++i) latest[i] = published[first + i].load(std::memory_order_acquire);
+                if (CheckRuns(table, footprint, capture, ticket) == DrawGen::Clean) {
+                    ++cleans;
+                    for (std::size_t i = 0; i < count; ++i) {
+                        if (latest[i] > seen[i]) ++violations;
+                    }
+                } else {
+                    ++others;
+                }
+            }
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    stop = true;
+    for (auto& thread : threads) thread.join();
+    std::cout << "draw validation: clean " << cleans.load() << " other " << others.load() << " violations " << violations.load() << "\n";
+    Require(violations.load() == 0, "a clean draw validation hid a published write");
+    Require(cleans.load() != 0 && others.load() != 0, "the draw-validation stress did not exercise both verdicts");
+}
+
 // Shadow classification: the outcome table, and an injected decision that the table calls Clean
 // while the byte compare found a change is counted unsafe.
 void shadowClassify() {
@@ -418,19 +541,19 @@ void shadowClassify() {
     AgcDriver::DriverDetail::DispatchVariant variant;
     variant.runs.emplace_back(at + 0x100, at + 0x180);
     variant.genSince.store(table.Now());
-    const auto verdict = AgcDriver::DriverDetail::ShadowValidatedVariant(Consumer::DrawValidate, variant, AgcDriver::DriverDetail::EntryOutcome::EqualData, table.Now());
+    const auto verdict = AgcDriver::DriverDetail::ShadowValidatedVariant(Consumer::DrawValidate, variant, AgcDriver::DriverDetail::EntryOutcome::EqualData, table.Now(), false);
     Require(verdict == Verdict::Clean, "the fixture is not clean in the table");
     Require(counter("gen_shadow.draw_validate.unsafe") == unsafeBefore + 1, "an injected unsafe draw validation was not counted");
     // The same variant after a real event: Changed, and an equal compare restamps its since.
     Note(Event::CpuSweep, at, at + Page, Data | Cpu);
     const auto restamps = counter("gen_shadow.draw_validate.equal_restamped");
     const auto before = table.Now();
-    Require(AgcDriver::DriverDetail::ShadowValidatedVariant(Consumer::DrawValidate, variant, AgcDriver::DriverDetail::EntryOutcome::Equal, before) == Verdict::Changed, "a written variant is not changed");
+    Require(AgcDriver::DriverDetail::ShadowValidatedVariant(Consumer::DrawValidate, variant, AgcDriver::DriverDetail::EntryOutcome::Equal, before, true) == Verdict::Changed, "a written variant is not changed");
     Require(counter("gen_shadow.draw_validate.equal_restamped") == restamps + 1 && variant.genSince.load() == before, "an equal compare after a change did not restamp");
-    Require(AgcDriver::DriverDetail::ShadowValidatedVariant(Consumer::DrawValidate, variant, AgcDriver::DriverDetail::EntryOutcome::Equal, table.Now()) == Verdict::Clean, "the restamped variant is not clean");
+    Require(AgcDriver::DriverDetail::ShadowValidatedVariant(Consumer::DrawValidate, variant, AgcDriver::DriverDetail::EntryOutcome::Equal, table.Now(), true) == Verdict::Clean, "the restamped variant is not clean");
     // A refusal by a gate is not classified.
     const auto refused = counter("gen_shadow.draw_validate.refused");
-    AgcDriver::DriverDetail::ShadowValidatedVariant(Consumer::DrawValidate, variant, AgcDriver::DriverDetail::EntryOutcome::PublishMoved, table.Now());
+    AgcDriver::DriverDetail::ShadowValidatedVariant(Consumer::DrawValidate, variant, AgcDriver::DriverDetail::EntryOutcome::PublishMoved, table.Now(), false);
     Require(counter("gen_shadow.draw_validate.refused") == refused + 1, "a refused validation was classified");
     // Hit runs: 9 clean queue-0 hits then a miss land in the 8-15 bucket.
     for (int i = 0; i < 9; ++i) NoteDrawLookup(true, true, true);
@@ -451,6 +574,7 @@ int main(int argc, char** argv) {
         else if (mode == "--check") check();
         else if (mode == "--stress") stress();
         else if (mode == "--lockfree") lockfree();
+        else if (mode == "--draw-validation") drawValidation();
         else if (mode == "--shadow-classify") shadowClassify();
         else {
             std::cerr << "unknown mode\n";
