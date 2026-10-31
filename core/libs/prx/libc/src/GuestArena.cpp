@@ -451,6 +451,10 @@ bool GuestArenaWritesClean_nid_no_patch(std::uintptr_t address, std::size_t byte
     return WindowsMappings::Get().WritesClean(address, bytes);
 }
 
+bool GuestArenaPrelockWritesClean_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().WritesClean(address, bytes, true);
+}
+
 WriteWatchTiming GuestArenaWriteWatchTiming_nid_no_patch() {
     return WindowsMappings::ThreadTiming();
 }

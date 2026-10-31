@@ -120,6 +120,7 @@ std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
+std::uint64_t CollectPrelockWrites(std::uint64_t address, std::size_t bytes, bool memo);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the
 // tracker mutex, so every collect that bumped before it has finished its walk and every later

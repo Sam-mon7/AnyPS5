@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -21,15 +22,19 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace AgcDriver {
@@ -164,7 +169,7 @@ AgcDriver::Graphics::ColorTarget DecodeTarget(const Block& block) {
     return color;
 }
 
-void PreparedDraws(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::State state, const AgcDriver::Pm4::DrawParameters& draw, std::span<const AgcDriver::Graphics::CompiledShader> shaders) {
+void PreparedDraws(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::State state, const AgcDriver::Pm4::DrawParameters& draw, std::span<const AgcDriver::Graphics::CompiledShader> shaders, const char* control) {
     const bool enabled = AgcDriver::Graphics::DrawPrelockEnabled();
     const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
@@ -239,6 +244,27 @@ void PreparedDraws(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::State s
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         Require(device.PrepareDraw(state, draw, shaders).device == VK_NULL_HANDLE, "draw preparation ran inside an existing GPU hold");
+    }
+    if (control != nullptr) {
+        std::vector<std::byte> expected;
+        unsigned sequence = 0;
+        for (const bool on : {true, false, true}) {
+            std::ofstream(control, std::ios::trunc) << ++sequence << " FIX_PRELOCK_WALK_MEMO=" << on << '\n';
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            AgcDriver::ArchB::Switches::PollControl();
+            Require(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixPrelockWalkMemo) == on, "prelock memo runtime toggle was not applied");
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            auto preparation = device.PrepareDraw(state, draw, shaders, recipe.get());
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                device.Draw(state, draw, shaders, {}, &recipe, nullptr, &preparation);
+                device.WaitIdle();
+            }
+            std::vector<std::byte> pixels(TargetBytes);
+            AgcDriver::GuestMemory::Read(state.color.address, pixels);
+            if (expected.empty()) expected = pixels;
+            else Require(pixels == expected, "prelock memo on/off/on rendered different target bytes");
+        }
     }
 }
 
@@ -347,7 +373,7 @@ void PreparedTargetDraws(AgcDriver::VulkanDevice& device, const AgcDriver::Graph
     GuestMemory::Write(reinterpret_cast<std::uintptr_t>(vertices), std::as_bytes(std::span(Triangle)));
 }
 
-void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> pixelCode, std::uint32_t scissorWidth, bool prelock = false, bool targetPrelock = false) {
+void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> pixelCode, std::uint32_t scissorWidth, bool prelock = false, bool targetPrelock = false, const char* control = nullptr) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
@@ -409,7 +435,7 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
     if (prelock) {
         if (targetPrelock) PreparedTargetDraws(device, state, draw, shaders, vertexBlock->data);
-        else PreparedDraws(device, state, draw, shaders);
+        else PreparedDraws(device, state, draw, shaders, control);
         return;
     }
     device.Draw(state, draw, shaders);
@@ -478,16 +504,31 @@ Outcome Run(AgcDriver::VulkanDevice& device, bool watched, bool seeded, bool hoo
 
 int main(int argc, char** argv) {
     try {
+        const bool memo = argc == 2 && std::string_view(argv[1]) == "--prelock-memo";
+        struct ControlFile {
+            std::filesystem::path path;
+            ~ControlFile() { if (!path.empty()) std::filesystem::remove(path); }
+        } control;
+        if (memo) {
+            control.path = std::filesystem::temp_directory_path() / ("agc-h3b-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+#ifdef _WIN32
+            _putenv_s("APS5_ARCHB_GATE_RUN", "1");
+            _putenv_s("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str());
+#else
+            setenv("APS5_ARCHB_GATE_RUN", "1", 1);
+            setenv("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str(), 1);
+#endif
+        }
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (argc == 2 && (std::string_view(argv[1]) == "--draw-prelock" || std::string_view(argv[1]) == "--draw-target-prelock")) {
+        if (memo || (argc == 2 && (std::string_view(argv[1]) == "--draw-prelock" || std::string_view(argv[1]) == "--draw-target-prelock"))) {
             Block block(BlockBytes, true);
             std::fill(block.data, block.data + block.bytes, std::uint8_t{0xff});
             const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
             if (AgcDriver::Graphics::HostImportFor(context, block.Address(), block.bytes) == nullptr) return VulkanTestSkipped;
             const bool targetPrelock = std::string_view(argv[1]) == "--draw-target-prelock";
             if (targetPrelock && !AgcDriver::GuestMemory::Watched(block.Address(), TargetBytes)) return VulkanTestSkipped;
-            Draw(*device, DecodeTarget(block), Program(0, false), Drawn, true, targetPrelock);
+            Draw(*device, DecodeTarget(block), Program(0, false), Drawn, true, targetPrelock, memo ? std::getenv("APS5_ARCHB_CONTROL_FILE") : nullptr);
             std::puts("draw preparation tests passed");
             return 0;
         }

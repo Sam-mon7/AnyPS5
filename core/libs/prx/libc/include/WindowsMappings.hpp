@@ -447,7 +447,7 @@ public:
         return timing;
     }
 
-    bool WritesClean(std::uintptr_t address, std::size_t bytes) {
+    bool WritesClean(std::uintptr_t address, std::size_t bytes, bool includePrivate = false) {
         const CollectTimer timer;
         std::lock_guard lock(mutex);
         if (bytes == 0 || address + bytes < address || address + bytes > UINTPTR_MAX - 4095) return false;
@@ -461,12 +461,17 @@ public:
                 cursor = std::min(end, std::prev(clean)->second);
                 continue;
             }
-            if (!watchResident) return false;
             const auto next = residentRuns.upper_bound(cursor);
-            if (next == residentRuns.begin()) return false;
-            const auto run = std::prev(next);
-            if (run->second.end <= cursor) return false;
-            const auto stop = std::min(end, run->second.end);
+            auto stop = end;
+            if (next != residentRuns.begin() && std::prev(next)->second.end > cursor) {
+                if (!watchResident) return false;
+                stop = std::min(end, std::prev(next)->second.end);
+            } else {
+                if (!includePrivate) return false;
+                const auto memory = query(cursor);
+                if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
+                stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            }
             void* page = nullptr;
             ULONG_PTR count = 1;
             DWORD granularity = 0;

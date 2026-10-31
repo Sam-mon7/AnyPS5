@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -3544,6 +3545,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 }
 
 DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe) {
+    const bool prelockWalkMemo = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixPrelockWalkMemo);
     AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.Prelock");
     DrawPreparation prepared;
     auto* census = AgcDriver::ArchB::Recorder::CurrentDraw();
@@ -3574,7 +3576,7 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
             }
             const auto& [surface, bytes] = *described;
             const auto precollect = [&](std::uint64_t address, std::uint64_t count) {
-                const auto generation = GuestMemory::CollectWrites(address, static_cast<std::size_t>(count));
+                const auto generation = GuestMemory::CollectPrelockWrites(address, static_cast<std::size_t>(count), prelockWalkMemo);
                 if (census != nullptr) {
                     census->Count(M::H3PrelockTargetRanges);
                     census->Count(M::H3PrelockTargetBytes, count);
@@ -3598,7 +3600,7 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         cached = SharedResourceCache().Find(prepared.resourceKey);
     }
     recorderTiming.Mark("lookup");
-    if (cached != nullptr && collect) cached->PrecollectSurfaces();
+    if (cached != nullptr && collect) cached->PrecollectSurfaces(prelockWalkMemo);
     recorderTiming.Mark("surfaces");
     if (collect && residentTargets && context.detiler != nullptr && StorageTexture::DrawTargetPrelockEnabled()) {
         const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

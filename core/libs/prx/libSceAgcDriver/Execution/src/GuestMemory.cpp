@@ -1495,23 +1495,43 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 }
 #endif
 
-bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
+bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, std::size_t* stamped = nullptr) {
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window};
 #ifdef _WIN32
-    if (collectWindowsWrites(runs, first, stop, armedOnly)) return true;
+    if (collectWindowsWrites(runs, first, stop, armedOnly)) {
+        if (stamped != nullptr) *stamped = runs.stamped;
+        return true;
+    }
     noteRefusedWalk(tracker, first, stop);
     return false;
 #else
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
     const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
+    if (stamped != nullptr) *stamped = runs.stamped;
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
     return complete;
 #endif
 }
 
-std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
+#ifdef _WIN32
+struct PrelockWalkMemo {
+    std::uint64_t end = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t mapping = 0;
+    std::uint64_t committed = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t forgotten = 0;
+};
+
+auto& prelockWalkMemos() {
+    thread_local std::unordered_map<std::uint64_t, PrelockWalkMemo>* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
+#endif
+
+std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool prelockMemo = false) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto* census = AgcDriver::ArchB::Recorder::CurrentDraw();
     using M = AgcDriver::ArchB::Recorder::Metric;
@@ -1562,6 +1582,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto failedStop = stop;
     const auto fail = [&]() -> std::uint64_t {
         if (census != nullptr) census->Count(M::H3CollectRefused);
+        if (prelockMemo) AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_refused_unavailable");
         if (memoFailures) epochCollectMap(epoch).failedRanges[failedFirst] = {failedFirst, failedStop, epoch, unwatched, mapping};
         return 0;
     };
@@ -1578,7 +1599,6 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
-    const TimedAccess timed(CounterCollect, bytes);
 #ifndef _WIN32
     if (useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bytes <= WriteBlockBytes) {
         const auto begin = first & ~(WriteBlockBytes - 1);
@@ -1589,8 +1609,75 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
-    if (census != nullptr) census->Count(M::H3CollectWalkBytes, stop - first);
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return fail();
+    const auto walk = [&](std::size_t* stamped = nullptr) {
+        const TimedAccess timed(CounterCollect, bytes);
+        if (census != nullptr) census->Count(M::H3CollectWalkBytes, stop - first);
+        if (prelockMemo) {
+            AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_walks");
+            AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_walked_bytes", stop - first);
+        }
+        return walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, stamped);
+    };
+    bool reused = false;
+#ifdef _WIN32
+    PrelockWalkMemo proof;
+    if (prelockMemo) {
+        proof = {stop, 0, mapping, GuestArena::GuestArenaCommitGeneration_nid_postfix(), unwatched, ForgetSerial()};
+        auto& memos = prelockWalkMemos();
+        const auto found = memos.find(first);
+        const char* refusal = nullptr;
+        if (found == memos.end() || found->second.end != stop) refusal = "fix_prelock_memo_refused_absent";
+        else {
+            const auto& previous = found->second;
+            if (previous.mapping != proof.mapping) refusal = "fix_prelock_memo_refused_mapping";
+            else if (previous.committed != proof.committed) refusal = "fix_prelock_memo_refused_commit";
+            else if (previous.unwatched != proof.unwatched) refusal = "fix_prelock_memo_refused_unwatch";
+            else if ((proof.forgotten & 1) != 0 || previous.forgotten != proof.forgotten) refusal = "fix_prelock_memo_refused_forget";
+            else if (previous.generation > tracker.generation || !tracker.unchanged(tracker.blockOf(first), tracker.blockOf(stop - 1), previous.generation) || tracker.refusedSince(first, stop, previous.generation)) refusal = "fix_prelock_memo_refused_written";
+            else if (!GuestArena::GuestArenaPrelockWritesClean_nid_no_patch(first, stop - first)) refusal = "fix_prelock_memo_refused_cpu_or_untracked";
+            else if (proof.mapping != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || proof.committed != GuestArena::GuestArenaCommitGeneration_nid_postfix() || proof.unwatched != UnwatchSerial() || proof.forgotten != ForgetSerial()) refusal = "fix_prelock_memo_refused_raced";
+        }
+        if (refusal != nullptr) AgcDriver::ArchB::Recorder::Count(refusal);
+        else {
+            reused = true;
+            AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_hits");
+            AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_reused_bytes", stop - first);
+            static const bool verify = [] {
+                const auto* value = std::getenv("APS5_VERIFY_PRELOCK_MEMO");
+                return value != nullptr && std::strcmp(value, "1") == 0;
+            }();
+            if (verify) {
+                AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_verify_checks");
+                std::size_t stamped = 0;
+                if (!walk(&stamped) || stamped != 0) {
+                    AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_verify_mismatches");
+                    throw std::runtime_error("prelock walk memo verification mismatch");
+                }
+                AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_verify_mismatches", 0);
+            }
+        }
+    }
+#else
+    if (prelockMemo) AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_refused_platform");
+#endif
+    std::size_t stamped = 0;
+    if (!reused && !walk(&stamped)) return fail();
+#ifdef _WIN32
+    if (prelockMemo) {
+        auto& memos = prelockWalkMemos();
+        if (stamped == 0 && (proof.forgotten & 1) == 0 && proof.mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && proof.committed == GuestArena::GuestArenaCommitGeneration_nid_postfix() && proof.unwatched == UnwatchSerial() && proof.forgotten == ForgetSerial()) {
+            if (memos.size() >= 256 && !memos.contains(first)) {
+                memos.clear();
+                AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_refused_capacity");
+            }
+            proof.generation = tracker.generation;
+            memos[first] = proof;
+        } else {
+            memos.erase(first);
+            AgcDriver::ArchB::Recorder::Count("fix_prelock_memo_refused_dirty_result");
+        }
+    }
+#endif
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
@@ -1625,6 +1712,10 @@ std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, false);
+}
+
+std::uint64_t CollectPrelockWrites(std::uint64_t address, std::size_t bytes, bool memo) {
+    return collectWrites(address, bytes, true, memo && ThreadCollectEpoch() != 0);
 }
 
 std::uint64_t WriteGeneration() {

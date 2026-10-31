@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -1958,6 +1959,76 @@ void CheckFailedCollectMemo() {
 }
 
 #ifdef _WIN32
+void CheckPrelockWalkMemo(std::string_view mode) {
+    constexpr std::size_t bytes = 4 * Block;
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * bytes, Block));
+    struct Cleanup {
+        std::uint8_t* memory;
+        HANDLE section = nullptr;
+        ~Cleanup() {
+            GuestArena::GuestArenaReset_nid_postfix(memory, 2 * bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, 2 * bytes);
+            if (section != nullptr) {
+                GuestArena::GuestArenaForgetSection_nid_postfix(section);
+                CloseHandle(section);
+            }
+        }
+    } cleanup{memory};
+    Require(memory != nullptr, "cannot reserve the prelock memo fixture");
+    if (mode == "alias") {
+        cleanup.section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+        Require(cleanup.section != nullptr, "cannot create the prelock memo backing");
+        GuestArena::GuestArenaMapDirect_nid_postfix(memory, bytes, cleanup.section, 0, PAGE_READWRITE);
+        GuestArena::GuestArenaMapDirect_nid_postfix(memory + bytes, bytes, cleanup.section, 0, PAGE_READWRITE);
+    } else GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto collect = [&](bool memo = true) {
+        BumpCollectEpoch();
+        return CollectPrelockWrites(base, bytes, memo);
+    };
+    Require(collect() != 0, "prelock memo fixture is not watched");
+    const auto clean = collect();
+    Require(clean != 0, "clean prelock collection failed");
+    const auto reused = collect();
+    const bool verify = std::getenv("APS5_VERIFY_PRELOCK_MEMO") != nullptr;
+    Require(verify ? reused > clean : reused == clean, "unchanged prelock range was walked again");
+    if (mode == "unchanged") return;
+    if (mode == "cpu") memory[Block + 1] = 0x31;
+    else if (mode == "gpu") std::thread([&] { MarkPossiblyWritten(base + Block, 4); }).join();
+    else if (mode == "upload") {
+        const std::array<std::byte, 4> source{std::byte{0x42}, std::byte{0x43}, std::byte{0x44}, std::byte{0x45}};
+        StoreOwnBytes(base + Block, source);
+    } else if (mode == "alias") {
+        Require(GuestArena::GuestArenaHandleWrite_nid_postfix(base + bytes + Block), "the storage backing alias was not armed");
+        memory[bytes + Block] = 0x53;
+        Require(memory[Block] == 0x53, "alias does not share the surface backing");
+    } else if (mode == "unwatch") {
+        Unwatch(base, bytes);
+        Require(collect() == 0, "an unwatched range reused its memo");
+        GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+        Require(collect() != 0, "rewatched backing was not collected");
+        return;
+    } else if (mode == "remap") {
+        GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+        memory[Block] = 0x64;
+    } else if (mode == "forget") GuestAllocations::GuestAllocationsInvalidate_nid_postfix(base, bytes);
+    else if (mode == "transition") {
+        const auto run = [&](bool memo) {
+            for (std::size_t i = 0; i < bytes; ++i) memory[i] = static_cast<std::uint8_t>(i);
+            Require(collect(memo) != 0, "toggle collection failed");
+            return std::vector<std::uint8_t>(memory, memory + bytes);
+        };
+        const auto on = run(true);
+        Require(on == run(false) && on == run(true), "on/off/on changed surface bytes");
+        return;
+    } else throw std::runtime_error("unknown prelock memo test");
+    const auto changed = WriteGeneration();
+    Require(collect() > changed, "a changed prelock range reused its memo");
+    if (mode == "cpu" || mode == "alias" || mode == "remap") Require(!UnchangedSince(base, bytes, reused), "prelock fallback lost the CPU write stamp");
+}
+
 void CheckTargetCleanProof() {
     constexpr std::size_t bytes = 4 * Block;
     auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * bytes, Block));
@@ -2077,6 +2148,10 @@ int main(int argc, char** argv) {
             return 0;
         }
 #ifdef _WIN32
+        if (argc == 2 && std::string_view(argv[1]).starts_with("--prelock-memo-")) {
+            CheckPrelockWalkMemo(std::string_view(argv[1]).substr(15));
+            return 0;
+        }
         if (std::wstring_view(GetCommandLineW()).ends_with(L"--target-clean-proof")) {
             CheckTargetCleanProof();
             return 0;
