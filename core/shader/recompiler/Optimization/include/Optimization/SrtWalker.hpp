@@ -75,6 +75,29 @@ struct SrtReadTrace {
     std::vector<std::pair<const IrValue*, std::uint64_t>> slotReads;
 };
 
+struct ImageTableSnapshotCounts {
+    std::uint64_t calls = 0;
+    std::uint64_t tables = 0;
+    std::uint64_t columns = 0;
+    std::uint64_t records = 0;
+    std::uint64_t words = 0;
+    std::uint64_t pageQueries = 0;
+    std::uint64_t previous = 0;
+    std::uint64_t identical = 0;
+    std::uint64_t unwritten = 0;
+    std::uint64_t compared = 0;
+    std::uint64_t ns = 0;
+    std::uint64_t materializeNs = 0;
+    std::uint64_t reused = 0;
+    std::uint64_t rebuilt = 0;
+    std::uint64_t pageReused = 0;
+    std::uint64_t noPrevious = 0;
+    std::uint64_t changed = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t verifyMismatches = 0;
+    std::uint64_t verifyNs = 0;
+};
+
 struct SrtRuntime {
     std::span<const std::uint32_t> userData;
     std::uint64_t shaderBase = 0;
@@ -89,6 +112,10 @@ struct SrtRuntime {
     SrtMemoryUnchanged unchangedSince = nullptr;
     SrtMemorySupplier supplyWords = nullptr;
     SrtUserDataUse* userDataUse = nullptr;
+    ImageTableSnapshotCounts* imageTableCounts = nullptr;
+    bool imageTableCensus = false;
+    bool imageTableSnapshotReuse = false;
+    bool verifyImageTableSnapshotReuse = false;
 };
 
 enum class RuntimeValueType {

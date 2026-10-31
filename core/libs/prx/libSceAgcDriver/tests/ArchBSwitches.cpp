@@ -79,7 +79,8 @@ void toggleCase(const std::string& name) {
     setEnvironment("APS5_ARCHB_GATE_DELAY_US", "0");
     setEnvironment("APS5_ARCHB_TEST_RUNTIME_DEPENDENT", "0");
     setEnvironment("APS5_ARCHB_CONTROL_FILE", name == "NoFileNoCost" ? nullptr : path.string().c_str());
-    if (name == "VqMemo") setEnvironment("APS5_ARCHB_FIX_VQ_MEMO", nullptr);
+    const bool imageTable = name == "ImageTableSnapshot";
+    if (name == "VqMemo" || imageTable) setEnvironment(imageTable ? "APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "APS5_ARCHB_FIX_VQ_MEMO", nullptr);
     Switches::Initialize();
     const auto write = [&](const std::string& line, bool poll = true) {
         std::ofstream(path, std::ios::binary | std::ios::trunc) << line << '\n';
@@ -88,18 +89,20 @@ void toggleCase(const std::string& name) {
             Switches::PollControl();
         }
     };
-    if (name == "VqMemo") {
+    if (name == "VqMemo" || imageTable) {
+        const auto feature = imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
+        const std::string token = imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
         for (const auto& entry : Switches::Table()) {
-            if (entry.feature == Feature::FixVqMemo) check(!entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "query memo switch contract");
+            if (entry.feature == feature) check(!entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "runtime fix switch contract");
         }
-        check(!Switches::Enabled(Feature::FixVqMemo), "query memo must default off");
-        write("1 FIX_VQ_MEMO=1");
-        const auto selected = Switches::Enabled(Feature::FixVqMemo);
-        check(selected, "query memo did not turn on");
-        write("2 FIX_VQ_MEMO=0");
-        check(selected && !Switches::Enabled(Feature::FixVqMemo), "query memo did not preserve the selected path across a toggle");
-        write("3 FIX_VQ_MEMO=1");
-        check(Switches::Enabled(Feature::FixVqMemo), "query memo did not turn back on");
+        check(!Switches::Enabled(feature), "runtime fix must default off");
+        write("1 " + token + "=1");
+        const auto selected = Switches::Enabled(feature);
+        check(selected, "runtime fix did not turn on");
+        write("2 " + token + "=0");
+        check(selected && !Switches::Enabled(feature), "runtime fix did not preserve the selected path across a toggle");
+        write("3 " + token + "=1");
+        check(Switches::Enabled(feature), "runtime fix did not turn back on");
     } else if (name == "SeqMonotonic") {
         write("2 GATE_NOOP=1 GATE_DELAY_US=7000");
         check(Switches::Enabled(Feature::GateNoop) && Switches::GateDelayMicros() == 7000, "initial toggle");
