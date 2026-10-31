@@ -121,6 +121,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     };
     const auto capture = [&] {
         const SampledReadScope sampling(evidenceReads);
+        shaderMemory.SetImageTableDrawHit(drawHit);
         try {
             return CaptureInvocation(shaderMemory, *program.snapshot, program.codeOffset, request, invocation);
         } catch (const std::exception& error) {
