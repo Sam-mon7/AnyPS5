@@ -55,6 +55,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #ifdef _WIN32
 #include <windows.h>
@@ -3614,6 +3616,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
             static const bool noAdopt = std::getenv("APS5_NO_PRESENT_EPOCH") != nullptr;
             if (!noAdopt) GuestMemory::AdoptLatestCollectEpoch();
             GuestMemory::CollectWritesUncached(buffer.address, bytes);
+            const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Presentation);
             if (!GuestMemory::UnchangedSince(buffer.address, bytes, resident->GenerationFor(buffer.address, bytes)) || (buffer.dccAddress != 0 && ResidentKeysMoved(*resident))) {
                 if (resident->ImageLayers() > 1) resident->RefreshLayers(layer, 1);
                 else resident->Refresh();
@@ -3622,6 +3625,10 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
             ++residentPresents;
         }
     }
+    // Write-generation census, once per present: the global serials proofs consult (their moves per
+    // frame) and the per-thread counters published for the recorder.
+    if (GuestMemory::Gen::ShadowActive()) GuestMemory::Gen::detail::SampleDriverSerials();
+    if (GuestMemory::Gen::Active()) GuestMemory::Gen::PublishCounters();
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
     bool dumpFrame = false;
     if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
@@ -6269,4 +6276,23 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     return RecipeOutcome::Recorded;
 }
 
+}
+
+namespace AgcDriver::GuestMemory::Gen::detail {
+void SampleDriverSerials() noexcept {
+    std::array<std::uint64_t, static_cast<std::size_t>(Serial::Count)> serials{};
+    serials[static_cast<std::size_t>(Serial::Proof)] = GuestMemory::ProofSerial();
+    serials[static_cast<std::size_t>(Serial::ResourceProof)] = GuestMemory::ResourceProofSerial();
+    serials[static_cast<std::size_t>(Serial::Pending)] = AgcDriver::Graphics::StorageTexture::PendingSerial();
+    serials[static_cast<std::size_t>(Serial::Publish)] = AgcDriver::Graphics::Recorder::PublishGeneration();
+    serials[static_cast<std::size_t>(Serial::Forget)] = GuestMemory::ForgetSerial() / 2;
+    serials[static_cast<std::size_t>(Serial::Unwatch)] = GuestMemory::UnwatchSerial();
+    serials[static_cast<std::size_t>(Serial::Allocations)] = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+#ifdef _WIN32
+    serials[static_cast<std::size_t>(Serial::Commit)] = GuestArena::GuestArenaCommitGeneration_nid_postfix();
+#endif
+    serials[static_cast<std::size_t>(Serial::Depth)] = AgcDriver::Graphics::DepthSurfacesSerial() + AgcDriver::Graphics::DepthSurfacesReleased();
+    serials[static_cast<std::size_t>(Serial::Tracker)] = GuestMemory::WriteGeneration();
+    SampleSerials(serials);
+}
 }

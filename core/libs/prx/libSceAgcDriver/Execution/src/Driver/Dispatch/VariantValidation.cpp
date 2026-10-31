@@ -94,7 +94,74 @@ bool Driver::vouchedValidation() {
     return enabled;
 }
 
+namespace {
+// Whether the calling thread's last validateVariant reached the byte compare (the shadow tells a
+// decision taken on the bytes from a refusal by a gate or a serial).
+thread_local bool variantCompared = false;
+}
+
+GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer consumer, const DispatchVariant& variant, EntryOutcome outcome, std::uint64_t before) {
+    namespace Gen = GuestMemory::Gen;
+    const auto since = variant.genSince.load(std::memory_order_acquire);
+    auto& table = Gen::Global();
+    const auto required = Gen::Required();
+    constexpr auto kinds = static_cast<std::uint8_t>(Gen::Data | Gen::Meta | Gen::Pending);
+    const auto rank = [](Gen::Verdict verdict) { return verdict == Gen::Verdict::Changed ? 3 : verdict == Gen::Verdict::Unknown ? 2 : verdict == Gen::Verdict::PendingOnly ? 1 : 0; };
+    const auto evaluate = [&](bool exhaustive, bool* needsSweep, Gen::UnknownReason* reason) {
+        auto verdict = since == 0 ? Gen::Verdict::Unknown : Gen::Verdict::Clean;
+        *reason = since == 0 ? Gen::UnknownReason::NoSince : Gen::UnknownReason::None;
+        for (const auto& [begin, end] : variant.runs) {
+            if (since == 0) break;
+            Gen::UnknownReason why = Gen::UnknownReason::None;
+            const auto next = exhaustive ? table.CheckExhaustive(begin, end, since, 0, kinds, &why) : table.Check(begin, end, since, 0, kinds, &why);
+            if (needsSweep != nullptr && (required == 0 || !table.Covered(begin, end, required))) *needsSweep = true;
+            if (rank(next) > rank(verdict)) {
+                verdict = next;
+                *reason = why;
+            }
+        }
+        // Not covered at the thread's ticket: Check would sweep first (unknown_not_swept, not Clean).
+        if (verdict == Gen::Verdict::Clean && (required == 0 || std::ranges::any_of(variant.runs, [&](const auto& run) { return !table.Covered(run.first, run.second, required); }))) {
+            verdict = Gen::Verdict::Unknown;
+            *reason = Gen::UnknownReason::NotSwept;
+        }
+        return verdict;
+    };
+    bool needsSweep = false;
+    Gen::UnknownReason reason = Gen::UnknownReason::None;
+    const auto verdict = evaluate(false, &needsSweep, &reason);
+    bool unchanged;
+    if (outcome == EntryOutcome::Equal) unchanged = true;
+    else if (outcome == EntryOutcome::EqualData || (variantCompared && (outcome == EntryOutcome::Differing || outcome == EntryOutcome::Inaccessible))) unchanged = false;
+    else {
+        Gen::CountRefused(consumer);
+        return verdict;
+    }
+    const auto classified = Gen::Classify(consumer, verdict, reason, unchanged, needsSweep);
+    if (classified == Gen::Outcome::Conservative && verdict == Gen::Verdict::Changed) {
+        bool dataMoved = false;
+        for (const auto& [begin, end] : variant.runs) dataMoved = dataMoved || table.Check(begin, end, since, 0, Gen::Data | Gen::Cpu) == Gen::Verdict::Changed;
+        if (!dataMoved) Gen::CountConservativeMeta(consumer);
+    }
+    const auto first = variant.runs.empty() ? std::pair<std::uint64_t, std::uint64_t>{0, 1} : variant.runs.front();
+    if (classified == Gen::Outcome::Unsafe) Gen::ReportUnsafe(consumer, first.first, first.second, since, "the byte compare found a change");
+    if (Gen::VerifySample()) {
+        Gen::UnknownReason slowReason = Gen::UnknownReason::None;
+        const auto slow = evaluate(true, nullptr, &slowReason);
+        auto verified = slow == Gen::Verdict::Clean ? (unchanged ? Gen::Outcome::AgreeClean : Gen::Outcome::Unsafe) : (unchanged ? Gen::Outcome::Conservative : Gen::Outcome::AgreeChanged);
+        if (slow != verdict) verified = Gen::Outcome::Unsafe;
+        Gen::CountVerify(consumer, verified);
+        if (verified == Gen::Outcome::Unsafe) Gen::ReportUnsafe(consumer, first.first, first.second, since, slow != verdict ? "verify: exhaustive verdict differs" : "verify: clean while the byte compare found a change");
+    }
+    if (verdict != Gen::Verdict::Clean && outcome == EntryOutcome::Equal && before != 0) {
+        Gen::CountRestamp(consumer);
+        variant.genSince.store(before, std::memory_order_release);
+    }
+    return verdict;
+}
+
 EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit, bool bufferBases) {
+    variantCompared = false;
     if (live != nullptr) live->clear();
     if (feedbackHit != nullptr) *feedbackHit = false;
     if (DrawPipeline::Active()) {
@@ -161,6 +228,7 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
 
     pending.Load();
     bool unmapped = false;
+    variantCompared = true;
     if (!validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked || feedback ? &mask : nullptr, vouched)) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
     if (Graphics::Recorder::PublishGeneration() != publish) return EntryOutcome::PublishMoved;
     if (Graphics::StorageTexture::PendingSerial() != pendingSerial) return EntryOutcome::PendingMoved;

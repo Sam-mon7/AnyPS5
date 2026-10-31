@@ -61,6 +61,11 @@ std::atomic<std::uint64_t> commitGeneration{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t, std::uint64_t)> privateMappingObserver{nullptr};
 #endif
 std::atomic<void (*)(std::uintptr_t, std::size_t)> accessObserver{nullptr};
+std::atomic<void (*)(std::uintptr_t, std::size_t, bool)> hostWriteObserver{nullptr};
+
+void noteHostWrite(const void* pointer, std::size_t bytes, bool end) {
+    if (const auto callback = hostWriteObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes, end);
+}
 
 void noteAccess(const void* pointer, std::size_t bytes) {
     if (const auto callback = accessObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -685,7 +690,12 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
     if (const auto hook = hostReadHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
+void GuestArenaSetHostWriteObserver_nid_no_patch(void (*observer)(std::uintptr_t address, std::size_t bytes, bool end)) {
+    hostWriteObserver.store(observer, std::memory_order_release);
+}
+
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+    noteHostWrite(pointer, bytes, false);
 #ifdef _WIN32
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else
@@ -710,6 +720,7 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #else
     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);
 #endif
+    noteHostWrite(pointer, bytes, true);
 }
 
 #ifndef _WIN32

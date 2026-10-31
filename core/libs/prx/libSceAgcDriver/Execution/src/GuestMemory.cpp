@@ -660,11 +660,21 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetSerial.fetch_add(1, std::memory_order_release);
     Pages().forget(address, bytes);
     forgetSerial.fetch_add(1, std::memory_order_release);
+    // Write generations: a mapping change (meta + data) published before libc returns; the blocks'
+    // sweeps no longer cover them. Leaves never touched stay missing (a later leaf is born after).
+    if (bytes != 0 && Gen::Active()) {
+        static_cast<void>(Gen::Note(Gen::Event::Forget, address, address + bytes, Gen::Meta | Gen::Data, 0, false));
+        Gen::Global().DropCoverage(address, address + bytes);
+    }
 }
 
 void ForgetInaccessiblePages(std::uintptr_t address, std::size_t bytes) {
     Pages().accessSerial.fetch_add(1, std::memory_order_acq_rel);
     Pages().forgetInaccessible(address, bytes);
+    if (bytes != 0 && Gen::Active()) {
+        static_cast<void>(Gen::Note(Gen::Event::Inaccessible, address, address + bytes, Gen::Meta, 0, false));
+        Gen::Global().DropCoverage(address, address + bytes);
+    }
 }
 
 #ifdef __linux__
@@ -1024,6 +1034,14 @@ struct WindowCopy {
 void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_t generation);
 #endif
 
+// Write generations: host writes (file I/O, AIO, network) into guest memory. Meta at the start, so
+// a capture made while the host write runs never reads clean; data and cpu once it finished.
+void noteHostWriteGen(std::uintptr_t address, std::size_t bytes, bool end) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address || !Gen::Active()) return;
+    if (end) static_cast<void>(Gen::Note(Gen::Event::HostWriteEnd, address, address + bytes, Gen::Data | Gen::Cpu, 0, false));
+    else static_cast<void>(Gen::Note(Gen::Event::HostWriteBegin, address, address + bytes, Gen::Meta, 0, false));
+}
+
 struct WriteTracker {
     AgcDriver::Mutex mutex;
     bool initialized = false;
@@ -1052,6 +1070,22 @@ struct WriteTracker {
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint64_t> generation{1};
     std::atomic<std::uint64_t> stable{1};
+    // A new tracker generation (under the mutex). With APS5_ARCHB_GEN_TABLE=1 it comes from the
+    // write-generation clock (GenClock), so the stamps and the generations handed to consumers are
+    // values of that clock and every table event is ordered against them; only values change, the
+    // order of every stamp and compare stays the same (no code does arithmetic on generations).
+    std::uint64_t bump() {
+        if (Gen::Active()) {
+            // Mapping changes reach the table through the page-state invalidator (ForgetPages),
+            // installed with the page-state cache: the driver installs it at its first range check,
+            // the table makes sure it is there before its first generation (one acquire load after).
+            Pages().initialize();
+            const auto next = Gen::Global().BumpAbove(generation.load(std::memory_order_relaxed));
+            generation.store(next, std::memory_order_release);
+            return next;
+        }
+        return ++generation;
+    }
     std::vector<void*> pages;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
     // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
@@ -1082,9 +1116,11 @@ struct WriteTracker {
         coverage.Initialize(base, size);
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
+        GuestArena::GuestArenaSetHostWriteObserver_nid_no_patch(&noteHostWriteGen);
 #else
         watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
         if (watched) leaves.resize(LeafCount);
+        if (watched) GuestArena::GuestArenaSetHostWriteObserver_nid_no_patch(&noteHostWriteGen);
 #endif
     }
 
@@ -1120,7 +1156,7 @@ struct WriteTracker {
         bool started = false;
         for (auto block = blockOf(first); block <= blockOf(stop - 1); ++block) {
             if (!coverage.Covers(blockBegin(block), static_cast<std::size_t>(std::min<std::uint64_t>(WriteBlockBytes, base + size - blockBegin(block))))) continue;
-            if (!started) ++generation;
+            if (!started) bump();
             started = true;
             stampHint(block);
         }
@@ -1469,18 +1505,160 @@ TrackerLock lockTracker(WriteTracker& tracker) {
     return TrackerLock(tracker);
 }
 
+// Write-generation shadow (APS5_ARCHB_GEN_SHADOW): every answer of the tracker's query APIs is also
+// asked of the generation table (lock-free Check over data, meta and pending at the consumer's own
+// since, which is a GenClock value while the table is on) and classified against the answer the
+// tracker gave, for the consumer named by the calling thread's Gen::ConsumerScope. Under the
+// tracker mutex like the query itself, so the stamps it compares were all published.
+struct ShadowVerdict {
+    Gen::Verdict verdict = Gen::Verdict::Clean;
+    Gen::UnknownReason reason = Gen::UnknownReason::None;
+    bool needsSweep = false;
+};
+
+Gen::UnknownReason uncoveredReason(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
+    if (!tracker.watched) return Gen::UnknownReason::Outside;
+#ifdef _WIN32
+    if (address < tracker.base || bytes > tracker.size || address - tracker.base > tracker.size - bytes) return Gen::UnknownReason::Outside;
+    if (!tracker.coverage.Covers(address, bytes)) return Gen::UnknownReason::Excluded;
+    return Gen::UnknownReason::HostRegion;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return Gen::UnknownReason::Outside;
+#endif
+}
+
+// Changed > Unknown > PendingOnly > Clean.
+void combineVerdict(ShadowVerdict& into, const ShadowVerdict& next) {
+    const auto rank = [](Gen::Verdict verdict) {
+        switch (verdict) {
+        case Gen::Verdict::Changed: return 3;
+        case Gen::Verdict::Unknown: return 2;
+        case Gen::Verdict::PendingOnly: return 1;
+        case Gen::Verdict::Clean: return 0;
+        }
+        return 3;
+    };
+    if (rank(next.verdict) > rank(into.verdict)) {
+        into.verdict = next.verdict;
+        into.reason = next.reason;
+    }
+    into.needsSweep = into.needsSweep || next.needsSweep;
+}
+
+ShadowVerdict shadowCheck(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t since, bool covered, bool exhaustive = false, std::uint8_t kinds = Gen::Data | Gen::Meta | Gen::Pending) {
+    ShadowVerdict result;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) {
+        result.verdict = Gen::Verdict::Unknown;
+        result.reason = Gen::UnknownReason::Outside;
+        return result;
+    }
+    if (!covered) {
+        result.verdict = Gen::Verdict::Unknown;
+        result.reason = since == 0 ? Gen::UnknownReason::NoSince : uncoveredReason(tracker, address, bytes);
+        return result;
+    }
+    auto& table = Gen::Global();
+    result.verdict = exhaustive ? table.CheckExhaustive(address, address + bytes, since, 0, kinds, &result.reason) : table.Check(address, address + bytes, since, 0, kinds, &result.reason);
+    const auto required = Gen::Required();
+    result.needsSweep = required == 0 || !table.Covered(address, address + bytes, required);
+    // Check at the context's ticket: without a covering sweep it would sweep first, so fields that
+    // read clean are only 'clean unless the sweep finds a write' (unknown_not_swept), never Clean.
+    if (result.needsSweep && result.verdict == Gen::Verdict::Clean) {
+        result.verdict = Gen::Verdict::Unknown;
+        result.reason = Gen::UnknownReason::NotSwept;
+    }
+    return result;
+}
+
+// The verifier (APS5_ARCHB_GEN_VERIFY=N, 1 in N shadow verdicts): the exhaustive check must give
+// the same verdict, and no block may carry a tracker stamp newer than its table data (a stamp the
+// table missed). Stamps from before the reset floor (the table was off) are not compared.
+// One range of a decision, with whether the tracker covered it (watched, a since, inside coverage).
+struct ShadowRange {
+    std::uint64_t address;
+    std::size_t bytes;
+    std::uint64_t since;
+    bool covered;
+};
+
+void verifyShadow(const WriteTracker& tracker, Gen::Consumer consumer, std::span<const ShadowRange> ranges, bool unchanged, const ShadowVerdict& fast) {
+    ShadowVerdict slow;
+    bool missed = false;
+    const auto floor = Gen::Global().ResetFloor();
+    for (const auto& range : ranges) {
+        combineVerdict(slow, shadowCheck(tracker, range.address, range.bytes, range.since, range.covered, true));
+        if (!range.covered || range.bytes == 0) continue;
+        for (auto block = tracker.blockOf(range.address); block <= tracker.blockOf(range.address + range.bytes - 1); ++block) {
+            const auto stamp = tracker.stampOf(block);
+            if (stamp >= floor && Gen::Global().Fields(tracker.blockBegin(block)).data < stamp) missed = true;
+        }
+    }
+    // The fast verdict may have been lowered to unknown_not_swept by libc's unswept-write probe
+    // (UnchangedSinceClean); the exhaustive pass agrees when its fields read clean or pending.
+    if (fast.verdict == Gen::Verdict::Unknown && fast.reason == Gen::UnknownReason::NotSwept && (slow.verdict == Gen::Verdict::Clean || slow.verdict == Gen::Verdict::PendingOnly)) slow = fast;
+    Gen::Outcome outcome;
+    if (slow.verdict == Gen::Verdict::Clean) outcome = unchanged ? Gen::Outcome::AgreeClean : Gen::Outcome::Unsafe;
+    else outcome = unchanged ? Gen::Outcome::Conservative : Gen::Outcome::AgreeChanged;
+    const bool differs = slow.verdict != fast.verdict;
+    if (missed || differs) outcome = Gen::Outcome::Unsafe;
+    Gen::CountVerify(consumer, outcome);
+    const auto& first = ranges.front();
+    if (outcome == Gen::Outcome::Unsafe) Gen::ReportUnsafe(consumer, first.address, first.address + first.bytes, first.since, missed ? "verify: the table missed a tracker stamp" : differs ? "verify: exhaustive verdict differs" : "verify: clean while the tracker found a change");
+}
+
+void classifyShadow(const WriteTracker& tracker, std::span<const ShadowRange> ranges, bool unchanged, const ShadowVerdict& verdict, const std::source_location& site) {
+    if (ranges.empty()) return;
+    const auto consumer = Gen::CurrentConsumer();
+    if (consumer == Gen::Consumer::Other) Gen::NoteOtherSite(site.file_name(), site.line());
+    const auto outcome = Gen::Classify(consumer, verdict.verdict, verdict.reason, unchanged, verdict.needsSweep);
+    // A conservative Changed: whether data alone would have read clean (the change was meta).
+    if (outcome == Gen::Outcome::Conservative && verdict.verdict == Gen::Verdict::Changed) {
+        bool dataMoved = false;
+        for (const auto& range : ranges) dataMoved = dataMoved || shadowCheck(tracker, range.address, range.bytes, range.since, range.covered, false, Gen::Data | Gen::Cpu).verdict == Gen::Verdict::Changed;
+        if (!dataMoved) Gen::CountConservativeMeta(consumer);
+    }
+    const auto& first = ranges.front();
+    if (outcome == Gen::Outcome::Unsafe) Gen::ReportUnsafe(consumer, first.address, first.address + first.bytes, first.since, "clean while the tracker found a change");
+    if (Gen::VerifySample()) verifyShadow(tracker, consumer, ranges, unchanged, verdict);
+}
+
+// One tracker answer over one range.
+void shadowQuery(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t since, bool covered, bool unchanged, const std::source_location& site) {
+    const std::array<ShadowRange, 1> ranges{ShadowRange{address, bytes, since, covered}};
+    classifyShadow(tracker, ranges, unchanged, shadowCheck(tracker, address, bytes, since, covered), site);
+}
+
+// Several ranges, one decision (UnchangedSinceAll, UnchangedSinceClean, UnchangedCommittedSince),
+// gathered in a per-thread scratch vector (no allocation once it has grown).
+void shadowRanges(const WriteTracker& tracker, std::span<const ShadowRange> ranges, bool unchanged, const std::source_location& site) {
+    ShadowVerdict combined;
+    for (const auto& range : ranges) combineVerdict(combined, shadowCheck(tracker, range.address, range.bytes, range.since, range.covered));
+    classifyShadow(tracker, ranges, unchanged, combined, site);
+}
+
+std::vector<ShadowRange>& shadowScratch() {
+    thread_local std::vector<ShadowRange>* scratch = nullptr;
+    return ShaderRecompiler::ThreadOwned(scratch);
+}
+
 #ifdef _WIN32
 void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     if (!tracker.watched || bytes == 0 || bytes > tracker.size || address < tracker.base || address - tracker.base > tracker.size - bytes) return;
     tracker.coverage.Restore(address, bytes, generation);
-    ++tracker.generation;
+    tracker.bump();
     tracker.noteCpuStore(address, address + bytes, tracker.generation);
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(address + bytes - 1); ++block) {
         if (const auto& leaf = tracker.leaves[block / WriteTracker::LeafBlocks]; leaf != nullptr) leaf->hintBlocks[block % WriteTracker::LeafBlocks] = 0;
         if (const auto found = tracker.driverPieces.find(block); found != tracker.driverPieces.end()) found->second.dropped = std::max<std::uint64_t>(found->second.dropped, tracker.generation);
         tracker.stamp(block, tracker.generation, StampKind::Cpu);
+    }
+    if (Gen::Active()) {
+        static_cast<void>(Gen::NoteState(Gen::Event::WatchMapping, address, address + bytes, Gen::BlockState::Tracked, Gen::Data | Gen::Cpu | Gen::Meta, tracker.generation.load(std::memory_order_relaxed)));
+        Gen::Global().DropCoverage(address, address + bytes);
     }
     unwatchSerial.fetch_add(1, std::memory_order_release);
 }
@@ -1825,6 +2003,23 @@ struct StampRuns {
     const WindowCopy* window = nullptr;
 };
 
+// Write generations (APS5_ARCHB_GEN_TABLE): the table event for a tracker stamp, with the stamp's
+// own generation (a GenClock value while the table is on). Import-window pages (bytes equal to the
+// pre-import hash) bump data too, which is conservative.
+void noteStampGen(StampKind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t generation) {
+    switch (kind) {
+    case StampKind::Cpu: Gen::Note(Gen::Event::CpuSweep, begin, end, Gen::Data | Gen::Cpu, generation); break;
+    case StampKind::Driver: Gen::Note(Gen::Event::DriverSweep, begin, end, Gen::Data, generation); break;
+    case StampKind::ImportWindow: Gen::Note(Gen::Event::ImportWindow, begin, end, Gen::Data | Gen::Cpu, generation); break;
+    case StampKind::Fresh: Gen::Note(Gen::Event::FreshCollect, begin, end, Gen::Data | Gen::Cpu, generation); break;
+    }
+}
+
+// A driver store or landed GPU write over [begin, end), stamped with `generation` (after the bytes).
+void noteDriverStoreGen(std::uint64_t begin, std::uint64_t end, std::uint64_t generation) {
+    if (end > begin && Gen::Active()) static_cast<void>(Gen::Note(Gen::Event::DriverStore, begin, end, Gen::Data, generation));
+}
+
 void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     auto& runs = *static_cast<StampRuns*>(context);
     auto& tracker = runs.tracker;
@@ -1834,10 +2029,16 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
     else tracker.noteWalkStore(begin, end, generation);
+    const bool gen = Gen::Active();
     if (runs.window != nullptr) {
-        for (auto page = begin; page < end; page += WritePageBytes) tracker.stamp(tracker.blockOf(page), generation, runs.window->Holds(page) ? StampKind::ImportWindow : kind);
+        for (auto page = begin; page < end; page += WritePageBytes) {
+            const auto pageKind = runs.window->Holds(page) ? StampKind::ImportWindow : kind;
+            tracker.stamp(tracker.blockOf(page), generation, pageKind);
+            if (gen) noteStampGen(pageKind, page, page + WritePageBytes, generation);
+        }
     } else {
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, kind);
+        if (gen) noteStampGen(kind, begin, end, generation);
     }
 #ifndef _WIN32
     collectDirtyRuns.fetch_add(1, std::memory_order_relaxed);
@@ -1905,15 +2106,35 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
     StampRuns runs{tracker, StampKind::Cpu};
     pagesOf(&GuestArena::GuestArenaTakeUnreportedPages_nid_no_patch, [&](std::uintptr_t page) { stampWrittenRun(&runs, page, page + WritePageBytes); });
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
-    pagesOf(&GuestArena::GuestArenaComparedPages_nid_no_patch, [&](std::uintptr_t page) { tracker.refused[tracker.blockOf(page)] = generation; });
+    const bool gen = Gen::Active();
+    pagesOf(&GuestArena::GuestArenaComparedPages_nid_no_patch, [&](std::uintptr_t page) {
+        tracker.refused[tracker.blockOf(page)] = generation;
+        // Compared-when-shared pages: the block reads Unknown(compared) until a walk tracks it again.
+        if (gen) static_cast<void>(Gen::NoteState(Gen::Event::Refused, page, page + WritePageBytes, Gen::BlockState::Compared, Gen::Meta, generation));
+    });
 }
 #endif
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool memoVirtualQuery = false) {
-    ++tracker.generation;
+    tracker.bump();
     StampRuns runs{tracker, kind, 0, window};
+    // Write generations: a complete resetting walk covers its pages at the ticket read before its
+    // OS query (rule V2); a failed one leaves its blocks unknown until a later walk succeeds (no
+    // meta bump: the dirty bits it did not reset are reported by that walk).
+    const bool gen = Gen::Active();
+    const bool sweep = gen && !armedOnly && (kind == StampKind::Cpu || kind == StampKind::Driver);
+    const auto ticket = sweep ? Gen::Global().LatestTicket() : 0;
+    const auto failed = [&] {
+        if (!gen) return;
+        static_cast<void>(Gen::Global().SetState(first, stop, Gen::BlockState::Uncommitted, false));
+        static_cast<void>(Gen::Note(Gen::Event::FailedWalk, first, stop, 0, tracker.generation.load(std::memory_order_relaxed), false));
+    };
 #ifdef _WIN32
-    if (collectWindowsWrites(runs, first, stop, armedOnly, memoVirtualQuery)) return true;
+    if (collectWindowsWrites(runs, first, stop, armedOnly, memoVirtualQuery)) {
+        if (sweep) Gen::NoteSweep(first, stop, ticket);
+        return true;
+    }
+    failed();
     noteRefusedWalk(tracker, first, stop);
     return false;
 #else
@@ -1922,6 +2143,8 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
     const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (complete && sweep) Gen::NoteSweep(first, stop, ticket);
+    else if (!complete) failed();
     return complete;
 #endif
 }
@@ -1973,6 +2196,19 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
+    // Write generations: an uncached collect sweeps at a private fresh ticket (rule V4); a memoized
+    // one is modeled under the shadow: what EnsureSwept would sweep at the thread's ticket, judged
+    // before this call's own walk can cover anything.
+    Gen::Coverage model{};
+    bool modeled = false;
+    if (!memoized && Gen::Active()) static_cast<void>(Gen::IssuePrivate(Gen::TicketReason::Uncached));
+    if (memoized && Gen::ShadowActive()) {
+        const auto required = Gen::Required();
+        const bool unbumped = required == 0 || HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() == 0;
+        model = Gen::Global().Model(first, stop, unbumped ? Gen::Table::NeverCovered : required, Gen::SweeperId());
+        Gen::NoteModel(model, unbumped);
+        modeled = true;
+    }
     // Only a thread that bumps its epoch reuses anything (an unbumped thread's epoch is fresh per call).
     WriteTracker::Memo* cached = nullptr;
     bool verifyHit = false;
@@ -2054,6 +2290,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
+    if (modeled && model.uncoveredPages == 0 && model.unknownBlocks == 0 && model.crossBlocks != 0) Gen::NoteModelCrossWalk();
     if (!walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, memoVirtualQuery)) return fail();
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
@@ -2162,13 +2399,16 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
     return tracker.generation.load(std::memory_order_relaxed);
 }
 
-void BumpCollectEpoch() {
+void BumpCollectEpoch(Gen::TicketReason reason) {
     census::noteBump();
     const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+    // Rule V1: a ticket at every ordering point, after the observation (the same points as the
+    // epoch). A committer's ticket is the one its commit carried (Gen::Follow), not a fresh one.
+    if (reason != Gen::TicketReason::Committer && Gen::Active()) static_cast<void>(Gen::Issue(reason));
 }
 
 std::uint64_t ThreadCollectEpoch() {
@@ -2182,6 +2422,13 @@ std::uint64_t UnwatchSerial() {
 void AdoptLatestCollectEpoch() {
     const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
     if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);
+    if (Gen::Active()) Gen::AdoptLatest();
+}
+
+namespace Gen::detail {
+std::uint64_t CurrentTrackerGeneration() noexcept {
+    return Tracker().generation.load(std::memory_order_relaxed);
+}
 }
 
 std::uint64_t CollectEpochBumps() {
@@ -2189,12 +2436,14 @@ std::uint64_t CollectEpochBumps() {
 }
 
 void ResetWriteCensus() {
+    if (Gen::Active()) Gen::ResetCensus();
     if (!census::enabled()) return;
     std::lock_guard lock(census::tableMutex());
     census::table().clear();
 }
 
 void ReportWriteCensus(std::uint64_t pass, std::uint64_t frames) {
+    if (Gen::Active()) Gen::ReportCensus(pass, frames);
     if (!census::enabled()) return;
     std::map<census::Key, census::Row> rows;
     {
@@ -2283,6 +2532,8 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
     if (!tracker.watched) return;
+    // Write generations: excluded blocks read Unknown(excluded) until coverage is restored.
+    if (bytes != 0 && Gen::Active()) static_cast<void>(Gen::NoteState(Gen::Event::Unwatch, address, address + bytes, Gen::BlockState::Excluded, Gen::Meta, 0, false));
 #ifdef _WIN32
     tracker.startHints(address, bytes);
     if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) unwatchSerial.fetch_add(1, std::memory_order_release);
@@ -2326,11 +2577,15 @@ void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
         if (tracker.coverage.Covers(begin, bytes)) continue;
         GuestArena::GuestArenaCompareWhenShared_nid_no_patch(static_cast<std::uintptr_t>(begin), bytes);
         if (!walkWrites(tracker, begin, end, StampKind::Cpu) || !tracker.coverage.Restore(begin, bytes)) continue;
-        ++tracker.generation;
+        tracker.bump();
         tracker.noteCpuStore(begin, end, tracker.generation);
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) {
             tracker.driverPieces.erase(block);
             tracker.stamp(block, tracker.generation, StampKind::Cpu);
+        }
+        if (Gen::Active()) {
+            static_cast<void>(Gen::NoteState(Gen::Event::Rewatch, begin, end, Gen::BlockState::Tracked, Gen::Data | Gen::Cpu | Gen::Meta, tracker.generation.load(std::memory_order_relaxed)));
+            Gen::Global().DropCoverage(begin, end);
         }
         restored = true;
     }
@@ -2440,25 +2695,67 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
 
-bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
-    return tracker.rangeUnchanged(address, bytes, generation);
+    const bool shadow = Gen::ShadowActive();
+    if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) {
+        if (shadow) shadowQuery(tracker, address, bytes, generation, false, false, site);
+        return false;
+    }
+    const bool unchanged = tracker.rangeUnchanged(address, bytes, generation);
+    if (shadow) shadowQuery(tracker, address, bytes, generation, true, unchanged, site);
+    return unchanged;
 }
 
-bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
+namespace {
+// UnchangedSinceAll / UnchangedSinceClean: one decision over every query.
+// `writesClean`: UnchangedSinceClean also asks libc whether the pages saw no write since their last
+// collect (a non-resetting probe, and no pinned writable alias): a range it reports written is what
+// a sweep at the ticket would find, so the table's verdict there is unknown_not_swept, never Clean.
+void shadowQueries(const WriteTracker& tracker, std::span<const UnchangedQuery> queries, bool unchanged, const std::source_location& site, bool writesClean = false) {
+    if (queries.empty()) return;
+    auto& ranges = shadowScratch();
+    ranges.clear();
+    bool unswept = false;
+    for (const auto& [address, bytes, generation] : queries) {
+        const bool covered = tracker.watched && generation != 0 && bytes != 0 && bytes <= UINT64_MAX - address && tracker.covers(address, bytes);
+        ranges.push_back({address, bytes, generation, covered});
+#ifdef _WIN32
+        if (writesClean && covered && !GuestArena::GuestArenaWritesClean_nid_no_patch(static_cast<std::uintptr_t>(address), bytes)) unswept = true;
+#endif
+    }
+    if (!unswept) {
+        shadowRanges(tracker, ranges, unchanged, site);
+        return;
+    }
+    ShadowVerdict combined;
+    for (const auto& range : ranges) combineVerdict(combined, shadowCheck(tracker, range.address, range.bytes, range.since, range.covered));
+    if (combined.verdict == Gen::Verdict::Clean || combined.verdict == Gen::Verdict::PendingOnly) {
+        combined.verdict = Gen::Verdict::Unknown;
+        combined.reason = Gen::UnknownReason::NotSwept;
+        combined.needsSweep = true;
+    }
+    classifyShadow(tracker, ranges, unchanged, combined, site);
+}
+}
+
+bool UnchangedSinceAll(std::span<const UnchangedQuery> queries, std::source_location site) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched) return false;
-    for (const auto& [address, bytes, generation] : queries) {
-        if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
-        if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
-    }
-    return true;
+    const auto answer = [&]() {
+        if (!tracker.watched) return false;
+        for (const auto& [address, bytes, generation] : queries) {
+            if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+            if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
+        }
+        return true;
+    }();
+    if (Gen::ShadowActive()) shadowQueries(tracker, queries, answer, site);
+    return answer;
 }
 
 bool UnchangedSinceClean(std::span<const UnchangedQuery> queries, std::source_location site) {
@@ -2473,11 +2770,15 @@ bool UnchangedSinceClean(std::span<const UnchangedQuery> queries, std::source_lo
     const auto committed = GuestArena::GuestArenaCommitGeneration_nid_postfix();
     const auto forgotten = ForgetSerial();
     if ((forgotten & 1) != 0) return false;
-    for (const auto& [address, bytes, generation] : queries) {
-        if (generation == 0 || bytes == 0 || bytes > UINT64_MAX - address || !tracker.covers(address, bytes)) return false;
-        if (!tracker.rangeUnchanged(address, bytes, generation) || !GuestArena::GuestArenaWritesClean_nid_no_patch(static_cast<std::uintptr_t>(address), bytes)) return false;
-    }
-    return mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && committed == GuestArena::GuestArenaCommitGeneration_nid_postfix() && forgotten == ForgetSerial();
+    const auto answer = [&]() {
+        for (const auto& [address, bytes, generation] : queries) {
+            if (generation == 0 || bytes == 0 || bytes > UINT64_MAX - address || !tracker.covers(address, bytes)) return false;
+            if (!tracker.rangeUnchanged(address, bytes, generation) || !GuestArena::GuestArenaWritesClean_nid_no_patch(static_cast<std::uintptr_t>(address), bytes)) return false;
+        }
+        return mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && committed == GuestArena::GuestArenaCommitGeneration_nid_postfix() && forgotten == ForgetSerial();
+    }();
+    if (Gen::ShadowActive()) shadowQueries(tracker, queries, answer, site, true);
+    return answer;
 #else
     static_cast<void>(queries);
     static_cast<void>(site);
@@ -2515,15 +2816,28 @@ std::uint64_t CollectCommittedWritesInPlace(std::uint64_t address, std::size_t b
     return generation;
 }
 
-bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation) {
+bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation, std::source_location site) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || generation == 0) return false;
-    for (const auto& [begin, end] : ranges) {
-        if (end <= begin || !tracker.covers(begin, static_cast<std::size_t>(end - begin)) || tracker.newestStamp(begin, end) > generation || tracker.refusedSince(begin, end, generation)) return false;
+    const auto answer = [&]() {
+        if (!tracker.watched || generation == 0) return false;
+        for (const auto& [begin, end] : ranges) {
+            if (end <= begin || !tracker.covers(begin, static_cast<std::size_t>(end - begin)) || tracker.newestStamp(begin, end) > generation || tracker.refusedSince(begin, end, generation)) return false;
+        }
+        return true;
+    }();
+    if (Gen::ShadowActive() && !ranges.empty()) {
+        auto& shadow = shadowScratch();
+        shadow.clear();
+        for (const auto& [begin, end] : ranges) {
+            const auto bytes = static_cast<std::size_t>(end > begin ? end - begin : 0);
+            const bool covered = tracker.watched && generation != 0 && bytes != 0 && tracker.covers(begin, bytes);
+            shadow.push_back({begin, bytes, generation, covered});
+        }
+        shadowRanges(tracker, shadow, answer, site);
     }
-    return true;
+    return answer;
 }
 
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
@@ -2532,7 +2846,8 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     BreakProofs();
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
-        ++tracker.generation;
+        tracker.bump();
+        noteDriverStoreGen(stored.first, stored.second, tracker.generation.load(std::memory_order_relaxed));
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
             tracker.noteUnstampedStore(stored.first, stored.second);
             if (tracker.watched) tracker.stampWatchedPart(stored.first, stored.second, tracker.generation, true);
@@ -2579,10 +2894,11 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
     auto lock = lockTracker(tracker);
     tracker.initialize();
     if (bytes == 0) return 0;
-    ++tracker.generation;
+    tracker.bump();
     if (!tracker.watched || !tracker.covers(address, bytes)) {
         tracker.noteUnstampedStore(address, address + bytes);
         if (tracker.watched) tracker.stampWatchedPart(address, address + bytes, tracker.generation, complete);
+        noteDriverStoreGen(address, address + bytes, tracker.generation.load(std::memory_order_relaxed));
         return 0;
     }
     {
@@ -2600,9 +2916,10 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
             lock.Resume();
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             tracker.noteUnstampedStore(address, address + bytes);
+            noteDriverStoreGen(address, address + bytes, tracker.generation.load(std::memory_order_relaxed));
             return 0;
         }
-        if (runs.stamped != 0) ++tracker.generation;
+        if (runs.stamped != 0) tracker.bump();
     }
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
@@ -2610,6 +2927,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
         tracker.stamp(block, tracker.generation, StampKind::Driver);
         tracker.noteDriverStore(block, address, address + bytes, tracker.generation, complete);
     }
+    noteDriverStoreGen(address, address + bytes, tracker.generation.load(std::memory_order_relaxed));
     return tracker.generation;
 }
 
@@ -2694,7 +3012,7 @@ bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
     while (cursor < stop) {
         std::size_t count = tracker.pages.size();
         if (!GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, true)) return false;
-        if (count != 0 && !marked) ++tracker.generation;
+        if (count != 0 && !marked) tracker.bump();
         marked = marked || count != 0;
         for (std::size_t i = 0; i < count; ++i) tracker.stampHint(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])));
         if (count < tracker.pages.size()) break;
@@ -2777,7 +3095,7 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
     return false;
 }
 
-bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu) {
+bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu, std::source_location site) {
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
     auto& tracker = Tracker();
@@ -2786,12 +3104,19 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
     if (!tracker.watched || bytes == 0 || !tracker.covers(address, bytes)) return false;
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
+    const bool shadow = Gen::ShadowActive();
+    const auto end = address + bytes;
     for (auto block = first; block <= last; ++block) {
         const auto k = block - first;
         if (k >= generations.size() || k >= changed.size()) break;
         const auto generation = generations[k];
         changed[k] = generation == 0 || tracker.stampOf(block) > generation ? BlockWritten : BlockUnchanged;
         if (k < cpu.size()) cpu[k] = generation == 0 || tracker.cpuStampOf(block) > generation ? 1 : 0;
+        if (shadow) {
+            const auto from = std::max<std::uint64_t>(address, tracker.blockBegin(block));
+            const auto to = std::min<std::uint64_t>(end, tracker.blockBegin(block) + WriteBlockBytes);
+            shadowQuery(tracker, from, static_cast<std::size_t>(to - from), generation, generation != 0, changed[k] == BlockUnchanged, site);
+        }
     }
     return true;
 }

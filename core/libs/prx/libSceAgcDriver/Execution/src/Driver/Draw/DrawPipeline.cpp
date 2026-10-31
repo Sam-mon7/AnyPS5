@@ -273,11 +273,14 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
     return token;
 }
 
-void DrawPipeline::FollowEpoch(std::uint64_t token) {
+void DrawPipeline::FollowEpoch(std::uint64_t token, std::uint64_t ticket) {
+    // Write generations: the committer checks at the ticket the issuing thread held when it enqueued
+    // the commit (carried explicitly, rule V1/V3), not at a fresh one of its own.
+    if (ticket != 0 && GuestMemory::Gen::Active()) GuestMemory::Gen::Follow(ticket);
     static thread_local std::uint64_t followed = 0;
     if (followed == token) return;
     followed = token;
-    GuestMemory::BumpCollectEpoch();
+    GuestMemory::BumpCollectEpoch(GuestMemory::Gen::TicketReason::Committer);
 }
 
 unsigned DrawPipeline::Committers() {

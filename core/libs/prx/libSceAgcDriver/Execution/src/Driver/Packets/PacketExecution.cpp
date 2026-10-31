@@ -321,7 +321,7 @@ void Driver::execute(const Submission& submission) {
                     Graphics::Recorder::WaitProfile sample(submission.queue, awaited, awaitedBytes);
                     sample.end = Graphics::Recorder::WaitEnd::Entry;
                 }
-                if (!skipHeldWaitEpoch(submission, cursor)) bumpEpoch(&EpochBumps::waits);
+                if (!skipHeldWaitEpoch(submission, cursor)) bumpEpoch(&EpochBumps::waits, GuestMemory::Gen::TicketReason::WaitEntry);
                 ++waitOutcomes().atEntry;
                 gateOpened() = true;
                 recent.Record(cursor);

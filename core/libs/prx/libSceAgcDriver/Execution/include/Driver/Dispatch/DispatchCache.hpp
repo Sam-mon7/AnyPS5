@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DISPATCHCACHE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DISPATCHCACHE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory/GenTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include <algorithm>
@@ -78,6 +79,10 @@ struct DispatchVariant {
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};
+    // Write-generation shadow (APS5_ARCHB_GEN_SHADOW): the GenClock value taken before the capture
+    // read the guest bytes (rule V6), moved to a value taken before an equal compare when the table
+    // said Changed (what CompareAndRestamp would do). Read by the census only; 0 without the table.
+    mutable std::atomic<std::uint64_t> genSince{0};
 };
 
 struct DispatchEntry {
@@ -135,6 +140,14 @@ void RecordBufferBasePatches(DispatchVariant& variant, const ShaderRecompiler::R
 bool PatchBufferBases(const DispatchVariant& variant, std::span<const std::uint32_t> words, ShaderRecompiler::RecompileResult& result);
 
 enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };
+
+// Write-generation shadow for one validated variant (draw or multi-variant dispatch): what Check
+// would say over its runs at its genSince, classified against the validation's decision when that
+// decision came from the byte compare (Equal: unchanged; EqualData, Differing or Inaccessible after
+// the compare: changed); refusals before or around the compare (pending sync, flushes, queued
+// labels, moved serials) are counted as refused. `before` is GenClock read before the validation.
+// Returns the verdict (Clean feeds the queue-0 hit-run histogram).
+GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer consumer, const DispatchVariant& variant, EntryOutcome outcome, std::uint64_t before);
 
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
 

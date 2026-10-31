@@ -54,12 +54,15 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     regions.clear();
                     appendEntryRegions(*variants[i], regions);
                     ++compared;
+                    const bool genShadow = GuestMemory::Gen::ShadowActive();
+                    const auto genBefore = genShadow ? GuestMemory::Gen::Global().Now() : 0;
                     auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback);
 
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
                         result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback);
                         ++(result == EntryOutcome::Equal || result == EntryOutcome::EqualData ? retriesEqual : retriesMoved);
                     }
+                    if (genShadow) static_cast<void>(ShadowValidatedVariant(GuestMemory::Gen::Consumer::DispatchValidate, *variants[i], result, genBefore));
                     if (i == 0) outcome = result;
                     if (result == EntryOutcome::Equal || result == EntryOutcome::EqualData) {
                         outcome = result;
@@ -75,6 +78,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 variant = variants.front();
                 compared = 1;
                 current = true;
+                const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::DispatchSpans);
                 for (const auto& [begin, bytes] : variant->spans) {
                     GuestMemory::CollectWrites(begin, bytes);
                     if (!GuestMemory::UnchangedSince(begin, bytes, generation)) {
@@ -96,6 +100,8 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     if (same) {
                         restamped = collected;
                         current = true;
+                        // The tracker said changed, the bytes are equal: the restamp CompareAndRestamp generalizes.
+                        if (GuestMemory::Gen::ShadowActive()) GuestMemory::Gen::CountRestamp(GuestMemory::Gen::Consumer::DispatchSpans);
                     }
                 }
                 if (current) outcome = EntryOutcome::Equal;

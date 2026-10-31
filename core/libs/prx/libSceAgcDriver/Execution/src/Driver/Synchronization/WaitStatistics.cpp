@@ -30,9 +30,13 @@ std::chrono::steady_clock::time_point& Driver::lastEpochBump() {
     return at;
 }
 
-void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
+void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter, GuestMemory::Gen::TicketReason reason) {
     lastEpochBump() = std::chrono::steady_clock::now();
-    GuestMemory::BumpCollectEpoch();
+    using GuestMemory::Gen::TicketReason;
+    if (reason == TicketReason::Other) {
+        reason = counter == &EpochBumps::submissions ? TicketReason::Submission : counter == &EpochBumps::packets ? TicketReason::Packet : counter == &EpochBumps::drains ? TicketReason::Drain : counter == &EpochBumps::reaps ? TicketReason::Reap : TicketReason::WaitCpu;
+    }
+    GuestMemory::BumpCollectEpoch(reason);
     if (DrawPipeline::Active()) DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed);
     ++(epochBumps().*counter);
 }

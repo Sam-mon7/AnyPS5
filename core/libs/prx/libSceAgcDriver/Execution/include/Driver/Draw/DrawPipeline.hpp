@@ -36,7 +36,8 @@ public:
     static std::size_t QueuedItems();
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
-    static void FollowEpoch(std::uint64_t token);
+    // `ticket`: the issuing thread's write-generation ticket carried with the commit (0: none).
+    static void FollowEpoch(std::uint64_t token, std::uint64_t ticket = 0);
     static unsigned Committers();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);

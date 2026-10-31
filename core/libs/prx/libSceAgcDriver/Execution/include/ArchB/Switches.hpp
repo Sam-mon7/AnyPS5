@@ -29,6 +29,8 @@ enum class Feature : std::uint8_t {
     FixAllocChurn,
     FixComputeSyncUnlocked,
     FixWriteTrackingBookkeeping,
+    GenTable,
+    GenShadow,
     Count
 };
 

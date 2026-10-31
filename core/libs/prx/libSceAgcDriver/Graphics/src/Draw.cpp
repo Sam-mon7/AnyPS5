@@ -1358,6 +1358,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 }
 
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::DrawInput);
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
     if (recorder != nullptr && bytes != 0) {
@@ -1421,6 +1422,7 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
 }
 
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::DrawInput);
     const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
     InPlaceIndices indices;
     if (bytes < Recorder::KeptIndexRangeIndices * indexSize) {
@@ -3572,6 +3574,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 }
 
 DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Prelock);
     DrawPreparation prepared;
     if (!DrawPrelockEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return prepared;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

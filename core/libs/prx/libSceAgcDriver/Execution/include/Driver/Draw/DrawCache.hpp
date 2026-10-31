@@ -140,6 +140,8 @@ struct StageCapture {
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::vector<std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied;
     std::uint64_t forgetSerial = 0;
+    // GenClock before the capture read guest memory (write-generation shadow; 0 without the table).
+    std::uint64_t genSince = 0;
     std::uint32_t pushOffset = 0;
     ShaderRecompiler::SrtUserDataUse userDataUse;
     std::uint64_t userDataMask = ~std::uint64_t{0};

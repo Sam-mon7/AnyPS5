@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory/GenTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <atomic>
 #include <cstddef>
@@ -74,7 +75,7 @@ void SetFreshCollectHook(FreshCollectHook hook);
 #endif
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, bool memoVirtualQuery = false, std::source_location site = std::source_location::current());
-bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site = std::source_location::current());
 // UnchangedSince for several ranges under one tracker lock: true only when every one holds.
 struct UnchangedQuery {
     std::uint64_t address;
@@ -82,7 +83,7 @@ struct UnchangedQuery {
     std::uint64_t generation;
 };
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
-bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
+bool UnchangedSinceAll(std::span<const UnchangedQuery> queries, std::source_location site = std::source_location::current());
 bool UnchangedSinceClean(std::span<const UnchangedQuery> queries, std::source_location site = std::source_location::current());
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::source_location site = std::source_location::current());
 // CollectCommittedWrites that fills `ranges` in place (keeping its capacity, for a reused scratch)
@@ -90,7 +91,7 @@ std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, s
 std::uint64_t CollectCommittedWritesInPlace(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::source_location site = std::source_location::current());
 std::uint64_t WriteGeneration();
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::source_location site = std::source_location::current());
-bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
+bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation, std::source_location site = std::source_location::current());
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):
 // UnchangedSince(range, it) holds until the next store over the range.
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes, std::source_location site = std::source_location::current());
@@ -114,7 +115,9 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // A thread that never bumps (the presenter, game threads inside the flush hook) gets a fresh epoch
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
-void BumpCollectEpoch();
+// With APS5_ARCHB_GEN_TABLE=1 every bump also issues a write-generation ticket (Gen::Issue) for
+// `reason`; Committer only adopts the ticket the commit carried (see DrawPipeline::FollowEpoch).
+void BumpCollectEpoch(Gen::TicketReason reason = Gen::TicketReason::Other);
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 std::uint64_t ResourceProofSerial();
@@ -154,7 +157,7 @@ bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint
 // watched arena, or for a generation of 0, a block reads as changed.
 constexpr std::uint8_t BlockUnchanged = 0;
 constexpr std::uint8_t BlockWritten = 1;
-bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
+bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {}, std::source_location site = std::source_location::current());
 
 // Serializes device work: draws, dispatches, presentation and the deferred write-backs below. The
 // mutex is recursive; it is wrapped so every acquisition (std::lock_guard at any site) measures how

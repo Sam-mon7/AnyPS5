@@ -305,6 +305,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory/GenTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -567,9 +568,11 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_fix_v1_switch COMMAND agc_archb_c01_switches_tests --toggle VqMemo)
     add_test(NAME agc_archb_fix_alloc_churn_switch COMMAND agc_archb_c01_switches_tests --toggle AllocChurn)
     add_test(NAME agc_archb_fix_wt_bookkeeping_switch COMMAND agc_archb_c01_switches_tests --toggle WriteTrackingBookkeeping)
-    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_archb_gen_table_switch COMMAND agc_archb_c01_switches_tests --toggle GenTable)
+    add_test(NAME agc_archb_gen_shadow_switch COMMAND agc_archb_c01_switches_tests --toggle GenShadow)
+    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
@@ -880,6 +883,31 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+# Stage 1 write generations, slice S1: the generation table, tickets, counters and shadow
+# classification (tests/GenTable.cpp); the guest-memory shadow cases are agc_archb_gen_shadow_* below.
+add_test_executable(agc_archb_gen_tests EXCLUDE_FROM_ALL tests/GenTable.cpp)
+target_include_directories(agc_archb_gen_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
+        ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
+        ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR}
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
+)
+target_link_libraries(agc_archb_gen_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_archb_gen_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_archb_gen_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_archb_gen_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    foreach(genCase IN ITEMS monotonic events coarse tickets journal check stress shadow-classify)
+        string(REPLACE "-" "_" genName "${genCase}")
+        add_test(NAME agc_archb_gen_table_${genName} COMMAND agc_archb_gen_tests --${genCase})
+        set_tests_properties(agc_archb_gen_table_${genName} PROPERTIES TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archb_gen_table_${genName} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+endif()
+
 add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
@@ -969,8 +997,14 @@ if(BUILD_TESTING)
     set_tests_properties(agc_write_tracking PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME agc_archb_gen_tracker_wrap COMMAND agc_write_tracking_tests --gen-tracker-wrap)
     set_tests_properties(agc_archb_gen_tracker_wrap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    # The write-generation shadow over real tracker answers (agree/conservative/unknown, sweep
+    # model, reset floor on enable), and an injected missed event the shadow and the verifier catch.
+    add_test(NAME agc_archb_gen_shadow_tracker COMMAND agc_write_tracking_tests --gen-shadow)
+    add_test(NAME agc_archb_gen_verify_catches COMMAND agc_write_tracking_tests --gen-verify-catches)
+    set_tests_properties(agc_archb_gen_shadow_tracker agc_archb_gen_verify_catches PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+        ENVIRONMENT "APS5_ARCHB_GEN_TABLE=1;APS5_ARCHB_GEN_SHADOW=1;APS5_ARCHB_GEN_VERIFY=1")
     if(WIN32)
-        set_tests_properties(agc_archb_gen_tracker_wrap PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(agc_archb_gen_tracker_wrap agc_archb_gen_shadow_tracker agc_archb_gen_verify_catches PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_failed_collect_memo COMMAND agc_write_tracking_tests --failed-collect-memo)
     add_test(NAME agc_failed_collect_memo_off COMMAND agc_write_tracking_tests --failed-collect-memo)

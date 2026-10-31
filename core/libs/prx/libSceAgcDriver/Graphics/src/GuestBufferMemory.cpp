@@ -2635,6 +2635,7 @@ void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t byt
 }
 
 void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t generation, std::vector<RefreshBlock>& blocks) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Mirror);
     constexpr std::uint64_t block = 65536;
     thread_local std::vector<std::uint8_t>* changedSlot = nullptr;
     auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
@@ -2675,6 +2676,7 @@ void appendHeapRun(std::span<ImageMirror* const> mirrors, std::uint64_t generati
 }
 
 void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshBlock>& blocks) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Mirror);
     std::sort(mirrors.begin(), mirrors.end(), [](const ImageMirror* left, const ImageMirror* right) { return left->base < right->base; });
     for (std::size_t first = 0; first < mirrors.size();) {
         auto last = first + 1;
@@ -2813,6 +2815,7 @@ void planSpaceMirrors(GuestBufferMemory::AddressSpace& space) {
 }
 
 std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Mirror);
     std::vector<std::pair<std::size_t, std::uint64_t>> checked;
     checked.reserve(space.heapRuns.size());
     for (std::size_t index = 0; index < space.heapRuns.size(); ++index) {

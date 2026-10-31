@@ -3169,6 +3169,7 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Snapshot);
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) {
         if (use != SnapshotUse::Storage || offset == nullptr) return {};
@@ -3277,6 +3278,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
 }
 
 bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) {
+    const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Snapshot);
     const auto found = indexRanges.find({address, use, bytes});
     if (found == indexRanges.end()) return false;
     if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
@@ -3321,6 +3323,9 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
+    // Write generations: a GPU write announced at recording (pending, before any later capture),
+    // tagged with the recording queue and the batch it joins.
+    if (GuestMemory::Gen::Active()) GuestMemory::Gen::NotePending(address, address + bytes, (std::uint64_t{GuestMemory::CurrentPacket().queue} << 32) | ((submissions + 1) & 0xffffffffu));
     if (DrawProfiled() && !ownLabel) {
         const auto packet = GuestMemory::CurrentPacket();
         ProfileStore(address, bytes, packet.queue, packet.opcode, WaitStage::Recorded, WaitBatchFor(open.get()));
@@ -3355,6 +3360,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+    if (GuestMemory::Gen::Active()) GuestMemory::Gen::NotePending(address, address + bytes, (std::uint64_t{GuestMemory::CurrentPacket().queue} << 32) | (reinterpret_cast<std::uintptr_t>(&batch) & 0xffffffffu));
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
@@ -4250,7 +4256,7 @@ bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
     GuestMemory::TagGpuLockSite(lockSite);
     mutex.lock();
     Check(result, "vkWaitSemaphoresKHR label readback");
-    GuestMemory::BumpCollectEpoch();
+    GuestMemory::BumpCollectEpoch(GuestMemory::Gen::TicketReason::UnlockedWait);
     if (RecorderAlive(myId)) FinishUpTo(serial);
     return true;
 }
@@ -4330,7 +4336,7 @@ bool Recorder::FinishComputeSyncUnlocked(std::uint64_t serial) {
     ArchB::Recorder::Count("fix_csync_unlocked_ms", ms);
     ArchB::Recorder::Count("fix_csync_relock_ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waited).count());
     GuestMemory::NoteUnlockedGpuWait(lockSite, ms);
-    GuestMemory::BumpCollectEpoch();
+    GuestMemory::BumpCollectEpoch(GuestMemory::Gen::TicketReason::UnlockedWait);
     if (!RecorderAlive(myId) || (wasActive && Active() != this)) {
         ArchB::Recorder::Count("fix_csync_torn_down");
         throw std::runtime_error("AGC compute sync recorder was torn down or replaced during the wait");

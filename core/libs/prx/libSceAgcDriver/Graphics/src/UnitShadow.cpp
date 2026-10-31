@@ -513,6 +513,8 @@ ShadowSlabPin::~ShadowSlabPin() {
 
 std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason, bool waited) {
     if (!UnitShadowEnabled() || scope == PublishScope::None || bytes == 0) return 0;
+    // Write generations: a unit-shadow publish changes the range's representation (meta).
+    if (GuestMemory::Gen::Active()) static_cast<void>(GuestMemory::Gen::Note(GuestMemory::Gen::Event::ShadowPublish, address, address + bytes, GuestMemory::Gen::Meta, 0, false));
     if (!waited && Recorder::InCompletion() && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Store) {
         // The store's own stamp makes the unit stale; a publish recorded now would land over the
         // store when the batch runs (the completion is not waited for).
