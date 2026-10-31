@@ -371,6 +371,36 @@ public:
         }
         return false;
     }
+
+    // OverlapsHostRegion by binary search (APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING): the host regions
+    // are fixed once the arena is constructed, so they are sorted by start once, with the largest end
+    // of every prefix, and the last region starting before the range's end decides.
+    bool OverlapsHostRegionSorted(std::uintptr_t start, std::size_t bytes) const {
+        if (!_sortedReady.load(std::memory_order_acquire)) {
+            std::call_once(_sortedOnce, [&] {
+                _sortedStarts.reserve(_hostRegions.size());
+                auto sorted = _hostRegions;
+                std::sort(sorted.begin(), sorted.end());
+                std::uintptr_t reach = 0;
+                for (const auto& [regionStart, regionEnd] : sorted) {
+                    reach = std::max(reach, regionEnd);
+                    _sortedStarts.push_back(regionStart);
+                    _sortedReach.push_back(reach);
+                }
+                _sortedReady.store(true, std::memory_order_release);
+            });
+        }
+        const auto end = start + bytes;
+        const auto after = std::lower_bound(_sortedStarts.begin(), _sortedStarts.end(), end);
+        if (after == _sortedStarts.begin()) return false;
+        return _sortedReach[static_cast<std::size_t>(after - _sortedStarts.begin()) - 1] > start;
+    }
+
+private:
+    mutable std::once_flag _sortedOnce;
+    mutable std::atomic<bool> _sortedReady{false};
+    mutable std::vector<std::uintptr_t> _sortedStarts;
+    mutable std::vector<std::uintptr_t> _sortedReach;
 };
 
 const bool g_reserved = (Arena::Get(), true);
@@ -480,8 +510,20 @@ WriteWatchTiming GuestArenaWriteWatchTiming_nid_no_patch() {
     return WindowsMappings::ThreadTiming();
 }
 
+WriteWatchCensus GuestArenaWriteWatchCensus_nid_no_patch() {
+    return WindowsMappings::ThreadCensus();
+}
+
+WriteWatchSweep GuestArenaWriteWatchSweep_nid_no_patch() {
+    return WindowsMappings::Get().Sweep();
+}
+
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     return Arena::Get().OverlapsHostRegion(address, bytes);
+}
+
+bool GuestArenaHostRegionOverlapsSorted_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return Arena::Get().OverlapsHostRegionSorted(address, bytes);
 }
 
 std::uint64_t GuestArenaCommitGeneration_nid_postfix() {

@@ -21,8 +21,12 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <map>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -2270,6 +2274,338 @@ void CheckVqMemo(std::wstring_view mode) {
 }
 #endif
 
+#ifdef _WIN32
+// APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING (run with it on; the verify variants also set
+// APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING=1, where every fast answer is checked against the original).
+// A CPU write between two collects of one epoch is seen by the next epoch, exactly as with the
+// original memo; an epoch boundary (a submission, a CPU-satisfiable label wait, a drain or a reap all
+// call BumpCollectEpoch) always forces a fresh walk; unwatching, remapping and decommitting retire
+// the cached answer; the generation a hit returns is the tracker's current one.
+void CheckWriteTrackingBookkeeping(std::wstring_view mode) {
+    using Recorder = AgcDriver::ArchB::Recorder;
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    const bool verify = [] {
+        const char* value = std::getenv("APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    std::filesystem::path control;
+    if (mode == L"toggle" || mode == L"bench") {
+        control = std::filesystem::temp_directory_path() / ("wt-bookkeeping-" + std::to_string(GetCurrentProcessId()) + ".txt");
+        _putenv_s("APS5_ARCHB_GATE_RUN", "1");
+        _putenv_s("APS5_ARCHB_CONTROL_FILE", control.string().c_str());
+    }
+    struct RemoveControl {
+        std::filesystem::path path;
+        ~RemoveControl() {
+            if (!path.empty()) std::filesystem::remove(path);
+        }
+    } removeControl{control};
+    Switches::Initialize();
+    Require(Switches::Enabled(Feature::FixWriteTrackingBookkeeping), "the bookkeeping switch is off");
+    Recorder::Boundary(true, 0, Recorder::Clock::now());
+    std::map<std::string, double> totals;
+    const auto collectCounters = [&] {
+        for (const auto& [name, value] : Recorder::Collect(Recorder::Clock::now()).counters) totals[name] += value;
+        Require(!totals.contains("fix_wt_bookkeeping_mismatches"), "a fast bookkeeping answer disagreed with the original path");
+    };
+    const auto requireCounter = [&](const char* name, double least) {
+        collectCounters();
+        if (totals[name] < least) {
+            for (const auto& [key, value] : totals) std::cerr << key << "=" << value << "\n";
+        }
+        Require(totals[name] >= least, std::string("bookkeeping counter too low: ") + name);
+    };
+    // A path counter is added in batches of 256 per thread.
+    const char* const hits = verify ? "fix_wt_bookkeeping_verified" : "fix_wt_bookkeeping_hits";
+    constexpr std::size_t bytes = 4 * Block;
+    constexpr std::size_t Page = 4096;
+    auto* memory = static_cast<volatile std::uint8_t*>(AllocateWatched(bytes));
+    const auto base = reinterpret_cast<std::uint64_t>(const_cast<std::uint8_t*>(memory));
+    struct Release {
+        void* memory;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uint64_t>(memory), bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+        }
+    } release{const_cast<std::uint8_t*>(memory)};
+    std::memset(const_cast<std::uint8_t*>(memory), 0, bytes);
+    const auto repeat = [&](std::uint64_t address, std::size_t size, std::uint64_t generation) {
+        for (int i = 0; i < 300; ++i) {
+            const auto again = CollectWrites(address, size);
+            Require(again != 0 && UnchangedSince(address, size, again) && UnchangedSince(address, size, generation), "a repeated collect in one epoch lost its range");
+        }
+    };
+    if (mode == L"epoch") {
+        BumpCollectEpoch();
+        const auto first = CollectWrites(base, bytes);
+        Require(first != 0, "the fixture was not collected");
+        repeat(base, bytes, first);
+        repeat(base + Block, Block, first);
+        requireCounter(hits, 512);
+        memory[Block + 5] = 7;
+        const auto sameEpoch = CollectWrites(base, bytes);
+        Require(sameEpoch != 0 && UnchangedSince(base, bytes, first), "a collect in the same epoch did not keep the epoch's answer (the original memo's ordering)");
+        BumpCollectEpoch();
+        const auto nextEpoch = CollectWrites(base, bytes);
+        Require(nextEpoch != 0 && !UnchangedSince(base, bytes, first) && UnchangedSince(base, bytes, nextEpoch), "a CPU write before an epoch boundary was not seen after it");
+        memory[3 * Block + 1] = 9;
+        BumpCollectEpoch();
+        const auto subrange = CollectWrites(base + 3 * Block, Block);
+        Require(subrange != 0 && !UnchangedSince(base + 3 * Block, Block, nextEpoch) && UnchangedSince(base, 3 * Block, nextEpoch), "a subrange collect after a boundary missed its write or invented one");
+        repeat(base + 3 * Block, Block, subrange);
+        memory[2 * Block] = 11;
+        const auto uncached = CollectWritesUncached(base, bytes);
+        Require(uncached != 0 && !UnchangedSince(base + 2 * Block, Block, subrange), "an uncached collect did not see a write at once");
+        const auto hit = CollectWrites(base + 3 * Block, Block);
+        Require(hit >= uncached && UnchangedSince(base, bytes, hit), "a hit after an uncached collect returned an old generation");
+        AdoptLatestCollectEpoch();
+        Require(CollectWrites(base, bytes) != 0, "a collect after adopting the newest epoch failed");
+        requireCounter(hits, 768);
+    } else if (mode == L"threads") {
+        BumpCollectEpoch();
+        const auto first = CollectWrites(base, bytes);
+        repeat(base, bytes, first);
+        memory[Block] = 1;
+        std::uint64_t other = 0;
+        bool otherSaw = false;
+        std::thread([&] {
+            BumpCollectEpoch();
+            other = CollectWrites(base, bytes);
+            otherSaw = !UnchangedSince(base, bytes, first);
+        }).join();
+        Require(other != 0 && otherSaw, "another thread's first collect of its epoch reused this thread's walk");
+        const auto mine = CollectWrites(base, bytes);
+        Require(mine >= other && !UnchangedSince(base, bytes, first), "a hit returned a generation older than another thread's stamp");
+        std::thread([&] { memory[2 * Block + 3] = 2; }).join();
+        BumpCollectEpoch();
+        const auto after = CollectWrites(base, bytes);
+        Require(after != 0 && !UnchangedSince(base + 2 * Block, Block, mine), "a write by another thread before the boundary was not seen");
+        std::array<std::thread, 4> workers;
+        for (std::size_t worker = 0; worker < workers.size(); ++worker) {
+            workers[worker] = std::thread([&, worker] {
+                for (int round = 0; round < 64; ++round) {
+                    BumpCollectEpoch();
+                    const auto range = base + worker * Block;
+                    const auto before = CollectWrites(range, Block);
+                    Require(before != 0, "a worker collect failed");
+                    for (int i = 0; i < 8; ++i) Require(CollectWrites(range, Block) != 0, "a worker repeat failed");
+                    memory[worker * Block + 64 + static_cast<std::size_t>(round)] = static_cast<std::uint8_t>(round + 1);
+                    BumpCollectEpoch();
+                    const auto seen = CollectWrites(range, Block);
+                    Require(seen != 0 && !UnchangedSince(range, Block, before), "a worker's write before its boundary was missed");
+                }
+            });
+        }
+        for (auto& worker : workers) worker.join();
+        collectCounters();
+    } else if (mode == L"remap") {
+        BumpCollectEpoch();
+        const auto first = CollectWrites(base, Block);
+        repeat(base, Block, first);
+        Unwatch(base, Block);
+        Require(CollectWrites(base, Block) == 0, "an unwatched range kept its cached collect");
+        const Runs restored{{base, base + Block}};
+        Rewatch(restored);
+        const auto rewatched = CollectWrites(base, Block);
+        Require(rewatched != 0 && !UnchangedSince(base, Block, first), "a rewatched range reused a collect from before the unwatch");
+        repeat(base, Block, rewatched);
+        // A direct mapping, its removal and a private commit in its place, all inside one epoch.
+        auto* view = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(Block, Block));
+        Require(view != nullptr, "cannot reserve the remap fixture");
+        const auto viewBase = reinterpret_cast<std::uint64_t>(view);
+        const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, Block, nullptr);
+        Require(section != nullptr, "cannot create the remap section");
+        GuestArena::GuestArenaCommit_nid_postfix(view, Block, PAGE_READWRITE, Block);
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(viewBase, Block);
+        const auto privateFirst = CollectWrites(viewBase, Block);
+        Require(privateFirst != 0, "the private remap fixture was not collected");
+        repeat(viewBase, Block, privateFirst);
+        GuestArena::GuestArenaReset_nid_postfix(view, Block);
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(viewBase, Block);
+        Require(CollectWrites(viewBase, Block) == 0, "a decommitted range kept its cached collect");
+        GuestArena::GuestArenaMapDirect_nid_postfix(view, Block, section, 0, PAGE_READWRITE);
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(viewBase, Block);
+        const auto mapped = CollectWrites(viewBase, Block);
+        Require(mapped != 0 && !UnchangedSince(viewBase, Block, privateFirst), "a remapped range kept its cached collect");
+        repeat(viewBase, Block, mapped);
+        GuestArena::GuestArenaReset_nid_postfix(view, Block);
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(viewBase, Block);
+        Require(CollectWrites(viewBase, Block) == 0, "an unmapped range kept its cached collect");
+        GuestArena::GuestArenaForgetSection_nid_postfix(section);
+        CloseHandle(section);
+        GuestArena::GuestArenaCommit_nid_postfix(view, Block, PAGE_READWRITE, Block);
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(viewBase, Block);
+        const auto recommitted = CollectWrites(viewBase, Block);
+        Require(recommitted != 0 && !UnchangedSince(viewBase, Block, mapped), "a recommitted range reused an old collect");
+        GuestArena::GuestArenaReset_nid_postfix(view, Block);
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(viewBase, Block);
+        GuestArena::GuestArenaRelease_nid_postfix(view, Block);
+        CheckFailedCollectMemo();
+        collectCounters();
+    } else if (mode == L"reset") {
+        BumpCollectEpoch();
+        const auto first = CollectWrites(base, bytes);
+        repeat(base, bytes, first);
+        const auto stamped = MarkWritten(base + 8, 4);
+        Require(stamped > first, "a driver store was not stamped");
+        const auto afterStamp = CollectWrites(base, bytes);
+        Require(afterStamp >= stamped && UnchangedSince(base, bytes, afterStamp) && !UnchangedSince(base, bytes, first), "a hit after a driver store returned a generation older than the store");
+        const std::array<std::byte, 16> source{};
+        const auto own = StoreOwnBytes(base + Block + 32, source);
+        Require(own != 0, "an own store was not stamped");
+        const auto afterOwn = CollectWrites(base, bytes);
+        Require(afterOwn >= own && UnchangedSince(base, bytes, afterOwn), "a hit after an own store returned an old generation");
+        Require(StoredOver(base + Block, 64, afterStamp), "an own store was not reported as stored over");
+        collectCounters();
+    } else if (mode == L"runs") {
+        // Committed ranges come from the page-state runs: odd starts (the byte-wise head), whole
+        // words, the four-word steps and the tail, over committed and reserved blocks.
+        PartlyCommitted range;
+        range.Commit(0);
+        range.Commit(2);
+        const auto partly = range.Address();
+        for (int pass = 0; pass < 4; ++pass)
+        for (std::size_t offset = 0; offset < PartlyCommitted::Bytes; offset += 3 * Page) {
+            for (const std::size_t length : {Page, 7 * Page, 9 * Page, Block, 33 * Page + 5, PartlyCommitted::Bytes}) {
+                if (offset + length > PartlyCommitted::Bytes) continue;
+                const auto runs = CommittedRanges(partly + offset, length);
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> expected;
+                for (const std::size_t block : {std::size_t{0}, std::size_t{2}}) {
+                    const auto begin = std::max<std::uint64_t>(partly + offset, partly + block * Block);
+                    const auto end = std::min<std::uint64_t>(partly + offset + length, partly + (block + 1) * Block);
+                    if (begin < end) expected.emplace_back(begin, end);
+                }
+                Require(runs == expected, "committed ranges changed under the bookkeeping switch");
+            }
+        }
+        // A run that crosses a page-state chunk (65536 pages) boundary, where one can be reserved.
+        std::uintptr_t arena = 0;
+        std::size_t arenaBytes = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&arena, &arenaBytes);
+        constexpr std::uint64_t chunk = std::uint64_t{65536} * Page;
+        bool crossed = false;
+        for (std::uint64_t boundary = arena + chunk * 8; !crossed && boundary + Block < arena + arenaBytes; boundary += chunk * 7) {
+            void* placed = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(boundary - Block, 2 * Block, Block);
+            if (placed == nullptr) continue;
+            if (reinterpret_cast<std::uint64_t>(placed) != boundary - Block) {
+                GuestArena::GuestArenaRelease_nid_postfix(placed, 2 * Block);
+                continue;
+            }
+            GuestArena::GuestArenaCommit_nid_postfix(placed, 2 * Block, PAGE_READWRITE, 2 * Block);
+            GuestAllocations::GuestAllocationsInvalidate_nid_postfix(boundary - Block, 2 * Block);
+            for (std::uint64_t start = boundary - Block; start < boundary; start += 5 * Page) {
+                const auto runs = CommittedRanges(start, static_cast<std::size_t>(boundary + Block - start));
+                Require(runs.size() == 1 && runs[0].first == start && runs[0].second == boundary + Block, "a committed run across a page-state chunk boundary changed");
+            }
+            GuestArena::GuestArenaReset_nid_postfix(placed, 2 * Block);
+            GuestAllocations::GuestAllocationsInvalidate_nid_postfix(boundary - Block, 2 * Block);
+            GuestArena::GuestArenaRelease_nid_postfix(placed, 2 * Block);
+            crossed = true;
+        }
+        if (!crossed) std::cout << "no page-state chunk boundary could be reserved: the crossing case was skipped\n";
+        requireCounter(verify ? "fix_wt_bookkeeping_verified" : "fix_wt_bookkeeping_runs", 256);
+    } else if (mode == L"regions") {
+        std::uintptr_t arena = 0;
+        std::size_t arenaBytes = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&arena, &arenaBytes);
+        std::uint64_t state = 0x9e3779b97f4a7c15ull;
+        std::size_t overlapping = 0;
+        for (int i = 0; i < 20000; ++i) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            const auto address = i < 10000 ? arena + (arenaBytes / 10000) * static_cast<std::uint64_t>(i) : arena + state % arenaBytes;
+            const std::size_t length = std::size_t{1} << (state >> 58) % 34;
+            const bool scanned = GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, length);
+            Require(GuestArena::GuestArenaHostRegionOverlapsSorted_nid_no_patch(address, length) == scanned, "the sorted host-region test disagreed with the scan");
+            overlapping += scanned ? 1 : 0;
+        }
+        // The exact edges: every region boundary of the arena (the host holes are regions of their
+        // own), probed around with several lengths.
+        std::size_t edges = 0;
+        for (std::uint64_t at = arena; at < arena + arenaBytes;) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region)) != sizeof(region) || region.RegionSize == 0) break;
+            const auto edge = at;
+            at = reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
+            if (!GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(edge, Page) && !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(at - Page, Page)) continue;
+            ++edges;
+            for (const auto point : {edge, at}) for (std::uint64_t probe = point - 3 * Page; probe <= point + 3 * Page; probe += Page / 2) {
+                for (const std::size_t length : {std::size_t{1}, Page, 2 * Page, std::size_t{1} << 20, std::size_t{1} << 31}) {
+                    const bool scanned = GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(probe, length);
+                    Require(GuestArena::GuestArenaHostRegionOverlapsSorted_nid_no_patch(probe, length) == scanned, "the sorted host-region test disagreed at a region edge");
+                    overlapping += scanned ? 1 : 0;
+                }
+            }
+        }
+        std::cout << "host-region samples overlapping: " << overlapping << ", region edges probed: " << edges << "\n";
+        for (int i = 0; i < 300; ++i) Require(Watched(base, bytes), "the fixture is not watched");
+        requireCounter(verify ? "fix_wt_bookkeeping_verified" : "fix_wt_bookkeeping_regions", 256);
+    } else if (mode == L"toggle") {
+        const auto write = [&](const std::string& line) {
+            std::ofstream(control, std::ios::binary | std::ios::trunc) << line << '\n';
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            Switches::PollControl();
+        };
+        BumpCollectEpoch();
+        const auto first = CollectWrites(base, bytes);
+        repeat(base, bytes, first);
+        write("1 FIX_WRITE_TRACKING_BOOKKEEPING=0");
+        Require(!Switches::Enabled(Feature::FixWriteTrackingBookkeeping), "the bookkeeping switch did not turn off");
+        memory[5] = 3;
+        const auto off = CollectWrites(base, bytes);
+        Require(off != 0 && UnchangedSince(base, bytes, first), "the original memo did not keep the epoch's answer");
+        write("2 FIX_WRITE_TRACKING_BOOKKEEPING=1");
+        Require(Switches::Enabled(Feature::FixWriteTrackingBookkeeping), "the bookkeeping switch did not turn back on");
+        const auto on = CollectWrites(base, bytes);
+        Require(on != 0 && UnchangedSince(base, bytes, first), "the table answered differently from the memo in the same epoch");
+        BumpCollectEpoch();
+        const auto next = CollectWrites(base, bytes);
+        Require(next != 0 && !UnchangedSince(base, bytes, first), "a write made while the switch was off was missed after the boundary");
+        repeat(base, bytes, next);
+        collectCounters();
+    } else if (mode == L"bench") {
+        // Not a ctest: nanoseconds per operation with the switch off and on (control-file toggles),
+        // for the replay's per-frame counts of table hits, page-state runs and host-region tests.
+        const auto write = [&](const std::string& line) {
+            std::ofstream(control, std::ios::binary | std::ios::trunc) << line << '\n';
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            Switches::PollControl();
+        };
+        constexpr std::size_t ranges = 64;
+        auto* wide = static_cast<std::uint8_t*>(AllocateWatched(ranges * Block));
+        const auto wideBase = reinterpret_cast<std::uint64_t>(wide);
+        std::memset(wide, 0, ranges * Block);
+        const auto time = [](auto&& body, int count) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < count; ++i) body(i);
+            return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / count;
+        };
+        std::uint64_t sink = 0;
+        const auto switchRead = time([&](int) { sink += Switches::Enabled(Feature::FixWriteTrackingBookkeeping) ? 1 : 0; }, 2000000);
+        std::cout << "bench switch read " << switchRead << " ns\n";
+        for (int round = 0; round < 3; ++round) {
+            for (const bool on : {false, true}) {
+                write(std::to_string(round * 2 + (on ? 2 : 1)) + " FIX_WRITE_TRACKING_BOOKKEEPING=" + (on ? "1" : "0"));
+                BumpCollectEpoch();
+                for (std::size_t i = 0; i < ranges; ++i) sink += CollectWrites(wideBase + i * Block, Block);
+                const auto exact = time([&](int i) { sink += CollectWrites(wideBase + (static_cast<std::size_t>(i) % ranges) * Block, Block); }, 400000);
+                const auto inner = time([&](int i) { sink += CollectWrites(wideBase + (static_cast<std::size_t>(i) % ranges) * Block + 4096, 8192); }, 400000);
+                const auto committed = time([&](int i) { sink += CommittedRanges(wideBase + static_cast<std::uint64_t>(i % 7) * 4096, ranges * Block - 7 * 4096).size(); }, 20000);
+                const auto watched = time([&](int i) { sink += Watched(wideBase + (static_cast<std::size_t>(i) % ranges) * Block, Block) ? 1 : 0; }, 400000);
+                std::cout << "bench " << (on ? "on " : "off") << ": collect hit (exact) " << exact << " ns, collect hit (subrange) " << inner << " ns, committed ranges 4 MiB " << committed << " ns, watched " << watched << " ns\n";
+            }
+        }
+        std::cout << "sink " << sink << "\n";
+        GuestArena::GuestArenaReset_nid_postfix(wide, ranges * Block);
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(wideBase, ranges * Block);
+        GuestArena::GuestArenaRelease_nid_postfix(wide, ranges * Block);
+    } else throw std::runtime_error("unknown bookkeeping test");
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2283,6 +2619,12 @@ int main(int argc, char** argv) {
         if (memo != std::wstring_view::npos) {
             Require(WriteWatched(), "query memo test needs write watching");
             CheckVqMemo(command.substr(memo + 10));
+            return 0;
+        }
+        const auto bookkeeping = command.rfind(L"--wt-bookkeeping-");
+        if (bookkeeping != std::wstring_view::npos) {
+            Require(WriteWatched(), "the bookkeeping test needs write watching");
+            CheckWriteTrackingBookkeeping(command.substr(bookkeeping + 17));
             return 0;
         }
 #endif

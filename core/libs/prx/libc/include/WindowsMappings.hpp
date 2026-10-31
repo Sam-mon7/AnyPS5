@@ -457,8 +457,59 @@ public:
         return timing;
     }
 
+    static WriteWatchCensus ThreadCensus() {
+        return census;
+    }
+
+    WriteWatchSweep Sweep() {
+        WriteWatchSweep result;
+        std::lock_guard lock(mutex);
+        const auto now = [] { return std::chrono::steady_clock::now(); };
+        const auto nanoseconds = [](auto elapsed) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()); };
+        for (const auto& [start, run] : residentRuns) {
+            ++result.residentRuns;
+            result.residentBytes += run.end - start;
+        }
+        std::vector<void*> pages(std::size_t{1} << 16);
+        for (const auto& [begin, end] : ownedRanges) {
+            for (auto cursor = begin; cursor < end;) {
+                const auto walkStart = now();
+                MEMORY_BASIC_INFORMATION memory{};
+                if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) || memory.RegionSize == 0) break;
+                result.walkNs += nanoseconds(now() - walkStart);
+                const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                if (memory.State == MEM_COMMIT && memory.Type == MEM_PRIVATE) {
+                    bool refused = false;
+                    for (auto at = cursor; at < regionEnd;) {
+                        ULONG_PTR count = pages.size();
+                        DWORD granularity = 0;
+                        const auto queryStart = now();
+                        const auto failed = GetWriteWatch(0, reinterpret_cast<void*>(at), regionEnd - at, pages.data(), &count, &granularity) != 0;
+                        result.queryNs += nanoseconds(now() - queryStart);
+                        ++result.queries;
+                        if (failed) {
+                            refused = true;
+                            break;
+                        }
+                        result.dirty += count;
+                        if (count < pages.size()) break;
+                        at = reinterpret_cast<std::uintptr_t>(pages[count - 1]) + 4096;
+                    }
+                    if (refused) ++result.refused;
+                    else {
+                        ++result.regions;
+                        result.bytes += regionEnd - cursor;
+                    }
+                }
+                cursor = regionEnd;
+            }
+        }
+        return result;
+    }
+
     bool WritesClean(std::uintptr_t address, std::size_t bytes) {
         const CollectTimer timer;
+        ++census.collects;
         std::lock_guard lock(mutex);
         if (bytes == 0 || address + bytes < address || address + bytes > UINTPTR_MAX - 4095) return false;
         const auto end = (address + bytes + 4095) & ~std::uintptr_t{4095};
@@ -488,6 +539,7 @@ public:
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All, const QueryMemoContext* memo = nullptr) {
         const CollectTimer timer;
+        ++census.collects;
         std::lock_guard lock(mutex);
         const auto capacity = *count;
         *count = 0;
@@ -759,6 +811,7 @@ private:
     }
 
     static inline thread_local WriteWatchTiming timing;
+    static inline thread_local WriteWatchCensus census;
 
     struct CollectTimer {
         bool profile = profileWrites();
@@ -770,11 +823,36 @@ private:
         }
     };
 
+    static bool censusWrites() {
+        static const bool census = [] {
+            const auto* value = std::getenv("APS5_ARCHB_WRITE_TRACKING_CENSUS");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        return census;
+    }
+
     static UINT queryWrites(DWORD flags, void* address, SIZE_T bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
-        if (!profileWrites()) return GetWriteWatch(flags, address, bytes, pages, count, granularity);
-        const auto start = std::chrono::steady_clock::now();
+        ++census.queries;
+        census.pages += (bytes + 4095) / 4096;
+        const bool timed = profileWrites() || censusWrites();
+        const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
-        timing.queryUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        if (result == 0) census.dirty += *count;
+        if (timed) {
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            census.ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+            if (profileWrites()) timing.queryUs += std::chrono::duration<double, std::micro>(elapsed).count();
+        }
+        return result;
+    }
+
+    static UINT resetWrites(void* address, SIZE_T bytes) {
+        ++census.resets;
+        census.pages += (bytes + 4095) / 4096;
+        if (!censusWrites()) return ResetWriteWatch(address, bytes);
+        const auto start = std::chrono::steady_clock::now();
+        const auto result = ResetWriteWatch(address, bytes);
+        census.ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
         return result;
     }
 
@@ -799,7 +877,7 @@ private:
         auto next = written.begin();
         std::uintptr_t resetFrom = 0;
         const auto flushReset = [&](std::uintptr_t to) {
-            if (resetFrom != 0 && ResetWriteWatch(reinterpret_cast<void*>(resetFrom), to - resetFrom) != 0) fail("reset resident guest writes");
+            if (resetFrom != 0 && resetWrites(reinterpret_cast<void*>(resetFrom), to - resetFrom) != 0) fail("reset resident guest writes");
             resetFrom = 0;
         };
         for (auto at = first; at < stop; at += 4096) {

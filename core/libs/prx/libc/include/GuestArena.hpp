@@ -64,7 +64,37 @@ struct WriteWatchTiming {
     double walkUs = 0;
 };
 WriteWatchTiming GuestArenaWriteWatchTiming_nid_no_patch();
+// The calling thread's write-watch work so far (cumulative): collection entries, OS GetWriteWatch and
+// ResetWriteWatch calls, the 4 KiB pages they covered and the dirty pages reported. The time inside
+// the OS calls is measured only under APS5_ARCHB_WRITE_TRACKING_CENSUS=1.
+struct WriteWatchCensus {
+    std::uint64_t collects = 0;
+    std::uint64_t queries = 0;
+    std::uint64_t resets = 0;
+    std::uint64_t pages = 0;
+    std::uint64_t dirty = 0;
+    std::uint64_t ns = 0;
+};
+WriteWatchCensus GuestArenaWriteWatchCensus_nid_no_patch();
+// One non-resetting GetWriteWatch over every committed private region of the reservations (what a
+// sweep of everything watched would cost): watched regions, their bytes, dirty pages, regions the OS
+// refused (not write-watched), and the time of the region walk and of the queries.
+struct WriteWatchSweep {
+    std::uint64_t regions = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t dirty = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t queries = 0;
+    std::uint64_t residentRuns = 0;
+    std::uint64_t residentBytes = 0;
+    std::uint64_t walkNs = 0;
+    std::uint64_t queryNs = 0;
+};
+WriteWatchSweep GuestArenaWriteWatchSweep_nid_no_patch();
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes);
+// The same answer by binary search over the host regions sorted once (the regions do not change after
+// the arena is reserved); the driver uses it under APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING.
+bool GuestArenaHostRegionOverlapsSorted_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 std::uint64_t GuestArenaCommitGeneration_nid_postfix();
 void GuestArenaSetPrivateMappingObserver_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes, std::uint64_t generation));
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection);

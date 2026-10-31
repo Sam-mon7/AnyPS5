@@ -566,9 +566,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_c01_switches COMMAND agc_archb_c01_switches_tests)
     add_test(NAME agc_archb_fix_v1_switch COMMAND agc_archb_c01_switches_tests --toggle VqMemo)
     add_test(NAME agc_archb_fix_alloc_churn_switch COMMAND agc_archb_c01_switches_tests --toggle AllocChurn)
-    set_tests_properties(agc_archb_fix_alloc_churn_switch PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_archb_fix_wt_bookkeeping_switch COMMAND agc_archb_c01_switches_tests --toggle WriteTrackingBookkeeping)
+    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_archb_fix_alloc_churn_switch PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
@@ -983,6 +984,22 @@ if(BUILD_TESTING)
                 ENVIRONMENT "APS5_VERIFY_VQ_MEMO=1"
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endforeach()
+        foreach(bookkeepingCase IN ITEMS epoch threads remap reset runs regions toggle)
+            add_test(NAME agc_archb_fix_wt_bookkeeping_${bookkeepingCase} COMMAND agc_write_tracking_tests --wt-bookkeeping-${bookkeepingCase})
+            add_test(NAME agc_archb_fix_wt_bookkeeping_${bookkeepingCase}_verify COMMAND agc_write_tracking_tests --wt-bookkeeping-${bookkeepingCase})
+            set_tests_properties(agc_archb_fix_wt_bookkeeping_${bookkeepingCase} PROPERTIES TIMEOUT 60
+                ENVIRONMENT "APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            set_tests_properties(agc_archb_fix_wt_bookkeeping_${bookkeepingCase}_verify PROPERTIES TIMEOUT 60
+                ENVIRONMENT "APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING=1;APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endforeach()
+        add_test(NAME agc_write_tracking_wt_bookkeeping COMMAND agc_write_tracking_tests)
+        add_test(NAME agc_failed_collect_memo_wt_bookkeeping COMMAND agc_write_tracking_tests --failed-collect-memo)
+        add_test(NAME agc_target_clean_proof_wt_bookkeeping COMMAND agc_write_tracking_tests --target-clean-proof)
+        set_tests_properties(agc_write_tracking_wt_bookkeeping agc_failed_collect_memo_wt_bookkeeping agc_target_clean_proof_wt_bookkeeping PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING=1;APS5_TARGET_CLEAN_PROOF=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_target_clean_proof COMMAND agc_write_tracking_tests --target-clean-proof)
