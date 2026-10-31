@@ -8,6 +8,18 @@
 // absolute address and breaks on host addresses outside that range.
 namespace GuestArena {
 
+#ifdef _WIN32
+struct QueryMemoContext {
+    std::uint64_t (*unwatch)() = nullptr;
+    std::uint64_t (*forget)() = nullptr;
+    bool verify = false;
+    void (*count)(const char*) = nullptr;
+};
+extern "C" bool GuestArenaCollectWritesMemo_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, bool armed, const QueryMemoContext* memo);
+extern "C" int GuestArenaVirtualProtect_nid_no_patch(void* address, std::size_t bytes, unsigned long protection, unsigned long* previous);
+extern "C" std::uint64_t GuestArenaQueryProtectionSerial_nid_no_patch();
+#endif
+
 #ifdef ANYPS5_ENABLE_ASAN
 inline constexpr std::uintptr_t GuestAddressOffset = 0x0000100000000000ull;
 #else

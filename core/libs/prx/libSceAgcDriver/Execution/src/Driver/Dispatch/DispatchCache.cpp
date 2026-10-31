@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -66,11 +67,15 @@ Driver::DispatchCacheFootprint Driver::DispatchCacheSize() {
 }
 
 std::uint64_t Driver::variantBytes(const DispatchVariant& variant) {
-    return sizeof(DispatchVariant) + variant.words.size() * sizeof(std::uint32_t) + variant.shared.size() * sizeof(SharedWords) + variant.runs.size() * sizeof(std::pair<std::uint64_t, std::uint64_t>) + variant.captured.size() * sizeof(ShaderRecompiler::MemoryRegion) + (variant.vertexInfo != nullptr ? sizeof(ShaderRecompiler::ShaderVertexStageInfo) : 0) + (variant.indirectCapture != nullptr ? sizeof(ShaderRecompiler::ResourceCapture) + variant.indirectCapture->snapshot.userData.size() * sizeof(std::uint32_t) : 0);
+    std::uint64_t feedbackBytes = variant.feedback.bindings.size() * sizeof(WordBitMasks);
+    for (const auto& binding : variant.feedback.bindings) feedbackBytes += binding.size() * sizeof(std::pair<std::uint32_t, std::uint32_t>);
+    return feedbackBytes + sizeof(DispatchVariant) + (variant.feedback.memory.size() + variant.feedback.userData.size() + variant.feedback.pushConstants.size()) * sizeof(std::pair<std::uint32_t, std::uint32_t>) + variant.userData.size() * sizeof(std::uint32_t) + variant.words.size() * sizeof(std::uint32_t) + variant.shared.size() * sizeof(SharedWords) + variant.runs.size() * sizeof(std::pair<std::uint64_t, std::uint64_t>) + variant.captured.size() * sizeof(ShaderRecompiler::MemoryRegion) + (variant.vertexInfo != nullptr ? sizeof(ShaderRecompiler::ShaderVertexStageInfo) : 0) + (variant.indirectCapture != nullptr ? sizeof(ShaderRecompiler::ResourceCapture) + variant.indirectCapture->snapshot.userData.size() * sizeof(std::uint32_t) : 0);
 }
 
 void Driver::accountVariant(const DispatchVariant& variant, bool added) {
     if (added) {
+        const auto masks = variant.feedback.memory.size() + variant.feedback.userData.size();
+        if (masks != 0u) ArchB::Recorder::Count("fix_tsharp_mask_positions", masks);
         ++dispatchCacheVariants;
         dispatchCacheVariantBytes += variantBytes(variant);
     } else {

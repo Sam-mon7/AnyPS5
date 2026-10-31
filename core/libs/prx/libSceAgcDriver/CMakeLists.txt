@@ -257,6 +257,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/IndirectDispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/VariantValidation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/TsharpFeedbackMask.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawProgramTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCache.cpp
@@ -550,6 +551,12 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_archb_c01_switches COMMAND agc_archb_c01_switches_tests)
+    add_test(NAME agc_archb_fix_v1_switch COMMAND agc_archb_c01_switches_tests --toggle VqMemo)
+    set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_fix_v1_switch PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_archb_c01_switches PROPERTIES TIMEOUT 30)
     foreach(archbToggleCase IN ITEMS SeqMonotonic RefusesStartupOnly RefusesUnknown PrerequisiteCascades
             NoFileNoCost AppliesAtBoundaryOnly ScreenshotToken)
@@ -860,7 +867,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
+target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc libSceAgcDriver)
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
 
@@ -931,11 +938,9 @@ configure_windows_unwind(agc_locks_tests)
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
-        Execution/src/GuestMemory.cpp
-        Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_write_tracking_tests PRIVATE shader_recompiler_agc_driver libc)
+target_link_libraries(agc_write_tracking_tests PRIVATE libSceAgcDriver libc)
 set_target_properties(agc_write_tracking_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_write_tracking_tests)
 if(BUILD_TESTING)
@@ -948,6 +953,12 @@ if(BUILD_TESTING)
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     set_tests_properties(agc_failed_collect_memo_off PROPERTIES ENVIRONMENT "APS5_NO_FAILED_COLLECT_MEMO=1")
     if(WIN32)
+        foreach(v1Case IN ITEMS reuse commit protect map unwatch forget coverage threads toggle)
+            add_test(NAME agc_archb_fix_v1_${v1Case} COMMAND agc_write_tracking_tests --vq-memo-${v1Case})
+            set_tests_properties(agc_archb_fix_v1_${v1Case} PROPERTIES TIMEOUT 30
+                ENVIRONMENT "APS5_VERIFY_VQ_MEMO=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endforeach()
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_target_clean_proof COMMAND agc_write_tracking_tests --target-clean-proof)
@@ -1641,6 +1652,21 @@ add_custom_command(
         VERBATIM
 )
 
+foreach(agcMipDimension IN ITEMS 1D 1DArray 3D)
+    set(agcMipShaderSpv ${agcTestShaderGeneratedRoot}/Sample${agcMipDimension}.spv)
+    set(agcMipShaderHeader ${agcTestShaderGeneratedRoot}/Sample${agcMipDimension}_spv.h)
+    add_custom_command(
+        OUTPUT "${agcMipShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -DMIP_CHAIN_${agcMipDimension}=1 -o "${agcMipShaderSpv}" "${agcSampleArrayShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcMipShaderSpv} -DOUTPUT=${agcMipShaderHeader}
+        -DSYMBOL=SAMPLE_${agcMipDimension}_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcSampleArrayShaderSource}" glslang-standalone
+        VERBATIM
+    )
+    list(APPEND agcMipChainShaderHeaders ${agcMipShaderHeader})
+endforeach()
+
 foreach(agcTriangleStage IN ITEMS vert frag)
     set(agcTriangleSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/Triangle.${agcTriangleStage})
     set(agcTriangleSpv ${agcTestShaderGeneratedRoot}/Triangle_${agcTriangleStage}.spv)
@@ -1716,6 +1742,7 @@ add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         ${agcTriangleHeaders}
         ${agcSampleLodShaderHeader}
         ${agcSampleArrayShaderHeader}
+        ${agcMipChainShaderHeaders}
         ${agcCoverShaderHeaders}
         ${agcBufferUpdateHeader}
 )
@@ -1763,6 +1790,17 @@ if(BUILD_TESTING)
         set_tests_properties(agc_pipeline_cache_header PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    foreach(h4Mode IN ITEMS libraries static)
+        set(h4Test agc_archb_fix_h4_${h4Mode})
+        add_test(NAME ${h4Test} COMMAND agc_driver_recorder_tests --pipeline-state-reuse-only)
+        set_tests_properties(${h4Test} PROPERTIES TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_PIPELINE_LTO=1" SKIP_RETURN_CODE 77)
+        if(h4Mode STREQUAL "static")
+            set_property(TEST ${h4Test} APPEND PROPERTY ENVIRONMENT "APS5_NO_GPL=1")
+        endif()
+        if(WIN32)
+            set_tests_properties(${h4Test} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_pipeline_library COMMAND agc_driver_recorder_tests --pipeline-library-only)
     add_test(NAME agc_pipeline_library_off COMMAND agc_driver_recorder_tests --pipeline-library-only)
     set_tests_properties(agc_pipeline_library agc_pipeline_library_off PROPERTIES SKIP_RETURN_CODE 77)
@@ -1873,6 +1911,17 @@ if(BUILD_TESTING)
         set_property(TEST agc_driver_texture_level_clamp APPEND PROPERTY ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    foreach(agcMipCase IN ITEMS 1d 2d 3d cube array 1d_array depth1d copies tiled)
+        add_test(NAME agc_driver_texture_mip_chain_${agcMipCase} COMMAND agc_driver_recorder_tests --texture-mip-chain ${agcMipCase})
+        set_tests_properties(agc_driver_texture_mip_chain_${agcMipCase} PROPERTIES
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation"
+            FAIL_REGULAR_EXPRESSION "VUID-;[Vv]alidation [Ee]rror;was not found but was requested by env var VK_INSTANCE_LAYERS"
+            TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_driver_texture_mip_chain_${agcMipCase} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_sampled_storage_base_level_usage COMMAND agc_driver_recorder_tests --sampled-storage-base-level-usage-only)
     set_tests_properties(agc_sampled_storage_base_level_usage PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)
@@ -3727,6 +3776,58 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_driver_draw_shader_profile_pipelined agc_driver_draw_shader_profile_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_archb_fix_f1_proof COMMAND agc_driver_draw_cache_reuse_tests --tsharp-proof)
+    foreach(f1bPath memory user refused)
+        set(f1bTest agc_archb_fix_f1b_cached_${f1bPath})
+        add_test(NAME ${f1bTest} COMMAND agc_driver_draw_cache_reuse_tests --tsharp-cached-${f1bPath})
+        set_tests_properties(${f1bTest} PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_VERIFY_TSHARP_MASK=1")
+        if(WIN32)
+            set_tests_properties(${f1bTest} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_tests_properties(agc_archb_fix_f1_proof PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_fix_f1_proof PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    foreach(f1Path draw_memory draw_user dispatch_memory dispatch_user)
+        foreach(f1Mode off on verify toggle no_register_key no_user_data_hits entry_verify)
+            if(f1Path MATCHES "^dispatch" AND f1Mode MATCHES "^(no_register_key|no_user_data_hits|entry_verify)$")
+                continue()
+            endif()
+            set(f1Test agc_archb_fix_f1_${f1Path}_${f1Mode})
+            add_test(NAME ${f1Test} COMMAND agc_driver_draw_cache_reuse_tests --tsharp-${f1Path}_${f1Mode})
+            set_tests_properties(${f1Test} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_RECORDER=1")
+            if(f1Mode STREQUAL "off")
+                set_property(TEST ${f1Test} APPEND PROPERTY ENVIRONMENT "APS5_ARCHB_FIX_TSHARP_FEEDBACK_MASK=0")
+            else()
+                set_property(TEST ${f1Test} APPEND PROPERTY ENVIRONMENT "APS5_ARCHB_FIX_TSHARP_FEEDBACK_MASK=1")
+            endif()
+            if(f1Mode STREQUAL "no_register_key")
+                set_property(TEST ${f1Test} APPEND PROPERTY ENVIRONMENT "APS5_NO_DRAW_KEY=1")
+            elseif(f1Mode STREQUAL "entry_verify")
+                set_property(TEST ${f1Test} APPEND PROPERTY ENVIRONMENT "APS5_VERIFY_DRAW_ENTRIES=1")
+            elseif(f1Mode STREQUAL "no_user_data_hits")
+                set_property(TEST ${f1Test} APPEND PROPERTY ENVIRONMENT "APS5_NO_DRAW_DATA_HITS=1")
+            endif()
+            if(f1Mode STREQUAL "verify")
+                set_property(TEST ${f1Test} APPEND PROPERTY ENVIRONMENT "APS5_VERIFY_DRAW_DATA_HITS=1;APS5_VERIFY_DATA_HITS=1;APS5_VERIFY_TSHARP_MASK=1")
+            endif()
+            if(WIN32)
+                set_tests_properties(${f1Test} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            endif()
+        endforeach()
+    endforeach()
+    foreach(h4Mode IN ITEMS queued inline)
+        set(h4Test agc_archb_fix_h4_${h4Mode}_refused_pixels)
+        add_test(NAME ${h4Test} COMMAND agc_driver_draw_cache_reuse_tests --pipeline-state-reuse)
+        set_tests_properties(${h4Test} PROPERTIES TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_RECORDER=1;APS5_NO_PIPELINE_LTO=1" SKIP_RETURN_CODE 77)
+        if(h4Mode STREQUAL "inline")
+            set_property(TEST ${h4Test} APPEND PROPERTY ENVIRONMENT "APS5_PIPELINED_DRAWS=0")
+        endif()
+        if(WIN32)
+            set_tests_properties(${h4Test} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_driver_draw_cache_reuse_off COMMAND agc_driver_draw_cache_reuse_tests)
     set_tests_properties(agc_driver_draw_cache_reuse_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_driver_draw_cache_reuse_verify COMMAND agc_driver_draw_cache_reuse_tests)

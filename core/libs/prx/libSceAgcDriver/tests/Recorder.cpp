@@ -36,6 +36,9 @@
 #include "SampleLod_spv.h"
 #include "BufferUpdate_spv.h"
 #include "SampleArray_spv.h"
+#include "Sample1D_spv.h"
+#include "Sample1DArray_spv.h"
+#include "Sample3D_spv.h"
 #include "Cover_vert_spv.h"
 #include "Cover_frag_spv.h"
 #include "VertexRange_vert_spv.h"
@@ -9718,8 +9721,12 @@ struct SampledViewProbe {
         active = nullptr;
     }
     static VKAPI_ATTR VkResult VKAPI_CALL createImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* callbacks, VkImage* created) {
-        Require(info->mipLevels > 0 && info->mipLevels <= std::bit_width(std::max({info->extent.width, info->extent.height, info->extent.depth})), "sampled image mip levels exceed its extent");
         const auto result = reinterpret_cast<PFN_vkCreateImage>(active->resolver(device, "vkCreateImage"))(device, info, callbacks, created);
+        if (info->mipLevels == 0 || info->mipLevels > std::bit_width(std::max({info->extent.width, info->extent.height, info->extent.depth}))) {
+            if (result == VK_SUCCESS) reinterpret_cast<PFN_vkDestroyImage>(active->resolver(device, "vkDestroyImage"))(device, *created, callbacks);
+            *created = VK_NULL_HANDLE;
+            throw std::runtime_error("image mip levels exceed its extent: " + std::to_string(info->extent.width) + "x" + std::to_string(info->extent.height) + " levels=" + std::to_string(info->mipLevels) + " storage=" + std::to_string((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0));
+        }
         if (result == VK_SUCCESS) {
             active->imageInfo = *info;
             ++active->images;
@@ -9812,6 +9819,241 @@ void textureLevelClampTests(const Device& device) {
         }
     }
     std::cout << "texture level clamp upload, view ranges and out-of-range base level tests passed\n";
+}
+
+
+void textureMipChainCopyTests(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    context.srgbDecodeFormats |= 1u;
+    context.srgbCopyFormats |= 1u;
+    SampledViewProbe probe(context);
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    Recorder recorder(context);
+    recorder.Activate();
+    SampleProgram sampler(context, recorder);
+    for (const auto format : {22u, 43u, 128u}) {
+        for (const auto levels : {2u, 4u}) {
+            GuestTextureResource resource{};
+            resource.width = 4;
+            resource.height = 1;
+            resource.mipCount = levels;
+            resource.lastLevel = levels - 1u;
+            resource.format = format;
+            resource.tileMode = TextureTileMode::kLinear;
+            resource.dimension = format == 22u ? TextureDimension::k1D : TextureDimension::k2D;
+            const auto geometry = DescribeSurface(resource);
+            std::vector<std::byte> memory(static_cast<std::size_t>(geometry.guestBytes) + 256u);
+            auto* surface = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(memory.data()) + 255u) & ~std::uintptr_t{255u});
+            resource.baseAddress = reinterpret_cast<std::uint64_t>(surface);
+            for (std::uint32_t level = 0; level < levels; ++level) {
+                const auto& mip = geometry.mips[level];
+                const float depth = (level + 1u) / 8.0f;
+                constexpr std::array<std::uint32_t, 4> packed{960u, 1024u, 1056u, 1088u};
+                const auto word = format == 22u ? std::bit_cast<std::uint32_t>(depth) : packed[level] << 21u;
+                auto* start = surface + mip.tiledOffset;
+                if (format == 128u) std::fill_n(start, static_cast<std::size_t>(mip.tiledSize), std::byte{static_cast<std::uint8_t>(32u + 48u * level)});
+                else for (std::uint64_t offset = 0; offset < mip.tiledSize; offset += sizeof(word)) std::memcpy(start + offset, &word, sizeof(word));
+            }
+            auto storage = StorageTexture::Create(context, detiler, resource, levels - 1u);
+            const auto imageLevels = std::min(levels, 3u);
+            for (const auto base : {0u, levels - 1u}) {
+                resource.baseLevel = base;
+                std::unique_ptr<Texture> copy;
+                if (format == 22u) copy = std::make_unique<Texture>(context, storage, resource, VkComponentMapping{}, Texture::DepthCopyTag{});
+                else if (format == 43u) copy = std::make_unique<Texture>(context, storage, resource, VkComponentMapping{}, Texture::RepackCopyTag{});
+                else copy = std::make_unique<Texture>(context, storage, resource, VkComponentMapping{}, Texture::SrgbExpandTag{});
+                Require(copy->RefreshDepthCopy(), "mip chain copy was not uploaded");
+                const auto first = std::min(base, imageLevels - 1u);
+                for (std::uint32_t level = first; level < imageLevels; ++level) {
+                    const auto srgb = (32.0f + 48.0f * level) / 255.0f;
+                    const auto expected = format == 22u ? (level + 1u) / 8.0f : format == 43u ? static_cast<float>(level + 1u) : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+                    expectRed(sampler.Red(copy->View(), copy->Layout(), static_cast<float>(level - first)), expected, "mip chain copied the wrong level");
+                    if (format == 128u) {
+                        Texture expanded(context, detiler, resource, {}, std::span(surface, static_cast<std::size_t>(geometry.guestBytes)));
+                        expectRed(sampler.Red(expanded.View(), expanded.Layout(), static_cast<float>(level - first)), expected, "mip chain snapshot sRGB expansion copied the wrong level");
+                    }
+                }
+            }
+        }
+    }
+    GuestTextureResource blocks{};
+    blocks.width = blocks.height = 2;
+    blocks.mipCount = 4;
+    blocks.lastLevel = 3;
+    blocks.format = 62;
+    blocks.tileMode = TextureTileMode::kLinear;
+    blocks.dimension = TextureDimension::k2D;
+    const auto geometry = DescribeSurface(blocks);
+    std::vector<std::byte> memory(static_cast<std::size_t>(geometry.guestBytes) + 256u);
+    auto* surface = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(memory.data()) + 255u) & ~std::uintptr_t{255u});
+    blocks.baseAddress = reinterpret_cast<std::uint64_t>(surface);
+    for (std::uint32_t level = 0; level < blocks.mipCount; ++level) {
+        const auto& mip = geometry.mips[level];
+        const std::uint64_t block = level == 0 ? 0xf800u : 0x07e0u;
+        for (std::uint64_t offset = 0; offset < mip.tiledSize; offset += sizeof(block)) std::memcpy(surface + mip.tiledOffset + offset, &block, sizeof(block));
+    }
+    auto storage = StorageTexture::Create(context, detiler, blocks, 0);
+    auto compressed = blocks;
+    compressed.width = compressed.height = 8;
+    compressed.format = 169;
+    Require(!Texture::CanBlockCopyFrom(*storage, compressed), "an incompatible compressed mip tail was accepted for a block copy");
+    compressed.mipCount = 2;
+    compressed.lastLevel = 1;
+    Require(Texture::CanBlockCopyFrom(*storage, compressed), "a normal compressed mip chain was refused");
+    Texture copy(context, storage, compressed, {}, Texture::BlockCopyTag{});
+    Require(copy.RefreshDepthCopy(), "compressed mip chain was not copied");
+    expectRed(sampler.Red(copy.View(), copy.Layout(), 0.0f), 1.0f, "compressed base mip was copied incorrectly");
+    expectRed(sampler.Red(copy.View(), copy.Layout(), 1.0f), 0.0f, "compressed last mip was copied incorrectly");
+    std::cout << "texture mip chain depth, repacked, sRGB and block copies passed\n";
+}
+
+
+void textureMipChainTests(const Device& device, std::string_view kind) {
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    SampledViewProbe probe(context);
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    Recorder recorder(context);
+    recorder.Activate();
+    GuestTextureResource resource{};
+    resource.width = 4;
+    resource.height = 1;
+    resource.format = 56;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    std::span<const std::uint32_t> code = SAMPLE_LOD_SPV;
+    if (kind == "1d" || kind == "1d_array") {
+        resource.dimension = kind == "1d" ? TextureDimension::k1D : TextureDimension::k1DArray;
+        resource.depthOrLastArray = kind == "1d" ? 0u : 2u;
+        code = kind == "1d" ? std::span<const std::uint32_t>(SAMPLE_1D_SPV) : std::span<const std::uint32_t>(SAMPLE_1DArray_SPV);
+    } else if (kind == "3d") {
+        resource.dimension = TextureDimension::k3D;
+        resource.height = 2;
+        resource.depthOrLastArray = 7;
+        code = SAMPLE_3D_SPV;
+    } else if (kind == "cube" || kind == "array" || kind == "tiled") {
+        resource.dimension = kind == "cube" ? TextureDimension::kCube : TextureDimension::k2DArray;
+        resource.height = 4;
+        resource.depthOrLastArray = kind == "cube" ? 5u : 2u;
+        resource.tileMode = kind == "tiled" ? TextureTileMode::kStandard64KB : TextureTileMode::kLinear;
+        code = SAMPLE_ARRAY_SPV;
+    } else if (kind == "depth1d") {
+        resource.dimension = TextureDimension::k1D;
+        resource.height = 16;
+        resource.format = 22;
+    } else {
+        Require(kind == "2d", "unknown mip chain test dimension");
+    }
+    SampleProgram sampler(context, recorder, code);
+    const auto fullLevels = kind == "3d" ? 4u : 3u;
+    for (const auto levels : {2u, fullLevels, fullLevels + 1u}) {
+        resource.mipCount = levels;
+        resource.lastLevel = levels - 1u;
+        const auto geometry = DescribeSurface(resource);
+        const auto bytes = static_cast<std::size_t>(geometry.guestBytes);
+        std::vector<std::byte> memory(bytes + 256);
+        auto* surface = kind == "tiled" ? static_cast<std::byte*>(AllocateWatched(bytes, 65536u)) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(memory.data()) + 255u) & ~std::uintptr_t{255u});
+        Require(surface != nullptr, "mip chain fixture could not allocate watched memory");
+        resource.baseAddress = reinterpret_cast<std::uint64_t>(surface);
+        const auto value = [&](std::uint32_t level, std::uint32_t layer) { return 16u + 24u * layer + (kind == "tiled" ? 0u : 8u * level); };
+        for (std::uint32_t layer = 0; layer < geometry.layers; ++layer) {
+            for (std::uint32_t level = 0; level < levels; ++level) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                const auto& mip = geometry.mips[level];
+                auto* start = surface + geometry.GuestLayerOffset(layer) + mip.tiledOffset;
+                if (kind == "depth1d") {
+                    const float depth = value(level, layer) / 255.0f;
+                    for (std::uint64_t offset = 0; offset < mip.tiledSize; offset += sizeof(depth)) std::memcpy(start + offset, &depth, sizeof(depth));
+                } else {
+                    std::fill_n(start, static_cast<std::size_t>(mip.tiledSize), std::byte{static_cast<std::uint8_t>(value(level, layer))});
+                }
+            }
+        }
+        GuestAllocations::Mutation().Add(surface, bytes, true, true, false);
+        struct Unregister {
+            const Context& context;
+            std::byte* surface;
+            std::size_t bytes;
+            bool watched;
+            ~Unregister() {
+                GuestAllocations::Mutation().Remove(surface);
+                if (watched) {
+                    HostImportFor(context, reinterpret_cast<std::uint64_t>(surface), bytes);
+                    ReleaseWatched(surface, bytes);
+                }
+            }
+        } unregister{context, surface, bytes, kind == "tiled"};
+        const auto imageLevels = std::min(levels, fullLevels);
+        const std::span<const std::byte> snapshot(surface, bytes);
+        const auto sample = [&](const Texture& texture, std::uint32_t base) {
+            const auto range = texture.SampledViewRange(false);
+            Require(range.levels == imageLevels - base, "mip chain view reports an unclamped level count");
+            for (std::uint32_t level = 0; level < range.levels; ++level) {
+                const auto slices = resource.dimension == TextureDimension::k3D ? std::max(geometry.imageDepth >> (base + level), 1u) : geometry.imageLayers;
+                for (std::uint32_t layer = 0; layer < slices; ++layer) {
+                    const auto coordinate = resource.dimension == TextureDimension::k3D ? (static_cast<float>(layer) + 0.5f) / slices : static_cast<float>(layer);
+                    expectRed(sampler.Red(texture.View(), texture.Layout(), static_cast<float>(level), coordinate), value(base + level, layer) / 255.0f, "mip chain upload sampled the wrong level or layer");
+                }
+            }
+            expectRed(sampler.Red(texture.View(), texture.Layout(), 15.0f, resource.dimension == TextureDimension::k3D ? 0.5f / std::max(geometry.imageDepth >> (imageLevels - 1u), 1u) : 0.0f), value(imageLevels - 1u, 0u) / 255.0f, "excess guest LOD did not sample the last real mip");
+        };
+        for (const auto base : {0u, levels - 1u}) {
+            resource.baseLevel = base;
+            resource.minLod = context.imageViewMinLod ? base << 8u : 0u;
+            probe.images = 0;
+            probe.ranges.clear();
+            Texture texture(context, detiler, resource, {}, snapshot, kind == "depth1d");
+            Require(probe.images == 1u && probe.imageInfo.mipLevels == imageLevels, "sampled texture created the wrong mip chain");
+            if (kind == "depth1d") Require(probe.imageInfo.imageType == VK_IMAGE_TYPE_2D && probe.imageInfo.extent.height == 1u, "depth1D texture did not use its actual 2D extent");
+            sample(texture, std::min(base, imageLevels - 1u));
+            if (texture.HasSrgbView()) texture.SrgbView(false, false);
+            if (base == 0u && (resource.dimension == TextureDimension::k1D || resource.dimension == TextureDimension::k2D || resource.dimension == TextureDimension::k2DArray)) texture.BaseLevelView();
+        }
+        resource.minLod = 0;
+        resource.baseLevel = 0;
+        if (kind == "depth1d") continue;
+        probe.images = 0;
+        auto storage = StorageTexture::Create(context, detiler, resource, levels - 1u);
+        Require(probe.images == 1u && probe.imageInfo.mipLevels == imageLevels, "storage texture created the wrong mip chain");
+        for (std::uint32_t level = 0; level < levels; ++level) {
+            storage->View(level);
+            if (storage->Attachable()) storage->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, level);
+        }
+        for (const auto base : {0u, levels - 1u}) {
+            resource.baseLevel = base;
+            Texture texture(context, storage, resource, {});
+            sample(texture, std::min(base, imageLevels - 1u));
+        }
+        const std::vector<std::byte> before(surface, surface + bytes);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, imageLevels - 1u, 1u, 0u, geometry.imageLayers};
+        const VkClearColorValue clear{{1.0f, 1.0f, 1.0f, 1.0f}};
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(recorder.Commands(), storage->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        recorder.Submit();
+        recorder.Sync();
+        storage->MarkDirty();
+        storage->WriteBack();
+        recorder.Submit();
+        recorder.Sync();
+        for (std::uint32_t layer = 0; layer < geometry.layers; ++layer) {
+            for (std::uint32_t level = 0; level < levels; ++level) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                if (kind == "tiled") continue;
+                const auto offset = geometry.GuestLayerOffset(layer) + geometry.mips[level].tiledOffset;
+                const auto expected = level == imageLevels - 1u ? std::byte{255} : before[offset];
+                Require(surface[offset] == expected, "mip chain write-back mismatch: levels=" + std::to_string(levels) + " layer=" + std::to_string(layer) + " level=" + std::to_string(level) + " got=" + std::to_string(std::to_integer<unsigned>(surface[offset])) + " expected=" + std::to_string(std::to_integer<unsigned>(expected)));
+            }
+        }
+        resource.baseLevel = levels - 1u;
+        Texture written(context, detiler, resource, {}, snapshot);
+        const auto lastDepth = resource.dimension == TextureDimension::k3D ? std::max(geometry.imageDepth >> (imageLevels - 1u), 1u) : 1u;
+        expectRed(sampler.Red(written.View(), written.Layout(), 0.0f, resource.dimension == TextureDimension::k3D ? 0.5f / lastDepth : 0.0f), 1.0f, "mip chain write-back did not preserve the last physical mip");
+        resource.baseLevel = 0;
+    }
+    std::cout << "texture mip chain " << kind << " uploads, sampling, views and write-back passed\n";
 }
 
 
@@ -11378,6 +11620,230 @@ void pipelineLibraryLtoInfoTests(const Device& device) {
     std::cout << "Pipeline library link-time optimization info tests passed: " << fastLibraries << " libraries without the info, " << created.Retaining() << " with it\n";
 }
 
+std::map<std::string, unsigned> pipelineReuseCalls;
+
+template<auto Member, typename TFunction> struct PipelineReuseCall;
+template<auto Member, typename TResult, typename... TArgs>
+struct PipelineReuseCall<Member, TResult(VKAPI_PTR*)(TArgs...)> {
+    static inline TResult(VKAPI_PTR* function)(TArgs...) = nullptr;
+    static inline const char* name = nullptr;
+    static TResult VKAPI_CALL Invoke(TArgs... args) {
+        ++pipelineReuseCalls[name];
+        return function(args...);
+    }
+};
+
+void pipelineStateReuseTests(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    DeviceFunctions functions;
+    const auto install = [&]<auto Member>(const char* name) {
+        using Call = PipelineReuseCall<Member, std::remove_reference_t<decltype(functions.*Member)>>;
+        Call::function = context.Function<std::remove_reference_t<decltype(functions.*Member)>>(name);
+        Call::name = name;
+        functions.*Member = Call::Invoke;
+    };
+    install.template operator()<&DeviceFunctions::cmdBindPipeline>("vkCmdBindPipeline");
+    install.template operator()<&DeviceFunctions::cmdPushConstants>("vkCmdPushConstants");
+    install.template operator()<&DeviceFunctions::cmdSetViewport>("vkCmdSetViewport");
+    install.template operator()<&DeviceFunctions::cmdSetScissor>("vkCmdSetScissor");
+    install.template operator()<&DeviceFunctions::cmdSetDepthBias>("vkCmdSetDepthBias");
+    install.template operator()<&DeviceFunctions::cmdSetDepthBounds>("vkCmdSetDepthBounds");
+    install.template operator()<&DeviceFunctions::cmdSetStencilReference>("vkCmdSetStencilReference");
+    install.template operator()<&DeviceFunctions::cmdSetStencilCompareMask>("vkCmdSetStencilCompareMask");
+    install.template operator()<&DeviceFunctions::cmdSetStencilWriteMask>("vkCmdSetStencilWriteMask");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetCullMode>("vkCmdSetCullModeEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetFrontFace>("vkCmdSetFrontFaceEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetDepthTestEnable>("vkCmdSetDepthTestEnableEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetDepthWriteEnable>("vkCmdSetDepthWriteEnableEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetDepthCompareOp>("vkCmdSetDepthCompareOpEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetDepthBoundsTestEnable>("vkCmdSetDepthBoundsTestEnableEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetStencilTestEnable>("vkCmdSetStencilTestEnableEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetStencilOp>("vkCmdSetStencilOpEXT");
+    context.functions = &functions;
+    Recorder recorder(context);
+    context.recorder = &recorder;
+    struct Cleanup {
+        Recorder& recorder;
+        VkDevice device;
+        ~Cleanup() { recorder.Sync(); ClearCachedPipelines(device); }
+    } cleanup{recorder, context.device};
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 11;
+    fragment.variantId = 12;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, context.graphicsPipelineLibrary ? PipelinePushSlotBytes : 0}};
+    vertex.pushConstants.resize(4);
+    fragment.pushConstants.resize(4);
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.color.extent = {64, 64};
+    state.colors = {state.color};
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    state.viewport = {0, 0, 64, 64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.depth = DepthTarget{0, 0, {64, 64}, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0};
+    state.depthBias = true;
+    state.depthBoundsTest = context.depthBounds;
+    state.stencilTest = true;
+    state.stencilFront.compareMask = state.stencilBack.compareMask = 255;
+    state.stencilFront.writeMask = state.stencilBack.writeMask = 255;
+    ShaderResources resources(context, shaders, state.color, 1, 0, 0);
+    VertexInputLayout input;
+    const auto lookup = [&] { return CachedPipeline(context, state, input, resources, shaders, VK_IMAGE_LAYOUT_GENERAL); };
+    auto pipeline = lookup();
+    auto commands = recorder.Commands();
+    auto* reuse = recorder.ReusePipelineState(true);
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+    const auto emit = [&] {
+        pipeline->Continue(commands, state, reuse);
+        pipeline->PushConstants(commands, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, push, reuse);
+    };
+    emit();
+    const auto first = pipelineReuseCalls;
+    emit();
+    Require(pipelineReuseCalls == first, "unchanged state emitted Vulkan commands");
+    const auto changed = [&](const char* name, auto change) {
+        const auto before = pipelineReuseCalls[name];
+        change();
+        emit();
+        Require(pipelineReuseCalls[name] > before, std::string("changed state was suppressed: ") + name);
+        const auto after = pipelineReuseCalls;
+        emit();
+        Require(pipelineReuseCalls == after, "changed state did not become reusable");
+    };
+    changed("vkCmdSetViewport", [&] { state.viewport.width = 63; });
+    changed("vkCmdSetScissor", [&] { state.scissor.extent.width = 63; });
+    if (context.depthBounds) changed("vkCmdSetDepthBounds", [&] { state.minDepthBounds = 0.1f; });
+    changed("vkCmdSetDepthBias", [&] { state.depthBiasConstant = 1; });
+    changed("vkCmdSetDepthBias", [&] { state.depthBiasSlope = 1; });
+    if (context.depthBiasClamp) changed("vkCmdSetDepthBias", [&] { state.depthBiasClamp = 1; });
+    if (context.graphicsPipelineLibrary) {
+        changed("vkCmdSetStencilReference", [&] { ++state.stencilFront.reference; });
+        changed("vkCmdSetStencilReference", [&] { ++state.stencilBack.reference; });
+        changed("vkCmdSetStencilCompareMask", [&] { --state.stencilFront.compareMask; });
+        changed("vkCmdSetStencilWriteMask", [&] { --state.stencilBack.writeMask; });
+        changed("vkCmdSetStencilOpEXT", [&] { state.stencilFront.passOp = VK_STENCIL_OP_REPLACE; });
+        changed("vkCmdSetCullModeEXT", [&] { state.cullMode = VK_CULL_MODE_BACK_BIT; });
+        changed("vkCmdSetFrontFaceEXT", [&] { state.frontFace = VK_FRONT_FACE_CLOCKWISE; });
+        changed("vkCmdSetDepthTestEnableEXT", [&] { state.depthTest = !state.depthTest; });
+        changed("vkCmdSetDepthWriteEnableEXT", [&] { state.depthWrite = !state.depthWrite; });
+        changed("vkCmdSetDepthCompareOpEXT", [&] { state.depthCompare = VK_COMPARE_OP_LESS; });
+        changed("vkCmdSetStencilTestEnableEXT", [&] { state.stencilTest = !state.stencilTest; });
+    }
+    changed("vkCmdPushConstants", [&] { push[0] = std::byte{1}; });
+    if (context.graphicsPipelineLibrary) changed("vkCmdPushConstants", [&] { push[PipelinePushSlotBytes] = std::byte{2}; });
+    const auto beforeBlend = pipeline;
+    changed("vkCmdBindPipeline", [&] { state.blendConstants[0] = 0.5f; pipeline = lookup(); });
+    Require(pipeline != beforeBlend, "blend constants did not change the pipeline key");
+    recorder.ReusePipelineState(false);
+    reuse = nullptr;
+    emit();
+    reuse = recorder.ReusePipelineState(true);
+    const auto beforeOn = pipelineReuseCalls["vkCmdSetViewport"];
+    emit();
+    Require(pipelineReuseCalls["vkCmdSetViewport"] > beforeOn, "on/off/on retained state from an off draw");
+    if (context.graphicsPipelineLibrary) {
+        auto wholeContext = context;
+        wholeContext.graphicsPipelineLibrary = false;
+        auto wholeShaders = shaders;
+        wholeShaders[1].pushConstantOffset = 4;
+        auto whole = std::make_shared<Pipeline>(wholeContext, state, input, resources, wholeShaders, VK_IMAGE_LAYOUT_GENERAL);
+        whole->Continue(commands, state, reuse);
+        const auto beforeDynamic = pipelineReuseCalls["vkCmdSetViewport"];
+        emit();
+        Require(pipelineReuseCalls["vkCmdSetViewport"] > beforeDynamic, "static pipeline binding left dynamic state reusable");
+        recorder.Keep(whole);
+    }
+    const auto beforeHelper = pipelineReuseCalls["vkCmdSetViewport"];
+    pipeline->Continue(commands, state);
+    emit();
+    Require(pipelineReuseCalls["vkCmdSetViewport"] >= beforeHelper + 2, "untracked helper did not invalidate state");
+    const auto beforeCommands = pipelineReuseCalls["vkCmdSetViewport"];
+    recorder.Commands();
+    emit();
+    Require(pipelineReuseCalls["vkCmdSetViewport"] > beforeCommands, "command-buffer exposure did not invalidate state");
+    recorder.Sync();
+    commands = recorder.Commands();
+    const auto beforeGeneration = pipelineReuseCalls["vkCmdSetViewport"];
+    emit();
+    Require(pipelineReuseCalls["vkCmdSetViewport"] > beforeGeneration, "command-buffer reuse retained old state");
+    recorder.Sync();
+    PipelineStateReuse slots;
+    const auto layout = pipeline->Layout();
+    const std::span<const std::byte, PipelinePushSlotBytes> bytes(push.data(), PipelinePushSlotBytes);
+    Require(slots.Push(layout, VK_SHADER_STAGE_VERTEX_BIT, 0, bytes) && !slots.Push(layout, VK_SHADER_STAGE_VERTEX_BIT, 0, bytes), "push slot was not reused");
+    Require(slots.Push(layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, bytes), "push stages were ignored");
+    VkPipelineLayout other = VK_NULL_HANDLE;
+    VkPipelineLayoutCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &info, nullptr, &other), "test layout");
+    Require(slots.Push(other, VK_SHADER_STAGE_FRAGMENT_BIT, 0, bytes), "layout change reused push constants");
+    Require(slots.Push(layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, bytes), "layout round trip reused push constants");
+    context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, other, nullptr);
+    state.depth.reset();
+    state.depthBias = false;
+    state.depthBoundsTest = false;
+    state.stencilTest = false;
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.viewport = {0, 0, 64, 64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.renderExtent = {64, 64};
+    pipeline = lookup();
+    auto target = std::make_shared<RenderTarget>(context, state.color, false);
+    const std::array views{target->View()};
+    const std::array<std::shared_ptr<void>, 1> owners{target};
+    auto framebuffer = pipeline->AcquireFramebuffer(views, owners, state.renderExtent);
+    Buffer readback(context, 64 * 64 * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto render = [&](bool enabled) {
+        commands = recorder.Commands();
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = target->Image();
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        const VkClearColorValue clear{};
+        context.Resolved(&DeviceFunctions::cmdClearColorImage, "vkCmdClearColorImage")(commands, target->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &barrier.subresourceRange);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        reuse = recorder.ReusePipelineState(enabled);
+        pipeline->Begin(commands, *framebuffer, state.renderExtent, state, reuse);
+        const auto before = pipelineReuseCalls;
+        for (unsigned draw = 0; draw < 4; ++draw) {
+            pipeline->Continue(commands, state, reuse);
+            context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, 3, 1, 0, 0);
+        }
+        Require(!enabled || pipelineReuseCalls == before, "consecutive GPU draws emitted unchanged state");
+        reuse = recorder.ReusePipelineState(false);
+        pipeline->Continue(commands, state, reuse);
+        context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, 3, 1, 0, 0);
+        reuse = recorder.ReusePipelineState(enabled);
+        pipeline->Continue(commands, state, reuse);
+        context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, 3, 1, 0, 0);
+        recorder.LeaveRenderPassOpen(1, Recorder::NoTiming, false, {});
+        commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {64, 64, 1};
+        context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, target->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        readback.Invalidate();
+        const auto bytes = readback.Bytes();
+        return std::vector<std::byte>(bytes.begin(), bytes.end());
+    };
+    const auto pixels = render(false);
+    Require(std::any_of(pixels.begin(), pixels.end(), [](std::byte value) { return value != std::byte{0}; }), "GPU reuse test drew no pixels");
+    Require(render(true) == pixels && render(false) == pixels && render(true) == pixels, "recorded on/off/on draws changed pixels");
+    std::cout << "Pipeline state reuse changed values, helpers, generations and toggles passed\n";
+}
+
 void pipelineLibraryTests(const Device& device) {
     std::lock_guard gpu(GpuMutex());
     const auto& context = device.GetContext();
@@ -11680,6 +12146,15 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-state-reuse-only") {
+            pipelineStateReuseTests(device);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--texture-mip-chain") {
+            if (std::string_view(argv[2]) == "copies") textureMipChainCopyTests(device);
+            else textureMipChainTests(device, argv[2]);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--texture-level-clamp-only") {
             textureLevelClampTests(device);
             return 0;

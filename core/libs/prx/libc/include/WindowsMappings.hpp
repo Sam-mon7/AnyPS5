@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -41,13 +42,18 @@ public:
 #endif
 
     void* Reserve(void* address, std::size_t bytes) {
-        return allocate(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        std::lock_guard lock(mutex);
+        ++mappingSerial;
+        auto* result = allocate(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        if (result != nullptr) remember(ownedRanges, reinterpret_cast<std::uintptr_t>(result), reinterpret_cast<std::uintptr_t>(result) + bytes);
+        return result;
     }
 
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         if (granule == 0) throw std::invalid_argument("guest memory commit granule is zero");
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
         std::lock_guard lock(mutex);
+        ++mappingSerial;
         collectableRanges.clear();
         const DWORD flags = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | (watched ? MEM_WRITE_WATCH : 0);
         const auto cut = [](std::uintptr_t at, std::size_t size, const char* operation) {
@@ -97,7 +103,7 @@ public:
                     invalidate(*mapped->second.page);
                 }
                 DWORD previous;
-                if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
                 cursor = stop;
             }
         }
@@ -166,7 +172,7 @@ public:
                 }
                 remember(freshRanges, base, base + runBytes);
                 DWORD previous;
-                if (protection != PAGE_READWRITE && !VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect resident guest pages");
+                if (protection != PAGE_READWRITE && !GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect resident guest pages");
                 done += runBytes;
                 continue;
             }
@@ -208,7 +214,7 @@ public:
             split(base, runBytes);
             mapRun(base, runBytes, section, offset + done);
             DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect shared guest pages");
+            if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect shared guest pages");
             collectableRanges.clear();
             for (std::size_t at = 0; at < runBytes; at += pageBytes) {
                 auto& [slot, shared] = pages[at / pageBytes];
@@ -225,6 +231,8 @@ public:
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
+        ++mappingSerial;
+        if (bytes != 0 && bytes <= UINTPTR_MAX - address) remember(externalProtectionRanges, address, address + bytes);
         collectableRanges.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
@@ -235,6 +243,8 @@ public:
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        ++mappingSerial;
+        if (bytes != 0 && bytes <= UINTPTR_MAX - address) remember(pinnedRanges, address, address + bytes);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
             ++page.pins;
@@ -476,7 +486,7 @@ public:
         return true;
     }
 
-    bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
+    bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All, const QueryMemoContext* memo = nullptr) {
         const CollectTimer timer;
         std::lock_guard lock(mutex);
         const auto capacity = *count;
@@ -496,7 +506,7 @@ public:
                     if ((it->second.collected & (1u << ((at - it->first) / 4096))) == 0) return false;
                 }
             }
-        } else if (clear && !collectable(address, end)) return false;
+        } else if (clear && !collectable(address, end, memo)) return false;
         static const bool rangeSkip = std::getenv("APS5_NO_COLLECT_RANGE_SKIP") == nullptr;
         if (rangeSkip && collection != Collection::Fresh) {
             const auto clean = cleanRanges.upper_bound(address);
@@ -617,7 +627,7 @@ public:
                     cursor = next == views.end() ? end : std::min(end, next->first);
                     continue;
                 }
-                const auto memory = query(cursor);
+                const auto memory = queryCollection(cursor, end, memo);
                 if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
                 if (capacity == *count) return true;
@@ -635,7 +645,7 @@ public:
     }
 
 private:
-    bool collectable(std::uintptr_t address, std::uintptr_t end) {
+    bool collectable(std::uintptr_t address, std::uintptr_t end, const QueryMemoContext* memo) {
         auto proven = collectableRanges.upper_bound(address);
         if (proven != collectableRanges.begin() && std::prev(proven)->second >= end) return true;
         static const bool rangeSkip = std::getenv("APS5_NO_COLLECT_RANGE_SKIP") == nullptr;
@@ -654,7 +664,7 @@ private:
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
-            const auto memory = query(cursor);
+            const auto memory = queryCollection(cursor, end, memo);
             if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
             cursor = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
         }
@@ -854,11 +864,11 @@ private:
         if (!map(section, GetCurrentProcess(), page, offset, sectionBytes, MEM_REPLACE_PLACEHOLDER, viewProtection, nullptr, 0)) fail("map shared guest page");
         if (!committed && query(base).State == MEM_RESERVE && !VirtualAlloc(page, viewBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
         DWORD previous;
-        if (!VirtualProtect(page, viewBytes, protection, &previous)) fail("protect shared guest page");
+        if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(page, viewBytes, protection, &previous)) fail("protect shared guest page");
         if (viewBytes == pageBytes) return;
         void* zeros = reinterpret_cast<void*>(base + viewBytes);
         if (!allocate(GetCurrentProcess(), zeros, pageBytes - viewBytes, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) fail("replace guest placeholder past the end of a file with zero pages");
-        if (!VirtualProtect(zeros, pageBytes - viewBytes, protection, &previous)) fail("protect guest pages past the end of a file");
+        if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(zeros, pageBytes - viewBytes, protection, &previous)) fail("protect guest pages past the end of a file");
     }
 
     void mapRun(std::uintptr_t base, std::size_t bytes, HANDLE section, std::uint64_t offset) {
@@ -897,7 +907,7 @@ private:
             if (!part.committed) continue;
             for (const auto [from, to] : {std::pair{part.base, std::min(part.end, at)}, std::pair{std::max(part.base, at), part.end}}) {
                 DWORD previous;
-                if (from < to && !VirtualProtect(reinterpret_cast<void*>(from), to - from, part.protection, &previous)) fail("protect a split run of shared guest pages");
+                if (from < to && !GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(from), to - from, part.protection, &previous)) fail("protect a split run of shared guest pages");
             }
         }
     }
@@ -911,11 +921,12 @@ private:
     }
 
     void demote(std::uintptr_t address, bool alias = false) {
+        ++mappingSerial;
         const auto run = std::prev(residentRuns.upper_bound(address));
         const auto start = run->first;
         const auto stop = run->second.end;
         DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
+        if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
         const auto section = views.at(start).section;
         auto window = open(section->handle, views.at(start).offset, stop - start);
         if (query(reinterpret_cast<std::uintptr_t>(window.bytes)).State == MEM_RESERVE && !VirtualAlloc(window.bytes, stop - start, MEM_COMMIT, PAGE_READWRITE)) fail("commit direct memory pages");
@@ -952,7 +963,7 @@ private:
         const auto start = run->first;
         const auto stop = run->second.end;
         DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("open resident guest pages");
+        if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("open resident guest pages");
         std::shared_ptr<Saved> saved;
         for (auto page = start; page < stop; page += pageBytes) {
             const auto found = views.find(page);
@@ -1050,7 +1061,7 @@ private:
             auto stop = sub + 1;
             while (stop < subpages && (mask & (1u << stop)) != 0 && stop * subpageBytes != viewBytes) ++stop;
             DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
+            if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
             sub = stop;
         }
     }
@@ -1093,6 +1104,101 @@ private:
         return memory;
     }
 
+    struct QueryMemo {
+        std::uintptr_t address = 0;
+        std::uint64_t mapping = 0;
+        std::uint64_t commit = 0;
+        std::uint64_t localMapping = 0;
+        std::uint64_t protection = 0;
+        std::uint64_t unwatch = 0;
+        std::uint64_t forget = 0;
+        MEMORY_BASIC_INFORMATION memory{};
+    };
+
+    const char* queryCoverage(std::uintptr_t address, std::uintptr_t end) const {
+        if (end <= address) return "fix_vq_memo_refused_range";
+        const auto owned = ownedRanges.upper_bound(address);
+        if (owned == ownedRanges.begin() || std::prev(owned)->second < end) return "fix_vq_memo_refused_untracked";
+        const auto external = externalProtectionRanges.lower_bound(end);
+        if (external != externalProtectionRanges.begin() && std::prev(external)->second > address) return "fix_vq_memo_refused_external_protection";
+        const auto pinned = pinnedRanges.lower_bound(end);
+        if (pinned != pinnedRanges.begin() && std::prev(pinned)->second > address) return "fix_vq_memo_refused_pinned";
+        return nullptr;
+    }
+
+    MEMORY_BASIC_INFORMATION queryCollection(std::uintptr_t address, std::uintptr_t end, const QueryMemoContext* context) {
+        if (context == nullptr) return query(address);
+        const auto count = [&](const char* name) { if (context->count != nullptr) context->count(name); };
+        const auto fallback = [&](const char* reason) {
+            count("fix_vq_memo_misses");
+            count(reason);
+            return query(address);
+        };
+        static const bool debugProtection = std::getenv("APS5_WATCH_WRITE") != nullptr;
+        if (debugProtection) return fallback("fix_vq_memo_refused_debug_protection");
+        if (const auto reason = queryCoverage(address, end)) return fallback(reason);
+        const auto unwatched = context->unwatch != nullptr ? context->unwatch() : 0;
+        const auto forgotten = context->forget != nullptr ? context->forget() : 0;
+        if ((forgotten & 1u) != 0) return fallback("fix_vq_memo_refused_forget_active");
+        const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto committed = GuestArenaCommitGeneration_nid_postfix();
+        const auto protection = GuestArenaQueryProtectionSerial_nid_no_patch();
+        if (protection == 0) return fallback("fix_vq_memo_refused_protection_active");
+        const auto stable = [&] {
+            return mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && committed == GuestArenaCommitGeneration_nid_postfix() &&
+                protection == GuestArenaQueryProtectionSerial_nid_no_patch() && (context->unwatch == nullptr || unwatched == context->unwatch()) &&
+                (context->forget == nullptr || forgotten == context->forget());
+        };
+        auto key = address >> 12;
+        key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ull;
+        key = (key ^ (key >> 27)) * 0x94d049bb133111ebull;
+        auto& entry = queryMemo[(key ^ (key >> 31)) % queryMemo.size()];
+        const char* reason = nullptr;
+        if (entry.address != address) {
+            if (entry.address != 0) count("fix_vq_memo_collisions");
+            reason = "fix_vq_memo_refused_cold";
+        }
+        else if (entry.commit != committed) reason = "fix_vq_memo_refused_commit";
+        else if (entry.unwatch != unwatched) reason = "fix_vq_memo_refused_unwatch";
+        else if (entry.forget != forgotten) reason = "fix_vq_memo_refused_forget";
+        else if (entry.mapping != mapping) reason = "fix_vq_memo_refused_mapping";
+        else if (entry.localMapping != mappingSerial) reason = "fix_vq_memo_refused_mapping";
+        else if (entry.protection != protection) reason = "fix_vq_memo_refused_protection";
+        if (reason == nullptr) {
+            if (!stable()) return fallback("fix_vq_memo_refused_changed");
+            count("fix_vq_memo_hits");
+            if (!context->verify) return entry.memory;
+            const auto actual = query(address);
+            if (!stable()) {
+                count("fix_vq_memo_refused_changed");
+                entry = {};
+                return actual;
+            }
+            count("fix_vq_memo_verified");
+            const auto& cached = entry.memory;
+            if (cached.BaseAddress != actual.BaseAddress || cached.AllocationBase != actual.AllocationBase ||
+#ifdef _WIN64
+                cached.PartitionId != actual.PartitionId ||
+#endif
+                cached.AllocationProtect != actual.AllocationProtect || cached.RegionSize != actual.RegionSize ||
+                cached.State != actual.State || cached.Protect != actual.Protect || cached.Type != actual.Type) {
+                count("fix_vq_memo_mismatches");
+                entry = {};
+            }
+            return actual;
+        }
+        const auto memory = fallback(reason);
+        const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+        const auto refusal = memory.RegionSize == 0 || memory.RegionSize > UINTPTR_MAX - base ? "fix_vq_memo_refused_range" :
+            (memory.Protect & PAGE_GUARD) != 0 ? "fix_vq_memo_refused_guard" :
+            memory.Type == MEM_MAPPED || memory.Type == MEM_IMAGE ? "fix_vq_memo_refused_mapping_type" :
+            queryCoverage(base, base + memory.RegionSize);
+        if (refusal != nullptr) count(refusal);
+        else if (!stable()) count("fix_vq_memo_refused_changed");
+        else entry = {address, mapping, committed, mappingSerial, protection, unwatched, forgotten, memory};
+        return memory;
+    }
+
     static std::uintptr_t split(std::uintptr_t address, std::size_t bytes) {
         auto memory = query(address);
         memory = query(reinterpret_cast<std::uintptr_t>(memory.AllocationBase));
@@ -1108,6 +1214,7 @@ private:
     }
 
     void reset(std::uintptr_t address, std::size_t bytes) {
+        ++mappingSerial;
         collectableRanges.clear();
         const auto end = address + bytes;
         forgetClean(address, end);
@@ -1204,6 +1311,11 @@ private:
     }
 
     Ranges cleanRanges;
+    Ranges ownedRanges;
+    Ranges externalProtectionRanges;
+    Ranges pinnedRanges;
+    std::uint64_t mappingSerial = 1;
+    std::array<QueryMemo, 4096> queryMemo{};
     Ranges collectableRanges;
     Ranges freshRanges;
     std::map<std::uintptr_t, View> views;

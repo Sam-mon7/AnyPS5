@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -90,20 +91,24 @@ bool Driver::vouchedValidation() {
     return enabled;
 }
 
-EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
+EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit) {
     if (live != nullptr) live->clear();
+    if (feedbackHit != nullptr) *feedbackHit = false;
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy() && pipeline.OverlapsAny(variant.runs)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
     }
     const bool masked = live != nullptr && !variant.dataPositions.empty();
-    const DataMask mask{variant.dataPositions, live};
+    const bool feedback = feedbackMask && !validateLegacy() && !variant.feedback.memory.empty();
+    if (feedbackMask && validateLegacy() && !variant.feedback.memory.empty()) ArchB::Recorder::Count("fix_tsharp_mask_refused_legacy");
+    const DataMask mask{masked ? std::span<const std::uint32_t>(variant.dataPositions) : std::span<const std::uint32_t>{}, live, feedback ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, feedbackHit};
     thread_local std::vector<VouchedRegions>* vouchedSlot = nullptr;
     auto& vouched = ShaderRecompiler::ThreadOwned(vouchedSlot);
     vouched.clear();
     if (!variant.shared.empty() && vouchedValidation() && !validateLegacy() && variant.runs.size() == regions.size()) VouchSharedRegions(variant.shared, regions.size(), &QueryPendingSpan, vouched);
     PendingView pending;
     pending.Load();
+    if (feedback && std::ranges::any_of(variant.runs, [&](const auto& run) { return pending.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); })) ArchB::Recorder::Count("fix_tsharp_mask_refused_pending");
     std::erase_if(vouched, [&](const VouchedRegions& range) { return pending.Overlaps(range.low, static_cast<std::size_t>(range.high - range.low)); });
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* checkedSlot = nullptr;
     auto& checked = ShaderRecompiler::ThreadOwned(checkedSlot);
@@ -150,7 +155,7 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
 
     pending.Load();
     bool unmapped = false;
-    if (!validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked ? &mask : nullptr, vouched)) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
+    if (!validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked || feedback ? &mask : nullptr, vouched)) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
     if (Graphics::Recorder::PublishGeneration() != publish) return EntryOutcome::PublishMoved;
     if (Graphics::StorageTexture::PendingSerial() != pendingSerial) return EntryOutcome::PendingMoved;
     if (GuestMemory::ForgetSerial() != forget) return EntryOutcome::ForgetMoved;

@@ -30,6 +30,16 @@ namespace AgcDriver::DriverDetail {
 
 inline constexpr std::size_t MaxDispatchVariants = 8;
 
+using WordBitMasks = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+
+struct TsharpFeedbackMasks {
+    WordBitMasks memory;
+    WordBitMasks userData;
+    std::vector<WordBitMasks> bindings;
+    WordBitMasks pushConstants;
+    bool operator==(const TsharpFeedbackMasks&) const = default;
+};
+
 struct DispatchVariant {
 
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
@@ -48,6 +58,8 @@ struct DispatchVariant {
     std::vector<std::uint32_t> dataPositions;
     std::vector<std::uint32_t> dataSlots;
     std::uint32_t flatBinding = NoFlatBinding;
+    TsharpFeedbackMasks feedback;
+    std::vector<std::uint32_t> userData;
 
     std::uint32_t pushOffset = 0;
     std::vector<std::int8_t> runBases;
@@ -103,7 +115,16 @@ struct EntryCounters {
 struct DataMask {
     std::span<const std::uint32_t> positions;
     std::vector<std::pair<std::uint32_t, std::uint32_t>>* live;
+    std::span<const std::pair<std::uint32_t, std::uint32_t>> feedback;
+    bool* feedbackHit = nullptr;
 };
+
+bool SameCapturedRuns(std::span<const std::pair<std::uint64_t, std::uint64_t>> before, std::span<const std::pair<std::uint64_t, std::uint64_t>> after);
+std::uint32_t WordMask(std::span<const std::pair<std::uint32_t, std::uint32_t>> masks, std::size_t position);
+bool FeedbackWordsEqual(std::span<const std::uint32_t> before, std::span<const std::uint32_t> after, std::span<const std::pair<std::uint32_t, std::uint32_t>> masks, bool* used = nullptr);
+void RecordTsharpFeedbackMasks(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
+void RecordUncachedTsharpFeedbackMasks(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
+bool FeedbackBindingsEqual(const DispatchVariant& variant, const ShaderRecompiler::RecompileResult& before, const ShaderRecompiler::RecompileResult& after, bool enabled);
 
 enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };
 
