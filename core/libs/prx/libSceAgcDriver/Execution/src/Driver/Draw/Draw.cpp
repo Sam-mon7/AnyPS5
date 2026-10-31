@@ -145,6 +145,7 @@ struct DrawTail {
     bool memoVirtualQuery = false;
     bool imageTableSnapshotReuse = false;
     bool imageTableBitScanKeys = false;
+    bool bufferBases = false;
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
@@ -436,6 +437,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.memoVirtualQuery = ArchB::Switches::Enabled(ArchB::Feature::FixVqMemo);
     tail.imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     tail.imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
+    tail.bufferBases = ArchB::Switches::Enabled(ArchB::Feature::FixBufferBaseRefresh);
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
     auto& phaseLap = tail.phaseLap;
@@ -768,7 +770,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowDecode);
     }
     auto& shaderMemory = tail.shaderMemory;
-    shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan, tail.feedbackMask);
+    shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan, tail.feedbackMask || tail.bufferBases);
     shaderMemory->SetImageTableSnapshotReuse(tail.imageTableSnapshotReuse);
     shaderMemory->SetImageTableBitScanKeys(tail.imageTableBitScanKeys);
     auto& results = tail.results;
@@ -819,7 +821,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         censusMisses = drawEntryCounters.misses;
     }
     try {
-        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, shapeKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree, tail.feedbackMask);
+        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, shapeKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree, tail.feedbackMask, tail.bufferBases);
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
@@ -900,7 +902,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     for (std::size_t i = 0; i < matched.size(); ++i) {
         if (matched[i] == nullptr || matched[i]->shaderDataPatches.empty()) continue;
         applyShaderDataPatches(*matched[i]);
-        if (stageData[i].compiled != nullptr) stageData[i].compiled = patchDataWords(*matched[i], stageData[i].words);
+        if (stageData[i].compiled != nullptr) stageData[i].compiled = patchDataWords(*matched[i], stageData[i].words, stageData[i].bufferBaseHit);
     }
     const auto relocatedDecode = decode;
     if (!userPatches.empty()) {
@@ -1153,6 +1155,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const bool sameRuns = tail.feedbackMask ? SameCapturedRuns(kept.runs, runs) : kept.runs == runs;
         const char* what = !sameRuns ? "runs" : !FeedbackWordsEqual(expectedWords, words, tail.feedbackMask ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(kept.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}) ? "words" : fresh.variantId != patched.variantId ? "variant" : !sameBindings ? "bindings" : nullptr;
         ++stageDataVerified;
+        if (hit.bufferBaseHit) ArchB::Recorder::Count(what == nullptr ? "fix_buffer_base_verified" : "fix_buffer_base_verify_mismatches");
         if (hit.feedbackHit) ArchB::Recorder::Count(what == nullptr ? "fix_tsharp_mask_verified" : "fix_tsharp_mask_verify_mismatches");
         if (what == nullptr) return;
         char message[256];
@@ -1256,7 +1259,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
-    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, tail.feedbackMask);
+    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, tail.feedbackMask, tail.bufferBases);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -96,7 +97,11 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
                 if (data->feedbackHit != nullptr) *data->feedbackHit = true;
                 continue;
             }
-            if (data->live == nullptr || !std::binary_search(data->positions.begin(), data->positions.end(), position)) return GuestMemory::Compare::Differs;
+            const bool bufferBase = ((stored ^ fresh) & ~WordMask(data->bufferBases, position)) == 0u;
+            if (data->live == nullptr || (!bufferBase && !std::binary_search(data->positions.begin(), data->positions.end(), position))) {
+                if (!data->bufferBases.empty()) ArchB::Recorder::Count("fix_buffer_base_refused_change");
+                return GuestMemory::Compare::Differs;
+            }
             data->live->emplace_back(position, fresh);
         }
         return GuestMemory::Compare::Equal;

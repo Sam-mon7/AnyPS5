@@ -25,6 +25,7 @@ enum class Feature : std::uint8_t {
     FixVqMemo,
     FixImageTableSnapshotReuse,
     FixImageTableBitScanKeys,
+    FixBufferBaseRefresh,
     Count
 };
 
