@@ -127,6 +127,7 @@ const std::atomic<std::uint64_t>*& Driver::workerQueued() {
 }
 
 void Driver::reapCompletionLabels() {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
     if (!gpuLock.owns_lock()) {
         ++triesFailed[TryIdle];

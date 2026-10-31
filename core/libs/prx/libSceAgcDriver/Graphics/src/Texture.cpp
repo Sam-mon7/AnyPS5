@@ -4437,6 +4437,7 @@ void StorageTexture::Flush() {
         pending.textures.remove(this);
         BumpPendingSerial();
     }
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     const auto previous = std::exchange(flushReason, "cache eviction");
     writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -4571,6 +4572,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     if (trace) {
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     if (!ownNotes.empty() && (flush.size() != 1 || std::any_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return ExistingHostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) == nullptr; }))) ownNotes.clear();
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes, ownNotes) != 0) {
@@ -4646,7 +4648,7 @@ bool StorageTexture::WaitForFlushing(std::uint64_t address, std::size_t bytes, c
             std::lock_guard lock(pending.mutex);
             if (std::none_of(pending.flushing.begin(), pending.flushing.end(), [&](const StorageTexture* texture) { return texture != except && texture != exempt && texture->overlaps(address, bytes); })) return waited;
         }
-        { std::lock_guard gpu(GuestMemory::GpuMutex()); }
+        { GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other); std::lock_guard gpu(GuestMemory::GpuMutex()); }
         std::this_thread::yield();
     }
 }
@@ -4664,6 +4666,7 @@ void StorageTexture::SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes)
         for (auto* texture : pending.flushing) take(texture);
     }
     if (overlapping.empty()) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     for (const auto& texture : overlapping) texture->saveBeforeUnwatch();
 }
@@ -4797,6 +4800,7 @@ void StorageTexture::awaitStoredSave(const std::vector<bool>* layers) {
 
 bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason, bool waited) {
     if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return false;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     if (PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited) == 0) return false;
     waitForIdlePublish(reason);

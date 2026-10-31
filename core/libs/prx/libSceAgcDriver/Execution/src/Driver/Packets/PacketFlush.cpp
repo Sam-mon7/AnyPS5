@@ -67,6 +67,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
 
     if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     else if (submit || capped) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    else GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Try);
 
     bool outright = needsRecord;
     if (LabelBatchSubmit()) {

@@ -164,6 +164,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     const auto submitWriter = [&](std::uint32_t writer, bool locked = false) {
         if (!submitLabels || writer == queue) return;
         std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
         if (!locked && !gpuLock.try_lock()) return;
         if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
             localDevice->SubmitRecorded(false);
@@ -305,6 +306,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             pollRefused(refusal);
         }
         if (pollProfile) ++poll.tries;
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
         std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
         if (!gpuLock.owns_lock()) {
             ++triesFailed[TryPoll];
@@ -411,6 +413,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         noteAwaitingTitle(queue, awaited);
         if (requireMemory && (polls & 15u) == 0) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
                 if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {

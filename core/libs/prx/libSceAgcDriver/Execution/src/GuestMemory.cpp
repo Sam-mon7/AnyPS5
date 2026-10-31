@@ -2406,8 +2406,163 @@ thread_local std::chrono::steady_clock::time_point recorderHoldStart{};
 thread_local std::uint64_t recorderHoldGeneration = 0;
 }
 
+namespace {
+using CensusClock = ArchB::Recorder::Clock;
+struct MutexCensusRow {
+    const void* thread = nullptr;
+    std::source_location location;
+    GpuLockSite site = GpuLockSite::Other;
+    std::array<std::string, 8> counters;
+    std::string behind;
+};
+struct MutexCensusState {
+    struct Hold {
+        MutexCensusRow* row = nullptr;
+        CensusClock::time_point begin{}, end{};
+    };
+    std::mutex mutex;
+    std::array<MutexCensusRow, 512> rows;
+    std::size_t used = 0;
+    std::array<Hold, 4096> holds;
+    std::uint64_t sequence = 0;
+};
+MutexCensusState& MutexCensus() {
+    static auto* state = new MutexCensusState;
+    return *state;
+}
+thread_local std::source_location censusLocation;
+thread_local MutexCensusRow* censusHold = nullptr;
+thread_local std::uint64_t censusHoldGeneration = 0;
+thread_local CensusClock::time_point censusHoldStart{};
+
+MutexCensusRow* CensusRow(GpuLockSite site, std::source_location location) {
+    static thread_local std::array<MutexCensusRow*, 128> cached{};
+    for (auto* row : cached) {
+        if (row == nullptr) break;
+        if (row->location.file_name() == location.file_name() && row->location.line() == location.line() && row->site == site) return row;
+    }
+    auto& state = MutexCensus();
+    std::lock_guard lock(state.mutex);
+    if (state.used == state.rows.size()) {
+        ArchB::Recorder::Count("M2.site_overflow");
+        return nullptr;
+    }
+    auto& row = state.rows[state.used++];
+    row.thread = CurrentThreadToken();
+    row.location = location;
+    row.site = site;
+    const std::string_view file(location.file_name());
+    const auto name = std::string(GpuLockSiteNames[static_cast<std::size_t>(site)]) + "." + std::string(file.substr(file.find_last_of("/\\") + 1)) + ":" + std::to_string(location.line());
+    constexpr const char* suffixes[] = {"acquires", "recursive", "try_failed", "wait_ms", "holds", "hold_ms", "post_acquire_ms", "contended"};
+    for (std::size_t i = 0; i < row.counters.size(); ++i) row.counters[i] = "M2.Site." + name + "." + suffixes[i];
+    char holder[80];
+    if (LockStats().holderColumn == PresenterColumn) std::snprintf(holder, sizeof(holder), "presenter");
+    else if (LockStats().tag != 0xffffffffu) std::snprintf(holder, sizeof(holder), "q0x%x.thread%p", LockStats().tag, row.thread);
+    else std::snprintf(holder, sizeof(holder), "thread%p", row.thread);
+    row.behind = "M2.WaitBehind." + std::string(holder) + "." + name + "_ms";
+    for (auto& entry : cached) {
+        if (entry == nullptr) { entry = &row; break; }
+    }
+    return &row;
+}
+
+struct MutexCensusAttempt {
+    MutexCensusRow* row = nullptr;
+    CensusClock::time_point begin{}, acquired{};
+    std::uint64_t generation = 0, sequence = 0;
+    bool recursive = false;
+    bool contended = false;
+    explicit MutexCensusAttempt(GpuMutexType& mutex) {
+        if (!ArchB::Recorder::MutexCensusEnabled()) return;
+        const auto location = std::exchange(censusLocation, {});
+        row = CensusRow(LockStats().nextSite, location);
+        if (row == nullptr) return;
+        generation = ArchB::Recorder::Generation();
+        recursive = mutex.HeldByThisThread();
+        begin = CensusClock::now();
+    }
+    void Waiting() {
+        if (row == nullptr || recursive) return;
+        contended = true;
+        auto& state = MutexCensus();
+        std::lock_guard lock(state.mutex);
+        sequence = state.sequence;
+        begin = CensusClock::now();
+    }
+    void Acquired() {
+        if (row == nullptr) return;
+        acquired = CensusClock::now();
+        if (recursive) return;
+        auto& state = MutexCensus();
+        double covered = 0;
+        {
+            std::lock_guard lock(state.mutex);
+            if (contended && LockStats().tag == 0) {
+                if (state.sequence - sequence > state.holds.size()) ArchB::Recorder::Count("M2.wait_history_overflow");
+                const auto first = std::max(sequence, state.sequence > state.holds.size() ? state.sequence - state.holds.size() : 0);
+                for (auto i = first; i < state.sequence; ++i) {
+                    const auto& hold = state.holds[i % state.holds.size()];
+                    const auto overlap = std::min(acquired, hold.end) - std::max(begin, hold.begin);
+                    if (overlap <= CensusClock::duration{} || hold.row == nullptr) continue;
+                    const auto ms = std::chrono::duration<double, std::milli>(overlap).count();
+                    ArchB::Recorder::Count(hold.row->behind.c_str(), ms);
+                    covered += ms;
+                }
+            }
+        }
+        censusHold = row;
+        censusHoldStart = acquired;
+        censusHoldGeneration = generation;
+        if (contended && LockStats().tag == 0) {
+            const auto waited = std::chrono::duration<double, std::milli>(acquired - begin).count();
+            ArchB::Recorder::Count("M2.wait_covered_ms", covered);
+            ArchB::Recorder::Count("M2.wait_unattributed_ms", std::max(0.0, waited - covered));
+        }
+    }
+    ~MutexCensusAttempt() {
+        if (row == nullptr || generation != ArchB::Recorder::Generation()) return;
+        const auto end = CensusClock::now();
+        if (acquired == CensusClock::time_point{}) {
+            ArchB::Recorder::Count(row->counters[2].c_str());
+            return;
+        }
+        ArchB::Recorder::Count(row->counters[0].c_str());
+        if (recursive) ArchB::Recorder::Count(row->counters[1].c_str());
+        if (contended) ArchB::Recorder::Count(row->counters[7].c_str());
+        ArchB::Recorder::Count(row->counters[3].c_str(), std::chrono::duration<double, std::milli>(acquired - begin).count());
+        ArchB::Recorder::Count(row->counters[6].c_str(), std::chrono::duration<double, std::milli>(end - acquired).count());
+    }
+};
+thread_local MutexCensusAttempt* censusAttempt = nullptr;
+struct CensusAttemptScope {
+    MutexCensusAttempt attempt;
+    MutexCensusAttempt* previous;
+    explicit CensusAttemptScope(GpuMutexType& mutex) : attempt(mutex), previous(std::exchange(censusAttempt, &attempt)) {}
+    ~CensusAttemptScope() { censusAttempt = previous; }
+};
+void CensusRelease() {
+    if (censusHold == nullptr) return;
+    const auto now = CensusClock::now();
+    auto& state = MutexCensus();
+    {
+        std::lock_guard lock(state.mutex);
+        state.holds[state.sequence++ % state.holds.size()] = {censusHold, censusHoldStart, now};
+    }
+    if (censusHoldGeneration == ArchB::Recorder::Generation()) {
+        ArchB::Recorder::Count(censusHold->counters[4].c_str());
+        ArchB::Recorder::Count(censusHold->counters[5].c_str(), std::chrono::duration<double, std::milli>(now - censusHoldStart).count());
+    }
+    censusHold = nullptr;
+}
+}
+
 void GpuMutexType::enter() {
-    if (!HeldByThisThread()) LockSpinning(mutex, HandoffSpinWindow());
+    if (censusAttempt != nullptr && censusAttempt->row != nullptr) {
+        if (!tryEnter()) {
+            censusAttempt->Waiting();
+            LockSpinning(mutex, HandoffSpinWindow());
+        }
+    } else if (!HeldByThisThread()) LockSpinning(mutex, HandoffSpinWindow());
 }
 
 bool GpuMutexType::tryEnter() {
@@ -2415,6 +2570,8 @@ bool GpuMutexType::tryEnter() {
 }
 
 void GpuMutexType::acquired() {
+    if (censusAttempt != nullptr) censusAttempt->Acquired();
+    ArchB::Recorder::MutexTimer censusTiming("M2.Mutex.Acquired");
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         recorderHoldGeneration = ArchB::Recorder::Generation();
@@ -2422,12 +2579,14 @@ void GpuMutexType::acquired() {
         if (recorderHoldStart != std::chrono::steady_clock::time_point{}) ArchB::Recorder::GpuLock(true, recorderHoldStart);
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+        censusTiming.Mark("recorder_timeline_serial");
         const bool skipInvalidation = ArchB::Switches::Enabled(ArchB::Feature::UbNoLockInvalidation);
         bool skipped = false;
         if (!proofThread) {
             if (skipInvalidation) skipped = true;
             else proofSerial.fetch_add(1, std::memory_order_acq_rel);
         }
+        censusTiming.Mark("proof_invalidation");
         if (ResourceEpochProofsEnabled()) {
             static const void* resourceProofOwner = nullptr;
             const auto token = CurrentThreadToken();
@@ -2438,10 +2597,12 @@ void GpuMutexType::acquired() {
             resourceProofOwner = token;
         }
         if (skipped) ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbNoLockInvalidation);
+        censusTiming.Mark("resource_proof_invalidation");
     }
 }
 
 bool GpuMutexType::try_lock() {
+    CensusAttemptScope census(*this);
     const bool timelineOuter = Timeline::Enabled && !HeldByThisThread();
     if (timelineOuter) {
         const auto site = LockStats().nextSite;
@@ -2455,8 +2616,12 @@ bool GpuMutexType::try_lock() {
     } timelineTry{timelineOuter, *this};
     if (!GpuLockProfiled()) {
         if (timelineOuter) LockStats().nextSite = GpuLockSite::Other;
-        if (!tryEnter()) return false;
+        if (!tryEnter()) {
+            if (census.attempt.row != nullptr) LockStats().nextSite = GpuLockSite::Other;
+            return false;
+        }
         acquired();
+        if (census.attempt.row != nullptr) LockStats().nextSite = GpuLockSite::Other;
         return true;
     }
     // The tag is consumed whether or not the try succeeds (a failed try must not name the next
@@ -2507,6 +2672,7 @@ void GpuMutexType::unlock() {
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockRelease, 0, 0, 0, 0, 0, Timeline::LockSite);
+        CensusRelease();
         mutex.unlock();
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
@@ -2534,6 +2700,7 @@ void AssertGpuLockHeld(const char* where) {
 
 void GpuMutexType::lock() {
     PerformanceTimer recorderTiming("GpuMutex.wait");
+    CensusAttemptScope census(*this);
     recorderTiming.RecorderCounter("gpu_mutex_wait_ms");
     if (Timeline::Enabled && !HeldByThisThread()) {
         Timeline::LockSite = static_cast<std::uint32_t>(LockStats().nextSite) + 1;
@@ -2548,11 +2715,13 @@ void GpuMutexType::lock() {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {
                 const auto start = std::chrono::steady_clock::now();
+                census.attempt.Waiting();
                 LockSpinning(mutex, HandoffSpinWindow());
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
         acquired();
+        if (census.attempt.row != nullptr) LockStats().nextSite = GpuLockSite::Other;
         return;
     }
     auto& stats = LockStats();
@@ -2566,6 +2735,7 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
+        census.attempt.Waiting();
         LockSpinning(mutex, HandoffSpinWindow());
         acquired();
         if (depth == 1) stats.holdSite = site;
@@ -2663,7 +2833,11 @@ void GpuMutexType::lock() {
     if (depth == 1 && GpuHoldProfiled()) BeginHold(site);
 }
 
-void TagGpuLockSite(GpuLockSite site) {
+void TagGpuLockSite(GpuLockSite site, std::source_location location) {
+    if (ArchB::Recorder::MutexCensusEnabled()) {
+        censusLocation = location;
+        LockStats().nextSite = site;
+    }
     // Off the profiled path the tag is never read, so the thread-local is not touched either.
     if (!GpuLockProfiled() && !PerformanceTrace::Recording() && !Timeline::Enabled) return;
     LockStats().nextSite = site;

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include <source_location>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -196,7 +197,7 @@ std::uint32_t GpuLockThreadTag();
 // outermost acquisition of a thread until its unlock; APS5_NO_HOLD_PROFILE=1 turns that off), so
 // the line shows who holds the mutex, not only who waits for it.
 enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Count };
-void TagGpuLockSite(GpuLockSite site);
+void TagGpuLockSite(GpuLockSite site, std::source_location location = std::source_location::current());
 void NoteGpuLabel();
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).

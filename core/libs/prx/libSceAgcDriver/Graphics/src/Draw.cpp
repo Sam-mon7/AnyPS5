@@ -3588,6 +3588,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 
 DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe) {
     AgcDriver::ArchB::Recorder::Timer recorderTiming("Draw.Prelock");
+    AgcDriver::ArchB::Recorder::MutexTimer mutexTiming("M2.Draw.Prepare");
     DrawPreparation prepared;
     if (!DrawPrelockEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return prepared;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3624,6 +3625,7 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
             if (surface.dccAddress != 0) precollect(surface.dccAddress, DccKeyBytes(bytes));
         }
     }
+    mutexTiming.Mark("target_collect");
     std::shared_ptr<ShaderResources> cached;
     if (recipe != nullptr && recipe->device == context.device) {
         cached = recipe->templateRef.lock();
@@ -3632,7 +3634,9 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         prepared.resourceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
         cached = SharedResourceCache().Find(prepared.resourceKey);
     }
+    mutexTiming.Mark("resource_lookup");
     if (cached != nullptr && collect) cached->PrecollectSurfaces();
+    mutexTiming.Mark("surface_collect");
     if (collect && residentTargets && context.detiler != nullptr && StorageTexture::DrawTargetPrelockEnabled()) {
         const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         prepared.targets.resize(state.colors.size());
@@ -3648,6 +3652,7 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         }
         if (profile) prepared.targetProofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
     }
+    mutexTiming.Mark("target_prepare");
     if (profile) {
         prepared.cached = cached;
         prepared.collectedBytes = GuestMemory::ThreadCollectedBytes() - collectedBefore;

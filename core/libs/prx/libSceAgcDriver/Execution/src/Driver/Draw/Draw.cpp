@@ -1257,9 +1257,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     snapshot();
     timing.Mark("post_compile_prepare");
     DrawLockTiming lockTiming{profile};
+    ArchB::Recorder::MutexTimer acquireTiming("M2.Draw.AcquireInterval");
     const auto prepareForDraw = [&](const Pm4::DrawParameters& parameters, const DrawRecipe* recipe = nullptr) {
         if (gpuLock.owns_lock() || !Graphics::DrawPrelockEnabled()) return;
         const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ArchB::Recorder::MutexTimer prelockTiming("M2.Draw.Prelock");
         lockTiming.preparation = localDevice->PrepareDraw(graphics, parameters, stages, recipe);
         if (profile) lockTiming.prepareMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     };
@@ -1269,10 +1271,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             lockTiming.Start();
             return;
         }
+        acquireTiming.Mark("before_lock");
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
         lockTiming.Start();
+        acquireTiming.Mark("lock_call_tail");
+        acquireTiming.Finish();
         timing.Mark("gpu_mutex_wait");
         phaseTiming.Phase(DrawRowLockWait);
 
@@ -1409,6 +1414,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return drawn();
     }
 
+    acquireTiming.Mark("indirect_setup");
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
     if (registerKey && !drawParameters.indirect && !patchedStages && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
@@ -1426,6 +1432,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             return DrawVerdict::Rejected;
         }
     }
+    acquireTiming.Mark("recipe_selection");
     if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty())) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);

@@ -126,6 +126,7 @@ struct Recorder::Thread {
         std::atomic<const char*> name{nullptr};
         const char* stage = nullptr;
         Value ms;
+        Value heldMs;
     };
     struct CounterEntry {
         std::atomic<const char*> name{nullptr};
@@ -187,13 +188,27 @@ void Recorder::Boundary(bool on, std::uint64_t sequence, Clock::time_point now) 
     enabled.store(on, std::memory_order_relaxed);
 }
 
+bool Recorder::MutexCensusEnabled() {
+    static const bool requested = [] {
+        const auto* value = std::getenv("APS5_ARCHB_MUTEX_CENSUS");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return requested && Enabled();
+}
+
+Recorder::MutexTimer::MutexTimer(const char* name) {
+    if (MutexCensusEnabled()) scope.Begin(name, Clock::now());
+}
+
 void Recorder::Scope::Begin(const char* scope, Clock::time_point now, Phase phase) {
     if (!Enabled()) return;
     active = true;
     name = scope;
     previous = now;
     draw = currentDraw;
+    mutexCensus = MutexCensusEnabled();
     parent = currentScope;
+    if (draw != nullptr || mutexCensus) heldBefore = heldTime(now);
     if (draw != nullptr) {
         heldBefore = heldTime(now);
         bucket = bucketOf(scope, {}, parent != nullptr && parent->draw == draw ? parent->bucket : Bucket::Bookkeeping);
@@ -209,11 +224,11 @@ void Recorder::Scope::Mark(const char* stage, Clock::time_point now) {
     const auto inclusive = now - previous;
     elapsed += inclusive;
     const auto exclusive = inclusive - children;
-    const auto held = draw != nullptr ? heldTime(now) : Clock::duration{};
+    const auto held = draw != nullptr || mutexCensus ? heldTime(now) : Clock::duration{};
     const auto inclusiveHeld = held - heldBefore;
     const auto exclusiveHeld = std::clamp(inclusiveHeld - heldChildren, Clock::duration{}, std::max(Clock::duration{}, exclusive));
     if (generation == Recorder::generation.load(std::memory_order_relaxed)) {
-        Recorder::phase(name, stage, exclusive);
+        Recorder::phase(name, stage, exclusive, mutexCensus ? exclusiveHeld : Clock::duration{});
         if (draw != nullptr && draw == currentDraw && draw->generation == generation) {
             const auto index = static_cast<std::size_t>(bucketOf(name, stage != nullptr ? stage : "", bucket));
             draw->elapsed[0][index] += exclusive - exclusiveHeld;
@@ -321,7 +336,7 @@ void Recorder::GpuLock(bool held, Clock::time_point now) {
     gpuHeld = held;
 }
 
-void Recorder::phase(const char* name, const char* stage, Clock::duration elapsed) {
+void Recorder::phase(const char* name, const char* stage, Clock::duration elapsed, Clock::duration held) {
     auto& t = thread();
     const auto hash = (reinterpret_cast<std::uintptr_t>(name) ^ (reinterpret_cast<std::uintptr_t>(stage) >> 3)) * 0x9e3779b97f4a7c15ull;
     for (std::size_t probe = 0; probe < t.phases.size(); ++probe) {
@@ -332,6 +347,7 @@ void Recorder::phase(const char* name, const char* stage, Clock::duration elapse
             row.name.store(name, std::memory_order_release);
         } else if (key != name || row.stage != stage) continue;
         row.ms.Add(milliseconds(elapsed));
+        if (held != Clock::duration{}) row.heldMs.Add(milliseconds(held));
         return;
     }
     t.phaseOverflow.Add(milliseconds(elapsed));
@@ -416,6 +432,12 @@ Recorder::Snapshot Recorder::Collect(Clock::time_point now) {
                 const auto phase = TraceFormat::Name(name, row.stage);
                 const auto ms = row.ms.Take();
                 result.phases[t.name][phase] += ms;
+                const auto held = row.heldMs.Take();
+                if (held != 0) {
+                    const auto key = "M2.Held." + phase + "_ms";
+                    result.threadCounters[t.name][key] += held;
+                    result.counters[key] += held;
+                }
                 if (phase.find("Wait") == std::string::npos && phase.find("wait") == std::string::npos) busy += ms;
             }
             const auto overflow = t.phaseOverflow.Take();

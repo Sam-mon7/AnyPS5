@@ -245,6 +245,29 @@ void targetsCensus(bool enabled) {
     near(Recorder::Collect(start + 4s).counters.at("H1.Hit.target_proof_ns"), 10000000);
 }
 
+void mutexPhases() {
+    const Recorder::Clock::time_point start{};
+    Recorder::Boundary(true, 900, start);
+    Recorder::BindThread("mutex phases");
+    require(Recorder::MutexCensusEnabled(), "mutex census is not enabled");
+    Recorder::Scope outer, inner;
+    outer.Begin("outer", start);
+    Recorder::GpuLock(true, start + 10ms);
+    inner.Begin("inner", start + 20ms);
+    inner.End(start + 40ms);
+    Recorder::GpuLock(false, start + 70ms);
+    outer.End(start + 100ms);
+    const auto result = Recorder::Collect(start + 100ms);
+    near(result.counters.at("M2.Held.outer_ms"), 40);
+    near(result.counters.at("M2.Held.inner_ms"), 20);
+    near(result.accountedMs, 100);
+    Recorder::Boundary(false, 901, start + 200ms);
+    require(!Recorder::MutexCensusEnabled(), "mutex census escaped recorder gate");
+    Recorder::MutexTimer off("disabled");
+    off.Finish();
+    require(!Recorder::Collect(start + 300ms).phases["mutex phases"].contains("disabled"), "disabled timer published");
+}
+
 void shaderTableOverflow() {
     const Recorder::Clock::time_point start{};
     Recorder::Boundary(true, 0, start);
@@ -268,7 +291,8 @@ int main(int argc, char** argv) {
     try {
         require(argc == 2, "expected one test case");
         const std::string_view name = argv[1];
-        if (name == "reconciles") reconciles();
+        if (name == "mutex_phases") mutexPhases();
+        else if (name == "reconciles") reconciles();
         else if (name == "no_path_change") noPathChange();
         else if (name == "toggle_interval_tagged") toggleIntervalTagged();
         else if (name == "shader_table_overflow") shaderTableOverflow();

@@ -228,6 +228,7 @@ void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
 }
 
 void Driver::ReleaseWindow(void* window) {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard lock(GuestMemory::GpuMutex());
     if (device && device->Window() == window) device.Reset();
 }

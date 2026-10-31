@@ -2303,6 +2303,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->CreateWorkgroupMemoryLayout();
     if (!state->shaderProfile->NullDescriptors()) {
         std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
         if (!GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
         state->placeholderImages = std::make_unique<Graphics::PlaceholderImages>(graphicsContext());
     }
@@ -5001,6 +5002,7 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
     if (overlaps) {
         // No reap here (SubmitAndEpoch's would run completions, which a compute worker must not do
         // on queue 0's behalf, see SubmitRecorded): the dispatch reaps after the wait.
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
         std::lock_guard lock(GuestMemory::GpuMutex());
         if (state->recorder) {
             bool open = false;

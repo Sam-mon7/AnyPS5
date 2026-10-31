@@ -647,7 +647,10 @@ void ResidentBuffer::submit(const std::vector<VkSparseMemoryBind>& binds) {
         std::unique_lock<std::mutex> queueLock;
         std::unique_lock<GuestMemory::GpuMutexType> gpuLock;
         if (ownQueue) queueLock = std::unique_lock(*context.sparseQueueMutex);
-        else gpuLock = std::unique_lock(GuestMemory::GpuMutex());
+        else {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
+            gpuLock = std::unique_lock(GuestMemory::GpuMutex());
+        }
         submitted = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
         if (submitted == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
     }

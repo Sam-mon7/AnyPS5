@@ -258,6 +258,7 @@ void Driver::execute(const Submission& submission) {
         const auto header = submission.commands[cursor];
         if (Pm4::FillerPacket(header)) {
             if (Graphics::Recorder::ComputeChainsEnabled()) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
                 std::lock_guard gpu(GuestMemory::GpuMutex());
                 if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr) recorder->EndComputeChain();
             }
@@ -274,6 +275,7 @@ void Driver::execute(const Submission& submission) {
                 if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
                 if (DrawFinisher::Busy()) DrawFinisher::Get().Drain();
             }
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
             std::lock_guard gpu(GuestMemory::GpuMutex());
             if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr) {
                 recorder->EndComputeChain(force);

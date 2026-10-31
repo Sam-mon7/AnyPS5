@@ -1734,6 +1734,7 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     }
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
     if (pending && pendingFills) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
         std::lock_guard gpu(GuestMemory::GpuMutex());
         if (const auto landed = htileAfterPendingFills(*recorder, target.htileAddress, bytes)) {
             const VkImageAspectFlags cleared = (VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u)) & HtileFillClears(*landed, target.htileStencil);
@@ -1993,6 +1994,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     R::Timer phases(census != nullptr ? "H2.TargetDepth" : nullptr);
     if (census != nullptr) census->Count(R::Metric::TargetDepthLookup);
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);
     std::unique_lock lock(surfacesMutex());
@@ -2080,6 +2082,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
 }
 
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target) {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
     for (const auto& candidate : surfaces()) {
@@ -2091,6 +2094,7 @@ SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTar
 }
 
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target) {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
     for (const auto& candidate : surfaces()) {
@@ -2134,6 +2138,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
     std::vector<Stored> stored;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
         std::lock_guard gpu(GuestMemory::GpuMutex());
         std::lock_guard lock(surfacesMutex());
         std::vector<std::pair<std::uint64_t, std::uint64_t>> remaining;
@@ -2349,6 +2354,7 @@ void CompleteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes) {
 }
 
 void ClearDepthSurfaces(VkDevice device) {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     drawnDepth = nullptr;
@@ -2382,6 +2388,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         std::lock_guard lock(surfacesMutex());
         if (std::none_of(surfaces().begin(), surfaces().end(), held)) return nullptr;
     }
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, resource.baseAddress);
     std::lock_guard lock(surfacesMutex());
@@ -2452,6 +2459,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
 
 bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resource, const Texture* texture) {
     if ((resource.dimension != TextureDimension::k2D && resource.dimension != TextureDimension::k2DMsaa) || resource.baseArray != 0) return false;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     const auto address = resource.baseAddress;
     settlePendingHtileClear(context, address);
@@ -2465,6 +2473,7 @@ bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resou
 
 void RequireNoNativeDepthFeedback_nid_no_patch(const Context& context, const DepthTarget& target, std::span<const std::shared_ptr<Texture>> sampled) {
     if (target.samples == 1u || sampled.empty()) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {

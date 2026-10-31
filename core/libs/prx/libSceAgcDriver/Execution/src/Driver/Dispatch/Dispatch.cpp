@@ -634,11 +634,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     if (recipeHit == nullptr || VulkanDevice::VerifyRecipes() || htileClearCompletion.has_value()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    ArchB::Recorder::MutexTimer mutexTiming("M2.DispatchCommit.Held");
                     recordLabelsForPacket(localDevice.get(), queueId);
+                    mutexTiming.Mark("labels");
                     if (noteWrites && writerKeyedEvidence() && !writersNoted) {
                         noteWrittenBuffers(address, queueId, compiledCommit);
                         writersNoted = true;
                     }
+                    mutexTiming.Mark("writers");
                     if (recipeHit != nullptr) {
                         VulkanDevice::IndirectOutcome outcome{0, 0};
                         const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
@@ -651,6 +654,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     } else {
                         localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : &builtRecipe, htileClearCompletion, profile ? &recipeFailure : nullptr);
                     }
+                    mutexTiming.Mark("device");
                     break;
                 }
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
@@ -734,9 +738,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         phaseTiming.Phase(PhaseLockWait);
+        ArchB::Recorder::MutexTimer mutexTiming("M2.Dispatch.Held");
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(PhaseLabels);
+        mutexTiming.Mark("labels");
         if (noteWrites && writerKeyedEvidence() && !writersNoted) {
             noteWrittenBuffers(address, submission.queue, compiled);
             writersNoted = true;
@@ -744,6 +750,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseNoteWriters);
         auto* const keysRecorder = filledKeys ? Graphics::Recorder::Active() : nullptr;
         const auto keysNoteBefore = keysRecorder != nullptr ? keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes) : 0;
+        mutexTiming.Mark("writers");
         try {
             const GuestMemory::ReadSiteScope deviceSite(GuestMemory::ReadSite::DispatchDevice);
             if (recipeHit != nullptr) {
@@ -765,6 +772,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         } catch (const std::exception& error) {
             if (rethrow(error)) return;
         }
+        mutexTiming.Mark("device");
         if (keysRecorder != nullptr && keysRecorder == Graphics::Recorder::Active()) {
             const auto note = keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes);
             if (note != 0 && note != keysNoteBefore) Graphics::NoteKeysFillOnGpu(keysFill->base, keysFill->bytes, *filledKeys);
@@ -780,6 +788,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, indirectArguments != 0);
         }
+        mutexTiming.Mark("recipe_publication");
         break;
     }
     phaseTiming.Phase(PhaseDevice);

@@ -1554,6 +1554,7 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
     if (freed < bytes) {
         auto& cache = StorageTextures();
         std::unique_lock<GuestMemory::GpuMutexType> gpu(GuestMemory::GpuMutex(), std::defer_lock);
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
         const bool inherited = storageCacheHeld != 0;
         if ((inherited && (!newImage || storageCacheReclaimable == 0)) || !gpu.try_lock()) {
             storageSkipped = true;

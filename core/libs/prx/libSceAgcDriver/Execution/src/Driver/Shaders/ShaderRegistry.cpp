@@ -2371,6 +2371,7 @@ void Driver::RegisterShader(const Shader* shader) {
 
     std::shared_ptr<VulkanDevice> localDevice = device.Load();
     if (localDevice == nullptr) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         localDevice = device;

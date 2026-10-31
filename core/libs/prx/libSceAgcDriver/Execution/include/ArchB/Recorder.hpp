@@ -154,6 +154,19 @@ public:
         Phase category = Phase::Prepare;
         std::uint64_t generation = 0;
         bool active = false;
+        bool mutexCensus = false;
+    };
+    static bool MutexCensusEnabled();
+    class MutexTimer {
+    public:
+        explicit MutexTimer(const char* name);
+        ~MutexTimer() { Finish(); }
+        void Mark(const char* stage) { if (scope.Active()) scope.Mark(stage, Clock::now()); }
+        void Finish() { if (scope.Active()) scope.End(Clock::now()); }
+        MutexTimer(const MutexTimer&) = delete;
+        MutexTimer& operator=(const MutexTimer&) = delete;
+    private:
+        Scope scope;
     };
     class Timer {
     public:
@@ -207,7 +220,7 @@ private:
     struct Thread;
     static Thread& thread();
     static Clock::duration heldTime(Clock::time_point now);
-    static void phase(const char* name, const char* stage, Clock::duration elapsed);
+    static void phase(const char* name, const char* stage, Clock::duration elapsed, Clock::duration held = {});
     inline static std::atomic<bool> enabled{false};
     inline static std::atomic<std::uint64_t> generation{0};
     inline static thread_local Thread* local = nullptr;

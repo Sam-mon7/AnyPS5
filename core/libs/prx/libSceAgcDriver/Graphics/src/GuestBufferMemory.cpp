@@ -3235,6 +3235,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         }
         if (retiredImport && recorder != nullptr) recorder->FlushDeferredReleases();
     } else {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Other);
         std::lock_guard lock(GuestMemory::GpuMutex());
         auto& state = Leases();
         auto* recorder = Recorder::Active();

@@ -5,6 +5,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include <string_view>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -202,9 +204,66 @@ void ThreadSlots() {
     AgcDriver::GuestMemory::SetReadSite(previous);
 }
 
+void MutexCensus() {
+    using R = AgcDriver::ArchB::Recorder;
+    namespace G = AgcDriver::GuestMemory;
+    using namespace std::chrono_literals;
+    R::Boundary(true, 0, R::Clock::now());
+    R::BindThread("census waiter");
+    G::TagGpuLockThread(0);
+    std::atomic<bool> held{false}, waiting{false};
+    std::thread holder([&] {
+        R::BindThread("census holder");
+        G::TagGpuLockThread(0x28);
+        G::TagGpuLockSite(G::GpuLockSite::Dispatch);
+        std::lock_guard lock(G::GpuMutex());
+        held.store(true);
+        while (!waiting.load()) std::this_thread::yield();
+        std::this_thread::sleep_for(25ms);
+    });
+    while (!held.load()) std::this_thread::yield();
+    std::this_thread::sleep_for(40ms);
+    G::TagGpuLockSite(G::GpuLockSite::Wait);
+    Check(!G::GpuMutex().try_lock(), "census try failure still refuses a held mutex");
+    waiting.store(true);
+    G::TagGpuLockSite(G::GpuLockSite::Draw);
+    {
+        std::lock_guard outer(G::GpuMutex());
+        G::TagGpuLockSite(G::GpuLockSite::Hook);
+        std::lock_guard inner(G::GpuMutex());
+    }
+    holder.join();
+    const auto result = R::Collect(R::Clock::now());
+    double behind = 0, hold = 0, wait = 0, recursive = 0, failed = 0;
+    for (const auto& [name, value] : result.threadCounters.at("census waiter")) {
+        if (name.starts_with("M2.WaitBehind.q0x28.")) behind += value;
+        if (name.ends_with(".wait_ms")) wait += value;
+        if (name.ends_with(".recursive")) recursive += value;
+        if (name.ends_with(".try_failed")) failed += value;
+    }
+    for (const auto& [name, value] : result.threadCounters.at("census holder")) {
+        if (name.ends_with(".hold_ms")) hold += value;
+    }
+    Check(behind > 0 && behind <= wait && behind < hold, "census clips holder time to the actual wait");
+    Check(recursive == 1 && failed == 1, "census separates recursive acquisitions and failed tries");
+    Check(result.counters.at("M2.wait_covered_ms") == behind, "census holder attribution reconciles");
+    Check(!result.counters.contains("M2.site_overflow") && !result.counters.contains("M2.wait_history_overflow"), "census did not overflow");
+    R::Boundary(false, 1, R::Clock::now());
+    G::TagGpuLockSite(G::GpuLockSite::Draw);
+    { std::lock_guard off(G::GpuMutex()); }
+    const auto off = R::Collect(R::Clock::now());
+    for (const auto& [name, value] : off.counters) {
+        if (name.starts_with("M2.")) Check(value == 0, "disabled recorder published mutex counters");
+    }
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "census") {
+        MutexCensus();
+        return failures != 0;
+    }
     MutexCounts(8, 100000, 0);
     MutexCounts(4, 2000, 20000);
     MutexTryLock();
