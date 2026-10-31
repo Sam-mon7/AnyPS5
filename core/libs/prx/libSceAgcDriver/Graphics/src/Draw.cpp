@@ -3515,7 +3515,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 
 }
 
-DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe) {
+DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery) {
     DrawPreparation prepared;
     if (!DrawPrelockEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return prepared;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3560,7 +3560,7 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         prepared.resourceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
         cached = SharedResourceCache().Find(prepared.resourceKey);
     }
-    if (cached != nullptr && collect) cached->PrecollectSurfaces();
+    if (cached != nullptr && collect) cached->PrecollectSurfaces(memoVirtualQuery);
     if (collect && residentTargets && context.detiler != nullptr && StorageTexture::DrawTargetPrelockEnabled()) {
         const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         prepared.targets.resize(state.colors.size());

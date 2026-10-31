@@ -550,6 +550,12 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_archb_c01_switches COMMAND agc_archb_c01_switches_tests)
+    add_test(NAME agc_archb_fix_v1_switch COMMAND agc_archb_c01_switches_tests --toggle VqMemo)
+    set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_fix_v1_switch PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_archb_c01_switches PROPERTIES TIMEOUT 30)
     foreach(archbToggleCase IN ITEMS SeqMonotonic RefusesStartupOnly RefusesUnknown PrerequisiteCascades
             NoFileNoCost AppliesAtBoundaryOnly ScreenshotToken)
@@ -931,11 +937,9 @@ configure_windows_unwind(agc_locks_tests)
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
-        Execution/src/GuestMemory.cpp
-        Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_write_tracking_tests PRIVATE shader_recompiler_agc_driver libc)
+target_link_libraries(agc_write_tracking_tests PRIVATE libSceAgcDriver libc)
 set_target_properties(agc_write_tracking_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_write_tracking_tests)
 if(BUILD_TESTING)
@@ -948,6 +952,12 @@ if(BUILD_TESTING)
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     set_tests_properties(agc_failed_collect_memo_off PROPERTIES ENVIRONMENT "APS5_NO_FAILED_COLLECT_MEMO=1")
     if(WIN32)
+        foreach(v1Case IN ITEMS reuse commit protect map unwatch forget coverage threads toggle)
+            add_test(NAME agc_archb_fix_v1_${v1Case} COMMAND agc_write_tracking_tests --vq-memo-${v1Case})
+            set_tests_properties(agc_archb_fix_v1_${v1Case} PROPERTIES TIMEOUT 30
+                ENVIRONMENT "APS5_VERIFY_VQ_MEMO=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endforeach()
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_target_clean_proof COMMAND agc_write_tracking_tests --target-clean-proof)
