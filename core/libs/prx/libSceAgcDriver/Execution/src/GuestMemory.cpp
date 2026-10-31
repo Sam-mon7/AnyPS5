@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/EpochMemoMap.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -837,19 +838,24 @@ std::uint64_t ForgetSerial() {
     return forgetSerial.load(std::memory_order_acquire);
 }
 
-Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable) {
+bool DescribeCommittedInto(std::uint64_t address, std::size_t bytes, bool writable, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    ranges.clear();
     require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "address range overflow");
     const TimedAccess timed(CounterVerify, bytes);
-    Commitment result;
     const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes, [&](const PageRun& run) {
         if (run.readable && (!writable || run.writable)) {
-            if (!result.ranges.empty() && result.ranges.back().second == run.begin) result.ranges.back().second = run.end;
-            else result.ranges.emplace_back(run.begin, run.end);
+            if (!ranges.empty() && ranges.back().second == run.begin) ranges.back().second = run.end;
+            else ranges.emplace_back(run.begin, run.end);
         }
         return true;
     });
     require(queried, "cannot query guest memory");
-    result.whole = bytes == 0 || (result.ranges.size() == 1 && result.ranges.front().first == address && result.ranges.front().second == address + bytes);
+    return bytes == 0 || (ranges.size() == 1 && ranges.front().first == address && ranges.front().second == address + bytes);
+}
+
+Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable) {
+    Commitment result;
+    result.whole = DescribeCommittedInto(address, bytes, writable, result.ranges);
     return result;
 }
 
@@ -1389,21 +1395,30 @@ ThreadCollectMemo& threadCollectMemo() {
     return *memo;
 }
 
+// Both maps enter the caller's epoch together. By default an epoch change clears them (freeing every
+// node); under APS5_ARCHB_FIX_ALLOC_CHURN the nodes are pooled and reused by the next epoch's walks
+// (EpochMemoMap: an entry of another epoch is never found, and the pool stays bounded).
 struct EpochCollectMap {
-    std::uint64_t epoch = 0;
-    std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
-    std::unordered_map<std::uintptr_t, WriteTracker::Memo> failedRanges;
+    EpochMemoMap<WriteTracker::Memo> ranges;
+    EpochMemoMap<WriteTracker::Memo> failedRanges;
 };
 
 EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
     thread_local EpochCollectMap* slot = nullptr;
     auto& map = ShaderRecompiler::ThreadOwned(slot);
-    if (map.epoch != epoch) {
-        map.ranges.clear();
-        map.failedRanges.clear();
-        map.epoch = epoch;
+    if (map.ranges.Epoch() != epoch) {
+        // Decided per epoch at its first collect, which often comes from a packet outside any draw
+        // (the epoch starts at an ordering point), so the live switch counts as well as the draw's.
+        const bool keep = ArchB::AllocChurnActive() || ArchB::Switches::Enabled(ArchB::Feature::FixAllocChurn);
+        map.ranges.Enter(epoch, keep);
+        map.failedRanges.Enter(epoch, keep);
     }
     return map;
+}
+
+// An insert that took a node kept from an earlier epoch (no allocation).
+void noteMemoReuse(EpochMemoMap<WriteTracker::Memo>::SlotState state) {
+    if (state == EpochMemoMap<WriteTracker::Memo>::SlotState::Reused) ArchB::Recorder::Count("fix_alloc_churn_memo_reuses");
 }
 
 bool epochCollectMapEnabled() {
@@ -1538,7 +1553,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
-            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
+            if (const auto* found = map.ranges.Find(first); found != nullptr && found->unwatched == unwatched && found->mapping == mapping && stop <= found->end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.stable.load(std::memory_order_acquire);
             }
@@ -1556,7 +1571,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const bool memoFailures = useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && !sharedCollectMemo() && epochCollectMapEnabled() && failedCollectMemoEnabled();
     if (memoFailures) {
         const auto& failed = epochCollectMap(epoch).failedRanges;
-        if (const auto found = failed.find(first); found != failed.end() && found->second.end == stop && found->second.unwatched == unwatched && found->second.mapping == mapping) {
+        if (const auto* found = failed.Find(first); found != nullptr && found->end == stop && found->unwatched == unwatched && found->mapping == mapping) {
             if (MemoryProfiled()) failedCollectMemoHits.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
@@ -1564,7 +1579,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto failedFirst = first;
     const auto failedStop = stop;
     const auto fail = [&]() -> std::uint64_t {
-        if (memoFailures) epochCollectMap(epoch).failedRanges[failedFirst] = {failedFirst, failedStop, epoch, unwatched, mapping};
+        if (memoFailures) {
+            EpochMemoMap<WriteTracker::Memo>::SlotState state;
+            epochCollectMap(epoch).failedRanges.Slot(failedFirst, state) = {failedFirst, failedStop, epoch, unwatched, mapping};
+            noteMemoReuse(state);
+        }
         return 0;
     };
     const auto lock = lockTracker(tracker);
@@ -1609,8 +1628,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
             memo.entries[memo.next++ % memo.entries.size()] = merged;
             if (epochCollectMapEnabled()) {
-                auto& entry = epochCollectMap(epoch).ranges[first];
-                if (entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
+                EpochMemoMap<WriteTracker::Memo>::SlotState state;
+                auto& entry = epochCollectMap(epoch).ranges.Slot(first, state);
+                // A new or reused node always takes this walk; a node of this epoch
+                // only when this walk supersedes it.
+                if (state != EpochMemoMap<WriteTracker::Memo>::SlotState::Current || entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
+                noteMemoReuse(state);
             }
         }
     }
@@ -1984,6 +2007,21 @@ std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, s
         if (generation == 0) return 0;
     }
     ranges = std::move(committed);
+    return generation;
+}
+
+std::uint64_t CollectCommittedWritesInPlace(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    ranges.clear();
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !WriteWatched()) return 0;
+    static_cast<void>(DescribeCommittedInto(address, bytes, false, ranges));
+    auto generation = TrackerGeneration();
+    for (const auto& [begin, end] : ranges) {
+        generation = CollectWrites(begin, static_cast<std::size_t>(end - begin));
+        if (generation == 0) {
+            ranges.clear();
+            return 0;
+        }
+    }
     return generation;
 }
 

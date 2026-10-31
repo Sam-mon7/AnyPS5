@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -1929,6 +1931,47 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
+// APS5_ARCHB_FIX_ALLOC_CHURN: the epoch collect map keeps its nodes across epochs. A kept entry must
+// never stand for a walk of a later epoch: a CPU store made before an epoch is always collected in
+// it, while the ranges nobody wrote keep their generations, epoch after epoch.
+void CheckAllocChurnMemo() {
+    using Recorder = AgcDriver::ArchB::Recorder;
+    Recorder::Boundary(true, 0, Recorder::Clock::now());
+    const AgcDriver::ArchB::AllocChurnScope churn(true);
+    constexpr std::size_t ranges = 8;
+    void* memory = AllocateWatched(ranges * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0, ranges * Block);
+    BumpCollectEpoch();
+    std::vector<std::uint64_t> collected(ranges);
+    for (std::size_t i = 0; i < ranges; ++i) {
+        collected[i] = CollectWrites(base + i * Block, Block);
+        Require(collected[i] != 0, "the churn fixture was not collected");
+    }
+    for (std::size_t epoch = 0; epoch < 64; ++epoch) {
+        const auto written = epoch % ranges;
+        bytes[written * Block + 64 + epoch] = static_cast<std::uint8_t>(epoch + 1);
+        BumpCollectEpoch();
+        for (std::size_t i = 0; i < ranges; ++i) {
+            const auto range = base + i * Block;
+            const auto generation = CollectWrites(range, Block);
+            Require(generation != 0 && UnchangedSince(range, Block, generation), "a collect in a later epoch did not prove its range");
+            if (i == written) {
+                Require(!UnchangedSince(range, Block, collected[i]), "a kept memo entry hid a CPU store made before the epoch");
+                collected[i] = generation;
+            } else {
+                Require(UnchangedSince(range, Block, collected[i]), "an unwritten range lost its generation");
+            }
+            Require(CollectWrites(range, Block) != 0 && UnchangedSince(range, Block, collected[i]), "a memoized collect in the same epoch failed");
+        }
+    }
+    // The kept nodes were overwritten in place (the counter the gate requires).
+    const auto counts = Recorder::Collect(Recorder::Clock::now()).counters;
+    const auto reuses = counts.find("fix_alloc_churn_memo_reuses");
+    Require(reuses != counts.end() && reuses->second >= 64 * ranges, "kept memo nodes were not reused in place");
+}
+
 void CheckFailedCollectMemo() {
     PartlyCommitted range;
     range.Commit(0);
@@ -2247,8 +2290,15 @@ int main(int argc, char** argv) {
             std::cout << "no write watching: skipped\n";
             return 77;
         }
+        // The draw-sampled switch, for the whole run on this thread (the suite with it on and off).
+        const char* allocChurn = std::getenv("APS5_ARCHB_FIX_ALLOC_CHURN");
+        const AgcDriver::ArchB::AllocChurnScope allocChurnScope(allocChurn != nullptr && std::string_view(allocChurn) == "1");
         if (argc == 2 && std::string_view(argv[1]) == "--failed-collect-memo") {
             CheckFailedCollectMemo();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--alloc-churn-memo") {
+            CheckAllocChurnMemo();
             return 0;
         }
 #ifdef _WIN32

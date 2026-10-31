@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -25,7 +26,10 @@ struct TileMipLayout {
 };
 
 std::vector<TileMipLayout> ComputeMipLayout(TextureTileMode tileMode, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t mipCount);
-std::uint64_t ComputeSurfaceSize(const std::vector<TileMipLayout>& mips, std::uint32_t arrayLayers);
+// ComputeMipLayout into caller storage (no allocation): its first mipCount elements, same values.
+using MipLayoutStorage = std::array<TileMipLayout, 16>;
+std::span<const TileMipLayout> ComputeMipLayoutInto(MipLayoutStorage& storage, TextureTileMode tileMode, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t mipCount);
+std::uint64_t ComputeSurfaceSize(std::span<const TileMipLayout> mips, std::uint32_t arrayLayers);
 // Mip chain of an uncompressed surface given its element size (color targets have no texture format).
 std::vector<TileMipLayout> ComputeElementMipLayout(TextureTileMode tileMode, std::uint32_t bytesPerElement, std::uint32_t width, std::uint32_t height, std::uint32_t mipCount);
 
@@ -74,6 +78,12 @@ struct SurfaceGeometry {
     bool HasLayer(std::uint32_t level, std::uint32_t layer) const { return imageDepth <= 1 || layer < std::max(imageDepth >> level, 1u); }
 };
 SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor);
+// DescribeSurface(descriptor).guestBytes without building the mip chain on the heap (thin surfaces;
+// the others take DescribeSurface). The same value and the same rejections.
+std::uint64_t DescribeSurfaceGuestBytes(const GuestTextureResource& descriptor);
+// DescribeSurfaceGuestBytes under APS5_ARCHB_FIX_ALLOC_CHURN (the draw's sampled switch, see
+// ArchB::AllocChurnScope), otherwise DescribeSurface(descriptor).guestBytes.
+std::uint64_t SurfaceGuestBytes(const GuestTextureResource& descriptor);
 bool LevelsFitAllocation(const GuestTextureResource& surface, std::uint32_t levels);
 GuestTextureResource ViewedArrayWindow(const GuestTextureResource& viewed, bool keysReadAsStored);
 GuestTextureResource ArrayLayerWindow(const GuestTextureResource& viewed, std::uint32_t maxArrayLayers);

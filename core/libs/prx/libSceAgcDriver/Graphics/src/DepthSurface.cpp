@@ -853,7 +853,7 @@ public:
     }
 
     std::vector<bool> WrittenUnits(const GuestTextureResource& resource, std::uint64_t& generation) {
-        const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+        const auto bytes = static_cast<std::size_t>(SurfaceGuestBytes(resource));
         SizeUnits(bytes);
         GuestMemory::CollectWrites(resource.baseAddress, bytes);
         generation = GuestMemory::TrackerGeneration();
@@ -1432,7 +1432,7 @@ struct LayeredSlice {
 class LayeredDepthStorage {
 public:
     LayeredDepthStorage(const Context& context, const GuestTextureResource& resource, const DepthTarget& base, std::uint32_t bytesPerTexel, std::uint32_t firstLayer, std::uint32_t layers) : context(context), base(base), extent(base.extent), bytesPerTexel(bytesPerTexel), firstLayer(firstLayer), layers(layers) {
-        const auto bytes = DescribeSurface(resource).guestBytes;
+        const auto bytes = SurfaceGuestBytes(resource);
         layerPitchBytes = DescribeSurface(resource).GuestLayerOffset(1);
         StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(bytes), nullptr, "storage image creation", PublishScope::None);
         storage = StorageTexture::Create(context, *context.detiler, resource, 0);
@@ -1823,7 +1823,7 @@ GuestTextureResource mirrorResource(const DepthTarget& target) {
 }
 
 std::pair<std::uint64_t, std::uint64_t> stalePlaneRange(const DepthSurface& surface) {
-    return {surface.target.address, surface.target.address + DescribeSurface(mirrorResource(surface.target)).guestBytes};
+    return {surface.target.address, surface.target.address + SurfaceGuestBytes(mirrorResource(surface.target))};
 }
 
 void retire(DepthSurface& surface) {
@@ -1847,7 +1847,7 @@ void retireStoringStale(DepthSurface& surface) {
         return;
     }
     const auto resource = mirrorResource(surface.target);
-    const auto planeBytes = DescribeSurface(resource).guestBytes;
+    const auto planeBytes = SurfaceGuestBytes(resource);
     std::uint64_t generation = 0;
     const auto written = surface.WrittenUnits(resource, generation);
     auto units = surface.staleUnits;
@@ -2057,7 +2057,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     }
     if ((depthWritten || cleared) && mirrorable(target)) {
         const auto plane = target.address;
-        const auto planeBytes = DescribeSurface(mirrorResource(target)).guestBytes;
+        const auto planeBytes = SurfaceGuestBytes(mirrorResource(target));
         surface->MarkAllStale(planeBytes);
         noteStalePlane(plane, plane + planeBytes);
     }
@@ -2102,7 +2102,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
     if (flushing || !overlapsStalePlane(address, end)) return {};
     if (scope == DepthPlaneScope::Overlapped) {
         std::lock_guard lock(surfacesMutex());
-        const auto staleInRange = [&](const auto& surface) { return surface->AnyStale() && !surface->syncing && ((surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || anyUnit(surface->StaleUnitsIn(DescribeSurface(mirrorResource(surface->target)).guestBytes, address, end))); };
+        const auto staleInRange = [&](const auto& surface) { return surface->AnyStale() && !surface->syncing && ((surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || anyUnit(surface->StaleUnitsIn(SurfaceGuestBytes(mirrorResource(surface->target)), address, end))); };
         if (std::none_of(surfaces().begin(), surfaces().end(), staleInRange)) return {};
     }
     flushing = true;
@@ -2127,7 +2127,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
             if (!surface->AnyStale()) continue;
             const auto resource = mirrorResource(surface->target);
             const auto plane = surface->target.address;
-            const auto planeBytes = DescribeSurface(resource).guestBytes;
+            const auto planeBytes = SurfaceGuestBytes(resource);
             const bool overlapped = !surface->syncing && plane < end && address < plane + planeBytes;
             if (overlapped && (surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) surface->MarkAllStale(planeBytes);
             if (overlapped && (scope == DepthPlaneScope::Whole || anyUnit(surface->StaleUnitsIn(planeBytes, address, end)))) {
@@ -2640,7 +2640,7 @@ bool DepthSurfaceBlocksMemoryProof(VkDevice device, std::uint64_t address, std::
         if (!surface->active->load(std::memory_order_acquire) || surface->retired || surface->context.device != device || !surface->Overlaps(address, bytes)) continue;
         if (address == surface->target.address || (surface->target.stencilAddress != 0 && address == surface->target.stencilAddress)) return true;
         if (!mirrorable(surface->target) || surface->syncing || (surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) return true;
-        if (surface->AnyStale() && anyUnit(surface->StaleUnitsIn(DescribeSurface(mirrorResource(surface->target)).guestBytes, address, end))) return true;
+        if (surface->AnyStale() && anyUnit(surface->StaleUnitsIn(SurfaceGuestBytes(mirrorResource(surface->target)), address, end))) return true;
     }
     return false;
 }
