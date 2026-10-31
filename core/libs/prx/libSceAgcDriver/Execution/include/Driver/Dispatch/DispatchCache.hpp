@@ -59,6 +59,11 @@ struct DispatchVariant {
     std::vector<std::uint32_t> dataSlots;
     std::uint32_t flatBinding = NoFlatBinding;
     TsharpFeedbackMasks feedback;
+    struct BufferBasePatch {
+        std::uint32_t position, binding, word;
+    };
+    WordBitMasks bufferBaseMasks;
+    std::vector<BufferBasePatch> bufferBasePatches;
     std::vector<std::uint32_t> userData;
 
     std::uint32_t pushOffset = 0;
@@ -117,6 +122,7 @@ struct DataMask {
     std::vector<std::pair<std::uint32_t, std::uint32_t>>* live;
     std::span<const std::pair<std::uint32_t, std::uint32_t>> feedback;
     bool* feedbackHit = nullptr;
+    std::span<const std::pair<std::uint32_t, std::uint32_t>> bufferBases;
 };
 
 bool SameCapturedRuns(std::span<const std::pair<std::uint64_t, std::uint64_t>> before, std::span<const std::pair<std::uint64_t, std::uint64_t>> after);
@@ -125,6 +131,8 @@ bool FeedbackWordsEqual(std::span<const std::uint32_t> before, std::span<const s
 void RecordTsharpFeedbackMasks(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
 void RecordUncachedTsharpFeedbackMasks(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
 bool FeedbackBindingsEqual(const DispatchVariant& variant, const ShaderRecompiler::RecompileResult& before, const ShaderRecompiler::RecompileResult& after, bool enabled);
+void RecordBufferBasePatches(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
+bool PatchBufferBases(const DispatchVariant& variant, std::span<const std::uint32_t> words, ShaderRecompiler::RecompileResult& result);
 
 enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };
 

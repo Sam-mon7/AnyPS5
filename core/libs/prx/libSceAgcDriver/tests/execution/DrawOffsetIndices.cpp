@@ -48,7 +48,8 @@ struct DriverTestAccess {
             const auto found = Driver::Get().drawCache.find(key);
             if (found != Driver::Get().drawCache.end()) lookup.entry = found->second;
         }
-        Driver::Get().lookupDraw(submission, device, decode.state, decode.pixel, decode.programs, decode.roles, infos, true, key != 0, false, lookup.key, lookup.entry, lookup.matched, lookup.regions, lookup.hit, verify, timing, ms, nullptr, candidates, data, packet);
+        std::uint64_t shapeKey = 0;
+        Driver::Get().lookupDraw(submission, device, decode.state, decode.pixel, decode.programs, decode.roles, infos, true, key != 0, false, lookup.key, shapeKey, lookup.entry, lookup.matched, lookup.regions, lookup.hit, verify, timing, ms, nullptr, candidates, data, packet, false, false, false);
         Graphics::Require(!verify, "cache regression must use the ordinary hit path");
         return lookup;
     }
