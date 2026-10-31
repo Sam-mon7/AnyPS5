@@ -292,8 +292,11 @@ private:
                     batch.swap(pending);
                 }
                 for (const auto& frame : batch) {
-                    if (frame.screenshot) std::fprintf(stderr, "[gpu] screenshot saved: %s\n", Screenshot::Write(GetAppTitleId_nid_postfix().value, frame.width, frame.height, frame.pixels).string().c_str());
-                    else WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels);
+                    if (frame.screenshot) {
+                        const auto path = Screenshot::Write(GetAppTitleId_nid_postfix().value, frame.width, frame.height, frame.pixels);
+                        if (path.empty()) std::fprintf(stderr, "[gpu] screenshot not saved: cannot write into the screenshot folder\n");
+                        else std::fprintf(stderr, "[gpu] screenshot saved: %s\n", path.string().c_str());
+                    } else WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels);
                     std::lock_guard lock(mutex);
                     queuedBytes -= frame.pixels.size();
                     changed.notify_all();
