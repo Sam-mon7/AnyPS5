@@ -27,6 +27,7 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+class PipelineStateReuse;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -96,6 +97,8 @@ public:
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
     VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    PipelineStateReuse* ReusePipelineState(bool enabled);
+    void InvalidatePipelineState(const char* counter);
     static bool ComputeChainsEnabled();
     static bool UnsafeComputeChainsRequested();
     static bool UnsafeComputeChains();
@@ -916,6 +919,7 @@ private:
     VkDeviceSize drawUploadUsed = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
+    std::unique_ptr<PipelineStateReuse> pipelineStateReuse;
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
     std::vector<VkQueryPool> sparePools;
     mutable AgcDriver::Mutex completedMutex;

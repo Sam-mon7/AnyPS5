@@ -3,17 +3,23 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -241,10 +247,65 @@ void SightingsKeepCollidingKeys() {
     Require(sightings.SeenBefore(12) && sightings.SeenBefore(13) && sightings.SeenBefore(14), "a full bucket lost a key newer than the one it replaced");
 }
 
+void PipelineStateReusePath(const std::filesystem::path& control) {
+    using R = AgcDriver::ArchB::Recorder;
+    using S = AgcDriver::ArchB::Switches;
+    using F = AgcDriver::ArchB::Feature;
+    R::Boundary(true, 0, R::Clock::now());
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    PixelConstant[0] = 0.25f;
+    SubmitConstantDraws(5);
+    R::Collect(R::Clock::now());
+    std::array<std::byte, ColorMemory.size()> reference{};
+    unsigned sequence = 0;
+    for (const bool enabled : {false, true, false, true}) {
+        std::ofstream(control, std::ios::trunc) << ++sequence << " FIX_PIPELINE_STATE_REUSE=" << enabled << '\n';
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        S::PollControl();
+        Require(S::Enabled(F::FixPipelineStateReuse) == enabled, "runtime pipeline reuse toggle did not apply");
+        ColorMemory.fill(std::byte{0});
+        SubmitConstantDraws(12);
+        Require(BrightestColorByte() == 64, "pipeline reuse changed rendered color");
+        if (sequence == 1) reference = ColorMemory;
+        else Require(reference == ColorMemory, "on/off/on pipeline reuse changed frame bytes");
+        const auto counts = R::Collect(R::Clock::now()).counters;
+        for (const auto& [name, value] : counts) if (name.starts_with("fix_pso_reuse_")) std::cout << name << "=" << value << "\n";
+        const auto count = [&](const char* name) { const auto found = counts.find(name); return found == counts.end() ? 0.0 : found->second; };
+        for (const auto* name : {"fix_pso_reuse_state_hits", "fix_pso_reuse_skipped_dynamic", "fix_pso_reuse_skipped_binds", "fix_pso_reuse_skipped_push"}) {
+            std::cout << name << "=" << count(name) << " enabled=" << enabled << '\n';
+            Require(count(name) == 0, std::string("untracked draw reused pipeline state: ") + name);
+        }
+        Require((count("fix_pso_reuse_refused_untracked_draw") > 0) == enabled, "untracked draw refusal was not counted");
+        Require(count("recorder_counter_overflow") == 0, "pipeline reuse counters overflowed");
+    }
+    PixelConstant[0] = 1.0f;
+    SubmitConstantDraws(4);
+    Require(BrightestColorByte() == 255, "pipeline reuse retained stale push or resource bytes");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-state-reuse") {
+            struct Control {
+                std::filesystem::path path = std::filesystem::temp_directory_path() / ("agc-h4-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+                ~Control() { std::filesystem::remove(path); }
+            } control;
+#ifdef _WIN32
+            _putenv_s("APS5_ARCHB_GATE_RUN", "1");
+            _putenv_s("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str());
+#else
+            setenv("APS5_ARCHB_GATE_RUN", "1", 1);
+            setenv("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str(), 1);
+#endif
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            PipelineStateReusePath(control.path);
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
         SightingsKeepCollidingKeys();
         bool libraries = false;
         {

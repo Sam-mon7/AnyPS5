@@ -11378,6 +11378,230 @@ void pipelineLibraryLtoInfoTests(const Device& device) {
     std::cout << "Pipeline library link-time optimization info tests passed: " << fastLibraries << " libraries without the info, " << created.Retaining() << " with it\n";
 }
 
+std::map<std::string, unsigned> pipelineReuseCalls;
+
+template<auto Member, typename TFunction> struct PipelineReuseCall;
+template<auto Member, typename TResult, typename... TArgs>
+struct PipelineReuseCall<Member, TResult(VKAPI_PTR*)(TArgs...)> {
+    static inline TResult(VKAPI_PTR* function)(TArgs...) = nullptr;
+    static inline const char* name = nullptr;
+    static TResult VKAPI_CALL Invoke(TArgs... args) {
+        ++pipelineReuseCalls[name];
+        return function(args...);
+    }
+};
+
+void pipelineStateReuseTests(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    DeviceFunctions functions;
+    const auto install = [&]<auto Member>(const char* name) {
+        using Call = PipelineReuseCall<Member, std::remove_reference_t<decltype(functions.*Member)>>;
+        Call::function = context.Function<std::remove_reference_t<decltype(functions.*Member)>>(name);
+        Call::name = name;
+        functions.*Member = Call::Invoke;
+    };
+    install.template operator()<&DeviceFunctions::cmdBindPipeline>("vkCmdBindPipeline");
+    install.template operator()<&DeviceFunctions::cmdPushConstants>("vkCmdPushConstants");
+    install.template operator()<&DeviceFunctions::cmdSetViewport>("vkCmdSetViewport");
+    install.template operator()<&DeviceFunctions::cmdSetScissor>("vkCmdSetScissor");
+    install.template operator()<&DeviceFunctions::cmdSetDepthBias>("vkCmdSetDepthBias");
+    install.template operator()<&DeviceFunctions::cmdSetDepthBounds>("vkCmdSetDepthBounds");
+    install.template operator()<&DeviceFunctions::cmdSetStencilReference>("vkCmdSetStencilReference");
+    install.template operator()<&DeviceFunctions::cmdSetStencilCompareMask>("vkCmdSetStencilCompareMask");
+    install.template operator()<&DeviceFunctions::cmdSetStencilWriteMask>("vkCmdSetStencilWriteMask");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetCullMode>("vkCmdSetCullModeEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetFrontFace>("vkCmdSetFrontFaceEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetDepthTestEnable>("vkCmdSetDepthTestEnableEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetDepthWriteEnable>("vkCmdSetDepthWriteEnableEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetDepthCompareOp>("vkCmdSetDepthCompareOpEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetDepthBoundsTestEnable>("vkCmdSetDepthBoundsTestEnableEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetStencilTestEnable>("vkCmdSetStencilTestEnableEXT");
+    if (context.graphicsPipelineLibrary) install.template operator()<&DeviceFunctions::cmdSetStencilOp>("vkCmdSetStencilOpEXT");
+    context.functions = &functions;
+    Recorder recorder(context);
+    context.recorder = &recorder;
+    struct Cleanup {
+        Recorder& recorder;
+        VkDevice device;
+        ~Cleanup() { recorder.Sync(); ClearCachedPipelines(device); }
+    } cleanup{recorder, context.device};
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 11;
+    fragment.variantId = 12;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, context.graphicsPipelineLibrary ? PipelinePushSlotBytes : 0}};
+    vertex.pushConstants.resize(4);
+    fragment.pushConstants.resize(4);
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.color.extent = {64, 64};
+    state.colors = {state.color};
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    state.viewport = {0, 0, 64, 64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.depth = DepthTarget{0, 0, {64, 64}, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0};
+    state.depthBias = true;
+    state.depthBoundsTest = context.depthBounds;
+    state.stencilTest = true;
+    state.stencilFront.compareMask = state.stencilBack.compareMask = 255;
+    state.stencilFront.writeMask = state.stencilBack.writeMask = 255;
+    ShaderResources resources(context, shaders, state.color, 1, 0, 0);
+    VertexInputLayout input;
+    const auto lookup = [&] { return CachedPipeline(context, state, input, resources, shaders, VK_IMAGE_LAYOUT_GENERAL); };
+    auto pipeline = lookup();
+    auto commands = recorder.Commands();
+    auto* reuse = recorder.ReusePipelineState(true);
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+    const auto emit = [&] {
+        pipeline->Continue(commands, state, reuse);
+        pipeline->PushConstants(commands, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, push, reuse);
+    };
+    emit();
+    const auto first = pipelineReuseCalls;
+    emit();
+    Require(pipelineReuseCalls == first, "unchanged state emitted Vulkan commands");
+    const auto changed = [&](const char* name, auto change) {
+        const auto before = pipelineReuseCalls[name];
+        change();
+        emit();
+        Require(pipelineReuseCalls[name] > before, std::string("changed state was suppressed: ") + name);
+        const auto after = pipelineReuseCalls;
+        emit();
+        Require(pipelineReuseCalls == after, "changed state did not become reusable");
+    };
+    changed("vkCmdSetViewport", [&] { state.viewport.width = 63; });
+    changed("vkCmdSetScissor", [&] { state.scissor.extent.width = 63; });
+    if (context.depthBounds) changed("vkCmdSetDepthBounds", [&] { state.minDepthBounds = 0.1f; });
+    changed("vkCmdSetDepthBias", [&] { state.depthBiasConstant = 1; });
+    changed("vkCmdSetDepthBias", [&] { state.depthBiasSlope = 1; });
+    if (context.depthBiasClamp) changed("vkCmdSetDepthBias", [&] { state.depthBiasClamp = 1; });
+    if (context.graphicsPipelineLibrary) {
+        changed("vkCmdSetStencilReference", [&] { ++state.stencilFront.reference; });
+        changed("vkCmdSetStencilReference", [&] { ++state.stencilBack.reference; });
+        changed("vkCmdSetStencilCompareMask", [&] { --state.stencilFront.compareMask; });
+        changed("vkCmdSetStencilWriteMask", [&] { --state.stencilBack.writeMask; });
+        changed("vkCmdSetStencilOpEXT", [&] { state.stencilFront.passOp = VK_STENCIL_OP_REPLACE; });
+        changed("vkCmdSetCullModeEXT", [&] { state.cullMode = VK_CULL_MODE_BACK_BIT; });
+        changed("vkCmdSetFrontFaceEXT", [&] { state.frontFace = VK_FRONT_FACE_CLOCKWISE; });
+        changed("vkCmdSetDepthTestEnableEXT", [&] { state.depthTest = !state.depthTest; });
+        changed("vkCmdSetDepthWriteEnableEXT", [&] { state.depthWrite = !state.depthWrite; });
+        changed("vkCmdSetDepthCompareOpEXT", [&] { state.depthCompare = VK_COMPARE_OP_LESS; });
+        changed("vkCmdSetStencilTestEnableEXT", [&] { state.stencilTest = !state.stencilTest; });
+    }
+    changed("vkCmdPushConstants", [&] { push[0] = std::byte{1}; });
+    if (context.graphicsPipelineLibrary) changed("vkCmdPushConstants", [&] { push[PipelinePushSlotBytes] = std::byte{2}; });
+    const auto beforeBlend = pipeline;
+    changed("vkCmdBindPipeline", [&] { state.blendConstants[0] = 0.5f; pipeline = lookup(); });
+    Require(pipeline != beforeBlend, "blend constants did not change the pipeline key");
+    recorder.ReusePipelineState(false);
+    reuse = nullptr;
+    emit();
+    reuse = recorder.ReusePipelineState(true);
+    const auto beforeOn = pipelineReuseCalls["vkCmdSetViewport"];
+    emit();
+    Require(pipelineReuseCalls["vkCmdSetViewport"] > beforeOn, "on/off/on retained state from an off draw");
+    if (context.graphicsPipelineLibrary) {
+        auto wholeContext = context;
+        wholeContext.graphicsPipelineLibrary = false;
+        auto wholeShaders = shaders;
+        wholeShaders[1].pushConstantOffset = 4;
+        auto whole = std::make_shared<Pipeline>(wholeContext, state, input, resources, wholeShaders, VK_IMAGE_LAYOUT_GENERAL);
+        whole->Continue(commands, state, reuse);
+        const auto beforeDynamic = pipelineReuseCalls["vkCmdSetViewport"];
+        emit();
+        Require(pipelineReuseCalls["vkCmdSetViewport"] > beforeDynamic, "static pipeline binding left dynamic state reusable");
+        recorder.Keep(whole);
+    }
+    const auto beforeHelper = pipelineReuseCalls["vkCmdSetViewport"];
+    pipeline->Continue(commands, state);
+    emit();
+    Require(pipelineReuseCalls["vkCmdSetViewport"] >= beforeHelper + 2, "untracked helper did not invalidate state");
+    const auto beforeCommands = pipelineReuseCalls["vkCmdSetViewport"];
+    recorder.Commands();
+    emit();
+    Require(pipelineReuseCalls["vkCmdSetViewport"] > beforeCommands, "command-buffer exposure did not invalidate state");
+    recorder.Sync();
+    commands = recorder.Commands();
+    const auto beforeGeneration = pipelineReuseCalls["vkCmdSetViewport"];
+    emit();
+    Require(pipelineReuseCalls["vkCmdSetViewport"] > beforeGeneration, "command-buffer reuse retained old state");
+    recorder.Sync();
+    PipelineStateReuse slots;
+    const auto layout = pipeline->Layout();
+    const std::span<const std::byte, PipelinePushSlotBytes> bytes(push.data(), PipelinePushSlotBytes);
+    Require(slots.Push(layout, VK_SHADER_STAGE_VERTEX_BIT, 0, bytes) && !slots.Push(layout, VK_SHADER_STAGE_VERTEX_BIT, 0, bytes), "push slot was not reused");
+    Require(slots.Push(layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, bytes), "push stages were ignored");
+    VkPipelineLayout other = VK_NULL_HANDLE;
+    VkPipelineLayoutCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &info, nullptr, &other), "test layout");
+    Require(slots.Push(other, VK_SHADER_STAGE_FRAGMENT_BIT, 0, bytes), "layout change reused push constants");
+    Require(slots.Push(layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, bytes), "layout round trip reused push constants");
+    context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, other, nullptr);
+    state.depth.reset();
+    state.depthBias = false;
+    state.depthBoundsTest = false;
+    state.stencilTest = false;
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.viewport = {0, 0, 64, 64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.renderExtent = {64, 64};
+    pipeline = lookup();
+    auto target = std::make_shared<RenderTarget>(context, state.color, false);
+    const std::array views{target->View()};
+    const std::array<std::shared_ptr<void>, 1> owners{target};
+    auto framebuffer = pipeline->AcquireFramebuffer(views, owners, state.renderExtent);
+    Buffer readback(context, 64 * 64 * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto render = [&](bool enabled) {
+        commands = recorder.Commands();
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = target->Image();
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        const VkClearColorValue clear{};
+        context.Resolved(&DeviceFunctions::cmdClearColorImage, "vkCmdClearColorImage")(commands, target->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &barrier.subresourceRange);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        reuse = recorder.ReusePipelineState(enabled);
+        pipeline->Begin(commands, *framebuffer, state.renderExtent, state, reuse);
+        const auto before = pipelineReuseCalls;
+        for (unsigned draw = 0; draw < 4; ++draw) {
+            pipeline->Continue(commands, state, reuse);
+            context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, 3, 1, 0, 0);
+        }
+        Require(!enabled || pipelineReuseCalls == before, "consecutive GPU draws emitted unchanged state");
+        reuse = recorder.ReusePipelineState(false);
+        pipeline->Continue(commands, state, reuse);
+        context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, 3, 1, 0, 0);
+        reuse = recorder.ReusePipelineState(enabled);
+        pipeline->Continue(commands, state, reuse);
+        context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, 3, 1, 0, 0);
+        recorder.LeaveRenderPassOpen(1, Recorder::NoTiming, false, {});
+        commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {64, 64, 1};
+        context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, target->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        readback.Invalidate();
+        const auto bytes = readback.Bytes();
+        return std::vector<std::byte>(bytes.begin(), bytes.end());
+    };
+    const auto pixels = render(false);
+    Require(std::any_of(pixels.begin(), pixels.end(), [](std::byte value) { return value != std::byte{0}; }), "GPU reuse test drew no pixels");
+    Require(render(true) == pixels && render(false) == pixels && render(true) == pixels, "recorded on/off/on draws changed pixels");
+    std::cout << "Pipeline state reuse changed values, helpers, generations and toggles passed\n";
+}
+
 void pipelineLibraryTests(const Device& device) {
     std::lock_guard gpu(GpuMutex());
     const auto& context = device.GetContext();
@@ -11680,6 +11904,10 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-state-reuse-only") {
+            pipelineStateReuseTests(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--texture-level-clamp-only") {
             textureLevelClampTests(device);
             return 0;
