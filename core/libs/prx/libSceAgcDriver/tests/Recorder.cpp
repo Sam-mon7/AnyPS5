@@ -36,6 +36,9 @@
 #include "SampleLod_spv.h"
 #include "BufferUpdate_spv.h"
 #include "SampleArray_spv.h"
+#include "Sample1D_spv.h"
+#include "Sample1DArray_spv.h"
+#include "Sample3D_spv.h"
 #include "Cover_vert_spv.h"
 #include "Cover_frag_spv.h"
 #include "VertexRange_vert_spv.h"
@@ -9718,8 +9721,12 @@ struct SampledViewProbe {
         active = nullptr;
     }
     static VKAPI_ATTR VkResult VKAPI_CALL createImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* callbacks, VkImage* created) {
-        Require(info->mipLevels > 0 && info->mipLevels <= std::bit_width(std::max({info->extent.width, info->extent.height, info->extent.depth})), "sampled image mip levels exceed its extent");
         const auto result = reinterpret_cast<PFN_vkCreateImage>(active->resolver(device, "vkCreateImage"))(device, info, callbacks, created);
+        if (info->mipLevels == 0 || info->mipLevels > std::bit_width(std::max({info->extent.width, info->extent.height, info->extent.depth}))) {
+            if (result == VK_SUCCESS) reinterpret_cast<PFN_vkDestroyImage>(active->resolver(device, "vkDestroyImage"))(device, *created, callbacks);
+            *created = VK_NULL_HANDLE;
+            throw std::runtime_error("image mip levels exceed its extent: " + std::to_string(info->extent.width) + "x" + std::to_string(info->extent.height) + " levels=" + std::to_string(info->mipLevels) + " storage=" + std::to_string((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0));
+        }
         if (result == VK_SUCCESS) {
             active->imageInfo = *info;
             ++active->images;
@@ -9812,6 +9819,241 @@ void textureLevelClampTests(const Device& device) {
         }
     }
     std::cout << "texture level clamp upload, view ranges and out-of-range base level tests passed\n";
+}
+
+
+void textureMipChainCopyTests(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    context.srgbDecodeFormats |= 1u;
+    context.srgbCopyFormats |= 1u;
+    SampledViewProbe probe(context);
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    Recorder recorder(context);
+    recorder.Activate();
+    SampleProgram sampler(context, recorder);
+    for (const auto format : {22u, 43u, 128u}) {
+        for (const auto levels : {2u, 4u}) {
+            GuestTextureResource resource{};
+            resource.width = 4;
+            resource.height = 1;
+            resource.mipCount = levels;
+            resource.lastLevel = levels - 1u;
+            resource.format = format;
+            resource.tileMode = TextureTileMode::kLinear;
+            resource.dimension = format == 22u ? TextureDimension::k1D : TextureDimension::k2D;
+            const auto geometry = DescribeSurface(resource);
+            std::vector<std::byte> memory(static_cast<std::size_t>(geometry.guestBytes) + 256u);
+            auto* surface = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(memory.data()) + 255u) & ~std::uintptr_t{255u});
+            resource.baseAddress = reinterpret_cast<std::uint64_t>(surface);
+            for (std::uint32_t level = 0; level < levels; ++level) {
+                const auto& mip = geometry.mips[level];
+                const float depth = (level + 1u) / 8.0f;
+                constexpr std::array<std::uint32_t, 4> packed{960u, 1024u, 1056u, 1088u};
+                const auto word = format == 22u ? std::bit_cast<std::uint32_t>(depth) : packed[level] << 21u;
+                auto* start = surface + mip.tiledOffset;
+                if (format == 128u) std::fill_n(start, static_cast<std::size_t>(mip.tiledSize), std::byte{static_cast<std::uint8_t>(32u + 48u * level)});
+                else for (std::uint64_t offset = 0; offset < mip.tiledSize; offset += sizeof(word)) std::memcpy(start + offset, &word, sizeof(word));
+            }
+            auto storage = StorageTexture::Create(context, detiler, resource, levels - 1u);
+            const auto imageLevels = std::min(levels, 3u);
+            for (const auto base : {0u, levels - 1u}) {
+                resource.baseLevel = base;
+                std::unique_ptr<Texture> copy;
+                if (format == 22u) copy = std::make_unique<Texture>(context, storage, resource, VkComponentMapping{}, Texture::DepthCopyTag{});
+                else if (format == 43u) copy = std::make_unique<Texture>(context, storage, resource, VkComponentMapping{}, Texture::RepackCopyTag{});
+                else copy = std::make_unique<Texture>(context, storage, resource, VkComponentMapping{}, Texture::SrgbExpandTag{});
+                Require(copy->RefreshDepthCopy(), "mip chain copy was not uploaded");
+                const auto first = std::min(base, imageLevels - 1u);
+                for (std::uint32_t level = first; level < imageLevels; ++level) {
+                    const auto srgb = (32.0f + 48.0f * level) / 255.0f;
+                    const auto expected = format == 22u ? (level + 1u) / 8.0f : format == 43u ? static_cast<float>(level + 1u) : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+                    expectRed(sampler.Red(copy->View(), copy->Layout(), static_cast<float>(level - first)), expected, "mip chain copied the wrong level");
+                    if (format == 128u) {
+                        Texture expanded(context, detiler, resource, {}, std::span(surface, static_cast<std::size_t>(geometry.guestBytes)));
+                        expectRed(sampler.Red(expanded.View(), expanded.Layout(), static_cast<float>(level - first)), expected, "mip chain snapshot sRGB expansion copied the wrong level");
+                    }
+                }
+            }
+        }
+    }
+    GuestTextureResource blocks{};
+    blocks.width = blocks.height = 2;
+    blocks.mipCount = 4;
+    blocks.lastLevel = 3;
+    blocks.format = 62;
+    blocks.tileMode = TextureTileMode::kLinear;
+    blocks.dimension = TextureDimension::k2D;
+    const auto geometry = DescribeSurface(blocks);
+    std::vector<std::byte> memory(static_cast<std::size_t>(geometry.guestBytes) + 256u);
+    auto* surface = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(memory.data()) + 255u) & ~std::uintptr_t{255u});
+    blocks.baseAddress = reinterpret_cast<std::uint64_t>(surface);
+    for (std::uint32_t level = 0; level < blocks.mipCount; ++level) {
+        const auto& mip = geometry.mips[level];
+        const std::uint64_t block = level == 0 ? 0xf800u : 0x07e0u;
+        for (std::uint64_t offset = 0; offset < mip.tiledSize; offset += sizeof(block)) std::memcpy(surface + mip.tiledOffset + offset, &block, sizeof(block));
+    }
+    auto storage = StorageTexture::Create(context, detiler, blocks, 0);
+    auto compressed = blocks;
+    compressed.width = compressed.height = 8;
+    compressed.format = 169;
+    Require(!Texture::CanBlockCopyFrom(*storage, compressed), "an incompatible compressed mip tail was accepted for a block copy");
+    compressed.mipCount = 2;
+    compressed.lastLevel = 1;
+    Require(Texture::CanBlockCopyFrom(*storage, compressed), "a normal compressed mip chain was refused");
+    Texture copy(context, storage, compressed, {}, Texture::BlockCopyTag{});
+    Require(copy.RefreshDepthCopy(), "compressed mip chain was not copied");
+    expectRed(sampler.Red(copy.View(), copy.Layout(), 0.0f), 1.0f, "compressed base mip was copied incorrectly");
+    expectRed(sampler.Red(copy.View(), copy.Layout(), 1.0f), 0.0f, "compressed last mip was copied incorrectly");
+    std::cout << "texture mip chain depth, repacked, sRGB and block copies passed\n";
+}
+
+
+void textureMipChainTests(const Device& device, std::string_view kind) {
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    SampledViewProbe probe(context);
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    Recorder recorder(context);
+    recorder.Activate();
+    GuestTextureResource resource{};
+    resource.width = 4;
+    resource.height = 1;
+    resource.format = 56;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    std::span<const std::uint32_t> code = SAMPLE_LOD_SPV;
+    if (kind == "1d" || kind == "1d_array") {
+        resource.dimension = kind == "1d" ? TextureDimension::k1D : TextureDimension::k1DArray;
+        resource.depthOrLastArray = kind == "1d" ? 0u : 2u;
+        code = kind == "1d" ? std::span<const std::uint32_t>(SAMPLE_1D_SPV) : std::span<const std::uint32_t>(SAMPLE_1DArray_SPV);
+    } else if (kind == "3d") {
+        resource.dimension = TextureDimension::k3D;
+        resource.height = 2;
+        resource.depthOrLastArray = 7;
+        code = SAMPLE_3D_SPV;
+    } else if (kind == "cube" || kind == "array" || kind == "tiled") {
+        resource.dimension = kind == "cube" ? TextureDimension::kCube : TextureDimension::k2DArray;
+        resource.height = 4;
+        resource.depthOrLastArray = kind == "cube" ? 5u : 2u;
+        resource.tileMode = kind == "tiled" ? TextureTileMode::kStandard64KB : TextureTileMode::kLinear;
+        code = SAMPLE_ARRAY_SPV;
+    } else if (kind == "depth1d") {
+        resource.dimension = TextureDimension::k1D;
+        resource.height = 16;
+        resource.format = 22;
+    } else {
+        Require(kind == "2d", "unknown mip chain test dimension");
+    }
+    SampleProgram sampler(context, recorder, code);
+    const auto fullLevels = kind == "3d" ? 4u : 3u;
+    for (const auto levels : {2u, fullLevels, fullLevels + 1u}) {
+        resource.mipCount = levels;
+        resource.lastLevel = levels - 1u;
+        const auto geometry = DescribeSurface(resource);
+        const auto bytes = static_cast<std::size_t>(geometry.guestBytes);
+        std::vector<std::byte> memory(bytes + 256);
+        auto* surface = kind == "tiled" ? static_cast<std::byte*>(AllocateWatched(bytes, 65536u)) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(memory.data()) + 255u) & ~std::uintptr_t{255u});
+        Require(surface != nullptr, "mip chain fixture could not allocate watched memory");
+        resource.baseAddress = reinterpret_cast<std::uint64_t>(surface);
+        const auto value = [&](std::uint32_t level, std::uint32_t layer) { return 16u + 24u * layer + (kind == "tiled" ? 0u : 8u * level); };
+        for (std::uint32_t layer = 0; layer < geometry.layers; ++layer) {
+            for (std::uint32_t level = 0; level < levels; ++level) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                const auto& mip = geometry.mips[level];
+                auto* start = surface + geometry.GuestLayerOffset(layer) + mip.tiledOffset;
+                if (kind == "depth1d") {
+                    const float depth = value(level, layer) / 255.0f;
+                    for (std::uint64_t offset = 0; offset < mip.tiledSize; offset += sizeof(depth)) std::memcpy(start + offset, &depth, sizeof(depth));
+                } else {
+                    std::fill_n(start, static_cast<std::size_t>(mip.tiledSize), std::byte{static_cast<std::uint8_t>(value(level, layer))});
+                }
+            }
+        }
+        GuestAllocations::Mutation().Add(surface, bytes, true, true, false);
+        struct Unregister {
+            const Context& context;
+            std::byte* surface;
+            std::size_t bytes;
+            bool watched;
+            ~Unregister() {
+                GuestAllocations::Mutation().Remove(surface);
+                if (watched) {
+                    HostImportFor(context, reinterpret_cast<std::uint64_t>(surface), bytes);
+                    ReleaseWatched(surface, bytes);
+                }
+            }
+        } unregister{context, surface, bytes, kind == "tiled"};
+        const auto imageLevels = std::min(levels, fullLevels);
+        const std::span<const std::byte> snapshot(surface, bytes);
+        const auto sample = [&](const Texture& texture, std::uint32_t base) {
+            const auto range = texture.SampledViewRange(false);
+            Require(range.levels == imageLevels - base, "mip chain view reports an unclamped level count");
+            for (std::uint32_t level = 0; level < range.levels; ++level) {
+                const auto slices = resource.dimension == TextureDimension::k3D ? std::max(geometry.imageDepth >> (base + level), 1u) : geometry.imageLayers;
+                for (std::uint32_t layer = 0; layer < slices; ++layer) {
+                    const auto coordinate = resource.dimension == TextureDimension::k3D ? (static_cast<float>(layer) + 0.5f) / slices : static_cast<float>(layer);
+                    expectRed(sampler.Red(texture.View(), texture.Layout(), static_cast<float>(level), coordinate), value(base + level, layer) / 255.0f, "mip chain upload sampled the wrong level or layer");
+                }
+            }
+            expectRed(sampler.Red(texture.View(), texture.Layout(), 15.0f, resource.dimension == TextureDimension::k3D ? 0.5f / std::max(geometry.imageDepth >> (imageLevels - 1u), 1u) : 0.0f), value(imageLevels - 1u, 0u) / 255.0f, "excess guest LOD did not sample the last real mip");
+        };
+        for (const auto base : {0u, levels - 1u}) {
+            resource.baseLevel = base;
+            resource.minLod = context.imageViewMinLod ? base << 8u : 0u;
+            probe.images = 0;
+            probe.ranges.clear();
+            Texture texture(context, detiler, resource, {}, snapshot, kind == "depth1d");
+            Require(probe.images == 1u && probe.imageInfo.mipLevels == imageLevels, "sampled texture created the wrong mip chain");
+            if (kind == "depth1d") Require(probe.imageInfo.imageType == VK_IMAGE_TYPE_2D && probe.imageInfo.extent.height == 1u, "depth1D texture did not use its actual 2D extent");
+            sample(texture, std::min(base, imageLevels - 1u));
+            if (texture.HasSrgbView()) texture.SrgbView(false, false);
+            if (base == 0u && (resource.dimension == TextureDimension::k1D || resource.dimension == TextureDimension::k2D || resource.dimension == TextureDimension::k2DArray)) texture.BaseLevelView();
+        }
+        resource.minLod = 0;
+        resource.baseLevel = 0;
+        if (kind == "depth1d") continue;
+        probe.images = 0;
+        auto storage = StorageTexture::Create(context, detiler, resource, levels - 1u);
+        Require(probe.images == 1u && probe.imageInfo.mipLevels == imageLevels, "storage texture created the wrong mip chain");
+        for (std::uint32_t level = 0; level < levels; ++level) {
+            storage->View(level);
+            if (storage->Attachable()) storage->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM, level);
+        }
+        for (const auto base : {0u, levels - 1u}) {
+            resource.baseLevel = base;
+            Texture texture(context, storage, resource, {});
+            sample(texture, std::min(base, imageLevels - 1u));
+        }
+        const std::vector<std::byte> before(surface, surface + bytes);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, imageLevels - 1u, 1u, 0u, geometry.imageLayers};
+        const VkClearColorValue clear{{1.0f, 1.0f, 1.0f, 1.0f}};
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(recorder.Commands(), storage->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        recorder.Submit();
+        recorder.Sync();
+        storage->MarkDirty();
+        storage->WriteBack();
+        recorder.Submit();
+        recorder.Sync();
+        for (std::uint32_t layer = 0; layer < geometry.layers; ++layer) {
+            for (std::uint32_t level = 0; level < levels; ++level) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                if (kind == "tiled") continue;
+                const auto offset = geometry.GuestLayerOffset(layer) + geometry.mips[level].tiledOffset;
+                const auto expected = level == imageLevels - 1u ? std::byte{255} : before[offset];
+                Require(surface[offset] == expected, "mip chain write-back mismatch: levels=" + std::to_string(levels) + " layer=" + std::to_string(layer) + " level=" + std::to_string(level) + " got=" + std::to_string(std::to_integer<unsigned>(surface[offset])) + " expected=" + std::to_string(std::to_integer<unsigned>(expected)));
+            }
+        }
+        resource.baseLevel = levels - 1u;
+        Texture written(context, detiler, resource, {}, snapshot);
+        const auto lastDepth = resource.dimension == TextureDimension::k3D ? std::max(geometry.imageDepth >> (imageLevels - 1u), 1u) : 1u;
+        expectRed(sampler.Red(written.View(), written.Layout(), 0.0f, resource.dimension == TextureDimension::k3D ? 0.5f / lastDepth : 0.0f), 1.0f, "mip chain write-back did not preserve the last physical mip");
+        resource.baseLevel = 0;
+    }
+    std::cout << "texture mip chain " << kind << " uploads, sampling, views and write-back passed\n";
 }
 
 
@@ -11906,6 +12148,12 @@ int main(int argc, char** argv) {
         Device& device = *created;
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-state-reuse-only") {
             pipelineStateReuseTests(device);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--texture-mip-chain") {
+            if (std::string_view(argv[2]) == "copies") textureMipChainCopyTests(device);
+            else textureMipChainTests(device, argv[2]);
+
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--texture-level-clamp-only") {
