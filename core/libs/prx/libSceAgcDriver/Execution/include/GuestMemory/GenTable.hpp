@@ -135,6 +135,20 @@ public:
     // Newest data generation over the range's blocks (0 where no leaf).
     Generation NewestData(std::uint64_t begin, std::uint64_t end) const noexcept;
 
+    // Slice S2 (GEN_LOCKFREE). A refused (compared-when-shared) walk over the blocks of [begin, end)
+    // at `generation`: the per-block refusal the tracker keeps in its map, readable without its mutex.
+    void Refuse(std::uint64_t begin, std::uint64_t end, Generation generation) noexcept;
+    // Whether every block of [begin, end) has data and refusal generations at most `since` (blocks
+    // of missing leaves had no event since the table went on), the reset floor is at most `since`
+    // and no event was lost to a failed leaf allocation. Lock-free: a true answer holds for the
+    // table's state at the first block read (fields only grow).
+    bool DataAtMost(std::uint64_t begin, std::uint64_t end, Generation since) const noexcept;
+    // The data generation of the block holding `address` (0 without a leaf).
+    Generation DataOf(std::uint64_t address) const noexcept;
+    // False once an event could not reach a block (a leaf allocation failed): lock-free answers
+    // are then refused for the rest of the run.
+    bool Complete() const noexcept;
+
     // Producer-tagged pending writes: a bounded ring; on overflow ForeignPendingSince is true.
     void Journal(std::uint64_t begin, std::uint64_t end, Generation generation, ProducerId producer) noexcept;
     std::size_t RecentJournal(std::span<JournalEntry> out) const noexcept;
@@ -158,6 +172,7 @@ private:
     std::atomic<Ticket> sweptFloor{0};
     std::unique_ptr<Slot[]> journal;
     std::atomic<std::uint64_t> journalHead{0};
+    mutable std::atomic<bool> incomplete{false};
 };
 
 // ----- Driver integration (one global table) -----
@@ -171,6 +186,21 @@ bool ShadowActive() noexcept;
 // APS5_ARCHB_GEN_VERIFY=N: 0 off, else 1 in N shadow verdicts get the exhaustive cross-check.
 std::uint32_t VerifyPeriod() noexcept;
 bool VerifyAbortOnUnsafe() noexcept;
+
+// Slice S2, GEN_LOCKFREE (requires GEN_TABLE): the tracker's query APIs answer from the table
+// without the tracker mutex when that answer is conclusive (GuestMemory.cpp). Once a lock-free or
+// draw-validation consumer has relied on the table, the table stays maintained even if GEN_TABLE
+// is turned off at run time (a consumer reading a table nobody maintains could miss a stamp).
+bool LockFreeActive() noexcept;
+enum class LockFreeApi : std::uint8_t { UnchangedSince, UnchangedSinceAll, ChangedBlocks, WrittenSince, NewestStamp, UnchangedCommittedSince, StoredOver, TrackerGeneration, Count };
+const char* LockFreeApiName(LockFreeApi api);
+// One query: answered from the table (fast) or by the locked tracker path (slow).
+void CountLockFree(LockFreeApi api, bool fast) noexcept;
+// Verify mode (APS5_ARCHB_GEN_VERIFY=N): a sampled fast answer recomputed under the tracker mutex.
+// unsafe: the table's answer under the mutex contradicts the tracker's; raced: the lock-free answer
+// differs only because a stamp landed between the two (the table under the mutex agrees).
+enum class LockFreeVerify : std::uint8_t { Agree, Raced, Unsafe };
+void CountLockFreeVerify(LockFreeApi api, LockFreeVerify outcome, std::uint64_t address, std::uint64_t bytes, std::uint64_t since) noexcept;
 
 // Ordering points (rule V1): the calling context's required ticket.
 enum class TicketReason : std::uint8_t { Submission, Packet, WaitEntry, WaitCpu, WaitGpuLabel, WaitOwn, Drain, Reap, UnlockedWait, Committer, Present, Uncached, Other, Count };

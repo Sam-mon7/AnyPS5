@@ -86,11 +86,19 @@ void toggleCase(const std::string& name) {
     if (bookkeeping) setEnvironment("APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING", nullptr);
     if (name == "AllocChurn") setEnvironment("APS5_ARCHB_FIX_ALLOC_CHURN", nullptr);
     const bool genTable = name == "GenTable";
-    const bool genShadow = name == "GenShadow";
+    // Switches that require GEN_TABLE (slice S1 GEN_SHADOW, S2 GEN_LOCKFREE): same contract.
+    const struct GenDependent {
+        const char* name;
+        Feature feature;
+        const char* token;
+    } genDependents[] = {{"GenShadow", Feature::GenShadow, "GEN_SHADOW"}, {"GenLockfree", Feature::GenLockfree, "GEN_LOCKFREE"}};
+    const GenDependent* genDependent = nullptr;
+    for (const auto& dependent : genDependents) if (name == dependent.name) genDependent = &dependent;
+    const bool genShadow = genDependent != nullptr;
     if (genTable || genShadow) {
         setEnvironment("APS5_ARCHB_GEN_TABLE", nullptr);
-        // GEN_SHADOW from the environment without GEN_TABLE: refused at startup (prerequisite).
-        setEnvironment("APS5_ARCHB_GEN_SHADOW", genShadow ? "1" : nullptr);
+        // The dependent from the environment without GEN_TABLE: refused at startup (prerequisite).
+        for (const auto& dependent : genDependents) setEnvironment((std::string("APS5_ARCHB_") + dependent.token).c_str(), genDependent == &dependent ? "1" : nullptr);
     }
     Switches::Initialize();
     const auto write = [&](const std::string& line, bool poll = true) {
@@ -119,29 +127,33 @@ void toggleCase(const std::string& name) {
         write("3 " + token + "=1");
         check(Switches::Enabled(feature), "runtime fix did not turn back on");
     } else if (genTable || genShadow) {
-        // Write generations, slice S1: GEN_TABLE runtime and default off; GEN_SHADOW runtime, default
-        // off, and requires GEN_TABLE (named alone it is refused, and it drops when GEN_TABLE does).
+        // Write generations: GEN_TABLE runtime and default off; each dependent (GEN_SHADOW, GEN_LOCKFREE)
+        // runtime, default off, and requires GEN_TABLE (named alone it is refused, and it drops when
+        // GEN_TABLE does).
+        const auto& dependent = genDependent != nullptr ? *genDependent : genDependents[0];
+        const std::string token = dependent.token;
         int listed = 0;
         for (const auto& entry : Switches::Table()) {
             if (entry.feature == Feature::GenTable) {
                 ++listed;
                 check(std::string(entry.name) == "GEN_TABLE" && !entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "GEN_TABLE switch contract");
             }
-            if (entry.feature == Feature::GenShadow) {
+            for (const auto& other : genDependents) {
+                if (entry.feature != other.feature) continue;
                 ++listed;
-                check(std::string(entry.name) == "GEN_SHADOW" && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::GenTable, "GEN_SHADOW switch contract");
+                check(std::string(entry.name) == other.token && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::GenTable, std::string(other.token) + " switch contract");
             }
         }
-        check(listed == 2, "write-generation switches are listed");
-        check(!Switches::Enabled(Feature::GenTable) && !Switches::Enabled(Feature::GenShadow), "write-generation switches must start off (GEN_SHADOW without GEN_TABLE refused)");
-        write("1 GEN_SHADOW=1");
-        check(!Switches::Enabled(Feature::GenShadow), "GEN_SHADOW turned on without GEN_TABLE");
-        write("2 GEN_TABLE=1 GEN_SHADOW=1");
-        check(Switches::Enabled(Feature::GenTable) && Switches::Enabled(Feature::GenShadow), "GEN_TABLE and GEN_SHADOW did not turn on together");
+        check(listed == 1 + static_cast<int>(std::size(genDependents)), "write-generation switches are listed");
+        check(!Switches::Enabled(Feature::GenTable) && !Switches::Enabled(dependent.feature), "write-generation switches must start off (a dependent without GEN_TABLE refused)");
+        write("1 " + token + "=1");
+        check(!Switches::Enabled(dependent.feature), token + " turned on without GEN_TABLE");
+        write("2 GEN_TABLE=1 " + token + "=1");
+        check(Switches::Enabled(Feature::GenTable) && Switches::Enabled(dependent.feature), "GEN_TABLE and " + token + " did not turn on together");
         write("3 GEN_TABLE=0");
-        check(!Switches::Enabled(Feature::GenTable) && !Switches::Enabled(Feature::GenShadow), "GEN_SHADOW stayed on after GEN_TABLE turned off");
+        check(!Switches::Enabled(Feature::GenTable) && !Switches::Enabled(dependent.feature), token + " stayed on after GEN_TABLE turned off");
         write("4 GEN_TABLE=1");
-        check(Switches::Enabled(Feature::GenTable) && !Switches::Enabled(Feature::GenShadow), "GEN_TABLE alone did not turn on alone");
+        check(Switches::Enabled(Feature::GenTable) && !Switches::Enabled(dependent.feature), "GEN_TABLE alone did not turn on alone");
     } else if (name == "AllocChurn") {
         using AgcDriver::ArchB::AllocChurnActive;
         using AgcDriver::ArchB::AllocChurnScope;

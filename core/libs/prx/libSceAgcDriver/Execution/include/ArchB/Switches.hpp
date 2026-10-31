@@ -31,6 +31,7 @@ enum class Feature : std::uint8_t {
     FixWriteTrackingBookkeeping,
     GenTable,
     GenShadow,
+    GenLockfree,
     Count
 };
 

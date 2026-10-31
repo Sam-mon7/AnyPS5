@@ -61,6 +61,9 @@ struct Table::Leaf {
     std::array<std::atomic<Generation>, LeafBlocks> cpu{};
     std::array<std::atomic<Generation>, LeafBlocks> pending{};
     std::array<std::atomic<Generation>, LeafBlocks> meta{};
+    // Slice S2: the newest refused (compared-when-shared) walk over the block, as the tracker's
+    // `refused` map holds it; stored before the tracker's own entry (both under the tracker mutex).
+    std::array<std::atomic<Generation>, LeafBlocks> refused{};
     std::array<std::atomic<Ticket>, LeafBlocks> swept{};
     std::array<std::atomic<Ticket>, LeafBlocks> maskTicket{};
     std::array<std::atomic<std::uint16_t>, LeafBlocks> mask{};
@@ -171,6 +174,8 @@ std::uint64_t Table::Apply(std::uint64_t begin, std::uint64_t end, std::uint8_t 
         auto* leaf = leafFor(block, create);
         const auto leafEnd = std::min(last + 1, (block / LeafBlocks + 1) * LeafBlocks);
         if (leaf == nullptr) {
+            // A lost event (allocation failure): lock-free answers are refused from now on.
+            if (create) incomplete.store(true, std::memory_order_seq_cst);
             block = leafEnd;
             continue;
         }
@@ -461,6 +466,62 @@ Generation Table::NewestData(std::uint64_t begin, std::uint64_t end) const noexc
     return newest;
 }
 
+void Table::Refuse(std::uint64_t begin, std::uint64_t end, Generation generation) noexcept {
+    end = std::min(end, AddressLimit);
+    if (begin >= end || generation == 0) return;
+    const auto last = (end - 1) >> BlockShift;
+    for (auto block = begin >> BlockShift; block <= last; ++block) {
+        auto* leaf = leafFor(block, true);
+        if (leaf == nullptr) {
+            incomplete.store(true, std::memory_order_seq_cst);
+            continue;
+        }
+        const auto i = static_cast<std::size_t>(block % LeafBlocks);
+        atomicMax(leaf->refused[i], generation);
+        // The coarse unit covers refusals too, so DataAtMost may skip a unit on it alone.
+        atomicMax(leaf->coarseChanged[i / CoarseBlocks], generation);
+    }
+}
+
+bool Table::DataAtMost(std::uint64_t begin, std::uint64_t end, Generation since) const noexcept {
+    if (leaves == nullptr || begin >= end || end > AddressLimit || since == 0) return false;
+    if (incomplete.load(std::memory_order_acquire) || resetGeneration.load(std::memory_order_acquire) > since) return false;
+    const auto last = (end - 1) >> BlockShift;
+    for (auto block = begin >> BlockShift; block <= last;) {
+        const auto leafEnd = std::min(last + 1, (block / LeafBlocks + 1) * LeafBlocks);
+        const auto* leaf = leaves[block / LeafBlocks].load(std::memory_order_acquire);
+        if (leaf == nullptr) {
+            block = leafEnd;
+            continue;
+        }
+        while (block < leafEnd) {
+            const auto i = static_cast<std::size_t>(block % LeafBlocks);
+            const auto unit = i / CoarseBlocks;
+            // A whole coarse unit inside the range whose newest event of any kind is old enough.
+            if (i % CoarseBlocks == 0 && block + CoarseBlocks <= leafEnd && leaf->coarseChanged[unit].load(std::memory_order_acquire) <= since) {
+                block += CoarseBlocks;
+                continue;
+            }
+            if (leaf->data[i].load(std::memory_order_acquire) > since || leaf->unitData[unit].load(std::memory_order_acquire) > since || leaf->refused[i].load(std::memory_order_acquire) > since) return false;
+            ++block;
+        }
+    }
+    return true;
+}
+
+Generation Table::DataOf(std::uint64_t address) const noexcept {
+    if (leaves == nullptr || address >= AddressLimit) return 0;
+    const auto block = address >> BlockShift;
+    const auto* leaf = leaves[block / LeafBlocks].load(std::memory_order_acquire);
+    if (leaf == nullptr) return 0;
+    const auto i = static_cast<std::size_t>(block % LeafBlocks);
+    return std::max(leaf->data[i].load(std::memory_order_acquire), leaf->unitData[i / CoarseBlocks].load(std::memory_order_acquire));
+}
+
+bool Table::Complete() const noexcept {
+    return leaves != nullptr && !incomplete.load(std::memory_order_acquire);
+}
+
 void Table::Journal(std::uint64_t begin, std::uint64_t end, Generation generation, ProducerId producer) noexcept {
     if (journal == nullptr) return;
     const auto index = journalHead.fetch_add(1, std::memory_order_acq_rel);
@@ -554,6 +615,13 @@ const char* EventName(Event event) {
     return index < std::size(names) ? names[index] : "?";
 }
 
+const char* LockFreeApiName(LockFreeApi api) {
+    static constexpr const char* names[] = {"unchanged_since", "unchanged_since_all", "changed_blocks", "written_since", "newest_stamp", "unchanged_committed_since", "stored_over", "tracker_generation"};
+    static_assert(std::size(names) == static_cast<std::size_t>(LockFreeApi::Count));
+    const auto index = static_cast<std::size_t>(api);
+    return index < std::size(names) ? names[index] : "?";
+}
+
 const char* ConsumerName(Consumer consumer) {
     static constexpr const char* names[] = {"draw_validate", "dispatch_validate", "dispatch_spans", "resource_proof", "texture_lookup", "storage_refresh", "prelock", "snapshot", "draw_input", "mirror", "presentation", "other"};
     static_assert(std::size(names) == static_cast<std::size_t>(Consumer::Count));
@@ -580,6 +648,12 @@ constexpr const char* ModelNames[] = {"calls", "sweeps", "runs", "pages", "block
 constexpr std::size_t ModelCount = std::size(ModelNames);
 constexpr const char* SerialNames[SerialCount] = {"proof", "resource_proof", "pending", "publish", "forget", "unwatch", "allocations", "commit", "depth", "tracker"};
 constexpr const char* WaitNames[] = {"gpu_label", "inheritable", "inheritable_table", "inheritable_memory"};
+constexpr std::size_t LockFreeCount = static_cast<std::size_t>(LockFreeApi::Count);
+// Counters a gate may require: their recorder names keep the name as is (no 'gen.' dot prefix;
+// queue 0 gets 'gen_q0_'), since the gate accepts only [A-Za-z_]\w* counter names.
+constexpr const char* PlainNames[] = {"gen_lockfree_fast", "gen_lockfree_slow", "gen_lockfree_verified", "gen_lockfree_raced", "gen_lockfree_unsafe"};
+constexpr std::size_t PlainCount = std::size(PlainNames);
+enum PlainCounter : std::size_t { LockFreeFast, LockFreeSlow, LockFreeVerified, LockFreeRaced, LockFreeUnsafe };
 constexpr std::size_t WaitCount = std::size(WaitNames);
 
 constexpr std::size_t EventBase = 0;
@@ -598,7 +672,9 @@ constexpr std::size_t SerialFrames = SerialBase + SerialCount;
 constexpr std::size_t GlobalOnly = SerialFrames + 1;
 constexpr std::size_t WaitBase = GlobalOnly + 1;
 constexpr std::size_t UnsafeLogged = WaitBase + WaitCount;
-constexpr std::size_t CounterCount = UnsafeLogged + 1;
+constexpr std::size_t LockFreeBase = UnsafeLogged + 1;
+constexpr std::size_t PlainBase = LockFreeBase + 2 * LockFreeCount;
+constexpr std::size_t CounterCount = PlainBase + PlainCount;
 
 const std::vector<std::string>& counterNames() {
     static const auto* names = [] {
@@ -630,6 +706,11 @@ const std::vector<std::string>& counterNames() {
         n[GlobalOnly] = "gen_shadow.resource_proof.global_only_refusals";
         for (std::size_t w = 0; w < WaitCount; ++w) n[WaitBase + w] = std::string("gen_wait_") + WaitNames[w];
         n[UnsafeLogged] = "gen_shadow.unsafe_logged";
+        for (std::size_t a = 0; a < LockFreeCount; ++a) {
+            n[LockFreeBase + 2 * a] = std::string("gen_lockfree.") + LockFreeApiName(static_cast<LockFreeApi>(a)) + ".fast";
+            n[LockFreeBase + 2 * a + 1] = std::string("gen_lockfree.") + LockFreeApiName(static_cast<LockFreeApi>(a)) + ".slow";
+        }
+        for (std::size_t p = 0; p < PlainCount; ++p) n[PlainBase + p] = PlainNames[p];
         for (const auto& name : n) {
             if (name.empty()) std::abort();
         }
@@ -721,6 +802,13 @@ std::mutex& activationMutex() {
     return *mutex;
 }
 std::atomic<bool> live{false};
+// Set (seq_cst) before the first lock-free or draw-validation answer: the table then stays
+// maintained for the rest of the run even if GEN_TABLE is turned off.
+std::atomic<bool> consumerRelied{false};
+
+void noteConsumer() noexcept {
+    if (!consumerRelied.load(std::memory_order_relaxed)) consumerRelied.store(true, std::memory_order_seq_cst);
+}
 
 struct RequiredSlot {};
 struct ConsumerSlot {};
@@ -734,7 +822,7 @@ Table& Global() {
 }
 
 bool Active() noexcept {
-    const bool on = ArchB::Switches::Enabled(ArchB::Feature::GenTable);
+    const bool on = ArchB::Switches::Enabled(ArchB::Feature::GenTable) || consumerRelied.load(std::memory_order_acquire);
     if (on == live.load(std::memory_order_acquire)) return on;
     std::lock_guard lock(activationMutex());
     if (on != live.load(std::memory_order_relaxed)) {
@@ -748,6 +836,36 @@ bool Active() noexcept {
 
 bool ShadowActive() noexcept {
     return ArchB::Switches::Enabled(ArchB::Feature::GenShadow) && Active();
+}
+
+bool LockFreeActive() noexcept {
+    if (!ArchB::Switches::Enabled(ArchB::Feature::GenLockfree)) return false;
+    noteConsumer();
+    return Active() && Global().Complete();
+}
+
+void CountLockFree(LockFreeApi api, bool fast) noexcept {
+    auto& counters = local();
+    const auto bump = [&](std::size_t counter) {
+        auto& slot = counters.values[counter];
+        slot.store(slot.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    };
+    bump(LockFreeBase + 2 * static_cast<std::size_t>(api) + (fast ? 0 : 1));
+    bump(PlainBase + (fast ? LockFreeFast : LockFreeSlow));
+}
+
+void CountLockFreeVerify(LockFreeApi api, LockFreeVerify outcome, std::uint64_t address, std::uint64_t bytes, std::uint64_t since) noexcept {
+    add(PlainBase + (outcome == LockFreeVerify::Agree ? LockFreeVerified : outcome == LockFreeVerify::Raced ? LockFreeRaced : LockFreeUnsafe));
+    if (outcome != LockFreeVerify::Unsafe) return;
+    static std::atomic<std::uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+        const auto fields = Global().Fields(address);
+        std::fprintf(stderr, "[gen-unsafe] lockfree api=%s range=0x%llx+0x%llx since=%llu now=%llu floor=%llu block data=%llu meta=%llu state=%u\n", LockFreeApiName(api), static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(since), static_cast<unsigned long long>(Global().Now()), static_cast<unsigned long long>(Global().ResetFloor()),
+            static_cast<unsigned long long>(fields.data), static_cast<unsigned long long>(fields.meta), static_cast<unsigned>(fields.state));
+        std::fflush(stderr);
+    }
+    if (VerifyAbortOnUnsafe()) std::abort();
 }
 
 std::uint32_t VerifyPeriod() noexcept {
@@ -1039,9 +1157,11 @@ void PublishCounters() noexcept {
         const auto& names = counterNames();
         r.allNames.reserve(CounterCount);
         r.queue0Names.reserve(CounterCount);
-        for (const auto& name : names) {
-            r.allNames.push_back("gen." + name.substr(4));
-            r.queue0Names.push_back("gen.q0." + name.substr(4));
+        for (std::size_t i = 0; i < CounterCount; ++i) {
+            const auto& name = names[i];
+            const bool plain = i >= PlainBase;
+            r.allNames.push_back(plain ? name : "gen." + name.substr(4));
+            r.queue0Names.push_back(plain ? "gen_q0_" + name.substr(4) : "gen.q0." + name.substr(4));
         }
     }
     const auto totals = foldLocked(r);
@@ -1146,6 +1266,7 @@ void SuppressEventForTest(Event event, bool value) noexcept {
 void ResetActivationForTest() noexcept {
     std::lock_guard lock(activationMutex());
     live.store(false, std::memory_order_release);
+    consumerRelied.store(false, std::memory_order_seq_cst);
 }
 
 }

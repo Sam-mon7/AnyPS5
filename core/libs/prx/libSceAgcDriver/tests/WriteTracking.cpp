@@ -32,6 +32,8 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <atomic>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -2755,6 +2757,217 @@ void CheckGenVerifyCatches() {
     Require(!UnchangedSince(base, bytes, since) && genCounter("gen_shadow.texture_lookup.unsafe") == unsafe + 1, "a published driver store was counted unsafe");
 }
 
+// Write generations, slice S2 (APS5_ARCHB_GEN_TABLE=1 APS5_ARCHB_GEN_LOCKFREE=1 APS5_ARCHB_GEN_VERIFY=1):
+// the tracker's query APIs answered from the table without the tracker mutex. Clean ranges are
+// answered fast with the tracker's answer, written ranges go to the locked path, ranges outside
+// write watching are refused fast, a refusal in the table forces the locked path, TrackerGeneration
+// is the published generation, and every sampled fast answer agrees with the locked one.
+std::uint64_t lockFreeFast(const char* api) {
+    return genCounter(std::string("gen_lockfree.") + api + ".fast");
+}
+
+std::uint64_t lockFreeSlow(const char* api) {
+    return genCounter(std::string("gen_lockfree.") + api + ".slow");
+}
+
+void CheckGenLockFree() {
+    Require(Gen::LockFreeActive() && Gen::VerifyPeriod() == 1, "the lock-free test needs GEN_TABLE, GEN_LOCKFREE and GEN_VERIFY=1");
+    constexpr std::size_t bytes = 8 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x5a, bytes);
+    BumpCollectEpoch(Gen::TicketReason::Submission);
+    const auto since = CollectWrites(base, bytes);
+    Require(since != 0 && TrackerGeneration() == since, "the lock-free tracker generation is not the published generation after a collect");
+
+    // Clean: answered from the table, the tracker's answer.
+    auto fast = lockFreeFast("unchanged_since");
+    Require(UnchangedSince(base, bytes, since) && lockFreeFast("unchanged_since") == fast + 1, "a clean range was not answered unchanged from the table");
+    fast = lockFreeFast("unchanged_since_all");
+    const std::array<UnchangedQuery, 2> clean{UnchangedQuery{base, Block, since}, UnchangedQuery{base + 4 * Block, 2 * Block, since}};
+    Require(UnchangedSinceAll(clean) && lockFreeFast("unchanged_since_all") == fast + 1, "clean queries were not answered from the table");
+    const std::array<UnchangedQuery, 2> zero{UnchangedQuery{base, Block, since}, UnchangedQuery{base + Block, Block, 0}};
+    Require(!UnchangedSinceAll(zero) && lockFreeFast("unchanged_since_all") == fast + 2, "a query with generation 0 was not refused from the table");
+    fast = lockFreeFast("written_since");
+    Require(!WrittenSince(base, bytes, since) && lockFreeFast("written_since") == fast + 1, "a clean range was not answered unwritten from the table");
+    fast = lockFreeFast("stored_over");
+    Require(!StoredOver(base, bytes, since) && lockFreeFast("stored_over") == fast + 1, "a clean range was not answered not-stored-over from the table");
+    fast = lockFreeFast("unchanged_committed_since");
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> committed{{{base, base + Block}, {base + 2 * Block, base + 3 * Block}}};
+    Require(UnchangedCommittedSince(committed, since) && lockFreeFast("unchanged_committed_since") == fast + 1, "clean committed ranges were not answered from the table");
+    {
+        std::array<std::uint64_t, 4> generations{since, since, 0, since};
+        std::array<std::uint8_t, 4> changed{};
+        std::array<std::uint8_t, 4> cpu{};
+        fast = lockFreeFast("changed_blocks");
+        Require(ChangedBlocks(base, 4 * Block, generations, changed, cpu) && lockFreeFast("changed_blocks") == fast + 1, "clean blocks were not answered from the table");
+        Require(changed[0] == BlockUnchanged && changed[1] == BlockUnchanged && changed[2] == BlockWritten && changed[3] == BlockUnchanged && cpu[0] == 0 && cpu[2] == 1, "per-block answers from the table are wrong");
+    }
+
+    // A CPU store, collected: the table data moved past `since`, so the locked path answers.
+    memory[3 * Block + 7] = 0x11;
+    BumpCollectEpoch(Gen::TicketReason::WaitCpu);
+    const auto after = CollectWrites(base, bytes);
+    auto slow = lockFreeSlow("unchanged_since");
+    Require(!UnchangedSince(base, bytes, since) && lockFreeSlow("unchanged_since") == slow + 1, "a written range was not answered by the locked path");
+    fast = lockFreeFast("unchanged_since");
+    Require(UnchangedSince(base, 3 * Block, since) && lockFreeFast("unchanged_since") == fast + 1, "the unwritten blocks beside a store were not answered from the table");
+    Require(UnchangedSince(base, bytes, after), "a range read as changed since the generation of the collect that saw its store");
+    slow = lockFreeSlow("written_since");
+    Require(WrittenSince(base, bytes, since) && lockFreeSlow("written_since") == slow + 1, "a written range was not answered written by the locked path");
+    {
+        std::array<std::uint64_t, 4> generations{since, since, since, since};
+        std::array<std::uint8_t, 4> changed{};
+        std::array<std::uint8_t, 4> cpu{};
+        slow = lockFreeSlow("changed_blocks");
+        Require(ChangedBlocks(base, 4 * Block, generations, changed, cpu) && lockFreeSlow("changed_blocks") == slow + 1, "a written block did not send the call to the locked path");
+        Require(changed[3] == BlockWritten && cpu[3] == 1 && changed[0] == BlockUnchanged && cpu[0] == 0, "the locked path after an inconclusive table answer is wrong");
+    }
+    // A driver store over part of a block: the table says changed (block granularity), the locked
+    // path's sub-block detail says the untouched part is unchanged.
+    const auto stored = MarkWritten(base + 5 * Block + 64, 64);
+    Require(stored > after && TrackerGeneration() == stored, "MarkWritten did not publish its generation");
+    slow = lockFreeSlow("unchanged_since");
+    Require(UnchangedSince(base + 5 * Block + 4096, 4096, after) && lockFreeSlow("unchanged_since") == slow + 1, "an untouched page of a stored block was not answered unchanged by the locked path");
+    Require(!UnchangedSince(base + 5 * Block, 4096, after), "the stored page reads unchanged");
+    Require(StoredOver(base + 5 * Block, 4096, after) && !StoredOver(base + 6 * Block, Block, after), "stored-over answers after a driver store are wrong");
+
+    // A refusal in the table (as a compared-when-shared walk records it) forces the locked path.
+    const auto refusedAt = CollectWrites(base, bytes);
+    Gen::Global().Refuse(base + 7 * Block, base + 8 * Block, Gen::Global().Bump());
+    slow = lockFreeSlow("unchanged_since");
+    Require(UnchangedSince(base + 7 * Block, Block, refusedAt) && lockFreeSlow("unchanged_since") == slow + 1, "a block refused in the table was answered from the table");
+
+    // Outside write watching: refused from the table without a stamp, as the locked path does.
+    Unwatch(base + 6 * Block, Block);
+    fast = lockFreeFast("unchanged_since");
+    Require(!UnchangedSince(base + 6 * Block, Block, refusedAt) && lockFreeFast("unchanged_since") == fast + 1, "an unwatched range was not refused from the table");
+    fast = lockFreeFast("stored_over");
+    Require(StoredOver(base + 6 * Block, Block, refusedAt) && lockFreeFast("stored_over") == fast + 1, "an unwatched range was not stored-over from the table");
+    Rewatch(std::array<std::pair<std::uint64_t, std::uint64_t>, 1>{{{base + 6 * Block, base + 7 * Block}}});
+    Require(!UnchangedSince(base + 6 * Block, Block, refusedAt), "a rewatched range reads unchanged since a generation before its exclusion");
+
+    // NewestStamp stays locked (counted), its value unchanged.
+    slow = lockFreeSlow("newest_stamp");
+    Require(NewestStamp(base + 5 * Block, Block) == stored && lockFreeSlow("newest_stamp") == slow + 1, "NewestStamp changed under GEN_LOCKFREE");
+    Require(genCounter("gen_lockfree_unsafe") == 0 && genCounter("gen_lockfree_raced") == 0 && genCounter("gen_lockfree_verified") > 0, "verify found a lock-free answer that differs from the locked one");
+}
+
+// A table that misses a tracker stamp (the driver-store event suppressed through the test hook):
+// the fast path answers unchanged, and verify mode (GEN_VERIFY=1) catches it under the mutex.
+void CheckGenLockFreeVerifyCatches() {
+    Require(Gen::LockFreeActive() && Gen::VerifyPeriod() == 1, "the verify test needs GEN_TABLE, GEN_LOCKFREE and GEN_VERIFY=1");
+    constexpr std::size_t bytes = 4 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x33, bytes);
+    BumpCollectEpoch(Gen::TicketReason::Submission);
+    const auto since = CollectWrites(base, bytes);
+    Gen::SuppressEventForTest(Gen::Event::DriverStore, true);
+    static_cast<void>(MarkWritten(base + Block + 64, 16));
+    Gen::SuppressEventForTest(Gen::Event::DriverStore, false);
+    const auto unsafe = genCounter("gen_lockfree_unsafe");
+    static_cast<void>(UnchangedSince(base + Block, Block, since));
+    Require(genCounter("gen_lockfree_unsafe") == unsafe + 1, "verify did not catch a fast answer the tracker contradicts");
+}
+
+// Concurrent stamping. Writers stamp blocks (driver stores and CPU stores with collects) while
+// checkers take a generation, wait for a store they ordered after it, and require the range to read
+// changed; background readers keep the lock-free paths busy. Verify mode cross-checks every fast
+// answer under the mutex: none may be unsafe.
+void CheckGenLockFreeStress() {
+    Require(Gen::LockFreeActive() && Gen::VerifyPeriod() != 0, "the stress test needs GEN_TABLE, GEN_LOCKFREE and GEN_VERIFY");
+    constexpr std::size_t blocks = 64;
+    constexpr std::size_t bytes = blocks * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0, bytes);
+    BumpCollectEpoch(Gen::TicketReason::Submission);
+    static_cast<void>(CollectWrites(base, bytes));
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> missed{0};
+    std::atomic<std::uint64_t> checks{0};
+    std::vector<std::thread> threads;
+    // Noise: driver stores and CPU stores with collects over the upper half.
+    for (int t = 0; t < 2; ++t) {
+        threads.emplace_back([&, t] {
+            std::mt19937_64 random(static_cast<std::uint64_t>(t) + 11u);
+            while (!stop.load(std::memory_order_relaxed)) {
+                const auto block = blocks / 2 + random() % (blocks / 2);
+                const auto address = base + block * Block + (random() % 16) * 4096;
+                if ((random() & 1u) == 0) {
+                    static_cast<void>(MarkWritten(address, 64));
+                } else {
+                    memory[address - base] = static_cast<std::uint8_t>(random());
+                    BumpCollectEpoch(Gen::TicketReason::Other);
+                    static_cast<void>(CollectWrites(base + block * Block, Block));
+                }
+            }
+        });
+    }
+    // Readers: every lock-free API over random ranges at random recent generations.
+    for (int t = 0; t < 2; ++t) {
+        threads.emplace_back([&, t] {
+            std::mt19937_64 random(static_cast<std::uint64_t>(t) + 101u);
+            std::array<std::uint64_t, 4> generations{};
+            std::array<std::uint8_t, 4> changed{};
+            std::array<std::uint8_t, 4> cpu{};
+            while (!stop.load(std::memory_order_relaxed)) {
+                const auto block = random() % (blocks - 4);
+                const auto since = TrackerGeneration() - random() % 4;
+                const auto address = base + block * Block;
+                static_cast<void>(UnchangedSince(address, 4 * Block, since));
+                static_cast<void>(WrittenSince(address, 2 * Block, since));
+                static_cast<void>(StoredOver(address, Block, since));
+                generations.fill(since);
+                static_cast<void>(ChangedBlocks(address, 4 * Block, generations, changed, cpu));
+                const std::array<UnchangedQuery, 2> queries{UnchangedQuery{address, Block, since}, UnchangedQuery{address + 2 * Block, Block, since}};
+                static_cast<void>(UnchangedSinceAll(queries));
+            }
+        });
+    }
+    // Checkers own the lower half (block per checker): generation, then an ordered store, then the check.
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&, t] {
+            std::mt19937_64 random(static_cast<std::uint64_t>(t) + 1001u);
+            std::atomic<int> phase{0};
+            const auto block = static_cast<std::size_t>(t) * 4;
+            const auto address = base + block * Block;
+            while (!stop.load(std::memory_order_relaxed)) {
+                BumpCollectEpoch(Gen::TicketReason::Other);
+                const auto since = (random() & 1u) != 0 ? TrackerGeneration() : CollectWrites(address, 4 * Block);
+                const bool cpuStore = (random() & 1u) != 0;
+                const auto offset = (random() % 4) * Block + (random() % 16) * 4096;
+                // The store on another thread, ordered after the generation by the handshake.
+                std::thread writer([&] {
+                    while (phase.load(std::memory_order_acquire) != 1) std::this_thread::yield();
+                    if (cpuStore) memory[block * Block + offset] = static_cast<std::uint8_t>(memory[block * Block + offset] + 1);
+                    else static_cast<void>(MarkWritten(address + offset, 32));
+                    phase.store(2, std::memory_order_release);
+                });
+                phase.store(1, std::memory_order_release);
+                while (phase.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+                writer.join();
+                phase.store(0, std::memory_order_relaxed);
+                // An ordering point after the store (a CPU store is seen by the next epoch's collect).
+                BumpCollectEpoch(Gen::TicketReason::WaitCpu);
+                static_cast<void>(CollectWrites(address, 4 * Block));
+                if (UnchangedSince(address, 4 * Block, since) || UnchangedSince(address + offset, 32, since) || !WrittenSince(address, 4 * Block, since)) missed.fetch_add(1, std::memory_order_relaxed);
+                checks.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+    stop.store(true);
+    for (auto& thread : threads) thread.join();
+    std::cout << "lock-free stress: checks=" << checks.load() << " fast=" << genCounter("gen_lockfree_fast") << " slow=" << genCounter("gen_lockfree_slow") << " verified=" << genCounter("gen_lockfree_verified")
+              << " raced=" << genCounter("gen_lockfree_raced") << " unsafe=" << genCounter("gen_lockfree_unsafe") << '\n';
+    Require(checks.load() > 100, "the stress test made too few checks");
+    Require(missed.load() == 0, "a store ordered after a generation was missed");
+    Require(genCounter("gen_lockfree_unsafe") == 0, "verify found an unsafe lock-free answer under concurrent stamping");
+    Require(genCounter("gen_lockfree_fast") > 0 && genCounter("gen_lockfree_verified") > 0, "the stress test exercised no fast answer");
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2800,6 +3013,21 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--gen-verify-catches") {
             CheckGenVerifyCatches();
             std::cout << "write-generation verify test passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--gen-lockfree") {
+            CheckGenLockFree();
+            std::cout << "write-generation lock-free test passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--gen-lockfree-verify-catches") {
+            CheckGenLockFreeVerifyCatches();
+            std::cout << "write-generation lock-free verify test passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--gen-lockfree-stress") {
+            CheckGenLockFreeStress();
+            std::cout << "write-generation lock-free stress test passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--gen-tracker-wrap") {
