@@ -136,6 +136,9 @@ void ResetWriteCensus();
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
+// Tests only (agc_archb_gen_tracker_wrap; the driver never calls it): moves the tracker generation
+// forward to `generation`, never back, so a test can cross 2^32 without 2^32 collects.
+void AdvanceTrackerGenerationForTest(std::uint64_t generation);
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes, std::source_location site = std::source_location::current());
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
