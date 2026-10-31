@@ -1513,6 +1513,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    auto* census = AgcDriver::ArchB::Recorder::CurrentDraw();
+    using M = AgcDriver::ArchB::Recorder::Metric;
+    if (census != nullptr) census->Count(M::H3CollectRequests);
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
@@ -1530,6 +1533,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
+                if (census != nullptr) census->Count(M::H3CollectMemoHits);
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.stable.load(std::memory_order_acquire);
             }
@@ -1539,6 +1543,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
+                if (census != nullptr) census->Count(M::H3CollectMemoHits);
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.stable.load(std::memory_order_acquire);
             }
@@ -1548,6 +1553,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (memoFailures) {
         const auto& failed = epochCollectMap(epoch).failedRanges;
         if (const auto found = failed.find(first); found != failed.end() && found->second.end == stop && found->second.unwatched == unwatched && found->second.mapping == mapping) {
+            if (census != nullptr) census->Count(M::H3CollectFailedMemoHits);
             if (MemoryProfiled()) failedCollectMemoHits.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
@@ -1555,6 +1561,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto failedFirst = first;
     const auto failedStop = stop;
     const auto fail = [&]() -> std::uint64_t {
+        if (census != nullptr) census->Count(M::H3CollectRefused);
         if (memoFailures) epochCollectMap(epoch).failedRanges[failedFirst] = {failedFirst, failedStop, epoch, unwatched, mapping};
         return 0;
     };
@@ -1565,6 +1572,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
             if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.mapping == mapping && entry.begin <= cursor && stop <= entry.end) {
+                if (census != nullptr) census->Count(M::H3CollectMemoHits);
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation;
             }
@@ -1581,6 +1589,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
+    if (census != nullptr) census->Count(M::H3CollectWalkBytes, stop - first);
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return fail();
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {

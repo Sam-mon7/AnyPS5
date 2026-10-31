@@ -13,7 +13,7 @@ namespace AgcDriver::ArchB {
 namespace {
 
 constexpr const char* bucketNames[] = {"lookup_proof", "mutex_wait", "targets_pass", "descriptors", "pipeline", "dynamic_state", "push_constants", "draw_commands", "barriers", "data_refresh", "bookkeeping"};
-constexpr const char* metricNames[] = {"calls", "continuations", "vulkan_calls", "vkcmd_calls", "descriptor_writes", "descriptor_elements", "image_elements", "buffer_elements", "descriptor_sets", "descriptor_binds", "pipeline_binds", "distinct_pipelines", "dynamic_calls", "push_calls", "draw_calls", "pass_begins", "pass_ends", "pass_continued", "barriers", "image_barriers", "layout_transitions", "snapshot_bytes", "binding_preparations", "binding_rewrites", "plain_stages", "ordered_access", "descriptor_set_requests", "snapshot_copied_bytes", "redundant_pipeline_binds", "redundant_dynamic_calls", "redundant_push_calls"};
+constexpr const char* metricNames[] = {"calls", "continuations", "vulkan_calls", "vkcmd_calls", "descriptor_writes", "descriptor_elements", "image_elements", "buffer_elements", "descriptor_sets", "descriptor_binds", "pipeline_binds", "distinct_pipelines", "dynamic_calls", "push_calls", "draw_calls", "pass_begins", "pass_ends", "pass_continued", "barriers", "image_barriers", "layout_transitions", "snapshot_bytes", "binding_preparations", "binding_rewrites", "plain_stages", "ordered_access", "descriptor_set_requests", "snapshot_copied_bytes", "redundant_pipeline_binds", "redundant_dynamic_calls", "redundant_push_calls", "h3_prelock_targets_ns", "h3_prelock_lookup_ns", "h3_prelock_surfaces_ns", "h3_prelock_proof_ns", "h3_binding_setup_ns", "h3_binding_selection_ns", "h3_snapshot_words_ns", "h3_snapshot_eligibility_ns", "h3_snapshot_unwritten_ns", "h3_snapshot_collect_ns", "h3_snapshot_lookup_ns", "h3_snapshot_copy_ns", "h3_snapshot_keep_ns", "h3_complete_images_ns", "h3_complete_upload_ns", "h3_complete_bda_ns", "h3_complete_descriptors_ns", "h3_complete_proof_ns", "h3_prelock_target_ranges", "h3_prelock_target_bytes", "h3_prelock_surface_ranges", "h3_prelock_surface_bytes", "h3_prelock_walked_bytes", "h3_binding_allocations", "h3_binding_read_ranges", "h3_snapshot_guest_ranges", "h3_snapshot_moved_ranges", "h3_snapshot_word_ranges", "h3_snapshot_word_bytes", "h3_snapshot_word_reused", "h3_snapshot_unwritten_hits", "h3_snapshot_collects", "h3_snapshot_reusable_hits", "h3_snapshot_uploads", "h3_snapshot_allocations", "h3_snapshot_pending_queries", "h3_bindings_previous", "h3_bindings_same", "h3_bindings_changed", "h3_bindings_expired", "h3_collect_requests", "h3_collect_memo_hits", "h3_collect_failed_memo_hits", "h3_collect_walk_bytes", "h3_collect_refused", "h3_complete_builds"};
 constexpr const char* stateNames[] = {"pipeline", "descriptors", "targets", "dynamic", "push"};
 constexpr const char* outcomeNames[] = {"Unclassified", "Hit", "Miss"};
 
@@ -38,6 +38,37 @@ Recorder::Bucket bucketOf(std::string_view name, std::string_view stage, Recorde
     }
     if (name == "Draw.KeepResources" || name == "Draw.ResourceRelease" || name.starts_with("Recorder.") || name.starts_with("Label")) return B::Bookkeeping;
     return fallback;
+}
+
+Recorder::Metric refreshMetric(std::string_view name, std::string_view stage) {
+    using M = Recorder::Metric;
+    if (name == "Draw.Prelock") {
+        if (stage == "targets") return M::H3PrelockTargetsNs;
+        if (stage == "lookup") return M::H3PrelockLookupNs;
+        if (stage == "surfaces") return M::H3PrelockSurfacesNs;
+        if (stage == "proof") return M::H3PrelockProofNs;
+    }
+    if (name == "Draw.BindingRefresh") {
+        if (stage == "setup") return M::H3BindingSetupNs;
+        if (stage == "selection") return M::H3BindingSelectionNs;
+    }
+    if (name == "Draw.Snapshot") {
+        if (stage == "words") return M::H3SnapshotWordsNs;
+        if (stage == "eligibility") return M::H3SnapshotEligibilityNs;
+        if (stage == "unwritten") return M::H3SnapshotUnwrittenNs;
+        if (stage == "collect") return M::H3SnapshotCollectNs;
+        if (stage == "lookup") return M::H3SnapshotLookupNs;
+        if (stage == "copy") return M::H3SnapshotCopyNs;
+        if (stage == "keep") return M::H3SnapshotKeepNs;
+    }
+    if (name == "Resources.Complete") {
+        if (stage == "images") return M::H3CompleteImagesNs;
+        if (stage == "upload") return M::H3CompleteUploadNs;
+        if (stage == "bda") return M::H3CompleteBdaNs;
+        if (stage == "descriptors") return M::H3CompleteDescriptorsNs;
+        if (stage == "proof") return M::H3CompleteProofNs;
+    }
+    return M::Count;
 }
 
 struct Value {
@@ -215,6 +246,8 @@ void Recorder::Scope::Mark(const char* stage, Clock::time_point now) {
         Recorder::phase(name, stage, exclusive);
         if (draw != nullptr && draw == currentDraw && draw->generation == generation) {
             const auto index = static_cast<std::size_t>(bucketOf(name, stage != nullptr ? stage : "", bucket));
+            const auto refresh = static_cast<Bucket>(index) == Bucket::Refresh ? refreshMetric(name, stage != nullptr ? stage : "") : Metric::Count;
+            if (refresh != Metric::Count) draw->Count(refresh, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(exclusive).count()));
             draw->elapsed[0][index] += exclusive - exclusiveHeld;
             draw->elapsed[1][index] += exclusiveHeld;
             if (std::string_view(name).starts_with("Vulkan.")) draw->emission[index] += exclusive;

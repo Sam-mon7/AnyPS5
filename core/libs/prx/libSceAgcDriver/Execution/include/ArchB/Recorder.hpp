@@ -26,7 +26,17 @@ public:
         Calls, Continuations, VulkanCalls, VkcmdCalls, DescriptorWrites, DescriptorElements, ImageElements, BufferElements,
         DescriptorSets, DescriptorBinds, PipelineBinds, DistinctPipelines, DynamicCalls, PushCalls, DrawCalls,
         PassBegins, PassEnds, PassContinued, Barriers, ImageBarriers, LayoutTransitions, SnapshotBytes,
-        BindingPreparations, BindingRewrites, PlainStages, OrderedAccess, DescriptorSetRequests, SnapshotCopiedBytes, RedundantPipelineBinds, RedundantDynamicCalls, RedundantPushCalls, Count
+        BindingPreparations, BindingRewrites, PlainStages, OrderedAccess, DescriptorSetRequests, SnapshotCopiedBytes, RedundantPipelineBinds, RedundantDynamicCalls, RedundantPushCalls,
+        H3PrelockTargetsNs, H3PrelockLookupNs, H3PrelockSurfacesNs, H3PrelockProofNs, H3BindingSetupNs,
+        H3BindingSelectionNs, H3SnapshotWordsNs, H3SnapshotEligibilityNs, H3SnapshotUnwrittenNs, H3SnapshotCollectNs,
+        H3SnapshotLookupNs, H3SnapshotCopyNs, H3SnapshotKeepNs, H3CompleteImagesNs, H3CompleteUploadNs,
+        H3CompleteBdaNs, H3CompleteDescriptorsNs, H3CompleteProofNs, H3PrelockTargetRanges, H3PrelockTargetBytes,
+        H3PrelockSurfaceRanges, H3PrelockSurfaceBytes, H3PrelockWalkedBytes, H3BindingAllocations, H3BindingReadRanges,
+        H3SnapshotGuestRanges, H3SnapshotMovedRanges, H3SnapshotWordRanges, H3SnapshotWordBytes, H3SnapshotWordReused,
+        H3SnapshotUnwrittenHits, H3SnapshotCollects, H3SnapshotReusableHits, H3SnapshotUploads, H3SnapshotAllocations,
+        H3SnapshotPendingQueries, H3BindingsPrevious, H3BindingsSame, H3BindingsChanged, H3BindingsExpired,
+        H3CollectRequests, H3CollectMemoHits, H3CollectFailedMemoHits, H3CollectWalkBytes, H3CollectRefused,
+        H3CompleteBuilds, Count
     };
     enum class State : std::uint8_t { Pipeline, Descriptors, Targets, Dynamic, Push, Count };
     struct Sequence {
@@ -49,6 +59,7 @@ public:
         Draw& operator=(const Draw&) = delete;
         void Classify(DrawOutcome value) { outcome = value; }
         void Count(Metric metric, std::uint64_t value = 1) { counters[static_cast<std::size_t>(metric)] += value; }
+        std::uint64_t Counted(Metric metric) const { return counters[static_cast<std::size_t>(metric)]; }
         void Word(State state, std::uint64_t value) { states[static_cast<std::size_t>(state)].Add(value); }
         void Bytes(State state, const void* data, std::size_t size) {
             Word(state, size);

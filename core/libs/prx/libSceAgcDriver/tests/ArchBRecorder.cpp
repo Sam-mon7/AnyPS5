@@ -194,6 +194,61 @@ void hitCensus(bool enabled) {
     near(toggled.counters.at("H1.Hit.calls"), 0);
 }
 
+void refreshCensus(bool enabled) {
+    const Recorder::Clock::time_point start{};
+    Recorder::BindThread("h3 fixture");
+    Recorder::Boundary(enabled, 800, start);
+    {
+        Recorder::Draw draw;
+        Recorder::Scope prelock, refresh, snapshot, complete;
+        prelock.Begin("Draw.Prelock", start);
+        prelock.Mark("targets", start + 1ms);
+        prelock.Mark("lookup", start + 3ms);
+        prelock.Mark("surfaces", start + 6ms);
+        prelock.Mark("proof", start + 10ms);
+        prelock.End(start + 10ms);
+        refresh.Begin("Draw.BindingRefresh", start + 10ms);
+        refresh.Mark("setup", start + 11ms);
+        snapshot.Begin("Draw.Snapshot", start + 11ms);
+        snapshot.Mark("eligibility", start + 13ms);
+        snapshot.Mark("unwritten", start + 16ms);
+        snapshot.Mark("collect", start + 20ms);
+        snapshot.Mark("lookup", start + 25ms);
+        snapshot.Mark("copy", start + 31ms);
+        snapshot.Mark("keep", start + 38ms);
+        snapshot.End(start + 38ms);
+        refresh.Mark("selection", start + 39ms);
+        refresh.End(start + 39ms);
+        complete.Begin("Resources.Complete", start + 39ms);
+        complete.Mark("images", start + 40ms);
+        complete.Mark("upload", start + 42ms);
+        complete.Mark("bda", start + 45ms);
+        complete.Mark("descriptors", start + 49ms);
+        complete.Mark("proof", start + 54ms);
+        complete.End(start + 54ms);
+        draw.Classify(Recorder::DrawOutcome::Hit);
+    }
+    const auto result = Recorder::Collect(start + 1s);
+    if (!enabled) {
+        require(!result.counters.contains("H1.Hit.h3_prelock_targets_ns"), "disabled refresh census published counters");
+        return;
+    }
+    const auto& values = result.threadCounters.at("h3 fixture");
+    near(values.at("H1.Hit.h3_prelock_targets_ns"), 1000000);
+    near(values.at("H1.Hit.h3_prelock_lookup_ns"), 2000000);
+    near(values.at("H1.Hit.h3_prelock_surfaces_ns"), 3000000);
+    near(values.at("H1.Hit.h3_prelock_proof_ns"), 4000000);
+    near(values.at("H1.Hit.h3_binding_setup_ns"), 1000000);
+    near(values.at("H1.Hit.h3_binding_selection_ns"), 1000000);
+    near(values.at("H1.Hit.h3_snapshot_eligibility_ns"), 2000000);
+    near(values.at("H1.Hit.h3_snapshot_collect_ns"), 4000000);
+    near(values.at("H1.Hit.h3_snapshot_lookup_ns"), 5000000);
+    near(values.at("H1.Hit.h3_complete_images_ns"), 1000000);
+    near(values.at("H1.Hit.h3_complete_proof_ns"), 5000000);
+    near(result.phases.at("h3 fixture").at("H1.Hit.Outside.data_refresh"), 54);
+    near(result.accountedMs, 54);
+}
+
 void shaderTableOverflow() {
     const Recorder::Clock::time_point start{};
     Recorder::Boundary(true, 0, start);
@@ -221,6 +276,8 @@ int main(int argc, char** argv) {
         else if (name == "no_path_change") noPathChange();
         else if (name == "toggle_interval_tagged") toggleIntervalTagged();
         else if (name == "shader_table_overflow") shaderTableOverflow();
+        else if (name == "refresh_census") refreshCensus(true);
+        else if (name == "refresh_census_disabled") refreshCensus(false);
         else if (name == "hit_census") hitCensus(true);
         else if (name == "hit_census_disabled") hitCensus(false);
         else throw std::runtime_error("unknown test case");

@@ -2520,6 +2520,7 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
 
 void ShaderResources::buildComplete() {
     PerformanceTimer frameTiming("Resources.Complete");
+    if (auto* census = AgcDriver::ArchB::Recorder::CurrentDraw()) census->Count(AgcDriver::ArchB::Recorder::Metric::H3CompleteBuilds);
     BuildLookups lookups;
     Require(!completed, "cannot update a published descriptor heap");
     const auto stageStart = std::chrono::steady_clock::now();
@@ -2542,13 +2543,16 @@ void ShaderResources::buildComplete() {
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
         resolveImageTables();
         timing.bindingsMs += phase(BuildPhase::Images);
+        frameTiming.Mark("images");
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
+        frameTiming.Mark("upload");
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         if (bda) bda->SetSrtGuards(std::move(srtGuardFaults));
         finishImageTables();
         phase(BuildPhase::Bda);
+        frameTiming.Mark("bda");
         if (_set != VK_NULL_HANDLE || fragment.set != VK_NULL_HANDLE) {
             // One update call for the whole set: the info arrays are sized up front so every write's
             // pointer into them stays valid until the call.
@@ -2684,7 +2688,9 @@ void ShaderResources::buildComplete() {
             dataPatches.push_back({static_cast<std::size_t>(allocation.dataAllocation), allocation.dataByte, allocation.adjustment});
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
+        frameTiming.Mark("descriptors");
         noteReusable();
+        frameTiming.Mark("proof");
         completed = true;
         if (BuildProfiled()) {
             timing.completeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageStart).count();
@@ -4977,6 +4983,10 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
 }
 
 void ShaderResources::PrecollectSurfaces() const {
+    if (auto* census = AgcDriver::ArchB::Recorder::CurrentDraw()) {
+        census->Count(AgcDriver::ArchB::Recorder::Metric::H3PrelockSurfaceRanges, describedRanges.size());
+        for (const auto& range : describedRanges) census->Count(AgcDriver::ArchB::Recorder::Metric::H3PrelockSurfaceBytes, range.bytes);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) {
         for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
@@ -6056,11 +6066,16 @@ std::size_t ShaderResources::DrawUploadLimit() {
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
     AgcDriver::ArchB::Recorder::Timer refreshTiming("Draw.BindingRefresh");
     auto* census = AgcDriver::ArchB::Recorder::CurrentDraw();
+    using M = AgcDriver::ArchB::Recorder::Metric;
     if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::BindingPreparations);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     guestMemory.InPlaceReads(reads);
+    if (census != nullptr) {
+        census->Count(M::H3BindingAllocations, allocations.size());
+        census->Count(M::H3BindingReadRanges, reads.size());
+    }
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
@@ -6072,16 +6087,24 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     bool stamped = false;
     const auto keep = [&](DrawBindings::Snapshot snapshot) {
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
+        snapshot.allocation = selected.back();
         result->snapshots.push_back(std::move(snapshot));
     };
+    refreshTiming.Mark("setup");
     for (std::size_t index = 0; index < allocations.size(); ++index) {
+        AgcDriver::ArchB::Recorder::Timer snapshotTiming("Draw.Snapshot");
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             constexpr std::size_t MovedWordBufferSlots = 8;
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && std::ranges::equal(entry.words, override->words); });
             std::shared_ptr<Buffer> buffer;
+            if (census != nullptr) {
+                census->Count(M::H3SnapshotWordRanges);
+                census->Count(M::H3SnapshotWordBytes, override->size);
+            }
             if (held != movedWordBuffers.end()) {
+                if (census != nullptr) census->Count(M::H3SnapshotWordReused);
                 buffer = held->buffer;
             } else {
                 buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -6096,6 +6119,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             }
             selected.push_back(index);
             keep({0, std::move(buffer), 0, override->size});
+            snapshotTiming.Mark("words");
             continue;
         }
         std::uint64_t address = item.address;
@@ -6104,13 +6128,28 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             address = override->address;
             size = override->size;
         } else {
-            if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+            if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) {
+                snapshotTiming.Mark("eligibility");
+                continue;
+            }
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+            if (census != nullptr && direct) census->Count(M::H3SnapshotPendingQueries);
+            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) {
+                snapshotTiming.Mark("eligibility");
+                continue;
+            }
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) {
+            snapshotTiming.Mark("eligibility");
+            continue;
+        }
+        snapshotTiming.Mark("eligibility");
+        if (census != nullptr) {
+            census->Count(M::H3SnapshotGuestRanges);
+            census->Count(M::H3SnapshotMovedRanges, override != moved.end());
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         if (!stamped) {
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
@@ -6118,6 +6157,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         VkDeviceSize offset = 0;
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
+        if (census != nullptr && buffer != nullptr) census->Count(M::H3SnapshotUnwrittenHits);
+        snapshotTiming.Mark("unwritten");
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
         if (verifySnapshots && buffer != nullptr) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
@@ -6131,19 +6172,27 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
+                if (census != nullptr) census->Count(M::H3SnapshotUploads);
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
                 if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::SnapshotCopiedBytes, bytes);
                 buffer = std::move(slice.buffer);
                 offset = slice.offset;
+                snapshotTiming.Mark("copy");
             } else {
+                if (census != nullptr) census->Count(M::H3SnapshotCollects);
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
+                snapshotTiming.Mark("collect");
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
+                if (census != nullptr && buffer != nullptr) census->Count(M::H3SnapshotReusableHits);
+                snapshotTiming.Mark("lookup");
                 if (buffer == nullptr) {
+                    if (census != nullptr) census->Count(M::H3SnapshotAllocations);
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                     if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::SnapshotCopiedBytes, bytes);
                     recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                    snapshotTiming.Mark("copy");
                 }
             }
             if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
@@ -6153,9 +6202,22 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         keep({begin, std::move(buffer), offset, bytes});
         totalSnapshotBytes += bytes;
         if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::SnapshotBytes, bytes);
+        snapshotTiming.Mark("keep");
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
+    refreshTiming.Mark("selection");
     if (selected.empty()) return {};
+    if (census != nullptr) {
+        const auto previous = censusDrawBindings.lock();
+        if (previous != nullptr) {
+            census->Count(M::H3BindingsPrevious);
+            const bool same = std::ranges::equal(previous->snapshots, result->snapshots, [](const auto& a, const auto& b) {
+                return a.allocation == b.allocation && a.address == b.address && a.buffer == b.buffer && a.offset == b.offset && a.bytes == b.bytes;
+            });
+            census->Count(same ? M::H3BindingsSame : M::H3BindingsChanged);
+        } else census->Count(M::H3BindingsExpired);
+        censusDrawBindings = result;
+    }
     refreshTiming.Finish();
     AgcDriver::ArchB::Recorder::Timer descriptorTiming("Draw.Descriptors");
     if (census != nullptr) census->Count(AgcDriver::ArchB::Recorder::Metric::BindingRewrites);
