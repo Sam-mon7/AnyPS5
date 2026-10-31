@@ -91,6 +91,7 @@ using DrawDataCandidates = std::vector<std::vector<DrawDataCandidate>>;
 
 struct StageDataHit {
     bool feedbackHit = false;
+    bool bufferBaseHit = false;
     std::vector<std::uint32_t> words;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
 };

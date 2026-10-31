@@ -262,6 +262,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawProgramTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCacheStatistics.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/BufferBaseRefresh.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawDecode.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawLookup.cpp
@@ -3851,6 +3852,18 @@ if(BUILD_TESTING)
             set_tests_properties(${h4Test} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    add_test(NAME agc_archb_fix_m4_buffer_base_proof COMMAND agc_driver_draw_cache_reuse_tests --buffer-base-proof)
+    add_test(NAME agc_archb_fix_m4_buffer_base_path COMMAND agc_driver_draw_cache_reuse_tests --buffer-base)
+    add_test(NAME agc_archb_fix_m4_buffer_base_verify COMMAND agc_driver_draw_cache_reuse_tests --buffer-base)
+    add_test(NAME agc_archb_fix_m4_buffer_base_indirect COMMAND agc_driver_draw_cache_reuse_tests --buffer-base-indirect)
+    add_test(NAME agc_archb_fix_m4_buffer_base_indirect_verify COMMAND agc_driver_draw_cache_reuse_tests --buffer-base-indirect)
+    add_test(NAME agc_archb_fix_m4_buffer_base_no_recorder COMMAND agc_driver_draw_cache_reuse_tests --buffer-base-no-recorder)
+    set_tests_properties(agc_archb_fix_m4_buffer_base_proof agc_archb_fix_m4_buffer_base_path agc_archb_fix_m4_buffer_base_verify agc_archb_fix_m4_buffer_base_indirect agc_archb_fix_m4_buffer_base_indirect_verify agc_archb_fix_m4_buffer_base_no_recorder PROPERTIES TIMEOUT 30)
+    set_tests_properties(agc_archb_fix_m4_buffer_base_path agc_archb_fix_m4_buffer_base_verify agc_archb_fix_m4_buffer_base_indirect agc_archb_fix_m4_buffer_base_indirect_verify agc_archb_fix_m4_buffer_base_no_recorder PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_archb_fix_m4_buffer_base_verify agc_archb_fix_m4_buffer_base_indirect_verify PROPERTIES ENVIRONMENT "APS5_VERIFY_DRAW_DATA_HITS=1")
+    if(WIN32)
+        set_tests_properties(agc_archb_fix_m4_buffer_base_proof agc_archb_fix_m4_buffer_base_path agc_archb_fix_m4_buffer_base_verify agc_archb_fix_m4_buffer_base_indirect agc_archb_fix_m4_buffer_base_indirect_verify agc_archb_fix_m4_buffer_base_no_recorder PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_draw_cache_reuse_off COMMAND agc_driver_draw_cache_reuse_tests)
     set_tests_properties(agc_driver_draw_cache_reuse_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_driver_draw_cache_reuse_verify COMMAND agc_driver_draw_cache_reuse_tests)
