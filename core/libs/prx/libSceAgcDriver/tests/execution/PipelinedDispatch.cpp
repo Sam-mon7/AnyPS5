@@ -130,18 +130,23 @@ void Submit(std::vector<std::uint32_t>& words) {
 }
 
 int main() {
+    // APS5_ARCHB_PIPE_Q0_COMMITTER=1 from the test environment pipelines queue 0 through the runtime
+    // switch instead (APS5_PIPELINED_DRAWS, when set, decides alone).
+    const char* pipeSwitch = std::getenv("APS5_ARCHB_PIPE_Q0_COMMITTER");
+    if (pipeSwitch == nullptr || pipeSwitch[0] != '1') {
 #ifdef _WIN32
-    _putenv_s("APS5_PIPELINED_DRAWS", "1");
+        _putenv_s("APS5_PIPELINED_DRAWS", "1");
 #else
-    setenv("APS5_PIPELINED_DRAWS", "1", 1);
+        setenv("APS5_PIPELINED_DRAWS", "1", 1);
 #endif
+    }
     try {
         {
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
         }
         const char* dispatchSwitch = std::getenv("APS5_PIPELINE_DISPATCH");
-        const bool pipelinedDispatch = dispatchSwitch != nullptr && dispatchSwitch[0] != '\0' && dispatchSwitch[0] != '0';
+        const bool pipelinedDispatch = (dispatchSwitch != nullptr && dispatchSwitch[0] != '\0' && dispatchSwitch[0] != '0') || (pipeSwitch != nullptr && pipeSwitch[0] == '1');
 
         Shader shader{};
         shader.file_header = 0x34333231;

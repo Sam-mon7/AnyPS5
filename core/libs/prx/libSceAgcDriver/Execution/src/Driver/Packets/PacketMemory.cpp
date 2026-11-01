@@ -320,7 +320,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
                 storeBufferFill(queue, fillAddress, fillBytes, {pattern, pattern, pattern, pattern}, localDevice, false, false);
                 ++dmaFills;
             }
-        }, {{fillAddress, fillAddress + fillBytes}});
+        }, {{fillAddress, fillAddress + fillBytes}}, 0, {}, {}, false, DrawPipeline::ItemKind::Dma);
         return true;
     }
     if (source == 2) {
@@ -340,7 +340,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
                 Graphics::NoteColorMetadataFill(fillAddress, fillBytes, pattern);
             }
             commitDmaStore(queue, address, bytes);
-        }, {{address, address + size}});
+        }, {{address, address + size}}, 0, {}, {}, false, DrawPipeline::ItemKind::Dma);
         return true;
     }
     if (Pm4::DmaSource(packet) == 0 || Pm4::DmaSource(packet) == 3) Graphics::RequireNoMultisampleTarget(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), packet[6] & 0x3ffffffu, "a DMA copy");
@@ -363,7 +363,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
         std::vector<std::byte> bytes(copy.bytes);
         GuestMemory::Read(copy.source, bytes, 1);
         commitDmaStore(queue, copy.destination, bytes);
-    }, {{copy->destination, copy->destination + copy->bytes}}, 0, {}, {{copy->source, copy->source + copy->bytes}});
+    }, {{copy->destination, copy->destination + copy->bytes}}, 0, {}, {{copy->source, copy->source + copy->bytes}}, false, DrawPipeline::ItemKind::Dma);
     return true;
 }
 
@@ -432,7 +432,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
         DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
             GuestMemory::SetCurrentPacket(opcode, queue);
             commitLabel(queue, address, bytes, endOfPipeInterrupt);
-        }, std::move(writes), address, std::move(stored));
+        }, std::move(writes), address, std::move(stored), {}, false, DrawPipeline::ItemKind::Label);
     };
     if (queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
         DrawFinisher::Pending held;

@@ -91,11 +91,16 @@ Behind SubmitBehindBusyPipeline(const std::array<std::uint32_t, 7>& dma, std::ui
 }
 
 int main() {
+    // APS5_ARCHB_PIPE_Q0_COMMITTER=1 from the test environment pipelines queue 0 through the runtime
+    // switch instead (APS5_PIPELINED_DRAWS, when set, decides alone).
+    const char* pipeSwitch = std::getenv("APS5_ARCHB_PIPE_Q0_COMMITTER");
+    if (pipeSwitch == nullptr || pipeSwitch[0] != '1') {
 #ifdef _WIN32
-    _putenv_s("APS5_PIPELINED_DRAWS", "1");
+        _putenv_s("APS5_PIPELINED_DRAWS", "1");
 #else
-    setenv("APS5_PIPELINED_DRAWS", "1", 1);
+        setenv("APS5_PIPELINED_DRAWS", "1", 1);
 #endif
+    }
     try {
         for (std::size_t i = 0; i < Source.size(); ++i) Source[i] = static_cast<std::uint32_t>(i * 2654435761u);
         Destination.fill(0);

@@ -28,6 +28,7 @@ enum class Feature : std::uint8_t {
     FixBufferBaseRefresh,
     FixAllocChurn,
     FixComputeSyncUnlocked,
+    PipeQ0Committer,
     Count
 };
 
