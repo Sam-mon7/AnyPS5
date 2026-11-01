@@ -492,13 +492,33 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const bool count = busy && !arguments && indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4);
         if (!pipelinedIndirect || arguments || count) {
             auto cause = !pipelinedIndirect ? DrawPipeline::DrainCause::IndirectDisabled : arguments ? DrawPipeline::DrainCause::IndirectArgs : DrawPipeline::DrainCause::IndirectCount;
+            std::optional<DrawPipeline::Range> diagWriter;
             if (pipelinedIndirect && arguments) {
                 // Count-only: which queued item writes the arguments (the next drain cut depends on it).
-                if (const auto writer = pipeline.NewestWriter(indirect.arguments, argumentBytes)) {
+                DrawPipeline::Range overlapped{};
+                if (const auto writer = pipeline.NewestWriter(indirect.arguments, argumentBytes, &overlapped)) {
                     cause = *writer == DrawPipeline::ItemKind::Draw ? DrawPipeline::DrainCause::IndirectArgsDraw : *writer == DrawPipeline::ItemKind::Dispatch ? DrawPipeline::DrainCause::IndirectArgsDispatch : *writer == DrawPipeline::ItemKind::Label ? DrawPipeline::DrainCause::IndirectArgsLabel : DrawPipeline::DrainCause::IndirectArgsOther;
+                    if (*writer == DrawPipeline::ItemKind::Draw && PipeWriteDiag()) diagWriter = overlapped;
                 }
             }
+            // APS5_PIPE_WRITE_DIAG: the arguments as the CPU sees them before the queued writer commits
+            // and after it committed and its GPU work was flushed (the reads wait for the GPU).
+            std::vector<std::byte> diagBefore;
+            const auto readArguments = [&] {
+                std::vector<std::byte> bytes(argumentBytes);
+                try {
+                    GuestMemory::Read(indirect.arguments, bytes, 4);
+                } catch (const std::exception&) {
+                    bytes.clear();
+                }
+                return bytes;
+            };
+            if (diagWriter) diagBefore = readArguments();
             pipeline.Drain(DrawPipeline::DrainReason::Indirect, 0x100, cause);
+            if (diagWriter) {
+                const auto after = readArguments();
+                NoteIndirectWriterOverlap(indirect.arguments, argumentBytes, *diagWriter, diagBefore.empty() || after.empty() ? std::optional<bool>{} : std::optional<bool>{diagBefore != after});
+            }
         }
     }
     auto& traceIndirect = tail.traceIndirect;
@@ -1476,6 +1496,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             if (pipelined && pipelinedIndirect && record == lastDrawable && !gpuLock.owns_lock() && deferredLabels().labels.empty()) {
                 phaseTiming.Phase(DrawRowVectors);
                 auto writes = drawWriteRanges(graphics, stages);
+                if (PipeWriteDiag()) NoteDrawWriteTags(graphics, stages);
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = tail.packetOpcode;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
@@ -1528,6 +1549,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty())) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
+        if (PipeWriteDiag()) NoteDrawWriteTags(graphics, stages);
         const auto commitQueue = submission.queue;
         const auto commitPacket = tail.packetOpcode;
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);

@@ -116,8 +116,9 @@ public:
     bool Busy() const;
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
-    // The kind of the newest queued item whose writes overlap the range (for drain causes only).
-    std::optional<ItemKind> NewestWriter(std::uint64_t address, std::size_t bytes);
+    // The kind of the newest queued item whose writes overlap the range (for drain causes only), and
+    // its first overlapping write range (diagnostics).
+    std::optional<ItemKind> NewestWriter(std::uint64_t address, std::size_t bytes, Range* overlapped = nullptr);
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     Watch WatchWrites();
     bool WrittenSince(const Watch& watch, const std::vector<Range>& reads);
