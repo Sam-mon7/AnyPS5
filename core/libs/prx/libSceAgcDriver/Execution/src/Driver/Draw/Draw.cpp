@@ -145,6 +145,8 @@ struct DrawTail {
     bool indirectGpuArgs = false;
     // APS5_ARCHB_PIPE_NARROW_DRAW_WRITES, sampled once per draw (the finisher takes it from the tail).
     bool narrowDrawWrites = false;
+    // APS5_ARCHB_PIPE_NARROW_SLICED_DEPTH, sampled once per draw.
+    bool narrowSlicedDepth = false;
     bool feedbackMask = false;
     bool pipelineStateReuse = false;
     bool memoVirtualQuery = false;
@@ -434,9 +436,14 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
 // The write set a queued draw announces; APS5_ARCHB_PIPE_NARROW_DRAW_WRITES bounds programs on the BDA
 // ABI without BDA writes and HTILE depth targets (counted when the bounded set has one of them, which
 // without the switch would have made it unbounded).
+// APS5_ARCHB_PIPE_NARROW_SLICED_DEPTH bounds single-sample depth targets whose view names slices
+// (counted when the bounded set has one).
 std::vector<DrawPipeline::Range> queuedDrawWrites(const DrawTail& tail, const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
-    auto writes = DrawWriteRanges(graphics, stages, ExactDrawWrites(), tail.narrowDrawWrites);
-    if (tail.narrowDrawWrites && !UnboundedWrites(writes) && ((graphics.depth && graphics.depth->htileAddress != 0) || std::any_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program != nullptr && stage.program->bdaAbiVersion != 0; }))) DrawPipeline::CountNarrowedDrawWrites();
+    auto writes = DrawWriteRanges(graphics, stages, ExactDrawWrites(), tail.narrowDrawWrites, tail.narrowSlicedDepth);
+    if ((tail.narrowDrawWrites || tail.narrowSlicedDepth) && !UnboundedWrites(writes)) {
+        if (tail.narrowDrawWrites && ((graphics.depth && graphics.depth->htileAddress != 0) || std::any_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program != nullptr && stage.program->bdaAbiVersion != 0; }))) DrawPipeline::CountNarrowedDrawWrites();
+        if (tail.narrowSlicedDepth && graphics.depth && (graphics.depth->firstSlice != 0 || graphics.depth->lastSlice != 0)) DrawPipeline::CountNarrowedSlicedDepth();
+    }
     return writes;
 }
 
@@ -507,6 +514,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.pipelined = DrawPipeline::Active();
     const bool pipelined = tail.pipelined;
     tail.narrowDrawWrites = pipelined && ArchB::Switches::Enabled(ArchB::Feature::PipeNarrowDrawWrites);
+    tail.narrowSlicedDepth = pipelined && ArchB::Switches::Enabled(ArchB::Feature::PipeNarrowSlicedDepth);
     static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
     if (pipelined && drawParameters.indirect) {
         const auto& indirect = *drawParameters.indirect;

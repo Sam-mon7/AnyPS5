@@ -2,8 +2,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -323,6 +326,64 @@ void IndirectArgumentsWrittenByAQueuedDraw(bool gpuSide) {
     std::cout << what << (drains == 0 ? " queued behind it" : " drained") << " and drew the written record (path" << pathNames << ")\n";
 }
 
+// APS5_ARCHB_PIPE_NARROW_SLICED_DEPTH. A queued draw item announces the write set DrawWriteRanges gives a
+// single-sample depth target whose view names slices 1..3 (as queuedDrawWrites does), placed in an arena
+// so that its first slice ends exactly at an indirect draw's records (`inside`: 16 bytes later, over
+// them). The draw reads its records on the CPU (a base vertex location), so an overlap must drain before
+// the read, with or without PIPE_INDIRECT_GPU_ARGS. With the cut, the records just outside the bounded
+// slice keep the pipeline (the draw queues behind the held writer) and the records inside drain; without
+// it the write set is unbounded and both drain.
+alignas(256) std::array<std::byte, 2 * 65536> SlicedArena{};
+alignas(256) std::array<std::byte, 1024> SlicedMemory{};
+
+void SlicedDepthWriterBeforeIndirectDraw(bool inside) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    const bool cut = Switches::Enabled(Feature::PipeNarrowSlicedDepth);
+    auto* records = reinterpret_cast<std::uint32_t*>(SlicedArena.data() + 65536);
+    std::copy(Records.begin(), Records.end(), records);
+    AgcDriver::Graphics::State state{};
+    state.depth = AgcDriver::Graphics::DepthTarget{};
+    state.depth->extent = {64, 64};
+    state.depth->format = VK_FORMAT_D32_SFLOAT;
+    state.depth->samples = 1;
+    state.depth->firstSlice = 1;
+    state.depth->lastSlice = 3;
+    const auto plane = AgcDriver::Graphics::DepthSliceBytes(state.depth->extent, 4u);
+    Require(plane == 65536, "the test depth slice is not one 64 KiB block");
+    state.depth->address = reinterpret_cast<std::uintptr_t>(SlicedArena.data()) + (inside ? 16u : 0u);
+    auto writes = AgcDriver::DriverDetail::DrawWriteRanges(state, {}, true, Switches::Enabled(Feature::PipeNarrowDrawWrites), cut);
+    Require(cut == !AgcDriver::DriverDetail::UnboundedWrites(writes), "the sliced depth writer's set is " + std::string(cut ? "unbounded with" : "bounded without") + " the cut");
+    SlicedMemory.fill(Kept);
+    std::vector<std::uint32_t> commands;
+    AppendState(commands);
+    AppendRecords(commands, records);
+    AppendTarget(commands, SlicedMemory, Clipped);
+    AppendIndirect(commands);
+    Blocker writer;
+    DrawPipeline::Queue0().Enqueue([state = writer.state] {
+        while (!state->release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        { std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex()); }
+        state->done = true;
+    }, std::move(writes), 0, {}, {}, true, DrawPipeline::ItemKind::Draw);
+    const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(0x100);
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the indirect draw submission failed");
+    const auto start = std::chrono::steady_clock::now();
+    while (DrawPipeline::DrainRequestsByOpcode(0x100) == drainsBefore && DrawPipeline::Queue0().Outstanding() < 2 && std::chrono::steady_clock::now() - start < std::chrono::seconds(10)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto queued = DrawPipeline::Queue0().Outstanding();
+    writer.Release();
+    Finish();
+    writer.Join();
+    Flush(SlicedMemory);
+    const auto drains = DrawPipeline::DrainRequestsByOpcode(0x100) - drainsBefore;
+    const std::string what = std::string("the indirect draw whose records are ") + (inside ? "inside" : "just past") + " a queued sliced depth writer's first slice";
+    if (cut && !inside) Require(drains == 0 && queued >= 2, what + " drained " + std::to_string(drains) + " times (" + std::to_string(queued) + " items queued), expected it to queue behind the writer");
+    else Require(drains >= 1, what + " did not drain " + (cut ? "with" : "without") + " the cut");
+    SameAsDirect(SlicedMemory, what);
+    std::cout << what << (drains == 0 ? " queued behind it" : " drained") << '\n';
+}
+
 void IndirectDrawWaitsForItsQueuedRecordWrite() {
     WrittenMemory.fill(Kept);
     LateRecords = {0, 1, 0, 0};
@@ -369,6 +430,8 @@ int main(int argc, char** argv) {
         DrawDirectReference();
         if (mode == "--gpu-args-written") IndirectArgumentsWrittenByAQueuedDraw(true);
         else if (mode == "--cpu-args-written") IndirectArgumentsWrittenByAQueuedDraw(false);
+        else if (mode == "--sliced-depth-outside") SlicedDepthWriterBeforeIndirectDraw(false);
+        else if (mode == "--sliced-depth-inside") SlicedDepthWriterBeforeIndirectDraw(true);
         else if (mode.empty()) {
             IndirectDrawsQueueBehindTheCommitter();
             IndirectDrawWaitsForItsQueuedRecordWrite();

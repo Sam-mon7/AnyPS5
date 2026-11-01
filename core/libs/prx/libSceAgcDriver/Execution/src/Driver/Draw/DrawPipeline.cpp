@@ -44,6 +44,7 @@ struct PipeCounters {
     std::atomic<std::uint64_t> keptIndirectRegs{0};
     std::atomic<std::uint64_t> keptIndirectArguments{0};
     std::atomic<std::uint64_t> narrowedDrawWrites{0};
+    std::atomic<std::uint64_t> narrowedSlicedDepth{0};
     std::atomic<std::uint64_t> lockedDrains{0};
     std::atomic<std::uint64_t> fullWaits{0};
     std::atomic<std::uint64_t> fullOvercommits{0};
@@ -368,6 +369,7 @@ void DrawPipeline::RegisterCounters() {
         ArchB::Recorder::RegisterCounter("pipe_keep_indirect_regs", counters.keptIndirectRegs);
         ArchB::Recorder::RegisterCounter("pipe_indirect_gpu_args_kept", counters.keptIndirectArguments);
         ArchB::Recorder::RegisterCounter("pipe_draw_writes_narrowed", counters.narrowedDrawWrites);
+        ArchB::Recorder::RegisterCounter("pipe_sliced_depth_narrowed", counters.narrowedSlicedDepth);
         ArchB::Recorder::RegisterCounter("pipe_drains_locked", counters.lockedDrains);
         ArchB::Recorder::RegisterCounter("pipe_full_waits", counters.fullWaits);
         ArchB::Recorder::RegisterCounter("pipe_full_overcommits", counters.fullOvercommits);
@@ -394,6 +396,10 @@ std::uint64_t DrawPipeline::KeptIndirectArguments() {
 
 void DrawPipeline::CountNarrowedDrawWrites() {
     pipeCounters().narrowedDrawWrites.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawPipeline::CountNarrowedSlicedDepth() {
+    pipeCounters().narrowedSlicedDepth.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t DrawPipeline::LockedDrains() {
@@ -534,6 +540,8 @@ std::string DrawPipeline::CumulativeText() {
     std::snprintf(item, sizeof(item), "; %llu register packets kept the pipeline", static_cast<unsigned long long>(counters.keptIndirectRegs.load(std::memory_order_relaxed)));
     text += item;
     std::snprintf(item, sizeof(item), "; %llu indirect draws kept it over their arguments; %llu draw write sets narrowed", static_cast<unsigned long long>(counters.keptIndirectArguments.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowedDrawWrites.load(std::memory_order_relaxed)));
+    text += item;
+    std::snprintf(item, sizeof(item), "; %llu sliced depth write sets narrowed", static_cast<unsigned long long>(counters.narrowedSlicedDepth.load(std::memory_order_relaxed)));
     text += item;
     text += DrawWriteDiagText();
     text += DrainDiagText();

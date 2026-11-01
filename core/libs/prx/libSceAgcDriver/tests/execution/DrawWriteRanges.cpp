@@ -201,10 +201,50 @@ void NarrowedWrites() {
     Require(UnboundedWrites(DrawWriteRanges(state, {}, true, true)), "a sliced HTILE depth target was bounded");
 }
 
+// APS5_ARCHB_PIPE_NARROW_SLICED_DEPTH: a single-sample depth target whose view names slices is bounded by
+// its first slice (decodeDepthPlane moved its plane, stencil and HTILE addresses there; the driver renders
+// and stores that slice only), exactly as a slice-0 view, never wider; multisampled targets, the estimate
+// mode and HTILE without PIPE_NARROW_DRAW_WRITES stay unbounded.
+void SlicedDepthWrites() {
+    using namespace AgcDriver::DriverDetail;
+    constexpr std::uint64_t base = 0x100000000ull;
+    constexpr auto unbounded = std::numeric_limits<std::uint64_t>::max();
+    AgcDriver::Graphics::State state{};
+    state.depth = AgcDriver::Graphics::DepthTarget{};
+    state.depth->address = base;
+    state.depth->stencilAddress = base + 0x10000000;
+    state.depth->extent = {1024, 1024};
+    state.depth->format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    state.depth->samples = 1;
+    state.depth->firstSlice = 3;
+    state.depth->lastSlice = 5;
+    const auto plane = AgcDriver::Graphics::DepthSliceBytes(state.depth->extent, 4u);
+    const auto stencil = AgcDriver::Graphics::DepthSliceBytes(state.depth->extent, 1u);
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true, true)), "a sliced depth target was bounded without the switch");
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, false, true, true)), "a sliced depth target was bounded by the estimate");
+    const auto sliced = DrawWriteRanges(state, {}, true, false, true);
+    Require(!UnboundedWrites(sliced) && Contains(sliced, base, base + plane) && Contains(sliced, state.depth->stencilAddress, state.depth->stencilAddress + stencil), "a sliced depth target omitted its first slice's planes");
+    Require(!Touches(sliced, base + plane, state.depth->stencilAddress) && !Touches(sliced, state.depth->stencilAddress + stencil, unbounded) && !Touches(sliced, 0, base), "a sliced depth target was bounded wider than one slice");
+    state.depth->firstSlice = 0;
+    state.depth->lastSlice = 0;
+    Require(DrawWriteRanges(state, {}, true) == sliced, "a sliced depth target's set differs from the slice-0 view's at the same addresses");
+    state.depth->firstSlice = 7;
+    state.depth->lastSlice = 2;
+    Require(DrawWriteRanges(state, {}, true, false, true) == sliced, "a depth view whose last slice is below its first was bounded differently");
+    state.depth->htileAddress = base + 0x40000000;
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true, false, true)), "a sliced HTILE depth target was bounded without PIPE_NARROW_DRAW_WRITES");
+    const auto htile = AgcDriver::Graphics::HtileMetadataBytes(state.depth->extent);
+    const auto both = DrawWriteRanges(state, {}, true, true, true);
+    Require(!UnboundedWrites(both) && Contains(both, state.depth->htileAddress, state.depth->htileAddress + htile) && !Touches(both, state.depth->htileAddress + htile, unbounded), "a sliced HTILE depth target was not bounded by one slice's HTILE metadata");
+    state.depth->samples = 4;
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true, true, true)), "a multisampled sliced depth target was bounded");
+}
+
 int main() {
     try {
         ConservativeWrites();
         NarrowedWrites();
+        SlicedDepthWrites();
         using AgcDriver::DriverDetail::DrawWriteRanges;
         constexpr std::uint64_t written = 0x100000000ull;
         constexpr std::uint64_t readOnly = 0x200000000ull;
