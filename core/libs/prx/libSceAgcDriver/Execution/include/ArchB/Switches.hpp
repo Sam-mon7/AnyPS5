@@ -38,6 +38,7 @@ enum class Feature : std::uint8_t {
     PipeIndirectGpuArgs,
     PipeNarrowDrawWrites,
     PipeNarrowSlicedDepth,
+    PipeNarrowDispatchWrites,
     Count
 };
 
