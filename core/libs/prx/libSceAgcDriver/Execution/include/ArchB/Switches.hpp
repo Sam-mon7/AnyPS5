@@ -34,6 +34,7 @@ enum class Feature : std::uint8_t {
     GenLockfree,
     GenDrawValidation,
     PipeQ0Committer,
+    PipeKeepIndirectRegs,
     Count
 };
 

@@ -7,6 +7,9 @@
 //   --sample-env  APS5_PIPELINED_DRAWS=0 with the switch on: the variable decides alone.
 //   --transition  a runtime toggle off drains what pipelined submissions left queued before the next
 //                 submission runs unpipelined.
+//   --keep-registers   (with APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS=1) a SET_CONTEXT_REG_INDIRECT whose table a
+//                 queued item writes keeps the pipeline: its valid list was read at submission.
+//   --registers-drain  (without it) the same packet drains, as before the cut.
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -190,6 +193,43 @@ void Transition() {
     std::cout << "transition drained\n";
 }
 
+void Registers(bool keep) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    check(Switches::Enabled(Feature::PipeQ0Committer) && Switches::Enabled(Feature::PipeKeepIndirectRegs) == keep, "unexpected switch environment");
+    // One valid offset/value pair (CB_TARGET_MASK); a held item claims to write the table.
+    alignas(256) static std::array<std::uint32_t, 2> table{0x8eu, 0xfu};
+    const auto address = reinterpret_cast<std::uintptr_t>(table.data());
+    auto release = std::make_shared<std::atomic<bool>>(false);
+    struct Release {
+        std::shared_ptr<std::atomic<bool>> flag;
+        ~Release() { flag->store(true, std::memory_order_release); }
+    } releaseAtExit{release};
+    DrawPipeline::Queue0().Enqueue([release] {
+        while (!release->load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }, {{address, address + sizeof(table)}});
+    const auto before = DrawPipeline::DrainRequestsByOpcode(0x9f);
+    std::vector<std::uint32_t> words{0xc0039f00u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0x80000000u, 1u};
+    std::thread releaser([&] {
+        // Kept: the submission ends with its completion queued behind the held item. Drained: the
+        // packet asks for the drain, which waits for the held item.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (DrawPipeline::DrainRequestsByOpcode(0x9f) != before) break;
+            if (keep && DrawPipeline::Queue0().Outstanding() >= 2) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        release->store(true, std::memory_order_release);
+    });
+    Submit(words);
+    releaser.join();
+    AgcDriverWaitIdle_nid_postfix();
+    const auto requests = DrawPipeline::DrainRequestsByOpcode(0x9f) - before;
+    if (keep) check(requests == 0, "SET_CONTEXT_REG_INDIRECT drained although its list was read at submission");
+    else check(requests == 1, "SET_CONTEXT_REG_INDIRECT over queued writes did not drain without the cut");
+    std::cout << (keep ? "register table kept the pipeline" : "register table drained the pipeline") << '\n';
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -198,6 +238,8 @@ int main(int argc, char** argv) {
         if (mode.empty() || mode == "--locked") LockedWaits();
         else if (mode.starts_with("--sample")) Sample(mode);
         else if (mode == "--transition") Transition();
+        else if (mode == "--keep-registers") Registers(true);
+        else if (mode == "--registers-drain") Registers(false);
         else throw std::runtime_error("unknown mode");
         return 0;
     } catch (const std::exception& error) {
