@@ -33,6 +33,8 @@ constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKin
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> CommitCounterNames{"pipe_commits_other", "pipe_commits_draw", "pipe_commits_dispatch", "pipe_commits_label", "pipe_commits_dma", "pipe_commits_fill"};
 // Depth when APS5_ARCHB_PIPE_Q0_COMMITTER pipelines queue 0 (APS5_PIPELINED_DRAWS=1 selects the same).
 constexpr std::size_t SwitchDepth = 8;
+// PIPE_DEEP_QUEUE: queue 0 runs further ahead of the committer (A0-A2 profiles: ~315 full waits per frame at 8).
+constexpr std::size_t DeepSwitchDepth = 32;
 
 // Cumulative pipe_* counts (never reset; the recorder takes per-window differences). The _ns sums
 // also go to the recorder as pipe_*_ms / pipe_enqueue_ns at the measuring site.
@@ -353,7 +355,8 @@ bool DrawPipeline::SampleQueue0(bool& viaSwitch) {
 
 std::size_t DrawPipeline::Capacity() {
     const auto depth = Depth();
-    return depth != 0 ? depth : SwitchDepth;
+    if (depth != 0) return depth;
+    return ArchB::Switches::Enabled(ArchB::Feature::PipeDeepQueue) ? DeepSwitchDepth : SwitchDepth;
 }
 
 bool& DrawPipeline::DispatchItems() {
