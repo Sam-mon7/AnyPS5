@@ -484,10 +484,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     bool pipelined = false;
     if (readsClear) {
         if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
+            // APS5_ARCHB_PIPE_NARROW_DISPATCH_WRITES (sampled per dispatch): a program on the BDA ABI
+            // without BDA writes is bounded by its written bindings, as for draws (DispatchWriteRanges).
+            const bool narrowWrites = ArchB::Switches::Enabled(ArchB::Feature::PipeNarrowDispatchWrites);
             bool bounded = false;
-            itemWrites = DispatchWriteRanges(*compiledResult, bounded);
+            itemWrites = DispatchWriteRanges(*compiledResult, bounded, narrowWrites);
             pipelined = bounded;
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
+            else if (narrowWrites && compiledResult->bdaAbiVersion != 0) DrawPipeline::CountNarrowedDispatchWrites();
             if (!bounded && PipeDrainDiag()) NoteUnboundedDispatchWrites(*compiledResult, true);
             fallbackCause = DrawPipeline::DrainCause::DispatchWrites;
         } else {

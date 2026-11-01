@@ -240,11 +240,49 @@ void SlicedDepthWrites() {
     Require(UnboundedWrites(DrawWriteRanges(state, {}, true, true, true)), "a multisampled sliced depth target was bounded");
 }
 
+// APS5_ARCHB_PIPE_NARROW_DISPATCH_WRITES: a dispatch program on the BDA ABI without BDA writes is bounded
+// by its written bindings; one with BDA writes or a GDS binding stays unbounded.
+void NarrowedDispatchWrites() {
+    using namespace AgcDriver::DriverDetail;
+    using Role = ShaderRecompiler::DescriptorRole;
+    constexpr std::uint64_t base = 0x100000000ull;
+    constexpr auto unbounded = std::numeric_limits<std::uint64_t>::max();
+    ShaderRecompiler::RecompileResult program;
+    program.bdaAbiVersion = 1;
+    program.bdaWrites = false;
+    ShaderRecompiler::DescriptorBinding table, fault, buffer;
+    table.role = Role::BdaPagetable;
+    table.count = 1;
+    fault.role = Role::FaultBuffer;
+    fault.count = 1;
+    buffer.role = Role::GuestBuffers;
+    buffer.count = 1;
+    buffer.guestDescriptor = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u), 256, 0x31016facu};
+    { ShaderRecompiler::DescriptorFlags flags; flags.bufferWritten = {true}; buffer.SetFlags(flags); }
+    program.bindings = {table, fault, buffer};
+    bool bounded = true;
+    static_cast<void>(DispatchWriteRanges(program, bounded));
+    Require(!bounded, "a BDA dispatch was bounded without the switch");
+    const auto narrowed = DispatchWriteRanges(program, bounded, true);
+    Require(bounded && Contains(narrowed, base, base + 256) && !Touches(narrowed, base + 256, unbounded) && !Touches(narrowed, 0, base), "a BDA dispatch without BDA writes was not bounded by its written buffer");
+    program.bdaWrites = true;
+    static_cast<void>(DispatchWriteRanges(program, bounded, true));
+    Require(!bounded, "a BDA dispatch with BDA writes was bounded");
+    program.bdaWrites = false;
+    ShaderRecompiler::DescriptorBinding gds;
+    gds.role = Role::Gds;
+    gds.count = 1;
+    program.bindings.push_back(gds);
+    static_cast<void>(DispatchWriteRanges(program, bounded, true));
+    Require(!bounded, "a BDA dispatch with a GDS binding was bounded");
+}
+
 int main() {
     try {
         ConservativeWrites();
         NarrowedWrites();
         SlicedDepthWrites();
+        NarrowedDispatchWrites();
         using AgcDriver::DriverDetail::DrawWriteRanges;
         constexpr std::uint64_t written = 0x100000000ull;
         constexpr std::uint64_t readOnly = 0x200000000ull;

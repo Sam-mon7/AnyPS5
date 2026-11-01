@@ -104,6 +104,9 @@ public:
     // APS5_ARCHB_PIPE_NARROW_SLICED_DEPTH: a queued draw's write set is bounded although its single-sample
     // depth target's view names slices (pipe_sliced_depth_narrowed).
     static void CountNarrowedSlicedDepth();
+    // APS5_ARCHB_PIPE_NARROW_DISPATCH_WRITES: a queue-0 dispatch item was enqueued because its BDA program
+    // without BDA writes is bounded by its written bindings (pipe_dispatch_writes_narrowed).
+    static void CountNarrowedDispatchWrites();
     // One "[pipe] cumulative: ..." line (printed with the [draw] pipelined report and at shutdown).
     static std::string CumulativeText();
     // Fallback counts: drains requested while the calling thread held the GPU mutex (waited with the
