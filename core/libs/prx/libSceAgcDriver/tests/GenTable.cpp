@@ -520,6 +520,64 @@ void drawValidation() {
     Require(cleans.load() != 0 && others.load() != 0, "the draw-validation stress did not exercise both verdicts");
 }
 
+// Micro-benchmark (not a CTest; `agc_archb_gen_tests --bench`): the maintenance operations the
+// tracker performs per stamp and per walk, and the lock-free reads, in ns per call.
+void bench() {
+    auto& table = Global();
+    const auto measure = [](const char* name, std::uint64_t calls, auto&& body) {
+        const auto start = std::chrono::steady_clock::now();
+        for (std::uint64_t i = 0; i < calls; ++i) body(i);
+        const auto ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
+        std::printf("%-44s %10.1f ns/call\n", name, ns / static_cast<double>(calls));
+    };
+    const std::uint64_t at = Base + 0x300000000ull;
+    table.RecordSweep(at, at + 1024 * Block, table.Issue(), 1);
+    // A window walk stamps page by page: one event per page (the S1 shape) against one per run.
+    measure("Note per page (window walk, 1 page)", 1u << 20, [&](std::uint64_t i) {
+        const auto page = at + (i % 16384) * Page;
+        static_cast<void>(Note(Event::ImportWindow, page, page + Page, Data | Cpu, 1000 + i / 16384));
+    });
+    measure("Note per 16-page run (one block)", 1u << 16, [&](std::uint64_t i) {
+        const auto block = at + (i % 1024) * Block;
+        static_cast<void>(Note(Event::ImportWindow, block, block + Block, Data | Cpu, 2000000 + i / 1024));
+    });
+    measure("Note fresh generation, 1 block", 1u << 18, [&](std::uint64_t i) {
+        const auto block = at + (i % 1024) * Block;
+        static_cast<void>(Note(Event::DriverStore, block, block + 64, Data));
+    });
+    measure("RecordSweep 64 KiB (1 block)", 1u << 18, [&](std::uint64_t i) {
+        const auto block = at + (i % 1024) * Block;
+        table.RecordSweep(block, block + Block, 10000 + i, 1);
+    });
+    measure("RecordSweep 16 KiB (partial block)", 1u << 18, [&](std::uint64_t i) {
+        const auto block = at + (i % 1024) * Block;
+        table.RecordSweep(block, block + 4 * Page, 400000 + i, 1);
+    });
+    measure("RecordSweep 4 MiB (one coarse unit)", 1u << 14, [&](std::uint64_t i) {
+        const auto unit = at + (i % 16) * 64 * Block;
+        table.RecordSweep(unit, unit + 64 * Block, 800000 + i, 1);
+    });
+    measure("RecordSweep 2 MiB (half a unit)", 1u << 14, [&](std::uint64_t i) {
+        const auto unit = at + (i % 16) * 64 * Block;
+        table.RecordSweep(unit, unit + 32 * Block, 900000 + i, 1);
+    });
+    const auto since = table.Now();
+    measure("DataAtMost 1 block", 1u << 20, [&](std::uint64_t i) {
+        const auto block = at + (i % 1024) * Block;
+        static_cast<void>(table.DataAtMost(block, block + 256, since));
+    });
+    measure("DataAtMost 16 blocks", 1u << 18, [&](std::uint64_t i) {
+        const auto block = at + (i % 1000) * Block;
+        static_cast<void>(table.DataAtMost(block, block + 16 * Block, since));
+    });
+    const auto ticket = table.Issue();
+    table.RecordSweep(at, at + 1024 * Block, table.Issue(), 1);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    for (int r = 0; r < 8; ++r) runs.emplace_back(at + r * 3 * Block + 0x100, at + r * 3 * Block + 0x180);
+    measure("CheckRuns 8 runs (draw variant)", 1u << 18, [&](std::uint64_t) { static_cast<void>(CheckRuns(table, runs, table.Now(), ticket)); });
+    measure("Issue ticket", 1u << 20, [&](std::uint64_t) { static_cast<void>(Issue(TicketReason::Other)); });
+}
+
 // Shadow classification: the outcome table, and an injected decision that the table calls Clean
 // while the byte compare found a change is counted unsafe.
 void shadowClassify() {
@@ -575,6 +633,7 @@ int main(int argc, char** argv) {
         else if (mode == "--stress") stress();
         else if (mode == "--lockfree") lockfree();
         else if (mode == "--draw-validation") drawValidation();
+        else if (mode == "--bench") bench();
         else if (mode == "--shadow-classify") shadowClassify();
         else {
             std::cerr << "unknown mode\n";
