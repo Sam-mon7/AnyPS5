@@ -153,9 +153,20 @@ void Driver::execute(const Submission& submission) {
         }
         ~FlipHold() { Release(); }
     } flipHold{*this, submission.holdsFlip};
-    const bool pipelined = submission.queue == 0 && DrawPipeline::Depth() != 0;
+    // Sampled once per submission (APS5_PIPELINED_DRAWS, or the runtime APS5_ARCHB_PIPE_Q0_COMMITTER):
+    // the whole submission runs one way. The switch also selects dispatch items for queue 0.
+    bool pipeSwitch = false;
+    const bool pipelined = submission.queue == 0 && DrawPipeline::SampleQueue0(pipeSwitch);
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     DrawPipeline::Active() = pipelined;
+    DrawPipeline::DispatchItems() = pipelined && (pipelineDispatch() || pipeSwitch);
+    if (submission.queue == 0) {
+        DrawPipeline::RegisterCounters();
+        if (pipelined) DrawPipeline::CountSubmission();
+        // The switch turned off: commit what the pipelined submissions before this one left queued
+        // (their deferred completions included) before anything runs unpipelined.
+        else if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Transition);
+    }
     struct PipelineDrain {
         bool pipelined;
         ~PipelineDrain() {
@@ -467,7 +478,7 @@ void Driver::execute(const Submission& submission) {
             currentPacketOffset() = cursor;
             if (gateOpened()) {
                 gateOpened() = false;
-                if (!pipelineDispatch() || submission.queue != 0) {
+                if (!(pipelineDispatch() || DrawPipeline::DispatchItems()) || submission.queue != 0) {
                     if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
                 }
@@ -551,8 +562,7 @@ void Driver::execute(const Submission& submission) {
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     if (const auto localDevice = device.Load()) localDevice->SealPassWriteOnly();
                 };
-                if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Enqueue(seal, {});
-                else seal();
+                if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Enqueue(seal, {});                else seal();
             }
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {

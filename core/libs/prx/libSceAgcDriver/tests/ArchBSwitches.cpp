@@ -82,8 +82,10 @@ void toggleCase(const std::string& name) {
     const bool imageTable = name == "ImageTableSnapshot";
     const bool bitScanKeys = name == "ImageTableBitScanKeys";
     const bool bookkeeping = name == "WriteTrackingBookkeeping";
+    const bool pipeQ0 = name == "PipeQ0Committer";
     if (name == "VqMemo" || imageTable || bitScanKeys) setEnvironment(bitScanKeys ? "APS5_ARCHB_FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "APS5_ARCHB_FIX_VQ_MEMO", nullptr);
     if (bookkeeping) setEnvironment("APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING", nullptr);
+    if (pipeQ0) setEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", nullptr);
     if (name == "AllocChurn") setEnvironment("APS5_ARCHB_FIX_ALLOC_CHURN", nullptr);
     const bool genTable = name == "GenTable";
     // Switches that require GEN_TABLE (slice S1 GEN_SHADOW, S2 GEN_LOCKFREE): same contract.
@@ -108,9 +110,9 @@ void toggleCase(const std::string& name) {
             Switches::PollControl();
         }
     };
-    if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping) {
-        const auto feature = bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
-        const std::string token = bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
+    if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping || pipeQ0) {
+        const auto feature = pipeQ0 ? Feature::PipeQ0Committer : bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
+        const std::string token = pipeQ0 ? "PIPE_Q0_COMMITTER" : bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
         bool listed = false;
         for (const auto& entry : Switches::Table()) {
             if (entry.feature != feature) continue;

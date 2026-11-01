@@ -118,11 +118,13 @@ void expectEliminated(const std::string& what) {
 }
 
 int main() {
+    const char* pipeSwitch = std::getenv("APS5_ARCHB_PIPE_Q0_COMMITTER");
+    const bool environmentDepth = pipeSwitch == nullptr || pipeSwitch[0] != '1';
 #ifdef _WIN32
-    _putenv_s("APS5_PIPELINED_DRAWS", "1");
+    if (environmentDepth) _putenv_s("APS5_PIPELINED_DRAWS", "1");
     _putenv_s("APS5_DRAW_PIPELINE", "1");
 #else
-    setenv("APS5_PIPELINED_DRAWS", "1", 1);
+    if (environmentDepth) setenv("APS5_PIPELINED_DRAWS", "1", 1);
     setenv("APS5_DRAW_PIPELINE", "1", 1);
 #endif
     try {

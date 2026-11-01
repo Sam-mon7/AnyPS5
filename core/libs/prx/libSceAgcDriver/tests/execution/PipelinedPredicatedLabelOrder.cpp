@@ -27,11 +27,16 @@ void WriteData(std::vector<std::uint32_t>& words, const void* destination, std::
 }
 
 int main() {
+    // APS5_ARCHB_PIPE_Q0_COMMITTER=1 from the test environment pipelines queue 0 through the runtime
+    // switch instead (APS5_PIPELINED_DRAWS, when set, decides alone).
+    const char* pipeSwitch = std::getenv("APS5_ARCHB_PIPE_Q0_COMMITTER");
+    if (pipeSwitch == nullptr || pipeSwitch[0] != '1') {
 #ifdef _WIN32
-    _putenv_s("APS5_PIPELINED_DRAWS", "1");
+        _putenv_s("APS5_PIPELINED_DRAWS", "1");
 #else
-    setenv("APS5_PIPELINED_DRAWS", "1", 1);
+        setenv("APS5_PIPELINED_DRAWS", "1", 1);
 #endif
+    }
     try {
         Predicate = {1, 0, 0, 0};
         Target = {0, 0, 0, 0};

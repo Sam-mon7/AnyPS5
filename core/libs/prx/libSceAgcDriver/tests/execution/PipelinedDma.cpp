@@ -73,11 +73,16 @@ void ExpectNoDrain(std::uint32_t opcode, std::uint64_t before, const char* what)
 }
 
 int main() {
+    // APS5_ARCHB_PIPE_Q0_COMMITTER=1 from the test environment pipelines queue 0 through the runtime
+    // switch instead (APS5_PIPELINED_DRAWS, when set, decides alone).
+    const char* pipeSwitch = std::getenv("APS5_ARCHB_PIPE_Q0_COMMITTER");
+    if (pipeSwitch == nullptr || pipeSwitch[0] != '1') {
 #ifdef _WIN32
-    _putenv_s("APS5_PIPELINED_DRAWS", "1");
+        _putenv_s("APS5_PIPELINED_DRAWS", "1");
 #else
-    setenv("APS5_PIPELINED_DRAWS", "1", 1);
+        setenv("APS5_PIPELINED_DRAWS", "1", 1);
 #endif
+    }
     try {
         alignas(256) static std::array<std::uint32_t, 1024> first{};
         alignas(256) static std::array<std::uint32_t, 1024> second{};

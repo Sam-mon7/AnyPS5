@@ -33,6 +33,7 @@ enum class Feature : std::uint8_t {
     GenShadow,
     GenLockfree,
     GenDrawValidation,
+    PipeQ0Committer,
     Count
 };
 

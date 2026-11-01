@@ -59,6 +59,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::GenShadow, "GEN_SHADOW", false, true, GenShadowPrerequisites},
     {Feature::GenLockfree, "GEN_LOCKFREE", false, true, GenLockfreePrerequisites},
     {Feature::GenDrawValidation, "GEN_DRAW_VALIDATION", false, true, GenDrawValidationPrerequisites},
+    {Feature::PipeQ0Committer, "PIPE_Q0_COMMITTER", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
