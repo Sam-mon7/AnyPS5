@@ -192,6 +192,11 @@ public:
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
     bool RecordPrivateDescriptors(VkDescriptorSet destination, const std::function<void()>& record, HostImportsProof& proof) const;
+    // APS5_ARCHB_FIX_DRAW_SET_POOL: per-draw descriptor sets this object wrote in full once, back from
+    // their completed batches (see PrepareDrawBindings).
+    struct DrawSetPool;
+    // One "[draw-set-pool] cumulative: ..." line (the fix_draw_set_pool_* counters).
+    static std::string DrawSetPoolText();
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -209,6 +214,11 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // APS5_ARCHB_FIX_DRAW_SET_POOL: the pool the sets return to when this object is released (its
+        // batch completed), and the allocation indices whose elements hold this draw's snapshots
+        // instead of the template's own buffer descriptors.
+        std::shared_ptr<DrawSetPool> pool;
+        std::vector<std::size_t> overridden;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -626,6 +636,8 @@ private:
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
     mutable std::size_t movedWordBufferNext = 0;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
+    // APS5_ARCHB_FIX_DRAW_SET_POOL: made with the descriptor writes (buildComplete), never replaced.
+    std::shared_ptr<DrawSetPool> drawSetPool;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;

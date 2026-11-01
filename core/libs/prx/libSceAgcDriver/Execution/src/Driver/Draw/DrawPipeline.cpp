@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -595,6 +596,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     drains = {};
     drainWaitNs = {};
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CumulativeText().c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", Graphics::ShaderResources::DrawSetPoolText().c_str());
 }
 
 
@@ -667,7 +669,10 @@ void DrawPipeline::run() {
 
 void DrawPipeline::Stop() {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (stats && pipeCounters().enqueues.load(std::memory_order_relaxed) != 0) AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", CumulativeText().c_str());
+    if (stats && pipeCounters().enqueues.load(std::memory_order_relaxed) != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", CumulativeText().c_str());
+        AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", Graphics::ShaderResources::DrawSetPoolText().c_str());
+    }
     std::thread committer;
     {
         std::lock_guard lock(mutex);
