@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -58,8 +59,16 @@ void Driver::noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, cons
     while (writtenBuffers.size() > WrittenBufferRing) writtenBuffers.pop_front();
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded) {
-    bounded = compiled.bdaAbiVersion == 0;
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded, bool readOnlyBda) {
+    // A program on the BDA ABI accesses guest memory by address through its page table, so its writes
+    // are unbounded, unless (readOnlyBda) its build has no BDA writes: the recompiler sets bdaWrites
+    // for every address store or atomic and every buffer store or atomic it could not bind to a V#,
+    // and the SPIR-V emitter defines the BDA write and atomic lookups only when it is set (EmitBdaWrite
+    // and the atomic emitters fail without them). Such a program reads through the page table and
+    // writes only its fault buffer, which is driver memory (BdaResources), not guest memory, so its
+    // guest writes are its written bindings, listed below as for a program without the BDA ABI.
+    const bool addressWrites = !readOnlyBda || compiled.bdaWrites;
+    bounded = compiled.bdaAbiVersion == 0 || !addressWrites;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     const auto add = [&](std::uint64_t address, std::uint64_t bytes) {
         if (address == 0) return;
@@ -67,7 +76,8 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const S
         else ranges.emplace_back(address, address + bytes);
     };
     for (const auto& binding : compiled.bindings) {
-        if (binding.role == ShaderRecompiler::DescriptorRole::Gds || binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) bounded = false;
+        if (binding.role == ShaderRecompiler::DescriptorRole::Gds) bounded = false;
+        if ((binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) && addressWrites) bounded = false;
         if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
             static const bool allWritten = std::getenv("APS5_ALL_BUFFERS_WRITTEN") != nullptr;
             if (allWritten) bounded = false;
@@ -119,7 +129,11 @@ bool ExactDrawWrites() {
     return exact;
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact) {
+bool UnboundedWrites(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    return ranges.size() == 1 && ranges.front().first == 0 && ranges.front().second == std::numeric_limits<std::uint64_t>::max();
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact, bool narrow) {
     constexpr std::uint64_t Slack = 64 * 1024;
     constexpr std::pair<std::uint64_t, std::uint64_t> Unbounded{0, std::numeric_limits<std::uint64_t>::max()};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -131,7 +145,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
     };
     for (const auto& stage : stages) {
         if (stage.program == nullptr) return {Unbounded};
-        auto writes = DispatchWriteRanges(*stage.program, bounded);
+        auto writes = DispatchWriteRanges(*stage.program, bounded, narrow);
         if (!bounded) return {Unbounded};
         ranges.insert(ranges.end(), writes.begin(), writes.end());
     }
@@ -168,11 +182,16 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
     for (const auto& color : graphics.colors) addColor(color);
     if (graphics.depth) {
         const auto& depth = *graphics.depth;
-        if (depth.extent.width == 0 || depth.extent.height == 0 || depth.extent.width > 16384 || depth.extent.height > 16384 || depth.samples != 1 || depth.firstSlice != 0 || depth.lastSlice != 0 || depth.htileAddress != 0) return {Unbounded};
+        // `narrow` (APS5_ARCHB_PIPE_NARROW_DRAW_WRITES, exact only): a single-sample, single-slice depth
+        // target with HTILE writes its planes and its HTILE metadata, the HtileMetadataBytes(extent)
+        // at htileAddress the driver reads and stores for it (DepthSurface.cpp) and nothing else.
+        const bool htileBounded = narrow && exact && depth.htileAddress != 0;
+        if (depth.extent.width == 0 || depth.extent.height == 0 || depth.extent.width > 16384 || depth.extent.height > 16384 || depth.samples != 1 || depth.firstSlice != 0 || depth.lastSlice != 0 || (depth.htileAddress != 0 && !htileBounded)) return {Unbounded};
         if (exact && depth.extent.width != 0 && depth.extent.height != 0) {
             const bool d16 = depth.format == VK_FORMAT_D16_UNORM || depth.format == VK_FORMAT_D16_UNORM_S8_UINT;
             add(depth.address, Graphics::DepthSliceBytes(depth.extent, d16 ? 2u : 4u));
             add(depth.stencilAddress, Graphics::DepthSliceBytes(depth.extent, 1u));
+            if (htileBounded) add(depth.htileAddress, Graphics::HtileMetadataBytes(depth.extent));
         } else {
             const auto align = [](std::uint64_t value) { return (value + 255) & ~255ull; };
             const auto pixels = align(depth.extent.width) * align(depth.extent.height);
@@ -185,8 +204,8 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
     return ranges;
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
-    return DrawWriteRanges(graphics, stages, ExactDrawWrites());
+std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool narrow) {
+    return DrawWriteRanges(graphics, stages, ExactDrawWrites(), narrow);
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages) {
@@ -293,6 +312,13 @@ struct WriteDiagState {
     std::uint64_t argumentsUnchanged = 0;
     std::uint64_t printed = 0;
     std::uint64_t events = 0;
+    // Unbounded write sets: why, over enqueued draws and over the overlaps they caused (the newest
+    // queued unbounded draw is the most recently enqueued one: FIFO, and it overlaps everything).
+    std::map<std::string, std::uint64_t> unboundedDraws;
+    std::map<std::string, std::uint64_t> unboundedOverlaps;
+    std::string lastUnbounded;
+    std::uint64_t boundedDraws = 0;
+    std::uint64_t unboundedPrinted = 0;
 };
 
 WriteDiagState& writeDiag() {
@@ -304,6 +330,77 @@ constexpr std::array<const char*, static_cast<std::size_t>(DrawWriteKind::Count)
 
 std::uint64_t diagKey(std::uint64_t begin, std::uint64_t end) {
     return begin * 0x9e3779b97f4a7c15ull ^ end;
+}
+
+// Mirrors DrawWriteRanges (exact): the first condition that made the write set unbounded.
+std::string unboundedReason(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool readOnlyBda = false) {
+    static const char* stageNames[] = {"cs", "vs", "hs", "ds", "gs", "ps", "ls", "ms"};
+    for (const auto& stage : stages) {
+        const auto* compiled = stage.program;
+        const auto index = static_cast<std::size_t>(stage.stage);
+        const std::string name = index < std::size(stageNames) ? stageNames[index] : "stage" + std::to_string(index);
+        if (compiled == nullptr) return name + " without program";
+        if (compiled->bdaAbiVersion != 0 && (!readOnlyBda || compiled->bdaWrites)) return name + (compiled->bdaWrites ? " bda abi, bda writes" : " bda abi, no bda writes");
+        for (const auto& binding : compiled->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::Gds) return name + " gds binding";
+            if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable && (!readOnlyBda || compiled->bdaWrites)) return name + " bda pagetable binding";
+            if (binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer && (!readOnlyBda || compiled->bdaWrites)) return name + " fault buffer binding";
+            if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+                if (std::getenv("APS5_ALL_BUFFERS_WRITTEN") != nullptr) return "APS5_ALL_BUFFERS_WRITTEN";
+                for (std::uint32_t element = 0; element < binding.count; ++element) {
+                    if (element < binding.Flags().bufferWritten.size() && !binding.Flags().bufferWritten[element]) continue;
+                    if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 4) return name + " written buffer descriptor missing";
+                    if ((binding.guestDescriptor[static_cast<std::size_t>(element) * 4 + 3] >> 30u) != 0) return name + " written buffer type bits";
+                }
+            }
+            if (binding.role != ShaderRecompiler::DescriptorRole::ImageStorageTable && binding.role != ShaderRecompiler::DescriptorRole::ImageTable && (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage)) continue;
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const bool written = element >= binding.Flags().imageWritten.size() || binding.Flags().imageWritten[element];
+                if (!written) continue;
+                const std::string what = binding.role == ShaderRecompiler::DescriptorRole::ImageTable ? " image table" : binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable ? " storage image table" : " storage image";
+                const bool flagged = element < binding.Flags().imageWritten.size();
+                if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) return name + what + (flagged ? " (written)" : " (no write flags)") + " descriptor missing";
+                const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
+                if (Graphics::IsNullTextureResource(words)) continue;
+                try {
+                    const auto resource = Graphics::DecodeTextureResource(words);
+                    if (Graphics::SurfaceGuestBytes(resource) == 0) return name + what + " zero bytes";
+                } catch (const std::runtime_error&) {
+                    return name + what + " undecodable";
+                }
+            }
+        }
+    }
+    const auto colorReason = [](const Graphics::ColorTarget& color) -> std::string {
+        if (color.address == 0 && color.dccAddress == 0 && color.cmaskAddress == 0) return {};
+        if (color.bytes == 0) return "color zero bytes";
+        if (color.extent.width == 0 || color.extent.height == 0 || color.extent.width > 16384 || color.extent.height > 16384) return "color extent";
+        if (color.samples != 1) return "color samples";
+        if (color.depth != 1) return "color depth (3D)";
+        if (color.layers != 1 || color.arrayAddress != 0 || color.arraySlice != 0 || color.arrayLastSlice != 0) return "color array";
+        if (color.mipCount != 1 || color.mip != 0) return "color mips";
+        if (color.depthSlice != 0) return "color depth slice";
+        try {
+            if (color.bytes < Graphics::ColorTargetLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes).Bytes()) return "color bytes below layout";
+        } catch (const std::runtime_error&) {
+            return "color layout undecodable";
+        }
+        return {};
+    };
+    if (graphics.hasColorTarget) {
+        if (auto reason = colorReason(graphics.color); !reason.empty()) return reason;
+    }
+    for (const auto& color : graphics.colors) {
+        if (auto reason = colorReason(color); !reason.empty()) return reason;
+    }
+    if (graphics.depth) {
+        const auto& depth = *graphics.depth;
+        if (depth.extent.width == 0 || depth.extent.height == 0 || depth.extent.width > 16384 || depth.extent.height > 16384) return "depth extent";
+        if (depth.samples != 1) return "depth samples";
+        if (depth.firstSlice != 0 || depth.lastSlice != 0) return "depth slices";
+        if (depth.htileAddress != 0 && !readOnlyBda) return "depth htile";
+    }
+    return "write range overflow or zero size";
 }
 
 }
@@ -375,8 +472,28 @@ void NoteDrawWriteTags(const Graphics::State& graphics, std::span<const Graphics
         } catch (const std::runtime_error&) {
         }
     }
+    const auto ranges = DrawWriteRanges(graphics, stages, true);
+    const bool unbounded = UnboundedWrites(ranges);
+    std::string reason = unbounded ? unboundedReason(graphics, stages) : std::string{};
+    if (unbounded && UnboundedWrites(DrawWriteRanges(graphics, stages, true, true))) reason += " | narrowed: " + unboundedReason(graphics, stages, true);
     auto& state = writeDiag();
     std::lock_guard lock(state.mutex);
+    if (unbounded) {
+        ++state.unboundedDraws[reason];
+        state.lastUnbounded = reason;
+        if (state.unboundedPrinted < 16) {
+            ++state.unboundedPrinted;
+            std::string variants;
+            for (const auto& stage : stages) {
+                char item[40];
+                std::snprintf(item, sizeof(item), " %u:0x%llx", static_cast<unsigned>(stage.stage), static_cast<unsigned long long>(stage.program != nullptr ? stage.program->variantId : 0));
+                variants += item;
+            }
+            std::fprintf(stderr, "[pipe-writer] unbounded draw write set: %s (stages%s)\n", reason.c_str(), variants.c_str());
+        }
+    } else {
+        ++state.boundedDraws;
+    }
     if (state.entries > 200000) {
         state.tags.clear();
         state.entries = 0;
@@ -403,12 +520,14 @@ void NoteIndirectWriterOverlap(std::uint64_t arguments, std::uint64_t argumentBy
             if (range == writer) tag = kept;
         }
     }
+    const bool unboundedWriter = writer.first == 0 && writer.second == std::numeric_limits<std::uint64_t>::max();
+    if (unboundedWriter) ++state.unboundedOverlaps[state.lastUnbounded];
     if (!tag) ++state.untagged;
     else {
         ++state.overlaps[static_cast<std::size_t>(tag->kind)];
         state.overlapBytes[static_cast<std::size_t>(tag->kind)] += writer.second - writer.first;
     }
-    if (state.printed >= 64) return;
+    if (state.printed >= 64 || (unboundedWriter && state.printed >= 4)) return;
     ++state.printed;
     std::fprintf(stderr, "[pipe-writer] indirect args 0x%llx+0x%llx overlap a queued draw's %s 0x%llx+0x%llx (args at +0x%llx) stage %u element %u stride/width %u records/height %u variant 0x%llx changed %s\n",
             static_cast<unsigned long long>(arguments), static_cast<unsigned long long>(argumentBytes), tag ? DrawWriteKindName(tag->kind) : "untagged range",
@@ -430,6 +549,11 @@ std::string DrawWriteDiagText() {
         std::snprintf(item, sizeof(item), " %s %llu (mean %.0f KiB)", DrawWriteKindNames[kind], static_cast<unsigned long long>(state.overlaps[kind]), static_cast<double>(state.overlapBytes[kind]) / static_cast<double>(state.overlaps[kind]) / 1024.0);
         text += item;
     }
+    text += "; overlaps by unbounded writer:";
+    for (const auto& [reason, count] : state.unboundedOverlaps) text += " [" + reason + "] " + std::to_string(count);
+    std::snprintf(item, sizeof(item), "; enqueued draws bounded %llu, unbounded:", static_cast<unsigned long long>(state.boundedDraws));
+    text += item;
+    for (const auto& [reason, count] : state.unboundedDraws) text += " [" + reason + "] " + std::to_string(count);
     return text;
 }
 

@@ -92,7 +92,7 @@ void toggleCase(const std::string& name) {
         Feature feature;
         const char* token;
     };
-    const auto pipeCut = name == "PipeKeepIndirectRegs" ? std::optional<PipeCut>{{Feature::PipeKeepIndirectRegs, "PIPE_KEEP_INDIRECT_REGS"}} : name == "PipeIndirectGpuArgs" ? std::optional<PipeCut>{{Feature::PipeIndirectGpuArgs, "PIPE_INDIRECT_GPU_ARGS"}} : std::nullopt;
+    const auto pipeCut = name == "PipeKeepIndirectRegs" ? std::optional<PipeCut>{{Feature::PipeKeepIndirectRegs, "PIPE_KEEP_INDIRECT_REGS"}} : name == "PipeIndirectGpuArgs" ? std::optional<PipeCut>{{Feature::PipeIndirectGpuArgs, "PIPE_INDIRECT_GPU_ARGS"}} : name == "PipeNarrowDrawWrites" ? std::optional<PipeCut>{{Feature::PipeNarrowDrawWrites, "PIPE_NARROW_DRAW_WRITES"}} : std::nullopt;
     const bool keepRegisters = pipeCut.has_value();
     if (keepRegisters) {
         setEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", nullptr);
