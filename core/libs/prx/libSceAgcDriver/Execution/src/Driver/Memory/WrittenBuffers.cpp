@@ -11,6 +11,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <unordered_map>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
@@ -273,6 +277,159 @@ std::string Driver::describeSelf(const ShaderRecompiler::RecompileResult& compil
         std::snprintf(item, sizeof(item), " own element %u 0x%llx+0x%llx%s", element, static_cast<unsigned long long>(base), static_cast<unsigned long long>(limit - base), atomic ? " atomic" : "");
         text += item;
     });
+    return text;
+}
+
+namespace {
+
+struct WriteDiagState {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, DrawWriteTag>>> tags;
+    std::size_t entries = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawWriteKind::Count)> overlaps{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawWriteKind::Count)> overlapBytes{};
+    std::uint64_t untagged = 0;
+    std::uint64_t argumentsChanged = 0;
+    std::uint64_t argumentsUnchanged = 0;
+    std::uint64_t printed = 0;
+    std::uint64_t events = 0;
+};
+
+WriteDiagState& writeDiag() {
+    static auto* state = new WriteDiagState();
+    return *state;
+}
+
+constexpr std::array<const char*, static_cast<std::size_t>(DrawWriteKind::Count)> DrawWriteKindNames{"buffer_written", "buffer_assumed", "storage_image", "storage_image_dcc", "color", "color_dcc", "color_cmask", "depth", "stencil"};
+
+std::uint64_t diagKey(std::uint64_t begin, std::uint64_t end) {
+    return begin * 0x9e3779b97f4a7c15ull ^ end;
+}
+
+}
+
+bool PipeWriteDiag() {
+    static const bool diag = [] { const char* text = std::getenv("APS5_PIPE_WRITE_DIAG"); return text != nullptr && text[0] == '1'; }();
+    return diag;
+}
+
+const char* DrawWriteKindName(DrawWriteKind kind) {
+    return static_cast<std::size_t>(kind) < DrawWriteKindNames.size() ? DrawWriteKindNames[static_cast<std::size_t>(kind)] : "?";
+}
+
+void NoteDrawWriteTags(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
+    std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, DrawWriteTag>> found;
+    const auto add = [&](std::uint64_t begin, std::uint64_t bytes, DrawWriteTag tag) {
+        if (begin == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - begin) return;
+        found.push_back({{begin, begin + bytes}, tag});
+    };
+    for (std::size_t s = 0; s < stages.size(); ++s) {
+        const auto* compiled = stages[s].program;
+        if (compiled == nullptr) continue;
+        for (const auto& binding : compiled->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+                for (std::uint32_t element = 0; element < binding.count; ++element) {
+                    const bool flagged = element < binding.Flags().bufferWritten.size();
+                    if (flagged && !binding.Flags().bufferWritten[element]) continue;
+                    if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 4) continue;
+                    const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4;
+                    const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+                    add(descriptor.Base48(), descriptor.GetSize(), {flagged ? DrawWriteKind::BufferWritten : DrawWriteKind::BufferAssumed, static_cast<std::uint8_t>(stages[s].stage), element, descriptor.Stride(), descriptor.NumRecords(), compiled->variantId});
+                }
+                continue;
+            }
+            if (binding.role != ShaderRecompiler::DescriptorRole::ImageStorageTable && binding.role != ShaderRecompiler::DescriptorRole::ImageTable && (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage)) continue;
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const bool written = element >= binding.Flags().imageWritten.size() || binding.Flags().imageWritten[element];
+                if (!written || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) continue;
+                const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
+                if (Graphics::IsNullTextureResource(words)) continue;
+                try {
+                    const auto resource = Graphics::DecodeTextureResource(words);
+                    const auto surfaceBytes = Graphics::SurfaceGuestBytes(resource);
+                    add(resource.baseAddress, surfaceBytes, {DrawWriteKind::StorageImage, static_cast<std::uint8_t>(stages[s].stage), element, 0, 0, compiled->variantId});
+                    if (resource.dccAddress != 0 && surfaceBytes != 0) add(resource.dccAddress, Graphics::DccKeyCount(resource, surfaceBytes), {DrawWriteKind::StorageImageDcc, static_cast<std::uint8_t>(stages[s].stage), element, 0, 0, compiled->variantId});
+                } catch (const std::runtime_error&) {
+                }
+            }
+        }
+    }
+    const auto addColor = [&](const Graphics::ColorTarget& color, std::uint32_t slot) {
+        if (color.bytes == 0) return;
+        add(color.address, color.bytes, {DrawWriteKind::Color, 0xff, slot, color.extent.width, color.extent.height, 0});
+        try {
+            const auto keys = color.dccPipeAligned ? Graphics::DccKeyCount(Graphics::ColorTextureTileMode(color.tileMode), color.elementBytes, color.extent.width, color.extent.height, color.bytes) : Graphics::DccKeyBytes(color.bytes);
+            add(color.dccAddress, keys, {DrawWriteKind::ColorDcc, 0xff, slot, color.extent.width, color.extent.height, 0});
+        } catch (const std::runtime_error&) {
+        }
+        add(color.cmaskAddress, color.cmaskBytes, {DrawWriteKind::ColorCmask, 0xff, slot, color.extent.width, color.extent.height, 0});
+    };
+    if (graphics.hasColorTarget) addColor(graphics.color, 0);
+    for (std::size_t slot = 0; slot < graphics.colors.size(); ++slot) addColor(graphics.colors[slot], static_cast<std::uint32_t>(slot + 1));
+    if (graphics.depth && graphics.depth->extent.width != 0 && graphics.depth->extent.height != 0) {
+        const auto& depth = *graphics.depth;
+        const bool d16 = depth.format == VK_FORMAT_D16_UNORM || depth.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        try {
+            add(depth.address, Graphics::DepthSliceBytes(depth.extent, d16 ? 2u : 4u), {DrawWriteKind::Depth, 0xff, 0, depth.extent.width, depth.extent.height, 0});
+            add(depth.stencilAddress, Graphics::DepthSliceBytes(depth.extent, 1u), {DrawWriteKind::Stencil, 0xff, 0, depth.extent.width, depth.extent.height, 0});
+        } catch (const std::runtime_error&) {
+        }
+    }
+    auto& state = writeDiag();
+    std::lock_guard lock(state.mutex);
+    if (state.entries > 200000) {
+        state.tags.clear();
+        state.entries = 0;
+    }
+    for (const auto& [range, tag] : found) {
+        auto& bucket = state.tags[diagKey(range.first, range.second)];
+        const auto same = std::find_if(bucket.begin(), bucket.end(), [&](const auto& kept) { return kept.first == range; });
+        if (same != bucket.end()) same->second = tag;
+        else {
+            bucket.push_back({range, tag});
+            ++state.entries;
+        }
+    }
+}
+
+void NoteIndirectWriterOverlap(std::uint64_t arguments, std::uint64_t argumentBytes, std::pair<std::uint64_t, std::uint64_t> writer, std::optional<bool> changed) {
+    auto& state = writeDiag();
+    std::lock_guard lock(state.mutex);
+    ++state.events;
+    if (changed) ++(*changed ? state.argumentsChanged : state.argumentsUnchanged);
+    std::optional<DrawWriteTag> tag;
+    if (const auto bucket = state.tags.find(diagKey(writer.first, writer.second)); bucket != state.tags.end()) {
+        for (const auto& [range, kept] : bucket->second) {
+            if (range == writer) tag = kept;
+        }
+    }
+    if (!tag) ++state.untagged;
+    else {
+        ++state.overlaps[static_cast<std::size_t>(tag->kind)];
+        state.overlapBytes[static_cast<std::size_t>(tag->kind)] += writer.second - writer.first;
+    }
+    if (state.printed >= 64) return;
+    ++state.printed;
+    std::fprintf(stderr, "[pipe-writer] indirect args 0x%llx+0x%llx overlap a queued draw's %s 0x%llx+0x%llx (args at +0x%llx) stage %u element %u stride/width %u records/height %u variant 0x%llx changed %s\n",
+            static_cast<unsigned long long>(arguments), static_cast<unsigned long long>(argumentBytes), tag ? DrawWriteKindName(tag->kind) : "untagged range",
+            static_cast<unsigned long long>(writer.first), static_cast<unsigned long long>(writer.second - writer.first),
+            static_cast<unsigned long long>(arguments >= writer.first ? arguments - writer.first : 0), tag ? static_cast<unsigned>(tag->stage) : 0u, tag ? tag->element : 0u, tag ? tag->a : 0u, tag ? tag->b : 0u,
+            static_cast<unsigned long long>(tag ? tag->variant : 0), !changed ? "unknown" : *changed ? "yes" : "no");
+}
+
+std::string DrawWriteDiagText() {
+    if (!PipeWriteDiag()) return {};
+    auto& state = writeDiag();
+    std::lock_guard lock(state.mutex);
+    std::string text = "; indirect writer overlaps";
+    char item[128];
+    std::snprintf(item, sizeof(item), " %llu (untagged %llu, args changed %llu, unchanged %llu)", static_cast<unsigned long long>(state.events), static_cast<unsigned long long>(state.untagged), static_cast<unsigned long long>(state.argumentsChanged), static_cast<unsigned long long>(state.argumentsUnchanged));
+    text += item;
+    for (std::size_t kind = 0; kind < state.overlaps.size(); ++kind) {
+        if (state.overlaps[kind] == 0) continue;
+        std::snprintf(item, sizeof(item), " %s %llu (mean %.0f KiB)", DrawWriteKindNames[kind], static_cast<unsigned long long>(state.overlaps[kind]), static_cast<double>(state.overlapBytes[kind]) / static_cast<double>(state.overlaps[kind]) / 1024.0);
+        text += item;
+    }
     return text;
 }
 

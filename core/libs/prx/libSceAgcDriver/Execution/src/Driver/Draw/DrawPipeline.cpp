@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -516,6 +517,7 @@ std::string DrawPipeline::CumulativeText() {
     text += item;
     std::snprintf(item, sizeof(item), "; %llu register packets kept the pipeline", static_cast<unsigned long long>(counters.keptIndirectRegs.load(std::memory_order_relaxed)));
     text += item;
+    text += DrawWriteDiagText();
     std::snprintf(item, sizeof(item), "; full: %llu waits (%.1f ms), %llu overcommits; locked drains %llu", static_cast<unsigned long long>(counters.fullWaits.load(std::memory_order_relaxed)), static_cast<double>(counters.fullWaitNs.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.fullOvercommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.lockedDrains.load(std::memory_order_relaxed)));
     text += item;
     return text;
@@ -780,11 +782,14 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
     return false;
 }
 
-std::optional<DrawPipeline::ItemKind> DrawPipeline::NewestWriter(std::uint64_t address, std::size_t bytes) {
+std::optional<DrawPipeline::ItemKind> DrawPipeline::NewestWriter(std::uint64_t address, std::size_t bytes, Range* overlapped) {
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
-        if (std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; })) return item->kind;
+        const auto write = std::find_if(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
+        if (write == item->writes.end()) continue;
+        if (overlapped != nullptr) *overlapped = *write;
+        return item->kind;
     }
     return std::nullopt;
 }
