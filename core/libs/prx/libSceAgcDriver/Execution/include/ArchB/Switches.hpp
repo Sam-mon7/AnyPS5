@@ -29,6 +29,7 @@ enum class Feature : std::uint8_t {
     FixAllocChurn,
     FixComputeSyncUnlocked,
     PipeQ0Committer,
+    PipeKeepIndirectRegs,
     Count
 };
 

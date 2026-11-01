@@ -84,6 +84,12 @@ void toggleCase(const std::string& name) {
     const bool pipeQ0 = name == "PipeQ0Committer";
     if (name == "VqMemo" || imageTable || bitScanKeys) setEnvironment(bitScanKeys ? "APS5_ARCHB_FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "APS5_ARCHB_FIX_VQ_MEMO", nullptr);
     if (pipeQ0) setEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", nullptr);
+    const bool keepRegisters = name == "PipeKeepIndirectRegs";
+    if (keepRegisters) {
+        setEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", nullptr);
+        // From the environment without PIPE_Q0_COMMITTER: refused at startup (prerequisite).
+        setEnvironment("APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS", "1");
+    }
     if (name == "AllocChurn") setEnvironment("APS5_ARCHB_FIX_ALLOC_CHURN", nullptr);
     Switches::Initialize();
     const auto write = [&](const std::string& line, bool poll = true) {
@@ -107,6 +113,36 @@ void toggleCase(const std::string& name) {
         check(selected && !Switches::Enabled(feature), "runtime fix did not preserve the selected path across a toggle");
         write("3 " + token + "=1");
         check(Switches::Enabled(feature), "runtime fix did not turn back on");
+    } else if (genTable || genShadow) {
+        const auto& dependent = genDependent != nullptr ? *genDependent : genDependents[0];
+        const std::string token = dependent.token;
+        int listed = 0;
+        for (const auto& entry : Switches::Table()) {
+                ++listed;
+            }
+            for (const auto& other : genDependents) {
+                if (entry.feature != other.feature) continue;
+                ++listed;
+            }
+        }
+        check(listed == 1 + static_cast<int>(std::size(genDependents)), "write-generation switches are listed");
+        write("1 " + token + "=1");
+    } else if (keepRegisters) {
+        // A2 cut: runtime, default off, requires PIPE_Q0_COMMITTER (named alone it is refused, and it
+        // drops when the committer switch does).
+        for (const auto& entry : Switches::Table()) {
+            if (entry.feature != Feature::PipeKeepIndirectRegs) continue;
+            listed = true;
+            check(std::string(entry.name) == "PIPE_KEEP_INDIRECT_REGS" && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::PipeQ0Committer, "PIPE_KEEP_INDIRECT_REGS switch contract");
+        }
+        check(listed, "PIPE_KEEP_INDIRECT_REGS is listed");
+        check(!Switches::Enabled(Feature::PipeKeepIndirectRegs), "PIPE_KEEP_INDIRECT_REGS started on without PIPE_Q0_COMMITTER");
+        write("1 PIPE_KEEP_INDIRECT_REGS=1");
+        check(!Switches::Enabled(Feature::PipeKeepIndirectRegs), "PIPE_KEEP_INDIRECT_REGS turned on without PIPE_Q0_COMMITTER");
+        write("2 PIPE_Q0_COMMITTER=1 PIPE_KEEP_INDIRECT_REGS=1");
+        check(Switches::Enabled(Feature::PipeQ0Committer) && Switches::Enabled(Feature::PipeKeepIndirectRegs), "the committer and PIPE_KEEP_INDIRECT_REGS did not turn on together");
+        write("3 PIPE_Q0_COMMITTER=0");
+        check(!Switches::Enabled(Feature::PipeQ0Committer) && !Switches::Enabled(Feature::PipeKeepIndirectRegs), "PIPE_KEEP_INDIRECT_REGS stayed on after the committer switch turned off");
     } else if (name == "AllocChurn") {
         using AgcDriver::ArchB::AllocChurnActive;
         using AgcDriver::ArchB::AllocChurnScope;

@@ -52,6 +52,8 @@ public:
     // Registers the pipe_* recorder counters (once; cheap to call again).
     static void RegisterCounters();
     static void CountSubmission();
+    // APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS: a 0x63/0x64/0x9f packet kept the busy pipeline (pipe_keep_indirect_regs).
+    static void CountKeptIndirectRegisters();
     // One "[pipe] cumulative: ..." line (printed with the [draw] pipelined report and at shutdown).
     static std::string CumulativeText();
     // Fallback counts: drains requested while the calling thread held the GPU mutex (waited with the
