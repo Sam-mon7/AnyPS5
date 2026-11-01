@@ -486,8 +486,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (pipelined && drawParameters.indirect) {
         const auto& indirect = *drawParameters.indirect;
         auto& pipeline = DrawPipeline::Queue0();
-        const bool overlaps = pipeline.Busy() && (pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes))) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4)));
-        if (!pipelinedIndirect || overlaps) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+        const bool busy = pipeline.Busy();
+        const auto argumentBytes = static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes));
+        const bool arguments = busy && pipeline.Overlaps(indirect.arguments, argumentBytes);
+        const bool count = busy && !arguments && indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4);
+        if (!pipelinedIndirect || arguments || count) {
+            auto cause = !pipelinedIndirect ? DrawPipeline::DrainCause::IndirectDisabled : arguments ? DrawPipeline::DrainCause::IndirectArgs : DrawPipeline::DrainCause::IndirectCount;
+            if (pipelinedIndirect && arguments) {
+                // Count-only: which queued item writes the arguments (the next drain cut depends on it).
+                if (const auto writer = pipeline.NewestWriter(indirect.arguments, argumentBytes)) {
+                    cause = *writer == DrawPipeline::ItemKind::Draw ? DrawPipeline::DrainCause::IndirectArgsDraw : *writer == DrawPipeline::ItemKind::Dispatch ? DrawPipeline::DrainCause::IndirectArgsDispatch : *writer == DrawPipeline::ItemKind::Label ? DrawPipeline::DrainCause::IndirectArgsLabel : DrawPipeline::DrainCause::IndirectArgsOther;
+                }
+            }
+            pipeline.Drain(DrawPipeline::DrainReason::Indirect, 0x100, cause);
+        }
     }
     auto& traceIndirect = tail.traceIndirect;
     if (const auto verdict = precheckDraw(queue, submission, packetOffset, packet, drawParameters, rejected, traceIndirect)) {
@@ -1035,8 +1047,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     auto& drawParameters = tail.drawParameters;
     const bool pipelined = tail.pipelined;
     static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
-    const auto drainBeforeInline = [&] {
-        if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    const auto drainBeforeInline = [&](DrawPipeline::DrainCause cause) {
+        if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect, 0x100, cause);
     };
     auto& traceIndirect = tail.traceIndirect;
     const auto dumpTarget = tail.dumpTarget;
@@ -1484,7 +1496,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 timing.Mark("draw_enqueued");
                 return drawn();
             }
-            drainBeforeInline();
+            drainBeforeInline(record != lastDrawable ? DrawPipeline::DrainCause::IndirectCpuRecords : DrawPipeline::DrainCause::IndirectInline);
             prepareForDraw(direct);
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
@@ -1537,7 +1549,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         timing.Mark("draw_enqueued");
         return drawn();
     }
-    if (drawParameters.indirect) drainBeforeInline();
+    if (drawParameters.indirect) drainBeforeInline(DrawPipeline::DrainCause::IndirectInline);
     prepareForDraw(drawParameters, recipe.get());
     lockForDraw();
     noteDrawWriters(stages, submission.queue);

@@ -65,7 +65,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
                 return DrawVerdict::Drawn;
             }
         }
-        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu, DrawPipeline::DrainCause::MetadataPass);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();

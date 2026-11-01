@@ -206,7 +206,7 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     if (feedbackHit != nullptr) *feedbackHit = false;
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.OverlapsAny(variant.runs)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        if (pipeline.Busy() && pipeline.OverlapsAny(variant.runs)) pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x100, DrawPipeline::DrainCause::CaptureVariant);
     }
     const bool refreshBuffers = bufferBases && live != nullptr && !validateLegacy() && !variant.bufferBaseMasks.empty();
     const bool masked = live != nullptr && (!variant.dataPositions.empty() || refreshBuffers);
