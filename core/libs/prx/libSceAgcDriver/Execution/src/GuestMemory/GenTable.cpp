@@ -269,10 +269,13 @@ void Table::RecordSweep(std::uint64_t begin, std::uint64_t end, Ticket ticket, s
         for (; block < leafEnd; ++block) {
             const auto i = static_cast<std::size_t>(block % LeafBlocks);
             const auto pages = pageMask(block, begin, end);
-            leaf->state[i].store(static_cast<std::uint8_t>(BlockState::Tracked), std::memory_order_release);
-            leaf->sweeper[i].store(sweeperId, std::memory_order_relaxed);
+            // Single sweeper (the tracker mutex): only the fields that change are written, and the
+            // coverage tickets with a plain store, not a CAS. The only other writers store 0 (coverage
+            // dropped by an event), and a store gives the same outcome as a CAS racing with them.
+            if (leaf->state[i].load(std::memory_order_relaxed) != static_cast<std::uint8_t>(BlockState::Tracked)) leaf->state[i].store(static_cast<std::uint8_t>(BlockState::Tracked), std::memory_order_release);
+            if (leaf->sweeper[i].load(std::memory_order_relaxed) != sweeperId) leaf->sweeper[i].store(sweeperId, std::memory_order_relaxed);
             if (pages == FullMask) {
-                atomicMax(leaf->swept[i], ticket);
+                if (leaf->swept[i].load(std::memory_order_relaxed) < ticket) leaf->swept[i].store(ticket, std::memory_order_release);
                 continue;
             }
             // Partial: the mask belongs to maskTicket (mask stored first, ticket after, so a reader
@@ -283,13 +286,17 @@ void Table::RecordSweep(std::uint64_t begin, std::uint64_t end, Ticket ticket, s
             else if (previous > ticket) continue;
             leaf->mask[i].store(mask, std::memory_order_release);
             leaf->maskTicket[i].store(ticket, std::memory_order_release);
-            if (mask == FullMask) atomicMax(leaf->swept[i], ticket);
+            if (mask == FullMask && leaf->swept[i].load(std::memory_order_relaxed) < ticket) leaf->swept[i].store(ticket, std::memory_order_release);
         }
         const auto unitLast = static_cast<std::size_t>((leafEnd - 1) % LeafBlocks) / CoarseBlocks;
         for (auto unit = unitFirst; unit <= unitLast; ++unit) {
-            Ticket low = NeverCovered;
-            for (std::size_t i = unit * CoarseBlocks; i < (unit + 1) * CoarseBlocks; ++i) low = std::min(low, leaf->swept[i].load(std::memory_order_relaxed));
-            leaf->coarseSwept[unit].store(low, std::memory_order_release);
+            // The unit summary is a lower bound of its blocks' coverage (a drop resets it to 0 first).
+            // Only a sweep over the whole unit raises it, to its own ticket (every block now holds at
+            // least that); a partial sweep leaves the bound as it was (blocks only rose), which only
+            // costs Check its per-unit shortcut.
+            const auto unitBegin = ((block - 1) / LeafBlocks * LeafBlocks + unit * CoarseBlocks) << BlockShift;
+            if (begin > unitBegin || end < unitBegin + (std::uint64_t{CoarseBlocks} << BlockShift)) continue;
+            if (leaf->coarseSwept[unit].load(std::memory_order_relaxed) < ticket) leaf->coarseSwept[unit].store(ticket, std::memory_order_release);
         }
     }
 }
@@ -954,7 +961,8 @@ Ticket Issue(TicketReason reason) noexcept {
     HostThreadSlot<std::uint64_t, RequiredSlot>::Set(ticket);
     auto& counters = local();
     counters.tag.store(GpuLockThreadTag(), std::memory_order_relaxed);
-    add(TicketBase + static_cast<std::size_t>(reason));
+    auto& slot = counters.values[TicketBase + static_cast<std::size_t>(reason)];
+    slot.store(slot.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     return ticket;
 }
 
@@ -995,18 +1003,23 @@ std::uint16_t SweeperId() noexcept {
 
 Generation Note(Event event, std::uint64_t begin, std::uint64_t end, std::uint8_t kinds, Generation generation, bool create) noexcept {
     if (suppressed[static_cast<std::size_t>(event)].load(std::memory_order_relaxed) || begin >= end) return 0;
+    // One thread-local lookup per event (the counters are this thread's, single writer).
     auto& counters = local();
+    const auto bump = [&](std::size_t counter, std::uint64_t value) {
+        auto& slot = counters.values[counter];
+        slot.store(slot.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
+    };
     const bool timed = (++counters.eventSample & 63u) == 0;
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto& table = Global();
     if (generation == 0) generation = table.Bump();
     const auto blocks = table.Apply(begin, end, kinds, generation, create);
     if (timed) {
-        add(EventNs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()) * 64);
-        add(EventSamples);
+        bump(EventNs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()) * 64);
+        bump(EventSamples, 1);
     }
-    add(EventBase + 2 * static_cast<std::size_t>(event));
-    add(EventBase + 2 * static_cast<std::size_t>(event) + 1, blocks);
+    bump(EventBase + 2 * static_cast<std::size_t>(event), 1);
+    bump(EventBase + 2 * static_cast<std::size_t>(event) + 1, blocks);
     return generation;
 }
 

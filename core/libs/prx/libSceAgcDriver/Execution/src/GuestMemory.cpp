@@ -2058,9 +2058,13 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     // without the mutex (GEN_LOCKFREE) never sees a tracker stamp the table does not hold.
     const bool gen = Gen::Active();
     if (runs.window != nullptr) {
+        // A page of a window walk bumps data and cpu in the table whether it keeps the walk's kind
+        // or reads as an unchanged import-window page (conservative), so one event covers the run.
+        const bool wholeRun = kind == StampKind::Cpu || kind == StampKind::Fresh;
+        if (gen && wholeRun) static_cast<void>(Gen::Note(Gen::Event::ImportWindow, begin, end, Gen::Data | Gen::Cpu, generation));
         for (auto page = begin; page < end; page += WritePageBytes) {
             const auto pageKind = runs.window->Holds(page) ? StampKind::ImportWindow : kind;
-            if (gen) noteStampGen(pageKind, page, page + WritePageBytes, generation);
+            if (gen && !wholeRun) noteStampGen(pageKind, page, page + WritePageBytes, generation);
             tracker.stamp(tracker.blockOf(page), generation, pageKind);
         }
     } else {
