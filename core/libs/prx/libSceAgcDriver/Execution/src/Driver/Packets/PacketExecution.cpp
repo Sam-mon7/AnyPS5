@@ -369,6 +369,28 @@ void Driver::execute(const Submission& submission) {
                 cursor = nextCursor;
                 continue;
             }
+            // APS5_ARCHB_PIPE_KEEP_OWN_LABEL_WAITS: the compare fails on memory, no queued item writes the
+            // label, and the label history holds a store of this queue (made by an earlier packet, whose
+            // item has committed and whose value has not landed yet) that satisfies it. waitMemory, run
+            // after the drain, takes exactly this history entry first and returns with no epoch bump, no
+            // pending wait and no submission (WaitEnd::History, writer == queue); later packets of this
+            // queue follow that store in queue order whether or not the pipeline drains. So the drain
+            // changes nothing; skip it and the wait, as for a label still held in the pipeline above.
+            if (!submission.heldAtSubmit.contains(cursor) && ArchB::Switches::Enabled(ArchB::Feature::PipeKeepOwnLabelWaits) && !DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes)) {
+                std::uint32_t writer = ~0u;
+                if (storedSince(packet, awaited, awaitedBytes, submission.received, &writer, nullptr) && writer == submission.queue) {
+                    if (profilePackets) {
+                        Graphics::Recorder::WaitProfile sample(submission.queue, awaited, awaitedBytes);
+                        sample.end = Graphics::Recorder::WaitEnd::History;
+                    }
+                    if (GuestMemory::Gen::Active()) GuestMemory::Gen::NoteTicket(GuestMemory::Gen::TicketReason::WaitOwn);
+                    DrawPipeline::CountKeptOwnLabelWait();
+                    gateOpened() = true;
+                    recent.Record(cursor);
+                    cursor = nextCursor;
+                    continue;
+                }
+            }
         }
         timing.Mark("pipeline_prepare");
         if (pipelined && DrawPipeline::Queue0().Busy()) {
