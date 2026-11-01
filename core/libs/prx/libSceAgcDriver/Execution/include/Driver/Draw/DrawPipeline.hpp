@@ -97,6 +97,10 @@ public:
     // overlap was enqueued without draining (pipe_indirect_gpu_args_kept).
     static void CountKeptIndirectArguments();
     static std::uint64_t KeptIndirectArguments();
+    // APS5_ARCHB_PIPE_NARROW_DRAW_WRITES: a queued draw's write set is bounded although it has a BDA
+    // program (without BDA writes) or an HTILE depth target (unbounded without the switch)
+    // (pipe_draw_writes_narrowed).
+    static void CountNarrowedDrawWrites();
     // One "[pipe] cumulative: ..." line (printed with the [draw] pipelined report and at shutdown).
     static std::string CumulativeText();
     // Fallback counts: drains requested while the calling thread held the GPU mutex (waited with the

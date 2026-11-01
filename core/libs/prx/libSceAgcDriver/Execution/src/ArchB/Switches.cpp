@@ -32,6 +32,7 @@ constexpr Feature TestRuntimePrerequisites[] = {Feature::GateNoop};
 #endif
 constexpr Feature PipeKeepIndirectRegsPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeIndirectGpuArgsPrerequisites[] = {Feature::PipeQ0Committer};
+constexpr Feature PipeNarrowDrawWritesPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -56,6 +57,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::PipeQ0Committer, "PIPE_Q0_COMMITTER", false, true, {}},
     {Feature::PipeKeepIndirectRegs, "PIPE_KEEP_INDIRECT_REGS", false, true, PipeKeepIndirectRegsPrerequisites},
     {Feature::PipeIndirectGpuArgs, "PIPE_INDIRECT_GPU_ARGS", false, true, PipeIndirectGpuArgsPrerequisites},
+    {Feature::PipeNarrowDrawWrites, "PIPE_NARROW_DRAW_WRITES", false, true, PipeNarrowDrawWritesPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
