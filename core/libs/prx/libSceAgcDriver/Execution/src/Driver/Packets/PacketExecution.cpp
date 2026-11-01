@@ -4,6 +4,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -50,15 +51,33 @@ bool waitTakesPendingLabel(std::span<const std::uint32_t> packet) {
     return value.has_value() && Pm4::WaitComparesValue(packet, *value);
 }
 
-bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
+// `keepIndirectRegs` (APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS, sampled per submission; null: off) is the
+// submission whose register lists 0x63/0x64/0x9f execute from, and `cursor` the packet's offset in it.
+bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, const Submission* keepIndirectRegs = nullptr, std::size_t cursor = 0) {
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
     switch (opcode) {
         case 0x11: case 0x12: case 0x13: case 0x20: case 0x26: case 0x2a: case 0x2f: case 0x42: case 0x58: case 0x59: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: return true;
         case 0x46: return packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
         case 0x15: return orderedFills();
-        case 0x63: case 0x64: case 0x9f:
-            return packet.size() >= 5 && !DrawPipeline::Queue0().Overlaps(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), static_cast<std::size_t>(packet[4]) * 8);
+        case 0x63: case 0x64: case 0x9f: {
+            if (packet.size() < 5) return false;
+            const auto table = packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u);
+            if (keepIndirectRegs != nullptr) {
+                // A valid list was read from the table at submission (readRegisterLists) and the packet
+                // executes from it without reading guest memory again, so commits still queued cannot
+                // change what it writes: keep the pipeline. Only an invalid list is read again where
+                // the packet executes; that read must see the queued writes (exact table bytes here).
+                const auto listed = keepIndirectRegs->registerLists.find(cursor);
+                if (listed != keepIndirectRegs->registerLists.end() && Pm4::IndirectRegistersValid(listed->second)) {
+                    DrawPipeline::CountKeptIndirectRegisters();
+                    return true;
+                }
+                return !DrawPipeline::Queue0().Overlaps(table, Pm4::IndirectRegisterTableBytes(packet));
+            }
+            // (counts packet[4] pairs of 8 bytes even when packet[3] selects 4-byte values: an overestimate)
+            return !DrawPipeline::Queue0().Overlaps(table, static_cast<std::size_t>(packet[4]) * 8);
+        }
         case 0x50: {
             if (packet.size() < 7) return false;
             const auto destination = Pm4::DmaDestination(packet);
@@ -160,6 +179,7 @@ void Driver::execute(const Submission& submission) {
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     DrawPipeline::Active() = pipelined;
     DrawPipeline::DispatchItems() = pipelined && (pipelineDispatch() || pipeSwitch);
+    const Submission* keepIndirectRegs = pipelined && ArchB::Switches::Enabled(ArchB::Feature::PipeKeepIndirectRegs) ? &submission : nullptr;
     if (submission.queue == 0) {
         DrawPipeline::RegisterCounters();
         if (pipelined) DrawPipeline::CountSubmission();
@@ -341,7 +361,7 @@ void Driver::execute(const Submission& submission) {
             }
         }
         timing.Mark("pipeline_prepare");
-        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode, keepIndirectRegs, cursor)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         timing.Mark("pipeline_drain");
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);

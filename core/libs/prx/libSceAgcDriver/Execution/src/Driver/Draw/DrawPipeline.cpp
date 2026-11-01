@@ -37,6 +37,7 @@ struct PipeCounters {
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> drains{};
     std::atomic<std::uint64_t> enqueues{0};
     std::atomic<std::uint64_t> submissions{0};
+    std::atomic<std::uint64_t> keptIndirectRegs{0};
     std::atomic<std::uint64_t> lockedDrains{0};
     std::atomic<std::uint64_t> fullWaits{0};
     std::atomic<std::uint64_t> fullOvercommits{0};
@@ -357,6 +358,7 @@ void DrawPipeline::RegisterCounters() {
         for (std::size_t i = 0; i < DrainCounterNames.size(); ++i) ArchB::Recorder::RegisterCounter(DrainCounterNames[i], counters.drains[i]);
         ArchB::Recorder::RegisterCounter("pipe_enqueues", counters.enqueues);
         ArchB::Recorder::RegisterCounter("pipe_submissions", counters.submissions);
+        ArchB::Recorder::RegisterCounter("pipe_keep_indirect_regs", counters.keptIndirectRegs);
         ArchB::Recorder::RegisterCounter("pipe_drains_locked", counters.lockedDrains);
         ArchB::Recorder::RegisterCounter("pipe_full_waits", counters.fullWaits);
         ArchB::Recorder::RegisterCounter("pipe_full_overcommits", counters.fullOvercommits);
@@ -367,6 +369,10 @@ void DrawPipeline::RegisterCounters() {
 
 void DrawPipeline::CountSubmission() {
     pipeCounters().submissions.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawPipeline::CountKeptIndirectRegisters() {
+    pipeCounters().keptIndirectRegs.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t DrawPipeline::LockedDrains() {
@@ -496,6 +502,8 @@ std::string DrawPipeline::CumulativeText() {
         text += item;
     }
     std::snprintf(item, sizeof(item), "; drain wait %.1f ms; %llu enqueues, %llu submissions", static_cast<double>(counters.drainWaitNs.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.enqueues.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.submissions.load(std::memory_order_relaxed)));
+    text += item;
+    std::snprintf(item, sizeof(item), "; %llu register packets kept the pipeline", static_cast<unsigned long long>(counters.keptIndirectRegs.load(std::memory_order_relaxed)));
     text += item;
     std::snprintf(item, sizeof(item), "; full: %llu waits (%.1f ms), %llu overcommits; locked drains %llu", static_cast<unsigned long long>(counters.fullWaits.load(std::memory_order_relaxed)), static_cast<double>(counters.fullWaitNs.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.fullOvercommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.lockedDrains.load(std::memory_order_relaxed)));
     text += item;

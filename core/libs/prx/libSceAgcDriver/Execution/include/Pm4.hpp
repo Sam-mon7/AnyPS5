@@ -93,6 +93,9 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue);
 inline bool IndirectRegisterOpcode(std::uint32_t opcode) { return opcode == 0x63 || opcode == 0x64 || opcode == 0x9f; }
 std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet);
 bool IndirectRegistersValid(std::span<const std::uint32_t> pairs);
+// Guest bytes ReadIndirectRegisters reads for a 5-DWORD 0x63/0x64/0x9f packet: packet[4] offset/value
+// pairs (8 bytes each) when packet[3] is 0x80000000, else packet[4] consecutive values (4 bytes each).
+inline std::size_t IndirectRegisterTableBytes(std::span<const std::uint32_t> packet) { return static_cast<std::size_t>(packet[4]) * (packet[3] == 0x80000000u ? 8u : 4u); }
 void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> pairs, QueueState& queue, bool skipInvalid = false);
 bool AccessesMemory(std::uint32_t header);
 // Whether an ACQUIRE_MEM packet asks only for GPU cache actions (no CPU-visible memory

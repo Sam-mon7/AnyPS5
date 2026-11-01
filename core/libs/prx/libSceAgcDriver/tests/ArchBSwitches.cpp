@@ -86,6 +86,12 @@ void toggleCase(const std::string& name) {
     if (name == "VqMemo" || imageTable || bitScanKeys) setEnvironment(bitScanKeys ? "APS5_ARCHB_FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "APS5_ARCHB_FIX_VQ_MEMO", nullptr);
     if (bookkeeping) setEnvironment("APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING", nullptr);
     if (pipeQ0) setEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", nullptr);
+    const bool keepRegisters = name == "PipeKeepIndirectRegs";
+    if (keepRegisters) {
+        setEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", nullptr);
+        // From the environment without PIPE_Q0_COMMITTER: refused at startup (prerequisite).
+        setEnvironment("APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS", "1");
+    }
     if (name == "AllocChurn") setEnvironment("APS5_ARCHB_FIX_ALLOC_CHURN", nullptr);
     const bool genTable = name == "GenTable";
     // Switches that require GEN_TABLE (slice S1 GEN_SHADOW, S2 GEN_LOCKFREE): same contract.
@@ -156,6 +162,23 @@ void toggleCase(const std::string& name) {
         check(!Switches::Enabled(Feature::GenTable) && !Switches::Enabled(dependent.feature), token + " stayed on after GEN_TABLE turned off");
         write("4 GEN_TABLE=1");
         check(Switches::Enabled(Feature::GenTable) && !Switches::Enabled(dependent.feature), "GEN_TABLE alone did not turn on alone");
+    } else if (keepRegisters) {
+        // A2 cut: runtime, default off, requires PIPE_Q0_COMMITTER (named alone it is refused, and it
+        // drops when the committer switch does).
+        bool listed = false;
+        for (const auto& entry : Switches::Table()) {
+            if (entry.feature != Feature::PipeKeepIndirectRegs) continue;
+            listed = true;
+            check(std::string(entry.name) == "PIPE_KEEP_INDIRECT_REGS" && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::PipeQ0Committer, "PIPE_KEEP_INDIRECT_REGS switch contract");
+        }
+        check(listed, "PIPE_KEEP_INDIRECT_REGS is listed");
+        check(!Switches::Enabled(Feature::PipeKeepIndirectRegs), "PIPE_KEEP_INDIRECT_REGS started on without PIPE_Q0_COMMITTER");
+        write("1 PIPE_KEEP_INDIRECT_REGS=1");
+        check(!Switches::Enabled(Feature::PipeKeepIndirectRegs), "PIPE_KEEP_INDIRECT_REGS turned on without PIPE_Q0_COMMITTER");
+        write("2 PIPE_Q0_COMMITTER=1 PIPE_KEEP_INDIRECT_REGS=1");
+        check(Switches::Enabled(Feature::PipeQ0Committer) && Switches::Enabled(Feature::PipeKeepIndirectRegs), "the committer and PIPE_KEEP_INDIRECT_REGS did not turn on together");
+        write("3 PIPE_Q0_COMMITTER=0");
+        check(!Switches::Enabled(Feature::PipeQ0Committer) && !Switches::Enabled(Feature::PipeKeepIndirectRegs), "PIPE_KEEP_INDIRECT_REGS stayed on after the committer switch turned off");
     } else if (name == "AllocChurn") {
         using AgcDriver::ArchB::AllocChurnActive;
         using AgcDriver::ArchB::AllocChurnScope;
