@@ -25,6 +25,8 @@ namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission", "transition"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainCounterNames{"pipe_drains_packet", "pipe_drains_flush", "pipe_drains_labels", "pipe_drains_capture", "pipe_drains_indirect", "pipe_drains_submission", "pipe_drains_transition"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainCause::Count)> CauseNames{"none", "indirect_args", "indirect_args_draw", "indirect_args_dispatch", "indirect_args_label", "indirect_args_other", "indirect_count", "indirect_disabled", "indirect_cpu_records", "indirect_inline", "regs_overlap", "regs_invalid", "wait_held_mismatch", "wait_overlap", "wait_unsatisfied", "dispatch_ahead", "dispatch_items_off", "dispatch_indirect", "dispatch_labels", "dispatch_copy", "dispatch_miss", "dispatch_verify", "dispatch_reads", "dispatch_no_recipe", "dispatch_writes", "dispatch_gate", "fill_inputs", "fills_unordered", "metadata_pass", "capture_variant", "capture_pending", "capture_shader"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainCause::Count)> CauseCounterNames{"pipe_drain_cause_none", "pipe_drain_cause_indirect_args", "pipe_drain_cause_indirect_args_draw", "pipe_drain_cause_indirect_args_dispatch", "pipe_drain_cause_indirect_args_label", "pipe_drain_cause_indirect_args_other", "pipe_drain_cause_indirect_count", "pipe_drain_cause_indirect_disabled", "pipe_drain_cause_indirect_cpu_records", "pipe_drain_cause_indirect_inline", "pipe_drain_cause_regs_overlap", "pipe_drain_cause_regs_invalid", "pipe_drain_cause_wait_held_mismatch", "pipe_drain_cause_wait_overlap", "pipe_drain_cause_wait_unsatisfied", "pipe_drain_cause_dispatch_ahead", "pipe_drain_cause_dispatch_items_off", "pipe_drain_cause_dispatch_indirect", "pipe_drain_cause_dispatch_labels", "pipe_drain_cause_dispatch_copy", "pipe_drain_cause_dispatch_miss", "pipe_drain_cause_dispatch_verify", "pipe_drain_cause_dispatch_reads", "pipe_drain_cause_dispatch_no_recipe", "pipe_drain_cause_dispatch_writes", "pipe_drain_cause_dispatch_gate", "pipe_drain_cause_fill_inputs", "pipe_drain_cause_fills_unordered", "pipe_drain_cause_metadata_pass", "pipe_drain_cause_capture_variant", "pipe_drain_cause_capture_pending", "pipe_drain_cause_capture_shader"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> KindNames{"other", "draw", "dispatch", "label", "dma", "fill"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> CommitCounterNames{"pipe_commits_other", "pipe_commits_draw", "pipe_commits_dispatch", "pipe_commits_label", "pipe_commits_dma", "pipe_commits_fill"};
 // Depth when APS5_ARCHB_PIPE_Q0_COMMITTER pipelines queue 0 (APS5_PIPELINED_DRAWS=1 selects the same).
@@ -35,6 +37,7 @@ constexpr std::size_t SwitchDepth = 8;
 struct PipeCounters {
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> commits{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> drains{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::DrainCause::Count)> causes{};
     std::atomic<std::uint64_t> enqueues{0};
     std::atomic<std::uint64_t> submissions{0};
     std::atomic<std::uint64_t> keptIndirectRegs{0};
@@ -356,6 +359,7 @@ void DrawPipeline::RegisterCounters() {
         auto& counters = pipeCounters();
         for (std::size_t i = 0; i < CommitCounterNames.size(); ++i) ArchB::Recorder::RegisterCounter(CommitCounterNames[i], counters.commits[i]);
         for (std::size_t i = 0; i < DrainCounterNames.size(); ++i) ArchB::Recorder::RegisterCounter(DrainCounterNames[i], counters.drains[i]);
+        for (std::size_t i = 0; i < CauseCounterNames.size(); ++i) ArchB::Recorder::RegisterCounter(CauseCounterNames[i], counters.causes[i]);
         ArchB::Recorder::RegisterCounter("pipe_enqueues", counters.enqueues);
         ArchB::Recorder::RegisterCounter("pipe_submissions", counters.submissions);
         ArchB::Recorder::RegisterCounter("pipe_keep_indirect_regs", counters.keptIndirectRegs);
@@ -501,6 +505,13 @@ std::string DrawPipeline::CumulativeText() {
         std::snprintf(item, sizeof(item), " %s %llu", DrainNames[i], static_cast<unsigned long long>(counters.drains[i].load(std::memory_order_relaxed)));
         text += item;
     }
+    text += "; by cause";
+    for (std::size_t i = 0; i < CauseNames.size(); ++i) {
+        const auto count = counters.causes[i].load(std::memory_order_relaxed);
+        if (count == 0) continue;
+        std::snprintf(item, sizeof(item), " %s %llu", CauseNames[i], static_cast<unsigned long long>(count));
+        text += item;
+    }
     std::snprintf(item, sizeof(item), "; drain wait %.1f ms; %llu enqueues, %llu submissions", static_cast<double>(counters.drainWaitNs.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.enqueues.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.submissions.load(std::memory_order_relaxed)));
     text += item;
     std::snprintf(item, sizeof(item), "; %llu register packets kept the pipeline", static_cast<unsigned long long>(counters.keptIndirectRegs.load(std::memory_order_relaxed)));
@@ -632,7 +643,7 @@ void DrawPipeline::ReleaseRetired() {
     std::swap(done, retired);
 }
 
-void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
+void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode, DrainCause cause) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) {
@@ -640,13 +651,13 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
         // a caller that did not is counted and waits with its hold given up, because the committer
         // needs the mutex to empty the pipeline.
         noteLockedDrain("draw pipeline", static_cast<unsigned>(reason), opcode);
-        waitWithoutGpuLock([&] { drainUnlocked(reason, opcode, finisherBusy); });
+        waitWithoutGpuLock([&] { drainUnlocked(reason, opcode, cause, finisherBusy); });
         return;
     }
-    drainUnlocked(reason, opcode, finisherBusy);
+    drainUnlocked(reason, opcode, cause, finisherBusy);
 }
 
-void DrawPipeline::drainUnlocked(DrainReason reason, std::uint32_t opcode, bool finisherBusy) {
+void DrawPipeline::drainUnlocked(DrainReason reason, std::uint32_t opcode, DrainCause cause, bool finisherBusy) {
     if (finisherBusy) DrawFinisher::Get().Drain();
     if (!Busy()) return;
     const auto start = std::chrono::steady_clock::now();
@@ -662,6 +673,7 @@ void DrawPipeline::drainUnlocked(DrainReason reason, std::uint32_t opcode, bool 
     drainWaitNs[index] += waited;
     auto& counters = pipeCounters();
     counters.drains[index].fetch_add(1, std::memory_order_relaxed);
+    counters.causes[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
     counters.drainWaitNs.fetch_add(waited, std::memory_order_relaxed);
     if (ArchB::Recorder::Enabled()) ArchB::Recorder::Count("pipe_drain_wait_ms", static_cast<double>(waited) / 1e6);
     rethrowFailure();
@@ -766,6 +778,15 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
         }
     }
     return false;
+}
+
+std::optional<DrawPipeline::ItemKind> DrawPipeline::NewestWriter(std::uint64_t address, std::size_t bytes) {
+    const auto end = address + bytes;
+    std::lock_guard lock(mutex);
+    for (auto item = items.rbegin(); item != items.rend(); ++item) {
+        if (std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; })) return item->kind;
+    }
+    return std::nullopt;
 }
 
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {

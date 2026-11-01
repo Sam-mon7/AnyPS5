@@ -53,13 +53,18 @@ bool waitTakesPendingLabel(std::span<const std::uint32_t> packet) {
 
 // `keepIndirectRegs` (APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS, sampled per submission; null: off) is the
 // submission whose register lists 0x63/0x64/0x9f execute from, and `cursor` the packet's offset in it.
-bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, const Submission* keepIndirectRegs = nullptr, std::size_t cursor = 0) {
+// `cause` (optional) says why a packet that does not keep the pipeline needs the drain, where split.
+bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, const Submission* keepIndirectRegs = nullptr, std::size_t cursor = 0, DrawPipeline::DrainCause* cause = nullptr) {
+    const auto because = [cause](DrawPipeline::DrainCause value) {
+        if (cause != nullptr) *cause = value;
+        return false;
+    };
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
     switch (opcode) {
         case 0x11: case 0x12: case 0x13: case 0x20: case 0x26: case 0x2a: case 0x2f: case 0x42: case 0x58: case 0x59: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: return true;
         case 0x46: return packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
-        case 0x15: return orderedFills();
+        case 0x15: return orderedFills() || because(DrawPipeline::DrainCause::FillsUnordered);
         case 0x63: case 0x64: case 0x9f: {
             if (packet.size() < 5) return false;
             const auto table = packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u);
@@ -73,10 +78,10 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
                     DrawPipeline::CountKeptIndirectRegisters();
                     return true;
                 }
-                return !DrawPipeline::Queue0().Overlaps(table, Pm4::IndirectRegisterTableBytes(packet));
+                return !DrawPipeline::Queue0().Overlaps(table, Pm4::IndirectRegisterTableBytes(packet)) || because(DrawPipeline::DrainCause::RegistersInvalid);
             }
             // (counts packet[4] pairs of 8 bytes even when packet[3] selects 4-byte values: an overestimate)
-            return !DrawPipeline::Queue0().Overlaps(table, static_cast<std::size_t>(packet[4]) * 8);
+            return !DrawPipeline::Queue0().Overlaps(table, static_cast<std::size_t>(packet[4]) * 8) || because(DrawPipeline::DrainCause::RegistersOverlap);
         }
         case 0x50: {
             if (packet.size() < 7) return false;
@@ -94,9 +99,9 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
             if (packet.size() < 5) return false;
             const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
             const auto bytes = Pm4::WaitAwaitedBytes(packet);
-            if (DrawPipeline::Queue0().Overlaps(awaited, bytes)) return false;
+            if (DrawPipeline::Queue0().Overlaps(awaited, bytes)) return because(DrawPipeline::DrainCause::WaitOverlap);
             GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), bytes, bytes);
-            return Pm4::WaitSatisfiedUnchecked(packet);
+            return Pm4::WaitSatisfiedUnchecked(packet) || because(DrawPipeline::DrainCause::WaitUnsatisfied);
         }
         case 0x10: {
             const auto operation = (header >> 2u) & 0x3fu;
@@ -332,10 +337,12 @@ void Driver::execute(const Submission& submission) {
             cursor = nextCursor;
             continue;
         }
+        bool heldLabelMismatch = false;
         if (pipelined && !predicated && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && orderedWaits && DrawPipeline::Queue0().Busy()) {
             const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
             const std::uint64_t awaited = (packet[2] & (awaitedBytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
             const auto value = DrawPipeline::Queue0().PendingLabel(awaited, awaitedBytes);
+            heldLabelMismatch = value.has_value();
             if (value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
                 if (profilePackets) {
                     Graphics::Recorder::WaitProfile sample(submission.queue, awaited, awaitedBytes);
@@ -361,7 +368,13 @@ void Driver::execute(const Submission& submission) {
             }
         }
         timing.Mark("pipeline_prepare");
-        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode, keepIndirectRegs, cursor)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        if (pipelined && DrawPipeline::Queue0().Busy()) {
+            auto cause = DrawPipeline::DrainCause::None;
+            if (!keepsDrawPipeline(packet, header, opcode, keepIndirectRegs, cursor, &cause)) {
+                if (cause == DrawPipeline::DrainCause::WaitOverlap && heldLabelMismatch) cause = DrawPipeline::DrainCause::WaitHeldMismatch;
+                DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode, cause);
+            }
+        }
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         timing.Mark("pipeline_drain");
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
@@ -499,7 +512,7 @@ void Driver::execute(const Submission& submission) {
             if (gateOpened()) {
                 gateOpened() = false;
                 if (!(pipelineDispatch() || DrawPipeline::DispatchItems()) || submission.queue != 0) {
-                    if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+                    if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode, DrawPipeline::DrainCause::DispatchGate);
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
                 }
             }

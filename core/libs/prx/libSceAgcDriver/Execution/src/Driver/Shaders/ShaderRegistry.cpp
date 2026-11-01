@@ -83,7 +83,7 @@ namespace {
 void DrainShaderWrites(std::uint64_t address, std::size_t bytes) {
     if (!DrawPipeline::Active()) return;
     auto& pipeline = DrawPipeline::Queue0();
-    if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+    if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x100, DrawPipeline::DrainCause::CaptureShader);
 }
 
 }

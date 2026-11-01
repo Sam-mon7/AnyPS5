@@ -35,6 +35,43 @@ public:
     // What an item commits, for the pipe_commits_* counters only (the `draw` flag of Enqueue keeps
     // its own meaning: a non-draw item breaks proofs after it runs).
     enum class ItemKind : std::uint8_t { Other, Draw, Dispatch, Label, Dma, Fill, Count };
+    // Why a drain was needed, finer than DrainReason, for choosing the next drain cut (counters
+    // pipe_drain_cause_<name>, counted only when the drain waited). None: not split.
+    enum class DrainCause : std::uint8_t {
+        None,
+        IndirectArgs,          // indirect draw arguments overlap queued writes (writer not found: finisher)
+        IndirectArgsDraw,      // ... and the newest overlapping item is a draw
+        IndirectArgsDispatch,  // ... a dispatch item
+        IndirectArgsLabel,     // ... a label or EOP item
+        IndirectArgsOther,     // ... a DMA, fill or other item
+        IndirectCount,         // its count word does (arguments clear)
+        IndirectDisabled,      // APS5_NO_PIPELINED_INDIRECT
+        IndirectCpuRecords,    // CPU-indirect draw: records before the last are drawn inline
+        IndirectInline,        // indirect draw (or its last record) drawn inline: labels queued or the mutex held
+        RegistersOverlap,      // 0x63/0x64/0x9f table overlaps queued writes (APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS off)
+        RegistersInvalid,      // invalid submission-time list read again, table overlaps queued writes
+        WaitHeldMismatch,      // 0x3c/0x93: the pipeline holds the awaited label, its value fails the compare
+        WaitOverlap,           // awaited memory overlaps queued writes, no held label value
+        WaitUnsatisfied,       // no overlap, the compare fails on memory
+        DispatchAhead,         // dispatch resolved ahead or resolving (not an item candidate)
+        DispatchItemsOff,      // dispatch items off
+        DispatchIndirect,      // indirect dispatch arguments
+        DispatchLabels,        // labels queued outside the pipeline
+        DispatchCopy,          // copy kernel (copied by the driver)
+        DispatchMiss,          // candidate: no dispatch-cache entry (or the cache is off / stamps validate)
+        DispatchVerify,        // candidate: APS5_VERIFY_DATA_HITS
+        DispatchReads,         // candidate: the entry reads memory a queued item writes
+        DispatchNoRecipe,      // cached, no recipe
+        DispatchWrites,        // cached with a recipe, writes not bounded
+        DispatchGate,          // the packet that opened the gate resolves dispatches ahead (items off)
+        FillInputs,            // a fill reads its pattern or control from queued writes
+        FillsUnordered,        // APS5_PIPELINE_DRAIN_FILLS
+        MetadataPass,          // color metadata pass not pipelined
+        CaptureVariant,        // a variant's runs overlap queued writes
+        CapturePending,        // a capture reads memory a queued item writes
+        CaptureShader,         // shader code written by a queued item
+        Count
+    };
 
     static DrawPipeline& Queue0();
     // APS5_PIPELINED_DRAWS as read at startup (0 when unset or blocked); see SampleQueue0.
@@ -72,13 +109,15 @@ public:
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other);
     // Waits until every queued item has committed. A caller holding the GPU mutex must drain before
     // taking it; if one does not, the wait runs with its hold given up (counted, see LockedDrains).
-    void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    void Drain(DrainReason reason, std::uint32_t opcode = 0x100, DrainCause cause = DrainCause::None);
     void Stop();
     void ReleaseRetired();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     bool Busy() const;
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
+    // The kind of the newest queued item whose writes overlap the range (for drain causes only).
+    std::optional<ItemKind> NewestWriter(std::uint64_t address, std::size_t bytes);
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     Watch WatchWrites();
     bool WrittenSince(const Watch& watch, const std::vector<Range>& reads);
@@ -105,7 +144,7 @@ private:
     };
     DrawPipeline() = default;
     void run();
-    void drainUnlocked(DrainReason reason, std::uint32_t opcode, bool finisherBusy);
+    void drainUnlocked(DrainReason reason, std::uint32_t opcode, DrainCause cause, bool finisherBusy);
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);

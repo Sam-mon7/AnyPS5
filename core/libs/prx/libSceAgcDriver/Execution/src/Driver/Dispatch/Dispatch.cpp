@@ -260,7 +260,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
-        if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Active() && !pipelineCandidate) {
+            const auto cause = resolving || fromAhead ? DrawPipeline::DrainCause::DispatchAhead : !DrawPipeline::DispatchItems() ? DrawPipeline::DrainCause::DispatchItemsOff : indirectArguments != 0 ? DrawPipeline::DrainCause::DispatchIndirect : !deferredLabels().labels.empty() ? DrawPipeline::DrainCause::DispatchLabels : DrawPipeline::DrainCause::DispatchCopy;
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, cause);
+        }
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
@@ -423,6 +426,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     phaseTiming.Phase(PhaseKey);
     timing.Mark("decode_key_device_setup");
     bool readsClear = false;
+    auto fallbackCause = DrawPipeline::DrainCause::DispatchReads;
     if (pipelineCandidate) {
         std::vector<ShaderRecompiler::MemoryRegion> reads;
         bool entryFound = false;
@@ -435,13 +439,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         if (!entryFound || noDispatchCache || stampValidate()) {
             NoteItemFallback(ItemFallback::Miss);
+            fallbackCause = DrawPipeline::DrainCause::DispatchMiss;
         } else if (verifyDataHits()) {
             NoteItemFallback(ItemFallback::Verify);
+            fallbackCause = DrawPipeline::DrainCause::DispatchVerify;
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
         }
-        if (!readsClear && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!readsClear && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, fallbackCause);
     }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
@@ -472,10 +478,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
             pipelined = bounded;
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
+            fallbackCause = DrawPipeline::DrainCause::DispatchWrites;
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
+            fallbackCause = DrawPipeline::DrainCause::DispatchNoRecipe;
         }
-        if (!pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, fallbackCause);
     }
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
