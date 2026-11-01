@@ -107,6 +107,9 @@ public:
     // APS5_ARCHB_PIPE_NARROW_DISPATCH_WRITES: a queue-0 dispatch item was enqueued because its BDA program
     // without BDA writes is bounded by its written bindings (pipe_dispatch_writes_narrowed).
     static void CountNarrowedDispatchWrites();
+    // APS5_ARCHB_PIPE_KEEP_OWN_LABEL_WAITS: a queue-0 WAIT_REG_MEM whose compare fails on memory kept the
+    // busy pipeline because queue 0's own earlier label store satisfies it (pipe_own_label_waits_kept).
+    static void CountKeptOwnLabelWait();
     // One "[pipe] cumulative: ..." line (printed with the [draw] pipelined report and at shutdown).
     static std::string CumulativeText();
     // Fallback counts: drains requested while the calling thread held the GPU mutex (waited with the

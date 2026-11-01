@@ -39,6 +39,7 @@ enum class Feature : std::uint8_t {
     PipeNarrowDrawWrites,
     PipeNarrowSlicedDepth,
     PipeNarrowDispatchWrites,
+    PipeKeepOwnLabelWaits,
     Count
 };
 

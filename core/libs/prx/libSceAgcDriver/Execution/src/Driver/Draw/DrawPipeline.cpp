@@ -46,6 +46,7 @@ struct PipeCounters {
     std::atomic<std::uint64_t> narrowedDrawWrites{0};
     std::atomic<std::uint64_t> narrowedSlicedDepth{0};
     std::atomic<std::uint64_t> narrowedDispatchWrites{0};
+    std::atomic<std::uint64_t> keptOwnLabelWaits{0};
     std::atomic<std::uint64_t> lockedDrains{0};
     std::atomic<std::uint64_t> fullWaits{0};
     std::atomic<std::uint64_t> fullOvercommits{0};
@@ -372,6 +373,7 @@ void DrawPipeline::RegisterCounters() {
         ArchB::Recorder::RegisterCounter("pipe_draw_writes_narrowed", counters.narrowedDrawWrites);
         ArchB::Recorder::RegisterCounter("pipe_sliced_depth_narrowed", counters.narrowedSlicedDepth);
         ArchB::Recorder::RegisterCounter("pipe_dispatch_writes_narrowed", counters.narrowedDispatchWrites);
+        ArchB::Recorder::RegisterCounter("pipe_own_label_waits_kept", counters.keptOwnLabelWaits);
         ArchB::Recorder::RegisterCounter("pipe_drains_locked", counters.lockedDrains);
         ArchB::Recorder::RegisterCounter("pipe_full_waits", counters.fullWaits);
         ArchB::Recorder::RegisterCounter("pipe_full_overcommits", counters.fullOvercommits);
@@ -406,6 +408,10 @@ void DrawPipeline::CountNarrowedSlicedDepth() {
 
 void DrawPipeline::CountNarrowedDispatchWrites() {
     pipeCounters().narrowedDispatchWrites.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawPipeline::CountKeptOwnLabelWait() {
+    pipeCounters().keptOwnLabelWaits.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t DrawPipeline::LockedDrains() {
@@ -548,6 +554,8 @@ std::string DrawPipeline::CumulativeText() {
     std::snprintf(item, sizeof(item), "; %llu indirect draws kept it over their arguments; %llu draw write sets narrowed", static_cast<unsigned long long>(counters.keptIndirectArguments.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowedDrawWrites.load(std::memory_order_relaxed)));
     text += item;
     std::snprintf(item, sizeof(item), "; %llu sliced depth write sets narrowed; %llu dispatch write sets narrowed", static_cast<unsigned long long>(counters.narrowedSlicedDepth.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowedDispatchWrites.load(std::memory_order_relaxed)));
+    text += item;
+    std::snprintf(item, sizeof(item), "; %llu waits kept on own labels", static_cast<unsigned long long>(counters.keptOwnLabelWaits.load(std::memory_order_relaxed)));
     text += item;
     text += DrawWriteDiagText();
     text += DrainDiagText();
