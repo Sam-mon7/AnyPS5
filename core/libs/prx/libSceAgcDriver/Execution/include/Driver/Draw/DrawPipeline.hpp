@@ -70,6 +70,8 @@ public:
         CaptureVariant,        // a variant's runs overlap queued writes
         CapturePending,        // a capture reads memory a queued item writes
         CaptureShader,         // shader code written by a queued item
+        IndirectCpuRead,       // APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS: a CPU-side indirect draw reads arguments queued items write
+        IndirectEmptySkip,     // ... the empty-draw skip of a known CPU-side program does
         Count
     };
 
@@ -91,6 +93,10 @@ public:
     static void CountSubmission();
     // APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS: a 0x63/0x64/0x9f packet kept the busy pipeline (pipe_keep_indirect_regs).
     static void CountKeptIndirectRegisters();
+    // APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS: an indirect draw whose arguments (or count) queued writes
+    // overlap was enqueued without draining (pipe_indirect_gpu_args_kept).
+    static void CountKeptIndirectArguments();
+    static std::uint64_t KeptIndirectArguments();
     // One "[pipe] cumulative: ..." line (printed with the [draw] pipelined report and at shutdown).
     static std::string CumulativeText();
     // Fallback counts: drains requested while the calling thread held the GPU mutex (waited with the

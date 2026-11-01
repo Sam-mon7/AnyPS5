@@ -30,6 +30,7 @@ enum class Feature : std::uint8_t {
     FixComputeSyncUnlocked,
     PipeQ0Committer,
     PipeKeepIndirectRegs,
+    PipeIndirectGpuArgs,
     Count
 };
 
