@@ -143,6 +143,8 @@ struct DrawTail {
     // APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS, sampled once per draw: the enqueue did not drain for arguments
     // queued items write; CPU reads of them drain first (drainBeforeArgumentRead).
     bool indirectGpuArgs = false;
+    // APS5_ARCHB_PIPE_NARROW_DRAW_WRITES, sampled once per draw (the finisher takes it from the tail).
+    bool narrowDrawWrites = false;
     bool feedbackMask = false;
     bool pipelineStateReuse = false;
     bool memoVirtualQuery = false;
@@ -429,6 +431,15 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
     return HostThreadLocal<std::unordered_map<std::uint64_t, bool>, CpuIndirectProgramsStorage>();
 }
 
+// The write set a queued draw announces; APS5_ARCHB_PIPE_NARROW_DRAW_WRITES bounds programs on the BDA
+// ABI without BDA writes and HTILE depth targets (counted when the bounded set has one of them, which
+// without the switch would have made it unbounded).
+std::vector<DrawPipeline::Range> queuedDrawWrites(const DrawTail& tail, const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
+    auto writes = DrawWriteRanges(graphics, stages, ExactDrawWrites(), tail.narrowDrawWrites);
+    if (tail.narrowDrawWrites && !UnboundedWrites(writes) && ((graphics.depth && graphics.depth->htileAddress != 0) || std::any_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program != nullptr && stage.program->bdaAbiVersion != 0; }))) DrawPipeline::CountNarrowedDrawWrites();
+    return writes;
+}
+
 // APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS: before the enqueue side reads an indirect draw's records or count
 // on the CPU, the queued items that write them commit (and their writes are announced, so the read's
 // flush hook waits for the GPU), as the drain at the start of the draw did with the switch off.
@@ -495,6 +506,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     tail.pipelined = DrawPipeline::Active();
     const bool pipelined = tail.pipelined;
+    tail.narrowDrawWrites = pipelined && ArchB::Switches::Enabled(ArchB::Feature::PipeNarrowDrawWrites);
     static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
     if (pipelined && drawParameters.indirect) {
         const auto& indirect = *drawParameters.indirect;
@@ -1519,7 +1531,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             }
             if (pipelined && pipelinedIndirect && record == lastDrawable && !gpuLock.owns_lock() && deferredLabels().labels.empty()) {
                 phaseTiming.Phase(DrawRowVectors);
-                auto writes = drawWriteRanges(graphics, stages);
+                auto writes = queuedDrawWrites(tail, graphics, stages);
                 if (PipeWriteDiag()) NoteDrawWriteTags(graphics, stages);
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = tail.packetOpcode;
@@ -1572,7 +1584,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
     if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty())) {
         phaseTiming.Phase(DrawRowVectors);
-        auto writes = drawWriteRanges(graphics, stages);
+        auto writes = queuedDrawWrites(tail, graphics, stages);
         if (PipeWriteDiag()) NoteDrawWriteTags(graphics, stages);
         const auto commitQueue = submission.queue;
         const auto commitPacket = tail.packetOpcode;

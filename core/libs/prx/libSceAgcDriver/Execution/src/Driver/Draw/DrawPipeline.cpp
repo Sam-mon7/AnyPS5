@@ -43,6 +43,7 @@ struct PipeCounters {
     std::atomic<std::uint64_t> submissions{0};
     std::atomic<std::uint64_t> keptIndirectRegs{0};
     std::atomic<std::uint64_t> keptIndirectArguments{0};
+    std::atomic<std::uint64_t> narrowedDrawWrites{0};
     std::atomic<std::uint64_t> lockedDrains{0};
     std::atomic<std::uint64_t> fullWaits{0};
     std::atomic<std::uint64_t> fullOvercommits{0};
@@ -366,6 +367,7 @@ void DrawPipeline::RegisterCounters() {
         ArchB::Recorder::RegisterCounter("pipe_submissions", counters.submissions);
         ArchB::Recorder::RegisterCounter("pipe_keep_indirect_regs", counters.keptIndirectRegs);
         ArchB::Recorder::RegisterCounter("pipe_indirect_gpu_args_kept", counters.keptIndirectArguments);
+        ArchB::Recorder::RegisterCounter("pipe_draw_writes_narrowed", counters.narrowedDrawWrites);
         ArchB::Recorder::RegisterCounter("pipe_drains_locked", counters.lockedDrains);
         ArchB::Recorder::RegisterCounter("pipe_full_waits", counters.fullWaits);
         ArchB::Recorder::RegisterCounter("pipe_full_overcommits", counters.fullOvercommits);
@@ -388,6 +390,10 @@ void DrawPipeline::CountKeptIndirectArguments() {
 
 std::uint64_t DrawPipeline::KeptIndirectArguments() {
     return pipeCounters().keptIndirectArguments.load(std::memory_order_relaxed);
+}
+
+void DrawPipeline::CountNarrowedDrawWrites() {
+    pipeCounters().narrowedDrawWrites.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t DrawPipeline::LockedDrains() {
@@ -527,7 +533,7 @@ std::string DrawPipeline::CumulativeText() {
     text += item;
     std::snprintf(item, sizeof(item), "; %llu register packets kept the pipeline", static_cast<unsigned long long>(counters.keptIndirectRegs.load(std::memory_order_relaxed)));
     text += item;
-    std::snprintf(item, sizeof(item), "; %llu indirect draws kept it over their arguments", static_cast<unsigned long long>(counters.keptIndirectArguments.load(std::memory_order_relaxed)));
+    std::snprintf(item, sizeof(item), "; %llu indirect draws kept it over their arguments; %llu draw write sets narrowed", static_cast<unsigned long long>(counters.keptIndirectArguments.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowedDrawWrites.load(std::memory_order_relaxed)));
     text += item;
     text += DrawWriteDiagText();
     std::snprintf(item, sizeof(item), "; full: %llu waits (%.1f ms), %llu overcommits; locked drains %llu", static_cast<unsigned long long>(counters.fullWaits.load(std::memory_order_relaxed)), static_cast<double>(counters.fullWaitNs.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.fullOvercommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.lockedDrains.load(std::memory_order_relaxed)));

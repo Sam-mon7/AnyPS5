@@ -13,8 +13,13 @@
 
 namespace AgcDriver::DriverDetail {
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact);
-std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded);
+// `narrow` (APS5_ARCHB_PIPE_NARROW_DRAW_WRITES, draws only): a program on the BDA ABI whose build has
+// no BDA writes is bounded by its written bindings, and a single-sample, single-slice depth target with
+// HTILE by its planes and HTILE metadata, instead of making the write set unbounded.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact, bool narrow = false);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded, bool readOnlyBda = false);
+// Whether a write set is the unbounded range (0, max).
+bool UnboundedWrites(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 bool ExactDrawWrites();
 std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages);
 

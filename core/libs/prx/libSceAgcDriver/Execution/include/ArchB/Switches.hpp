@@ -36,6 +36,7 @@ enum class Feature : std::uint8_t {
     PipeQ0Committer,
     PipeKeepIndirectRegs,
     PipeIndirectGpuArgs,
+    PipeNarrowDrawWrites,
     Count
 };
 

@@ -141,9 +141,70 @@ void ConservativeWrites() {
 
 }
 
+// APS5_ARCHB_PIPE_NARROW_DRAW_WRITES: a draw program on the BDA ABI without BDA writes is bounded by its
+// written bindings (its page table and fault buffer are driver memory); one with BDA writes, a GDS
+// binding, and dispatches stay unbounded. A single-sample, single-slice HTILE depth target is bounded by
+// its planes and HTILE metadata; multisampled or sliced ones stay unbounded.
+void NarrowedWrites() {
+    using namespace AgcDriver::DriverDetail;
+    using Role = ShaderRecompiler::DescriptorRole;
+    constexpr std::uint64_t base = 0x100000000ull;
+    constexpr auto unbounded = std::numeric_limits<std::uint64_t>::max();
+    ShaderRecompiler::RecompileResult program;
+    program.bdaAbiVersion = 1;
+    program.bdaWrites = false;
+    ShaderRecompiler::DescriptorBinding table, fault, buffer;
+    table.role = Role::BdaPagetable;
+    table.count = 1;
+    fault.role = Role::FaultBuffer;
+    fault.count = 1;
+    buffer.role = Role::GuestBuffers;
+    buffer.count = 1;
+    buffer.guestDescriptor = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u), 256, 0x31016facu};
+    { ShaderRecompiler::DescriptorFlags flags; flags.bufferWritten = {true}; buffer.SetFlags(flags); }
+    program.bindings = {table, fault, buffer};
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Vertex, &program, 0}}};
+    Require(UnboundedWrites(DrawWriteRanges({}, stages, true)), "a BDA program was bounded without the switch");
+    auto narrowed = DrawWriteRanges({}, stages, true, true);
+    Require(!UnboundedWrites(narrowed) && Contains(narrowed, base, base + 256) && !Touches(narrowed, base + 256, unbounded) && !Touches(narrowed, 0, base), "a BDA program without BDA writes was not bounded by its written buffer");
+    bool bounded = true;
+    static_cast<void>(DispatchWriteRanges(program, bounded));
+    Require(!bounded, "a dispatch with a BDA program was bounded without the switch");
+    program.bdaWrites = true;
+    Require(UnboundedWrites(DrawWriteRanges({}, stages, true, true)), "a BDA program with BDA writes was bounded");
+    program.bdaWrites = false;
+    ShaderRecompiler::DescriptorBinding gds;
+    gds.role = Role::Gds;
+    gds.count = 1;
+    program.bindings.push_back(gds);
+    Require(UnboundedWrites(DrawWriteRanges({}, stages, true, true)), "a GDS binding was bounded");
+
+    AgcDriver::Graphics::State state{};
+    state.depth = AgcDriver::Graphics::DepthTarget{};
+    state.depth->address = base;
+    state.depth->stencilAddress = base + 0x10000000;
+    state.depth->htileAddress = base + 0x40000000;
+    state.depth->extent = {1920, 1080};
+    state.depth->format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    state.depth->samples = 1;
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true)), "an HTILE depth target was bounded without the switch");
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, false, true)), "an HTILE depth target was bounded by the estimate");
+    narrowed = DrawWriteRanges(state, {}, true, true);
+    const auto plane = AgcDriver::Graphics::DepthSliceBytes(state.depth->extent, 4u);
+    const auto htile = AgcDriver::Graphics::HtileMetadataBytes(state.depth->extent);
+    Require(!UnboundedWrites(narrowed) && Contains(narrowed, base, base + plane) && Contains(narrowed, state.depth->stencilAddress, state.depth->stencilAddress + AgcDriver::Graphics::DepthSliceBytes(state.depth->extent, 1u)) && Contains(narrowed, state.depth->htileAddress, state.depth->htileAddress + htile), "an HTILE depth target omitted a plane or its metadata");
+    Require(!Touches(narrowed, state.depth->htileAddress + htile, unbounded) && htile >= 32768u, "an HTILE depth target was bounded wider than its metadata");
+    state.depth->samples = 4;
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true, true)), "a multisampled HTILE depth target was bounded");
+    state.depth->samples = 1;
+    state.depth->lastSlice = 2;
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true, true)), "a sliced HTILE depth target was bounded");
+}
+
 int main() {
     try {
         ConservativeWrites();
+        NarrowedWrites();
         using AgcDriver::DriverDetail::DrawWriteRanges;
         constexpr std::uint64_t written = 0x100000000ull;
         constexpr std::uint64_t readOnly = 0x200000000ull;
