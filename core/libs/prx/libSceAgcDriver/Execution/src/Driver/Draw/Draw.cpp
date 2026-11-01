@@ -1479,7 +1479,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     if (identity.programs != 0) addDrawCommit(identity, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committing).count());
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
-                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, {}, false, DrawPipeline::ItemKind::Draw);
                 phaseTiming.Phase(DrawRowLockWait);
                 timing.Mark("draw_enqueued");
                 return drawn();
@@ -1532,7 +1532,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             if (identity.programs != 0) addDrawCommit(identity, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committing).count());
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true);
+        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw);
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();

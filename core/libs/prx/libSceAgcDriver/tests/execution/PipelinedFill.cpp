@@ -166,7 +166,7 @@ void FillIntoFullPipeline() {
     Pattern = {0x5a5a5a5au, 0, 0, 0};
     Control = {256, 0, 0, 0};
     Labels.fill(0);
-    const auto depth = DrawPipeline::Depth();
+    const auto depth = DrawPipeline::Capacity();
     Require(depth >= 3 && depth - 2 <= Labels.size(), "unexpected draw pipeline depth " + std::to_string(depth));
     std::vector<std::uint32_t> words;
     AppendScratchFill(words);
@@ -246,11 +246,16 @@ void SatisfiedWaitDrainsOverlappingQueuedWork() {
 }
 
 int main() {
+    // APS5_ARCHB_PIPE_Q0_COMMITTER=1 from the test environment pipelines queue 0 through the runtime
+    // switch instead (APS5_PIPELINED_DRAWS, when set, decides alone).
+    const char* pipeSwitch = std::getenv("APS5_ARCHB_PIPE_Q0_COMMITTER");
+    if (pipeSwitch == nullptr || pipeSwitch[0] != '1') {
 #ifdef _WIN32
-    _putenv_s("APS5_PIPELINED_DRAWS", "1");
+        _putenv_s("APS5_PIPELINED_DRAWS", "1");
 #else
-    setenv("APS5_PIPELINED_DRAWS", "1", 1);
+        setenv("APS5_PIPELINED_DRAWS", "1", 1);
 #endif
+    }
     try {
         {
             const auto device = OpenVulkanTestDevice();

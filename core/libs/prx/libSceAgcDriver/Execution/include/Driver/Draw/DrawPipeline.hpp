@@ -29,10 +29,35 @@ public:
         std::size_t items = 0;
         std::vector<Range> writes;
     };
-    enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
+    // Transition: the first queue-0 submission after APS5_ARCHB_PIPE_Q0_COMMITTER turned off drains
+    // what the pipelined submissions before it left queued.
+    enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Transition, Count };
+    // What an item commits, for the pipe_commits_* counters only (the `draw` flag of Enqueue keeps
+    // its own meaning: a non-draw item breaks proofs after it runs).
+    enum class ItemKind : std::uint8_t { Other, Draw, Dispatch, Label, Dma, Fill, Count };
 
     static DrawPipeline& Queue0();
+    // APS5_PIPELINED_DRAWS as read at startup (0 when unset or blocked); see SampleQueue0.
     static std::size_t Depth();
+    // Whether the queue-0 submission starting now is pipelined, sampled once at its start. When
+    // APS5_PIPELINED_DRAWS is set it alone decides (Depth() != 0, as before the switch existed);
+    // otherwise APS5_ARCHB_PIPE_Q0_COMMITTER does (runtime; `viaSwitch` is set), unless one of the
+    // variables that force Depth() to 0 is set.
+    static bool SampleQueue0(bool& viaSwitch);
+    // Items held before Enqueue waits for room: Depth(), or 8 when the switch pipelines.
+    static std::size_t Capacity();
+    // Whether the calling thread's current submission records eligible dispatches as pipeline items
+    // (APS5_PIPELINE_DISPATCH, or the switch); set with Active() at submission start.
+    static bool& DispatchItems();
+    // Registers the pipe_* recorder counters (once; cheap to call again).
+    static void RegisterCounters();
+    static void CountSubmission();
+    // One "[pipe] cumulative: ..." line (printed with the [draw] pipelined report and at shutdown).
+    static std::string CumulativeText();
+    // Fallback counts: drains requested while the calling thread held the GPU mutex (waited with the
+    // hold given up), and enqueues past the capacity because the thread held the mutex.
+    static std::uint64_t LockedDrains();
+    static std::uint64_t FullOvercommits();
     static std::size_t QueuedItems();
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
@@ -40,7 +65,11 @@ public:
     static void FollowEpoch(std::uint64_t token, std::uint64_t ticket = 0);
     static unsigned Committers();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
+    // Never waits while the calling thread holds the GPU mutex: a full pipeline then takes the item
+    // past its capacity (the committer needs the mutex to make room).
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other);
+    // Waits until every queued item has committed. A caller holding the GPU mutex must drain before
+    // taking it; if one does not, the wait runs with its hold given up (counted, see LockedDrains).
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     void ReleaseRetired();
@@ -70,9 +99,11 @@ private:
         std::vector<std::byte> labelBytes;
         std::vector<Range> reads;
         bool draw = false;
+        ItemKind kind = ItemKind::Other;
     };
     DrawPipeline() = default;
     void run();
+    void drainUnlocked(DrainReason reason, std::uint32_t opcode, bool finisherBusy);
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);
@@ -135,6 +166,8 @@ public:
     static bool Enabled();
     static bool OnFinisherThread();
     static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
+    // Like DrawPipeline: never waits while the caller holds the GPU mutex (Enqueue goes past the
+    // depth; Drain and Settle wait with the hold given up).
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain();
@@ -144,6 +177,7 @@ public:
 private:
     DrawFinisher() = default;
     void run();
+    void waitEmpty(bool rethrow);
     inline static std::atomic<std::size_t> outstanding{0};
     std::mutex mutex;
     std::condition_variable wake;
