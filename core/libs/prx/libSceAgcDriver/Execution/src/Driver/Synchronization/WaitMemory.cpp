@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -170,6 +171,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     if (profile) waitProfile.emplace(queue, awaited, awaitedBytes);
     const auto finishProfile = [&](Graphics::Recorder::WaitEnd end) {
         timelineWait.end = static_cast<std::uint32_t>(end);
+        if (PipeDrainDiag()) ThreadWaitDiag().end = static_cast<int>(end);
         if (profile) waitProfile->end = end;
     };
     static const bool submitLabels = std::getenv("APS5_NO_WAIT_LABEL_SUBMIT") == nullptr;
@@ -195,6 +197,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::optional<std::uint64_t> historyGeneration;
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
         submitWriter(writer);
+        if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(writer);
         if (writer != queue) {
             notePendingWait(packet, queue, received);
             epochPoint.reason = GuestMemory::Gen::TicketReason::WaitGpuLabel;
@@ -241,6 +244,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (trace) traceLate("trusted", hit, refusal);
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
+        if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(hit->queue);
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
@@ -411,6 +415,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
             submitWriter(writer);
+            if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(writer);
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
             finishProfile(Graphics::Recorder::WaitEnd::History);

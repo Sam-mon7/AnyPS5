@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -338,6 +339,8 @@ void Driver::execute(const Submission& submission) {
             continue;
         }
         bool heldLabelMismatch = false;
+        // APS5_PIPE_DRAIN_DIAG: this wait drained with an unsatisfied compare; its waitMemory is timed.
+        bool unsatisfiedWaitDiag = false;
         if (pipelined && !predicated && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && orderedWaits && DrawPipeline::Queue0().Busy()) {
             const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
             const std::uint64_t awaited = (packet[2] & (awaitedBytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
@@ -372,7 +375,19 @@ void Driver::execute(const Submission& submission) {
             auto cause = DrawPipeline::DrainCause::None;
             if (!keepsDrawPipeline(packet, header, opcode, keepIndirectRegs, cursor, &cause)) {
                 if (cause == DrawPipeline::DrainCause::WaitOverlap && heldLabelMismatch) cause = DrawPipeline::DrainCause::WaitHeldMismatch;
+                unsatisfiedWaitDiag = cause == DrawPipeline::DrainCause::WaitUnsatisfied && PipeDrainDiag();
+                bool tableBefore = false;
+                bool sameQueueBefore = false;
+                std::uint64_t awaited = 0;
+                if (unsatisfiedWaitDiag) {
+                    const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
+                    awaited = (packet[2] & (awaitedBytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
+                    const auto hit = Graphics::Recorder::LookupLabel(awaited, awaitedBytes, submission.received);
+                    tableBefore = hit.has_value() && Pm4::WaitComparesValue(packet, hit->value);
+                    sameQueueBefore = tableBefore && hit->queue == submission.queue && !hit->late;
+                }
                 DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode, cause);
+                if (unsatisfiedWaitDiag) NoteUnsatisfiedWaitDrain(awaited, Pm4::WaitSatisfiedUnchecked(packet), tableBefore, sameQueueBefore);
             }
         }
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
@@ -524,7 +539,10 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode == 0x3c || opcode == 0x93) {
             static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
             const auto waitStart = traceGpu ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (unsatisfiedWaitDiag) ThreadWaitDiag() = {};
+            const auto diagStart = unsatisfiedWaitDiag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor), false, skipHeldWaitEpoch(submission, cursor)); });
+            if (unsatisfiedWaitDiag) NoteUnsatisfiedWaitEnd(submission.queue, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - diagStart).count());
             gateOpened() = true;
             if (traceGpu && std::chrono::steady_clock::now() - waitStart > std::chrono::milliseconds(200)) {
 

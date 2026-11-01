@@ -41,6 +41,26 @@ void NoteDrawWriteTags(const Graphics::State& graphics, std::span<const Graphics
 void NoteIndirectWriterOverlap(std::uint64_t arguments, std::uint64_t argumentBytes, std::pair<std::uint64_t, std::uint64_t> writer, std::optional<bool> changed);
 std::string DrawWriteDiagText();
 
+// Drain diagnostics (APS5_PIPE_DRAIN_DIAG=1): why queued dispatches are unbounded (dispatch_writes),
+// how waits that drained with an unsatisfied compare (wait_unsatisfied) ended, and what the copy
+// kernels behind dispatch_copy drains did; a summary in the `[pipe] cumulative:` line.
+bool PipeDrainDiag();
+// `withNarrowed`: also name what remains unbounded when a BDA program without BDA writes is bounded
+// by its written bindings (DispatchWriteRanges `readOnlyBda`).
+void NoteUnboundedDispatchWrites(const ShaderRecompiler::RecompileResult& compiled, bool withNarrowed);
+// How the calling thread's last waitMemory ended (Graphics::Recorder::WaitEnd, -1 unknown) and the queue
+// that wrote the label it took (-1 unknown: memory).
+struct WaitDiagNote {
+    int end = -1;
+    int writer = -1;
+};
+WaitDiagNote& ThreadWaitDiag();
+void NoteUnsatisfiedWaitDrain(std::uint64_t awaited, bool satisfiedAfterDrain, bool tableBefore, bool sameQueueBefore);
+void NoteUnsatisfiedWaitEnd(std::uint32_t queue, double ms);
+// `path`: the CopyPath the copy counted on this thread (-1 none), `copied`: copyBuffer took the dispatch.
+void NoteCopyDrain(const char* kind, int path, bool copied);
+std::string DrainDiagText();
+
 }
 
 #endif

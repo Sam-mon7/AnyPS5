@@ -14,6 +14,11 @@ namespace AgcDriver::DriverDetail {
 std::atomic<std::uint64_t> knownValueEntries{0}, knownValueReads{0}, knownValueVerified{0}, knownValueMismatches{0};
 std::array<std::atomic<std::uint64_t>, CopyPaths> copyPathCounts{};
 
+int& LastCopyPathOnThread() {
+    static thread_local int path = -1;
+    return path;
+}
+
 bool Driver::matchesCopyKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
     static const bool enabled = std::getenv("APS5_NO_COPY_HLE") == nullptr;
     if (!enabled || userData.size() != 12 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1 || !compute.groupIdEnable[0]) return false;
@@ -80,6 +85,7 @@ void Driver::countCopy(int path, std::size_t bytes, std::chrono::steady_clock::t
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (path < 0 || path >= CopyPaths) return;
     copyPathCounts[path].fetch_add(1, std::memory_order_relaxed);
+    LastCopyPathOnThread() = path;
     if (!profile) return;
     using Outcome = VulkanDevice::CopyOutcome;
     static AgcDriver::Mutex countsMutex;
