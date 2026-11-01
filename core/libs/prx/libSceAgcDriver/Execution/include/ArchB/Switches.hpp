@@ -40,6 +40,7 @@ enum class Feature : std::uint8_t {
     PipeNarrowSlicedDepth,
     PipeNarrowDispatchWrites,
     PipeKeepOwnLabelWaits,
+    FixDrawSetPool,
     Count
 };
 

@@ -1,6 +1,7 @@
 #include "prx/libc/include/Api.hpp"
 #include "BdaTests.hpp"
 #include "GraphicsTests.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -5000,6 +5001,7 @@ struct MockDescriptorWrite {
     VkDescriptorType type;
     std::vector<VkDescriptorBufferInfo> buffers;
     std::vector<VkDescriptorImageInfo> images;
+    VkDescriptorSet set = VK_NULL_HANDLE;
 };
 
 struct LiveCounter {
@@ -5275,6 +5277,7 @@ VKAPI_ATTR void VKAPI_CALL mockUpdateDescriptorSets(VkDevice, std::uint32_t coun
         MockDescriptorWrite write{writes[i].dstBinding, writes[i].dstArrayElement, writes[i].descriptorCount, writes[i].descriptorType, {}, {}};
         if (writes[i].pBufferInfo != nullptr) write.buffers.assign(writes[i].pBufferInfo, writes[i].pBufferInfo + writes[i].descriptorCount);
         if (writes[i].pImageInfo != nullptr) write.images.assign(writes[i].pImageInfo, writes[i].pImageInfo + writes[i].descriptorCount);
+        write.set = writes[i].dstSet;
         mock.writes.push_back(write);
     }
 }
@@ -6155,6 +6158,100 @@ void descriptorSnapshotTests() {
         }
         Require(mock.live == 0, "snapshot descriptor resources leaked Vulkan objects");
     }
+}
+
+// APS5_ARCHB_FIX_DRAW_SET_POOL: a draw's set returns to its template when the draw is released, and
+// the template's next draw rewrites only the elements it or the set's previous draw points at a
+// snapshot; an element only the previous draw replaced gets the template's descriptor back.
+void drawSetPoolTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+#ifdef _WIN32
+    _putenv_s("APS5_ARCHB_PIPE_Q0_COMMITTER", "1");
+    _putenv_s("APS5_ARCHB_FIX_DRAW_SET_POOL", "1");
+#else
+    setenv("APS5_ARCHB_PIPE_Q0_COMMITTER", "1", 1);
+    setenv("APS5_ARCHB_FIX_DRAW_SET_POOL", "1", 1);
+#endif
+    Require(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawSetPool), "the draw set pool switch is not on");
+    mock = MockVulkan{};
+    mock.allowCopies = true;
+    auto context = mockContext();
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        auto binding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
+        { auto flags = binding.Flags(); flags.bufferWritten = {false, false}; binding.SetFlags(std::move(flags)); }
+        vertex.bindings.push_back(binding);
+        fragment.bindings.push_back(makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8)));
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        const auto original = findWrite(0).buffers;
+        std::array<std::vector<std::uint32_t>, 2> words;
+        words[0].assign(6, 0x12340000u);
+        words[1].assign(3, 0x12340001u);
+        // One draw snapshotting the elements in `selected` (bit per element of binding 0).
+        const auto draw = [&](unsigned selected) {
+            std::vector<ShaderResources::MovedBuffer> moved;
+            for (std::size_t index = 0; index < 2; ++index) {
+                if ((selected & (1u << index)) != 0) moved.push_back({index, 0, index == 0 ? 24u : 12u, words[index]});
+            }
+            mock.writes.clear();
+            auto bindings = resources.PrepareDrawBindings(recorder, moved);
+            Require(bindings != nullptr && bindings->snapshots.size() == moved.size() && bindings->allocation.set != VK_NULL_HANDLE, "draw snapshots are missing");
+            return bindings;
+        };
+        // Its batch completes: the recorder lets the bindings go (possibly on its release thread).
+        const auto release = [&](std::shared_ptr<ShaderResources::DrawBindings>& bindings) {
+            std::weak_ptr<ShaderResources::DrawBindings> watched = bindings;
+            bindings.reset();
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!watched.expired() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            Require(watched.expired(), "a completed draw's bindings were not released");
+        };
+        const auto snapshotOf = [](const ShaderResources::DrawBindings& bindings, std::size_t index) {
+            const auto& item = bindings.snapshots.at(index);
+            return VkDescriptorBufferInfo{item.buffer->Handle(), item.offset, item.bytes};
+        };
+        const auto same = [](const VkDescriptorBufferInfo& a, const VkDescriptorBufferInfo& b) { return a.buffer == b.buffer && a.offset == b.offset && a.range == b.range; };
+
+        auto first = draw(1u);
+        Require(mock.writes.size() == 2, "a draw without a pooled set did not write every binding");
+        const auto set = first->allocation.set;
+        const auto sets = cache.Counters().sets;
+        release(first);
+
+        auto second = draw(2u);
+        Require(second->allocation.set == set && cache.Counters().sets == sets, "the template's next draw did not reuse its pooled set");
+        Require(mock.writes.size() == 1, "a pooled set was not rewritten at its snapshot elements only");
+        const auto& rewritten = mock.writes.front();
+        Require(rewritten.set == set && rewritten.binding == 0 && rewritten.arrayElement == 0 && rewritten.count == 2, "a pooled set's rewrite missed an element the previous draw replaced");
+        Require(same(rewritten.buffers[0], original[0]), "an element only the previous draw replaced did not get the template's descriptor back");
+        Require(same(rewritten.buffers[1], snapshotOf(*second, 0)), "a pooled set's snapshot element does not point at this draw's snapshot");
+        release(second);
+
+        auto third = draw(2u);
+        Require(third->allocation.set == set && mock.writes.size() == 1, "the pooled set was not reused again");
+        const auto& only = mock.writes.front();
+        Require(only.set == set && only.binding == 0 && only.arrayElement == 1 && only.count == 1 && same(only.buffers[0], snapshotOf(*third, 0)), "a repeated snapshot element was not the only element written");
+
+        // While the set is in use the next draw takes a set from the descriptor cache and writes it in full.
+        auto fourth = draw(1u);
+        Require(fourth->allocation.set != set && mock.writes.size() == 2, "a draw took a set still in use or wrote a fresh set partially");
+        const auto text = ShaderResources::DrawSetPoolText();
+        Require(text.find(" 2 pooled sets reused") != std::string::npos, "the pool counters missed the reuses: " + text);
+        third.reset();
+        fourth.reset();
+        recorder.Sync();
+    }
+    Require(mock.live == 0, "pooled draw sets leaked Vulkan objects");
+    std::cout << "draw set pool tests passed\n";
 }
 
 alignas(16) std::array<std::uint32_t, 8> guestMovedFirst{0x51515151, 0x52525252, 0x53535353, 0x54545454, 0x55555555, 0x56565656, 0x57575757, 0x58585858};
@@ -12195,6 +12292,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unused-stencil-reference") {
             stencilReferenceUnusedTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-set-pool") {
+            drawSetPoolTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--command-batch-fence-failure") {

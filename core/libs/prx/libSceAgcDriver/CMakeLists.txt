@@ -579,9 +579,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_pipe_narrow_sliced_depth_switch COMMAND agc_archb_c01_switches_tests --toggle PipeNarrowSlicedDepth)
     add_test(NAME agc_archb_pipe_narrow_dispatch_writes_switch COMMAND agc_archb_c01_switches_tests --toggle PipeNarrowDispatchWrites)
     add_test(NAME agc_archb_pipe_keep_own_label_waits_switch COMMAND agc_archb_c01_switches_tests --toggle PipeKeepOwnLabelWaits)
-    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_archb_fix_draw_set_pool_switch COMMAND agc_archb_c01_switches_tests --toggle FixDrawSetPool)
+    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
@@ -2467,6 +2468,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_command_batch_fence_failure PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # APS5_ARCHB_FIX_DRAW_SET_POOL on the mock device: pooled sets are reused and rewritten only at
+    # snapshot elements (the test sets the switch and its prerequisite itself).
+    add_test(NAME agc_driver_draw_set_pool COMMAND agc_driver_graphics_tests --draw-set-pool)
+    set_tests_properties(agc_driver_draw_set_pool PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_driver_draw_set_pool PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 set_target_properties(agc_driver_graphics_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -3438,6 +3447,17 @@ if(BUILD_TESTING)
             set_property(TEST agc_driver_pipe_q0_${agcPipeQ0Mode} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endforeach()
     endif()
+    # APS5_ARCHB_FIX_DRAW_SET_POOL: draws and dispatches of cached templates through pooled per-draw
+    # descriptor sets rewritten only at their snapshot elements, with queue 0 pipelined.
+    set(agcDrawSetPoolTests agc_driver_draw_cache_reuse agc_driver_draw_data_hit_user_words agc_driver_pipelined_dispatch agc_driver_buffer_load_store agc_driver_image_table_reuse)
+    foreach(agcTestName IN LISTS agcDrawSetPoolTests)
+        add_test(NAME ${agcTestName}_draw_set_pool COMMAND ${agcTestName}_tests)
+        set_tests_properties(${agcTestName}_draw_set_pool PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_PIPE_Q0_COMMITTER=1;APS5_ARCHB_FIX_DRAW_SET_POOL=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_property(TEST ${agcTestName}_draw_set_pool APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PIPELINED_DRAWS=unset:")
+        if(WIN32)
+            set_property(TEST ${agcTestName}_draw_set_pool APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     # Stage 2 cut A2b (APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS): a queued draw writes an indirect draw's
     # records; a GPU-side indirect draw after it queues behind it without draining (with the cut) and
     # draws the written records; a CPU-side one drains before reading them (with or without the cut).

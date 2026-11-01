@@ -2507,6 +2507,54 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
     return result;
 }
 
+// APS5_ARCHB_FIX_DRAW_SET_POOL. The sets of a draw of this object are a copy of the object's own set
+// (descriptorWrites, written in full and fixed since buildComplete) with the snapshot elements
+// pointed at the draw's snapshots. A set back from its completed batch still holds that copy, so the
+// next draw only rewrites the elements either draw points at a snapshot (each other element holds
+// the object's own descriptor, as in the full rewrite). Nothing else writes a pooled set: it left
+// the descriptor cache with the draw that wrote it in full and returns to it only when the pool goes.
+struct ShaderResources::DrawSetPool {
+    struct Entry {
+        DescriptorCache::SetAllocation allocation;
+        DescriptorCache::SetAllocation fragmentAllocation;
+        std::vector<std::size_t> overridden;
+    };
+    static constexpr std::size_t Capacity = 64;
+    DescriptorCache* cache = nullptr;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout fragmentLayout = VK_NULL_HANDLE;
+    AgcDriver::Mutex mutex;
+    std::vector<Entry> entries;
+
+    DrawSetPool(DescriptorCache* cache, VkDescriptorSetLayout layout, VkDescriptorSetLayout fragmentLayout) : cache(cache), layout(layout), fragmentLayout(fragmentLayout) {}
+    DrawSetPool(const DrawSetPool&) = delete;
+    DrawSetPool& operator=(const DrawSetPool&) = delete;
+    ~DrawSetPool() {
+        for (const auto& entry : entries) {
+            if (entry.allocation.set != VK_NULL_HANDLE) cache->Recycle(layout, entry.allocation);
+            if (entry.fragmentAllocation.set != VK_NULL_HANDLE) cache->Recycle(fragmentLayout, entry.fragmentAllocation);
+        }
+    }
+    bool Take(Entry& taken) {
+        std::lock_guard lock(mutex);
+        if (entries.empty()) return false;
+        taken = std::move(entries.back());
+        entries.pop_back();
+        return true;
+    }
+    // False when full (or out of memory): the caller releases the sets as before.
+    bool Give(const DescriptorCache::SetAllocation& allocation, const DescriptorCache::SetAllocation& fragmentAllocation, std::vector<std::size_t>& overridden) noexcept {
+        std::lock_guard lock(mutex);
+        if (entries.size() >= Capacity) return false;
+        try {
+            entries.push_back({allocation, fragmentAllocation, std::move(overridden)});
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+};
+
 void ShaderResources::buildComplete() {
     PerformanceTimer frameTiming("Resources.Complete");
     BuildLookups lookups;
@@ -2659,6 +2707,8 @@ void ShaderResources::buildComplete() {
                 if (!made.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(made.size()), made.data(), 0, nullptr);
             }
             for (auto& table : tableWrites) table.written = table.recorded;
+            // The writes are final from here on (completed): what a pooled draw set keeps.
+            if (!usesBda && context.descriptorCache != nullptr) drawSetPool = std::make_shared<DrawSetPool>(context.descriptorCache, _layout, fragment.layout);
         }
         for (const auto& allocation : allocations) {
             if (allocation.adjustment == 0) continue;
@@ -5923,8 +5973,44 @@ bool ShaderResources::LayoutUpdateAfterBind() const {
     return updateAfterBind;
 }
 
+namespace {
+struct DrawSetPoolCounters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> fullElements{0};
+    std::atomic<std::uint64_t> writtenElements{0};
+    // APS5_PROFILE_DRAW or APS5_PIPELINE_STATS only: the descriptor part of PrepareDrawBindings (set, writes, keeps), with
+    // the switch on or off.
+    std::atomic<std::uint64_t> setCalls{0};
+    std::atomic<std::uint64_t> setNs{0};
+};
+DrawSetPoolCounters& drawSetPoolCounters() {
+    static auto* counters = [] {
+        auto* made = new DrawSetPoolCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_draw_set_pool_hits", made->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_draw_set_pool_misses", made->misses);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_draw_set_pool_full_elements", made->fullElements);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_draw_set_pool_written_elements", made->writtenElements);
+        return made;
+    }();
+    return *counters;
+}
+}
+
+std::string ShaderResources::DrawSetPoolText() {
+    auto& counters = drawSetPoolCounters();
+    char text[320];
+    const auto calls = counters.setCalls.load(std::memory_order_relaxed);
+    std::snprintf(text, sizeof(text), "[draw-set-pool] cumulative: %llu pooled sets reused, %llu sets written in full; elements written %llu (a full rewrite of the reused sets: %llu); set work %llu calls, %.2f us each",
+        static_cast<unsigned long long>(counters.hits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.misses.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(counters.writtenElements.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.fullElements.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(calls), calls == 0 ? 0.0 : static_cast<double>(counters.setNs.load(std::memory_order_relaxed)) / 1e3 / static_cast<double>(calls));
+    return text;
+}
+
 ShaderResources::DrawBindings::~DrawBindings() {
     if (cache == nullptr) return;
+    if (pool != nullptr && pool->Give(allocation, fragmentAllocation, overridden)) return;
     const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
         if (set.set == VK_NULL_HANDLE) return;
         if (setLayout != VK_NULL_HANDLE) cache->Recycle(setLayout, set);
@@ -6152,7 +6238,36 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
+    static const bool timeSets = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    struct SetTiming {
+        std::chrono::steady_clock::time_point start;
+        ~SetTiming() {
+            if (start == std::chrono::steady_clock::time_point{}) return;
+            auto& counters = drawSetPoolCounters();
+            counters.setCalls.fetch_add(1, std::memory_order_relaxed);
+            counters.setNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        }
+    } setTiming{timeSets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    result->cache = context.descriptorCache;
+    // APS5_ARCHB_FIX_DRAW_SET_POOL (sampled per call): a set back from an earlier draw of this object
+    // keeps everything but the snapshot elements (see DrawSetPool).
+    const bool pooled = drawSetPool != nullptr && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawSetPool);
+    DrawSetPool::Entry reused;
+    const bool reuse = pooled && drawSetPool->Take(reused);
+    // The sets go to the pool only once written (a set is pooled only holding this object's writes
+    // and the snapshot elements `overridden` names); until then a failure releases them as before.
+    const auto adopt = [&] {
+        if (!pooled) return;
+        result->overridden.assign(selected.begin(), selected.end());
+        result->pool = drawSetPool;
+    };
+    if (reuse) {
+        result->allocation = reused.allocation;
+        result->fragmentAllocation = reused.fragmentAllocation;
+        if (result->allocation.set != VK_NULL_HANDLE) result->layout = _layout;
+        if (result->fragmentAllocation.set != VK_NULL_HANDLE) result->fragmentLayout = fragment.layout;
+    } else {
     std::array<bool, 2> described{};
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
     auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
@@ -6170,7 +6285,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
     const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
-    result->cache = context.descriptorCache;
     if (described[0] || splitSets) {
         result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
         result->layout = _layout;
@@ -6181,16 +6295,82 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->fragmentLayout = fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
+    }
     thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
     auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
     buffers = descriptorBuffers;
     thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
     auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
-    writes = descriptorWrites;
     thread_local std::vector<std::size_t>* indicesSlot = nullptr;
     auto& snapshotIndices = ShaderRecompiler::ThreadOwned(indicesSlot);
     snapshotIndices.assign(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
+    if (reuse) {
+        // The elements this draw or the set's previous draw points at a snapshot get this draw's
+        // snapshot, or the object's own descriptor where only the previous draw had one; every other
+        // element still holds the object's own descriptor from the set's full write.
+        thread_local std::vector<std::uint8_t>* marksSlot = nullptr;
+        auto& marks = ShaderRecompiler::ThreadOwned(marksSlot);
+        marks.assign(allocations.size(), 0);
+        for (const auto index : selected) marks[index] = 1;
+        for (const auto index : reused.overridden) {
+            if (index < marks.size()) marks[index] = 1;
+        }
+        writes.clear();
+        std::size_t full = 0;
+        std::size_t written = 0;
+        auto nextTemplate = descriptorWrites.begin();
+        for (const auto& binding : bindings) {
+            const auto original = setOf(binding) == 0 ? _set : fragment.set;
+            const auto destination = setOf(binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
+            while (nextTemplate != descriptorWrites.end() && nextTemplate->dstBinding == binding.layout.binding && nextTemplate->dstSet == original) {
+                const auto& write = *nextTemplate++;
+                full += write.descriptorCount;
+                if (binding.allocations.empty()) continue;
+                const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+                for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                    const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
+                    if (snapshotIndex == selected.size()) continue;
+                    const auto& snapshot = result->snapshots[snapshotIndex];
+                    buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
+                }
+                for (std::size_t element = 0; element < binding.allocations.size();) {
+                    if (marks[binding.allocations[element]] == 0) {
+                        ++element;
+                        continue;
+                    }
+                    auto last = element;
+                    while (last < binding.allocations.size() && marks[binding.allocations[last]] != 0) ++last;
+                    auto run = write;
+                    run.dstSet = destination;
+                    run.dstArrayElement = write.dstArrayElement + static_cast<std::uint32_t>(element);
+                    run.descriptorCount = static_cast<std::uint32_t>(last - element);
+                    run.pBufferInfo = buffers.data() + offset + element;
+                    writes.push_back(run);
+                    written += last - element;
+                    element = last;
+                }
+            }
+        }
+        Require(nextTemplate == descriptorWrites.end(), "draw snapshot writes disagree with their descriptor bindings");
+        auto& counters = drawSetPoolCounters();
+        counters.hits.fetch_add(1, std::memory_order_relaxed);
+        counters.fullElements.fetch_add(full, std::memory_order_relaxed);
+        counters.writtenElements.fetch_add(written, std::memory_order_relaxed);
+        if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        adopt();
+        recorder.Keep(result);
+        for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        return result;
+    }
+    writes = descriptorWrites;
+    if (pooled) {
+        std::size_t full = 0;
+        for (const auto& write : writes) full += write.descriptorCount;
+        auto& counters = drawSetPoolCounters();
+        counters.misses.fetch_add(1, std::memory_order_relaxed);
+        counters.writtenElements.fetch_add(full, std::memory_order_relaxed);
+    }
     auto nextWrite = writes.begin();
     for (const auto& binding : bindings) {
         const auto original = setOf(binding) == 0 ? _set : fragment.set;
@@ -6210,6 +6390,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    adopt();
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
