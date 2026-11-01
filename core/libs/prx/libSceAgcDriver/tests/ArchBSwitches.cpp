@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <new>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -86,11 +87,17 @@ void toggleCase(const std::string& name) {
     if (name == "VqMemo" || imageTable || bitScanKeys) setEnvironment(bitScanKeys ? "APS5_ARCHB_FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "APS5_ARCHB_FIX_VQ_MEMO", nullptr);
     if (bookkeeping) setEnvironment("APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING", nullptr);
     if (pipeQ0) setEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", nullptr);
-    const bool keepRegisters = name == "PipeKeepIndirectRegs";
+    // A2 cuts that require PIPE_Q0_COMMITTER: the same contract.
+    struct PipeCut {
+        Feature feature;
+        const char* token;
+    };
+    const auto pipeCut = name == "PipeKeepIndirectRegs" ? std::optional<PipeCut>{{Feature::PipeKeepIndirectRegs, "PIPE_KEEP_INDIRECT_REGS"}} : name == "PipeIndirectGpuArgs" ? std::optional<PipeCut>{{Feature::PipeIndirectGpuArgs, "PIPE_INDIRECT_GPU_ARGS"}} : std::nullopt;
+    const bool keepRegisters = pipeCut.has_value();
     if (keepRegisters) {
         setEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", nullptr);
         // From the environment without PIPE_Q0_COMMITTER: refused at startup (prerequisite).
-        setEnvironment("APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS", "1");
+        setEnvironment((std::string("APS5_ARCHB_") + pipeCut->token).c_str(), "1");
     }
     if (name == "AllocChurn") setEnvironment("APS5_ARCHB_FIX_ALLOC_CHURN", nullptr);
     const bool genTable = name == "GenTable";
@@ -165,20 +172,22 @@ void toggleCase(const std::string& name) {
     } else if (keepRegisters) {
         // A2 cut: runtime, default off, requires PIPE_Q0_COMMITTER (named alone it is refused, and it
         // drops when the committer switch does).
+        const std::string token = pipeCut->token;
+        const auto feature = pipeCut->feature;
         bool listed = false;
         for (const auto& entry : Switches::Table()) {
-            if (entry.feature != Feature::PipeKeepIndirectRegs) continue;
+            if (entry.feature != feature) continue;
             listed = true;
-            check(std::string(entry.name) == "PIPE_KEEP_INDIRECT_REGS" && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::PipeQ0Committer, "PIPE_KEEP_INDIRECT_REGS switch contract");
+            check(std::string(entry.name) == token && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::PipeQ0Committer, token + " switch contract");
         }
-        check(listed, "PIPE_KEEP_INDIRECT_REGS is listed");
-        check(!Switches::Enabled(Feature::PipeKeepIndirectRegs), "PIPE_KEEP_INDIRECT_REGS started on without PIPE_Q0_COMMITTER");
-        write("1 PIPE_KEEP_INDIRECT_REGS=1");
-        check(!Switches::Enabled(Feature::PipeKeepIndirectRegs), "PIPE_KEEP_INDIRECT_REGS turned on without PIPE_Q0_COMMITTER");
-        write("2 PIPE_Q0_COMMITTER=1 PIPE_KEEP_INDIRECT_REGS=1");
-        check(Switches::Enabled(Feature::PipeQ0Committer) && Switches::Enabled(Feature::PipeKeepIndirectRegs), "the committer and PIPE_KEEP_INDIRECT_REGS did not turn on together");
+        check(listed, token + " is listed");
+        check(!Switches::Enabled(feature), token + " started on without PIPE_Q0_COMMITTER");
+        write("1 " + token + "=1");
+        check(!Switches::Enabled(feature), token + " turned on without PIPE_Q0_COMMITTER");
+        write("2 PIPE_Q0_COMMITTER=1 " + token + "=1");
+        check(Switches::Enabled(Feature::PipeQ0Committer) && Switches::Enabled(feature), "the committer and " + token + " did not turn on together");
         write("3 PIPE_Q0_COMMITTER=0");
-        check(!Switches::Enabled(Feature::PipeQ0Committer) && !Switches::Enabled(Feature::PipeKeepIndirectRegs), "PIPE_KEEP_INDIRECT_REGS stayed on after the committer switch turned off");
+        check(!Switches::Enabled(Feature::PipeQ0Committer) && !Switches::Enabled(feature), token + " stayed on after the committer switch turned off");
     } else if (name == "AllocChurn") {
         using AgcDriver::ArchB::AllocChurnActive;
         using AgcDriver::ArchB::AllocChurnScope;

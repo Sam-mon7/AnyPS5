@@ -140,6 +140,9 @@ struct DrawTail {
     bool registerKey = false;
     bool ubPointerFree = false;
     bool ubSkipCpuIndirect = false;
+    // APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS, sampled once per draw: the enqueue did not drain for arguments
+    // queued items write; CPU reads of them drain first (drainBeforeArgumentRead).
+    bool indirectGpuArgs = false;
     bool feedbackMask = false;
     bool pipelineStateReuse = false;
     bool memoVirtualQuery = false;
@@ -426,6 +429,16 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
     return HostThreadLocal<std::unordered_map<std::uint64_t, bool>, CpuIndirectProgramsStorage>();
 }
 
+// APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS: before the enqueue side reads an indirect draw's records or count
+// on the CPU, the queued items that write them commit (and their writes are announced, so the read's
+// flush hook waits for the GPU), as the drain at the start of the draw did with the switch off.
+void drainBeforeArgumentRead(const Pm4::DrawParameters::IndirectDraw& indirect, DrawPipeline::DrainCause cause) {
+    auto& pipeline = DrawPipeline::Queue0();
+    if (!pipeline.Busy()) return;
+    const auto argumentBytes = static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes));
+    if (pipeline.Overlaps(indirect.arguments, argumentBytes) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4))) pipeline.Drain(DrawPipeline::DrainReason::Indirect, 0x100, cause);
+}
+
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
@@ -490,7 +503,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto argumentBytes = static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes));
         const bool arguments = busy && pipeline.Overlaps(indirect.arguments, argumentBytes);
         const bool count = busy && !arguments && indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4);
-        if (!pipelinedIndirect || arguments || count) {
+        // APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS: arguments (or a count) that queued items write do not drain
+        // here. This drain only ordered the enqueue side of the draw after those commits: the draw is
+        // enqueued (finishDraw) and committed after them either way, and at its commit the device
+        // either reads the records on the GPU (behind a barrier on the import) or on the CPU at record
+        // time (decide in Graphics/src/Draw.cpp), both after the writers were recorded. What the enqueue
+        // side reads itself (the records of a CPU-side draw, the empty-draw skip) drains first.
+        tail.indirectGpuArgs = pipelinedIndirect && ArchB::Switches::Enabled(ArchB::Feature::PipeIndirectGpuArgs);
+        if (tail.indirectGpuArgs && (arguments || count)) {
+            DrawPipeline::CountKeptIndirectArguments();
+        } else if (!pipelinedIndirect || arguments || count) {
             auto cause = !pipelinedIndirect ? DrawPipeline::DrainCause::IndirectDisabled : arguments ? DrawPipeline::DrainCause::IndirectArgs : DrawPipeline::DrainCause::IndirectCount;
             std::optional<DrawPipeline::Range> diagWriter;
             if (pipelinedIndirect && arguments) {
@@ -715,6 +737,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto known = cpuIndirectPrograms.find(programs.front().binary.codeAddress);
         if (known != cpuIndirectPrograms.end() && known->second) {
             const auto& indirect = *drawParameters.indirect;
+            if (tail.indirectGpuArgs) drainBeforeArgumentRead(indirect, DrawPipeline::DrainCause::IndirectEmptySkip);
             recordQueuedLabelsBeforeRead(submission.queue);
             const auto readStart = std::chrono::steady_clock::now();
             const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
@@ -1418,6 +1441,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             }
             programResults[i] = &results[resultIndex[i]];
         }
+        if (tail.indirectGpuArgs) drainBeforeArgumentRead(indirect, DrawPipeline::DrainCause::IndirectCpuRead);
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
