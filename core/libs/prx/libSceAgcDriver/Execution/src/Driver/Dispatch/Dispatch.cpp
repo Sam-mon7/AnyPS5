@@ -260,8 +260,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
+        // APS5_PIPE_DRAIN_DIAG: what the copy kernel behind a dispatch_copy drain that waited did.
+        bool copyDrainDiag = false;
         if (DrawPipeline::Active() && !pipelineCandidate) {
             const auto cause = resolving || fromAhead ? DrawPipeline::DrainCause::DispatchAhead : !DrawPipeline::DispatchItems() ? DrawPipeline::DrainCause::DispatchItemsOff : indirectArguments != 0 ? DrawPipeline::DrainCause::DispatchIndirect : !deferredLabels().labels.empty() ? DrawPipeline::DrainCause::DispatchLabels : DrawPipeline::DrainCause::DispatchCopy;
+            copyDrainDiag = cause == DrawPipeline::DrainCause::DispatchCopy && PipeDrainDiag() && DrawPipeline::Queue0().Busy();
             DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, cause);
         }
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
@@ -270,7 +273,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto bytes = static_cast<std::size_t>(threads * 16u);
             if (Graphics::NoteHtileDepthClear(htile, bytes, nativeBytes)) htileClearCompletion = std::pair{htile, bytes};
         }
-        if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
+        if (copyDrainDiag) LastCopyPathOnThread() = -1;
+        const bool copied = !partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address);
+        if (copyDrainDiag) {
+            const auto code = std::span(snapshot.code).subspan(codeOffset);
+            const char* kind = partialLastGroup ? "partial group" : matchesCopyKernel(code, userData, compute) ? "counted" : MatchesIndexedCopyKernel(code, userData, compute) ? "indexed" : "stream";
+            NoteCopyDrain(kind, LastCopyPathOnThread(), copied);
+        }
+        if (copied) {
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
             return;
         }
@@ -478,6 +488,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
             pipelined = bounded;
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
+            if (!bounded && PipeDrainDiag()) NoteUnboundedDispatchWrites(*compiledResult, true);
             fallbackCause = DrawPipeline::DrainCause::DispatchWrites;
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);

@@ -536,6 +536,7 @@ std::string DrawPipeline::CumulativeText() {
     std::snprintf(item, sizeof(item), "; %llu indirect draws kept it over their arguments; %llu draw write sets narrowed", static_cast<unsigned long long>(counters.keptIndirectArguments.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowedDrawWrites.load(std::memory_order_relaxed)));
     text += item;
     text += DrawWriteDiagText();
+    text += DrainDiagText();
     std::snprintf(item, sizeof(item), "; full: %llu waits (%.1f ms), %llu overcommits; locked drains %llu", static_cast<unsigned long long>(counters.fullWaits.load(std::memory_order_relaxed)), static_cast<double>(counters.fullWaitNs.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.fullOvercommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.lockedDrains.load(std::memory_order_relaxed)));
     text += item;
     return text;

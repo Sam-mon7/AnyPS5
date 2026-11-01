@@ -332,6 +332,42 @@ std::uint64_t diagKey(std::uint64_t begin, std::uint64_t end) {
     return begin * 0x9e3779b97f4a7c15ull ^ end;
 }
 
+// Mirrors DispatchWriteRanges: the first condition that makes one program's write set unbounded
+// (empty: bounded unless a range overflows or is empty).
+std::string programUnboundedReason(const ShaderRecompiler::RecompileResult& compiled, bool readOnlyBda) {
+    if (compiled.bdaAbiVersion != 0 && (!readOnlyBda || compiled.bdaWrites)) return compiled.bdaWrites ? " bda abi, bda writes" : " bda abi, no bda writes";
+    for (const auto& binding : compiled.bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::Gds) return " gds binding";
+        if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable && (!readOnlyBda || compiled.bdaWrites)) return " bda pagetable binding";
+        if (binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer && (!readOnlyBda || compiled.bdaWrites)) return " fault buffer binding";
+        if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+            if (std::getenv("APS5_ALL_BUFFERS_WRITTEN") != nullptr) return " APS5_ALL_BUFFERS_WRITTEN";
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                if (element < binding.Flags().bufferWritten.size() && !binding.Flags().bufferWritten[element]) continue;
+                if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 4) return " written buffer descriptor missing";
+                if ((binding.guestDescriptor[static_cast<std::size_t>(element) * 4 + 3] >> 30u) != 0) return " written buffer type bits";
+            }
+        }
+        if (binding.role != ShaderRecompiler::DescriptorRole::ImageStorageTable && binding.role != ShaderRecompiler::DescriptorRole::ImageTable && (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage)) continue;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            const bool written = element >= binding.Flags().imageWritten.size() || binding.Flags().imageWritten[element];
+            if (!written) continue;
+            const std::string what = binding.role == ShaderRecompiler::DescriptorRole::ImageTable ? " image table" : binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable ? " storage image table" : " storage image";
+            const bool flagged = element < binding.Flags().imageWritten.size();
+            if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) return what + (flagged ? " (written)" : " (no write flags)") + " descriptor missing";
+            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
+            if (Graphics::IsNullTextureResource(words)) continue;
+            try {
+                const auto resource = Graphics::DecodeTextureResource(words);
+                if (Graphics::SurfaceGuestBytes(resource) == 0) return what + " zero bytes";
+            } catch (const std::runtime_error&) {
+                return what + " undecodable";
+            }
+        }
+    }
+    return {};
+}
+
 // Mirrors DrawWriteRanges (exact): the first condition that made the write set unbounded.
 std::string unboundedReason(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool readOnlyBda = false) {
     static const char* stageNames[] = {"cs", "vs", "hs", "ds", "gs", "ps", "ls", "ms"};
@@ -340,36 +376,7 @@ std::string unboundedReason(const Graphics::State& graphics, std::span<const Gra
         const auto index = static_cast<std::size_t>(stage.stage);
         const std::string name = index < std::size(stageNames) ? stageNames[index] : "stage" + std::to_string(index);
         if (compiled == nullptr) return name + " without program";
-        if (compiled->bdaAbiVersion != 0 && (!readOnlyBda || compiled->bdaWrites)) return name + (compiled->bdaWrites ? " bda abi, bda writes" : " bda abi, no bda writes");
-        for (const auto& binding : compiled->bindings) {
-            if (binding.role == ShaderRecompiler::DescriptorRole::Gds) return name + " gds binding";
-            if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable && (!readOnlyBda || compiled->bdaWrites)) return name + " bda pagetable binding";
-            if (binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer && (!readOnlyBda || compiled->bdaWrites)) return name + " fault buffer binding";
-            if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
-                if (std::getenv("APS5_ALL_BUFFERS_WRITTEN") != nullptr) return "APS5_ALL_BUFFERS_WRITTEN";
-                for (std::uint32_t element = 0; element < binding.count; ++element) {
-                    if (element < binding.Flags().bufferWritten.size() && !binding.Flags().bufferWritten[element]) continue;
-                    if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 4) return name + " written buffer descriptor missing";
-                    if ((binding.guestDescriptor[static_cast<std::size_t>(element) * 4 + 3] >> 30u) != 0) return name + " written buffer type bits";
-                }
-            }
-            if (binding.role != ShaderRecompiler::DescriptorRole::ImageStorageTable && binding.role != ShaderRecompiler::DescriptorRole::ImageTable && (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage)) continue;
-            for (std::uint32_t element = 0; element < binding.count; ++element) {
-                const bool written = element >= binding.Flags().imageWritten.size() || binding.Flags().imageWritten[element];
-                if (!written) continue;
-                const std::string what = binding.role == ShaderRecompiler::DescriptorRole::ImageTable ? " image table" : binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable ? " storage image table" : " storage image";
-                const bool flagged = element < binding.Flags().imageWritten.size();
-                if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) return name + what + (flagged ? " (written)" : " (no write flags)") + " descriptor missing";
-                const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
-                if (Graphics::IsNullTextureResource(words)) continue;
-                try {
-                    const auto resource = Graphics::DecodeTextureResource(words);
-                    if (Graphics::SurfaceGuestBytes(resource) == 0) return name + what + " zero bytes";
-                } catch (const std::runtime_error&) {
-                    return name + what + " undecodable";
-                }
-            }
-        }
+        if (auto reason = programUnboundedReason(*compiled, readOnlyBda); !reason.empty()) return name + reason;
     }
     const auto colorReason = [](const Graphics::ColorTarget& color) -> std::string {
         if (color.address == 0 && color.dccAddress == 0 && color.cmaskAddress == 0) return {};
@@ -554,6 +561,101 @@ std::string DrawWriteDiagText() {
     std::snprintf(item, sizeof(item), "; enqueued draws bounded %llu, unbounded:", static_cast<unsigned long long>(state.boundedDraws));
     text += item;
     for (const auto& [reason, count] : state.unboundedDraws) text += " [" + reason + "] " + std::to_string(count);
+    return text;
+}
+
+// Drain diagnostics (APS5_PIPE_DRAIN_DIAG=1): what the dispatch_writes, wait_unsatisfied and
+// dispatch_copy drains of the queue-0 pipeline are.
+namespace {
+
+struct DrainDiagState {
+    std::mutex mutex;
+    std::map<std::string, std::uint64_t> dispatchWrites;
+    std::uint64_t waitDrains = 0;
+    std::uint64_t waitSatisfiedAfterDrain = 0;
+    std::uint64_t waitTableBefore = 0;
+    std::uint64_t waitTableSameQueueBefore = 0;
+    std::map<std::string, std::uint64_t> waitEnds;
+    std::map<std::string, double> waitEndMs;
+    std::map<std::uint64_t, std::uint64_t> waitAddresses;
+    std::map<std::string, std::uint64_t> copies;
+};
+
+DrainDiagState& drainDiag() {
+    static auto* state = new DrainDiagState();
+    return *state;
+}
+
+}
+
+bool PipeDrainDiag() {
+    static const bool diag = [] { const char* text = std::getenv("APS5_PIPE_DRAIN_DIAG"); return text != nullptr && text[0] == '1'; }();
+    return diag;
+}
+
+void NoteUnboundedDispatchWrites(const ShaderRecompiler::RecompileResult& compiled, bool withNarrowed) {
+    auto reason = programUnboundedReason(compiled, false);
+    if (reason.empty()) reason = " write range overflow or zero size";
+    if (withNarrowed) {
+        auto left = programUnboundedReason(compiled, true);
+        reason += " | narrowed:" + (left.empty() ? std::string(" bounded unless a range is empty or overflows") : left);
+    }
+    auto& state = drainDiag();
+    std::lock_guard lock(state.mutex);
+    ++state.dispatchWrites[reason];
+}
+
+WaitDiagNote& ThreadWaitDiag() {
+    static thread_local WaitDiagNote note;
+    return note;
+}
+
+void NoteUnsatisfiedWaitDrain(std::uint64_t awaited, bool satisfiedAfterDrain, bool tableBefore, bool sameQueueBefore) {
+    auto& state = drainDiag();
+    std::lock_guard lock(state.mutex);
+    ++state.waitDrains;
+    if (satisfiedAfterDrain) ++state.waitSatisfiedAfterDrain;
+    if (tableBefore) ++state.waitTableBefore;
+    if (sameQueueBefore) ++state.waitTableSameQueueBefore;
+    if (state.waitAddresses.size() < 4096 || state.waitAddresses.contains(awaited)) ++state.waitAddresses[awaited];
+}
+
+void NoteUnsatisfiedWaitEnd(std::uint32_t queue, double ms) {
+    static constexpr const char* ends[] = {"entry", "polled", "recorder", "fence", "history", "held", "aborted"};
+    const auto& note = ThreadWaitDiag();
+    std::string key = note.end >= 0 && note.end < 7 ? ends[note.end] : "unknown";
+    key += note.writer < 0 ? " writer ?" : note.writer == static_cast<int>(queue) ? " writer same queue" : " writer queue " + std::to_string(note.writer);
+    auto& state = drainDiag();
+    std::lock_guard lock(state.mutex);
+    ++state.waitEnds[key];
+    state.waitEndMs[key] += ms;
+}
+
+void NoteCopyDrain(const char* kind, int path, bool copied) {
+    static constexpr const char* paths[] = {"cpu", "gpu", "not imported", "aliased", "record pending", "shape", "overlapping", "inaccessible", "over gpu max"};
+    std::string key = std::string(kind) + (copied ? " copied " : " kernel ") + (path >= 0 && path < 9 ? paths[path] : "(no path)");
+    auto& state = drainDiag();
+    std::lock_guard lock(state.mutex);
+    ++state.copies[key];
+}
+
+std::string DrainDiagText() {
+    if (!PipeDrainDiag()) return {};
+    auto& state = drainDiag();
+    std::lock_guard lock(state.mutex);
+    std::string text = "; drain diag: dispatch writes unbounded:";
+    for (const auto& [reason, count] : state.dispatchWrites) text += " [" + reason + "] " + std::to_string(count);
+    char item[256];
+    std::uint64_t repeated = 0;
+    for (const auto& [address, count] : state.waitAddresses) repeated = std::max(repeated, count);
+    std::snprintf(item, sizeof(item), "; wait_unsatisfied drains %llu (satisfied in memory after the drain %llu, label table matched before %llu, same queue %llu; %zu addresses, busiest %llu):", static_cast<unsigned long long>(state.waitDrains), static_cast<unsigned long long>(state.waitSatisfiedAfterDrain), static_cast<unsigned long long>(state.waitTableBefore), static_cast<unsigned long long>(state.waitTableSameQueueBefore), state.waitAddresses.size(), static_cast<unsigned long long>(repeated));
+    text += item;
+    for (const auto& [key, count] : state.waitEnds) {
+        std::snprintf(item, sizeof(item), " [%s] %llu (%.1f ms)", key.c_str(), static_cast<unsigned long long>(count), state.waitEndMs[key]);
+        text += item;
+    }
+    text += "; dispatch_copy drains:";
+    for (const auto& [key, count] : state.copies) text += " [" + key + "] " + std::to_string(count);
     return text;
 }
 

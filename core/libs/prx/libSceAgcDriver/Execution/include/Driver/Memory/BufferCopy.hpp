@@ -19,6 +19,8 @@ extern std::atomic<std::uint64_t> knownValueEntries, knownValueReads, knownValue
 enum CopyPath { CopyCpu = 0, CopyGpu = 1, CopyNotImported = 2, CopyAliased = 3, CopyRecordPending = 4, CopyShape = 5, CopyOverlapping = 6, CopyInaccessible = 7, CopyOverGpuMax = 8, CopyPaths = 9 };
 
 extern std::array<std::atomic<std::uint64_t>, CopyPaths> copyPathCounts;
+// The CopyPath the calling thread counted last (diagnostics; -1 after a reset).
+int& LastCopyPathOnThread();
 
 struct StreamCopy {
     std::uint64_t source = 0;
