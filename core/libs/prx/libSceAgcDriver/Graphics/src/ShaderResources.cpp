@@ -5981,8 +5981,9 @@ struct DrawSetPoolCounters {
     std::atomic<std::uint64_t> writtenElements{0};
     // APS5_PROFILE_DRAW or APS5_PIPELINE_STATS only: the descriptor part of PrepareDrawBindings (set, writes, keeps), with
     // the switch on or off.
-    std::atomic<std::uint64_t> setCalls{0};
-    std::atomic<std::uint64_t> setNs{0};
+    // Indexed by whether the call used the pool (the switch as sampled by that call).
+    std::array<std::atomic<std::uint64_t>, 2> setCalls{};
+    std::array<std::atomic<std::uint64_t>, 2> setNs{};
 };
 DrawSetPoolCounters& drawSetPoolCounters() {
     static auto* counters = [] {
@@ -5999,12 +6000,15 @@ DrawSetPoolCounters& drawSetPoolCounters() {
 
 std::string ShaderResources::DrawSetPoolText() {
     auto& counters = drawSetPoolCounters();
-    char text[320];
-    const auto calls = counters.setCalls.load(std::memory_order_relaxed);
-    std::snprintf(text, sizeof(text), "[draw-set-pool] cumulative: %llu pooled sets reused, %llu sets written in full; elements written %llu (a full rewrite of the reused sets: %llu); set work %llu calls, %.2f us each",
+    char text[384];
+    const auto perCall = [&](std::size_t mode) {
+        const auto calls = counters.setCalls[mode].load(std::memory_order_relaxed);
+        return calls == 0 ? 0.0 : static_cast<double>(counters.setNs[mode].load(std::memory_order_relaxed)) / 1e3 / static_cast<double>(calls);
+    };
+    std::snprintf(text, sizeof(text), "[draw-set-pool] cumulative: %llu pooled sets reused, %llu sets written in full; elements written %llu (a full rewrite of the reused sets: %llu); set work: switch off %llu calls %.2f us each, on %llu calls %.2f us each",
         static_cast<unsigned long long>(counters.hits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.misses.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(counters.writtenElements.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.fullElements.load(std::memory_order_relaxed)),
-        static_cast<unsigned long long>(calls), calls == 0 ? 0.0 : static_cast<double>(counters.setNs.load(std::memory_order_relaxed)) / 1e3 / static_cast<double>(calls));
+        static_cast<unsigned long long>(counters.setCalls[0].load(std::memory_order_relaxed)), perCall(0), static_cast<unsigned long long>(counters.setCalls[1].load(std::memory_order_relaxed)), perCall(1));
     return text;
 }
 
@@ -6241,11 +6245,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     static const bool timeSets = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
     struct SetTiming {
         std::chrono::steady_clock::time_point start;
+        std::size_t mode = 0;
         ~SetTiming() {
             if (start == std::chrono::steady_clock::time_point{}) return;
             auto& counters = drawSetPoolCounters();
-            counters.setCalls.fetch_add(1, std::memory_order_relaxed);
-            counters.setNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+            counters.setCalls[mode].fetch_add(1, std::memory_order_relaxed);
+            counters.setNs[mode].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
         }
     } setTiming{timeSets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
@@ -6253,6 +6258,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     // APS5_ARCHB_FIX_DRAW_SET_POOL (sampled per call): a set back from an earlier draw of this object
     // keeps everything but the snapshot elements (see DrawSetPool).
     const bool pooled = drawSetPool != nullptr && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawSetPool);
+    setTiming.mode = pooled ? 1 : 0;
     DrawSetPool::Entry reused;
     const bool reuse = pooled && drawSetPool->Take(reused);
     // The sets go to the pool only once written (a set is pooled only holding this object's writes
