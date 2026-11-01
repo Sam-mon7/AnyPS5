@@ -133,7 +133,7 @@ bool UnboundedWrites(const std::vector<std::pair<std::uint64_t, std::uint64_t>>&
     return ranges.size() == 1 && ranges.front().first == 0 && ranges.front().second == std::numeric_limits<std::uint64_t>::max();
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact, bool narrow) {
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact, bool narrow, bool slicedDepth) {
     constexpr std::uint64_t Slack = 64 * 1024;
     constexpr std::pair<std::uint64_t, std::uint64_t> Unbounded{0, std::numeric_limits<std::uint64_t>::max()};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -186,7 +186,15 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
         // target with HTILE writes its planes and its HTILE metadata, the HtileMetadataBytes(extent)
         // at htileAddress the driver reads and stores for it (DepthSurface.cpp) and nothing else.
         const bool htileBounded = narrow && exact && depth.htileAddress != 0;
-        if (depth.extent.width == 0 || depth.extent.height == 0 || depth.extent.width > 16384 || depth.extent.height > 16384 || depth.samples != 1 || depth.firstSlice != 0 || depth.lastSlice != 0 || (depth.htileAddress != 0 && !htileBounded)) return {Unbounded};
+        // `slicedDepth` (APS5_ARCHB_PIPE_NARROW_SLICED_DEPTH, exact only): a single-sample depth target
+        // whose view names slices (DB_DEPTH_VIEW SLICE_START/SLICE_MAX) is written in one slice only, the
+        // one decodeDepthPlane already moved address, stencilAddress and htileAddress to: the depth
+        // surface is keyed and sized without the slice fields (DepthSurface sameSurface, DepthSliceBytes,
+        // HtileMetadataBytes), its image has one layer, layered rendering with a depth target is refused
+        // (State.cpp, renderLayers) and layer exports are ignored. So its writes are the ranges below, as
+        // for a slice-0 view.
+        const bool slicesBounded = slicedDepth && exact;
+        if (depth.extent.width == 0 || depth.extent.height == 0 || depth.extent.width > 16384 || depth.extent.height > 16384 || depth.samples != 1 || ((depth.firstSlice != 0 || depth.lastSlice != 0) && !slicesBounded) || (depth.htileAddress != 0 && !htileBounded)) return {Unbounded};
         if (exact && depth.extent.width != 0 && depth.extent.height != 0) {
             const bool d16 = depth.format == VK_FORMAT_D16_UNORM || depth.format == VK_FORMAT_D16_UNORM_S8_UINT;
             add(depth.address, Graphics::DepthSliceBytes(depth.extent, d16 ? 2u : 4u));
@@ -204,8 +212,8 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
     return ranges;
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool narrow) {
-    return DrawWriteRanges(graphics, stages, ExactDrawWrites(), narrow);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool narrow, bool slicedDepth) {
+    return DrawWriteRanges(graphics, stages, ExactDrawWrites(), narrow, slicedDepth);
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages) {
@@ -369,7 +377,7 @@ std::string programUnboundedReason(const ShaderRecompiler::RecompileResult& comp
 }
 
 // Mirrors DrawWriteRanges (exact): the first condition that made the write set unbounded.
-std::string unboundedReason(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool readOnlyBda = false) {
+std::string unboundedReason(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool readOnlyBda = false, bool slicedDepth = false) {
     static const char* stageNames[] = {"cs", "vs", "hs", "ds", "gs", "ps", "ls", "ms"};
     for (const auto& stage : stages) {
         const auto* compiled = stage.program;
@@ -404,7 +412,7 @@ std::string unboundedReason(const Graphics::State& graphics, std::span<const Gra
         const auto& depth = *graphics.depth;
         if (depth.extent.width == 0 || depth.extent.height == 0 || depth.extent.width > 16384 || depth.extent.height > 16384) return "depth extent";
         if (depth.samples != 1) return "depth samples";
-        if (depth.firstSlice != 0 || depth.lastSlice != 0) return "depth slices";
+        if ((depth.firstSlice != 0 || depth.lastSlice != 0) && !slicedDepth) return "depth slices";
         if (depth.htileAddress != 0 && !readOnlyBda) return "depth htile";
     }
     return "write range overflow or zero size";
@@ -482,7 +490,7 @@ void NoteDrawWriteTags(const Graphics::State& graphics, std::span<const Graphics
     const auto ranges = DrawWriteRanges(graphics, stages, true);
     const bool unbounded = UnboundedWrites(ranges);
     std::string reason = unbounded ? unboundedReason(graphics, stages) : std::string{};
-    if (unbounded && UnboundedWrites(DrawWriteRanges(graphics, stages, true, true))) reason += " | narrowed: " + unboundedReason(graphics, stages, true);
+    if (unbounded && UnboundedWrites(DrawWriteRanges(graphics, stages, true, true, true))) reason += " | narrowed: " + unboundedReason(graphics, stages, true, true);
     auto& state = writeDiag();
     std::lock_guard lock(state.mutex);
     if (unbounded) {

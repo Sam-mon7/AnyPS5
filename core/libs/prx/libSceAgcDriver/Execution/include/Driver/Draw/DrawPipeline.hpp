@@ -101,6 +101,9 @@ public:
     // program (without BDA writes) or an HTILE depth target (unbounded without the switch)
     // (pipe_draw_writes_narrowed).
     static void CountNarrowedDrawWrites();
+    // APS5_ARCHB_PIPE_NARROW_SLICED_DEPTH: a queued draw's write set is bounded although its single-sample
+    // depth target's view names slices (pipe_sliced_depth_narrowed).
+    static void CountNarrowedSlicedDepth();
     // One "[pipe] cumulative: ..." line (printed with the [draw] pipelined report and at shutdown).
     static std::string CumulativeText();
     // Fallback counts: drains requested while the calling thread held the GPU mutex (waited with the
