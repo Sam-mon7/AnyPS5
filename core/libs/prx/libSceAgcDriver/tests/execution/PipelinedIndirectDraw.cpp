@@ -1,7 +1,9 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -19,6 +21,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -44,6 +47,8 @@ alignas(256) std::array<std::byte, 1024> SecondMemory{};
 alignas(256) std::array<std::byte, 1024> WrittenMemory{};
 alignas(256) std::array<std::uint32_t, 4> Records{3, 1, 0, 0};
 alignas(256) std::array<std::uint32_t, 4> LateRecords{0, 1, 0, 0};
+alignas(256) std::array<std::byte, 1024> ArgsWrittenMemory{};
+alignas(256) std::array<std::uint32_t, 4> DrawWrittenRecords{0, 1, 0, 0};
 
 struct Header {
     Shader shader{};
@@ -225,6 +230,99 @@ void IndirectDrawsQueueBehindTheCommitter() {
     SameAsDirect(SecondMemory, "the second queued indirect draw");
 }
 
+// A queued draw item whose write range covers an indirect draw's record and whose commit stores the
+// record (as the GPU would by then), held until released.
+struct RecordWriter {
+    struct State {
+        std::atomic<bool> release{false};
+        std::atomic<bool> done{false};
+    };
+    std::shared_ptr<State> state = std::make_shared<State>();
+    void Release() { state->release = true; }
+    void Enqueue(std::array<std::uint32_t, 4>& records, std::array<std::uint32_t, 4> value) {
+        const auto address = reinterpret_cast<std::uintptr_t>(records.data());
+        DrawPipeline::Queue0().Enqueue([state = state, target = records.data(), value] {
+            while (!state->release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            {
+                std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+                std::copy(value.begin(), value.end(), target);
+            }
+            state->done = true;
+        }, {{address, address + sizeof(records)}}, 0, {}, {}, true, DrawPipeline::ItemKind::Draw);
+    }
+    void Join() const {
+        const auto start = std::chrono::steady_clock::now();
+        while (!state->done.load()) {
+            Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(20), "the record writer never ran");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+};
+
+// APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS. A queued draw writes the record of the indirect draw after it.
+// `gpuSide`: the indirect draw names no base vertex or start instance location, so its records are
+// consumed by the GPU (the cut keeps the pipeline: no drain, and the draw, committed after the writer,
+// draws the written record); otherwise it is a CPU-side draw, whose records the enqueue side reads,
+// so it drains before reading them (with the cut there, without it at the start of the draw).
+void IndirectArgumentsWrittenByAQueuedDraw(bool gpuSide) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    const bool cut = Switches::Enabled(Feature::PipeIndirectGpuArgs);
+    ArgsWrittenMemory.fill(Kept);
+    DrawWrittenRecords = {0, 1, 0, 0};
+    std::vector<std::uint32_t> commands;
+    AppendState(commands);
+    AppendRecords(commands, DrawWrittenRecords.data());
+    AppendTarget(commands, ArgsWrittenMemory, gpuSide ? 0u : Clipped);
+    if (gpuSide) Append(commands, 0x24, {0, 0, 0, 2});
+    else AppendIndirect(commands);
+    RecordWriter writer;
+    writer.Enqueue(DrawWrittenRecords, {3, 1, 0, 0});
+    const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(0x100);
+    const auto keptBefore = DrawPipeline::KeptIndirectArguments();
+    const auto pathsBefore = AgcDriver::Graphics::IndirectDrawCounts();
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the indirect draw submission failed");
+    // Queued: the draw is behind the held writer. Drained: the draw waits for the writer.
+    const auto start = std::chrono::steady_clock::now();
+    while (DrawPipeline::DrainRequestsByOpcode(0x100) == drainsBefore && DrawPipeline::Queue0().Outstanding() < 2 && std::chrono::steady_clock::now() - start < std::chrono::seconds(10)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto queued = DrawPipeline::Queue0().Outstanding();
+    writer.Release();
+    Finish();
+    writer.Join();
+    Flush(ArgsWrittenMemory);
+    const auto drains = DrawPipeline::DrainRequestsByOpcode(0x100) - drainsBefore;
+    const auto kept = DrawPipeline::KeptIndirectArguments() - keptBefore;
+    const auto paths = AgcDriver::Graphics::IndirectDrawCounts();
+    // Paths decided at the commit (records read by the GPU, or by the CPU at record time: pending image,
+    // pending label or copy, not imported, disabled) and the CPU paths the enqueue side decides.
+    using Path = AgcDriver::Graphics::IndirectDrawPath;
+    std::uint64_t gpu = 0, cpu = 0;
+    std::string pathNames;
+    for (std::size_t path = 0; path < paths.size(); ++path) {
+        const auto count = paths[path] - pathsBefore[path];
+        if (count == 0) continue;
+        const auto kind = static_cast<Path>(path);
+        const bool atCommit = kind == Path::Gpu || kind == Path::PendingImage || kind == Path::PendingLabelOrCopy || kind == Path::NotImported || kind == Path::Disabled;
+        (atCommit ? gpu : cpu) += count;
+        pathNames += std::string(" ") + AgcDriver::Graphics::IndirectDrawPathName(kind);
+    }
+    const std::string what = std::string(gpuSide ? "the GPU-side" : "the CPU-side") + " indirect draw whose record a queued draw writes";
+    Require(DrawWrittenRecords[0] == 3, "the queued writer did not store the record's vertex count");
+    if (gpuSide) {
+        Require(gpu == 1 && cpu == 0, what + " took a path decided at its commit " + std::to_string(gpu) + " times and an enqueue-side CPU path " + std::to_string(cpu) + " times (" + pathNames + " ), expected a commit-time path once");
+        if (cut) Require(drains == 0 && kept == 1 && queued >= 2, what + " drained " + std::to_string(drains) + " times (" + std::to_string(kept) + " kept, " + std::to_string(queued) + " items queued), expected it to queue behind the writer");
+        else Require(drains >= 1 && kept == 0, what + " did not drain without the cut");
+    } else {
+        Require(cpu == 1 && gpu == 0, what + " took an enqueue-side CPU path " + std::to_string(cpu) + " times and a commit-time path " + std::to_string(gpu) + " times (" + pathNames + " ), expected an enqueue-side CPU path once");
+        Require(drains >= 1, what + " did not drain before its records were read");
+        Require(kept == (cut ? 1u : 0u), what + ": " + std::to_string(kept) + " enqueues kept the pipeline over the arguments");
+        if (cut) Require(DrawPipeline::CumulativeText().find("indirect_cpu_read 1") != std::string::npos, what + ": the drain is not counted as indirect_cpu_read: " + DrawPipeline::CumulativeText());
+    }
+    SameAsDirect(ArgsWrittenMemory, what);
+    std::cout << what << (drains == 0 ? " queued behind it" : " drained") << " and drew the written record (path" << pathNames << ")\n";
+}
+
 void IndirectDrawWaitsForItsQueuedRecordWrite() {
     WrittenMemory.fill(Kept);
     LateRecords = {0, 1, 0, 0};
@@ -249,7 +347,8 @@ void IndirectDrawWaitsForItsQueuedRecordWrite() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const std::string mode = argc > 1 ? argv[1] : "";
     // APS5_ARCHB_PIPE_Q0_COMMITTER=1 from the test environment pipelines queue 0 through the runtime
     // switch instead (APS5_PIPELINED_DRAWS, when set, decides alone).
     const char* pipeSwitch = std::getenv("APS5_ARCHB_PIPE_Q0_COMMITTER");
@@ -268,8 +367,14 @@ int main() {
         Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
         DrawDirectReference();
-        IndirectDrawsQueueBehindTheCommitter();
-        IndirectDrawWaitsForItsQueuedRecordWrite();
+        if (mode == "--gpu-args-written") IndirectArgumentsWrittenByAQueuedDraw(true);
+        else if (mode == "--cpu-args-written") IndirectArgumentsWrittenByAQueuedDraw(false);
+        else if (mode.empty()) {
+            IndirectDrawsQueueBehindTheCommitter();
+            IndirectDrawWaitsForItsQueuedRecordWrite();
+        } else {
+            throw std::runtime_error("unknown mode " + mode);
+        }
         AgcDriverShutdown_nid_postfix();
         std::puts("pipelined indirect draw tests passed");
         return 0;

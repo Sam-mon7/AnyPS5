@@ -35,6 +35,7 @@ enum class Feature : std::uint8_t {
     GenDrawValidation,
     PipeQ0Committer,
     PipeKeepIndirectRegs,
+    PipeIndirectGpuArgs,
     Count
 };
 

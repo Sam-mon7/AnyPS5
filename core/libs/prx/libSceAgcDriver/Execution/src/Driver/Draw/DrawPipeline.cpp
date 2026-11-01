@@ -26,8 +26,8 @@ namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission", "transition"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainCounterNames{"pipe_drains_packet", "pipe_drains_flush", "pipe_drains_labels", "pipe_drains_capture", "pipe_drains_indirect", "pipe_drains_submission", "pipe_drains_transition"};
-constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainCause::Count)> CauseNames{"none", "indirect_args", "indirect_args_draw", "indirect_args_dispatch", "indirect_args_label", "indirect_args_other", "indirect_count", "indirect_disabled", "indirect_cpu_records", "indirect_inline", "regs_overlap", "regs_invalid", "wait_held_mismatch", "wait_overlap", "wait_unsatisfied", "dispatch_ahead", "dispatch_items_off", "dispatch_indirect", "dispatch_labels", "dispatch_copy", "dispatch_miss", "dispatch_verify", "dispatch_reads", "dispatch_no_recipe", "dispatch_writes", "dispatch_gate", "fill_inputs", "fills_unordered", "metadata_pass", "capture_variant", "capture_pending", "capture_shader"};
-constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainCause::Count)> CauseCounterNames{"pipe_drain_cause_none", "pipe_drain_cause_indirect_args", "pipe_drain_cause_indirect_args_draw", "pipe_drain_cause_indirect_args_dispatch", "pipe_drain_cause_indirect_args_label", "pipe_drain_cause_indirect_args_other", "pipe_drain_cause_indirect_count", "pipe_drain_cause_indirect_disabled", "pipe_drain_cause_indirect_cpu_records", "pipe_drain_cause_indirect_inline", "pipe_drain_cause_regs_overlap", "pipe_drain_cause_regs_invalid", "pipe_drain_cause_wait_held_mismatch", "pipe_drain_cause_wait_overlap", "pipe_drain_cause_wait_unsatisfied", "pipe_drain_cause_dispatch_ahead", "pipe_drain_cause_dispatch_items_off", "pipe_drain_cause_dispatch_indirect", "pipe_drain_cause_dispatch_labels", "pipe_drain_cause_dispatch_copy", "pipe_drain_cause_dispatch_miss", "pipe_drain_cause_dispatch_verify", "pipe_drain_cause_dispatch_reads", "pipe_drain_cause_dispatch_no_recipe", "pipe_drain_cause_dispatch_writes", "pipe_drain_cause_dispatch_gate", "pipe_drain_cause_fill_inputs", "pipe_drain_cause_fills_unordered", "pipe_drain_cause_metadata_pass", "pipe_drain_cause_capture_variant", "pipe_drain_cause_capture_pending", "pipe_drain_cause_capture_shader"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainCause::Count)> CauseNames{"none", "indirect_args", "indirect_args_draw", "indirect_args_dispatch", "indirect_args_label", "indirect_args_other", "indirect_count", "indirect_disabled", "indirect_cpu_records", "indirect_inline", "regs_overlap", "regs_invalid", "wait_held_mismatch", "wait_overlap", "wait_unsatisfied", "dispatch_ahead", "dispatch_items_off", "dispatch_indirect", "dispatch_labels", "dispatch_copy", "dispatch_miss", "dispatch_verify", "dispatch_reads", "dispatch_no_recipe", "dispatch_writes", "dispatch_gate", "fill_inputs", "fills_unordered", "metadata_pass", "capture_variant", "capture_pending", "capture_shader", "indirect_cpu_read", "indirect_empty_skip"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainCause::Count)> CauseCounterNames{"pipe_drain_cause_none", "pipe_drain_cause_indirect_args", "pipe_drain_cause_indirect_args_draw", "pipe_drain_cause_indirect_args_dispatch", "pipe_drain_cause_indirect_args_label", "pipe_drain_cause_indirect_args_other", "pipe_drain_cause_indirect_count", "pipe_drain_cause_indirect_disabled", "pipe_drain_cause_indirect_cpu_records", "pipe_drain_cause_indirect_inline", "pipe_drain_cause_regs_overlap", "pipe_drain_cause_regs_invalid", "pipe_drain_cause_wait_held_mismatch", "pipe_drain_cause_wait_overlap", "pipe_drain_cause_wait_unsatisfied", "pipe_drain_cause_dispatch_ahead", "pipe_drain_cause_dispatch_items_off", "pipe_drain_cause_dispatch_indirect", "pipe_drain_cause_dispatch_labels", "pipe_drain_cause_dispatch_copy", "pipe_drain_cause_dispatch_miss", "pipe_drain_cause_dispatch_verify", "pipe_drain_cause_dispatch_reads", "pipe_drain_cause_dispatch_no_recipe", "pipe_drain_cause_dispatch_writes", "pipe_drain_cause_dispatch_gate", "pipe_drain_cause_fill_inputs", "pipe_drain_cause_fills_unordered", "pipe_drain_cause_metadata_pass", "pipe_drain_cause_capture_variant", "pipe_drain_cause_capture_pending", "pipe_drain_cause_capture_shader", "pipe_drain_cause_indirect_cpu_read", "pipe_drain_cause_indirect_empty_skip"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> KindNames{"other", "draw", "dispatch", "label", "dma", "fill"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> CommitCounterNames{"pipe_commits_other", "pipe_commits_draw", "pipe_commits_dispatch", "pipe_commits_label", "pipe_commits_dma", "pipe_commits_fill"};
 // Depth when APS5_ARCHB_PIPE_Q0_COMMITTER pipelines queue 0 (APS5_PIPELINED_DRAWS=1 selects the same).
@@ -42,6 +42,7 @@ struct PipeCounters {
     std::atomic<std::uint64_t> enqueues{0};
     std::atomic<std::uint64_t> submissions{0};
     std::atomic<std::uint64_t> keptIndirectRegs{0};
+    std::atomic<std::uint64_t> keptIndirectArguments{0};
     std::atomic<std::uint64_t> lockedDrains{0};
     std::atomic<std::uint64_t> fullWaits{0};
     std::atomic<std::uint64_t> fullOvercommits{0};
@@ -364,6 +365,7 @@ void DrawPipeline::RegisterCounters() {
         ArchB::Recorder::RegisterCounter("pipe_enqueues", counters.enqueues);
         ArchB::Recorder::RegisterCounter("pipe_submissions", counters.submissions);
         ArchB::Recorder::RegisterCounter("pipe_keep_indirect_regs", counters.keptIndirectRegs);
+        ArchB::Recorder::RegisterCounter("pipe_indirect_gpu_args_kept", counters.keptIndirectArguments);
         ArchB::Recorder::RegisterCounter("pipe_drains_locked", counters.lockedDrains);
         ArchB::Recorder::RegisterCounter("pipe_full_waits", counters.fullWaits);
         ArchB::Recorder::RegisterCounter("pipe_full_overcommits", counters.fullOvercommits);
@@ -378,6 +380,14 @@ void DrawPipeline::CountSubmission() {
 
 void DrawPipeline::CountKeptIndirectRegisters() {
     pipeCounters().keptIndirectRegs.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawPipeline::CountKeptIndirectArguments() {
+    pipeCounters().keptIndirectArguments.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t DrawPipeline::KeptIndirectArguments() {
+    return pipeCounters().keptIndirectArguments.load(std::memory_order_relaxed);
 }
 
 std::uint64_t DrawPipeline::LockedDrains() {
@@ -516,6 +526,8 @@ std::string DrawPipeline::CumulativeText() {
     std::snprintf(item, sizeof(item), "; drain wait %.1f ms; %llu enqueues, %llu submissions", static_cast<double>(counters.drainWaitNs.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.enqueues.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.submissions.load(std::memory_order_relaxed)));
     text += item;
     std::snprintf(item, sizeof(item), "; %llu register packets kept the pipeline", static_cast<unsigned long long>(counters.keptIndirectRegs.load(std::memory_order_relaxed)));
+    text += item;
+    std::snprintf(item, sizeof(item), "; %llu indirect draws kept it over their arguments", static_cast<unsigned long long>(counters.keptIndirectArguments.load(std::memory_order_relaxed)));
     text += item;
     text += DrawWriteDiagText();
     std::snprintf(item, sizeof(item), "; full: %llu waits (%.1f ms), %llu overcommits; locked drains %llu", static_cast<unsigned long long>(counters.fullWaits.load(std::memory_order_relaxed)), static_cast<double>(counters.fullWaitNs.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.fullOvercommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.lockedDrains.load(std::memory_order_relaxed)));
