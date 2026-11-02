@@ -379,6 +379,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         const bool depth1D = depthCompare && (descriptor.dimension == TextureDimension::k1D || descriptor.dimension == TextureDimension::k1DArray);
         static const bool unclampedLevels = std::getenv("APS5_NO_TEXTURE_LEVEL_CLAMP") != nullptr;
         const auto imageLevels = unclampedLevels ? descriptor.mipCount : std::min(descriptor.mipCount, static_cast<std::uint32_t>(std::bit_width(std::max({descriptor.width, descriptor.height, geometry.imageDepth}))));
+        if (imageLevels != descriptor.mipCount) APS5_LOG_OUT("[zoo-clamp] Texture address=0x%llx %ux%ux%u mips=%u -> %u layers=%u format=%u vk=%d", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, geometry.imageDepth, descriptor.mipCount, imageLevels, arrayLayers, descriptor.format, static_cast<int>(vkFormat));
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageInfo.flags = (descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u) | (SrgbTwinFormat(context, vkFormat) != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0u);
         imageInfo.imageType = depth1D ? VK_IMAGE_TYPE_2D : ImageTypeFor(descriptor.dimension);
