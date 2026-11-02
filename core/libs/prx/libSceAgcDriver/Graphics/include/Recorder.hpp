@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineStateReuse.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <unordered_map>
 #include <atomic>
@@ -87,6 +88,7 @@ public:
         bool continued = false;
         bool barrier = true;
         PassBreak reason = PassBreak::Continued;
+        PipelineStateReuse* pipelineState = nullptr;
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
@@ -712,6 +714,7 @@ private:
             std::uint32_t timing = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;
             PassBreak closedBy = PassBreak::NewBatch;
+            PipelineStateReuse pipelineState;
         } renderPass;
         PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.

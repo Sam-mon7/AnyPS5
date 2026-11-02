@@ -879,7 +879,7 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     return framebuffer;
 }
 
-void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
+void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, PipelineStateReuse* reuse) const {
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -907,7 +907,7 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
         if (outputs && depthFormat != VK_FORMAT_UNDEFINED) rendering.pDepthAttachment = &depth;
         if (outputs && depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat)) rendering.pStencilAttachment = &depth;
         context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
-        Continue(commands, state);
+        Continue(commands, state, reuse);
         return;
     }
     VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -926,44 +926,72 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     sampleLocations.pPostSubpassSampleLocations = &post;
     if (sampleLocationsEnabled) begin.pNext = &sampleLocations;
     context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
-    Continue(commands, state);
+    Continue(commands, state, reuse);
 }
 
-void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
-    if (optimized != nullptr) optimized->Schedule();
-    const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
-    context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);
-    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
-    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
-    if (state.stencilReplayReference) context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
-    if (libraries) {
-        setLibraryState(commands, state);
+namespace {
+
+constexpr const char* ReusedBindScope = "Graphics.ReusedPipelineBind";
+constexpr const char* ReusedDynamicScope = "Graphics.ReusedDynamicState";
+constexpr const char* ReusedPushScope = "Graphics.ReusedPushConstants";
+
+template<typename TEmit, typename... TValues>
+void setDynamic(PipelineStateReuse* reuse, PipelineStateReuse::Dynamic slot, TEmit emit, const TValues&... values) {
+    if (reuse != nullptr && reuse->Same(slot, values...)) {
+        PerformanceTrace::Count(ReusedDynamicScope);
         return;
     }
-    if (depthBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
-    if (!depthBounds) return;
-    context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
+    emit(values...);
+    if (reuse != nullptr) reuse->Note(slot, values...);
 }
 
-void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state) const {
+}
+
+void Pipeline::Continue(VkCommandBuffer commands, const State& state, PipelineStateReuse* reuse) const {
+    using Slot = PipelineStateReuse::Dynamic;
+    if (optimized != nullptr) optimized->Schedule();
+    const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
+    const auto selected = best != VK_NULL_HANDLE ? best : pipeline;
+    if (reuse != nullptr && reuse->Bound(selected)) {
+        PerformanceTrace::Count(ReusedBindScope);
+    } else {
+        context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, selected);
+        if (reuse != nullptr) reuse->NoteBind(selected, layout, libraries);
+    }
+    setDynamic(reuse, Slot::Viewport, [&](const VkViewport& viewport) { context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &viewport); }, state.viewport);
+    setDynamic(reuse, Slot::Scissor, [&](const VkRect2D& scissor) { context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &scissor); }, state.scissor);
+    if (state.stencilReplayReference) context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
+    if (libraries) {
+        setLibraryState(commands, state, reuse);
+        return;
+    }
+    const auto call = [&](auto member, const char* name) { return [&, member, name](const auto&... values) { context.Resolved(member, name)(commands, values...); }; };
+    if (depthBias) setDynamic(reuse, Slot::DepthBias, call(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias"), HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
+    if (!depthBounds) return;
+    setDynamic(reuse, Slot::DepthBounds, call(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds"), state.minDepthBounds, state.maxDepthBounds);
+}
+
+void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state, PipelineStateReuse* reuse) const {
+    using Slot = PipelineStateReuse::Dynamic;
     const bool depth = state.depth.has_value();
-    context.Resolved(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, state.cullMode);
-    context.Resolved(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, state.frontFace);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f);
-    context.Resolved(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, depth && state.depthTest);
-    context.Resolved(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, depth && state.depthWrite);
-    context.Resolved(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, depthBounds);
-    context.Resolved(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, depth && state.stencilTest);
-    const auto stencil = [&](VkStencilFaceFlags face, const VkStencilOpState& op) {
-        context.Resolved(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT")(commands, face, op.failOp, op.passOp, op.depthFailOp, op.compareOp);
-        context.Resolved(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask")(commands, face, op.compareMask);
-        context.Resolved(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask")(commands, face, op.writeMask);
-        context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, face, op.reference);
+    const auto call = [&](auto member, const char* name) { return [&, member, name](const auto&... values) { context.Resolved(member, name)(commands, values...); }; };
+    setDynamic(reuse, Slot::CullMode, call(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT"), state.cullMode);
+    setDynamic(reuse, Slot::FrontFace, call(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT"), state.frontFace);
+    setDynamic(reuse, Slot::DepthBias, call(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias"), depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f);
+    setDynamic(reuse, Slot::DepthBounds, call(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds"), depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f);
+    setDynamic(reuse, Slot::DepthTest, call(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT"), VkBool32{depth && state.depthTest});
+    setDynamic(reuse, Slot::DepthWrite, call(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT"), VkBool32{depth && state.depthWrite});
+    setDynamic(reuse, Slot::DepthCompare, call(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT"), depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS);
+    setDynamic(reuse, Slot::DepthBoundsTest, call(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT"), VkBool32{depthBounds});
+    setDynamic(reuse, Slot::StencilTest, call(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT"), VkBool32{depth && state.stencilTest});
+    const auto stencil = [&](Slot op, Slot compare, Slot write, Slot reference, VkStencilFaceFlags face, const VkStencilOpState& values) {
+        setDynamic(reuse, op, call(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT"), face, values.failOp, values.passOp, values.depthFailOp, values.compareOp);
+        setDynamic(reuse, compare, call(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask"), face, values.compareMask);
+        setDynamic(reuse, write, call(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask"), face, values.writeMask);
+        setDynamic(reuse, reference, call(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference"), face, values.reference);
     };
-    stencil(VK_STENCIL_FACE_FRONT_BIT, depth ? state.stencilFront : VkStencilOpState{});
-    stencil(VK_STENCIL_FACE_BACK_BIT, depth ? state.stencilBack : VkStencilOpState{});
+    stencil(Slot::FrontStencilOp, Slot::FrontCompareMask, Slot::FrontWriteMask, Slot::FrontReference, VK_STENCIL_FACE_FRONT_BIT, depth ? state.stencilFront : VkStencilOpState{});
+    stencil(Slot::BackStencilOp, Slot::BackCompareMask, Slot::BackWriteMask, Slot::BackReference, VK_STENCIL_FACE_BACK_BIT, depth ? state.stencilBack : VkStencilOpState{});
 }
 
 void Pipeline::ContinueSecondChannel(VkCommandBuffer commands) const {
@@ -980,14 +1008,24 @@ void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state) c
     if (depthBounds) context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
 }
 
-void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
+void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes, PipelineStateReuse* reuse) const {
+    static_assert(PipelineStateReuse::PushSlotBytes == PipelinePushSlotBytes && PipelineStateReuse::PushSlots * PipelinePushSlotBytes == PipelinePushConstantBytes);
     if (stages == 0) return;
+    const auto push = [&](VkShaderStageFlags flags, std::size_t slot) {
+        const std::span<const std::byte, PipelinePushSlotBytes> values(bytes.data() + slot * PipelinePushSlotBytes, PipelinePushSlotBytes);
+        if (reuse != nullptr && reuse->SamePush(layout, flags, slot, values)) {
+            PerformanceTrace::Count(ReusedPushScope);
+            return;
+        }
+        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, flags, static_cast<std::uint32_t>(slot * PipelinePushSlotBytes), PipelinePushSlotBytes, values.data());
+        if (reuse != nullptr) reuse->NotePush(layout, flags, slot, values);
+    };
     if (dynamicRendering) {
-        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, pushStagesOf(context), 0, PipelinePushSlotBytes, bytes.data());
-        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes, bytes.data() + PipelinePushSlotBytes);
+        push(pushStagesOf(context), 0);
+        push(VK_SHADER_STAGE_FRAGMENT_BIT, 1);
         return;
     }
-    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, stages, 0, PipelinePushSlotBytes, bytes.data());
+    push(stages, 0);
 }
 
 namespace {
