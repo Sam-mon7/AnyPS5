@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -2252,6 +2253,42 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
+void CheckMemoNodePool() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    const bool environment = RuntimeSwitches::Set(RuntimeSwitch::NoMemoNodePool);
+    constexpr std::size_t ranges = 8;
+    void* memory = AllocateWatched(ranges * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0, ranges * Block);
+    BumpCollectEpoch();
+    std::vector<std::uint64_t> collected(ranges);
+    for (std::size_t i = 0; i < ranges; ++i) {
+        collected[i] = CollectWrites(base + i * Block, Block);
+        Require(collected[i] != 0, "the memo node pool fixture was not collected");
+    }
+    for (std::size_t epoch = 0; epoch < 96; ++epoch) {
+        if (epoch >= 64) RuntimeSwitches::Assign(RuntimeSwitch::NoMemoNodePool, (epoch / 4) % 2 != 0);
+        const auto written = epoch % ranges;
+        bytes[written * Block + 64 + epoch] = static_cast<std::uint8_t>(epoch + 1);
+        BumpCollectEpoch();
+        for (std::size_t i = 0; i < ranges; ++i) {
+            const auto range = base + i * Block;
+            const auto generation = CollectWrites(range, Block);
+            Require(generation != 0 && UnchangedSince(range, Block, generation), "a collect in a later epoch did not prove its range");
+            if (i == written) {
+                Require(!UnchangedSince(range, Block, collected[i]), "a pooled memo node hid a CPU store made before the epoch");
+                collected[i] = generation;
+            } else {
+                Require(UnchangedSince(range, Block, collected[i]), "an unwritten range lost its generation");
+            }
+            Require(CollectWrites(range, Block) != 0 && UnchangedSince(range, Block, collected[i]), "a memoized collect in the same epoch failed");
+        }
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::NoMemoNodePool, environment);
+}
+
 void CheckAdoptLatestEpoch() {
     std::uint64_t bumped = 0;
     std::thread([&] {
@@ -2358,6 +2395,7 @@ int main() {
         CheckUnwatchHooks();
         CheckCommittedRanges();
         CheckAdoptLatestEpoch();
+        CheckMemoNodePool();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

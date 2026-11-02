@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/EpochMemoMap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -1561,17 +1563,13 @@ ThreadCollectMemo& threadCollectMemo() {
 }
 
 struct EpochCollectMap {
-    std::uint64_t epoch = 0;
-    std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
+    EpochMemoMap<WriteTracker::Memo> ranges;
 };
 
 EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
     thread_local EpochCollectMap* slot = nullptr;
     auto& map = ShaderRecompiler::ThreadOwned(slot);
-    if (map.epoch != epoch) {
-        map.ranges.clear();
-        map.epoch = epoch;
-    }
+    if (map.ranges.Epoch() != epoch) map.ranges.Enter(epoch, !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoMemoNodePool));
     return map;
 }
 
@@ -1713,7 +1711,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
-            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
+            if (const auto* found = map.ranges.Find(first); found != nullptr && found->unwatched == unwatched && found->mapping == mapping && stop <= found->end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.stable.load(std::memory_order_acquire);
             }
@@ -1760,8 +1758,9 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             auto& memo = threadCollectMemo();
             memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, serial, mapping};
             if (epochCollectMapEnabled()) {
-                auto& entry = epochCollectMap(epoch).ranges[first];
-                if (entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
+                EpochMemoMap<WriteTracker::Memo>::SlotState state;
+                auto& entry = epochCollectMap(epoch).ranges.Slot(first, state);
+                if (state != EpochMemoMap<WriteTracker::Memo>::SlotState::Current || entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
             }
         }
     }
