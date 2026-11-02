@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include <algorithm>
 #include <atomic>
@@ -5971,6 +5972,11 @@ bool SkipWriteBack() {
     static const bool skip = std::getenv("APS5_GPU_NO_WRITEBACK") != nullptr;
     return skip;
 }
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>>& InPlaceReadScratch() {
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
 }
 
 void ShaderResources::WriteBack() {
@@ -6000,6 +6006,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     if (auto split = guestMemory.SplitInPlaceReads()) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
+    } else if (!RuntimeSwitches::Set(RuntimeSwitch::NoDrawAllocTrim)) {
+        auto& reads = InPlaceReadScratch();
+        guestMemory.InPlaceReads(reads);
+        recorder.NotePendingReads(reads, kind);
     } else {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
     }
@@ -6054,8 +6064,13 @@ void ShaderResources::WriteBackBuffers() {
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
-    const auto reads = guestMemory.InPlaceReads();
-    return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+    const auto overlaps = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads) {
+        return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+    };
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoDrawAllocTrim)) return overlaps(guestMemory.InPlaceReads());
+    auto& reads = InPlaceReadScratch();
+    guestMemory.InPlaceReads(reads);
+    return overlaps(reads);
 }
 
 void ShaderResources::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const {

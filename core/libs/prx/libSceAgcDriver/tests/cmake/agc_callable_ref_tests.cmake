@@ -1,0 +1,13 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_callable_ref_tests tests/CallableRef.cpp)
+    target_include_directories(agc_callable_ref_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_callable_ref_tests PRIVATE libc)
+    set_target_properties(agc_callable_ref_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_callable_ref_tests)
+    add_test(NAME agc_callable_ref COMMAND agc_callable_ref_tests)
+    set_tests_properties(agc_callable_ref PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_callable_ref PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

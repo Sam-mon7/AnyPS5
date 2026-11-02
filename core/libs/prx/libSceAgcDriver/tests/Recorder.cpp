@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -4264,6 +4265,16 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         ShaderResources resources(context, compute, {}, false, dispatchThreads);
         const auto reads = resources.InPlaceReads();
         const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return range.first <= element && range.second >= element + elementBytes; });
+        const bool trimmed = !RuntimeSwitches::Set(RuntimeSwitch::NoDrawAllocTrim);
+        for (const bool trim : {true, false, true}) {
+            RuntimeSwitches::Assign(RuntimeSwitch::NoDrawAllocTrim, !trim);
+            const std::array<std::pair<std::uint64_t, std::size_t>, 5> probes{{{element, 1}, {element + elementBytes - 1, 1}, {element + elementBytes, 4096}, {element - 4096, 4096}, {element - 1, 2}}};
+            for (const auto& [probe, probeBytes] : probes) {
+                const bool expected = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return probe < range.second && range.first < probe + probeBytes; });
+                Require(resources.ReadsOverlap(probe, probeBytes) == expected, trim ? "ReadsOverlap through the per-thread scratch differs from the in-place reads" : "ReadsOverlap with APS5_NO_DRAW_ALLOC_TRIM differs from the in-place reads");
+            }
+        }
+        RuntimeSwitches::Assign(RuntimeSwitch::NoDrawAllocTrim, !trimmed);
         resources.MarkGpuWrites(recorder);
         recorder.Sync();
         return direct;
