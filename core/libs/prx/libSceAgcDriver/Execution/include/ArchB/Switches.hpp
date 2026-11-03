@@ -42,6 +42,7 @@ enum class Feature : std::uint8_t {
     PipeKeepOwnLabelWaits,
     FixDrawSetPool,
     PipeDeepQueue,
+    PipeCommitterMutexPriority,
     Count
 };
 

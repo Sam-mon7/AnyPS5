@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory/GenTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -193,6 +194,16 @@ GpuMutexType& GpuMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
+// APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY (runtime, sampled per acquisition): `queued` says whether
+// the queue-0 committer has work queued or in progress. While it does, a queue worker other than
+// queue 0 (a thread tagged by TagGpuLockThread with a nonzero queue) waits before its outermost
+// lock(), spinning up to GpuLockPriorityWindow(), so its holds fall into the committer's idle gaps
+// rather than between two commits (2026-11-03 profile: the committer waited ~6.5 ms per frame
+// behind compute-queue holds and idled ~19 ms). Queue 0, the committer, the presenter and untagged
+// threads never wait; try_lock never waits. One hook, set once.
+void SetGpuLockPriorityHook(bool (*queued)());
+// The longest a queue worker waits for the committer (APS5_PIPE_MUTEX_PRIORITY_US, default 1000 us).
+std::chrono::nanoseconds GpuLockPriorityWindow();
 std::uint64_t GpuHoldSerial();
 std::uint64_t ThreadGpuHeldNs();
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling

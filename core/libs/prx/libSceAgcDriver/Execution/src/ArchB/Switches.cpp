@@ -41,6 +41,7 @@ constexpr Feature PipeNarrowDispatchWritesPrerequisites[] = {Feature::PipeQ0Comm
 constexpr Feature PipeKeepOwnLabelWaitsPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature FixDrawSetPoolPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeDeepQueuePrerequisites[] = {Feature::PipeQ0Committer};
+constexpr Feature PipeCommitterMutexPriorityPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -76,6 +77,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::PipeKeepOwnLabelWaits, "PIPE_KEEP_OWN_LABEL_WAITS", false, true, PipeKeepOwnLabelWaitsPrerequisites},
     {Feature::FixDrawSetPool, "FIX_DRAW_SET_POOL", false, true, FixDrawSetPoolPrerequisites},
     {Feature::PipeDeepQueue, "PIPE_DEEP_QUEUE", false, true, PipeDeepQueuePrerequisites},
+    {Feature::PipeCommitterMutexPriority, "PIPE_COMMITTER_MUTEX_PRIORITY", false, true, PipeCommitterMutexPriorityPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

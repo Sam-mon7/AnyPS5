@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -9,6 +10,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -151,6 +156,86 @@ void GpuMutexRecursion() {
     Check(counter == 80000, "every nested increment under the GPU mutex counted");
 }
 
+// APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY: a queue worker (tagged, nonzero queue) waits before
+// its outermost lock() while the committer hook reports work, up to the window; queue 0, untagged
+// threads, nested acquisitions and try_lock never wait; the switch turned off stops the waits.
+std::atomic<bool> committerBusy{false};
+
+double LockMs(std::uint32_t tag, bool nested = false) {
+    double ms = -1;
+    std::thread worker([&] {
+        if (tag != 0xffffffffu) AgcDriver::GuestMemory::TagGpuLockThread(tag);
+        auto& mutex = AgcDriver::GuestMemory::GpuMutex();
+        std::unique_lock outer(mutex, std::defer_lock);
+        if (nested) {
+            const bool previous = committerBusy.exchange(false);
+            outer.lock();
+            committerBusy.store(previous);
+        }
+        const auto start = std::chrono::steady_clock::now();
+        mutex.lock();
+        ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        mutex.unlock();
+    });
+    worker.join();
+    return ms;
+}
+
+void CommitterMutexPriority(const std::filesystem::path& control) {
+    using namespace std::chrono_literals;
+    const auto window = AgcDriver::GuestMemory::GpuLockPriorityWindow();
+    Check(window == std::chrono::nanoseconds(10ms), "APS5_PIPE_MUTEX_PRIORITY_US sets the window (clamped to 10 ms)");
+    Check(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeCommitterMutexPriority), "the switch is on from the environment (with PIPE_Q0_COMMITTER)");
+    AgcDriver::GuestMemory::SetGpuLockPriorityHook([] { return committerBusy.load(); });
+    committerBusy = false;
+    Check(LockMs(0x28) < 5, "a queue worker does not wait while the committer is idle");
+    committerBusy = true;
+    Check(LockMs(0) < 5, "queue 0 never waits for the committer");
+    Check(LockMs(0xffffffffu) < 5, "an untagged thread (committer, presenter) never waits");
+    Check(LockMs(0x28, true) < 5, "a nested acquisition never waits");
+    const double timedOut = LockMs(0x30);
+    Check(timedOut >= 9 && timedOut < 1000, "a queue worker takes the mutex at the end of the window while the committer stays busy");
+    // The committer goes idle partway: the worker takes the mutex then, not at the window's end.
+    // (Busy-waits here, not sleeps: a sleep may overshoot the 10 ms window on a loaded machine.)
+    std::atomic<bool> acquired{false};
+    std::atomic<bool> started{false};
+    std::chrono::steady_clock::time_point acquiredAt{};
+    std::thread worker([&] {
+        AgcDriver::GuestMemory::TagGpuLockThread(0x40);
+        started = true;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        acquiredAt = std::chrono::steady_clock::now();
+        acquired = true;
+    });
+    while (!started.load()) std::this_thread::yield();
+    const auto begin = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - begin < 3ms) std::this_thread::yield();
+    Check(!acquired.load(), "a queue worker waits while the committer is busy");
+    const auto cleared = std::chrono::steady_clock::now();
+    committerBusy = false;
+    worker.join();
+    Check(acquired.load() && acquiredAt >= cleared && acquiredAt - begin < 9ms, "the waiting worker takes the mutex once the committer is idle, before the window ends");
+    {
+        std::lock_guard held(AgcDriver::GuestMemory::GpuMutex());
+        committerBusy = true;
+        bool taken = true;
+        const auto start = std::chrono::steady_clock::now();
+        std::thread trier([&] {
+            AgcDriver::GuestMemory::TagGpuLockThread(0x28);
+            taken = AgcDriver::GuestMemory::GpuMutex().try_lock();
+            if (taken) AgcDriver::GuestMemory::GpuMutex().unlock();
+        });
+        trier.join();
+        Check(!taken && std::chrono::steady_clock::now() - start < 5ms, "try_lock fails at once on a held mutex (no wait for the committer)");
+    }
+    std::ofstream(control, std::ios::binary | std::ios::trunc) << "1 PIPE_COMMITTER_MUTEX_PRIORITY=0\n";
+    std::this_thread::sleep_for(60ms);
+    AgcDriver::ArchB::Switches::PollControl();
+    Check(!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeCommitterMutexPriority), "the switch turns off at run time");
+    Check(LockMs(0x28) < 5, "with the switch off a queue worker does not wait");
+    committerBusy = false;
+}
+
 template<typename TTag>
 void SlotIsolation(const char* what) {
     using Slot = HostThreadSlot<std::uint64_t, TTag>;
@@ -204,7 +289,23 @@ void ThreadSlots() {
 
 }
 
+void SetEnvironment(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 int main() {
+    // Before anything reads the ArchB switches (the first GPU-mutex acquisition does).
+    const auto control = std::filesystem::temp_directory_path() / ("agc-locks-control-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+    std::ofstream(control, std::ios::binary | std::ios::trunc) << "";
+    SetEnvironment("APS5_ARCHB_CONTROL_FILE", control.string().c_str());
+    SetEnvironment("APS5_ARCHB_GATE_RUN", "1");  // the control file is read only on a gate run
+    SetEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", "1");
+    SetEnvironment("APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY", "1");
+    SetEnvironment("APS5_PIPE_MUTEX_PRIORITY_US", "50000");
     MutexCounts(8, 100000, 0);
     MutexCounts(4, 2000, 20000);
     MutexTryLock();
@@ -212,6 +313,9 @@ int main() {
     DeviceGate();
     GpuMutexRecursion();
     ThreadSlots();
+    CommitterMutexPriority(control);
+    std::error_code ignored;
+    std::filesystem::remove(control, ignored);
     if (failures != 0) {
         std::fprintf(stderr, "%d lock check(s) failed\n", failures);
         return 1;

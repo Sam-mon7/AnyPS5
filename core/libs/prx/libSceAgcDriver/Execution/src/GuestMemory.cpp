@@ -3567,6 +3567,54 @@ namespace {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
 thread_local std::chrono::steady_clock::time_point recorderHoldStart{};
 thread_local std::uint64_t recorderHoldGeneration = 0;
+
+// APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY (GuestMemory.hpp, SetGpuLockPriorityHook).
+std::atomic<bool (*)()> gpuLockPriorityHook{nullptr};
+struct GpuLockPriorityCounters {
+    std::atomic<std::uint64_t> waits{0};      // acquisitions that found the committer busy and waited
+    std::atomic<std::uint64_t> cleared{0};    // ... and saw it go idle within the window
+    std::atomic<std::uint64_t> timeouts{0};   // ... and took the mutex at the end of the window
+    std::atomic<std::uint64_t> waitedUs{0};
+};
+GpuLockPriorityCounters& priorityCounters() {
+    static GpuLockPriorityCounters counters;
+    return counters;
+}
+
+void DeferToCommitter(const GpuMutexType& mutex) {
+    const auto hook = gpuLockPriorityHook.load(std::memory_order_acquire);
+    if (hook == nullptr || !ArchB::Switches::Enabled(ArchB::Feature::PipeCommitterMutexPriority)) return;
+    const auto tag = LockStats().tag;
+    if (tag == 0 || tag == 0xffffffffu || mutex.HeldByThisThread() || !hook()) return;
+    const auto start = std::chrono::steady_clock::now();
+    const bool idle = SpinUntil(GpuLockPriorityWindow(), [&] { return !hook(); });
+    auto& counters = priorityCounters();
+    counters.waits.fetch_add(1, std::memory_order_relaxed);
+    (idle ? counters.cleared : counters.timeouts).fetch_add(1, std::memory_order_relaxed);
+    counters.waitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+}
+
+void SetGpuLockPriorityHook(bool (*queued)()) {
+    static const bool registered = [] {
+        auto& counters = priorityCounters();
+        ArchB::Recorder::RegisterCounter("pipe_mutex_priority_waits", counters.waits);
+        ArchB::Recorder::RegisterCounter("pipe_mutex_priority_cleared", counters.cleared);
+        ArchB::Recorder::RegisterCounter("pipe_mutex_priority_timeouts", counters.timeouts);
+        ArchB::Recorder::RegisterCounter("pipe_mutex_priority_waited_us", counters.waitedUs);
+        return true;
+    }();
+    static_cast<void>(registered);
+    gpuLockPriorityHook.store(queued, std::memory_order_release);
+}
+
+std::chrono::nanoseconds GpuLockPriorityWindow() {
+    static const std::chrono::nanoseconds window = [] {
+        const char* text = std::getenv("APS5_PIPE_MUTEX_PRIORITY_US");
+        const long long us = text != nullptr && *text != '\0' ? std::clamp<long long>(std::strtoll(text, nullptr, 10), 0, 10000) : 1000;
+        return std::chrono::nanoseconds(std::chrono::microseconds(us));
+    }();
+    return window;
 }
 
 void GpuMutexType::enter() {
@@ -3694,6 +3742,8 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    // Before the wait timer: time given to the committer is counted apart (pipe_mutex_priority_*).
+    DeferToCommitter(*this);
     PerformanceTimer recorderTiming("GpuMutex.wait");
     recorderTiming.RecorderCounter("gpu_mutex_wait_ms");
     if (Timeline::Enabled && !HeldByThisThread()) {
