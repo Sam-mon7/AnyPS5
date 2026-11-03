@@ -44,6 +44,7 @@ enum class Feature : std::uint8_t {
     PipeDeepQueue,
     PipeCommitterMutexPriority,
     PipeFullHysteresis,
+    PipeDispatchAlias,
     Count
 };
 

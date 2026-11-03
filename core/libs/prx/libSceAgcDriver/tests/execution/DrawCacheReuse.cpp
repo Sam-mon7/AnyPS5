@@ -685,6 +685,22 @@ void TsharpCachePath(bool dispatch, bool user, bool toggle) {
     Require(count("fix_tsharp_mask_verify_mismatches") == 0, "feedback verification mismatched");
     Require(count("fix_tsharp_build_verify_mismatches") == 0, "cached feedback proof verification mismatched");
     Require(!enabled || !verify || dispatch || count("fix_tsharp_mask_verified") >= 3, "feedback-only hits were not verified");
+    // APS5_ARCHB_PIPE_DISPATCH_ALIAS with queue 0 pipelined: a feedback-only user-data change misses the
+    // exact key, and the lookup serves the feedback alias; the pre-check resolves the same entry, so the
+    // dispatch is no miss (an item when the variant has a recipe; this test's variants have none), and
+    // without the switch it falls back as a miss and runs on queue 0.
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    if (dispatch && user && enabled && Switches::Enabled(Feature::PipeQ0Committer)) {
+        std::fprintf(stderr, "queue-0 dispatches: items %.0f, alias items %.0f, alias resolved %.0f, misses %.0f, alias misses %.0f, misses then hit %.0f, no recipe %.0f\n", count("pipe_q0_dispatch_item"), count("pipe_q0_dispatch_alias_item"), count("pipe_q0_dispatch_alias_resolved"), count("pipe_q0_dispatch_miss"), count("pipe_q0_dispatch_miss_alias"), count("pipe_q0_dispatch_miss_then_hit"), count("pipe_q0_dispatch_no_recipe"));
+        if (Switches::Enabled(Feature::PipeDispatchAlias)) {
+            Require(count("pipe_q0_dispatch_miss_alias") == 0, "a dispatch the feedback alias serves fell back as a miss with PIPE_DISPATCH_ALIAS");
+            Require(count("pipe_q0_dispatch_alias_resolved") >= 3, "the pre-check did not resolve the feedback alias with PIPE_DISPATCH_ALIAS");
+        } else {
+            Require(count("pipe_q0_dispatch_miss_alias") >= 3, "no feedback-alias dispatch fell back as a miss without PIPE_DISPATCH_ALIAS");
+            Require(count("pipe_q0_dispatch_alias_resolved") == 0 && count("pipe_q0_dispatch_alias_item") == 0, "the pre-check used the feedback alias without PIPE_DISPATCH_ALIAS");
+        }
+    }
 }
 
 void PipelineStateReusePath(const std::filesystem::path& control) {

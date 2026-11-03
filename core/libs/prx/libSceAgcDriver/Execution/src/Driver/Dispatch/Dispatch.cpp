@@ -106,6 +106,23 @@ void NoteItemFallback(ItemFallback reason) {
     itemFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
 
+// Queue-0 dispatches by outcome (recorder counters pipe_q0_dispatch_<outcome>): committed as items,
+// not candidates (copy kernels, indirect, deferred labels, ahead), the pre-check fallbacks, and among
+// the misses those whose exact key was absent while the feedback alias (APS5_ARCHB_PIPE_DISPATCH_ALIAS)
+// resolved an entry, and the misses the q0 lookup then served from the cache anyway.
+enum class Q0Dispatch : std::size_t { Item, NotCandidateCopy, NotCandidateIndirect, NotCandidateLabels, NotCandidateOther, Miss, MissAlias, MissThenHit, Reads, NoRecipe, Writes, Verify, AliasItem, AliasResolved, Count };
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Q0Dispatch::Count)> q0Dispatches{};
+
+void NoteQ0Dispatch(Q0Dispatch outcome) {
+    static const bool registered = [] {
+        constexpr std::array<const char*, static_cast<std::size_t>(Q0Dispatch::Count)> names{"pipe_q0_dispatch_item", "pipe_q0_dispatch_copy_kernel", "pipe_q0_dispatch_indirect", "pipe_q0_dispatch_labels", "pipe_q0_dispatch_not_candidate", "pipe_q0_dispatch_miss", "pipe_q0_dispatch_miss_alias", "pipe_q0_dispatch_miss_then_hit", "pipe_q0_dispatch_reads", "pipe_q0_dispatch_no_recipe", "pipe_q0_dispatch_writes", "pipe_q0_dispatch_verify", "pipe_q0_dispatch_alias_item", "pipe_q0_dispatch_alias_resolved"};
+        for (std::size_t i = 0; i < names.size(); ++i) ArchB::Recorder::RegisterCounter(names[i], q0Dispatches[i]);
+        return true;
+    }();
+    static_cast<void>(registered);
+    q0Dispatches[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+}
+
 void ReportDispatchItems(bool profile) {
     static auto lastReport = std::chrono::steady_clock::now();
     if (!profile) return;
@@ -264,6 +281,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         bool copyDrainDiag = false;
         if (DrawPipeline::Active() && !pipelineCandidate) {
             const auto cause = resolving || fromAhead ? DrawPipeline::DrainCause::DispatchAhead : !DrawPipeline::DispatchItems() ? DrawPipeline::DrainCause::DispatchItemsOff : indirectArguments != 0 ? DrawPipeline::DrainCause::DispatchIndirect : !deferredLabels().labels.empty() ? DrawPipeline::DrainCause::DispatchLabels : DrawPipeline::DrainCause::DispatchCopy;
+            NoteQ0Dispatch(cause == DrawPipeline::DrainCause::DispatchCopy ? Q0Dispatch::NotCandidateCopy : cause == DrawPipeline::DrainCause::DispatchIndirect ? Q0Dispatch::NotCandidateIndirect : cause == DrawPipeline::DrainCause::DispatchLabels ? Q0Dispatch::NotCandidateLabels : Q0Dispatch::NotCandidateOther);
             copyDrainDiag = cause == DrawPipeline::DrainCause::DispatchCopy && PipeDrainDiag() && DrawPipeline::Queue0().Busy();
             DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, cause);
         }
@@ -437,25 +455,48 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     timing.Mark("decode_key_device_setup");
     bool readsClear = false;
     auto fallbackCause = DrawPipeline::DrainCause::DispatchReads;
+    // APS5_ARCHB_PIPE_DISPATCH_ALIAS (sampled per dispatch): the pre-check resolves the entry the q0
+    // lookup will serve, the exact key and else the feedback-key alias (DispatchLookup.cpp), and tests
+    // that entry's regions against queued writes.
+    bool aliasEntry = false;
     if (pipelineCandidate) {
         std::vector<ShaderRecompiler::MemoryRegion> reads;
         bool entryFound = false;
+        bool aliasAvailable = false;
         {
             std::lock_guard cacheLock(dispatchCacheMutex);
-            if (const auto found = dispatchCache.find(key); found != dispatchCache.end()) {
+            auto found = dispatchCache.find(key);
+            if (found == dispatchCache.end() && feedbackMask && feedbackKey != 0 && !noDispatchCache && !stampValidate()) {
+                if (const auto alias = dispatchFeedbackKeys.find(feedbackKey); alias != dispatchFeedbackKeys.end()) {
+                    if (const auto aliased = dispatchCache.find(alias->second); aliased != dispatchCache.end()) {
+                        aliasAvailable = true;
+                        if (ArchB::Switches::Enabled(ArchB::Feature::PipeDispatchAlias)) {
+                            found = aliased;
+                            aliasEntry = true;
+                            NoteQ0Dispatch(Q0Dispatch::AliasResolved);
+                        }
+                    }
+                }
+            }
+            if (found != dispatchCache.end()) {
                 entryFound = true;
                 for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
             }
         }
         if (!entryFound || noDispatchCache || stampValidate()) {
             NoteItemFallback(ItemFallback::Miss);
+            NoteQ0Dispatch(aliasAvailable ? Q0Dispatch::MissAlias : Q0Dispatch::Miss);
             fallbackCause = DrawPipeline::DrainCause::DispatchMiss;
         } else if (verifyDataHits()) {
             NoteItemFallback(ItemFallback::Verify);
+            NoteQ0Dispatch(Q0Dispatch::Verify);
             fallbackCause = DrawPipeline::DrainCause::DispatchVerify;
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
-            if (!readsClear) NoteItemFallback(ItemFallback::Reads);
+            if (!readsClear) {
+                NoteItemFallback(ItemFallback::Reads);
+                NoteQ0Dispatch(Q0Dispatch::Reads);
+            }
         }
         if (!readsClear && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, fallbackCause);
     }
@@ -480,6 +521,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering, feedbackMask, feedbackKey, userData);
     }
     timing.Mark("lookup_cache");
+    if (pipelineCandidate && fallbackCause == DrawPipeline::DrainCause::DispatchMiss && cached) NoteQ0Dispatch(Q0Dispatch::MissThenHit);
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
     if (readsClear) {
@@ -490,12 +532,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded, narrowWrites);
             pipelined = bounded;
-            if (!bounded) NoteItemFallback(ItemFallback::Writes);
+            if (!bounded) {
+                NoteItemFallback(ItemFallback::Writes);
+                NoteQ0Dispatch(Q0Dispatch::Writes);
+            }
             else if (narrowWrites && compiledResult->bdaAbiVersion != 0) DrawPipeline::CountNarrowedDispatchWrites();
             if (!bounded && PipeDrainDiag()) NoteUnboundedDispatchWrites(*compiledResult, true);
             fallbackCause = DrawPipeline::DrainCause::DispatchWrites;
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
+            NoteQ0Dispatch(Q0Dispatch::NoRecipe);
             fallbackCause = DrawPipeline::DrainCause::DispatchNoRecipe;
         }
         if (!pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, fallbackCause);
@@ -653,6 +699,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto ticket = GuestMemory::Gen::Required();
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
+        NoteQ0Dispatch(aliasEntry ? Q0Dispatch::AliasItem : Q0Dispatch::Item);
         DrawPipeline::Queue0().Enqueue([this, allocChurn, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, computeSync] {
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             const ArchB::AllocChurnScope allocChurnScope(allocChurn);
