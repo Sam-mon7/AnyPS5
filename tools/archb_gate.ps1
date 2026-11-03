@@ -22,6 +22,7 @@ param(
     [switch]$Diagnostic,
     [switch]$RecorderOverhead,
     [ValidateRange(0, 10)][int]$SlowSessionRetries = 2,
+    [switch]$HighQos,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][string]$WatchdogManifest,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][int]$RunnerPid,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][long]$RunnerStartTicks
@@ -571,6 +572,7 @@ function Invoke-GateLegOnce($Configuration, [string]$Label, [string]$Kind, [int]
         Write-GateJson $activePath $active
         while (-not $navProcess.WaitForExit(1000)) { $null = Add-GateMemorySample $process $directory ([ref]$lowSince) }
         if ($navProcess.ExitCode -ne 0) { Stop-GateFailure $navProcess.ExitCode 'Navigation failed' }
+        if ($HighQos) { & (Join-Path $script:GateTools 'archb_high_qos.ps1') -GamePid $process.Id | Set-Content -LiteralPath (Join-Path $directory 'high-qos.txt') -Encoding utf8 }
         if ($upperBound) { $result.stage = 'warmup' }
         $navigation = Get-Content -LiteralPath (Join-Path $directory 'navigation.json') -Raw | ConvertFrom-Json -AsHashtable
         $null = Invoke-GatePython 'archb_gate_nav.py' @('screenshot', '--pid', $process.Id, '--output', (Join-Path $directory 'start.png'))
