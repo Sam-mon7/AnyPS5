@@ -1,6 +1,9 @@
 #include "prx/libc/include/Api.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <array>
 #include <cstdio>
 #include <mutex>
@@ -796,12 +799,56 @@ extern "C" void BlockPathAlias_nid_no_patch(const char* guestPrefix) {
     aliases.blocked.push_back(prefix);
 }
 
+struct PathStats {
+    struct Entry { std::uint64_t calls = 0, ns = 0; unsigned long thread = 0; };
+    std::mutex mutex;
+    std::map<std::string, Entry> entries;
+    std::uint64_t calls = 0, ns = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+static PathStats* PathStatsState() {
+    static PathStats* state = std::getenv("APS5_LIBC_PATH_STATS") != nullptr ? new PathStats : nullptr;
+    return state;
+}
+static void NotePathResolution(PathStats& stats, const char* path, std::chrono::steady_clock::time_point start) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+    std::lock_guard lock(stats.mutex);
+    auto& entry = stats.entries[path];
+    ++entry.calls; entry.ns += ns;
+#ifdef _WIN32
+    entry.thread = GetCurrentThreadId();
+#endif
+    ++stats.calls; stats.ns += ns;
+    const double seconds = std::chrono::duration<double>(now - stats.last).count();
+    if (seconds < 10.0) return;
+    std::vector<std::pair<std::uint64_t, const std::pair<const std::string, PathStats::Entry>*>> top;
+    for (const auto& item : stats.entries) top.emplace_back(item.second.ns, &item);
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "[libc-paths] %.1f s: %llu resolutions, %.1f ms host time, %zu distinct paths\n", seconds,
+                 static_cast<unsigned long long>(stats.calls), stats.ns / 1e6, stats.entries.size());
+    for (std::size_t i = 0; i < top.size() && i < 8; ++i) {
+        const auto& [name, entry] = *top[i].second;
+        std::fprintf(stderr, "[libc-paths]   %llu calls, %.1f ms, %.1f us each, thread %lu: %s\n", static_cast<unsigned long long>(entry.calls),
+                     entry.ns / 1e6, entry.calls ? entry.ns / 1e3 / entry.calls : 0.0, entry.thread, name.c_str());
+    }
+    std::fflush(stderr);
+    stats.entries.clear(); stats.calls = 0; stats.ns = 0; stats.last = now;
+}
+
 static std::filesystem::path ResolveLocked(const char* path, bool module, bool archived) {
     if (!path) { APS5_INVALID_ARG_EX; }
+    auto* stats = PathStatsState();
+    const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (archived) AppArchiveReady_nid_no_patch();
     auto& state = Directories();
-    std::lock_guard lock(state.mutex);
-    return Resolve(state, path, module, archived);
+    std::filesystem::path resolved;
+    {
+        std::lock_guard lock(state.mutex);
+        resolved = Resolve(state, path, module, archived);
+    }
+    if (stats) NotePathResolution(*stats, path, start);
+    return resolved;
 }
 
 extern "C" std::filesystem::path ResolveDiskPath_nid_no_patch(const char* path) {
