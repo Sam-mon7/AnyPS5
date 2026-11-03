@@ -199,11 +199,11 @@ private:
     // APS5_ARCHB_FIX_DISPATCH_RELOCATION: the draw relocation alias for dispatches. A dispatch-cache
     // insert tags its variant's runs by the user word each is read through (tagVariantRuns), learns
     // the program identity's relocation shape (the words used only as bases and the offsets read
-    // through them) and keys the entry under an alias that hashes the identity, the other user
-    // words, and the content at the relocatable words' offsets instead of their values. An absent
-    // key computes the same alias from the current user words; a donor found there is copied with
-    // its runs moved by each word's delta (validated by value as usual) and its forwarded shader
-    // data patched to the new words. Under dispatchCacheMutex except the content reads.
+    // through them) and keys the entry under an alias of the identity and the other user words
+    // (the relocatable bases left out). An absent key computes the same alias from the current
+    // user words; a donor found there is copied with its runs moved by each word's delta and its
+    // forwarded shader data patched to the new words, then validated by value as usual (equal, or a
+    // data hit when only data positions changed). Under dispatchCacheMutex.
     static std::shared_ptr<const DrawRelocation> dispatchRelocationShape(const DispatchVariant& variant);
     static std::uint64_t dispatchAliasKey(std::uint64_t identity, std::span<const std::uint32_t> userData, const DrawRelocation& shape, bool& readable);
     std::shared_ptr<DispatchEntry> relocateDispatchEntry(std::unique_lock<AgcDriver::Mutex>& cacheLock, std::uint64_t identity, std::span<const std::uint32_t> userData);

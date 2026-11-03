@@ -152,6 +152,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 if (relocated) {
                     applyShaderDataPatches(*variant);
                     ArchB::Recorder::Count("fix_dispatch_relocation_hits");
+                    if (dataHit) ArchB::Recorder::Count("fix_dispatch_relocation_data_hits");
                 }
                 if (feedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");
                 ++counters.variantHitsByRank[rank];

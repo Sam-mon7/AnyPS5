@@ -275,12 +275,15 @@ std::shared_ptr<const DrawRelocation> Driver::dispatchRelocationShape(const Disp
 }
 
 std::uint64_t Driver::dispatchAliasKey(std::uint64_t identity, std::span<const std::uint32_t> userData, const DrawRelocation& shape, bool& readable) {
+    // The shape alias: a relocatable base contributes only its alignment, not its value or the
+    // content behind it (ring-allocated constants move and change every frame); the donor's copy is
+    // validated by value, so content that changed only at data positions is a data hit and anything
+    // else a miss. (A content-keyed alias, as for draws, found ~0 donors live: 0.06 hits/f.)
     std::uint64_t key = identity ^ 0x6a09e667f3bcc908ull;
     readable = true;
     for (std::uint32_t index = 0; index < userData.size(); ++index) {
-        const auto word = std::find_if(shape.words.begin(), shape.words.end(), [&](const RelocatableUserWord& candidate) { return candidate.reg == index; });
-        const auto mixed = word != shape.words.end() ? relocatedContentKey(*word, userData[index], readable) : userData[index];
-        if (!readable) return 0;
+        const bool relocatable = std::any_of(shape.words.begin(), shape.words.end(), [&](const RelocatableUserWord& candidate) { return candidate.reg == index; });
+        const std::uint64_t mixed = relocatable ? (0xa5a5a5a500000000ull | (userData[index] & 3u)) : userData[index];
         key = (key ^ mixed) * 0x100000001b3ull;
     }
     return key;
@@ -291,12 +294,10 @@ std::shared_ptr<DispatchEntry> Driver::relocateDispatchEntry(std::unique_lock<Ag
     if (known == dispatchRelocations.end()) return nullptr;
     const auto shape = known->second;
     ArchB::Recorder::Count("fix_dispatch_relocation_lookups");
-    // The content reads go through the guest-memory paths; not under the cache mutex.
-    cacheLock.unlock();
+    static_cast<void>(cacheLock);
     bool readable = true;
     const auto alias = dispatchAliasKey(identity, userData, *shape, readable);
-    cacheLock.lock();
-    if (!readable || alias == 0) return nullptr;
+    if (!readable) return nullptr;
     const auto found = dispatchAliases.find(alias);
     if (found == dispatchAliases.end()) return nullptr;
     const auto cached = dispatchCache.find(found->second);

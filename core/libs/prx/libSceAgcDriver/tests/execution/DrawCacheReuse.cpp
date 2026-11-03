@@ -705,10 +705,13 @@ void TsharpCachePath(bool dispatch, bool user, bool toggle) {
 
 // APS5_ARCHB_FIX_DISPATCH_RELOCATION: a dispatch whose resource table pointer (user[4:5]) moved to
 // another table with the same content is served from the entry of the first table through the
-// relocation alias (a cache hit, the same output); a moved table with other content is not; without
+// relocation alias (a cache hit, the same output); a moved table whose scalar constant changed is
+// served as a data hit with the new constant; a moved table whose T# address changed writes the new
+// texture's value (a miss, or a data hit if that word is refreshable data); without
 // the switch every moved pointer misses. With queue 0 pipelined (PIPE_Q0_COMMITTER) the relocated
 // dispatches still fall back from the pre-check (exact key absent) and then hit in the lookup.
-alignas(256) std::array<std::array<std::uint32_t, 16>, 4> RelocationTables{};
+alignas(256) std::array<std::array<std::uint32_t, 16>, 5> RelocationTables{};
+alignas(256) std::array<std::byte, 4096> RelocationTexture{};
 
 void DispatchRelocationPath() {
     using namespace AgcDriver::DriverDetail;
@@ -721,6 +724,10 @@ void DispatchRelocationPath() {
     const std::array<std::uint32_t, 16> table{static_cast<std::uint32_t>(texture >> 8), static_cast<std::uint32_t>(texture >> 40) | (56u << 20u), 0, 0x90000fac, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(0.25f), 0, 0, 0, 0x92, 0x00fff000, 0, 0};
     for (auto& entry : RelocationTables) entry = table;
     RelocationTables[3][8] = std::bit_cast<std::uint32_t>(0.5f);
+    RelocationTexture.fill(std::byte{128});
+    const auto otherTexture = reinterpret_cast<std::uintptr_t>(RelocationTexture.data());
+    RelocationTables[4][0] = static_cast<std::uint32_t>(otherTexture >> 8);
+    RelocationTables[4][1] = static_cast<std::uint32_t>(otherTexture >> 40) | (56u << 20u);
     const std::vector<std::uint32_t> code{0xf40c0202u, 0xfa000000u, 0xf4000402u, 0xfa000020u, 0xf4080502u, 0xfa000030u, 0xbf8cc07fu,
         0x7e2802ffu, 0x3f000000u, 0x7e2a02ffu, 0x3f000000u, 0xf09c0f08u, 0x00a20a14u, 0xbf8c3f70u, 0x10001410u,
         0x7e020280u, 0xe0700000u, 0x80000001u, 0xbf810000u};
@@ -753,13 +760,16 @@ void DispatchRelocationPath() {
     Require(third == 64 && (again == moved + 1) == enabled, "a second move did not take the same cache path");
     const auto [other, fourth] = submit(RelocationTables[3]);
     Require(fourth == 128, "a moved table with another constant wrote a stale value");
-    Require(other == again, "a moved table with other content hit the cache");
+    const auto [image, sixth] = submit(RelocationTables[4]);
+    Require(sixth == 32, "a moved table with another texture wrote a stale value");
+    static_cast<void>(image);
     const auto [back, fifth] = submit(RelocationTables[0]);
-    Require(fifth == 64 && back == other + 1, "the first table's exact key no longer hit");
+    Require(fifth == 64 && back == image + 1, "the first table's exact key no longer hit");
     const auto counts = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now()).counters;
     const auto count = [&](const char* name) { const auto it = counts.find(name); return it == counts.end() ? 0.0 : it->second; };
-    std::fprintf(stderr, "dispatch relocation: learned %.0f, lookups %.0f, donors %.0f, refused %.0f, hits %.0f; queue-0 misses %.0f, misses then hit %.0f\n", count("fix_dispatch_relocation_learned"), count("fix_dispatch_relocation_lookups"), count("fix_dispatch_relocation_donors"), count("fix_dispatch_relocation_refused"), count("fix_dispatch_relocation_hits"), count("pipe_q0_dispatch_miss"), count("pipe_q0_dispatch_miss_then_hit"));
-    Require(count("fix_dispatch_relocation_hits") == (enabled ? 2.0 : 0.0), "relocation hits were not counted as expected");
+    std::fprintf(stderr, "dispatch relocation: learned %.0f, lookups %.0f, donors %.0f, refused %.0f, hits %.0f (data %.0f); queue-0 misses %.0f, misses then hit %.0f\n", count("fix_dispatch_relocation_learned"), count("fix_dispatch_relocation_lookups"), count("fix_dispatch_relocation_donors"), count("fix_dispatch_relocation_refused"), count("fix_dispatch_relocation_hits"), count("fix_dispatch_relocation_data_hits"), count("pipe_q0_dispatch_miss"), count("pipe_q0_dispatch_miss_then_hit"));
+    if (enabled) Require(count("fix_dispatch_relocation_hits") >= 2.0 && count("fix_dispatch_relocation_hits") <= 4.0, "relocation hits were not counted as expected");
+    else Require(count("fix_dispatch_relocation_hits") == 0.0, "relocation hits without the switch");
     if (enabled && Switches::Enabled(Feature::PipeQ0Committer)) Require(count("pipe_q0_dispatch_miss_then_hit") >= 2, "relocated queue-0 dispatches were not served after the pre-check miss");
 }
 
