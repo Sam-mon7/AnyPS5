@@ -46,6 +46,7 @@ enum class Feature : std::uint8_t {
     PipeFullHysteresis,
     PipeDispatchAlias,
     PipeCollectShare,
+    FixDispatchRelocation,
     Count
 };
 

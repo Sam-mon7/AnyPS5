@@ -196,6 +196,17 @@ private:
     void learnPendingRelocation();
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
     void reportDrawRelocation();
+    // APS5_ARCHB_FIX_DISPATCH_RELOCATION: the draw relocation alias for dispatches. A dispatch-cache
+    // insert tags its variant's runs by the user word each is read through (tagVariantRuns), learns
+    // the program identity's relocation shape (the words used only as bases and the offsets read
+    // through them) and keys the entry under an alias that hashes the identity, the other user
+    // words, and the content at the relocatable words' offsets instead of their values. An absent
+    // key computes the same alias from the current user words; a donor found there is copied with
+    // its runs moved by each word's delta (validated by value as usual) and its forwarded shader
+    // data patched to the new words. Under dispatchCacheMutex except the content reads.
+    static std::shared_ptr<const DrawRelocation> dispatchRelocationShape(const DispatchVariant& variant);
+    static std::uint64_t dispatchAliasKey(std::uint64_t identity, std::span<const std::uint32_t> userData, const DrawRelocation& shape, bool& readable);
+    std::shared_ptr<DispatchEntry> relocateDispatchEntry(std::unique_lock<AgcDriver::Mutex>& cacheLock, std::uint64_t identity, std::span<const std::uint32_t> userData);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission, const Graphics::Context& context);
@@ -418,6 +429,8 @@ private:
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;
     std::unordered_map<std::uint64_t, std::uint64_t> dispatchFeedbackKeys;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const DrawRelocation>> dispatchRelocations;
+    std::unordered_map<std::uint64_t, std::uint64_t> dispatchAliases;
 
     std::list<std::uint64_t> dispatchOrder;
     AgcDriver::Mutex dispatchCacheMutex;

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "ImageTableAbi.hpp"
@@ -34,13 +36,21 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         const auto supplied = shaderMemory->SuppliedBlocks();
         fresh->runs.reserve(srtRegions.size());
         fresh->words.reserve(capturedWords);
-        for (const auto& region : srtRegions) {
-            fresh->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
-            const auto count = region.bytes.size() / sizeof(std::uint32_t);
-            const auto offset = fresh->words.size();
-            fresh->words.resize(offset + count);
-            std::memcpy(fresh->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
-            AppendSharedWords(fresh->shared, fresh->runs.size() - 1u, offset, region.bytes, supplied);
+        // APS5_ARCHB_FIX_DISPATCH_RELOCATION (sampled per insert): runs split and tagged by the user
+        // word they are read through, as for draw stages.
+        const bool relocation = capture != nullptr && feedbackKey != 0 && !stampValidate() && ArchB::Switches::Enabled(ArchB::Feature::FixDispatchRelocation);
+        if (relocation) {
+            tagVariantRuns(*fresh, srtRegions, capture->userDataUse, true, 0, supplied);
+            if (fresh->userData.empty()) fresh->userData = capture->snapshot.userData;
+        } else {
+            for (const auto& region : srtRegions) {
+                fresh->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+                const auto count = region.bytes.size() / sizeof(std::uint32_t);
+                const auto offset = fresh->words.size();
+                fresh->words.resize(offset + count);
+                std::memcpy(fresh->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
+                AppendSharedWords(fresh->shared, fresh->runs.size() - 1u, offset, region.bytes, supplied);
+            }
         }
 
         DataWordPositionCounts dataCounts;
@@ -80,7 +90,24 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
             stable = captureStable(srtRegions);
         }
+        // The relocation shape and this entry's alias (content reads, before the cache mutex).
+        std::shared_ptr<const DrawRelocation> relocationShape;
+        std::uint64_t relocationAlias = 0;
+        if (relocation && stable) {
+            relocationShape = dispatchRelocationShape(*fresh);
+            bool readable = true;
+            if (relocationShape != nullptr) relocationAlias = dispatchAliasKey(feedbackKey, fresh->userData, *relocationShape, readable);
+            if (!readable) relocationAlias = 0;
+        }
         std::lock_guard cacheLock(dispatchCacheMutex);
+        if (relocationShape != nullptr) {
+            dispatchRelocations[feedbackKey] = relocationShape;
+            if (relocationAlias != 0) {
+                if (dispatchAliases.size() >= dispatchCacheEntries()) dispatchAliases.clear();
+                dispatchAliases[relocationAlias] = key;
+                ArchB::Recorder::Count("fix_dispatch_relocation_learned");
+            }
+        }
         if (profile && missedEntry != nullptr && missedDiffering) classifyDiffering(address, key, *missedEntry->variants.front(), *fresh, capture.get(), entryCounters);
         if (stable) {
             if (profile) {

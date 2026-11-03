@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -22,6 +23,12 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
         }
         std::shared_ptr<DispatchEntry> entry = found != dispatchCache.end() ? found->second : nullptr;
         if (entry == nullptr) ++entryCounters.absent;
+        // APS5_ARCHB_FIX_DISPATCH_RELOCATION: a moved user-data base whose content an entry holds.
+        bool relocated = false;
+        if (entry == nullptr && feedbackKey != 0 && !stampValidate() && ArchB::Switches::Enabled(ArchB::Feature::FixDispatchRelocation)) {
+            entry = relocateDispatchEntry(cacheLock, feedbackKey, userData);
+            relocated = entry != nullptr;
+        }
         if (validateUnlocked) cacheLock.unlock();
         phaseTiming.Phase(PhaseLookup);
         if (entry != nullptr) {
@@ -142,6 +149,10 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 case EntryOutcome::ForgetMoved: ++counters.forgetMoved; break;
             }
             if (current) {
+                if (relocated) {
+                    applyShaderDataPatches(*variant);
+                    ArchB::Recorder::Count("fix_dispatch_relocation_hits");
+                }
                 if (feedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");
                 ++counters.variantHitsByRank[rank];
                 compiledResult = variant->compiled;

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -254,6 +255,106 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
     for (const auto& move : moves) patches.push_back({move.program, move.index, move.to});
     entry = std::move(relocated);
     decode = donor->decode;
+}
+
+std::shared_ptr<const DrawRelocation> Driver::dispatchRelocationShape(const DispatchVariant& variant) {
+    if (variant.relocatableWords == 0) return nullptr;
+    auto shape = std::make_shared<DrawRelocation>();
+    for (std::uint32_t index = 0; index < variant.userData.size() && index < 64; ++index) {
+        if ((variant.relocatableWords >> index & 1u) == 0) continue;
+        RelocatableUserWord word{index, {}};
+        const auto base = AlignedWord(variant.userData[index]);
+        for (std::size_t run = 0; run < variant.runs.size() && run < variant.runBases.size(); ++run) {
+            if (variant.runBases[run] != static_cast<std::int8_t>(index)) continue;
+            word.reads.emplace_back(static_cast<std::int64_t>(variant.runs[run].first - base), static_cast<std::uint32_t>((variant.runs[run].second - variant.runs[run].first) / sizeof(std::uint32_t)));
+        }
+        if (!word.reads.empty()) shape->words.push_back(std::move(word));
+    }
+    if (shape->words.empty()) return nullptr;
+    return shape;
+}
+
+std::uint64_t Driver::dispatchAliasKey(std::uint64_t identity, std::span<const std::uint32_t> userData, const DrawRelocation& shape, bool& readable) {
+    std::uint64_t key = identity ^ 0x6a09e667f3bcc908ull;
+    readable = true;
+    for (std::uint32_t index = 0; index < userData.size(); ++index) {
+        const auto word = std::find_if(shape.words.begin(), shape.words.end(), [&](const RelocatableUserWord& candidate) { return candidate.reg == index; });
+        const auto mixed = word != shape.words.end() ? relocatedContentKey(*word, userData[index], readable) : userData[index];
+        if (!readable) return 0;
+        key = (key ^ mixed) * 0x100000001b3ull;
+    }
+    return key;
+}
+
+std::shared_ptr<DispatchEntry> Driver::relocateDispatchEntry(std::unique_lock<AgcDriver::Mutex>& cacheLock, std::uint64_t identity, std::span<const std::uint32_t> userData) {
+    const auto known = dispatchRelocations.find(identity);
+    if (known == dispatchRelocations.end()) return nullptr;
+    const auto shape = known->second;
+    ArchB::Recorder::Count("fix_dispatch_relocation_lookups");
+    // The content reads go through the guest-memory paths; not under the cache mutex.
+    cacheLock.unlock();
+    bool readable = true;
+    const auto alias = dispatchAliasKey(identity, userData, *shape, readable);
+    cacheLock.lock();
+    if (!readable || alias == 0) return nullptr;
+    const auto found = dispatchAliases.find(alias);
+    if (found == dispatchAliases.end()) return nullptr;
+    const auto cached = dispatchCache.find(found->second);
+    if (cached == dispatchCache.end()) {
+        dispatchAliases.erase(found);
+        return nullptr;
+    }
+    const auto donor = cached->second;
+    auto relocated = std::make_shared<DispatchEntry>();
+    for (const auto& variant : donor->variants) {
+        if (variant == nullptr || variant->compiled == nullptr || variant->userData.size() != userData.size()) continue;
+        struct Move {
+            std::uint32_t index, from, to;
+        };
+        std::vector<Move> moves;
+        for (std::uint32_t index = 0; index < userData.size(); ++index) {
+            if (variant->userData[index] != userData[index]) moves.push_back({index, variant->userData[index], userData[index]});
+        }
+        const bool allowed = !moves.empty() && std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.index < 64 && (variant->relocatableWords >> move.index & 1u) != 0 && move.from != 0 && move.to != 0 && ((move.from ^ move.to) & 3u) == 0; });
+        if (!allowed) {
+            ArchB::Recorder::Count("fix_dispatch_relocation_refused");
+            continue;
+        }
+        auto copy = std::make_shared<DispatchVariant>();
+        copy->runs = variant->runs;
+        copy->runBases = variant->runBases;
+        copy->relocatableWords = variant->relocatableWords;
+        copy->words = variant->words;
+        copy->forgetSerial = variant->forgetSerial;
+        copy->compiled = variant->compiled;
+        copy->meshIndexDescriptor = variant->meshIndexDescriptor;
+        copy->shader = variant->shader;
+        copy->dataPositions = variant->dataPositions;
+        copy->dataSlots = variant->dataSlots;
+        copy->flatBinding = variant->flatBinding;
+        copy->feedback = variant->feedback;
+        copy->bufferBaseMasks = variant->bufferBaseMasks;
+        copy->bufferBasePatches = variant->bufferBasePatches;
+        copy->pushOffset = variant->pushOffset;
+        copy->userDataMask = variant->userDataMask;
+        copy->userData.assign(userData.begin(), userData.end());
+        for (const auto& move : moves) {
+            const auto delta = AlignedWord(move.to) - AlignedWord(move.from);
+            for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
+                if (copy->runBases[run] != static_cast<std::int8_t>(move.index)) continue;
+                copy->runs[run].first += delta;
+                copy->runs[run].second += delta;
+            }
+            const auto& forwarded = variant->compiled->shaderDataUserWords;
+            for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
+                if (forwarded[slot] == move.index) copy->shaderDataPatches.emplace_back(slot, move.to);
+            }
+        }
+        relocated->variants.push_back(std::move(copy));
+    }
+    if (relocated->variants.empty()) return nullptr;
+    ArchB::Recorder::Count("fix_dispatch_relocation_donors");
+    return relocated;
 }
 
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {

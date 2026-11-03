@@ -703,6 +703,66 @@ void TsharpCachePath(bool dispatch, bool user, bool toggle) {
     }
 }
 
+// APS5_ARCHB_FIX_DISPATCH_RELOCATION: a dispatch whose resource table pointer (user[4:5]) moved to
+// another table with the same content is served from the entry of the first table through the
+// relocation alias (a cache hit, the same output); a moved table with other content is not; without
+// the switch every moved pointer misses. With queue 0 pipelined (PIPE_Q0_COMMITTER) the relocated
+// dispatches still fall back from the pre-check (exact key absent) and then hit in the lookup.
+alignas(256) std::array<std::array<std::uint32_t, 16>, 4> RelocationTables{};
+
+void DispatchRelocationPath() {
+    using namespace AgcDriver::DriverDetail;
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    const bool enabled = Switches::Enabled(Feature::FixDispatchRelocation);
+    AgcDriver::ArchB::Recorder::Boundary(true, 0, AgcDriver::ArchB::Recorder::Clock::now());
+    FeedbackTexture.fill(std::byte{255});
+    const auto texture = reinterpret_cast<std::uintptr_t>(FeedbackTexture.data());
+    const std::array<std::uint32_t, 16> table{static_cast<std::uint32_t>(texture >> 8), static_cast<std::uint32_t>(texture >> 40) | (56u << 20u), 0, 0x90000fac, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(0.25f), 0, 0, 0, 0x92, 0x00fff000, 0, 0};
+    for (auto& entry : RelocationTables) entry = table;
+    RelocationTables[3][8] = std::bit_cast<std::uint32_t>(0.5f);
+    const std::vector<std::uint32_t> code{0xf40c0202u, 0xfa000000u, 0xf4000402u, 0xfa000020u, 0xf4080502u, 0xfa000030u, 0xbf8cc07fu,
+        0x7e2802ffu, 0x3f000000u, 0x7e2a02ffu, 0x3f000000u, 0xf09c0f08u, 0x00a20a14u, 0xbf8c3f70u, 0x10001410u,
+        0x7e020280u, 0xe0700000u, 0x80000001u, 0xbf810000u};
+    std::copy(code.begin(), code.end(), FeedbackCode.begin());
+    Registered(FeedbackHeader, FeedbackCode.data(), code.size() * 4, 0);
+    const auto submit = [&](const std::array<std::uint32_t, 16>& from) {
+        const auto pointer = reinterpret_cast<std::uintptr_t>(from.data());
+        const auto output = reinterpret_cast<std::uintptr_t>(FeedbackOutput.data());
+        const std::array<std::uint32_t, 6> words{static_cast<std::uint32_t>(output), static_cast<std::uint32_t>(output >> 32) & 0xffffu, sizeof(FeedbackOutput), 0x31016facu, static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32)};
+        const auto address = reinterpret_cast<std::uintptr_t>(FeedbackCode.data());
+        std::vector<std::uint32_t> commands;
+        Append(commands, 0x76, {0x20c, static_cast<std::uint32_t>(address >> 8), static_cast<std::uint32_t>(address >> 40)});
+        Append(commands, 0x76, {0x207, 1, 1, 1});
+        Append(commands, 0x76, {0x213, static_cast<std::uint32_t>(words.size()) << 1});
+        for (std::size_t w = 0; w < words.size(); ++w) Append(commands, 0x76, {0x240u + static_cast<std::uint32_t>(w), words[w]});
+        Append(commands, 0x15, {1, 1, 1, 0x8041});
+        FeedbackOutput.fill(0.0f);
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "relocation dispatch submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::FlushGpuWrites(output, sizeof(FeedbackOutput));
+        return std::pair{Driver::Get().DispatchCacheCounters().equal, static_cast<unsigned>(FeedbackOutput[0] * 255.0f + 0.5f)};
+    };
+    const auto [taught, first] = submit(RelocationTables[0]);
+    Require(first == 64, "the teaching dispatch did not write the table's constant");
+    const auto [moved, second] = submit(RelocationTables[1]);
+    Require(second == 64, "a dispatch whose table moved wrote another value");
+    Require((moved == taught + 1) == enabled, enabled ? "a dispatch whose table moved to equal content missed the relocation alias" : "a moved table hit without FIX_DISPATCH_RELOCATION");
+    const auto [again, third] = submit(RelocationTables[2]);
+    Require(third == 64 && (again == moved + 1) == enabled, "a second move did not take the same cache path");
+    const auto [other, fourth] = submit(RelocationTables[3]);
+    Require(fourth == 128, "a moved table with another constant wrote a stale value");
+    Require(other == again, "a moved table with other content hit the cache");
+    const auto [back, fifth] = submit(RelocationTables[0]);
+    Require(fifth == 64 && back == other + 1, "the first table's exact key no longer hit");
+    const auto counts = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now()).counters;
+    const auto count = [&](const char* name) { const auto it = counts.find(name); return it == counts.end() ? 0.0 : it->second; };
+    std::fprintf(stderr, "dispatch relocation: learned %.0f, lookups %.0f, donors %.0f, refused %.0f, hits %.0f; queue-0 misses %.0f, misses then hit %.0f\n", count("fix_dispatch_relocation_learned"), count("fix_dispatch_relocation_lookups"), count("fix_dispatch_relocation_donors"), count("fix_dispatch_relocation_refused"), count("fix_dispatch_relocation_hits"), count("pipe_q0_dispatch_miss"), count("pipe_q0_dispatch_miss_then_hit"));
+    Require(count("fix_dispatch_relocation_hits") == (enabled ? 2.0 : 0.0), "relocation hits were not counted as expected");
+    if (enabled && Switches::Enabled(Feature::PipeQ0Committer)) Require(count("pipe_q0_dispatch_miss_then_hit") >= 2, "relocated queue-0 dispatches were not served after the pre-check miss");
+}
+
 void PipelineStateReusePath(const std::filesystem::path& control) {
     using R = AgcDriver::ArchB::Recorder;
     using S = AgcDriver::ArchB::Switches;
@@ -795,6 +855,13 @@ int main(int argc, char** argv) {
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
             TsharpCachePath(mode.find("dispatch") != std::string_view::npos, mode.find("user") != std::string_view::npos, toggle);
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--dispatch-relocation") {
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            DispatchRelocationPath();
             AgcDriverShutdown_nid_postfix();
             return 0;
         }

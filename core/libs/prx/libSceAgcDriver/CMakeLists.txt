@@ -585,9 +585,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_pipe_full_hysteresis_switch COMMAND agc_archb_c01_switches_tests --toggle PipeFullHysteresis)
     add_test(NAME agc_archb_pipe_dispatch_alias_switch COMMAND agc_archb_c01_switches_tests --toggle PipeDispatchAlias)
     add_test(NAME agc_archb_pipe_collect_share_switch COMMAND agc_archb_c01_switches_tests --toggle PipeCollectShare)
-    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_archb_fix_dispatch_relocation_switch COMMAND agc_archb_c01_switches_tests --toggle FixDispatchRelocation)
+    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
@@ -4041,6 +4042,24 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_draw_shader_profile_pipelined agc_driver_draw_shader_profile_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_archb_fix_f1_proof COMMAND agc_driver_draw_cache_reuse_tests --tsharp-proof)
+    # APS5_ARCHB_FIX_DISPATCH_RELOCATION: a dispatch whose resource table moved to equal content hits
+    # through the relocation alias (on), never without the switch (off), and after the queue-0
+    # pre-check miss with queue 0 pipelined (pipelined).
+    foreach(relocationMode on off pipelined)
+        set(relocationTest agc_archb_fix_dispatch_relocation_${relocationMode})
+        add_test(NAME ${relocationTest} COMMAND agc_driver_draw_cache_reuse_tests --dispatch-relocation)
+        set(relocationEnv "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_RECORDER=1;APS5_ARCHB_FIX_DISPATCH_RELOCATION=1")
+        if(relocationMode STREQUAL "off")
+            set(relocationEnv "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_RECORDER=1;APS5_ARCHB_FIX_DISPATCH_RELOCATION=0")
+        elseif(relocationMode STREQUAL "pipelined")
+            set(relocationEnv "${relocationEnv};APS5_ARCHB_PIPE_Q0_COMMITTER=1")
+        endif()
+        set_tests_properties(${relocationTest} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "${relocationEnv}")
+        set_property(TEST ${relocationTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PIPELINED_DRAWS=unset:")
+        if(WIN32)
+            set_property(TEST ${relocationTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     # APS5_ARCHB_PIPE_DISPATCH_ALIAS: feedback-only user-data changes of a queue-0 dispatch, with queue 0
     # pipelined, are committed as items with the switch and fall back as misses without it.
     foreach(aliasMode on off)

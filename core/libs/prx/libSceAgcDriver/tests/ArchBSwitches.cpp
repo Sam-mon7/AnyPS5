@@ -87,6 +87,8 @@ void toggleCase(const std::string& name) {
     if (name == "VqMemo" || imageTable || bitScanKeys) setEnvironment(bitScanKeys ? "APS5_ARCHB_FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "APS5_ARCHB_FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "APS5_ARCHB_FIX_VQ_MEMO", nullptr);
     if (bookkeeping) setEnvironment("APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING", nullptr);
     if (pipeQ0) setEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", nullptr);
+    const bool dispatchRelocation = name == "FixDispatchRelocation";
+    if (dispatchRelocation) setEnvironment("APS5_ARCHB_FIX_DISPATCH_RELOCATION", nullptr);
     // A2 cuts that require PIPE_Q0_COMMITTER: the same contract.
     struct PipeCut {
         Feature feature;
@@ -123,9 +125,9 @@ void toggleCase(const std::string& name) {
             Switches::PollControl();
         }
     };
-    if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping || pipeQ0) {
-        const auto feature = pipeQ0 ? Feature::PipeQ0Committer : bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
-        const std::string token = pipeQ0 ? "PIPE_Q0_COMMITTER" : bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
+    if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping || pipeQ0 || dispatchRelocation) {
+        const auto feature = dispatchRelocation ? Feature::FixDispatchRelocation : pipeQ0 ? Feature::PipeQ0Committer : bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
+        const std::string token = dispatchRelocation ? "FIX_DISPATCH_RELOCATION" : pipeQ0 ? "PIPE_Q0_COMMITTER" : bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
         bool listed = false;
         for (const auto& entry : Switches::Table()) {
             if (entry.feature != feature) continue;
