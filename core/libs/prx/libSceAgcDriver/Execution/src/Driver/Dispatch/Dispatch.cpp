@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -116,17 +117,78 @@ void NoteItemFallback(ItemFallback reason) {
 // not candidates (copy kernels, indirect, deferred labels, ahead), the pre-check fallbacks, and among
 // the misses those whose exact key was absent while the feedback alias (APS5_ARCHB_PIPE_DISPATCH_ALIAS)
 // resolved an entry, and the misses the q0 lookup then served from the cache anyway.
-enum class Q0Dispatch : std::size_t { Item, NotCandidateCopy, NotCandidateIndirect, NotCandidateLabels, NotCandidateOther, Miss, MissAlias, MissThenHit, Reads, NoRecipe, Writes, Verify, AliasItem, AliasResolved, Count };
+enum class Q0Dispatch : std::size_t { Item, NotCandidateCopy, NotCandidateIndirect, NotCandidateLabels, NotCandidateOther, Miss, MissAlias, MissThenHit, Reads, NoRecipe, Writes, Verify, AliasItem, AliasResolved, CopyItem, Count };
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Q0Dispatch::Count)> q0Dispatches{};
 
 void NoteQ0Dispatch(Q0Dispatch outcome) {
     static const bool registered = [] {
-        constexpr std::array<const char*, static_cast<std::size_t>(Q0Dispatch::Count)> names{"pipe_q0_dispatch_item", "pipe_q0_dispatch_copy_kernel", "pipe_q0_dispatch_indirect", "pipe_q0_dispatch_labels", "pipe_q0_dispatch_not_candidate", "pipe_q0_dispatch_miss", "pipe_q0_dispatch_miss_alias", "pipe_q0_dispatch_miss_then_hit", "pipe_q0_dispatch_reads", "pipe_q0_dispatch_no_recipe", "pipe_q0_dispatch_writes", "pipe_q0_dispatch_verify", "pipe_q0_dispatch_alias_item", "pipe_q0_dispatch_alias_resolved"};
+        constexpr std::array<const char*, static_cast<std::size_t>(Q0Dispatch::Count)> names{"pipe_q0_dispatch_item", "pipe_q0_dispatch_copy_kernel", "pipe_q0_dispatch_indirect", "pipe_q0_dispatch_labels", "pipe_q0_dispatch_not_candidate", "pipe_q0_dispatch_miss", "pipe_q0_dispatch_miss_alias", "pipe_q0_dispatch_miss_then_hit", "pipe_q0_dispatch_reads", "pipe_q0_dispatch_no_recipe", "pipe_q0_dispatch_writes", "pipe_q0_dispatch_verify", "pipe_q0_dispatch_alias_item", "pipe_q0_dispatch_alias_resolved", "pipe_q0_dispatch_copy_item"};
         for (std::size_t i = 0; i < names.size(); ++i) ArchB::Recorder::RegisterCounter(names[i], q0Dispatches[i]);
         return true;
     }();
     static_cast<void>(registered);
     q0Dispatches[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// APS5_COPY_KERNEL_DIAG=1 (diagnostic): the queue-0 copy kernels by kind: how many found the pipeline
+// busy, whether their count record was stable (no queued or recorded GPU write over it), whether
+// queued writes overlap their source or destination or queued draws read their destination, the
+// drain's wait and the copy's own time. One "[copy-kernel-diag]" line every 10 s.
+bool CopyKernelDiagEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_COPY_KERNEL_DIAG");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+struct CopyKernelDiagNote {
+    CopyKernelKind kind = CopyKernelKind::Counted;
+    bool busy = false;
+    bool recordStable = false;
+    bool sourceQueued = false;
+    bool destinationQueued = false;
+    bool destinationRead = false;
+    bool copied = false;
+    std::uint64_t bytes = 0;
+    double drainMs = 0;
+    double copyMs = 0;
+};
+
+void NoteCopyKernelDiag(const CopyKernelDiagNote& note) {
+    struct Totals {
+        std::uint64_t count = 0, busy = 0, recordStable = 0, sourceQueued = 0, destinationQueued = 0, destinationRead = 0, copied = 0, bytes = 0, waited = 0;
+        double drainMs = 0, copyMs = 0;
+    };
+    static std::mutex mutex;
+    static std::array<Totals, 3> totals{};
+    static auto reportedAt = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    auto& total = totals[static_cast<std::size_t>(note.kind)];
+    ++total.count;
+    total.busy += note.busy;
+    total.recordStable += note.recordStable;
+    total.sourceQueued += note.sourceQueued;
+    total.destinationQueued += note.destinationQueued;
+    total.destinationRead += note.destinationRead;
+    total.copied += note.copied;
+    total.bytes += note.bytes;
+    total.waited += note.drainMs > 0.002;
+    total.drainMs += note.drainMs;
+    total.copyMs += note.copyMs;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reportedAt < std::chrono::seconds(10)) return;
+    reportedAt = now;
+    std::string text = "[copy-kernel-diag] queue-0 copy kernels (10 s):";
+    constexpr std::array<const char*, 3> names{"counted", "indexed", "stream"};
+    for (std::size_t kind = 0; kind < totals.size(); ++kind) {
+        const auto& t = totals[kind];
+        char item[400];
+        std::snprintf(item, sizeof(item), " [%s] %llu (busy %llu, record stable %llu, source under queued writes %llu, destination under queued writes %llu, destination read by queued draws %llu, copied %llu, %.1f KiB avg bound; drains waited %llu for %.1f ms; copies %.1f ms)", names[kind], static_cast<unsigned long long>(t.count), static_cast<unsigned long long>(t.busy), static_cast<unsigned long long>(t.recordStable), static_cast<unsigned long long>(t.sourceQueued), static_cast<unsigned long long>(t.destinationQueued), static_cast<unsigned long long>(t.destinationRead), static_cast<unsigned long long>(t.copied), t.count == 0 ? 0.0 : static_cast<double>(t.bytes) / 1024.0 / static_cast<double>(t.count), static_cast<unsigned long long>(t.waited), t.drainMs, t.copyMs);
+        text += item;
+    }
+    std::fprintf(stderr, "%s\n", text.c_str());
+    totals = {};
 }
 
 // APS5_DISPATCH_MISS_DIAG=1 (diagnostic): why queue-0 dispatch-cache keys keep changing. Every
@@ -408,8 +470,38 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
+        // APS5_ARCHB_PIPE_COPY_KERNEL_ITEMS: a copy kernel queue 0 can resolve now goes into the pipeline.
+        if (!fromAhead && !partialLastGroup && indirectArguments == 0 && Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads) == 0 && enqueueCopyKernel(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
+            NoteQ0Dispatch(Q0Dispatch::CopyItem);
+            pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
+            return;
+        }
         // APS5_PIPE_DRAIN_DIAG: what the copy kernel behind a dispatch_copy drain that waited did.
         bool copyDrainDiag = false;
+        std::optional<CopyKernelDiagNote> copyDiag;
+        std::chrono::steady_clock::time_point copyDiagMark;
+        if (CopyKernelDiagEnabled() && submission.queue == 0 && !partialLastGroup && indirectArguments == 0) {
+            const auto code = std::span(snapshot.code).subspan(codeOffset);
+            const bool counted = matchesCopyKernel(code, userData, compute);
+            const bool indexed = !counted && MatchesIndexedCopyKernel(code, userData, compute);
+            if (counted || indexed || MatchesStreamCopyKernel(code, userData, compute)) {
+                CopyKernelDiagNote note;
+                note.kind = counted ? CopyKernelKind::Counted : indexed ? CopyKernelKind::Indexed : CopyKernelKind::Stream;
+                note.busy = DrawPipeline::Active() && DrawPipeline::Queue0().Busy();
+                if (const auto bounds = CopyKernelRanges(note.kind, userData, packet[1])) {
+                    const auto bytesOf = [](const CopyRange& range) { return static_cast<std::size_t>(range.second - range.first); };
+                    note.bytes = bytesOf(bounds->destination);
+                    if (note.busy) {
+                        note.sourceQueued = DrawPipeline::Queue0().Overlaps(bounds->source.first, bytesOf(bounds->source));
+                        note.destinationQueued = DrawPipeline::Queue0().Overlaps(bounds->destination.first, bytesOf(bounds->destination));
+                        note.destinationRead = DrawPipeline::HeldReads(bounds->destination.first, bytesOf(bounds->destination));
+                    }
+                    note.recordStable = note.kind == CopyKernelKind::Stream || ((!note.busy || !DrawPipeline::Queue0().Overlaps(bounds->record.first, bytesOf(bounds->record))) && !Graphics::Recorder::SnapshotWriteOverlaps(bounds->record.first, bytesOf(bounds->record)));
+                }
+                copyDiag = note;
+                copyDiagMark = std::chrono::steady_clock::now();
+            }
+        }
         if (DrawPipeline::Active() && !pipelineCandidate) {
             const auto cause = resolving || fromAhead ? DrawPipeline::DrainCause::DispatchAhead : !DrawPipeline::DispatchItems() ? DrawPipeline::DrainCause::DispatchItemsOff : indirectArguments != 0 ? DrawPipeline::DrainCause::DispatchIndirect : !deferredLabels().labels.empty() ? DrawPipeline::DrainCause::DispatchLabels : DrawPipeline::DrainCause::DispatchCopy;
             NoteQ0Dispatch(cause == DrawPipeline::DrainCause::DispatchCopy ? Q0Dispatch::NotCandidateCopy : cause == DrawPipeline::DrainCause::DispatchIndirect ? Q0Dispatch::NotCandidateIndirect : cause == DrawPipeline::DrainCause::DispatchLabels ? Q0Dispatch::NotCandidateLabels : Q0Dispatch::NotCandidateOther);
@@ -423,7 +515,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (Graphics::NoteHtileDepthClear(htile, bytes, nativeBytes)) htileClearCompletion = std::pair{htile, bytes};
         }
         if (copyDrainDiag) LastCopyPathOnThread() = -1;
+        if (copyDiag) {
+            const auto now = std::chrono::steady_clock::now();
+            copyDiag->drainMs = std::chrono::duration<double, std::milli>(now - copyDiagMark).count();
+            copyDiagMark = now;
+        }
         const bool copied = !partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address);
+        if (copyDiag) {
+            copyDiag->copyMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copyDiagMark).count();
+            copyDiag->copied = copied;
+            NoteCopyKernelDiag(*copyDiag);
+        }
         if (copyDrainDiag) {
             const auto code = std::span(snapshot.code).subspan(codeOffset);
             const char* kind = partialLastGroup ? "partial group" : matchesCopyKernel(code, userData, compute) ? "counted" : MatchesIndexedCopyKernel(code, userData, compute) ? "indexed" : "stream";
@@ -844,6 +946,24 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             DrawPipeline::FollowEpoch(epoch, ticket);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
+            if (Graphics::StructCensus::Enabled()) {
+                using namespace Graphics::StructCensus;
+                Commit commit;
+                commit.kind = Kind::Dispatch;
+                commit.shape = Mix(reinterpret_cast<std::uintptr_t>(result.get()), address);
+                commit.components[ComponentParams] = Mix((static_cast<std::uint64_t>(groups[0]) << 32u) | groups[1], groups[2]);
+                commit.components[ComponentPush] = HashBytes(3, std::as_bytes(std::span(liveWords)));
+                commit.components[ComponentBindings] = Mix(4, reinterpret_cast<std::uintptr_t>(recipe.get()));
+                auto addresses = std::uint64_t{5};
+                auto data = std::uint64_t{6};
+                for (const auto& snapshot : snapshots) {
+                    addresses = Mix(Mix(addresses, snapshot.address), snapshot.bytes.size());
+                    data = HashBytes(data, std::as_bytes(std::span(snapshot.bytes)));
+                }
+                commit.components[ComponentAddresses] = addresses;
+                commit.components[ComponentData] = data;
+                NoteCommit(commit);
+            }
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
             try {
                 std::shared_ptr<RecipeHit> recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(recipe, false);

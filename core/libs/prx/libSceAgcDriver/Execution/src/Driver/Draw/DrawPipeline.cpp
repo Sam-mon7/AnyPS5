@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -628,6 +629,12 @@ std::string DrawPipeline::CumulativeText() {
     text += item;
     std::snprintf(item, sizeof(item), "; %llu waits kept on own labels", static_cast<unsigned long long>(counters.keptOwnLabelWaits.load(std::memory_order_relaxed)));
     text += item;
+    {
+        const auto copy = [](CopyItemCounter counter) { return static_cast<unsigned long long>(copyItemCounts[counter].load(std::memory_order_relaxed)); };
+        char line[256];
+        std::snprintf(line, sizeof(line), "; copy items %llu (copied %llu, fallback %llu; refused kind %llu shape %llu record %llu labels %llu; verified %llu, mismatches %llu)", copy(CopyItemEnqueued), copy(CopyItemCopied), copy(CopyItemFallback), copy(CopyItemRefusedKind), copy(CopyItemRefusedShape), copy(CopyItemRefusedRecord), copy(CopyItemRefusedLabels), copy(CopyItemVerified), copy(CopyItemVerifyMismatch));
+        text += line;
+    }
     text += DrawWriteDiagText();
     text += DrainDiagText();
     std::snprintf(item, sizeof(item), "; full: %llu waits (%.1f ms), %llu overcommits; locked drains %llu", static_cast<unsigned long long>(counters.fullWaits.load(std::memory_order_relaxed)), static_cast<double>(counters.fullWaitNs.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.fullOvercommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.lockedDrains.load(std::memory_order_relaxed)));

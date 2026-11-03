@@ -335,6 +335,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeferredDestruction.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/StructCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
@@ -586,9 +587,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_pipe_dispatch_alias_switch COMMAND agc_archb_c01_switches_tests --toggle PipeDispatchAlias)
     add_test(NAME agc_archb_pipe_collect_share_switch COMMAND agc_archb_c01_switches_tests --toggle PipeCollectShare)
     add_test(NAME agc_archb_fix_dispatch_relocation_switch COMMAND agc_archb_c01_switches_tests --toggle FixDispatchRelocation)
-    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_archb_pipe_copy_kernel_items_switch COMMAND agc_archb_c01_switches_tests --toggle PipeCopyKernelItems)
+    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
@@ -4058,6 +4060,32 @@ if(BUILD_TESTING)
         set_property(TEST ${relocationTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PIPELINED_DRAWS=unset:")
         if(WIN32)
             set_property(TEST ${relocationTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    # APS5_ARCHB_STRUCT_REPEAT_CENSUS: the frame-by-frame structural repeat comparison on synthetic commits.
+    add_test(NAME agc_archb_struct_repeat_census COMMAND agc_driver_struct_census_tests)
+    set_tests_properties(agc_archb_struct_repeat_census PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_property(TEST agc_archb_struct_repeat_census APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # APS5_ARCHB_PIPE_COPY_KERNEL_ITEMS: queue-0 counted and stream copy kernels as pipeline items (on, verify)
+    # or inline after a drain (off); a queued write of the count record keeps the copy inline; a dispatch
+    # behind a queued copy reads the copied bytes.
+    foreach(copyItemMode on off verify)
+        set(copyItemTest agc_archb_pipe_copy_kernel_items_${copyItemMode})
+        add_test(NAME ${copyItemTest} COMMAND agc_driver_copy_kernel_items_tests)
+        set(copyItemValue 1)
+        if(copyItemMode STREQUAL "off")
+            set(copyItemValue 0)
+        endif()
+        set(copyItemEnv "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_RECORDER=1;APS5_ARCHB_PIPE_Q0_COMMITTER=1;APS5_ARCHB_PIPE_COPY_KERNEL_ITEMS=${copyItemValue}")
+        if(copyItemMode STREQUAL "verify")
+            set(copyItemEnv "${copyItemEnv};APS5_ARCHB_PIPE_COPY_KERNEL_ITEMS_VERIFY=1")
+        endif()
+        set_tests_properties(${copyItemTest} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 ENVIRONMENT "${copyItemEnv}" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_property(TEST ${copyItemTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PIPELINED_DRAWS=unset:")
+        if(WIN32)
+            set_property(TEST ${copyItemTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
     # APS5_ARCHB_PIPE_DISPATCH_ALIAS: feedback-only user-data changes of a queue-0 dispatch, with queue 0

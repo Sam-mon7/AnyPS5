@@ -4,6 +4,11 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +18,18 @@ namespace AgcDriver::DriverDetail {
 
 std::atomic<std::uint64_t> knownValueEntries{0}, knownValueReads{0}, knownValueVerified{0}, knownValueMismatches{0};
 std::array<std::atomic<std::uint64_t>, CopyPaths> copyPathCounts{};
+
+std::array<std::atomic<std::uint64_t>, CopyItemCounters> copyItemCounts{};
+
+void NoteCopyItem(CopyItemCounter counter) {
+    static const bool registered = [] {
+        constexpr std::array<const char*, CopyItemCounters> names{"pipe_copy_item_enqueued", "pipe_copy_item_copied", "pipe_copy_item_fallback", "pipe_copy_item_refused_kind", "pipe_copy_item_refused_shape", "pipe_copy_item_refused_record", "pipe_copy_item_refused_labels", "pipe_copy_item_verified", "pipe_copy_item_verify_mismatch"};
+        for (std::size_t i = 0; i < names.size(); ++i) ArchB::Recorder::RegisterCounter(names[i], copyItemCounts[i]);
+        return true;
+    }();
+    static_cast<void>(registered);
+    copyItemCounts[counter].fetch_add(1, std::memory_order_relaxed);
+}
 
 int& LastCopyPathOnThread() {
     static thread_local int path = -1;
@@ -79,6 +96,32 @@ std::optional<StreamCopy> IndexedCopyRange(const std::vector<std::uint32_t>& use
     const StreamCopy copy{base(0) + std::uint64_t{sourceOffset} * 16u, base(4) + std::uint64_t{destinationOffset} * 16u, static_cast<std::size_t>(elements) * 16u};
     if (copy.bytes > (16u << 20u) || copy.source % 16 != 0 || copy.destination % 16 != 0) return std::nullopt;
     return copy;
+}
+
+std::optional<CopyKernelBounds> CopyKernelRanges(CopyKernelKind kind, const std::vector<std::uint32_t>& userData, std::uint32_t groups) {
+    const auto base = [&](std::size_t word) { return userData[word] | (static_cast<std::uint64_t>(userData[word + 1] & 0xffffu) << 32u); };
+    if (groups == 0) return std::nullopt;
+    CopyKernelBounds bounds;
+    if (kind == CopyKernelKind::Stream) {
+        if (userData.size() < 8) return std::nullopt;
+        const auto range = StreamCopyRange(userData, groups);
+        if (!range) return std::nullopt;
+        bounds.source = {range->source, range->source + range->bytes};
+        bounds.destination = {range->destination, range->destination + range->bytes};
+        return bounds;
+    }
+    if (userData.size() < 12) return std::nullopt;
+    const auto launched = std::uint64_t{groups} * 64u;
+    const std::uint64_t element = kind == CopyKernelKind::Counted ? 4u : 16u;
+    // Counted: count <= both record counts and count <= the launched threads; indexed: offset +
+    // elements <= the record count of each side.
+    const auto sourceElements = kind == CopyKernelKind::Counted ? std::min<std::uint64_t>(userData[2], launched) : std::uint64_t{userData[2]};
+    const auto destinationElements = kind == CopyKernelKind::Counted ? std::min<std::uint64_t>(userData[6], launched) : std::uint64_t{userData[6]};
+    bounds.source = {base(0), base(0) + sourceElements * element};
+    bounds.destination = {base(4), base(4) + destinationElements * element};
+    bounds.record = {base(8), base(8) + (kind == CopyKernelKind::Counted ? 8u : 12u)};
+    if (bounds.destination.second == bounds.destination.first) return std::nullopt;
+    return bounds;
 }
 
 void Driver::countCopy(int path, std::size_t bytes, std::chrono::steady_clock::time_point started, std::chrono::steady_clock::time_point locked, const VulkanDevice::CopyOutcome* outcome) {
@@ -154,15 +197,6 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     const bool stream = !hashed && !indexed;
     if (stream && !MatchesStreamCopyKernel(code, userData, compute)) return false;
     const auto started = std::chrono::steady_clock::now();
-    static const std::size_t cpuMax = [] {
-        if (std::getenv("APS5_NO_CPU_COPY") != nullptr) return std::size_t{0};
-        const char* text = std::getenv("APS5_COPY_HLE_CPU_MAX");
-        return text ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{262144};
-    }();
-    static const std::size_t gpuMax = [] {
-        const char* text = std::getenv("APS5_COPY_HLE_GPU_MAX");
-        return text ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::numeric_limits<std::size_t>::max();
-    }();
     const auto base = [&](std::size_t word) { return userData[word] | (static_cast<std::uint64_t>(userData[word + 1] & 0xffffu) << 32u); };
     auto source = base(0);
     auto destination = base(4);
@@ -241,6 +275,19 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             return false;
         }
     }
+    return copyKernelRange(queueId, source, destination, bytes, localDevice, programAddress, started, locked);
+}
+
+bool Driver::copyKernelRange(std::uint32_t queueId, std::uint64_t source, std::uint64_t destination, std::size_t bytes, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress, std::chrono::steady_clock::time_point started, std::chrono::steady_clock::time_point locked) {
+    static const std::size_t cpuMax = [] {
+        if (std::getenv("APS5_NO_CPU_COPY") != nullptr) return std::size_t{0};
+        const char* text = std::getenv("APS5_COPY_HLE_CPU_MAX");
+        return text ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{262144};
+    }();
+    static const std::size_t gpuMax = [] {
+        const char* text = std::getenv("APS5_COPY_HLE_GPU_MAX");
+        return text ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::numeric_limits<std::size_t>::max();
+    }();
     if (source < destination + bytes && destination < source + bytes) {
         countCopy(CopyOverlapping, bytes, started, locked);
         return false;
@@ -256,6 +303,108 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     if (outcome.path == CopyNotImported || outcome.path == CopyOverGpuMax) return false;
 
     if (outcome.path == CopyCpu) noteForeignWriter(destination, destination + bytes, queueId);
+    return true;
+}
+
+bool Driver::enqueueCopyKernel(QueueState& queue, std::uint32_t queueId, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress) {
+    if (queueId != 0 || localDevice == nullptr || !DrawPipeline::Active() || !DrawPipeline::DispatchItems() || !ArchB::Switches::Enabled(ArchB::Feature::PipeCopyKernelItems)) return false;
+    const bool counted = matchesCopyKernel(code, userData, compute);
+    const bool stream = !counted && MatchesStreamCopyKernel(code, userData, compute);
+    if (!counted && !stream) {
+        // Indexed copies stay inline: their record read finishes lease work first (copyBuffer).
+        if (MatchesIndexedCopyKernel(code, userData, compute)) NoteCopyItem(CopyItemRefusedKind);
+        return false;
+    }
+    // Labels deferred outside the pipeline are recorded by the inline path before it copies.
+    if (!deferredLabels().labels.empty()) {
+        NoteCopyItem(CopyItemRefusedLabels);
+        return false;
+    }
+    std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
+    if ((packet[4] & 0x20u) != 0) {
+        for (std::uint32_t axis = 0; axis < 3; ++axis) {
+            const auto threads = std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u);
+            groups[axis] = (groups[axis] + threads - 1) / threads;
+        }
+    }
+    const auto refuse = [](CopyItemCounter counter) {
+        NoteCopyItem(counter);
+        return false;
+    };
+    if (groups[1] != 1 || groups[2] != 1) return refuse(CopyItemRefusedShape);
+    const auto base = [&](std::size_t word) { return userData[word] | (static_cast<std::uint64_t>(userData[word + 1] & 0xffffu) << 32u); };
+    std::uint64_t source = base(0);
+    std::uint64_t destination = base(4);
+    std::size_t bytes = 0;
+    std::uint64_t record = 0;
+    std::array<std::uint32_t, 2> recordWords{};
+    if (stream) {
+        const auto range = StreamCopyRange(userData, groups[0]);
+        if (!range) return refuse(CopyItemRefusedShape);
+        bytes = range->bytes;
+    } else {
+        // The count record must hold its final value now: no queued item writes it (checked first:
+        // an item leaves the queue only after its recorded writes are published, so the recorder
+        // snapshot read after it holds whatever a just-committed item wrote), no recorded GPU write,
+        // pending image result or label lands on it. Its value then cannot change before the commit
+        // (a guest CPU store before this submission's later labels would race the GPU on hardware).
+        record = base(8);
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(record), 8)) return refuse(CopyItemRefusedRecord);
+        if (DrawPipeline::Queue0().Overlaps(record, 8) || Graphics::Recorder::SnapshotWriteOverlaps(record, 8)) return refuse(CopyItemRefusedRecord);
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> recordRange{{{record, record + 8}}};
+        if (Graphics::StorageTexture::AnyPendingOverlaps(recordRange)) return refuse(CopyItemRefusedRecord);
+        for (auto dword = record; dword < record + 8; dword += 4) {
+            if (localDevice->PendingLabel(dword, 4, 0).has_value() || DrawPipeline::Queue0().PendingLabel(dword, 4).has_value()) return refuse(CopyItemRefusedRecord);
+        }
+        std::memcpy(recordWords.data(), reinterpret_cast<const void*>(record), 8);
+        const auto count = recordWords[0];
+        const auto period = recordWords[1];
+        bytes = static_cast<std::size_t>(count) * 4u;
+        if (count == 0 || period < count || groups[0] != (count + 63u) / 64u || count > userData[2] || count > userData[6] || bytes > (16u << 20u) || source % 4 != 0 || destination % 4 != 0 || (record < destination + bytes && destination < record + 8)) return refuse(CopyItemRefusedShape);
+    }
+    if (source < destination + bytes && destination < source + bytes) return refuse(CopyItemRefusedShape);
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(source), bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(destination), bytes, true)) return refuse(CopyItemRefusedShape);
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_ARCHB_PIPE_COPY_KERNEL_ITEMS_VERIFY");
+        return text != nullptr && text[0] == '1';
+    }();
+    const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+    const auto ticket = GuestMemory::Gen::Required();
+    NoteCopyItem(CopyItemEnqueued);
+    DrawPipeline::Queue0().Enqueue([this, localDevice, source, destination, bytes, programAddress, queueId, record, recordWords, epoch, ticket] {
+        PerformanceTimer recorderTiming("Driver.CopyCommit");
+        DrawPipeline::FollowEpoch(epoch, ticket);
+        GuestMemory::SetCurrentPacket(0x15, queueId);
+        const auto started = std::chrono::steady_clock::now();
+        bool copied = false;
+        {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            const auto locked = std::chrono::steady_clock::now();
+            recordLabelsForPacket(localDevice.get(), queueId);
+            localDevice->ReapRecorded();
+            // APS5_ARCHB_PIPE_COPY_KERNEL_ITEMS_VERIFY=1: the count record queue 0 read still holds
+            // the same value at the commit (all earlier work recorded, finished batches reaped).
+            if (verify && record != 0 && !Graphics::Recorder::SnapshotWriteOverlaps(record, 8)) {
+                std::array<std::uint32_t, 2> now{};
+                std::memcpy(now.data(), reinterpret_cast<const void*>(record), 8);
+                NoteCopyItem(CopyItemVerified);
+                if (now != recordWords) NoteCopyItem(CopyItemVerifyMismatch);
+            }
+            copied = copyKernelRange(queueId, source, destination, bytes, localDevice, programAddress, started, locked);
+        }
+        if (copied) {
+            NoteCopyItem(CopyItemCopied);
+            return;
+        }
+        // The device refused (memory it cannot reach in place): the plain copy every earlier write
+        // has landed in, as the pipelined DMA copy does (GuestMemory::Read flushes pending writes).
+        NoteCopyItem(CopyItemFallback);
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(source), bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(destination), bytes, true)) return;
+        std::vector<std::byte> data(bytes);
+        GuestMemory::Read(source, data, 1);
+        commitDmaStore(queueId, destination, data);
+    }, {{destination, destination + bytes}}, 0, {}, {{source, source + bytes}}, false, DrawPipeline::ItemKind::Dispatch);
     return true;
 }
 

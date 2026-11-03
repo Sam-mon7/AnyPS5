@@ -45,6 +45,7 @@ constexpr Feature PipeCommitterMutexPriorityPrerequisites[] = {Feature::PipeQ0Co
 constexpr Feature PipeFullHysteresisPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeDispatchAliasPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeCollectSharePrerequisites[] = {Feature::PipeQ0Committer};
+constexpr Feature PipeCopyKernelItemsPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -85,6 +86,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::PipeDispatchAlias, "PIPE_DISPATCH_ALIAS", false, true, PipeDispatchAliasPrerequisites},
     {Feature::PipeCollectShare, "PIPE_COLLECT_SHARE", false, true, PipeCollectSharePrerequisites},
     {Feature::FixDispatchRelocation, "FIX_DISPATCH_RELOCATION", false, true, {}},
+    {Feature::PipeCopyKernelItems, "PIPE_COPY_KERNEL_ITEMS", false, true, PipeCopyKernelItemsPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -2452,6 +2453,52 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
+// APS5_ARCHB_STRUCT_REPEAT_CENSUS: the recorded draw's structural state by component (StructCensus.hpp).
+void noteDrawCensus(const State& state, const Pm4::DrawParameters& draw, const RecordedDraw& record, std::uint64_t passKey, const ShaderResources::DrawBindings* bindings, bool continued) {
+    using namespace StructCensus;
+    Commit commit;
+    commit.kind = Kind::Draw;
+    commit.passBegin = !continued;
+    auto shape = Mix(reinterpret_cast<std::uintptr_t>(record.pipeline.get()), passKey);
+    shape = Mix(shape, reinterpret_cast<std::uintptr_t>(record.framebuffer.get()));
+    shape = Mix(shape, record.pushStages);
+    shape = Mix(shape, (draw.indexed ? 1u : 0u) | (draw.indirect.has_value() ? 2u : 0u) | (static_cast<std::uint64_t>(draw.indexSize) << 8u));
+    if (bindings != nullptr) {
+        shape = Mix(shape, reinterpret_cast<std::uintptr_t>(bindings->layout));
+        shape = Mix(shape, reinterpret_cast<std::uintptr_t>(bindings->fragmentLayout));
+    }
+    commit.shape = shape;
+    const auto bytesOf = [](const auto& value) { return std::as_bytes(std::span(&value, 1)); };
+    auto dynamic = HashBytes(1, bytesOf(state.viewport));
+    dynamic = HashBytes(dynamic, bytesOf(state.scissor));
+    dynamic = HashBytes(dynamic, bytesOf(state.blendConstants));
+    dynamic = Mix(dynamic, (static_cast<std::uint64_t>(state.stencilFront.reference) << 32u) | state.stencilBack.reference);
+    dynamic = Mix(dynamic, (static_cast<std::uint64_t>(state.stencilFront.compareMask) << 32u) | state.stencilFront.writeMask);
+    float bias[3] = {state.depthBiasConstant, state.depthBiasSlope, state.depthBiasClamp};
+    dynamic = HashBytes(dynamic, std::as_bytes(std::span(bias)));
+    commit.components[ComponentDynamic] = dynamic;
+    auto params = Mix(2, (static_cast<std::uint64_t>(draw.indexCount) << 32u) | draw.instanceCount);
+    params = Mix(params, (static_cast<std::uint64_t>(draw.firstVertex) << 32u) | draw.firstInstance);
+    params = Mix(params, draw.flags);
+    if (draw.indirect.has_value()) params = Mix(params, (static_cast<std::uint64_t>(draw.indirect->count) << 32u) | draw.indirect->stride);
+    commit.components[ComponentParams] = params;
+    commit.components[ComponentPush] = record.pushBytes != nullptr ? HashBytes(3, std::as_bytes(std::span(*record.pushBytes))) : 3;
+    commit.components[ComponentBindings] = Mix(4, reinterpret_cast<std::uintptr_t>(record.resources.get()));
+    auto addresses = Mix(5, draw.indexed ? draw.indexAddress : 0);
+    if (draw.indirect.has_value()) addresses = Mix(addresses, draw.indirect->arguments);
+    auto data = std::uint64_t{6};
+    if (bindings != nullptr) {
+        for (const auto& snapshot : bindings->snapshots) {
+            addresses = Mix(addresses, snapshot.address);
+            addresses = Mix(addresses, snapshot.bytes);
+            if (snapshot.buffer != nullptr) data = HashBytes(data, snapshot.Bytes());
+        }
+    }
+    commit.components[ComponentAddresses] = addresses;
+    commit.components[ComponentData] = data;
+    StructCensus::NoteCommit(commit);
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr, bool pipelineStateReuse = false) {
     using R = AgcDriver::ArchB::Recorder;
     auto recordLap = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2668,6 +2715,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
+    if (StructCensus::Enabled()) noteDrawCensus(state, draw, record, passKey, drawBindings.get(), continued);
     recordPhase(RecordCommands);
     std::function<void(VkCommandBuffer)> storeProxies;
     if (!continued && (!record.proxies.empty() || !record.reordered.empty() || record.depthLocations)) {

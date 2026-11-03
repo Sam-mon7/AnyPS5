@@ -47,6 +47,7 @@ enum class Feature : std::uint8_t {
     PipeDispatchAlias,
     PipeCollectShare,
     FixDispatchRelocation,
+    PipeCopyKernelItems,
     Count
 };
 
