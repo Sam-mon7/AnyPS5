@@ -465,9 +465,19 @@ def session_health_flags_slow_sessions(directory):
     (directory / "stderr.log").write_text("".join(line.format(address) for address in ("0x10a0000000", "0x1009000000", "0x1003000000")), encoding="utf-8")
     once = session_health(directory)
     assert once["healthy"] and once["large_textures_made"]["0x1009000000"] == 1, once
-    (directory / "stderr.log").write_text(line.format("0x1003000000") + line.format("0x1009000000") * 5, encoding="utf-8")
+    (directory / "stderr.log").write_text(line.format("0x1003000000") + line.format("0x1009000000") * 9, encoding="utf-8")
     remade = session_health(directory)
-    assert not remade["healthy"] and remade["reasons"] == ["large textures made again and again: 0x1009000000 x5"], remade
+    assert not remade["healthy"] and remade["reasons"] == ["large textures made again and again: 0x1009000000 x9"], remade
+    # Builds without the report: the texture log names each texture made; the pool made 50+ times by the end of the warmup is the pathology,
+    # small textures made often (render-target snapshots) are not.
+    (directory / "stderr.log").write_text("", encoding="utf-8")
+    made = "[src/Texture.cpp:409 Texture] Texture address={} {}x{} mips=11 layers={} dim=2 tile=3 format=174 vk=138 element=16\n"
+    (directory / "stdout.log").write_text(made.format("0x1009000000", 1024, 1024, 256) * 36 + made.format("0x276800000", 64, 64, 1) * 50, encoding="utf-8")
+    assert session_health(directory)["healthy"]
+    (directory / "stdout.log").write_text(made.format("0x1009000000", 1024, 1024, 256) * 60, encoding="utf-8")
+    logged = session_health(directory)
+    assert not logged["healthy"] and logged["reasons"] == ["large textures created again and again (texture log): 0x1009000000 x60"], logged
+    (directory / "stderr.log").write_text(line.format("0x1009000000") * 9, encoding="utf-8")
     tools = Path(__file__).resolve().parents[5] / "tools"
     completed = subprocess.run([sys.executable, str(tools / "archb_gate_stats.py"), "session", str(directory)], capture_output=True, text=True, timeout=10)
     assert completed.returncode == 0 and json.loads(completed.stdout)["healthy"] is False, completed.stdout + completed.stderr

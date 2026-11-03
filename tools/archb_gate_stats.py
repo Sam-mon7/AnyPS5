@@ -296,8 +296,13 @@ def final_verdict(legs, baseline=None):
 # pathology, not the switches; the gate relaunches it (archb_gate.ps1, code 28).
 SLOW_BUILD_MS_PER_FRAME = 30.0
 SLOW_BUILD_WINDOWS = 3
-LARGE_TEXTURE_REMADE = 4
+LARGE_TEXTURE_REMADE = 8
 LARGE_TEXTURE_LINE = re.compile(r"\[texture-cache\] large texture (0x[0-9a-f]+) \(")
+# Every build logs each texture it makes (Texture.cpp, stdout): in the pathology the pool shows up hundreds of
+# times (1 in normal sessions of current builds; older builds re-made it up to ~36 times in a normal session).
+TEXTURE_MADE_LINE = re.compile(r"Texture\] Texture address=(0x[0-9a-f]+) (\d+)x(\d+) mips=\d+ layers=(\d+)")
+TEXTURE_MADE_TEXELS = 16 << 20
+TEXTURE_MADE_AGAIN = 50
 
 
 def read_shared(path):
@@ -332,8 +337,15 @@ def session_health(directory):
     remade = sorted((address, count) for address, count in made.items() if count >= LARGE_TEXTURE_REMADE)
     if remade:
         reasons.append("large textures made again and again: " + ", ".join(f"{address} x{count}" for address, count in remade))
+    created = collections.Counter()
+    for match in TEXTURE_MADE_LINE.finditer(read_shared(directory / "stdout.log")):
+        if int(match.group(2)) * int(match.group(3)) * int(match.group(4)) >= TEXTURE_MADE_TEXELS:
+            created[match.group(1)] += 1
+    recreated = sorted((address, count) for address, count in created.items() if count >= TEXTURE_MADE_AGAIN)
+    if recreated and not remade:
+        reasons.append("large textures created again and again (texture log): " + ", ".join(f"{address} x{count}" for address, count in recreated))
     return {"healthy": not reasons, "reasons": reasons, "build_ms_per_frame": [round(value, 3) for value in recent],
-            "large_textures_made": dict(made), "code": 0}
+            "large_textures_made": dict(made), "large_textures_created": dict(created), "code": 0}
 
 
 def recorder_diagnostics(directory):
