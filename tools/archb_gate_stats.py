@@ -311,6 +311,10 @@ def read_shared(path):
             return handle.read().decode("utf-8", errors="replace")
     except FileNotFoundError:
         return ""
+    except PermissionError:
+        # A log the writer holds without read sharing: the check goes on with the other sources.
+        print(f"session check: {path} is not readable while the game runs; skipped", file=sys.stderr)
+        return ""
 
 
 def session_health(directory):

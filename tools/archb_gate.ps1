@@ -535,7 +535,10 @@ function Invoke-GateLegOnce($Configuration, [string]$Label, [string]$Kind, [int]
     foreach ($key in $environment.Keys) { $start.Environment[$key] = [string]$environment[$key] }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
-    $outStream = [IO.File]::Create((Join-Path $directory 'stdout.log'))
+    # Both logs shared for reading: the session check reads them while the game runs (stdout.log was
+    # [IO.File]::Create, FileShare.None, and the check failed with "Permission denied", 2026-11-03).
+    $outStream = [IO.FileStream]::new((Join-Path $directory 'stdout.log'), [IO.FileMode]::Create,
+        [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 4096)
     $errStream = [IO.FileStream]::new((Join-Path $directory 'stderr.log'), [IO.FileMode]::Create,
         [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1, [IO.FileOptions]::Asynchronous)
     $lowSince = $null
