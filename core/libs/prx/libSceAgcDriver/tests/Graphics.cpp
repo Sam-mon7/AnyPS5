@@ -6364,17 +6364,19 @@ void drawReuseTests() {
         Require(!mock.writes.empty(), "a fresh mixed set was not written");
         const auto mixedSet = fifth->allocation.set;
         const auto wordBuffer = fifth->snapshots[0].buffer.get();
+        const auto wordOffset = fifth->snapshots[0].offset;
         release(fifth);
         // Nothing changed: the shared element keeps its held word buffer and the slot matches.
         auto sixth = drawMixed();
-        Require(sixth->allocation.set == mixedSet && sixth->snapshots[0].buffer.get() == wordBuffer, "the mixed draw did not reuse its set and word buffer");
+        Require(sixth->allocation.set == mixedSet && sixth->snapshots[0].buffer.get() == wordBuffer && sixth->snapshots[0].offset == wordOffset, "the mixed draw did not reuse its set and word buffer");
         if (verifying) Require(!mock.writes.empty() && text().find("mismatches 0") != std::string::npos, "verification did not rewrite the unchanged mixed set: " + text());
         else Require(mock.writes.empty(), "an unchanged mixed draw wrote descriptors");
         release(sixth);
         // New words: a new shared buffer, so only element 0 is written (element 1's slot still matches).
         words.assign(4, 0x7b7b0000u);
         auto seventh = drawMixed();
-        Require(seventh->allocation.set == mixedSet && seventh->snapshots[0].buffer.get() != wordBuffer, "new words did not make a new shared buffer");
+        // (With APS5_ARCHB_FIX_MOVED_WORD_UPLOAD the new words share the upload chunk at another offset.)
+        Require(seventh->allocation.set == mixedSet && (seventh->snapshots[0].buffer.get() != wordBuffer || seventh->snapshots[0].offset != wordOffset), "new words did not make a new shared buffer");
         if (!verifying) {
             Require(mock.writes.size() == 1 && mock.writes.front().binding == 0 && mock.writes.front().arrayElement == 0 && mock.writes.front().count == 1, "a changed shared element was not the only element written");
             Require(mock.writes.front().buffers[0].buffer == seventh->snapshots[0].buffer->Handle(), "the changed shared element does not point at its new buffer");
@@ -6386,6 +6388,68 @@ void drawReuseTests() {
     guestFirst = guestFirstSaved;
     Require(mock.live == 0, "slotted draw sets leaked Vulkan objects");
     std::cout << "draw reuse tests passed\n";
+}
+
+// APS5_ARCHB_FIX_MOVED_WORD_UPLOAD (mode from the environment: off, on, verify): a moved data buffer's words
+// are snapshotted into a draw upload slice (on) or a buffer of their own (off); either way the snapshot holds
+// the words, an identical later draw takes the held snapshot, new words make a new one, and on, two word sets
+// share the recorder's upload chunk at different aligned offsets.
+void movedWordUploadTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    const auto value = [](const char* name) {
+        const char* text = std::getenv(name);
+        return text != nullptr && std::string_view(text) == "1";
+    };
+    const bool on = value("APS5_ARCHB_FIX_MOVED_WORD_UPLOAD");
+    const bool verifying = on && value("APS5_ARCHB_FIX_MOVED_WORD_UPLOAD_VERIFY");
+    Require(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixMovedWordUpload) == on, "the moved word upload switch does not follow the environment");
+    mock = MockVulkan{};
+    mock.allowCopies = true;
+    auto context = mockContext();
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        auto binding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
+        { auto flags = binding.Flags(); flags.bufferWritten = {false, false}; binding.SetFlags(std::move(flags)); }
+        vertex.bindings.push_back(binding);
+        fragment.bindings.push_back(makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8)));
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        const auto draw = [&](const std::vector<std::uint32_t>& words) {
+            const std::vector<ShaderResources::MovedBuffer> moved{{0, 0, 16, words}};
+            auto bindings = resources.PrepareDrawBindings(recorder, moved);
+            Require(bindings != nullptr && bindings->snapshots.size() == 1 && bindings->snapshots[0].buffer != nullptr && bindings->snapshots[0].bytes == 16, "the moved word snapshot is missing");
+            Require(std::memcmp(bindings->snapshots[0].Bytes().data(), words.data(), 16) == 0, "the moved word snapshot does not hold the words");
+            return bindings;
+        };
+        const auto before = ShaderResources::MovedWordTotals();
+        const std::vector<std::uint32_t> first(4, 0x5a5a0000u), second(4, 0x6b6b0000u);
+        auto a = draw(first);
+        auto b = draw(first);
+        Require(a->snapshots[0].buffer == b->snapshots[0].buffer && a->snapshots[0].offset == b->snapshots[0].offset, "identical words did not take the held snapshot");
+        auto c = draw(second);
+        Require(c->snapshots[0].buffer != a->snapshots[0].buffer || c->snapshots[0].offset != a->snapshots[0].offset, "new words reused the held snapshot");
+        const auto after = ShaderResources::MovedWordTotals();
+        if (on) {
+            const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+            Require(c->snapshots[0].buffer == a->snapshots[0].buffer && c->snapshots[0].offset != a->snapshots[0].offset && c->snapshots[0].offset % alignment == 0, "two word sets did not share the upload chunk at aligned offsets");
+            Require(after.uploaded - before.uploaded == 2 && after.held - before.held == 1 && after.created == before.created, "the moved words did not take the upload path");
+            if (verifying) Require(after.verified - before.verified == 1 && after.mismatches == before.mismatches, "verify did not check the held slice");
+        } else {
+            Require(c->snapshots[0].buffer != a->snapshots[0].buffer && c->snapshots[0].offset == 0, "the default path did not make a buffer per word set");
+            Require(after.created - before.created == 2 && after.uploaded == before.uploaded, "the default path took the upload path");
+        }
+        a.reset();
+        b.reset();
+        c.reset();
+        recorder.Sync();
+    }
+    std::cout << "moved word upload tests passed (" << (verifying ? "verify" : on ? "on" : "off") << ")\n";
 }
 
 // APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO (Stage 3 B2): a ResourceCacheMemo answers exactly what ResourceCache::Find
@@ -12521,6 +12585,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--lookup-memo") {
             lookupMemoTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--moved-word-upload") {
+            movedWordUploadTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-reuse") {

@@ -54,6 +54,7 @@ enum class Feature : std::uint8_t {
     FixStableFailedWide,
     FixSnapshotPageRefresh,
     FixSnapshotCandidates,
+    FixMovedWordUpload,
     Count
 };
 

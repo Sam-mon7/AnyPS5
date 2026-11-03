@@ -266,6 +266,12 @@ public:
         std::uint64_t draws, fallbacks, skipped, verified, mismatches;
     };
     static SnapshotCandidateStats SnapshotCandidateTotals();
+    // APS5_ARCHB_FIX_MOVED_WORD_UPLOAD counters (cumulative; for tests): moved word buffers found held,
+    // made in a draw upload slice, made as their own buffer (switch off), verified held slices, mismatches.
+    struct MovedWordStats {
+        std::uint64_t held, uploaded, created, verified, mismatches;
+    };
+    static MovedWordStats MovedWordTotals();
     // "[snapshot-fixes] cumulative: ..." for FIX_SNAPSHOT_PAGE_REFRESH and FIX_SNAPSHOT_CANDIDATES (empty
     // while neither ran).
     static std::string SnapshotFixesText();
@@ -681,6 +687,9 @@ private:
         std::vector<std::uint32_t> words;
         std::size_t size;
         std::shared_ptr<Buffer> buffer;
+        // APS5_ARCHB_FIX_MOVED_WORD_UPLOAD: the words live in a draw upload slice at this offset.
+        VkDeviceSize offset = 0;
+        bool uploaded = false;
     };
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
     mutable std::size_t movedWordBufferNext = 0;

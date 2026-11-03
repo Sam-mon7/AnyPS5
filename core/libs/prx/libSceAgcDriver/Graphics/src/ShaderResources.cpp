@@ -6170,6 +6170,7 @@ namespace {
 // APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES (see ShaderResources::snapshotCandidates).
 struct SnapshotCandidateCounters {
     std::atomic<std::uint64_t> draws{0}, fallbacks{0}, skipped{0}, verified{0}, mismatches{0};
+    std::atomic<std::uint64_t> builds{0}, buildNs{0}, buildPairs{0};
 };
 
 SnapshotCandidateCounters& snapshotCandidateCounters() {
@@ -6203,13 +6204,59 @@ ShaderResources::SnapshotCandidateStats ShaderResources::SnapshotCandidateTotals
 std::string ShaderResources::SnapshotFixesText() {
     const auto pages = Recorder::PageRefreshTotals();
     const auto candidates = SnapshotCandidateTotals();
-    if (pages.refreshes + pages.fallbacks + candidates.draws + candidates.fallbacks == 0) return {};
+    auto& counters = snapshotCandidateCounters();
+    const auto builds = counters.builds.load(std::memory_order_relaxed);
+    const auto movedWords = MovedWordTotals();
+    if (pages.refreshes + pages.fallbacks + candidates.draws + candidates.fallbacks + builds + movedWords.uploaded + movedWords.verified == 0) return {};
     const auto u = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
     char text[512];
     std::snprintf(text, sizeof(text), "[snapshot-fixes] cumulative: page refresh %llu refreshes, %llu fallbacks, %.1f MiB compared (blocks %.1f MiB, verify only), %.1f MiB copied, %llu pages verified, page mismatches %llu; candidates %llu draws, %llu fallbacks, %llu elements skipped, %llu verified, candidate mismatches %llu",
         u(pages.refreshes), u(pages.fallbacks), static_cast<double>(pages.comparedBytes) / 1048576.0, static_cast<double>(pages.blockBytes) / 1048576.0, static_cast<double>(pages.copiedBytes) / 1048576.0, u(pages.verifiedPages), u(pages.mismatches),
         u(candidates.draws), u(candidates.fallbacks), u(candidates.skipped), u(candidates.verified), u(candidates.mismatches));
-    return text;
+    char more[320];
+    std::snprintf(more, sizeof(more), "; candidate lists built %llu in %.1f ms (%llu element x read pairs); moved words %llu held, %llu uploaded, %llu created, %llu verified, moved mismatches %llu", u(builds), static_cast<double>(counters.buildNs.load(std::memory_order_relaxed)) / 1e6, u(counters.buildPairs.load(std::memory_order_relaxed)),
+        u(movedWords.held), u(movedWords.uploaded), u(movedWords.created), u(movedWords.verified), u(movedWords.mismatches));
+    return std::string(text) + more;
+}
+
+namespace {
+// APS5_ARCHB_FIX_MOVED_WORD_UPLOAD: a moved data buffer's words go into a draw upload slice (bump
+// allocation in the recorder's upload chunk, never written again once filled) instead of a buffer of
+// their own taken from the pool (often with a new VkBuffer bound to fit its size) and released after the
+// batch. A live record (snapfix-count-1103-0918) measured the moved word path at 1.27 us per
+// PrepareDrawBindings call (1.12 moved buffers each, ~0.9 ms/f on the committer). The 8 held word
+// buffers keep (buffer, offset) for an identical later draw, as before. _VERIFY checks a held slice still
+// holds its words before reusing it.
+struct MovedWordCounters {
+    std::atomic<std::uint64_t> held{0}, uploaded{0}, created{0}, verified{0}, mismatches{0};
+};
+
+MovedWordCounters& movedWordCounters() {
+    static auto* counters = [] {
+        auto* made = new MovedWordCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_moved_word_upload_held", made->held);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_moved_word_upload_uploaded", made->uploaded);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_moved_word_upload_created", made->created);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_moved_word_upload_verified", made->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_moved_word_upload_mismatches", made->mismatches);
+        return made;
+    }();
+    return *counters;
+}
+
+bool movedWordUploadVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_FIX_MOVED_WORD_UPLOAD_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+}
+
+ShaderResources::MovedWordStats ShaderResources::MovedWordTotals() {
+    auto& counters = movedWordCounters();
+    const auto get = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    return {get(counters.held), get(counters.uploaded), get(counters.created), get(counters.verified), get(counters.mismatches)};
 }
 
 bool ShaderResources::staticSnapshotCheck(std::size_t index, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads) const {
@@ -6219,11 +6266,21 @@ bool ShaderResources::staticSnapshotCheck(std::size_t index, std::span<const std
 }
 
 void ShaderResources::computeSnapshotCandidates() {
+    const auto start = std::chrono::steady_clock::now();
+    struct Timed {
+        std::chrono::steady_clock::time_point start;
+        ~Timed() {
+            auto& counters = snapshotCandidateCounters();
+            counters.builds.fetch_add(1, std::memory_order_relaxed);
+            counters.buildNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        }
+    } timed{start};
     snapshotCandidates.clear();
     snapshotCandidatesKnown = false;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda || !guestMemory.InPlaceReadsSettled()) return;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
     guestMemory.InPlaceReads(reads);
+    snapshotCandidateCounters().buildPairs.fetch_add(reads.size() * allocations.size(), std::memory_order_relaxed);
     snapshotCandidates.resize(allocations.size());
     for (std::size_t index = 0; index < allocations.size(); ++index) snapshotCandidates[index] = staticSnapshotCheck(index, reads) ? 1 : 0;
     snapshotCandidatesKnown = true;
@@ -6471,24 +6528,53 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 }
             } movedTime{diag, checkStart};
             constexpr std::size_t MovedWordBufferSlots = 8;
-            const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && std::ranges::equal(entry.words, override->words); });
+            const bool uploadWords = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixMovedWordUpload);
+            const auto fill = [&](std::byte* bytes) {
+                std::memcpy(bytes, override->words.data(), override->size);
+                for (const auto& patch : dataPatches) {
+                    if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                }
+            };
+            // A held entry made on the other path is not taken (one path per entry keeps the counts and
+            // the verify check meaningful); it ages out of the ring.
+            const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.uploaded == uploadWords && std::ranges::equal(entry.words, override->words); });
             std::shared_ptr<Buffer> buffer;
+            VkDeviceSize wordOffset = 0;
             if (held != movedWordBuffers.end()) {
                 buffer = held->buffer;
-            } else {
-                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-                std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
-                for (const auto& patch : dataPatches) {
-                    if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                wordOffset = held->offset;
+                if (uploadWords) {
+                    movedWordCounters().held.fetch_add(1, std::memory_order_relaxed);
+                    if (movedWordUploadVerify()) {
+                        thread_local std::vector<std::byte>* expectedSlot = nullptr;
+                        auto& expected = ShaderRecompiler::ThreadOwned(expectedSlot);
+                        expected.resize(override->size);
+                        fill(expected.data());
+                        auto& counters = movedWordCounters();
+                        counters.verified.fetch_add(1, std::memory_order_relaxed);
+                        if (std::memcmp(buffer->Bytes().data() + wordOffset, expected.data(), override->size) != 0) counters.mismatches.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
-                MovedWordBuffer entry{index, {override->words.begin(), override->words.end()}, override->size, buffer};
+            } else {
+                if (uploadWords) {
+                    auto slice = recorder.DrawUpload(override->size);
+                    fill(slice.bytes);
+                    buffer = std::move(slice.buffer);
+                    wordOffset = slice.offset;
+                    movedWordCounters().uploaded.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                    fill(buffer->Bytes().data());
+                    movedWordCounters().created.fetch_add(1, std::memory_order_relaxed);
+                }
+                MovedWordBuffer entry{index, {override->words.begin(), override->words.end()}, override->size, buffer, wordOffset, uploadWords};
                 if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
                 else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
             }
             if (diag) bindingsDiag().movedWords.fetch_add(1, std::memory_order_relaxed);
             if (slotted) drawReuseCounters().sharedElements.fetch_add(1, std::memory_order_relaxed);
             selected.push_back(index);
-            keep({0, std::move(buffer), 0, override->size});
+            keep({0, std::move(buffer), wordOffset, override->size});
             continue;
         }
         std::uint64_t address = item.address;
