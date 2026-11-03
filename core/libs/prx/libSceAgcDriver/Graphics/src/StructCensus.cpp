@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -201,6 +202,99 @@ std::string Describe(const Stats& stats) {
         text += line;
     }
     return text;
+}
+
+bool ReuseTracker::Note(std::uint64_t structure) {
+    const auto occurrence = current[structure]++;
+    if (!havePrevious) return false;
+    const auto found = previous.find(structure);
+    return found != previous.end() && found->second > occurrence;
+}
+
+void ReuseTracker::EndFrame() {
+    if (current.empty()) return;
+    std::swap(previous, current);
+    current.clear();
+    havePrevious = true;
+}
+
+bool ReuseCensusEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_ARCHB_DRAW_REUSE_CENSUS");
+        return text != nullptr && text[0] != '\0' && text[0] != '0';
+    }();
+    return enabled;
+}
+
+namespace {
+struct ReuseCounters {
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> recipeDraws{0};
+    std::atomic<std::uint64_t> recipeHits{0};
+    std::atomic<std::uint64_t> hitTotalNs{0};
+    std::atomic<std::uint64_t> missTotalNs{0};
+    std::array<std::atomic<std::uint64_t>, ReuseStages> hitNs{};
+    std::array<std::atomic<std::uint64_t>, ReuseStages> missNs{};
+};
+
+ReuseCounters& reuseCounters() {
+    static auto* counters = [] {
+        auto* made = new ReuseCounters();
+        using AgcDriver::ArchB::Recorder;
+        Recorder::RegisterCounter("reuse_census_draws", made->draws);
+        Recorder::RegisterCounter("reuse_census_hits", made->hits);
+        Recorder::RegisterCounter("reuse_census_recipe_draws", made->recipeDraws);
+        Recorder::RegisterCounter("reuse_census_recipe_hits", made->recipeHits);
+        Recorder::RegisterCounter("reuse_census_hit_total_ns", made->hitTotalNs);
+        Recorder::RegisterCounter("reuse_census_miss_total_ns", made->missTotalNs);
+        static std::array<std::string, ReuseStages * 2> names;
+        for (std::size_t stage = 0; stage < ReuseStages; ++stage) {
+            names[stage * 2] = std::string("reuse_census_hit_") + ReuseStageNames[stage] + "_ns";
+            names[stage * 2 + 1] = std::string("reuse_census_miss_") + ReuseStageNames[stage] + "_ns";
+            Recorder::RegisterCounter(names[stage * 2].c_str(), made->hitNs[stage]);
+            Recorder::RegisterCounter(names[stage * 2 + 1].c_str(), made->missNs[stage]);
+        }
+        return made;
+    }();
+    return *counters;
+}
+
+std::mutex reuseMutex;
+ReuseTracker reuseTracker;
+std::uint64_t reuseFrame = 0;
+std::uint64_t reuseFrames = 0;
+std::chrono::steady_clock::time_point reuseReportedAt = std::chrono::steady_clock::now();
+}
+
+void NoteReuseDraw(std::uint64_t structure, bool recipe, const std::array<std::uint64_t, ReuseStages>& ns, std::uint64_t totalNs, std::uint64_t frame) {
+    auto& counters = reuseCounters();
+    bool hit = false;
+    {
+        std::lock_guard lock(reuseMutex);
+        if (frame != reuseFrame) {
+            reuseFrame = frame;
+            reuseTracker.EndFrame();
+            ++reuseFrames;
+        }
+        hit = reuseTracker.Note(structure);
+    }
+    counters.draws.fetch_add(1, std::memory_order_relaxed);
+    if (recipe) counters.recipeDraws.fetch_add(1, std::memory_order_relaxed);
+    if (hit) {
+        counters.hits.fetch_add(1, std::memory_order_relaxed);
+        if (recipe) counters.recipeHits.fetch_add(1, std::memory_order_relaxed);
+    }
+    (hit ? counters.hitTotalNs : counters.missTotalNs).fetch_add(totalNs, std::memory_order_relaxed);
+    auto& stages = hit ? counters.hitNs : counters.missNs;
+    for (std::size_t stage = 0; stage < ReuseStages; ++stage) stages[stage].fetch_add(ns[stage], std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(reuseMutex);
+    if (now - reuseReportedAt < std::chrono::seconds(10)) return;
+    reuseReportedAt = now;
+    std::string text = "[reuse-census] cumulative frames=" + std::to_string(reuseFrames) + " draws=" + std::to_string(counters.draws.load()) + " hits=" + std::to_string(counters.hits.load()) + " recipe_draws=" + std::to_string(counters.recipeDraws.load()) + " recipe_hits=" + std::to_string(counters.recipeHits.load()) + " hit_total_ns=" + std::to_string(counters.hitTotalNs.load()) + " miss_total_ns=" + std::to_string(counters.missTotalNs.load());
+    for (std::size_t stage = 0; stage < ReuseStages; ++stage) text += std::string(" hit_") + ReuseStageNames[stage] + "=" + std::to_string(counters.hitNs[stage].load()) + " miss_" + ReuseStageNames[stage] + "=" + std::to_string(counters.missNs[stage].load());
+    std::fprintf(stderr, "%s\n", text.c_str());
 }
 
 }

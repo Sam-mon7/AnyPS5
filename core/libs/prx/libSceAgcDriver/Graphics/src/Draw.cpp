@@ -1278,6 +1278,13 @@ namespace {
 
 // APS5_PROFILE_DRAW: the per-phase timers of one draw (DrawPhase), shared by Draw's parts and
 // DrawWithRecipe.
+// APS5_ARCHB_DRAW_REUSE_CENSUS (defined with noteDrawCensus): every DrawTimer phase also ends a
+// census stage (markPhase maps DrawPhase to StructCensus::ReuseStage).
+namespace reuseCensus {
+void markPhase(std::size_t drawPhase);
+void mark(StructCensus::ReuseStage stage);
+}
+
 struct DrawTimer {
     bool profile;
     std::chrono::steady_clock::time_point phaseStart;
@@ -1291,6 +1298,7 @@ struct DrawTimer {
         heldStart = phaseHeldStart = GuestMemory::ThreadGpuHeldNs();
     }
     void phase(DrawPhase which) {
+        reuseCensus::markPhase(which);
         if (!profile) return;
         const auto now = std::chrono::steady_clock::now();
         const auto held = GuestMemory::ThreadGpuHeldNs();
@@ -1967,8 +1975,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         if (timer.profile && preparation != nullptr && preparation->device != VK_NULL_HANDLE) preparation->cacheChanged |= cached.owner_before(preparation->cached) || preparation->cached.owner_before(cached);
         if (cached != nullptr) {
             lookupPhase(LookupKeyFind);
+            reuseCensus::mark(StructCensus::ReuseLookup);
             const bool valid = cached->Revalidate(shaders);
             lookupPhase(LookupProof);
+            reuseCensus::mark(StructCensus::ReuseProof);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
@@ -2454,7 +2464,9 @@ bool WriteOnlyPasses() {
 }
 
 // APS5_ARCHB_STRUCT_REPEAT_CENSUS: the recorded draw's structural state by component (StructCensus.hpp).
-void noteDrawCensus(const State& state, const Pm4::DrawParameters& draw, const RecordedDraw& record, std::uint64_t passKey, const ShaderResources::DrawBindings* bindings, bool continued) {
+// The snapshot contents are hashed only when `withData` (the repeat census; the reuse census keys
+// the structure level, which leaves addresses and data out).
+StructCensus::Commit drawCensusCommit(const State& state, const Pm4::DrawParameters& draw, const RecordedDraw& record, std::uint64_t passKey, const ShaderResources::DrawBindings* bindings, bool continued, bool withData) {
     using namespace StructCensus;
     Commit commit;
     commit.kind = Kind::Draw;
@@ -2487,7 +2499,7 @@ void noteDrawCensus(const State& state, const Pm4::DrawParameters& draw, const R
     auto addresses = Mix(5, draw.indexed ? draw.indexAddress : 0);
     if (draw.indirect.has_value()) addresses = Mix(addresses, draw.indirect->arguments);
     auto data = std::uint64_t{6};
-    if (bindings != nullptr) {
+    if (bindings != nullptr && withData) {
         for (const auto& snapshot : bindings->snapshots) {
             addresses = Mix(addresses, snapshot.address);
             addresses = Mix(addresses, snapshot.bytes);
@@ -2496,11 +2508,84 @@ void noteDrawCensus(const State& state, const Pm4::DrawParameters& draw, const R
     }
     commit.components[ComponentAddresses] = addresses;
     commit.components[ComponentData] = data;
-    StructCensus::NoteCommit(commit);
+    return commit;
+}
+
+void noteDrawCensus(const State& state, const Pm4::DrawParameters& draw, const RecordedDraw& record, std::uint64_t passKey, const ShaderResources::DrawBindings* bindings, bool continued) {
+    StructCensus::NoteCommit(drawCensusCommit(state, draw, record, passKey, bindings, continued, true));
+}
+
+// APS5_ARCHB_DRAW_REUSE_CENSUS (B0, StructCensus.hpp): the committer's current draw, its stage
+// times since begin() (a recipe hit in DrawWithRecipe, a full draw in Draw) and its structure hash.
+// A draw that leaves before recordDraw (a recipe miss, an unrecorded draw) is dropped by the next
+// begin().
+namespace reuseCensus {
+struct Current {
+    bool active = false;
+    bool recipe = false;
+    std::uint64_t start = 0;
+    std::uint64_t last = 0;
+    std::uint64_t structure = 0;
+    std::array<std::uint64_t, StructCensus::ReuseStages> ns{};
+};
+thread_local Current current;
+
+std::uint64_t nowNs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void begin(bool recipe) {
+    static const bool enabled = StructCensus::ReuseCensusEnabled();
+    if (!enabled || !GuestMemory::IsCommitterThread()) {
+        current.active = false;
+        return;
+    }
+    current = {};
+    current.active = true;
+    current.recipe = recipe;
+    current.start = current.last = nowNs();
+}
+
+void mark(StructCensus::ReuseStage stage) {
+    if (!current.active) return;
+    const auto now = nowNs();
+    current.ns[stage] += now - current.last;
+    current.last = now;
+}
+
+// The structure level of the draw's census commit; its hashing time is left out of the stages.
+void structure(const State& state, const Pm4::DrawParameters& draw, const RecordedDraw& record, std::uint64_t passKey, const ShaderResources::DrawBindings* bindings, bool continued) {
+    if (!current.active) return;
+    mark(StructCensus::ReuseRecord);
+    current.structure = StructCensus::Tracker::LevelHashes(drawCensusCommit(state, draw, record, passKey, bindings, continued, false))[StructCensus::LevelStructure];
+    current.last = nowNs();
+}
+
+void finish() {
+    if (!current.active) return;
+    current.active = false;
+    StructCensus::NoteReuseDraw(current.structure, current.recipe, current.ns, current.last - current.start, GuestMemory::CensusFlips());
+}
+
+void markPhase(std::size_t drawPhase) {
+    if (!current.active) return;
+    using namespace StructCensus;
+    switch (drawPhase) {
+        case PhaseReadTarget: mark(ReuseTargets); break;
+        case PhaseLookup:
+        case PhasePipeline: mark(ReuseLookup); break;
+        case PhaseRecord: mark(ReuseRecord); break;
+        case PhaseKeep: mark(ReuseKeep); break;
+        default: mark(ReuseOther); break;
+    }
+}
 }
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr, bool pipelineStateReuse = false) {
     using R = AgcDriver::ArchB::Recorder;
+    // B0: a full draw's whole preparation (target lookups, template key and find or build,
+    // pipeline) is "other" (reported apart by the recipe counters), a recipe hit's tail "other".
+    reuseCensus::mark(StructCensus::ReuseOther);
     auto recordLap = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto recordPhase = [&](RecordPhase phase) {
         if (!timer.profile) return;
@@ -2579,8 +2664,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     recordPhase(RecordAccess);
+    reuseCensus::mark(StructCensus::ReuseAccess);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
     recordPhase(RecordBindings);
+    reuseCensus::mark(StructCensus::ReuseBindings);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -2611,6 +2698,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || (gpuIndirect && !inPassIndirect) || meshIndirect || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
     recordPhase(RecordPass);
+    reuseCensus::mark(StructCensus::ReusePass);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2716,6 +2804,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
     if (StructCensus::Enabled()) noteDrawCensus(state, draw, record, passKey, drawBindings.get(), continued);
+    reuseCensus::structure(state, draw, record, passKey, drawBindings.get(), continued);
     recordPhase(RecordCommands);
     std::function<void(VkCommandBuffer)> storeProxies;
     if (!continued && (!record.proxies.empty() || !record.reordered.empty() || record.depthLocations)) {
@@ -2736,11 +2825,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             }
         };
     }
+    reuseCensus::mark(StructCensus::ReuseRecord);
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     recordPhase(RecordLeave);
+    reuseCensus::mark(StructCensus::ReusePass);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     recordPhase(RecordKeep);
+    reuseCensus::mark(StructCensus::ReuseKeep);
+    reuseCensus::finish();
     timer.phase(PhaseKeep);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -3694,6 +3787,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (!pipelineStateReuse && context.recorder != nullptr) context.recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_off");
     if (preparation != nullptr) RecheckDrawPreparation(context, *preparation);
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    reuseCensus::begin(false);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PreparedDraw prepared(profile);
     prepared.preparation = preparation;
@@ -3726,6 +3820,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         return result;
     };
     Require(!draw.indirect, "a draw recipe covers direct draws only");
+    reuseCensus::begin(true);
     auto* recorder = Recorder::Active();
     if (state.quadList || StripPatches(state, shaders) || !RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
     if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
@@ -3736,6 +3831,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         result.recorded = true;
         return result;
     }
+    reuseCensus::mark(StructCensus::ReuseOther);
     // The resident-target proof on the stored images (design_cpu_final 3.7): while an image is
     // still the storage cache's for its surface (StorageImageCached: the cache entry, removed under
     // the cache mutex before an eviction's flush, and the LRU touch a lookup would make), it is
@@ -3768,14 +3864,17 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
     }
     timer.phase(PhasePrepare);
+    reuseCensus::mark(StructCensus::ReuseTargets);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
     // key leaves to a hit repeated; a failure removes the template from the cache (the batch keeps
     // it) and the caller rebuilds.
     auto resources = recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
+    reuseCensus::mark(StructCensus::ReuseLookup);
     const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool proved = resources->ProveCurrent(shaders, &result.proof);
+    reuseCensus::mark(StructCensus::ReuseProof);
     if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
     if (!proved) {
         SharedResourceCache().Remove(recipe.key, resources.get());
@@ -3814,6 +3913,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
     }
     timer.phase(PhasePipeline);
+    reuseCensus::mark(StructCensus::ReuseLookup);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;
     record.recorder = recorder;

@@ -2374,9 +2374,293 @@ struct Scope {
 };
 }
 
+// APS5_ARCHB_COMMITTER_COLLECT_CENSUS (see GuestMemory.hpp). Committer thread only: its tables are
+// thread-local and printed by the committer itself.
+namespace committerCensus {
+std::atomic<std::uint64_t> flips{0};
+
+bool enabled() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_ARCHB_COMMITTER_COLLECT_CENSUS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return on;
+}
+
+enum Outcome : std::uint8_t { OutcomeNone, OutcomeHitCache, OutcomeHitMap, OutcomeHitRing, OutcomeHitShare, OutcomeFailedHit, OutcomeWalk, OutcomeFailed };
+// A range against the ranges collected earlier in a scope (epoch or item).
+enum Seen : std::uint8_t { SeenNo, SeenPartial, SeenSubset, SeenExact, SeenKinds };
+
+struct SiteKey {
+    const char* file;
+    std::uint32_t line;
+    std::uint8_t kind;
+    bool prelock;
+    bool memoized;
+    bool operator<(const SiteKey& other) const {
+        return std::tie(file, line, kind, prelock, memoized) < std::tie(other.file, other.line, other.kind, other.prelock, other.memoized);
+    }
+};
+
+struct SiteRow {
+    std::uint64_t calls = 0;
+    std::uint64_t ns = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t hitNs = 0;
+    std::array<std::uint64_t, 4> hitPaths{};  // cache, epoch map, ring, share
+    std::uint64_t failedHits = 0;
+    std::uint64_t failed = 0;
+    std::uint64_t walks = 0;
+    std::uint64_t walkPages = 0;
+    std::uint64_t walkNs = 0;
+    std::uint64_t walkCallNs = 0;
+    // Walks: the range against this epoch's / this item's earlier collected ranges.
+    std::array<std::uint64_t, SeenKinds> walkEpoch{};
+    std::array<std::uint64_t, SeenKinds> walkItem{};
+    std::uint64_t walkEpochSeenPages = 0;  // pages of walks already collected in the epoch
+    std::uint64_t walkEpochSeenNs = 0;     // walk time of walks that were exact or subset in the epoch
+    std::uint64_t walkItemSeenNs = 0;      // ... in the item
+    // Memo hits: the range against this item's earlier ranges, and (when not in the item) the epoch's.
+    std::array<std::uint64_t, SeenKinds> hitItem{};
+    std::array<std::uint64_t, SeenKinds> hitEpoch{};
+    std::uint64_t hitItemSeenNs = 0;  // call time of hits that were exact or subset in the item
+};
+
+struct ChainKey {
+    const char* file;
+    std::uint32_t line;
+    std::array<unsigned long long, 6> frames;
+    bool operator<(const ChainKey& other) const {
+        return std::tie(file, line, frames) < std::tie(other.file, other.line, other.frames);
+    }
+};
+
+struct ChainRow {
+    std::uint64_t walks = 0;
+    std::uint64_t pages = 0;
+    std::uint64_t ns = 0;
+    std::uint64_t epochSeen = 0;  // walks exact or subset in the epoch
+    std::uint64_t itemSeen = 0;
+    bool prelock = false;
+    std::uint8_t kind = 0;
+};
+
+// The ranges collected in one scope: exact pairs and their union.
+struct Scope {
+    std::uint64_t serial = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> exact;
+    std::map<std::uint64_t, std::uint64_t> merged;
+
+    void reset(std::uint64_t value) {
+        serial = value;
+        exact.clear();
+        merged.clear();
+    }
+    // How [first, stop) relates to the ranges so far, and the pages of it already collected.
+    Seen classify(std::uint64_t first, std::uint64_t stop, std::uint64_t& seenPages) const {
+        seenPages = 0;
+        auto it = merged.upper_bound(first);
+        if (it != merged.begin()) --it;
+        for (; it != merged.end() && it->first < stop; ++it) {
+            const auto from = std::max(first, it->first);
+            const auto to = std::min(stop, it->second);
+            if (from < to) seenPages += (to - from) / 4096;
+        }
+        const auto pages = (stop - first) / 4096;
+        if (seenPages == 0) return SeenNo;
+        if (seenPages < pages) return SeenPartial;
+        // Exact pairs are looked up only for covered ranges (the common case is a short list per item).
+        if (exact.size() < 8192 && std::find(exact.begin(), exact.end(), std::pair{first, stop}) != exact.end()) return SeenExact;
+        return SeenSubset;
+    }
+    void add(std::uint64_t first, std::uint64_t stop) {
+        if (exact.size() < 8192) exact.emplace_back(first, stop);
+        auto begin = first;
+        auto end = stop;
+        auto merge = merged.lower_bound(begin);
+        if (merge != merged.begin() && std::prev(merge)->second >= begin) --merge;
+        while (merge != merged.end() && merge->first <= end) {
+            begin = std::min(begin, merge->first);
+            end = std::max(end, merge->second);
+            merge = merged.erase(merge);
+        }
+        merged.emplace(begin, end);
+    }
+};
+
+struct State {
+    std::map<SiteKey, SiteRow> sites;
+    std::map<ChainKey, ChainRow> chains;
+    Scope epoch;
+    Scope item;
+    std::uint64_t itemSerial = 0;
+    std::uint8_t itemKind = 0;
+    std::uint64_t items[8]{};
+    std::uint64_t calls = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+State& state() {
+    thread_local State* slot = nullptr;
+    if (slot == nullptr) slot = new State();
+    return *slot;
+}
+
+void report(State& census) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - census.reported < std::chrono::seconds(10)) return;
+    census.reported = now;
+    static constexpr const char* kindNames[] = {"other", "draw", "dispatch", "label", "dma", "fill", "?", "?"};
+    std::string text;
+    char line[2048];
+    std::snprintf(line, sizeof(line), "[collect-census] begin flips=%llu items other=%llu draw=%llu dispatch=%llu label=%llu dma=%llu fill=%llu\n", static_cast<unsigned long long>(flips.load(std::memory_order_relaxed)), static_cast<unsigned long long>(census.items[0]), static_cast<unsigned long long>(census.items[1]), static_cast<unsigned long long>(census.items[2]), static_cast<unsigned long long>(census.items[3]), static_cast<unsigned long long>(census.items[4]), static_cast<unsigned long long>(census.items[5]));
+    text += line;
+    for (const auto& [key, row] : census.sites) {
+        const char* file = std::strrchr(key.file, '/');
+        const char* back = std::strrchr(key.file, '\\');
+        if (back != nullptr && (file == nullptr || back > file)) file = back;
+        file = file != nullptr ? file + 1 : key.file;
+        std::snprintf(line, sizeof(line),
+                      "[collect-census] site %s:%u kind=%s phase=%s memo=%d calls=%llu ns=%llu hits=%llu hit_ns=%llu paths=%llu/%llu/%llu/%llu failed_hits=%llu failed=%llu walks=%llu pages=%llu walk_ns=%llu walk_call_ns=%llu "
+                      "walk_epoch=%llu/%llu/%llu/%llu walk_item=%llu/%llu/%llu/%llu walk_epoch_seen_pages=%llu walk_epoch_seen_ns=%llu walk_item_seen_ns=%llu hit_item=%llu/%llu/%llu/%llu hit_epoch=%llu/%llu/%llu/%llu hit_item_seen_ns=%llu\n",
+                      file, key.line, kindNames[key.kind & 7u], key.prelock ? "prelock" : "other", key.memoized ? 1 : 0, static_cast<unsigned long long>(row.calls), static_cast<unsigned long long>(row.ns), static_cast<unsigned long long>(row.hits), static_cast<unsigned long long>(row.hitNs),
+                      static_cast<unsigned long long>(row.hitPaths[0]), static_cast<unsigned long long>(row.hitPaths[1]), static_cast<unsigned long long>(row.hitPaths[2]), static_cast<unsigned long long>(row.hitPaths[3]), static_cast<unsigned long long>(row.failedHits), static_cast<unsigned long long>(row.failed),
+                      static_cast<unsigned long long>(row.walks), static_cast<unsigned long long>(row.walkPages), static_cast<unsigned long long>(row.walkNs), static_cast<unsigned long long>(row.walkCallNs),
+                      static_cast<unsigned long long>(row.walkEpoch[0]), static_cast<unsigned long long>(row.walkEpoch[1]), static_cast<unsigned long long>(row.walkEpoch[2]), static_cast<unsigned long long>(row.walkEpoch[3]),
+                      static_cast<unsigned long long>(row.walkItem[0]), static_cast<unsigned long long>(row.walkItem[1]), static_cast<unsigned long long>(row.walkItem[2]), static_cast<unsigned long long>(row.walkItem[3]),
+                      static_cast<unsigned long long>(row.walkEpochSeenPages), static_cast<unsigned long long>(row.walkEpochSeenNs), static_cast<unsigned long long>(row.walkItemSeenNs),
+                      static_cast<unsigned long long>(row.hitItem[0]), static_cast<unsigned long long>(row.hitItem[1]), static_cast<unsigned long long>(row.hitItem[2]), static_cast<unsigned long long>(row.hitItem[3]),
+                      static_cast<unsigned long long>(row.hitEpoch[0]), static_cast<unsigned long long>(row.hitEpoch[1]), static_cast<unsigned long long>(row.hitEpoch[2]), static_cast<unsigned long long>(row.hitEpoch[3]), static_cast<unsigned long long>(row.hitItemSeenNs));
+        text += line;
+    }
+    // The walk chains by walk time, top 48.
+    std::vector<std::pair<const ChainKey*, const ChainRow*>> chains;
+    chains.reserve(census.chains.size());
+    for (const auto& [key, row] : census.chains) chains.emplace_back(&key, &row);
+    std::sort(chains.begin(), chains.end(), [](const auto& a, const auto& b) { return a.second->ns > b.second->ns; });
+    if (chains.size() > 48) chains.resize(48);
+    for (const auto& [key, row] : chains) {
+        const char* file = std::strrchr(key->file, '\\');
+        if (const char* slash = std::strrchr(key->file, '/'); slash != nullptr && (file == nullptr || slash > file)) file = slash;
+        file = file != nullptr ? file + 1 : key->file;
+        std::snprintf(line, sizeof(line), "[collect-census] chain %s:%u kind=%s phase=%s walks=%llu pages=%llu ns=%llu epoch_seen=%llu item_seen=%llu frames=+%llx,+%llx,+%llx,+%llx,+%llx,+%llx\n", file, key->line, kindNames[row->kind & 7u], row->prelock ? "prelock" : "other",
+                      static_cast<unsigned long long>(row->walks), static_cast<unsigned long long>(row->pages), static_cast<unsigned long long>(row->ns), static_cast<unsigned long long>(row->epochSeen), static_cast<unsigned long long>(row->itemSeen),
+                      key->frames[0], key->frames[1], key->frames[2], key->frames[3], key->frames[4], key->frames[5]);
+        text += line;
+    }
+    text += "[collect-census] end\n";
+    std::fputs(text.c_str(), stderr);
+    std::fflush(stderr);
+}
+
+std::uint64_t nowNs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// One committer collect.
+class Call {
+public:
+    Call(bool active, const std::source_location& site, bool memoized) : on(active), site(site), memoized(memoized) {
+        if (on) start = nowNs();
+    }
+    void range(std::uint64_t begin, std::uint64_t end, std::uint64_t epochValue) {
+        first = begin;
+        stop = end;
+        epoch = epochValue;
+    }
+    void hit(Outcome path) {
+        if (on) outcome = path;
+    }
+    void walked(bool ok, std::uint64_t ns) {
+        if (!on) return;
+        outcome = ok ? OutcomeWalk : OutcomeFailed;
+        walkNs = ns;
+        if (ok) chain = CaptureCallerOffsets(frames, 0);
+    }
+    void failed() {
+        if (on && outcome == OutcomeNone) outcome = OutcomeFailed;
+    }
+    ~Call() {
+        if (!on) return;
+        const auto ns = nowNs() - start;
+        auto& census = state();
+        if (census.epoch.serial != epoch) census.epoch.reset(epoch);
+        if (census.item.serial != census.itemSerial) census.item.reset(census.itemSerial);
+        auto& row = census.sites[SiteKey{site.file_name(), site.line(), census.itemKind, aheadCensus::prelock, memoized}];
+        ++row.calls;
+        row.ns += ns;
+        const bool ranged = stop > first;
+        std::uint64_t epochPages = 0;
+        std::uint64_t itemPages = 0;
+        const auto inEpoch = ranged ? census.epoch.classify(first, stop, epochPages) : SeenNo;
+        const auto inItem = ranged ? census.item.classify(first, stop, itemPages) : SeenNo;
+        const auto seen = [](Seen value) { return value == SeenExact || value == SeenSubset; };
+        switch (outcome) {
+            case OutcomeHitCache:
+            case OutcomeHitMap:
+            case OutcomeHitRing:
+            case OutcomeHitShare:
+                ++row.hits;
+                row.hitNs += ns;
+                ++row.hitPaths[outcome - OutcomeHitCache];
+                ++row.hitItem[inItem];
+                if (!seen(inItem)) ++row.hitEpoch[inEpoch];
+                else row.hitItemSeenNs += ns;
+                break;
+            case OutcomeFailedHit: ++row.failedHits; break;
+            case OutcomeWalk: {
+                ++row.walks;
+                row.walkPages += (stop - first) / 4096;
+                row.walkNs += walkNs;
+                row.walkCallNs += ns;
+                ++row.walkEpoch[inEpoch];
+                ++row.walkItem[inItem];
+                row.walkEpochSeenPages += epochPages;
+                if (seen(inEpoch)) row.walkEpochSeenNs += walkNs;
+                if (seen(inItem)) row.walkItemSeenNs += walkNs;
+                ChainKey key{site.file_name(), site.line(), {}};
+                for (std::size_t i = 0; i < chain && i < key.frames.size(); ++i) key.frames[i] = frames[i];
+                auto& chainRow = census.chains[key];
+                ++chainRow.walks;
+                chainRow.pages += (stop - first) / 4096;
+                chainRow.ns += walkNs;
+                if (seen(inEpoch)) ++chainRow.epochSeen;
+                if (seen(inItem)) ++chainRow.itemSeen;
+                chainRow.prelock = aheadCensus::prelock;
+                chainRow.kind = census.itemKind;
+                break;
+            }
+            default: ++row.failed; break;
+        }
+        if (ranged && outcome != OutcomeFailed && outcome != OutcomeFailedHit && outcome != OutcomeNone) {
+            census.epoch.add(first, stop);
+            census.item.add(first, stop);
+        }
+        if ((++census.calls & 1023u) == 0) report(census);
+    }
+    Call(const Call&) = delete;
+    Call& operator=(const Call&) = delete;
+
+    const bool on;
+
+private:
+    const std::source_location& site;
+    bool memoized;
+    std::uint64_t start = 0;
+    std::uint64_t first = 0;
+    std::uint64_t stop = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t walkNs = 0;
+    Outcome outcome = OutcomeNone;
+    std::array<unsigned long long, 6> frames{};
+    std::size_t chain = 0;
+};
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery, const std::source_location& site) {
     const census::Scope censusScope(memoized ? "collect" : "collect_uncached", &site);
     const aheadCensus::Scope aheadScope(committerThread && memoized && aheadCensus::enabled());
+    committerCensus::Call committerCall(committerThread && committerCensus::enabled(), site, memoized);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -2389,6 +2673,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
+    if (committerCall.on) committerCall.range(first, stop, epoch);
     if (committerThread && useMemo) CommitterCollects().collects.fetch_add(1, std::memory_order_relaxed);
     // Write generations: an uncached collect sweeps at a private fresh ticket (rule V4); a memoized
     // one is modeled under the shadow: what EnsureSwept would sweep at the thread's ticket, judged
@@ -2413,6 +2698,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 bookkeeping::count(bookkeeping::Hits);
                 if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 if (committerThread) CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
+                committerCall.hit(committerCensus::OutcomeHitCache);
                 return tracker.stable.load(std::memory_order_acquire);
             }
             verifyHit = true;
@@ -2443,6 +2729,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
             if (const auto* found = map.ranges.Find(first); found != nullptr && found->unwatched == unwatched && found->mapping == mapping && stop <= found->end) {
+                committerCall.hit(committerCensus::OutcomeHitMap);
                 return memoHit();
             }
         }
@@ -2451,6 +2738,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
+                committerCall.hit(committerCensus::OutcomeHitRing);
                 return memoHit();
             }
         }
@@ -2462,6 +2750,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         const auto& failed = epochCollectMap(epoch).failedRanges;
         if (const auto* found = failed.Find(first); found != nullptr && found->end == stop && found->unwatched == unwatched && found->mapping == mapping) {
             if (MemoryProfiled()) failedCollectMemoHits.fetch_add(1, std::memory_order_relaxed);
+            committerCall.hit(committerCensus::OutcomeFailedHit);
             return 0;
         }
     }
@@ -2547,6 +2836,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             counters.shareCoveredPages.fetch_add(pages, std::memory_order_relaxed);
             if (!verifying) {
                 // Answered like a memo hit (the current generation; queue 0's walk stamped what it found).
+                committerCall.hit(committerCensus::OutcomeHitShare);
                 remember();
                 return tracker.generation.load(std::memory_order_relaxed);
             }
@@ -2560,10 +2850,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // The clock before the OS query: every bump at or below it happened before this walk.
     const auto shareClock = shareProducer ? nextCollectEpoch.load(std::memory_order_acquire) : 0;
     const auto walkStart = shareCommitter ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto aheadWalkStart = aheadScope.on && useMemo ? aheadCensus::nowNs() : 0;
+    const auto aheadWalkStart = (aheadScope.on && useMemo) || committerCall.on ? aheadCensus::nowNs() : 0;
     std::uint64_t stamped = 0;
     const bool walkedOk = walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, memoVirtualQuery, &stamped);
     if (aheadScope.on && useMemo) aheadScope.walked((stop - first) / page, aheadCensus::nowNs() - aheadWalkStart);
+    if (committerCall.on) committerCall.walked(walkedOk, aheadCensus::nowNs() - aheadWalkStart);
     if (!walkedOk) return fail();
     if (shareCommitter) {
         auto& counters = CommitterCollects();
@@ -2698,6 +2989,10 @@ void MarkCommitterThread() {
     committerThread = true;
 }
 
+bool IsCommitterThread() {
+    return committerThread;
+}
+
 void SetCollectShareProducer(bool producer) {
     collectShare::producer = producer;
 }
@@ -2709,6 +3004,26 @@ void FollowCollectShare(std::uint64_t clock) {
 
 bool CollectAheadCensus() {
     return aheadCensus::enabled();
+}
+
+bool CommitterCollectCensus() {
+    return committerCensus::enabled();
+}
+
+void BeginCommitterCensusItem(std::uint8_t kind) {
+    if (!committerThread || !committerCensus::enabled()) return;
+    auto& census = committerCensus::state();
+    ++census.itemSerial;
+    census.itemKind = kind;
+    ++census.items[kind & 7u];
+}
+
+void NoteCensusFlip() {
+    committerCensus::flips.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t CensusFlips() {
+    return committerCensus::flips.load(std::memory_order_relaxed);
 }
 
 CollectAheadCensusCounters& CollectAheadCensusCounts() {

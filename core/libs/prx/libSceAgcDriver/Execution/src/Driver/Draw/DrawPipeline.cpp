@@ -788,6 +788,8 @@ void DrawPipeline::run() {
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
+        static const bool collectCensus = GuestMemory::CommitterCollectCensus();
+        if (collectCensus) GuestMemory::BeginCommitterCensusItem(static_cast<std::uint8_t>(kind));
         try {
             if (commit != nullptr) (*commit)();
             if (!isDraw) GuestMemory::BreakProofs();

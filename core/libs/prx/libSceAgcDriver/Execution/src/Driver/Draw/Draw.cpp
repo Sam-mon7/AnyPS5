@@ -1643,7 +1643,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     DrawLockTiming lockTiming{profile};
     if (Graphics::DrawPrelockEnabled()) {
         const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        static const bool aheadCensus = GuestMemory::CollectAheadCensus();
+        static const bool aheadCensus = GuestMemory::CollectAheadCensus() || GuestMemory::CommitterCollectCensus();
         struct PrelockPhase {
             bool on;
             explicit PrelockPhase(bool active) : on(active) {

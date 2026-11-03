@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // APS5_ARCHB_STRUCT_REPEAT_CENSUS (diagnostic, read once, default off; Stage 3 slice 7): hashes the
@@ -81,6 +82,33 @@ void NoteFrame();
 // Thread-safe; a commit noted after NoteFrame belongs to the next frame.
 void NoteCommit(const Commit& commit);
 std::string Describe(const Stats& stats);
+
+// APS5_ARCHB_DRAW_REUSE_CENSUS (diagnostic, read once, default off; Stage 3 Appendix B step B0):
+// for every draw the queue-0 committer records, whether a per-draw structure-reuse cache keyed by
+// (structure hash, occurrence index in the frame) would hit, i.e. the previous frame drew the same
+// structure (pipeline, pass, framebuffer, set layouts, push stages, draw kind, dynamic state, draw
+// parameters, push bytes, resource template) at least k+1 times, and the committer time of the
+// draw's stages split by would-hit and miss: what structure reuse could remove (lookup, bindings,
+// record, keep) next to what it keeps (targets, proof, access lists, pass bookkeeping). Recorder
+// counters reuse_census_* per frame and a "[reuse-census]" line on stderr every 10 s.
+enum ReuseStage : std::size_t { ReuseOther, ReuseTargets, ReuseLookup, ReuseProof, ReuseAccess, ReuseBindings, ReusePass, ReuseRecord, ReuseKeep, ReuseStages };
+inline constexpr const char* ReuseStageNames[ReuseStages] = {"other", "targets", "lookup", "proof", "access", "bindings", "pass", "record", "keep"};
+
+// Would-hit classification (pure logic; the unit tests drive it directly).
+class ReuseTracker {
+public:
+    // A draw of `structure` in the current frame: whether the previous frame had its occurrence.
+    bool Note(std::uint64_t structure);
+    void EndFrame();
+
+private:
+    std::unordered_map<std::uint64_t, std::uint32_t> previous, current;
+    bool havePrevious = false;
+};
+
+bool ReuseCensusEnabled();
+// One recorded committer draw; `frame` is the flip count (a change ends the census frame).
+void NoteReuseDraw(std::uint64_t structure, bool recipe, const std::array<std::uint64_t, ReuseStages>& ns, std::uint64_t totalNs, std::uint64_t frame);
 
 }
 

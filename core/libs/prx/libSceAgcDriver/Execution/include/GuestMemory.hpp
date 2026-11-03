@@ -148,6 +148,8 @@ struct CommitterCollectCounters {
 };
 CommitterCollectCounters& CommitterCollects();
 void MarkCommitterThread();
+// Whether the calling thread is the queue-0 committer (MarkCommitterThread).
+bool IsCommitterThread();
 // APS5_ARCHB_PIPE_COLLECT_SHARE: queue 0 marks itself while it runs a pipelined submission, and
 // its completed CollectWrites walks are recorded per page with the collect clock read before the
 // walk (the global epoch counter, CollectShareClock()). A committed item belongs to the ordering
@@ -191,6 +193,21 @@ struct CommitterItemCollects {
     bool prepared = false;
 };
 CommitterItemCollects TakeCommitterItemCollects();
+// APS5_ARCHB_COMMITTER_COLLECT_CENSUS=1 (diagnostic, read once, default off): every collect the
+// queue-0 committer makes (memoized or not), by calling site, the kind of item it commits and the
+// phase (a draw's unlocked preparation or not): calls and time, memo hits by path, walks (pages,
+// time) and failures. Each range is compared with the ranges the committer already collected
+// (walked or answered) earlier in the same collect epoch and in the same item: exactly the same
+// range, a subset of their union, or a partial overlap (the pages already collected), for walks
+// (work a better memo or a narrower range would remove) and for memo hits (calls a per-item or
+// per-epoch dedupe before collecting would remove). Walks are also keyed by their driver callers
+// (module offsets, s3/symbolize.py). A "[collect-census]" block on stderr every 10 s (cumulative,
+// with the flip count). The committer calls BeginCommitterCensusItem before each item.
+bool CommitterCollectCensus();
+void BeginCommitterCensusItem(std::uint8_t kind);
+// Queue 0 at each flip (the census divides by flips).
+void NoteCensusFlip();
+std::uint64_t CensusFlips();
 // The latest collect epoch any thread began (a walk starting now follows every bump up to it).
 std::uint64_t CollectClock();
 std::uint64_t ProofSerial();

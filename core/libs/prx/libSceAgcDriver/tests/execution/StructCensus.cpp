@@ -85,6 +85,25 @@ void PassGainsADraw() {
     check(t.aligned == 21 && t.alignedSame[ComponentPush] == 20, "a gained draw: alignment " + std::to_string(t.aligned) + " push " + std::to_string(t.alignedSame[ComponentPush]));
 }
 
+// APS5_ARCHB_DRAW_REUSE_CENSUS (B0): a draw would hit when the previous frame drew its structure
+// at least occurrence+1 times; nothing hits in the first frame; an empty frame keeps the previous.
+void ReuseWouldHit() {
+    ReuseTracker tracker;
+    check(!tracker.Note(1) && !tracker.Note(1) && !tracker.Note(2), "first frame: no hits");
+    tracker.EndFrame();
+    check(tracker.Note(1), "second frame: first occurrence of 1 hits");
+    check(tracker.Note(1), "second frame: second occurrence of 1 hits");
+    check(!tracker.Note(1), "second frame: a third occurrence of 1 misses");
+    check(!tracker.Note(3), "second frame: a new structure misses");
+    check(tracker.Note(2), "second frame: 2 hits");
+    tracker.EndFrame();
+    tracker.EndFrame();  // an empty frame: the previous frame stays
+    check(tracker.Note(1) && tracker.Note(1) && tracker.Note(1), "third frame: 1 drawn three times before");
+    check(tracker.Note(3) && !tracker.Note(4), "third frame: 3 hits, 4 misses");
+    tracker.EndFrame();
+    check(!tracker.Note(2), "fourth frame: 2 was not in the third frame");
+}
+
 }
 
 int main() {
@@ -92,6 +111,7 @@ int main() {
         IdenticalFrames();
         DataChanges();
         PassGainsADraw();
+        ReuseWouldHit();
         std::puts("struct census tests passed");
         return 0;
     } catch (const std::exception& error) {

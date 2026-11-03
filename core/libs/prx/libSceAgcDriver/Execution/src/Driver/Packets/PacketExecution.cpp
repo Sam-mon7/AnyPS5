@@ -527,6 +527,7 @@ void Driver::execute(const Submission& submission) {
             if (!flipInterruptDeferred) deliverFlipEopInterrupt(submission.queue);
             ++flipsCounted;
             if (Graphics::StructCensus::Enabled()) Graphics::StructCensus::NoteFrame();
+            GuestMemory::NoteCensusFlip();
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
 
