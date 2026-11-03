@@ -1445,6 +1445,51 @@ struct WriteTracker {
         return false;
     }
 
+    // APS5_ARCHB_FIX_SNAPSHOT_PAGE_REFRESH: rangeUnchanged per 4 KiB page of [address, end), with each
+    // block's evidence looked up once. storedOver decomposes over the pages of a block (its whole-block
+    // terms report every page, its page and piece terms only the pages they overlap), so a page is left
+    // out exactly when rangeUnchanged(page) holds. Pages that may have changed are appended to `runs`.
+    void changedPages(std::uint64_t address, std::uint64_t end, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs) const {
+        const auto add = [&](std::uint64_t from, std::uint64_t to) {
+            if (!runs.empty() && runs.back().second == from) runs.back().second = to;
+            else runs.emplace_back(from, to);
+        };
+        for (auto block = blockOf(address); block <= blockOf(end - 1); ++block) {
+            const auto begin = blockBegin(block);
+            const auto from = std::max(address, begin);
+            const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes);
+            if (refusedSince(from, to, since)) {
+                add(from, to);
+                continue;
+            }
+            if (stampOf(block) <= since) continue;
+            const auto cpu = cpuPages.find(block);
+            const auto walk = walkPages.find(block);
+            const auto driver = driverPieces.find(block);
+            bool whole = cpu == cpuPages.end() && cpuStampOf(block) > since;
+            if (!whole && driver != driverPieces.end()) {
+                const auto& entry = driver->second;
+                whole = entry.whole > since || entry.dropped > since || entry.possibleWhole > since || entry.possibleDropped > since;
+            }
+            if (whole) {
+                add(from, to);
+                continue;
+            }
+            for (auto page = (from - begin) / WritePageBytes; page <= (to - 1 - begin) / WritePageBytes; ++page) {
+                const auto pageFrom = std::max<std::uint64_t>(from, begin + page * WritePageBytes);
+                const auto pageTo = std::min<std::uint64_t>(to, begin + (page + 1) * WritePageBytes);
+                bool stored = (cpu != cpuPages.end() && cpu->second.pages[page] > since) || (walk != walkPages.end() && walk->second.pages[page] > since);
+                if (!stored && driver != driverPieces.end()) {
+                    const auto lo = pageFrom - begin;
+                    const auto hi = pageTo - begin;
+                    for (const auto& piece : driver->second.pieces) stored = stored || (piece.generation > since && piece.begin < hi && lo < piece.end);
+                    for (const auto& piece : driver->second.possiblePieces) stored = stored || (piece.generation > since && piece.begin < hi && lo < piece.end);
+                }
+                if (stored) add(pageFrom, pageTo);
+            }
+        }
+    }
+
     bool rangeUnchanged(std::uint64_t address, std::size_t bytes, std::uint64_t since) const {
         if (refusedSince(address, address + bytes, since)) return false;
         return unchanged(blockOf(address), blockOf(address + bytes - 1), since) || !storedOver(address, address + bytes, since, true);
@@ -4198,6 +4243,17 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
             shadowQuery(tracker, from, static_cast<std::size_t>(to - from), generation, generation != 0, changed[k] == BlockUnchanged, site);
         }
     }
+    return true;
+}
+
+bool ChangedPages(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs) {
+    runs.clear();
+    if (bytes == 0 || generation == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || !tracker.covers(address, bytes)) return false;
+    tracker.changedPages(address, address + bytes, generation, runs);
     return true;
 }
 

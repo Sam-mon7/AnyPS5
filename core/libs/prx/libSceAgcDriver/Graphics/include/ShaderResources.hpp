@@ -259,6 +259,18 @@ public:
     static std::size_t MaxDrawSnapshotBytes();
     // APS5_ARCHB_PIPE_DRAW_REUSE: a "[draw-reuse]" summary of the slot counters.
     static std::string DrawReuseText();
+    // APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES counters (cumulative, process-wide; for tests): draws that used the
+    // per-template candidate list, draws that fell back (no list, or committed), elements the list skipped,
+    // elements verified against the per-draw checks and verify mismatches.
+    struct SnapshotCandidateStats {
+        std::uint64_t draws, fallbacks, skipped, verified, mismatches;
+    };
+    static SnapshotCandidateStats SnapshotCandidateTotals();
+    // "[snapshot-fixes] cumulative: ..." for FIX_SNAPSHOT_PAGE_REFRESH and FIX_SNAPSHOT_CANDIDATES (empty
+    // while neither ran).
+    static std::string SnapshotFixesText();
+    // Per allocation: whether it passed the build's static snapshot checks (for tests).
+    const std::vector<std::uint8_t>& SnapshotCandidates() const { return snapshotCandidates; }
     // APS5_DRAW_BINDINGS_DIAG (diagnostic, read once): a "[draw-bindings]" line splitting
     // PrepareDrawBindings by snapshot path (counts, bytes, ns; cumulative); empty when off.
     static std::string DrawBindingsDiagText();
@@ -617,6 +629,14 @@ private:
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
+    // APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES: per allocation, whether PrepareDrawBindings' per-draw checks that
+    // depend only on this object pass (a guest buffer, not written, overlapping none of this object's
+    // writes, read in place). Set at the end of buildComplete, after which allocations, writes and the
+    // in-place reads stay as they are until WriteBack commits the upload (InPlaceReadsSettled).
+    std::vector<std::uint8_t> snapshotCandidates;
+    bool snapshotCandidatesKnown = false;
+    bool staticSnapshotCheck(std::size_t index, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads) const;
+    void computeSnapshotCandidates();
     std::unique_ptr<BdaResources> bda;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
     bool usesBda = false;

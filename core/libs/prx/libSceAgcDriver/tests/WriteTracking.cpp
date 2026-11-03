@@ -203,6 +203,73 @@ void CheckStoredOverUsesPageEvidence() {
     Require(!StoredOver(base + Page, Page, before), "a page-local CPU write made an untouched page in the same block count as stored over");
 }
 
+// APS5_ARCHB_FIX_SNAPSHOT_PAGE_REFRESH: ChangedPages lists exactly the pages UnchangedSince cannot clear
+// on their own (CPU stores collected per page, partial and possible driver stores, a whole-block driver
+// store), merged into ascending runs clipped to the range.
+void CheckChangedPages() {
+    constexpr std::size_t Page = 4096;
+    constexpr std::size_t bytes = 4 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    struct Cleanup {
+        void* memory;
+        ~Cleanup() {
+#ifdef _WIN32
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+#else
+            GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
+            munmap(memory, bytes);
+#endif
+        }
+    } cleanup{memory};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the changed-pages fixture was not collected");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    Require(ChangedPages(base, bytes, before, runs) && runs.empty(), "an unwritten range reports changed pages");
+
+    auto* volatile_memory = static_cast<volatile std::uint8_t*>(memory);
+    volatile_memory[5] = 0x22;                          // block 0, page 0
+    volatile_memory[3 * Page + 9] = 0x22;               // block 0, page 3
+    volatile_memory[Block + 15 * Page + 1] = 0x22;      // block 1, last page
+    volatile_memory[2 * Block + 3] = 0x22;              // block 2, first page (a run across the block boundary)
+    CollectWritesUncached(base, bytes);
+    MarkWritten(base + 3 * Block + 2 * Page + 100, 64); // block 3, page 2 (a driver piece)
+    MarkPossiblyWritten(base + 3 * Block + 7 * Page, 16); // block 3, page 7 (a possible piece)
+
+    const auto check = [&](std::uint64_t address, std::size_t length, std::uint64_t since, const char* what) {
+        Require(ChangedPages(address, length, since, runs), what);
+        for (std::size_t k = 0; k < runs.size(); ++k) {
+            Require(runs[k].first < runs[k].second && runs[k].first >= address && runs[k].second <= address + length, "a changed-page run is empty or outside its range");
+            if (k != 0) Require(runs[k - 1].second < runs[k].first, "changed-page runs are not merged and ascending");
+        }
+        for (auto at = address; at < address + length;) {
+            const auto to = std::min<std::uint64_t>(address + length, (at / Page + 1) * Page);
+            const bool listed = std::any_of(runs.begin(), runs.end(), [&](const auto& run) { return run.first <= at && to <= run.second; });
+            Require(listed == !UnchangedSince(at, static_cast<std::size_t>(to - at), since), what);
+            at = to;
+        }
+    };
+    check(base, bytes, before, "a page listed by ChangedPages disagrees with UnchangedSince over the page");
+    check(base + 100, bytes - 300, before, "an unaligned range: a page listed by ChangedPages disagrees with UnchangedSince");
+    Require(ChangedPages(base, bytes, before, runs), "the written fixture was not answered");
+    const auto listed = [&](std::uint64_t at) { return std::any_of(runs.begin(), runs.end(), [&](const auto& run) { return run.first <= at && at < run.second; }); };
+    Require(listed(base) && listed(base + 3 * Page) && listed(base + Block + 15 * Page) && listed(base + 2 * Block) && listed(base + 3 * Block + 2 * Page) && listed(base + 3 * Block + 7 * Page), "a written page is missing from the changed pages");
+    Require(!listed(base + Page) && !listed(base + 4 * Page) && !listed(base + Block) && !listed(base + 2 * Block + Page) && !listed(base + 3 * Block + 3 * Page), "an untouched page of a stamped block is listed as changed");
+    Require(std::any_of(runs.begin(), runs.end(), [&](const auto& run) { return run.first == base + Block + 15 * Page && run.second == base + 2 * Block + Page; }), "adjacent changed pages across a block boundary are not one run");
+
+    const auto mid = TrackerGeneration();
+    MarkWritten(base + Block, Block);
+    Require(ChangedPages(base, bytes, mid, runs) && runs.size() == 1 && runs.front() == std::pair<std::uint64_t, std::uint64_t>{base + Block, base + 2 * Block}, "a whole-block driver store does not mark every page of its block alone");
+    check(base, bytes, mid, "after a whole-block store: a page listed by ChangedPages disagrees with UnchangedSince");
+
+    Require(!ChangedPages(base, bytes, 0, runs) && runs.empty(), "a generation of 0 was answered");
+    std::array<std::uint8_t, 64> unwatched{};
+    const auto outside = reinterpret_cast<std::uint64_t>(unwatched.data());
+    if (!Watched(outside, unwatched.size())) Require(!ChangedPages(outside, unwatched.size(), before, runs) && runs.empty(), "an unwatched range was answered");
+}
+
 void CheckStoredAllSince() {
     constexpr std::size_t bytes = 4 * Block;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
@@ -3183,6 +3250,11 @@ int main(int argc, char** argv) {
         // The draw-sampled switch, for the whole run on this thread (the suite with it on and off).
         const char* allocChurn = std::getenv("APS5_ARCHB_FIX_ALLOC_CHURN");
         const AgcDriver::ArchB::AllocChurnScope allocChurnScope(allocChurn != nullptr && std::string_view(allocChurn) == "1");
+        if (argc == 2 && std::string_view(argv[1]) == "--changed-pages") {
+            CheckChangedPages();
+            std::cout << "changed pages test passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--failed-collect-memo") {
             CheckFailedCollectMemo();
             return 0;

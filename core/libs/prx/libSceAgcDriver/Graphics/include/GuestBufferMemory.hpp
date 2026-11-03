@@ -339,6 +339,9 @@ public:
     struct AddressSpace;
     void WriteBack();
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const;
+    // Whether InPlaceReads answers from a finished upload that has not been committed (written back):
+    // its answer then stays the same until WriteBack (APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES).
+    bool InPlaceReadsSettled() const { return uploaded && !committed; }
     bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const;
     // Guest ranges the shader may write through descriptors, as [begin, end).
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Writes() const { return writes; }

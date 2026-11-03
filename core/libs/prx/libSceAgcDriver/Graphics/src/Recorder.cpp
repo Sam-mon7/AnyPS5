@@ -21,6 +21,8 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/DispatchArguments_spv.h"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3232,6 +3234,47 @@ std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, 
     return {};
 }
 
+namespace {
+// APS5_ARCHB_FIX_SNAPSHOT_PAGE_REFRESH: a large draw snapshot refreshed in place compares only the
+// 4 KiB pages GuestMemory::ChangedPages reports (the pages UnchangedSince cannot clear on their own),
+// not every byte of each 64 KiB block stamped since the snapshot's generation. A live record
+// (b1b2-count-1103-0754) saw ~8.5 refreshes/f compare ~1.8 MiB of stamped blocks each to copy ~29 KiB.
+// _VERIFY compares block by block as before (that result is used) and checks every page of a stamped
+// block the page path would have skipped against guest memory: a page that differs is a mismatch.
+struct PageRefreshCounters {
+    std::atomic<std::uint64_t> refreshes{0}, fallbacks{0}, comparedBytes{0}, blockBytes{0}, copiedBytes{0}, verifiedPages{0}, mismatches{0};
+};
+
+PageRefreshCounters& pageRefreshCounters() {
+    static auto* counters = [] {
+        auto* made = new PageRefreshCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_page_refresh_refreshes", made->refreshes);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_page_refresh_fallbacks", made->fallbacks);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_page_refresh_compared_bytes", made->comparedBytes);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_page_refresh_block_bytes", made->blockBytes);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_page_refresh_copied_bytes", made->copiedBytes);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_page_refresh_verified_pages", made->verifiedPages);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_page_refresh_mismatches", made->mismatches);
+        return made;
+    }();
+    return *counters;
+}
+
+bool pageRefreshVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_FIX_SNAPSHOT_PAGE_REFRESH_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+}
+
+Recorder::PageRefreshStats Recorder::PageRefreshTotals() {
+    auto& counters = pageRefreshCounters();
+    const auto get = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    return {get(counters.refreshes), get(counters.fallbacks), get(counters.comparedBytes), get(counters.blockBytes), get(counters.copiedBytes), get(counters.verifiedPages), get(counters.mismatches)};
+}
+
 bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {
     const auto held = entry.buffer->Bytes();
     if (held.size() != bytes || bytes == 0) return false;
@@ -3245,6 +3288,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         std::vector<std::pair<std::size_t, std::size_t>> differing;
         std::vector<CompareSpan> spans;
         std::vector<std::uint8_t> equal;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> pages;
     };
     auto& scratch = HostThreadLocal<Scratch, Scratch>();
     auto& generations = scratch.generations;
@@ -3252,18 +3296,64 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
     auto& differing = scratch.differing;
     auto& spans = scratch.spans;
     auto& equal = scratch.equal;
-    generations.assign(count, entry.generation);
-    changed.assign(count, GuestMemory::BlockWritten);
+    auto& pages = scratch.pages;
     differing.clear();
     spans.clear();
     const bool sole = entry.buffer.use_count() == 1;
-    GuestMemory::ChangedBlocks(address, bytes, generations, changed);
-    for (std::size_t k = 0; k < count; ++k) {
-        if (changed[k] == GuestMemory::BlockUnchanged) continue;
-        const auto from = std::max(address, aligned + k * block);
-        const auto to = std::min(end, aligned + (k + 1) * block);
-        const auto offset = static_cast<std::size_t>(from - address);
-        spans.push_back({held.data() + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
+    const bool pageMode = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixSnapshotPageRefresh);
+    const bool verifyPages = pageMode && pageRefreshVerify();
+    const bool pagesKnown = pageMode && GuestMemory::ChangedPages(address, bytes, entry.generation, pages);
+    if (pageMode) {
+        auto& counters = pageRefreshCounters();
+        (pagesKnown ? counters.refreshes : counters.fallbacks).fetch_add(1, std::memory_order_relaxed);
+    }
+    if (pagesKnown && !verifyPages) {
+        std::size_t compared = 0;
+        // One span per page: a span that differs is copied whole, so a merged run would copy far more
+        // than the block path (which copies whole 64 KiB blocks) when a single byte in it changed.
+        for (const auto& [from, to] : pages) {
+            for (auto at = from; at < to;) {
+                const auto next = std::min<std::uint64_t>(to, (at / 4096 + 1) * 4096);
+                spans.push_back({held.data() + static_cast<std::size_t>(at - address), reinterpret_cast<const void*>(at), static_cast<std::size_t>(next - at)});
+                at = next;
+            }
+            compared += static_cast<std::size_t>(to - from);
+        }
+        pageRefreshCounters().comparedBytes.fetch_add(compared, std::memory_order_relaxed);
+    } else {
+        generations.assign(count, entry.generation);
+        changed.assign(count, GuestMemory::BlockWritten);
+        GuestMemory::ChangedBlocks(address, bytes, generations, changed);
+        for (std::size_t k = 0; k < count; ++k) {
+            if (changed[k] == GuestMemory::BlockUnchanged) continue;
+            const auto from = std::max(address, aligned + k * block);
+            const auto to = std::min(end, aligned + (k + 1) * block);
+            const auto offset = static_cast<std::size_t>(from - address);
+            spans.push_back({held.data() + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
+        }
+        if (pagesKnown) {
+            // Verify: every page of a stamped block outside the page runs must still hold the snapshot's bytes.
+            auto& counters = pageRefreshCounters();
+            std::size_t blockBytes = 0, pageBytes = 0, run = 0;
+            for (const auto& [from, to] : pages) pageBytes += static_cast<std::size_t>(to - from);
+            for (const auto& span : spans) {
+                blockBytes += span.bytes;
+                const auto spanFrom = reinterpret_cast<std::uint64_t>(span.second);
+                const auto spanTo = spanFrom + span.bytes;
+                for (auto at = spanFrom; at < spanTo;) {
+                    const auto pageTo = std::min<std::uint64_t>(spanTo, (at / 4096 + 1) * 4096);
+                    while (run < pages.size() && pages[run].second <= at) ++run;
+                    const bool listed = run < pages.size() && pages[run].first <= at;
+                    if (!listed) {
+                        counters.verifiedPages.fetch_add(1, std::memory_order_relaxed);
+                        if (std::memcmp(held.data() + static_cast<std::size_t>(at - address), reinterpret_cast<const void*>(at), static_cast<std::size_t>(pageTo - at)) != 0) counters.mismatches.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    at = pageTo;
+                }
+            }
+            counters.blockBytes.fetch_add(blockBytes, std::memory_order_relaxed);
+            counters.comparedBytes.fetch_add(pageBytes, std::memory_order_relaxed);
+        }
     }
     equal.assign(spans.size(), 0);
     CompareSpans(spans, equal);
@@ -3281,10 +3371,11 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         else differing.emplace_back(offset, length);
     }
     for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
-    if (SnapshotDiagEnabled()) {
+    if (SnapshotDiagEnabled() || pageMode) {
         std::size_t copied = 0;
         for (const auto& [offset, length] : differing) copied += length;
-        SnapshotDiag().copiedBytes.fetch_add(copied, std::memory_order_relaxed);
+        if (SnapshotDiagEnabled()) SnapshotDiag().copiedBytes.fetch_add(copied, std::memory_order_relaxed);
+        if (pageMode) pageRefreshCounters().copiedBytes.fetch_add(copied, std::memory_order_relaxed);
     }
     return true;
 }

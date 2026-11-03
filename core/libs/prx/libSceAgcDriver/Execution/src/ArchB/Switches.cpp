@@ -93,6 +93,8 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::PipeDrawReuse, "PIPE_DRAW_REUSE", false, true, PipeDrawReusePrerequisites},
     {Feature::PipeDrawLookupMemo, "PIPE_DRAW_LOOKUP_MEMO", false, true, PipeDrawLookupMemoPrerequisites},
     {Feature::FixStableFailedWide, "FIX_STABLE_FAILED_WIDE", false, true, {}},
+    {Feature::FixSnapshotPageRefresh, "FIX_SNAPSHOT_PAGE_REFRESH", false, true, {}},
+    {Feature::FixSnapshotCandidates, "FIX_SNAPSHOT_CANDIDATES", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

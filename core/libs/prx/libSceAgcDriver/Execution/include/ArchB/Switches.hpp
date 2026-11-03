@@ -52,6 +52,8 @@ enum class Feature : std::uint8_t {
     PipeDrawReuse,
     PipeDrawLookupMemo,
     FixStableFailedWide,
+    FixSnapshotPageRefresh,
+    FixSnapshotCandidates,
     Count
 };
 

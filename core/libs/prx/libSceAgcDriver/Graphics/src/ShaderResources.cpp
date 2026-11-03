@@ -2773,6 +2773,7 @@ void ShaderResources::buildComplete() {
             dataPatches.push_back({static_cast<std::size_t>(allocation.dataAllocation), allocation.dataByte, allocation.adjustment});
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
+        computeSnapshotCandidates();
         noteReusable();
         completed = true;
         if (BuildProfiled()) {
@@ -6133,6 +6134,10 @@ struct BindingsDiag {
     std::atomic<std::uint64_t> unwrittenSmall{0}, unwrittenLarge{0}, unwrittenLargeBytes{0};
     std::atomic<std::uint64_t> uploads{0}, uploadBytes{0}, uploadNs{0};
     std::atomic<std::uint64_t> large{0}, largeBytes{0}, collectNs{0}, reusableNs{0}, reused{0}, created{0}, createdBytes{0}, createNs{0};
+    // Attribution of the selection's remaining time: InPlaceReads, the per-element checks (override
+    // lookup, guest/written/WritesOverlap/in-place/pending), moved word buffers, the unwritten fast path
+    // (stamp, lookup, note after the snapshot).
+    std::atomic<std::uint64_t> readsNs{0}, checkNs{0}, checkElements{0}, checkPassed{0}, movedNs{0}, unwrittenNs{0}, noteNs{0};
 };
 BindingsDiag& bindingsDiag() {
     static auto* diag = new BindingsDiag();
@@ -6161,6 +6166,69 @@ std::string ShaderResources::DrawReuseText() {
     return text;
 }
 
+namespace {
+// APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES (see ShaderResources::snapshotCandidates).
+struct SnapshotCandidateCounters {
+    std::atomic<std::uint64_t> draws{0}, fallbacks{0}, skipped{0}, verified{0}, mismatches{0};
+};
+
+SnapshotCandidateCounters& snapshotCandidateCounters() {
+    static auto* counters = [] {
+        auto* made = new SnapshotCandidateCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_candidates_draws", made->draws);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_candidates_fallbacks", made->fallbacks);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_candidates_skipped", made->skipped);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_candidates_verified", made->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_snapshot_candidates_mismatches", made->mismatches);
+        return made;
+    }();
+    return *counters;
+}
+
+bool snapshotCandidatesVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+}
+
+ShaderResources::SnapshotCandidateStats ShaderResources::SnapshotCandidateTotals() {
+    auto& counters = snapshotCandidateCounters();
+    const auto get = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    return {get(counters.draws), get(counters.fallbacks), get(counters.skipped), get(counters.verified), get(counters.mismatches)};
+}
+
+std::string ShaderResources::SnapshotFixesText() {
+    const auto pages = Recorder::PageRefreshTotals();
+    const auto candidates = SnapshotCandidateTotals();
+    if (pages.refreshes + pages.fallbacks + candidates.draws + candidates.fallbacks == 0) return {};
+    const auto u = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    char text[512];
+    std::snprintf(text, sizeof(text), "[snapshot-fixes] cumulative: page refresh %llu refreshes, %llu fallbacks, %.1f MiB compared (blocks %.1f MiB, verify only), %.1f MiB copied, %llu pages verified, page mismatches %llu; candidates %llu draws, %llu fallbacks, %llu elements skipped, %llu verified, candidate mismatches %llu",
+        u(pages.refreshes), u(pages.fallbacks), static_cast<double>(pages.comparedBytes) / 1048576.0, static_cast<double>(pages.blockBytes) / 1048576.0, static_cast<double>(pages.copiedBytes) / 1048576.0, u(pages.verifiedPages), u(pages.mismatches),
+        u(candidates.draws), u(candidates.fallbacks), u(candidates.skipped), u(candidates.verified), u(candidates.mismatches));
+    return text;
+}
+
+bool ShaderResources::staticSnapshotCheck(std::size_t index, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads) const {
+    const auto& item = allocations[index];
+    if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) return false;
+    return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+}
+
+void ShaderResources::computeSnapshotCandidates() {
+    snapshotCandidates.clear();
+    snapshotCandidatesKnown = false;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda || !guestMemory.InPlaceReadsSettled()) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    guestMemory.InPlaceReads(reads);
+    snapshotCandidates.resize(allocations.size());
+    for (std::size_t index = 0; index < allocations.size(); ++index) snapshotCandidates[index] = staticSnapshotCheck(index, reads) ? 1 : 0;
+    snapshotCandidatesKnown = true;
+}
+
 std::string ShaderResources::DrawBindingsDiagText() {
     if (!Recorder::SnapshotDiagEnabled()) return {};
     auto& d = bindingsDiag();
@@ -6171,7 +6239,11 @@ std::string ShaderResources::DrawBindingsDiagText() {
         get(d.calls), get(d.empty), get(d.elements), get(d.totalNs), get(d.selectNs), get(d.movedWords), get(d.slotted), get(d.slottedBytes), get(d.unwrittenSmall), get(d.unwrittenLarge), get(d.unwrittenLargeBytes),
         get(d.uploads), get(d.uploadBytes), get(d.uploadNs), get(d.large), get(d.largeBytes), get(d.collectNs), get(d.reusableNs), get(d.reused), get(d.created), get(d.createdBytes), get(d.createNs),
         get(r.exact), get(r.refreshed), get(r.refreshFailed), get(r.containing), get(r.missing), get(r.comparedBytes), get(r.copiedBytes), get(r.compareNs));
-    return text;
+    std::string line = text;
+    char more[256];
+    std::snprintf(more, sizeof(more), " | reads_ns %llu check_ns %llu check_elements %llu check_passed %llu moved_ns %llu unwritten_ns %llu note_ns %llu",
+        get(d.readsNs), get(d.checkNs), get(d.checkElements), get(d.checkPassed), get(d.movedNs), get(d.unwrittenNs), get(d.noteNs));
+    return line + more;
 }
 
 std::string ShaderResources::DrawSetPoolText() {
@@ -6336,7 +6408,25 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     } diagTotal{diag, diagStart};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
-    guestMemory.InPlaceReads(reads);
+    // APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES: the checks that depend only on this object come from the list
+    // made at build; _VERIFY makes them as well (their answer is used) and counts a differing element.
+    const bool candidates = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixSnapshotCandidates);
+    const bool useCandidates = candidates && snapshotCandidatesKnown && snapshotCandidates.size() == allocations.size() && guestMemory.InPlaceReadsSettled();
+    const bool verifyCandidates = useCandidates && snapshotCandidatesVerify();
+    if (candidates) (useCandidates ? snapshotCandidateCounters().draws : snapshotCandidateCounters().fallbacks).fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t candidateSkips = 0;
+    struct CandidateSkips {
+        const std::uint64_t& count;
+        ~CandidateSkips() {
+            if (count != 0) snapshotCandidateCounters().skipped.fetch_add(count, std::memory_order_relaxed);
+        }
+    } candidateSkipsReport{candidateSkips};
+    {
+        const auto readsStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (!useCandidates || verifyCandidates) guestMemory.InPlaceReads(reads);
+        else reads.clear();
+        if (diag) bindingsDiag().readsNs.fetch_add(diagNs(readsStart), std::memory_order_relaxed);
+    }
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
@@ -6370,8 +6460,16 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     slotSnapshots.clear();
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
+        const auto checkStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
+            struct MovedTime {
+                bool on;
+                std::chrono::steady_clock::time_point start;
+                ~MovedTime() {
+                    if (on) bindingsDiag().movedNs.fetch_add(diagNs(start), std::memory_order_relaxed);
+                }
+            } movedTime{diag, checkStart};
             constexpr std::size_t MovedWordBufferSlots = 8;
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && std::ranges::equal(entry.words, override->words); });
             std::shared_ptr<Buffer> buffer;
@@ -6395,13 +6493,45 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         std::uint64_t address = item.address;
         std::size_t size = item.size;
+        struct CheckTime {
+            bool on;
+            std::chrono::steady_clock::time_point start;
+            bool passed = false;
+            ~CheckTime() {
+                if (!on) return;
+                auto& d = bindingsDiag();
+                d.checkElements.fetch_add(1, std::memory_order_relaxed);
+                if (passed) d.checkPassed.fetch_add(1, std::memory_order_relaxed);
+                d.checkNs.fetch_add(diagNs(start), std::memory_order_relaxed);
+            }
+        };
+        std::optional<CheckTime> checkTime;
+        if (diag) checkTime.emplace(true, checkStart);
         if (override != moved.end()) {
             address = override->address;
             size = override->size;
+        } else if (useCandidates) {
+            bool pass = snapshotCandidates[index] != 0;
+            if (verifyCandidates) {
+                const bool checked = staticSnapshotCheck(index, reads);
+                auto& counters = snapshotCandidateCounters();
+                counters.verified.fetch_add(1, std::memory_order_relaxed);
+                if (checked != pass) counters.mismatches.fetch_add(1, std::memory_order_relaxed);
+                pass = checked;
+            }
+            if (movedOnly || !pass) {
+                ++candidateSkips;
+                continue;
+            }
+            if (recorder.PendingWriteOverlaps(item.address, item.size)) continue;
         } else {
             if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+        }
+        if (checkTime) {
+            checkTime->passed = true;
+            checkTime.reset();
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
@@ -6420,6 +6550,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             }
             continue;
         }
+        const auto unwrittenStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         if (!stamped) {
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
@@ -6427,6 +6558,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         VkDeviceSize offset = 0;
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
+        if (diag) bindingsDiag().unwrittenNs.fetch_add(diagNs(unwrittenStart), std::memory_order_relaxed);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
         if (verifySnapshots && buffer != nullptr) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
@@ -6476,8 +6608,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     }
                 }
             }
+            const auto noteStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
             else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer, offset);
+            if (diag) bindingsDiag().noteNs.fetch_add(diagNs(noteStart), std::memory_order_relaxed);
         } else if (diag) {
             auto& d = bindingsDiag();
             if (bytes <= uploadLimit) {

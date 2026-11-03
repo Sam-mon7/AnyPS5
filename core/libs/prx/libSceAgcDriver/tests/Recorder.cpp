@@ -3552,6 +3552,88 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
     Require(texel(*past, 3) == 0x77777777u, "the level past the last mip was not read from its addrlib tail slot");
 }
 
+// APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES (mode from the environment: off, on, verify): the build marks a guest
+// buffer read in place as a snapshot candidate and a written one not; a draw then selects the same snapshot
+// as the per-draw checks, still refuses an element under a pending write, and counts the skipped element.
+void snapshotCandidateTests(const Device& device) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: snapshot candidates not tested\n";
+        return;
+    }
+    const auto value = [](const char* name) {
+        const char* text = std::getenv(name);
+        return text != nullptr && std::string_view(text) == "1";
+    };
+    const bool on = value("APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES");
+    const bool verify = on && value("APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES_VERIFY");
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the test block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: snapshot candidates not tested\n";
+        return;
+    }
+    const auto readOnly = address + 4096;
+    const auto written = address + 16384;
+    constexpr std::size_t elementBytes = 1024;
+    const auto words = [](std::uint64_t at) { return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u) & 0xffffu, elementBytes, 0x31000000u}; };
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 2;
+    for (const auto at : {readOnly, written}) for (const auto word : words(at)) binding.guestDescriptor.push_back(word);
+    { auto flags = binding.Flags(); flags.bufferWritten = {false, true}; binding.SetFlags(std::move(flags)); }
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    {
+        auto snapshotContext = context;
+        DescriptorCache cache(snapshotContext);
+        snapshotContext.descriptorCache = &cache;
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, compute);
+        const auto& candidates = resources.SnapshotCandidates();
+        Require(std::count(candidates.begin(), candidates.end(), std::uint8_t{1}) == 1, "the build did not mark exactly the read-only guest buffer as a snapshot candidate");
+        const auto before = ShaderResources::SnapshotCandidateTotals();
+        auto first = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(first != nullptr && first->snapshots.size() == 1 && first->snapshots[0].address == readOnly && first->snapshots[0].bytes == elementBytes, "the draw did not snapshot exactly the read-only element");
+        Require(std::memcmp(first->snapshots[0].Bytes().data(), reinterpret_cast<const void*>(readOnly), elementBytes) == 0, "the snapshot does not hold the guest bytes");
+        const auto after = ShaderResources::SnapshotCandidateTotals();
+        if (!on) {
+            Require(after.draws == before.draws && after.fallbacks == before.fallbacks && after.skipped == before.skipped, "the candidate list was used with its switch off");
+        } else {
+            Require(after.draws == before.draws + 1 && after.fallbacks == before.fallbacks, "the draw did not use the candidate list");
+            Require(after.skipped - before.skipped == 1, "the written element was not skipped by the candidate list");
+            Require(after.mismatches == before.mismatches, "the candidate list disagrees with the per-draw checks");
+            if (verify) Require(after.verified - before.verified == 2, "verify did not check both elements");
+        }
+        snapshotRecorder.NotePendingWrite(readOnly, elementBytes);
+        Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "a candidate under a pending write was snapshotted");
+        first.reset();
+        snapshotRecorder.Sync();
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    std::cout << "snapshot candidates passed (" << (verify ? "verify" : on ? "on" : "off") << ")\n";
+}
+
 void resourceReadTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -4897,6 +4979,77 @@ void drawSnapshotEvictionTests(const Device& device) {
     std::memset(block, 0x5a, 16);
     CollectWrites(address, 16);
     Require(cache.ReusableDrawSnapshot(address, 16) == nullptr && cache.ReusableDrawSnapshot(address, 16) == nullptr, "a snapshot outlived a CPU store");
+}
+
+// APS5_ARCHB_FIX_SNAPSHOT_PAGE_REFRESH (mode from the environment: off, on, verify): a large snapshot
+// refreshed in place holds the guest bytes afterwards; on, only the written pages are compared; verify
+// compares the stamped blocks and finds no skipped page that differs; a snapshot still held elsewhere is
+// never refreshed in place.
+void drawSnapshotPageRefreshTests(const Device& device) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t Page = 4096;
+    constexpr std::size_t Block = 65536;
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = WriteWatched() ? AllocateWatched(bytes, Block) : nullptr;
+    if (memory == nullptr) {
+        std::cout << "write watching unavailable: draw snapshot page refresh not tested\n";
+        return;
+    }
+    struct Release {
+        void* memory;
+        ~Release() { ReleaseWatched(memory, bytes); }
+    } release{memory};
+    const auto value = [](const char* name) {
+        const char* text = std::getenv(name);
+        return text != nullptr && std::string_view(text) == "1";
+    };
+    const bool on = value("APS5_ARCHB_FIX_SNAPSHOT_PAGE_REFRESH");
+    const bool verify = on && value("APS5_ARCHB_FIX_SNAPSHOT_PAGE_REFRESH_VERIFY");
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    auto* guest = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, bytes);
+    Recorder cache(device.GetContext());
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto generation = CollectWritesUncached(address, bytes);
+    Require(generation != 0, "the page refresh fixture has no generation");
+    // The cache must be the snapshot's only owner for an in-place refresh: the test keeps a raw pointer.
+    auto made = std::make_shared<Buffer>(device.GetContext(), bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    std::memcpy(made->Bytes().data(), memory, bytes);
+    Buffer* const buffer = made.get();
+    cache.KeepDrawSnapshot(address, bytes, generation, registry, std::move(made));
+    const auto before = Recorder::PageRefreshTotals();
+    guest[5] = 0x22;                       // block 0, page 0: changed
+    guest[2 * Block + 7 * Page + 1] = 0x33; // block 2, page 7: changed
+    guest[Block + Page] = 0x11;             // block 1, page 1: written with its own value
+    generation = CollectWritesUncached(address, bytes);
+    VkDeviceSize offset = 1;
+    Require(cache.ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset).get() == buffer && offset == 0, "a written large snapshot was not refreshed in place");
+    Require(std::memcmp(buffer->Bytes().data(), memory, bytes) == 0, "the refreshed snapshot does not hold the guest bytes");
+    const auto after = Recorder::PageRefreshTotals();
+    if (!on) {
+        Require(after.refreshes == before.refreshes && after.comparedBytes == before.comparedBytes && after.fallbacks == before.fallbacks, "the page refresh ran with its switch off");
+    } else {
+        Require(after.refreshes == before.refreshes + 1 && after.fallbacks == before.fallbacks, "the refresh did not take the page path");
+        Require(after.comparedBytes - before.comparedBytes == 3 * Page, "the page refresh compared other than the three written pages");
+        Require(after.mismatches == before.mismatches, "the page refresh verify found a skipped page that differs");
+        if (verify) {
+            Require(after.blockBytes - before.blockBytes == 3 * Block && after.verifiedPages - before.verifiedPages == 3 * (Block / Page) - 3, "verify did not check the skipped pages of the stamped blocks");
+            Require(after.copiedBytes - before.copiedBytes == 2 * Block, "verify did not keep the block path's copies");
+        } else {
+            Require(after.copiedBytes - before.copiedBytes == 2 * Page, "the page refresh copied other than the two changed pages");
+        }
+    }
+    // Unchanged since the refresh: an exact hit, nothing compared.
+    Require(cache.ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::Storage, nullptr, CollectWritesUncached(address, bytes), &offset).get() == buffer, "a refreshed snapshot was not reusable unchanged");
+    Require(Recorder::PageRefreshTotals().refreshes == after.refreshes, "an unchanged snapshot was refreshed");
+    // Held by a batch (another owner) and changed: never refreshed in place.
+    const auto heldElsewhere = cache.ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::Storage, nullptr, CollectWritesUncached(address, bytes), &offset);
+    Require(heldElsewhere.get() == buffer, "the unchanged snapshot was not found again");
+    guest[3 * Block + 9] = 0x44;
+    generation = CollectWritesUncached(address, bytes);
+    Require(cache.ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset) == nullptr, "a changed snapshot still held elsewhere was refreshed in place");
+    Require(heldElsewhere->Bytes()[3 * Block + 9] == std::byte{0x11}, "a snapshot held elsewhere was written");
+    std::cout << "draw snapshot page refresh passed (" << (verify ? "verify" : on ? "on" : "off") << ")\n";
 }
 
 void containingSnapshotTests(const Device& device) {
@@ -12544,6 +12697,14 @@ int main(int argc, char** argv) {
             unwrittenSnapshotTests(device);
             drawSnapshotUploadTests(device, recorder);
             std::cout << "Draw snapshot cap tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--snapshot-candidates-only") {
+            snapshotCandidateTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-page-refresh-only") {
+            drawSnapshotPageRefreshTests(device);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {

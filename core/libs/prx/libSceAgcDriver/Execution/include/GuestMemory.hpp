@@ -267,6 +267,14 @@ bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint
 constexpr std::uint8_t BlockUnchanged = 0;
 constexpr std::uint8_t BlockWritten = 1;
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {}, std::source_location site = std::source_location::current());
+// APS5_ARCHB_FIX_SNAPSHOT_PAGE_REFRESH: the parts of [address, address + bytes) that may have changed
+// since `generation`, per 4 KiB page: a page is left out exactly when UnchangedSince over that page
+// alone (clipped to the range) would answer true under the tracker mutex (no refusal in its block,
+// and its block not stamped after the generation or no CPU, walk or driver store recorded over the
+// page after it). Appended to `runs` as merged, ascending [begin, end) runs. One tracker lock. False
+// (runs empty) when the range is not tracked or the generation is 0: the caller then treats the whole
+// range as changed.
+bool ChangedPages(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs);
 
 // Serializes device work: draws, dispatches, presentation and the deferred write-backs below. The
 // mutex is recursive; it is wrapped so every acquisition (std::lock_guard at any site) measures how
