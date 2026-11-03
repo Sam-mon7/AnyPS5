@@ -56,6 +56,7 @@ enum class Feature : std::uint8_t {
     FixSnapshotCandidates,
     FixMovedWordUpload,
     FixUnstampedAlias,
+    FixPipelineKeyWriter,
     Count
 };
 

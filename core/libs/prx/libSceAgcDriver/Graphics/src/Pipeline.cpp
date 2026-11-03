@@ -1115,13 +1115,54 @@ void append(std::vector<std::byte>& key, const TValue& value) {
     key.insert(key.end(), bytes.begin(), bytes.end());
 }
 
+struct KeyWriter {
+    std::vector<std::byte>& out;
+    std::size_t length = 0;
+    void clear() { length = 0; }
+    void put(const void* data, std::size_t bytes) {
+        if (out.size() < length + bytes) out.resize(std::max(out.size() * 2, length + bytes + 256));
+        std::memcpy(out.data() + length, data, bytes);
+        length += bytes;
+    }
+};
+
+template<typename TValue>
+void append(KeyWriter& key, const TValue& value) {
+    static_assert(std::is_trivially_copyable_v<TValue>);
+    key.put(&value, sizeof(TValue));
+}
+
+struct KeyWriterCounters {
+    std::atomic<std::uint64_t> keys{0}, verified{0}, mismatches{0};
+};
+
+KeyWriterCounters& keyWriterCounters() {
+    static auto* counters = [] {
+        auto* made = new KeyWriterCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_pipeline_key_writer_keys", made->keys);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_pipeline_key_writer_verified", made->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_pipeline_key_writer_mismatches", made->mismatches);
+        return made;
+    }();
+    return *counters;
+}
+
+bool keyWriterVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_FIX_PIPELINE_KEY_WRITER_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 // Everything the Pipeline objects are built from, or empty when a stage's result has no module
 // (nothing else may share its pipeline). The stage identities and the state fields are the same on
 // every run (CanonicalPipelineState keeps exactly the fields read here), which lets the journal's
 // replay insert an entry a later draw finds; a generated stage (rect-list pair, geometry) is keyed
 // by its identity like the others, so a replayed pipeline built from another device's generated
 // module is missed rather than used.
-void pipelineKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+template<typename TKey>
+void pipelineKeyInto(TKey& key, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     key.clear();
     append(key, context.device);
     append(key, attachmentLayout);
@@ -1239,6 +1280,27 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
     append(key, context.sampleLocationGridSampleCounts);
     append(key, context.storageImageMultisample);
     append(key, context.shaderStencilExport);
+}
+
+void pipelineKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixPipelineKeyWriter)) {
+        pipelineKeyInto(key, context, state, input, resources, shaders, attachmentLayout);
+        return;
+    }
+    if (key.size() < key.capacity()) key.resize(key.capacity());
+    KeyWriter writer{key};
+    pipelineKeyInto(writer, context, state, input, resources, shaders, attachmentLayout);
+    key.resize(writer.length);
+    auto& counters = keyWriterCounters();
+    counters.keys.fetch_add(1, std::memory_order_relaxed);
+    if (!keyWriterVerify()) return;
+    struct PlainKeyStorage {};
+    auto& plain = HostThreadLocal<std::vector<std::byte>, PlainKeyStorage>();
+    pipelineKeyInto(plain, context, state, input, resources, shaders, attachmentLayout);
+    counters.verified.fetch_add(1, std::memory_order_relaxed);
+    if (plain == key) return;
+    counters.mismatches.fetch_add(1, std::memory_order_relaxed);
+    key = plain;
 }
 
 std::uint64_t hashKey(const std::vector<std::byte>& key) {
@@ -1547,6 +1609,11 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     if (PipelineJournalEnabled() && !PipelineJournalReplaying()) RecordGraphicsPipeline(MakeGraphicsPipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout), shaders);
     if (memo) pipelineMemo::remember(context, key, pipeline);
     return pipeline;
+}
+
+PipelineKeyWriterTotals PipelineKeyWriterCounts() {
+    auto& counters = keyWriterCounters();
+    return {counters.keys.load(std::memory_order_relaxed), counters.verified.load(std::memory_order_relaxed), counters.mismatches.load(std::memory_order_relaxed)};
 }
 
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {

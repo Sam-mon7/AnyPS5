@@ -167,6 +167,12 @@ struct PipelineStoreCounters {
     std::uint64_t bound = 0;
 };
 PipelineStoreCounters PipelineStoreTotals();
+struct PipelineKeyWriterTotals {
+    std::uint64_t keys = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t mismatches = 0;
+};
+PipelineKeyWriterTotals PipelineKeyWriterCounts();
 // Whether the store may still raise its bound (not fixed by APS5_PIPELINE_STORE_ENTRIES, below 4096).
 bool PipelineStoreCanGrow();
 // The pipeline store's key of a configuration (empty when the configuration gets a private pipeline).

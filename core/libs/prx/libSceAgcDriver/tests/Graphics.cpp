@@ -6456,6 +6456,143 @@ void movedWordUploadTests() {
 // would: the found object while the cache still holds that insertion; after a replacement, removal, clear or
 // eviction it asks the cache again; it touches the cache's LRU every TouchEvery-th use. With
 // APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO_VERIFY=1 every hit is checked against Find.
+void pipelineKeyWriterTests() {
+    using namespace AgcDriver::Graphics;
+    using Stage = ShaderRecompiler::ShaderStage;
+    const auto module = [](std::uint32_t salt) {
+        ShaderRecompiler::RecompileResult result;
+        result.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010000u, 0u, 8u, 0u, 0x00020011u, 1u, 0x00020011u, 2u + salt};
+        result.runtimeAbiVersion = ShaderRecompiler::RuntimeAbi::Version;
+        return result;
+    };
+    const auto value = [](const char* name) {
+        const char* text = std::getenv(name);
+        return text != nullptr && std::string_view(text) == "1";
+    };
+    const bool on = value("APS5_ARCHB_FIX_PIPELINE_KEY_WRITER");
+    const bool verifying = on && value("APS5_ARCHB_FIX_PIPELINE_KEY_WRITER_VERIFY");
+    Require(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixPipelineKeyWriter) == on, "the pipeline key writer switch does not follow the environment");
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.device = makeHandle<VkDevice>();
+    context.tessellationShader = true;
+    context.limits.maxTessellationPatchSize = 32;
+    context.limits.maxColorAttachments = 8;
+    context.limits.maxPushConstantsSize = 256;
+    context.limits.maxVertexInputBindings = 16;
+    context.limits.maxVertexInputAttributes = 16;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        auto vertex = module(1);
+        vertex.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 1, std::vector<std::uint32_t>(4)));
+        auto fragment = module(2);
+        fragment.pushConstants.resize(8);
+        fragment.bindings.push_back(makeBinding(Role::ShaderData, 0, 1, std::vector<std::uint32_t>(4)));
+        fragment.bindings.back().descriptorSet = ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet;
+        const std::array<CompiledShader, 2> shaders{{{Stage::Vertex, &vertex, 0}, {Stage::Fragment, &fragment, PipelinePushSlotBytes}}};
+        ShaderRecompiler::RecompileResult empty;
+        const std::array<CompiledShader, 2> unkeyed{{{Stage::Vertex, &vertex, 0}, {Stage::Fragment, &empty, PipelinePushSlotBytes}}};
+        const auto layouts = DescribeSetLayouts(context, shaders);
+        State base{};
+        base.stages = {ShaderPath::Vertex, 7u, 64u, 32u, std::nullopt, std::nullopt};
+        ColorTarget color{};
+        color.address = 0x1000;
+        color.extent = {64, 32};
+        color.format = VK_FORMAT_R8G8B8A8_UNORM;
+        color.samples = 1;
+        base.color = color;
+        base.colors = {color};
+        VkPipelineColorBlendAttachmentState blend{};
+        blend.colorWriteMask = 0xf;
+        base.blends = {blend};
+        base.renderExtent = {64, 32};
+        base.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        base.samples = 1;
+        std::vector<State> states{base};
+        auto twoTargets = base;
+        twoTargets.colors = {color, color};
+        twoTargets.colors[1].format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        twoTargets.colors[1].exportIndex = 1;
+        states.push_back(twoTargets);
+        auto blended = twoTargets;
+        blend.blendEnable = VK_TRUE;
+        blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        blended.blends = {blend, blend};
+        blended.blendConstants = {0.25f, 0.5f, 0.75f, 1.0f};
+        states.push_back(blended);
+        auto depth = base;
+        DepthTarget target{};
+        target.format = VK_FORMAT_D32_SFLOAT;
+        target.samples = 1;
+        depth.depth = target;
+        depth.depthTest = true;
+        depth.depthWrite = true;
+        depth.depthCompare = VK_COMPARE_OP_LESS_OR_EQUAL;
+        depth.stencilTest = true;
+        depth.stencilFront = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xff, 0xff, 1};
+        depth.stencilBack = depth.stencilFront;
+        states.push_back(depth);
+        auto replay = depth;
+        replay.stencilReplayReference = 3u;
+        replay.stencilFront.writeMask = 0x0f;
+        states.push_back(replay);
+        auto grid = base;
+        grid.samples = 2;
+        grid.customSampleLocations = true;
+        grid.sampleLocationGrid = true;
+        grid.sampleLocations[31] = 0x5a;
+        states.push_back(grid);
+        auto tessellated = base;
+        tessellated.stages.tessellation = ShaderRecompiler::TessellationConfiguration{3, 3, 2, 1, 4, 128, 16, true};
+        states.push_back(tessellated);
+        auto mesh = base;
+        mesh.stages.mesh = ShaderRecompiler::MeshConfiguration{1, 2, 2, 4, 4, 32, 64, 1, 4, 2};
+        states.push_back(mesh);
+        auto targetless = base;
+        targetless.colors.clear();
+        targetless.blends.clear();
+        targetless.hasColorTarget = false;
+        states.push_back(targetless);
+        const VertexInputLayout input{{{0, 16, VK_VERTEX_INPUT_RATE_VERTEX}}, {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}}};
+        const VertexInputLayout wideInput{{{0, 32, VK_VERTEX_INPUT_RATE_VERTEX}, {1, 8, VK_VERTEX_INPUT_RATE_INSTANCE}}, {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16}, {2, 1, VK_FORMAT_R32G32_SFLOAT, 0}}};
+        const std::array<const VertexInputLayout*, 2> inputs{&input, &wideInput};
+        const auto before = PipelineKeyWriterCounts();
+        std::uint64_t builds = 0;
+        std::vector<std::vector<std::byte>> fresh;
+        for (const auto* layout : inputs) {
+            for (const auto& state : states) {
+                std::vector<std::byte> key;
+                BuildPipelineStoreKey(key, context, state, *layout, layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL);
+                ++builds;
+                Require(!key.empty(), "a keyed configuration has an empty pipeline key");
+                fresh.push_back(std::move(key));
+            }
+        }
+        for (std::size_t i = 0; i < fresh.size(); ++i) {
+            for (std::size_t j = i + 1; j < fresh.size(); ++j) Require(fresh[i] != fresh[j], "two different configurations have the same pipeline key");
+        }
+        std::vector<std::byte> reused;
+        for (int round = 0; round < 3; ++round) {
+            for (std::size_t layout = inputs.size(); layout-- > 0;) {
+                for (std::size_t index = states.size(); index-- > 0;) {
+                    BuildPipelineStoreKey(reused, context, states[index], *inputs[layout], layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL);
+                    ++builds;
+                    Require(reused == fresh[layout * states.size() + index], "a reused key vector holds other bytes than a fresh build");
+                }
+            }
+            BuildPipelineStoreKey(reused, context, base, input, layouts.View(), unkeyed, VK_IMAGE_LAYOUT_GENERAL);
+            ++builds;
+            Require(reused.empty(), "a stage without a module did not empty the pipeline key");
+        }
+        const auto after = PipelineKeyWriterCounts();
+        Require(after.keys - before.keys == (on ? builds : 0), "the key writer did not build every key exactly when on");
+        Require(after.verified - before.verified == (verifying ? builds : 0), "verify mode did not check every key");
+        Require(after.mismatches == before.mismatches, "the key writer built other bytes than the plain key");
+    }
+    Require(mock.live == 0, "pipeline key writer tests leaked Vulkan objects");
+}
+
 void lookupMemoTests() {
     using AgcDriver::Graphics::DescriptorCache;
     using AgcDriver::Graphics::ResourceCache;
@@ -12581,6 +12718,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-set-pool") {
             drawSetPoolTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-key-writer") {
+            pipelineKeyWriterTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--lookup-memo") {
