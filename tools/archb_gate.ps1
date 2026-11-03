@@ -655,7 +655,14 @@ function Invoke-ArchBGate {
     try {
         try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
         if (-not $owned) { Stop-GateFailure 30 'Another gate owns the runtime' }
-        $busy = @(Get-Process | Where-Object { $_.ProcessName -in @('demons-souls', 'ninja', 'cmake', 'ctest', 'agc_frame_replay') })
+        $busy = @(Get-Process | Where-Object { $_.ProcessName -in @('demons-souls', 'ninja', 'cmake', 'ctest') })
+        # Idle leftover replays (no CPU over 2 s) are not counted: they are not ours to kill and do not load the machine.
+        $replays = @(Get-Process -Name agc_frame_replay -ErrorAction SilentlyContinue)
+        if ($replays.Count) {
+            $replayCpu = ($replays | Measure-Object CPU -Sum).Sum
+            Start-Sleep -Seconds 2
+            if ((@(Get-Process -Name agc_frame_replay -ErrorAction SilentlyContinue) | Measure-Object CPU -Sum).Sum - $replayCpu -gt 0.2) { $busy += $replays }
+        }
         if ($busy.Count) { Stop-GateFailure 30 "Busy processes: $($busy.ProcessName -join ', ')" }
         $null = Invoke-GatePython 'archb_gate_config.py' @('repair', $Runtime)
         if ($Experiments -and ($Mode -ne 'Child' -or $Matrix -or $Bisect -or -not $script:AllowAlternating -or $BlockSeconds -ne 15 -or $SettleSeconds -ne 3)) { Stop-GateFailure 21 'Experiments require alternating Child mode, 15s blocks and 3s settling' }
