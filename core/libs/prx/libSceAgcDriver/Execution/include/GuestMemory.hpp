@@ -252,6 +252,27 @@ std::uint64_t TrackerGeneration();
 // forward to `generation`, never back, so a test can cross 2^32 without 2^32 collects.
 void AdvanceTrackerGenerationForTest(std::uint64_t generation);
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
+// NewestStamp split in its two parts: the newest block stamp of the range, and the newest of its
+// unstamped-store slots (driver stores outside write watching, hashed by block modulo 4 GiB) with the
+// block holding that slot and the last store that set it. For diagnostics (one tracker lock).
+struct StampSplit {
+    std::uint64_t block = 0;
+    std::uint64_t unstamped = 0;
+    std::uint64_t slotAddress = 0;
+    std::uint64_t storeBegin = 0;
+    std::uint64_t storeEnd = 0;
+};
+StampSplit SplitNewestStamp(std::uint64_t address, std::size_t bytes);
+// APS5_ARCHB_FIX_UNSTAMPED_ALIAS (see lockedUnchangedCommittedSince in GuestMemory.cpp), cumulative and
+// process-wide: committed-range answers only an aliased unstamped slot made "changed" (switch on or
+// off), those served with the switch on, and newer slots whose last store overlapped the range in an
+// unstamped block (left "changed"; must stay 0).
+struct UnstampedAliasCounters {
+    std::atomic<std::uint64_t> aliased{0};
+    std::atomic<std::uint64_t> served{0};
+    std::atomic<std::uint64_t> mismatches{0};
+};
+UnstampedAliasCounters& UnstampedAlias();
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes, std::source_location site = std::source_location::current());
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
 // range's pages first (a game store not collected yet becomes a block stamp), then the compare over

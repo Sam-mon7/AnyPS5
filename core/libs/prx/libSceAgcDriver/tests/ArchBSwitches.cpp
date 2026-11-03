@@ -99,6 +99,8 @@ void toggleCase(const std::string& name) {
     if (candidates) setEnvironment("APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES", nullptr);
     const bool movedUpload = name == "FixMovedWordUpload";
     if (movedUpload) setEnvironment("APS5_ARCHB_FIX_MOVED_WORD_UPLOAD", nullptr);
+    const bool unstampedAlias = name == "FixUnstampedAlias";
+    if (unstampedAlias) setEnvironment("APS5_ARCHB_FIX_UNSTAMPED_ALIAS", nullptr);
     // A2 cuts that require PIPE_Q0_COMMITTER: the same contract.
     struct PipeCut {
         Feature feature;
@@ -135,9 +137,9 @@ void toggleCase(const std::string& name) {
             Switches::PollControl();
         }
     };
-    if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping || pipeQ0 || dispatchRelocation || stableFailed || stableWide || pageRefresh || candidates || movedUpload) {
-        const auto feature = movedUpload ? Feature::FixMovedWordUpload : candidates ? Feature::FixSnapshotCandidates : pageRefresh ? Feature::FixSnapshotPageRefresh : stableWide ? Feature::FixStableFailedWide : stableFailed ? Feature::FixStableFailedCollects : dispatchRelocation ? Feature::FixDispatchRelocation : pipeQ0 ? Feature::PipeQ0Committer : bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
-        const std::string token = movedUpload ? "FIX_MOVED_WORD_UPLOAD" : candidates ? "FIX_SNAPSHOT_CANDIDATES" : pageRefresh ? "FIX_SNAPSHOT_PAGE_REFRESH" : stableWide ? "FIX_STABLE_FAILED_WIDE" : stableFailed ? "FIX_STABLE_FAILED_COLLECTS" : dispatchRelocation ? "FIX_DISPATCH_RELOCATION" : pipeQ0 ? "PIPE_Q0_COMMITTER" : bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
+    if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping || pipeQ0 || dispatchRelocation || stableFailed || stableWide || pageRefresh || candidates || movedUpload || unstampedAlias) {
+        const auto feature = unstampedAlias ? Feature::FixUnstampedAlias : movedUpload ? Feature::FixMovedWordUpload : candidates ? Feature::FixSnapshotCandidates : pageRefresh ? Feature::FixSnapshotPageRefresh : stableWide ? Feature::FixStableFailedWide : stableFailed ? Feature::FixStableFailedCollects : dispatchRelocation ? Feature::FixDispatchRelocation : pipeQ0 ? Feature::PipeQ0Committer : bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
+        const std::string token = unstampedAlias ? "FIX_UNSTAMPED_ALIAS" : movedUpload ? "FIX_MOVED_WORD_UPLOAD" : candidates ? "FIX_SNAPSHOT_CANDIDATES" : pageRefresh ? "FIX_SNAPSHOT_PAGE_REFRESH" : stableWide ? "FIX_STABLE_FAILED_WIDE" : stableFailed ? "FIX_STABLE_FAILED_COLLECTS" : dispatchRelocation ? "FIX_DISPATCH_RELOCATION" : pipeQ0 ? "PIPE_Q0_COMMITTER" : bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
         bool listed = false;
         for (const auto& entry : Switches::Table()) {
             if (entry.feature != feature) continue;

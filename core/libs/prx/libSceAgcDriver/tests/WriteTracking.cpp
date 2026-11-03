@@ -2004,6 +2004,69 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
+// APS5_ARCHB_FIX_UNSTAMPED_ALIAS (mode from the environment): a driver store into unwatched memory 4 GiB
+// away from a collected committed range sets the unstamped-store slots of the range's blocks (hashed
+// by block modulo 4 GiB). Off, the range then reads as changed (counted as aliased); on, it reads as
+// unchanged (counted as served), while a real store into the range (whole or partly watched) and a
+// collect of a CPU write still read as changed, and the split names the aliasing store.
+void CheckUnstampedAlias() {
+    const char* value = std::getenv("APS5_ARCHB_FIX_UNSTAMPED_ALIAS");
+    const bool on = value != nullptr && std::string_view(value) == "1";
+    Require(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixUnstampedAlias) == on, "the unstamped alias switch does not follow the environment");
+    PartlyCommitted range;
+    const auto base = range.Address();
+    range.Commit(0);
+    range.Commit(1);
+    std::memset(range.Data(), 0x11, 2 * Block);
+    Runs runs;
+    const Runs committed{{base, base + 2 * Block}};
+    const auto synced = CollectCommitted(range, runs);
+    Require(synced != 0 && runs == committed && UnchangedCommittedSince(runs, synced), "the committed fixture was not collected");
+
+    // An unwatched address that shares the slot of the range's second block.
+    constexpr std::uint64_t Period = std::uint64_t{1} << 32u;
+    const auto target = base + Block + 0x40;
+    std::uint64_t alias = 0;
+    for (const auto candidate : {target + Period, target + 2 * Period, target + 3 * Period, target >= Period ? target - Period : target + 4 * Period}) {
+        if (!Watched(candidate, 16)) {
+            alias = candidate;
+            break;
+        }
+    }
+    Require(alias != 0, "no unwatched address 4 GiB away from the fixture");
+    auto& counts = UnstampedAlias();
+    const auto aliased = counts.aliased.load();
+    const auto served = counts.served.load();
+    Require(MarkWritten(alias, 16) == 0, "a driver store into unwatched memory was stamped as watched");
+    const auto split = SplitNewestStamp(base, 2 * Block);
+    Require(split.unstamped > synced && split.block <= synced && split.slotAddress == (base + Block) / Block * Block && split.storeBegin == alias && split.storeEnd == alias + 16, "the stamp split does not name the aliasing store");
+    Require((NewestStamp(base, 2 * Block) > synced) == !on, on ? "an aliased slot advanced the newest stamp of a watched range" : "the aliasing store did not advance the newest stamp with the fix off");
+    Require(UnchangedSince(base, 2 * Block, synced), "the aliasing store changed the whole-range answer, which never reads the slots");
+    Require(UnchangedCommittedSince(runs, synced) == on, on ? "an aliased unstamped slot still reads the committed range as changed" : "an aliased unstamped slot no longer reads the committed range as changed with the fix off");
+    Require(counts.aliased.load() == aliased + 1 && counts.served.load() == served + (on ? 1 : 0) && counts.mismatches.load() == 0, "the alias counters do not follow the answer");
+
+    // Real changes still read as changed.
+    Require(MarkWritten(base + Block + 0x80, 4) != 0 && !UnchangedCommittedSince(runs, synced), "a driver store into the committed range reads as unchanged");
+    const auto stored = CollectCommitted(range, runs);
+    Require(stored > synced && UnchangedCommittedSince(runs, stored), "a collect after the driver store reads the range as changed");
+    Require(MarkWritten(alias, 16) == 0 && UnchangedCommittedSince(runs, stored) == on, "a second aliasing store does not follow the switch");
+    range.Data()[Block + 8] = 0x22;
+    const auto written = CollectCommitted(range, runs);
+    Require(written > stored && !UnchangedCommittedSince(runs, stored) && UnchangedCommittedSince(runs, written), "a CPU write into the committed range was missed");
+    // A store over the range's end and the unwatched block after it (partly watched): the watched part
+    // is stamped, so the range reads as changed although the store also set its slots.
+    Unwatch(range.Address(2), Block);
+    const auto beforePartial = CollectCommitted(range, runs);
+    Require(MarkWritten(base + 2 * Block - 32, 64) == 0 && !UnchangedCommittedSince(runs, beforePartial), "a partly watched store into the committed range reads as unchanged");
+    // StoredAllSince (the HTILE clear check): a complete driver store over the block, then an alias.
+    const auto beforeClear = TrackerGeneration();
+    Require(MarkWritten(base, Block) != 0 && StoredAllSince_nid_no_patch(base, Block, beforeClear), "a complete driver store over the block is not seen");
+    Require(MarkWritten(alias - Block, 16) == 0 && StoredAllSince_nid_no_patch(base, Block, beforeClear) == on, "an aliasing store does not follow the switch in StoredAllSince");
+    Require(counts.mismatches.load() == 0, "a newer slot was set by a store into the range");
+    range.Decommit(1);
+    range.Decommit(0);
+}
+
 // APS5_ARCHB_FIX_ALLOC_CHURN: the epoch collect map keeps its nodes across epochs. A kept entry must
 // never stand for a walk of a later epoch: a CPU store made before an epoch is always collected in
 // it, while the ranges nobody wrote keep their generations, epoch after epoch.
@@ -3253,6 +3316,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--changed-pages") {
             CheckChangedPages();
             std::cout << "changed pages test passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--unstamped-alias") {
+            CheckUnstampedAlias();
+            std::cout << "unstamped alias test passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--failed-collect-memo") {

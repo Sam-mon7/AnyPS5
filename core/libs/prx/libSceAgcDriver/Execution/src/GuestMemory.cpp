@@ -1042,6 +1042,12 @@ void noteHostWriteGen(std::uintptr_t address, std::size_t bytes, bool end) {
     else static_cast<void>(Gen::Note(Gen::Event::HostWriteBegin, address, address + bytes, Gen::Meta, 0, false));
 }
 
+// APS5_ARCHB_FIX_UNSTAMPED_ALIAS (see lockedUnchangedCommittedSince): the unstamped-store slots never
+// decide for a range that is write-watched in full.
+bool unstampedAliasActive() {
+    return ArchB::Switches::Enabled(ArchB::Feature::FixUnstampedAlias);
+}
+
 struct WriteTracker {
     AgcDriver::Mutex mutex;
     bool initialized = false;
@@ -1325,43 +1331,104 @@ struct WriteTracker {
         return leaf != nullptr ? leaf->blocks[block % LeafBlocks] : 0;
     }
 
-    static constexpr std::size_t UnstampedSlots = 1u << 16;
-    // Driver stores outside write watching, hashed by absolute block. Written under the mutex, read
-    // without it by the GEN_LOCKFREE answers: allocated once and published with release.
+    // Driver stores outside write watching, hashed by absolute block: 2^16 slots by default (one slot
+    // per 64 KiB block modulo 4 GiB), so a store into unwatched memory also advances the slot of every
+    // block 4 GiB * k away from it, watched or not. APS5_UNSTAMPED_SLOTS_LOG2 (4..20) narrows or widens
+    // the table (tests and the in-game alias reproduction: 12 makes every unwatched store alias a block
+    // of any range of 256 MiB or more). Written under the mutex, read without it by the GEN_LOCKFREE
+    // answers: allocated once and published with release.
+    static std::size_t unstampedSlotCount() {
+        static const std::size_t count = [] {
+            const char* text = std::getenv("APS5_UNSTAMPED_SLOTS_LOG2");
+            const auto log2 = text != nullptr && *text != '\0' ? std::clamp<unsigned long>(std::strtoul(text, nullptr, 10), 4ul, 20ul) : 16ul;
+            return std::size_t{1} << log2;
+        }();
+        return count;
+    }
     std::atomic<std::atomic<std::uint64_t>*> unstampedStores{nullptr};
+    // The last store that set each slot ([begin, end), under the mutex): the FIX_UNSTAMPED_ALIAS verify
+    // check and the large-texture diag name it.
+    std::unique_ptr<std::pair<std::uint64_t, std::uint64_t>[]> unstampedRanges;
 
     void noteUnstampedStore(std::uint64_t address, std::uint64_t end) {
+        const auto count = unstampedSlotCount();
         auto* slots = unstampedStores.load(std::memory_order_relaxed);
         if (slots == nullptr) {
-            slots = new std::atomic<std::uint64_t>[UnstampedSlots]();
+            slots = new std::atomic<std::uint64_t>[count]();
+            unstampedRanges = std::make_unique<std::pair<std::uint64_t, std::uint64_t>[]>(count);
             unstampedStores.store(slots, std::memory_order_release);
         }
         const auto value = generation.load(std::memory_order_relaxed);
         const auto first = address / WriteBlockBytes;
         const auto last = (end - 1) / WriteBlockBytes;
-        if (last - first >= UnstampedSlots) {
-            for (std::size_t i = 0; i < UnstampedSlots; ++i) slots[i].store(value, std::memory_order_release);
+        if (last - first >= count) {
+            for (std::size_t i = 0; i < count; ++i) {
+                slots[i].store(value, std::memory_order_release);
+                unstampedRanges[i] = {address, end};
+            }
             return;
         }
-        for (auto block = first; block <= last; ++block) slots[block % UnstampedSlots].store(value, std::memory_order_release);
+        for (auto block = first; block <= last; ++block) {
+            slots[block % count].store(value, std::memory_order_release);
+            unstampedRanges[block % count] = {address, end};
+        }
     }
 
     std::uint64_t newestUnstamped(std::uint64_t address, std::uint64_t end) const {
         const auto* slots = unstampedStores.load(std::memory_order_acquire);
         if (slots == nullptr || end <= address) return 0;
+        const auto count = unstampedSlotCount();
         std::uint64_t newest = 0;
         const auto first = address / WriteBlockBytes;
         const auto last = (end - 1) / WriteBlockBytes;
-        if (last - first >= UnstampedSlots) {
-            for (std::size_t i = 0; i < UnstampedSlots; ++i) newest = std::max(newest, slots[i].load(std::memory_order_acquire));
+        if (last - first >= count) {
+            for (std::size_t i = 0; i < count; ++i) newest = std::max(newest, slots[i].load(std::memory_order_acquire));
         } else {
-            for (auto block = first; block <= last; ++block) newest = std::max(newest, slots[block % UnstampedSlots].load(std::memory_order_acquire));
+            for (auto block = first; block <= last; ++block) newest = std::max(newest, slots[block % count].load(std::memory_order_acquire));
         }
         return newest;
     }
 
+    // The block of [address, end) whose unstamped slot is newest, the slot's value and the last store
+    // that set it (under the mutex); value 0 when no slot of the range was ever set.
+    struct UnstampedSlot {
+        std::uint64_t block = 0;
+        std::uint64_t value = 0;
+        std::pair<std::uint64_t, std::uint64_t> store{};
+    };
+    UnstampedSlot newestUnstampedSlot(std::uint64_t address, std::uint64_t end) const {
+        const auto* slots = unstampedStores.load(std::memory_order_acquire);
+        if (slots == nullptr || end <= address) return {};
+        const auto count = unstampedSlotCount();
+        UnstampedSlot found;
+        const auto first = address / WriteBlockBytes;
+        const auto last = std::min<std::uint64_t>((end - 1) / WriteBlockBytes, first + count - 1);
+        for (auto block = first; block <= last; ++block) {
+            const auto value = slots[block % count].load(std::memory_order_acquire);
+            if (value > found.value) found = {block, value, unstampedRanges[block % count]};
+        }
+        return found;
+    }
+
+    // newestStamp without the unstamped slots: the newest block stamp of [address, end).
+    std::uint64_t newestBlockStamp(std::uint64_t address, std::uint64_t end) const {
+        if (!watched) return 0;
+#ifdef _WIN32
+        address = std::max<std::uint64_t>(address, base);
+        end = std::min<std::uint64_t>(end, base + size);
+#else
+        end = std::min<std::uint64_t>(end, LeafCount * LeafBlocks * WriteBlockBytes);
+#endif
+        std::uint64_t newest = 0;
+        if (address >= end) return newest;
+        for (auto block = blockOf(address); block <= blockOf(end - 1); ++block) newest = std::max(newest, stampOf(block));
+        return newest;
+    }
+
+    // With FIX_UNSTAMPED_ALIAS the slots count only for a range not write-watched in full (a watched
+    // block's own stores stamp it; its slot holds only aliases of unwatched stores).
     std::uint64_t newestStamp(std::uint64_t address, std::uint64_t end) const {
-        std::uint64_t newest = newestUnstamped(address, end);
+        std::uint64_t newest = unstampedAliasActive() && watched && end > address && covers(address, static_cast<std::size_t>(end - address)) ? 0 : newestUnstamped(address, end);
         if (!watched) return newest;
 #ifdef _WIN32
         address = std::max<std::uint64_t>(address, base);
@@ -3788,11 +3855,78 @@ std::uint64_t CollectCommittedWritesInPlace(std::uint64_t address, std::size_t b
 }
 
 namespace {
+// APS5_ARCHB_FIX_UNSTAMPED_ALIAS: UnchangedCommittedSince reads a committed range as changed when any
+// of its blocks' unstamped-store slots is newer than the generation. Those slots record driver stores
+// into memory outside write watching, hashed by block modulo 4 GiB (see noteUnstampedStore), so a
+// store into unwatched memory 4 GiB * k away from a watched range advances its slots too, and a GPU
+// write made every frame at such an address reads a large partially resident snapshot (the zoo's 352
+// MiB texture pool at 0x1009000000) as changed every frame: it is snapshotted, detiled and uploaded
+// again per frame (60 -> 205 ms/frame) in the sessions whose unwatched GPU targets land on such an
+// address. The ranges asked about are write-watched in full (checked first), and a store into watched
+// memory always stamps the blocks it touches (MarkWritten and StoreOwnBytes stamp the watched part of a
+// partly watched store; a coverage restore, Rewatch or a new private mapping, stamps every block it
+// restores after any store made while the range was unwatched), so for these ranges the block stamps
+// alone decide; the slots add only aliases. With the switch on they are ignored here; a slot that is
+// newer is still checked: when the store that last set it overlaps the range in a block not stamped at
+// or after it (impossible by the argument above) the answer stays "changed" and the mismatch is counted
+// (fix_unstamped_alias_mismatches). fix_unstamped_alias_aliased counts the answers only the slots made
+// "changed" (on or off), fix_unstamped_alias_served those served with the switch on. The same switch
+// keeps the slots out of NewestStamp (a cache key) and StoredAllSince for ranges watched in full.
+UnstampedAliasCounters& unstampedAliasCounters() {
+    static auto* made = [] {
+        auto* counts = new UnstampedAliasCounters();
+        ArchB::Recorder::RegisterCounter("fix_unstamped_alias_aliased", counts->aliased);
+        ArchB::Recorder::RegisterCounter("fix_unstamped_alias_served", counts->served);
+        ArchB::Recorder::RegisterCounter("fix_unstamped_alias_mismatches", counts->mismatches);
+        return counts;
+    }();
+    return *made;
+}
+
+// Whether the newer slots of a fully watched committed range are aliases: no block holding one has its
+// last recorded store overlapping the range's part of the block without a block stamp at or after it.
+bool unstampedSlotsAlias(const WriteTracker& tracker, std::uint64_t begin, std::uint64_t end, std::uint64_t generation) {
+    const auto* slots = tracker.unstampedStores.load(std::memory_order_acquire);
+    if (slots == nullptr) return true;
+    const auto count = WriteTracker::unstampedSlotCount();
+    for (auto block = begin / WriteBlockBytes; block <= (end - 1) / WriteBlockBytes; ++block) {
+        const auto value = slots[block % count].load(std::memory_order_acquire);
+        if (value <= generation) continue;
+        const auto [storeBegin, storeEnd] = tracker.unstampedRanges[block % count];
+        const auto from = std::max<std::uint64_t>(begin, block * WriteBlockBytes);
+        const auto to = std::min<std::uint64_t>(end, (block + 1) * WriteBlockBytes);
+        if (storeBegin < to && from < storeEnd && tracker.stampOf(tracker.blockOf(from)) < value) return false;
+    }
+    return true;
+}
+
+void reportUnstampedAlias(const WriteTracker& tracker, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, std::uint64_t served) {
+    if (served > 8 && served % 4096 != 0) return;
+    const auto slot = tracker.newestUnstampedSlot(begin, end);
+    std::fprintf(stderr, "[guestmem] FIX_UNSTAMPED_ALIAS: committed range 0x%llx..0x%llx (%llu KiB) unchanged since generation %llu (newest block stamp %llu) read as changed only by the unstamped slot of block 0x%llx (%llu), last set by a driver store to unwatched 0x%llx..0x%llx (%llu MiB away): served; %llu served so far\n",
+                 static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>((end - begin) >> 10u), static_cast<unsigned long long>(generation),
+                 static_cast<unsigned long long>(tracker.newestBlockStamp(begin, end)), static_cast<unsigned long long>(slot.block * WriteBlockBytes), static_cast<unsigned long long>(slot.value),
+                 static_cast<unsigned long long>(slot.store.first), static_cast<unsigned long long>(slot.store.second),
+                 static_cast<unsigned long long>((slot.store.first > slot.block * WriteBlockBytes ? slot.store.first - slot.block * WriteBlockBytes : slot.block * WriteBlockBytes - slot.store.first) >> 20u),
+                 static_cast<unsigned long long>(served));
+}
+
 bool lockedUnchangedCommittedSince(const WriteTracker& tracker, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation) {
     if (!tracker.watched || generation == 0) return false;
+    std::pair<std::uint64_t, std::uint64_t> aliased{};
     for (const auto& [begin, end] : ranges) {
-        if (end <= begin || !tracker.covers(begin, static_cast<std::size_t>(end - begin)) || tracker.newestStamp(begin, end) > generation || tracker.refusedSince(begin, end, generation)) return false;
+        if (end <= begin || !tracker.covers(begin, static_cast<std::size_t>(end - begin)) || tracker.newestBlockStamp(begin, end) > generation || tracker.refusedSince(begin, end, generation)) return false;
+        if (tracker.newestUnstamped(begin, end) <= generation) continue;
+        auto& counts = unstampedAliasCounters();
+        counts.aliased.fetch_add(1, std::memory_order_relaxed);
+        if (!unstampedAliasActive()) return false;
+        if (!unstampedSlotsAlias(tracker, begin, end, generation)) {
+            counts.mismatches.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (aliased.second == 0) aliased = {begin, end};
     }
+    if (aliased.second != 0) reportUnstampedAlias(tracker, aliased.first, aliased.second, generation, unstampedAliasCounters().served.fetch_add(1, std::memory_order_relaxed) + 1);
     return true;
 }
 
@@ -3991,7 +4125,8 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
     tracker.initialize();
     if (!tracker.watched || !tracker.covers(address, bytes)) return false;
     const auto end = address + bytes;
-    if (tracker.newestUnstamped(address, end) > generation) return false;
+    // The range is watched in full: with FIX_UNSTAMPED_ALIAS its slots (aliases only) do not decide.
+    if (!unstampedAliasActive() && tracker.newestUnstamped(address, end) > generation) return false;
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(end - 1u); ++block) {
         const auto found = tracker.driverPieces.find(block);
         if (found == tracker.driverPieces.end()) return false;
@@ -4034,6 +4169,25 @@ std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     return bytes == 0 ? 0 : tracker.newestStamp(address, address + bytes);
+}
+
+StampSplit SplitNewestStamp(std::uint64_t address, std::size_t bytes) {
+    StampSplit split;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return split;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    split.block = tracker.newestBlockStamp(address, address + bytes);
+    const auto slot = tracker.newestUnstampedSlot(address, address + bytes);
+    split.unstamped = slot.value;
+    split.slotAddress = slot.block * WriteBlockBytes;
+    split.storeBegin = slot.store.first;
+    split.storeEnd = slot.store.second;
+    return split;
+}
+
+UnstampedAliasCounters& UnstampedAlias() {
+    return unstampedAliasCounters();
 }
 
 #ifdef _WIN32

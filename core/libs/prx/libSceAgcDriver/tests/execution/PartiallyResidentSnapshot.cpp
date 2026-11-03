@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -322,6 +323,67 @@ void LargeTracked(const Context& context, ReservedSurface& surface, std::size_t 
     AgcDriver::GuestMemory::SetFlushHook(nullptr);
     ClearCachedTextures(context.device);
     surface.Decommit(0, committedBytes);
+}
+
+// APS5_ARCHB_FIX_UNSTAMPED_ALIAS (mode from the environment): the zoo's texture pool case. A large
+// partially resident snapshot (validated through its committed ranges) is sampled, then the driver
+// stores into unwatched memory 4 GiB away from its committed block (an unstamped store whose slot
+// aliases the block). Off, the next sample uploads it again (the pathology: once per frame when the
+// store recurs every frame); on, the cached texture is served, while a real driver store into the
+// committed block still uploads it again.
+void LargeAlias(const Context& context, ReservedSurface& surface) {
+    const char* value = std::getenv("APS5_ARCHB_FIX_UNSTAMPED_ALIAS");
+    const bool on = value != nullptr && std::string_view(value) == "1";
+    Require(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixUnstampedAlias) == on, "the unstamped alias switch does not follow the environment");
+    const auto address = surface.Address();
+    const auto words = Descriptor(address, LargeSide);
+    surface.Commit(0, BlockBytes);
+    std::memset(surface.Data(), 0x5a, BlockBytes);
+    surfaceBegin = address;
+    surfaceEnd = address + LargeSurfaceBytes;
+    constexpr std::uint64_t Period = std::uint64_t{1} << 32u;
+    std::uint64_t alias = 0;
+    // The guest arena is write-watched as a whole: the first address 4 GiB * k above the surface past it.
+    for (std::uint64_t k = 1; k <= 4096 && alias == 0; ++k) {
+        const auto candidate = address + 0x100 + k * Period;
+        if (!AgcDriver::GuestMemory::Watched(candidate, 16)) alias = candidate;
+    }
+    Require(alias != 0, "no unwatched address 4 GiB away from the surface");
+    std::shared_ptr<Texture> previous;
+    const auto sample = [&](const std::string& when, bool uploaded) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        surfaceReads = 0;
+        auto texture = CachedSampledTexture(context, words);
+        Require(texture != nullptr && !texture->ViewsStorageImage(), "the large partially resident surface was not sampled through a snapshot " + when);
+        const auto reads = surfaceReads.load();
+        if (uploaded && (reads == 0 || texture == previous)) throw std::runtime_error("sampling the large partially resident surface " + when + " kept the texture uploaded before it");
+        if (!uploaded && (reads != 0 || texture != previous)) throw std::runtime_error("sampling the large partially resident surface " + when + " uploaded it again (" + std::to_string(reads) + " reads)");
+        previous = texture;
+    };
+    auto& counts = AgcDriver::GuestMemory::UnstampedAlias();
+    AgcDriver::GuestMemory::SetFlushHook(&CountReads);
+    try {
+        sample("at its first use", true);
+        sample("again", false);
+        const auto made = TextureCacheUsage().largeMade;
+        for (int frame = 0; frame < 3; ++frame) {
+            const auto served = counts.served.load();
+            Require(AgcDriver::GuestMemory::MarkWritten(alias, 16) == 0, "the aliasing store was stamped as watched");
+            sample("after a driver store into unwatched memory 4 GiB away (frame " + std::to_string(frame) + ")", !on);
+            Require(counts.served.load() == served + (on ? 1 : 0), "the alias counters do not follow the switch");
+        }
+        Require(TextureCacheUsage().largeMade == made + (on ? 0 : 3), "the large texture count does not follow the switch");
+        AgcDriver::GuestMemory::MarkWritten(address + 0x200, 4);
+        sample("after a driver store into its committed block", true);
+        sample("after the upload that followed the driver store", false);
+        Require(counts.mismatches.load() == 0, "a newer slot was set by a store into the surface");
+    } catch (...) {
+        AgcDriver::GuestMemory::SetFlushHook(nullptr);
+        throw;
+    }
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+    ClearCachedTextures(context.device);
+    surface.Decommit(0, BlockBytes);
 }
 
 #ifdef _WIN32
@@ -837,12 +899,14 @@ int main(int argc, char** argv) {
             TextureDetiler detiler(context);
             context.detiler = &detiler;
             const bool large = argc == 2 && std::string_view(argv[1]) == "--large-tracked";
-            ReservedSurface surface(large ? LargeSurfaceBytes : SurfaceBytes);
+            const bool largeAlias = argc == 2 && std::string_view(argv[1]) == "--large-alias";
+            ReservedSurface surface(large || largeAlias ? LargeSurfaceBytes : SurfaceBytes);
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (large) {
                 LargeTracked(context, surface, LargeSurfaceBytes);
                 LargeTracked(context, surface, BlockBytes);
-            } else if (argc == 2 && std::string_view(argv[1]) == "--pending-stores") PendingStores(context, surface);
+            } else if (largeAlias) LargeAlias(context, surface);
+            else if (argc == 2 && std::string_view(argv[1]) == "--pending-stores") PendingStores(context, surface);
             else if (argc == 2 && std::string_view(argv[1]) == "--depth-transition") DepthTransition(context, surface);
             else if (argc == 2 && std::string_view(argv[1]) == "--partial-depth-transition") DepthTransition(context, surface, true);
             else if (argc == 2 && std::string_view(argv[1]) == "--resource-proof") ResourceProof(context, surface);

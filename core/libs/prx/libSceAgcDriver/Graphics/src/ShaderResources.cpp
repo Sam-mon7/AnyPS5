@@ -751,7 +751,7 @@ AgcDriver::Mutex largeReasonMutex;
 std::string largeLastReason;
 
 std::string LargeTextureStaleReason(const CachedTexture& entry, const StorageTexture* pendingSource, std::uint64_t guestBytes, DccKeys keys, bool stagedFlushed, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* committed, std::uint64_t address) {
-    char text[480];
+    char text[720];
     if (entry.source != nullptr) {
         std::snprintf(text, sizeof(text), "stale view (results pending now %d, staged clear flushed %d, keys %d)", pendingSource != nullptr ? 1 : 0, stagedFlushed ? 1 : 0, static_cast<int>(keys));
     } else if (pendingSource != nullptr) {
@@ -771,9 +771,14 @@ std::string LargeTextureStaleReason(const CachedTexture& entry, const StorageTex
         const bool tracked = GuestMemory::ChangedPages(address, surface, entry.generation, runs);
         std::uint64_t changedBytes = 0;
         for (const auto& [begin, end] : runs) changedBytes += end - begin;
-        std::snprintf(text, sizeof(text), "changed: committed ranges %lld -> %lld (same %d), recorded GPU write over it %d, unchanged since generation %llu: %d (newest stamp %llu), snapshot kept for compare %d, untracked key %d; pages tracked %d, %zu changed runs, %llu KiB, first at +0x%llx (%llu KiB)",
+        // The newest stamp in its parts: block stamps, and the unstamped-store slots (driver stores
+        // outside write watching, hashed by block modulo 4 GiB; see FIX_UNSTAMPED_ALIAS) with the store
+        // that last set the newest one.
+        const auto split = GuestMemory::SplitNewestStamp(address, surface);
+        std::snprintf(text, sizeof(text), "changed: committed ranges %lld -> %lld (same %d), recorded GPU write over it %d, unchanged since generation %llu: %d (newest stamp %llu: block %llu, unstamped slot %llu of block 0x%llx last set by a store to 0x%llx..0x%llx), snapshot kept for compare %d, untracked key %d; pages tracked %d, %zu changed runs, %llu KiB, first at +0x%llx (%llu KiB)",
                       entry.committed.has_value() ? static_cast<long long>(entry.committed->size()) : -1ll, committed != nullptr ? static_cast<long long>(committed->size()) : -1ll, sameRanges ? 1 : 0, pending ? 1 : 0,
-                      static_cast<unsigned long long>(entry.generation), unchanged ? 1 : 0, static_cast<unsigned long long>(GuestMemory::NewestStamp(address, surface)), entry.bytes.empty() ? 0 : 1, entry.untracked[0] != 0 ? 1 : 0,
+                      static_cast<unsigned long long>(entry.generation), unchanged ? 1 : 0, static_cast<unsigned long long>(GuestMemory::NewestStamp(address, surface)), static_cast<unsigned long long>(split.block), static_cast<unsigned long long>(split.unstamped),
+                      static_cast<unsigned long long>(split.slotAddress), static_cast<unsigned long long>(split.storeBegin), static_cast<unsigned long long>(split.storeEnd), entry.bytes.empty() ? 0 : 1, entry.untracked[0] != 0 ? 1 : 0,
                       tracked ? 1 : 0, runs.size(), static_cast<unsigned long long>(changedBytes >> 10u), runs.empty() ? 0ull : static_cast<unsigned long long>(runs.front().first - address), runs.empty() ? 0ull : static_cast<unsigned long long>((runs.front().second - runs.front().first) >> 10u));
     }
     return text;
