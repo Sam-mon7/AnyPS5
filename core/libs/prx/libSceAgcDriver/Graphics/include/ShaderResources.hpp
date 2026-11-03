@@ -46,6 +46,9 @@ struct TextureCacheUse {
     std::uint64_t sampledBytes = 0;
     std::uint64_t spareBytes = 0;
     std::uint64_t storageBytes = 0;
+    // Large sampled textures made (see LargeTextureReport in ShaderResources.cpp) and why the last one was.
+    std::uint64_t largeMade = 0;
+    std::string largeLastReason;
 };
 TextureCacheUse TextureCacheUsage();
 void OverrideCacheBudgetForTest(std::uint64_t bytes);

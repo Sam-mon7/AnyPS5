@@ -1078,6 +1078,32 @@ void recycleTests(const Context& context) {
     Require(TextureCacheUsage().spareEntries == 1 && TextureCacheUsage().spareBytes == BigBytes, "the second big snapshot did not take the parked spare of its size");
 }
 
+// Large sampled textures name why each was made (2026-11-03: the zoo's 352 MiB pool re-made every frame in some
+// sessions); the mode sets APS5_LARGE_TEXTURE_REPORT_KIB=64 so this fixture's 256 KiB surfaces count as large.
+void largeReportTests(const Context& context) {
+    Block block(context);
+    ClearCachedTextures(context.device);
+    const auto address = block.Surface(0);
+    const auto before = TextureCacheUsage().largeMade;
+    std::memset(reinterpret_cast<void*>(address), 0xa1, SurfaceBytes);
+    const auto first = Sampled(context, address);
+    auto use = TextureCacheUsage();
+    Require(use.largeMade == before + 1 && use.largeLastReason == "absent", "the first large snapshot was not reported as absent: " + use.largeLastReason);
+    Require(Sampled(context, address) == first && TextureCacheUsage().largeMade == before + 1, "an unchanged large snapshot was made again");
+    std::memset(reinterpret_cast<void*>(address), 0xb2, SurfaceBytes);
+    const auto second = Sampled(context, address);
+    use = TextureCacheUsage();
+    Require(second != first && use.largeMade == before + 2, "a changed large snapshot was not made again");
+    Require(use.largeLastReason.rfind("changed: ", 0) == 0, "a changed large snapshot was not reported as changed: " + use.largeLastReason);
+    const auto other = Sampled(context, address, Side / 2);
+    use = TextureCacheUsage();
+    if (DescribeSurface(Resource(address, Side / 2)).guestBytes >= (64u << 10u)) {
+        Require(other != second && use.largeLastReason.rfind("absent, 1 entries at the address under other keys", 0) == 0, "a second key over the same address was not reported: " + use.largeLastReason);
+    }
+    ClearCachedTextures(context.device);
+    std::puts("large texture report tests passed");
+}
+
 void spareAgeTests(const Context& context) {
     Block block(context);
     ClearCachedTextures(context.device);
@@ -1586,9 +1612,11 @@ int main(int argc, char** argv) {
         const bool recover = mode == "recover-sampled" || mode == "recover-storage" || mode == "recover-srgb" || mode == "recover-repack";
 #ifdef _WIN32
         if (!memory) _putenv_s("APS5_TEXTURE_CACHE_MIB", recover ? "16" : "1");
+        if (mode == "large-report") _putenv_s("APS5_LARGE_TEXTURE_REPORT_KIB", "64");
         if (std::getenv("APS5_TEMPLATE_AUDIT_MS") == nullptr) _putenv_s("APS5_TEMPLATE_AUDIT_MS", "250");
 #else
         if (!memory) setenv("APS5_TEXTURE_CACHE_MIB", recover ? "16" : "1", 1);
+        if (mode == "large-report") setenv("APS5_LARGE_TEXTURE_REPORT_KIB", "64", 1);
         setenv("APS5_TEMPLATE_AUDIT_MS", "250", 0);
 #endif
         std::unique_ptr<Device> device;
@@ -1638,6 +1666,11 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             replacedEntryTests(context);
             std::puts("resource cache replaced entry tests passed");
+            return 0;
+        }
+        if (mode == "large-report") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            largeReportTests(context);
             return 0;
         }
         if (mode == "pending-scan") {

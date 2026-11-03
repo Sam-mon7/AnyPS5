@@ -732,6 +732,66 @@ void reportGuestAllocation(const GuestTextureResource& resource, std::uint64_t g
     std::fprintf(stderr, "[gpu] view 0x%llx of %llu MiB lies in the guest allocation 0x%llx..0x%llx (%llu MiB, range 0x%llx..0x%llx, %s%s%s): %llu of its %u slices fit in the range\n", static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(guestBytes >> 20u), static_cast<unsigned long long>(range->allocationAddress), static_cast<unsigned long long>(range->allocationAddress + range->allocationBytes), static_cast<unsigned long long>(range->allocationBytes >> 20u), static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(end), range->readable ? "r" : "-", range->writable ? "w" : "-", range->gpu ? "g" : "-", static_cast<unsigned long long>(fitting), geometry.layers);
 }
 
+// Large sampled textures (texture pools, atlases: hundreds of MiB to snapshot, detile and upload) are
+// made once and then served from the cache; one made again on every lookup costs a whole frame. Each
+// such creation prints why the cache did not serve it (the first 16 per process, then every 64th), so a
+// session stuck re-making one names the cause (2026-11-03: the zoo's 1024x1024x256 BC3 pool at
+// 0x1009000000 re-made every frame in ~1 of 6 sessions, 60 -> 205 ms/frame).
+// APS5_LARGE_TEXTURE_REPORT_KIB moves the threshold (tests; 0 KiB reports every snapshot and view).
+std::uint64_t LargeTextureReportBytes() {
+    static const std::uint64_t bytes = [] {
+        const char* text = std::getenv("APS5_LARGE_TEXTURE_REPORT_KIB");
+        return text != nullptr && *text != '\0' ? std::strtoull(text, nullptr, 10) << 10u : 64ull << 20u;
+    }();
+    return bytes;
+}
+
+std::atomic<std::uint64_t> largeTexturesMade{0};
+AgcDriver::Mutex largeReasonMutex;
+std::string largeLastReason;
+
+std::string LargeTextureStaleReason(const CachedTexture& entry, const StorageTexture* pendingSource, std::uint64_t guestBytes, DccKeys keys, bool stagedFlushed, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* committed, std::uint64_t address) {
+    char text[480];
+    if (entry.source != nullptr) {
+        std::snprintf(text, sizeof(text), "stale view (results pending now %d, staged clear flushed %d, keys %d)", pendingSource != nullptr ? 1 : 0, stagedFlushed ? 1 : 0, static_cast<int>(keys));
+    } else if (pendingSource != nullptr) {
+        const auto& pending = pendingSource->Descriptor();
+        std::snprintf(text, sizeof(text), "stale snapshot: results now pending in the storage image 0x%llx (%ux%u, format %u, %llu KiB)", static_cast<unsigned long long>(pending.baseAddress), pending.width, pending.height, pending.format, static_cast<unsigned long long>(pendingSource->GuestBytes() >> 10u));
+    } else if (entry.surfaceBytes != guestBytes) {
+        std::snprintf(text, sizeof(text), "stale snapshot: surface bytes %llu -> %llu", static_cast<unsigned long long>(entry.surfaceBytes), static_cast<unsigned long long>(guestBytes));
+    } else if (entry.keys != keys) {
+        std::snprintf(text, sizeof(text), "stale snapshot: DCC keys %d -> %d", static_cast<int>(entry.keys), static_cast<int>(keys));
+    } else {
+        const auto surface = static_cast<std::size_t>(entry.surfaceBytes);
+        const bool sameRanges = committed != nullptr ? entry.committed.has_value() && *entry.committed == *committed : !entry.committed.has_value();
+        const bool pending = Recorder::SnapshotWriteOverlaps(address, surface);
+        const bool unchanged = committed != nullptr ? GuestMemory::UnchangedCommittedSince(*committed, entry.generation) : GuestMemory::UnchangedSince(address, surface, entry.generation);
+        // Where it changed: the 4 KiB pages UnchangedSince would refuse (none listed: untracked range or generation 0).
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+        const bool tracked = GuestMemory::ChangedPages(address, surface, entry.generation, runs);
+        std::uint64_t changedBytes = 0;
+        for (const auto& [begin, end] : runs) changedBytes += end - begin;
+        std::snprintf(text, sizeof(text), "changed: committed ranges %lld -> %lld (same %d), recorded GPU write over it %d, unchanged since generation %llu: %d (newest stamp %llu), snapshot kept for compare %d, untracked key %d; pages tracked %d, %zu changed runs, %llu KiB, first at +0x%llx (%llu KiB)",
+                      entry.committed.has_value() ? static_cast<long long>(entry.committed->size()) : -1ll, committed != nullptr ? static_cast<long long>(committed->size()) : -1ll, sameRanges ? 1 : 0, pending ? 1 : 0,
+                      static_cast<unsigned long long>(entry.generation), unchanged ? 1 : 0, static_cast<unsigned long long>(GuestMemory::NewestStamp(address, surface)), entry.bytes.empty() ? 0 : 1, entry.untracked[0] != 0 ? 1 : 0,
+                      tracked ? 1 : 0, runs.size(), static_cast<unsigned long long>(changedBytes >> 10u), runs.empty() ? 0ull : static_cast<unsigned long long>(runs.front().first - address), runs.empty() ? 0ull : static_cast<unsigned long long>((runs.front().second - runs.front().first) >> 10u));
+    }
+    return text;
+}
+
+void LargeTextureReport(const GuestTextureResource& resource, std::uint64_t guestBytes, std::uint64_t accounted, bool fromStorage, const std::string& why, bool admitted, std::uint64_t cachedBytes, std::uint64_t budget) {
+    const auto made = largeTexturesMade.fetch_add(1, std::memory_order_relaxed) + 1;
+    {
+        std::lock_guard lock(largeReasonMutex);
+        largeLastReason = why;
+    }
+    if (made > 16 && made % 64 != 0) return;
+    std::fprintf(stderr, "[texture-cache] large texture 0x%llx (%ux%u, %u layers, format %u, %llu MiB guest, %llu MiB image, %s) made: %s; %s (cache %llu MiB, budget %llu MiB); %llu large textures made so far, frame %llu\n",
+                 static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.depthOrLastArray + 1u, resource.format, static_cast<unsigned long long>(guestBytes >> 20u), static_cast<unsigned long long>(accounted >> 20u),
+                 fromStorage ? "view" : "snapshot", why.c_str(), admitted ? "cached" : "used uncached", static_cast<unsigned long long>(cachedBytes >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(made),
+                 static_cast<unsigned long long>(Recorder::Presents()));
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
     const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::TextureLookup);
@@ -972,6 +1032,24 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const CacheHold held(sampledCacheHeld);
     dropUncachedViews(cache);
     std::vector<std::byte> recycled;
+    // Why a large sampled texture is made (see LargeTextureReport): an ordinary lookup returns a cached
+    // one, so a large texture made again and again is a cost worth naming.
+    const bool large = bytes >= LargeTextureReportBytes();
+    std::string largeWhy = "absent";
+    if (large) {
+        std::size_t sameAddress = 0;
+        std::array<std::uint32_t, 8> differing{};
+        for (const auto& other : cache.entries) {
+            if (other.address != address) continue;
+            ++sameAddress;
+            for (std::size_t i = 0; i < differing.size(); ++i) differing[i] |= other.key.words[i] ^ key.words[i];
+        }
+        if (sameAddress != 0) {
+            char text[160];
+            std::snprintf(text, sizeof(text), "absent, %zu entries at the address under other keys (words differing %08x %08x %08x %08x %08x %08x %08x %08x)", sameAddress, differing[0], differing[1], differing[2], differing[3], differing[4], differing[5], differing[6], differing[7]);
+            largeWhy = text;
+        }
+    }
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         if (it->source != nullptr) {
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
@@ -1026,6 +1104,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 return it->texture;
             }
         }
+        if (large) largeWhy = LargeTextureStaleReason(*it, source.get(), guestBytes, *keys, stagedFlushed, hasCommitted ? &committedRanges() : nullptr, address);
         if (it->bytes.size() == bytes) recycled = std::move(it->bytes);
         else parkSnapshot(cache, it->bytes);
         eraseTexture(cache, it);
@@ -1080,7 +1159,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
-    if (!admitTexture(cache, key, entry.accounted, budget)) {
+    const auto cachedBefore = cache.bytes;
+    const bool admitted = admitTexture(cache, key, entry.accounted, budget);
+    if (large) LargeTextureReport(resource, guestBytes, entry.accounted, source != nullptr, largeWhy, admitted, cachedBefore, budget);
+    if (!admitted) {
         noteReleased(texture);
         logTextureLookup(entry, resource, generation);
         reportCacheCounts(cache, budget);
@@ -1426,6 +1508,11 @@ TextureCacheUse TextureCacheUsage() {
         use.spareBytes = sampled.spareBytes;
     }
     use.storageBytes = storageCacheBytes();
+    use.largeMade = largeTexturesMade.load(std::memory_order_relaxed);
+    {
+        std::lock_guard lock(largeReasonMutex);
+        use.largeLastReason = largeLastReason;
+    }
     return use;
 }
 
