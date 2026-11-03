@@ -219,6 +219,14 @@ public:
         // instead of the template's own buffer descriptors.
         std::shared_ptr<DrawSetPool> pool;
         std::vector<std::size_t> overridden;
+        // APS5_ARCHB_PIPE_DRAW_REUSE (Stage 3 B1): the snapshots live in this set's own buffer, the
+        // elements `overridden` names pointing at `slotOffsets`/`slotSizes` in it; the set returns to
+        // the pool with them, so a later draw selecting the same elements and sizes copies its bytes
+        // there and writes no descriptor. `slotSerial`: the batch that used them (verification).
+        std::shared_ptr<Buffer> slotBuffer;
+        std::vector<VkDeviceSize> slotOffsets;
+        std::vector<std::size_t> slotSizes;
+        std::uint64_t slotSerial = 0;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -238,6 +246,8 @@ public:
     static const char* MoveRefusalName(MoveRefusal refusal);
     std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
     static std::size_t MaxDrawSnapshotBytes();
+    // APS5_ARCHB_PIPE_DRAW_REUSE: a "[draw-reuse]" summary of the slot counters.
+    static std::string DrawReuseText();
     static std::size_t DrawUploadLimit();
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU

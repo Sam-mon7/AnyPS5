@@ -6254,6 +6254,104 @@ void drawSetPoolTests() {
     std::cout << "draw set pool tests passed\n";
 }
 
+// APS5_ARCHB_PIPE_DRAW_REUSE (Stage 3 B1): on the committer, a pooled set keeps its snapshots in its own slot
+// buffer; the template's next draw selecting the same elements takes that set, copies the current guest
+// bytes into the slots and writes no descriptor (with _VERIFY it rewrites them and checks the batch); a draw
+// while the set is in use takes a fresh set and writes it in full; a different selection lays out new slots.
+void drawReuseTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+#ifdef _WIN32
+    _putenv_s("APS5_ARCHB_PIPE_Q0_COMMITTER", "1");
+    _putenv_s("APS5_ARCHB_FIX_DRAW_SET_POOL", "1");
+    _putenv_s("APS5_ARCHB_PIPE_DRAW_REUSE", "1");
+#else
+    setenv("APS5_ARCHB_PIPE_Q0_COMMITTER", "1", 1);
+    setenv("APS5_ARCHB_FIX_DRAW_SET_POOL", "1", 1);
+    setenv("APS5_ARCHB_PIPE_DRAW_REUSE", "1", 1);
+#endif
+    Require(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeDrawReuse), "the draw reuse switch is not on");
+    const char* verifyText = std::getenv("APS5_ARCHB_PIPE_DRAW_REUSE_VERIFY");
+    const bool verifying = verifyText != nullptr && std::string_view(verifyText) == "1";
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    mock = MockVulkan{};
+    mock.allowCopies = true;
+    auto context = mockContext();
+    const auto guestFirstSaved = guestFirst;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        auto binding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
+        { auto flags = binding.Flags(); flags.bufferWritten = {false, false}; binding.SetFlags(std::move(flags)); }
+        vertex.bindings.push_back(binding);
+        fragment.bindings.push_back(makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8)));
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        // Both elements of binding 0 snapshotted from moved addresses (read-only buffers that moved:
+        // the snapshot is taken from the moved address, as for a guest buffer read in place).
+        const auto draw = [&] {
+            mock.writes.clear();
+            const std::vector<ShaderResources::MovedBuffer> moved{{0, reinterpret_cast<std::uint64_t>(guestFirst.data()), 16, {}}, {1, reinterpret_cast<std::uint64_t>(guestSecond.data()), 32, {}}};
+            auto bindings = resources.PrepareDrawBindings(recorder, moved);
+            Require(bindings != nullptr && bindings->snapshots.size() == 2 && bindings->allocation.set != VK_NULL_HANDLE, "draw snapshots are missing");
+            return bindings;
+        };
+        const auto release = [&](std::shared_ptr<ShaderResources::DrawBindings>& bindings) {
+            std::weak_ptr<ShaderResources::DrawBindings> watched = bindings;
+            bindings.reset();
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!watched.expired() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            Require(watched.expired(), "a completed draw's bindings were not released");
+        };
+        const auto holds = [](const ShaderResources::DrawBindings& bindings, std::size_t index, const void* guest) {
+            const auto& item = bindings.snapshots.at(index);
+            return item.buffer == bindings.slotBuffer && std::memcmp(item.Bytes().data(), guest, item.bytes) == 0;
+        };
+        const auto text = [] { return ShaderResources::DrawReuseText(); };
+
+        auto first = draw();
+        Require(first->slotBuffer != nullptr && first->snapshots.size() == first->slotSizes.size(), "a committer draw did not put its snapshots in slots: " + text());
+        Require(holds(*first, 0, guestFirst.data()) && holds(*first, 1, guestSecond.data()), "a slot does not hold the guest bytes");
+        Require(!mock.writes.empty(), "a fresh set was not written");
+        const auto set = first->allocation.set;
+        const auto slots = first->slotBuffer.get();
+        const auto offsets = first->slotOffsets;
+        release(first);
+
+        guestFirst[0] = 0x99999999u;
+        auto second = draw();
+        Require(second->allocation.set == set && second->slotBuffer.get() == slots && second->slotOffsets == offsets, "the next draw did not take the set with matching slots");
+        Require(holds(*second, 0, guestFirst.data()), "a matched slot did not get the current guest bytes");
+        if (verifying) Require(!mock.writes.empty() && text().find("verified 1,") != std::string::npos && text().find("mismatches 0") != std::string::npos, "verification did not rewrite and check the matched set: " + text());
+        else Require(mock.writes.empty() && text().find(" 1 slot hits") != std::string::npos, "a matched set was written again: " + text());
+
+        // In use: the next draw takes a fresh set and slots and writes them in full.
+        auto third = draw();
+        Require(third->allocation.set != set && third->slotBuffer.get() != slots && !mock.writes.empty(), "a draw took a set still in use");
+        release(third);
+        release(second);
+
+        // Another selection (only element 1 moved, element 0 not a snapshot): no pooled set matches, so a
+        // pooled set gets new slots and its elements are rewritten (element 0 back to the template's).
+        mock.writes.clear();
+        const std::vector<ShaderResources::MovedBuffer> one{{1, reinterpret_cast<std::uint64_t>(guestSecond.data()), 32, {}}};
+        auto fourth = resources.PrepareDrawBindings(recorder, one);
+        Require(fourth != nullptr && fourth->snapshots.size() == 1 && fourth->slotSizes.size() == 1 && fourth->slotBuffer.get() != slots, "a new selection did not lay out new slots");
+        Require(!mock.writes.empty() && holds(*fourth, 0, guestSecond.data()), "a new selection's set was not rewritten from its slots");
+        fourth.reset();
+        recorder.Sync();
+    }
+    guestFirst = guestFirstSaved;
+    Require(mock.live == 0, "slotted draw sets leaked Vulkan objects");
+    std::cout << "draw reuse tests passed\n";
+}
+
 alignas(16) std::array<std::uint32_t, 8> guestMovedFirst{0x51515151, 0x52525252, 0x53535353, 0x54545454, 0x55555555, 0x56565656, 0x57575757, 0x58585858};
 alignas(16) std::array<std::uint32_t, 8> guestMovedSecond{0x61616161, 0x62626262, 0x63636363, 0x64646464, 0x65656565, 0x66666666, 0x67676767, 0x68686868};
 
@@ -12296,6 +12394,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-set-pool") {
             drawSetPoolTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-reuse") {
+            drawReuseTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--command-batch-fence-failure") {

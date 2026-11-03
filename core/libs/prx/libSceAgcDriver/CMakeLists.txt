@@ -589,9 +589,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_fix_dispatch_relocation_switch COMMAND agc_archb_c01_switches_tests --toggle FixDispatchRelocation)
     add_test(NAME agc_archb_pipe_copy_kernel_items_switch COMMAND agc_archb_c01_switches_tests --toggle PipeCopyKernelItems)
     add_test(NAME agc_archb_fix_stable_failed_collects_switch COMMAND agc_archb_c01_switches_tests --toggle FixStableFailedCollects)
-    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_archb_pipe_draw_reuse_switch COMMAND agc_archb_c01_switches_tests --toggle PipeDrawReuse)
+    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch agc_archb_pipe_draw_reuse_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch agc_archb_pipe_draw_reuse_switch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
@@ -2515,6 +2516,15 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_draw_set_pool PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # APS5_ARCHB_PIPE_DRAW_REUSE (Stage 3 B1): pooled sets with their own snapshot slots (on, verified).
+    add_test(NAME agc_archb_pipe_draw_reuse_on COMMAND agc_driver_graphics_tests --draw-reuse)
+    add_test(NAME agc_archb_pipe_draw_reuse_verify COMMAND agc_driver_graphics_tests --draw-reuse)
+    set_tests_properties(agc_archb_pipe_draw_reuse_on agc_archb_pipe_draw_reuse_verify PROPERTIES TIMEOUT 30)
+    set_tests_properties(agc_archb_pipe_draw_reuse_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_PIPE_DRAW_REUSE_VERIFY=1")
+    if(WIN32)
+        set_tests_properties(agc_archb_pipe_draw_reuse_on agc_archb_pipe_draw_reuse_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 set_target_properties(agc_driver_graphics_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -3496,6 +3506,24 @@ if(BUILD_TESTING)
         if(WIN32)
             set_property(TEST ${agcTestName}_draw_set_pool APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
+    endforeach()
+    # APS5_ARCHB_PIPE_DRAW_REUSE (Stage 3 B1): the same draws with each pooled set's snapshots in its own
+    # slot buffer (a set whose slots match is used without a descriptor write); _verify rewrites the
+    # elements anyway and checks the set's previous batch completed.
+    foreach(agcTestName IN LISTS agcDrawSetPoolTests)
+        foreach(agcReuseMode IN ITEMS draw_reuse draw_reuse_verify)
+            add_test(NAME ${agcTestName}_${agcReuseMode} COMMAND ${agcTestName}_tests)
+            set(agcReuseEnv "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_PIPE_Q0_COMMITTER=1;APS5_ARCHB_FIX_DRAW_SET_POOL=1;APS5_ARCHB_PIPE_DRAW_REUSE=1;APS5_PIPELINE_STATS=1")
+            if(agcReuseMode STREQUAL "draw_reuse_verify")
+                set(agcReuseEnv "${agcReuseEnv};APS5_ARCHB_PIPE_DRAW_REUSE_VERIFY=1")
+            endif()
+            set_tests_properties(${agcTestName}_${agcReuseMode} PROPERTIES ENVIRONMENT "${agcReuseEnv}" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                FAIL_REGULAR_EXPRESSION "mismatches [1-9]")
+            set_property(TEST ${agcTestName}_${agcReuseMode} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PIPELINED_DRAWS=unset:")
+            if(WIN32)
+                set_property(TEST ${agcTestName}_${agcReuseMode} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            endif()
+        endforeach()
     endforeach()
     # Stage 2 cut A2b (APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS): a queued draw writes an indirect draw's
     # records; a GPU-side indirect draw after it queues behind it without draining (with the cut) and
