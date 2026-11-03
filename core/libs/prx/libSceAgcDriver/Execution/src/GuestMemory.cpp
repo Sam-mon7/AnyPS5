@@ -2711,13 +2711,19 @@ struct Entry {
     Serials serials{};
 };
 
+// APS5_ARCHB_FIX_STABLE_FAILED_WIDE (sampled per lookup): 8192 slots instead of 1024. A live census
+// (records/b1b2-count-1103-0754, APS5_STABLE_FAILED_DIAG) saw ~125 inserts/f with no page-state serial
+// moving at all: the re-inserts are ranges that lost their slot to another range. An entry carries its
+// range, so a lookup through the other width simply misses.
 struct Table {
     static constexpr std::size_t Entries = 1024;
-    std::array<Entry, Entries> entries{};
+    static constexpr std::size_t WideEntries = 8192;
+    std::array<Entry, WideEntries> entries{};
     Entry& at(std::uint64_t first, std::uint64_t stop) {
         auto key = (first >> 12) * 0x9e3779b97f4a7c15ull ^ (stop >> 12) * 0xc2b2ae3d27d4eb4full;
         key ^= key >> 29;
-        return entries[static_cast<std::size_t>(key % Entries)];
+        const auto slots = ArchB::Switches::Enabled(ArchB::Feature::FixStableFailedWide) ? WideEntries : Entries;
+        return entries[static_cast<std::size_t>(key % slots)];
     }
 };
 
@@ -2729,6 +2735,37 @@ Table& table() {
         HostThreadSlot<Table*, Slot>::Set(owned);
     }
     return *owned;
+}
+
+// APS5_STABLE_FAILED_DIAG (diagnostic, read once): why a settled lookup missed the table: an empty
+// slot, a slot holding another range, or this range under serials that moved (by serial; several
+// can move at once), or the serials were not settled.
+bool diagEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_STABLE_FAILED_DIAG");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+struct DiagCounters {
+    std::atomic<std::uint64_t> empty{0}, otherRange{0}, unwatched{0}, mapping{0}, committed{0}, protection{0}, forgotten{0}, unsettled{0};
+};
+
+DiagCounters& diagCounters() {
+    static auto* made = [] {
+        auto* counts = new DiagCounters();
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_diag_empty", counts->empty);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_diag_other_range", counts->otherRange);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_diag_unwatched", counts->unwatched);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_diag_mapping", counts->mapping);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_diag_committed", counts->committed);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_diag_protection", counts->protection);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_diag_forgotten", counts->forgotten);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_diag_unsettled", counts->unsettled);
+        return counts;
+    }();
+    return *made;
 }
 
 StableFailedCollectCounters& counters() {
@@ -2849,8 +2886,23 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const bool stableFailures = memoFailures && !Gen::Active() && stableFailed::active();
     const auto stableSerials = stableFailures ? stableFailed::read(unwatched, mapping) : stableFailed::Serials{};
     bool stableVerify = false;
+    if (stableFailures && !stableSerials.settled() && stableFailed::diagEnabled()) stableFailed::diagCounters().unsettled.fetch_add(1, std::memory_order_relaxed);
     if (stableFailures && stableSerials.settled()) {
         const auto& entry = stableFailed::table().at(first, stop);
+        if (stableFailed::diagEnabled() && !(entry.first == first && entry.stop == stop && entry.serials == stableSerials)) {
+            auto& diag = stableFailed::diagCounters();
+            if (entry.stop == 0) {
+                diag.empty.fetch_add(1, std::memory_order_relaxed);
+            } else if (entry.first != first || entry.stop != stop) {
+                diag.otherRange.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (entry.serials.unwatched != stableSerials.unwatched) diag.unwatched.fetch_add(1, std::memory_order_relaxed);
+                if (entry.serials.mapping != stableSerials.mapping) diag.mapping.fetch_add(1, std::memory_order_relaxed);
+                if (entry.serials.committed != stableSerials.committed) diag.committed.fetch_add(1, std::memory_order_relaxed);
+                if (entry.serials.protection != stableSerials.protection) diag.protection.fetch_add(1, std::memory_order_relaxed);
+                if (entry.serials.forgotten != stableSerials.forgotten) diag.forgotten.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (entry.first == first && entry.stop == stop && entry.serials == stableSerials) {
             if (!stableFailed::verify()) {
                 stableFailed::counters().hits.fetch_add(1, std::memory_order_relaxed);

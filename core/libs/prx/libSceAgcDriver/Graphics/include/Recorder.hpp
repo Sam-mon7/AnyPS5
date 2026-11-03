@@ -164,6 +164,20 @@ public:
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset = 0);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr);
     static constexpr std::size_t ContainingSnapshotProbes = 16;
+    // APS5_DRAW_BINDINGS_DIAG (diagnostic, read once, default off): what ReusableDrawSnapshot did for
+    // storage snapshots (PrepareDrawBindings' large-snapshot path), printed in "[draw-bindings]".
+    struct StorageSnapshotDiag {
+        std::atomic<std::uint64_t> exact{0};          // held entry, guest unchanged since its generation
+        std::atomic<std::uint64_t> refreshed{0};      // held entry, changed blocks compared and copied in place
+        std::atomic<std::uint64_t> refreshFailed{0};  // held entry changed and could not be refreshed (erased)
+        std::atomic<std::uint64_t> containing{0};     // served from a containing entry
+        std::atomic<std::uint64_t> missing{0};        // nothing held
+        std::atomic<std::uint64_t> comparedBytes{0};
+        std::atomic<std::uint64_t> copiedBytes{0};
+        std::atomic<std::uint64_t> compareNs{0};      // ChangedBlocks + CompareSpans + copies
+    };
+    static StorageSnapshotDiag& SnapshotDiag();
+    static bool SnapshotDiagEnabled();
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
     struct UploadSlice {

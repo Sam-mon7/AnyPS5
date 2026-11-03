@@ -1936,6 +1936,74 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     return resident;
 }
 
+// APS5_DRAW_BINDINGS_DIAG (diagnostic): the committer's lookup work of full-path draws by step
+// (template Find, moved read-only buffers, alias checks, the indirect path decision, CachedPipeline,
+// AcquireFramebuffer, the rest of the pipeline phase); proofs are left out. DrawLookupDiagText.
+namespace lookupDiag {
+enum Step : std::size_t { StepFind, StepMoved, StepAliases, StepDecide, StepCompletion, StepMasked, StepDepthFeedback, StepPipeline, StepFramebuffer, StepRest, StepTail, Steps };
+constexpr const char* StepNames[Steps] = {"find", "moved", "aliases", "decide", "completion", "masked", "depth_feedback", "pipeline", "framebuffer", "rest", "tail"};
+struct Counters {
+    std::array<std::atomic<std::uint64_t>, Steps> ns{};
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> hits{0};
+};
+Counters& counters() {
+    static auto* made = new Counters();
+    return *made;
+}
+thread_local bool active = false;
+thread_local std::chrono::steady_clock::time_point lap;
+void start() {
+    active = Recorder::SnapshotDiagEnabled() && GuestMemory::IsCommitterThread();
+    if (active) lap = std::chrono::steady_clock::now();
+}
+void restart() {
+    if (active) lap = std::chrono::steady_clock::now();
+}
+void mark(Step step) {
+    if (!active) return;
+    const auto now = std::chrono::steady_clock::now();
+    counters().ns[step].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lap).count()), std::memory_order_relaxed);
+    lap = now;
+}
+void finish(bool hit) {
+    if (!active) return;
+    active = false;
+    counters().draws.fetch_add(1, std::memory_order_relaxed);
+    if (hit) counters().hits.fetch_add(1, std::memory_order_relaxed);
+}
+}
+
+// APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO (Stage 3 B2): the queue-0 committer's memo of its template
+// lookups (ResourceCacheMemo); the template's proof, moved-buffer and alias checks run as before.
+namespace lookupMemo {
+ResourceCacheMemo::Counters& counters() {
+    static auto* made = [] {
+        auto* counts = new ResourceCacheMemo::Counters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_draw_lookup_memo_hits", counts->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_draw_lookup_memo_misses", counts->misses);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_draw_lookup_memo_stale", counts->stale);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_draw_lookup_memo_touches", counts->touches);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_draw_lookup_memo_verified", counts->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_draw_lookup_memo_mismatches", counts->mismatches);
+        return counts;
+    }();
+    return *made;
+}
+bool verify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+std::shared_ptr<ShaderResources> find(const ResourceCache::Key& key) {
+    if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeDrawLookupMemo) || !GuestMemory::IsCommitterThread()) return SharedResourceCache().Find(key);
+    thread_local ResourceCacheMemo* memoSlot = nullptr;
+    return ShaderRecompiler::ThreadOwned(memoSlot).Find(SharedResourceCache(), key, verify(), counters());
+}
+}
+
 // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
 // stages repeat, or a fresh build.
 struct ResolvedResources {
@@ -1948,6 +2016,7 @@ struct ResolvedResources {
 
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, DrawPreparation* preparation) {
     ResolvedResources resolved;
+    lookupDiag::active = false;
     auto lookupLap = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lookupPhase = [&](LookupPhase phase) {
         if (!timer.profile) return;
@@ -1971,7 +2040,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             resolved.contentKey = std::exchange(preparation->resourceKey, {});
             if (timer.profile) preparation->keyUsed = true;
         } else resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        auto cached = SharedResourceCache().Find(resolved.contentKey);
+        lookupDiag::start();
+        auto cached = lookupMemo::find(resolved.contentKey);
+        lookupDiag::mark(lookupDiag::StepFind);
         if (timer.profile && preparation != nullptr && preparation->device != VK_NULL_HANDLE) preparation->cacheChanged |= cached.owner_before(preparation->cached) || preparation->cached.owner_before(cached);
         if (cached != nullptr) {
             lookupPhase(LookupKeyFind);
@@ -1979,11 +2050,14 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             const bool valid = cached->Revalidate(shaders);
             lookupPhase(LookupProof);
             reuseCensus::mark(StructCensus::ReuseProof);
+            lookupDiag::restart();
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            lookupDiag::mark(lookupDiag::StepMoved);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                lookupDiag::mark(lookupDiag::StepAliases);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 if (timer.profile) outcome.movedBuffers = resolved.moved.size();
@@ -3162,6 +3236,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& indirect = prepared.indirect;
     indirect.args = args;
     auto& records = prepared.records;
+    lookupDiag::restart();
     if (args != nullptr) {
         static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
         const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) {
@@ -3207,6 +3282,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             }
         }
     }
+    lookupDiag::mark(lookupDiag::StepDecide);
     // A draw whose only completion work is a BDA fault check (the rect-list stages carry a fault
     // buffer, so every rect-list draw needed one) is recorded too, with the check as a completion
     // action like a dispatch's write-back: its own batch would first wait for everything recorded
@@ -3250,6 +3326,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
     if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    lookupDiag::mark(lookupDiag::StepCompletion);
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
@@ -3275,11 +3352,14 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
     }
+    lookupDiag::mark(lookupDiag::StepRest);
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
+    lookupDiag::mark(lookupDiag::StepDepthFeedback);
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto& masked = prepared.masked;
     masked = maskedState(state, inputs.fragmentOutputs);
+    lookupDiag::mark(lookupDiag::StepMasked);
     if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) recipeOut = nullptr;
     for (std::size_t index = 0; index < targets.size(); ++index) {
         if (!targets[index].proxied) continue;
@@ -3305,7 +3385,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
     auto& pipeline = prepared.pipeline;
+    lookupDiag::mark(lookupDiag::StepRest);
     pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    lookupDiag::mark(lookupDiag::StepPipeline);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     auto& owners = prepared.owners;
@@ -3318,6 +3400,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     auto& framebuffer = prepared.framebuffer;
     framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+    lookupDiag::mark(lookupDiag::StepFramebuffer);
     auto& reordered = prepared.reordered;
     auto& reorderPass = prepared.reorderPass;
     if (pipeline->ReordersSamples()) {
@@ -3329,6 +3412,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
     }
     prepared.depthLocations = passDepthLocations(context, pipelineState, *pipeline);
+    lookupDiag::mark(lookupDiag::StepTail);
+    lookupDiag::finish(outcome.kind == KindTemplateHit);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     return true;
@@ -4037,5 +4122,21 @@ bool TakeLastDrawPhases(std::array<double, DrawGraphicsPhaseCount>& us) {
     us = last.us;
     last.set = false;
     return true;
+}
+
+// APS5_DRAW_BINDINGS_DIAG: a "[draw-lookup-diag]" line (cumulative ns per step); empty when off.
+std::string DrawLookupDiagText() {
+    if (!Recorder::SnapshotDiagEnabled()) return {};
+    auto& counters = lookupDiag::counters();
+    std::string text = "[draw-lookup-diag] cumulative: draws " + std::to_string(counters.draws.load(std::memory_order_relaxed)) + " template_hits " + std::to_string(counters.hits.load(std::memory_order_relaxed));
+    for (std::size_t step = 0; step < lookupDiag::Steps; ++step) text += std::string(" ") + lookupDiag::StepNames[step] + "_ns " + std::to_string(counters.ns[step].load(std::memory_order_relaxed));
+    return text;
+}
+
+// APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO: a "[draw-lookup-memo]" cumulative line.
+std::string DrawLookupMemoText() {
+    auto& counters = lookupMemo::counters();
+    const auto get = [](const std::atomic<std::uint64_t>& value) { return std::to_string(value.load(std::memory_order_relaxed)); };
+    return "[draw-lookup-memo] cumulative: hits " + get(counters.hits) + " misses " + get(counters.misses) + " stale " + get(counters.stale) + " touches " + get(counters.touches) + " verified " + get(counters.verified) + " mismatches " + get(counters.mismatches);
 }
 }

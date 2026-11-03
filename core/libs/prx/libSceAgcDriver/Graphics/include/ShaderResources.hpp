@@ -9,6 +9,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <list>
@@ -219,14 +220,24 @@ public:
         // instead of the template's own buffer descriptors.
         std::shared_ptr<DrawSetPool> pool;
         std::vector<std::size_t> overridden;
-        // APS5_ARCHB_PIPE_DRAW_REUSE (Stage 3 B1): the snapshots live in this set's own buffer, the
-        // elements `overridden` names pointing at `slotOffsets`/`slotSizes` in it; the set returns to
-        // the pool with them, so a later draw selecting the same elements and sizes copies its bytes
-        // there and writes no descriptor. `slotSerial`: the batch that used them (verification).
+        // APS5_ARCHB_PIPE_DRAW_REUSE (Stage 3 B1): the snapshots within the upload limit live in this
+        // set's own slot buffer (the elements `slotElements` names, at `slotOffsets`/`slotSizes`); the
+        // set returns to the pool with them, so a later draw selecting the same small elements and sizes
+        // copies its bytes there. `held`: per element of `overridden`, the buffer (weakly: an expired
+        // buffer never compares equal, and a shared snapshot's refresh-in-place still sees itself as
+        // the only owner), offset and range the set's descriptor holds, so the pool's next draw writes
+        // only the elements whose descriptor changed. `serial`: the batch that used the set.
+        struct Held {
+            std::weak_ptr<Buffer> buffer;
+            VkDeviceSize offset = 0;
+            VkDeviceSize range = 0;
+        };
+        std::vector<Held> held;
         std::shared_ptr<Buffer> slotBuffer;
+        std::vector<std::size_t> slotElements;
         std::vector<VkDeviceSize> slotOffsets;
         std::vector<std::size_t> slotSizes;
-        std::uint64_t slotSerial = 0;
+        std::uint64_t serial = 0;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -248,6 +259,9 @@ public:
     static std::size_t MaxDrawSnapshotBytes();
     // APS5_ARCHB_PIPE_DRAW_REUSE: a "[draw-reuse]" summary of the slot counters.
     static std::string DrawReuseText();
+    // APS5_DRAW_BINDINGS_DIAG (diagnostic, read once): a "[draw-bindings]" line splitting
+    // PrepareDrawBindings by snapshot path (counts, bytes, ns; cumulative); empty when off.
+    static std::string DrawBindingsDiagText();
     static std::size_t DrawUploadLimit();
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
@@ -309,6 +323,11 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces(bool memoVirtualQuery = false) const;
     bool Reusable() const { return reusable; }
+    // APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO: a serial unique to this object's insertion into the shared
+    // resource cache while the cache holds it, 0 once it left (ResourceCache sets it under its mutex),
+    // so a memo of a Find result stays exactly what Find would return while the serial holds.
+    std::uint64_t CacheMembership() const { return cacheMembership.load(std::memory_order_acquire); }
+    void SetCacheMembership(std::uint64_t serial) const { cacheMembership.store(serial, std::memory_order_release); }
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
@@ -679,6 +698,7 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    mutable std::atomic<std::uint64_t> cacheMembership{0};
     bool provedOnce = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
@@ -772,6 +792,8 @@ class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    // The hash the cache's index uses (ResourceCacheMemo keys its table with it).
+    static std::size_t HashKey(const Key& key) noexcept { return KeyHash{}(key); }
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
@@ -850,6 +872,38 @@ private:
 // The process-wide cache the device and the draw path share (keys name the device; a device clears
 // it when it goes). Never destroyed: entries belong to the device, not to static teardown.
 ResourceCache& SharedResourceCache();
+
+// APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO (Stage 3 B2): one thread's memo of ResourceCache::Find results,
+// direct-mapped by the key's hash. An entry answers while its object is still the cache's insertion
+// it was found as (ShaderResources::CacheMembership, cleared under the cache's mutex whenever the
+// entry leaves: replaced, evicted, removed, image or texture dropped, cleared), i.e. exactly what
+// Find would return then; a hit skips the cache's mutex, index lookup and LRU bookkeeping, and
+// touches the LRU every TouchEvery-th use so a template used only through the memo does not age out.
+// With `verify` it calls Find anyway, returns Find's answer and counts a different one.
+class ResourceCacheMemo {
+public:
+    struct Counters {
+        std::atomic<std::uint64_t> hits{0};
+        std::atomic<std::uint64_t> misses{0};   // no entry for the key (Find called)
+        std::atomic<std::uint64_t> stale{0};    // an entry whose object left the cache (Find called)
+        std::atomic<std::uint64_t> touches{0};
+        std::atomic<std::uint64_t> verified{0};
+        std::atomic<std::uint64_t> mismatches{0};
+    };
+    static constexpr std::size_t Entries = 4096;
+    static constexpr std::uint32_t TouchEvery = 32;
+    std::shared_ptr<ShaderResources> Find(ResourceCache& cache, const ResourceCache::Key& key, bool verify, Counters& counters);
+
+private:
+    struct Entry {
+        std::uint64_t hash = 0;
+        ResourceCache::Key key;
+        std::weak_ptr<ShaderResources> resources;
+        std::uint64_t membership = 0;
+        std::uint32_t uses = 0;
+    };
+    std::vector<Entry> entries;
+};
 
 }
 

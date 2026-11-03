@@ -47,6 +47,7 @@ constexpr Feature PipeDispatchAliasPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeCollectSharePrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeCopyKernelItemsPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeDrawReusePrerequisites[] = {Feature::PipeQ0Committer};
+constexpr Feature PipeDrawLookupMemoPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -90,6 +91,8 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::PipeCopyKernelItems, "PIPE_COPY_KERNEL_ITEMS", false, true, PipeCopyKernelItemsPrerequisites},
     {Feature::FixStableFailedCollects, "FIX_STABLE_FAILED_COLLECTS", false, true, {}},
     {Feature::PipeDrawReuse, "PIPE_DRAW_REUSE", false, true, PipeDrawReusePrerequisites},
+    {Feature::PipeDrawLookupMemo, "PIPE_DRAW_LOOKUP_MEMO", false, true, PipeDrawLookupMemoPrerequisites},
+    {Feature::FixStableFailedWide, "FIX_STABLE_FAILED_WIDE", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

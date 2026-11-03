@@ -20,6 +20,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+
+namespace AgcDriver::Graphics {
+// APS5_DRAW_BINDINGS_DIAG (Draw.cpp): the committer's lookup steps; empty when off.
+std::string DrawLookupDiagText();
+// APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO (Draw.cpp): the committer's template memo counters.
+std::string DrawLookupMemoText();
+// APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO (Pipeline.cpp): the committer's pipeline memo counters.
+std::string PipelineLookupMemoText();
+}
 #include <string>
 
 namespace AgcDriver::DriverDetail {
@@ -726,6 +735,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CumulativeText().c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", Graphics::ShaderResources::DrawSetPoolText().c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", Graphics::ShaderResources::DrawReuseText().c_str());
+    if (const auto diag = Graphics::ShaderResources::DrawBindingsDiagText(); !diag.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", diag.c_str());
+    if (const auto diag = Graphics::DrawLookupDiagText(); !diag.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", diag.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", Graphics::DrawLookupMemoText().c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", Graphics::PipelineLookupMemoText().c_str());
 }
 
 
@@ -832,6 +845,10 @@ void DrawPipeline::Stop() {
         AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", CumulativeText().c_str());
         AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", Graphics::ShaderResources::DrawSetPoolText().c_str());
         AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", Graphics::ShaderResources::DrawReuseText().c_str());
+        if (const auto diag = Graphics::ShaderResources::DrawBindingsDiagText(); !diag.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", diag.c_str());
+        if (const auto diag = Graphics::DrawLookupDiagText(); !diag.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", diag.c_str());
+        AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", Graphics::DrawLookupMemoText().c_str());
+        AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", Graphics::PipelineLookupMemoText().c_str());
     }
     std::thread committer;
     {

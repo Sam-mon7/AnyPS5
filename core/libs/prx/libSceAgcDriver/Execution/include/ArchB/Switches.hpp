@@ -50,6 +50,8 @@ enum class Feature : std::uint8_t {
     PipeCopyKernelItems,
     FixStableFailedCollects,
     PipeDrawReuse,
+    PipeDrawLookupMemo,
+    FixStableFailedWide,
     Count
 };
 

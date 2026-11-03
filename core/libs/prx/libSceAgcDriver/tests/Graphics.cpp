@@ -6254,10 +6254,12 @@ void drawSetPoolTests() {
     std::cout << "draw set pool tests passed\n";
 }
 
-// APS5_ARCHB_PIPE_DRAW_REUSE (Stage 3 B1): on the committer, a pooled set keeps its snapshots in its own slot
-// buffer; the template's next draw selecting the same elements takes that set, copies the current guest
+// APS5_ARCHB_PIPE_DRAW_REUSE (Stage 3 B1): on the committer, a pooled set keeps its small snapshots in its own
+// slot buffer; the template's next draw selecting the same elements takes that set, copies the current guest
 // bytes into the slots and writes no descriptor (with _VERIFY it rewrites them and checks the batch); a draw
 // while the set is in use takes a fresh set and writes it in full; a different selection lays out new slots.
+// Shared snapshots (here moved word buffers; large guest snapshots take the same path) stay out of the slots,
+// and a pooled set rewrites such an element only when its buffer changed.
 void drawReuseTests() {
     using AgcDriver::Graphics::DescriptorCache;
     using AgcDriver::Graphics::Recorder;
@@ -6328,8 +6330,8 @@ void drawReuseTests() {
         auto second = draw();
         Require(second->allocation.set == set && second->slotBuffer.get() == slots && second->slotOffsets == offsets, "the next draw did not take the set with matching slots");
         Require(holds(*second, 0, guestFirst.data()), "a matched slot did not get the current guest bytes");
-        if (verifying) Require(!mock.writes.empty() && text().find("verified 1,") != std::string::npos && text().find("mismatches 0") != std::string::npos, "verification did not rewrite and check the matched set: " + text());
-        else Require(mock.writes.empty() && text().find(" 1 slot hits") != std::string::npos, "a matched set was written again: " + text());
+        if (verifying) Require(!mock.writes.empty() && text().find("verified 3,") != std::string::npos && text().find("mismatches 0") != std::string::npos, "verification did not rewrite and check the matched set: " + text());
+        else Require(mock.writes.empty() && text().find(" 1 with no descriptor write") != std::string::npos && text().find("slots: 1 hits") != std::string::npos, "a matched set was written again: " + text());
 
         // In use: the next draw takes a fresh set and slots and writes them in full.
         auto third = draw();
@@ -6344,12 +6346,133 @@ void drawReuseTests() {
         auto fourth = resources.PrepareDrawBindings(recorder, one);
         Require(fourth != nullptr && fourth->snapshots.size() == 1 && fourth->slotSizes.size() == 1 && fourth->slotBuffer.get() != slots, "a new selection did not lay out new slots");
         Require(!mock.writes.empty() && holds(*fourth, 0, guestSecond.data()), "a new selection's set was not rewritten from its slots");
-        fourth.reset();
+        release(fourth);
+
+        // Shared and slotted elements in one draw (another template, so its pool starts empty): element 0
+        // from moved words (a held word buffer, the shared path), element 1 from a moved address (a slot).
+        ShaderResources mixed(context, vertex, fragment, state.color, 0, 0);
+        std::vector<std::uint32_t> words(4, 0x7a7a0000u);
+        const auto drawMixed = [&] {
+            mock.writes.clear();
+            const std::vector<ShaderResources::MovedBuffer> both{{0, 0, 16, words}, {1, reinterpret_cast<std::uint64_t>(guestSecond.data()), 32, {}}};
+            auto bindings = mixed.PrepareDrawBindings(recorder, both);
+            Require(bindings != nullptr && bindings->snapshots.size() == 2 && bindings->slotElements == std::vector<std::size_t>{1}, "a mixed draw did not slot only its small guest snapshot: " + text());
+            Require(bindings->snapshots[0].buffer != bindings->slotBuffer && holds(*bindings, 1, guestSecond.data()), "a shared snapshot went into the slots");
+            return bindings;
+        };
+        auto fifth = drawMixed();
+        Require(!mock.writes.empty(), "a fresh mixed set was not written");
+        const auto mixedSet = fifth->allocation.set;
+        const auto wordBuffer = fifth->snapshots[0].buffer.get();
+        release(fifth);
+        // Nothing changed: the shared element keeps its held word buffer and the slot matches.
+        auto sixth = drawMixed();
+        Require(sixth->allocation.set == mixedSet && sixth->snapshots[0].buffer.get() == wordBuffer, "the mixed draw did not reuse its set and word buffer");
+        if (verifying) Require(!mock.writes.empty() && text().find("mismatches 0") != std::string::npos, "verification did not rewrite the unchanged mixed set: " + text());
+        else Require(mock.writes.empty(), "an unchanged mixed draw wrote descriptors");
+        release(sixth);
+        // New words: a new shared buffer, so only element 0 is written (element 1's slot still matches).
+        words.assign(4, 0x7b7b0000u);
+        auto seventh = drawMixed();
+        Require(seventh->allocation.set == mixedSet && seventh->snapshots[0].buffer.get() != wordBuffer, "new words did not make a new shared buffer");
+        if (!verifying) {
+            Require(mock.writes.size() == 1 && mock.writes.front().binding == 0 && mock.writes.front().arrayElement == 0 && mock.writes.front().count == 1, "a changed shared element was not the only element written");
+            Require(mock.writes.front().buffers[0].buffer == seventh->snapshots[0].buffer->Handle(), "the changed shared element does not point at its new buffer");
+        }
+        Require(text().find("mismatches 0") != std::string::npos, "draw reuse counted a mismatch: " + text());
+        seventh.reset();
         recorder.Sync();
     }
     guestFirst = guestFirstSaved;
     Require(mock.live == 0, "slotted draw sets leaked Vulkan objects");
     std::cout << "draw reuse tests passed\n";
+}
+
+// APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO (Stage 3 B2): a ResourceCacheMemo answers exactly what ResourceCache::Find
+// would: the found object while the cache still holds that insertion; after a replacement, removal, clear or
+// eviction it asks the cache again; it touches the cache's LRU every TouchEvery-th use. With
+// APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO_VERIFY=1 every hit is checked against Find.
+void lookupMemoTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::ResourceCache;
+    using AgcDriver::Graphics::ResourceCacheMemo;
+    using AgcDriver::Graphics::ShaderResources;
+    const char* verifyText = std::getenv("APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO_VERIFY");
+    const bool verifying = verifyText != nullptr && std::string_view(verifyText) == "1";
+    mock = MockVulkan{};
+    mock.allowCopies = true;
+    auto context = mockContext();
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestFirst.data(), 16)));
+        fragment.bindings.push_back(makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8)));
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        const auto make = [&] { return std::make_shared<ShaderResources>(context, vertex, fragment, state.color, 0, 0); };
+        ResourceCache templates;
+        ResourceCacheMemo memo;
+        ResourceCacheMemo::Counters counters;
+        const auto count = [](const std::atomic<std::uint64_t>& value) { return value.load(); };
+        const ResourceCache::Key a{0xffffffffu, 1, 2, 3}, b{0xffffffffu, 4, 5, 6, 7};
+        auto first = make();
+        Require(first->CacheMembership() == 0, "a new template claims cache membership");
+        templates.Insert(a, first);
+        Require(first->CacheMembership() != 0, "an inserted template has no cache membership");
+        Require(memo.Find(templates, a, verifying, counters) == first && count(counters.misses) == 1, "the memo's first lookup did not ask the cache");
+        Require(memo.Find(templates, a, verifying, counters) == first && count(counters.hits) == 1, "a memo entry did not answer");
+        Require(memo.Find(templates, b, verifying, counters) == nullptr && count(counters.misses) == 2, "an unknown key was answered");
+        // Replaced under the key: the old entry is stale and the memo returns the new insertion.
+        auto second = make();
+        templates.Insert(a, second);
+        Require(first->CacheMembership() == 0 && second->CacheMembership() != 0, "a replaced template kept its membership");
+        Require(memo.Find(templates, a, verifying, counters) == second && count(counters.stale) == 1, "a replaced template was answered");
+        Require(memo.Find(templates, a, verifying, counters) == second && count(counters.hits) == 2, "the replacement was not memoized");
+        // Removed (the object still alive here): stale, then nothing; reinserted: a fresh insertion is found.
+        templates.Remove(a);
+        Require(second->CacheMembership() == 0 && memo.Find(templates, a, verifying, counters) == nullptr && count(counters.stale) == 2, "a removed template was answered");
+        templates.Insert(a, second);
+        Require(memo.Find(templates, a, verifying, counters) == second && count(counters.misses) == 3, "a reinserted template was not found anew");
+        // LRU touches: every TouchEvery-th use of an entry.
+        const auto touches = count(counters.touches);
+        for (std::uint32_t use = 0; use < ResourceCacheMemo::TouchEvery; ++use) Require(memo.Find(templates, a, verifying, counters) == second, "a memoized template was lost");
+        Require(count(counters.touches) == touches + 1, "the memo did not touch the cache's LRU once per TouchEvery uses");
+        // Cleared: stale.
+        templates.Clear();
+        Require(second->CacheMembership() == 0 && memo.Find(templates, a, verifying, counters) == nullptr && count(counters.stale) == 3, "a cleared template was answered");
+        // Evicted over the bound (a fresh cache bounded to one entry).
+#ifdef _WIN32
+        _putenv_s("APS5_RESOURCE_CACHE_ENTRIES", "1");
+#else
+        setenv("APS5_RESOURCE_CACHE_ENTRIES", "1", 1);
+#endif
+        {
+            ResourceCache bounded;
+            ResourceCacheMemo boundedMemo;
+            ResourceCacheMemo::Counters boundedCounters;
+            auto third = make();
+            auto fourth = make();
+            bounded.Insert(a, third);
+            Require(boundedMemo.Find(bounded, a, verifying, boundedCounters) == third, "the bounded cache lost its entry");
+            bounded.Insert(b, fourth);
+            Require(third->CacheMembership() == 0 && boundedMemo.Find(bounded, a, verifying, boundedCounters) == nullptr && count(boundedCounters.stale) == 1, "an evicted template was answered");
+            Require(boundedMemo.Find(bounded, b, verifying, boundedCounters) == fourth, "the bound's survivor was not found");
+            Require(count(boundedCounters.mismatches) == 0, "the bounded memo counted a mismatch");
+            bounded.Clear();
+        }
+#ifdef _WIN32
+        _putenv_s("APS5_RESOURCE_CACHE_ENTRIES", "");
+#else
+        unsetenv("APS5_RESOURCE_CACHE_ENTRIES");
+#endif
+        Require(count(counters.mismatches) == 0, "the memo counted a mismatch");
+        if (verifying) Require(count(counters.verified) == count(counters.hits), "verification did not check every hit");
+        else Require(count(counters.verified) == 0, "hits were verified without verification");
+        templates.Clear();
+    }
+    Require(mock.live == 0, "memoized templates leaked Vulkan objects");
+    std::cout << "lookup memo tests passed\n";
 }
 
 alignas(16) std::array<std::uint32_t, 8> guestMovedFirst{0x51515151, 0x52525252, 0x53535353, 0x54545454, 0x55555555, 0x56565656, 0x57575757, 0x58585858};
@@ -12394,6 +12517,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-set-pool") {
             drawSetPoolTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--lookup-memo") {
+            lookupMemoTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-reuse") {

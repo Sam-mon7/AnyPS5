@@ -11,7 +11,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1348,6 +1352,90 @@ void reportPipelines(PipelineStore& store) {
 
 }
 
+// APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO (Stage 3 B2): the queue-0 committer's last pipelines by store key.
+// An entry answers a lookup of the same key on the same device instance (handle and buffer pool) while
+// its pipeline lives, without the store's hash, mutex, index and LRU work; every TouchEvery-th use goes
+// through the store instead, so a pipeline used through the memo does not age out of the store.
+namespace pipelineMemo {
+constexpr std::size_t Entries = 8;
+constexpr std::uint32_t TouchEvery = 32;
+struct Entry {
+    VkDevice device = VK_NULL_HANDLE;
+    const BufferPool* poolRaw = nullptr;
+    std::weak_ptr<BufferPool> pool;
+    std::vector<std::byte> key;
+    std::weak_ptr<Pipeline> pipeline;
+    std::uint32_t uses = 0;
+};
+struct Table {
+    std::array<Entry, Entries> entries;
+    std::size_t next = 0;
+};
+struct Counters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+};
+Counters& counters() {
+    static auto* made = [] {
+        auto* counts = new Counters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_draw_lookup_memo_pipeline_hits", counts->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_draw_lookup_memo_pipeline_misses", counts->misses);
+        return counts;
+    }();
+    return *made;
+}
+bool active() {
+    return AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeDrawLookupMemo) && AgcDriver::GuestMemory::IsCommitterThread();
+}
+Table& table() {
+    struct Tag {};
+    return HostThreadLocal<Table, Tag>();
+}
+bool sameDevice(const Entry& entry, const Context& context) {
+    if (entry.device != context.device || entry.poolRaw != context.bufferPool.get()) return false;
+    return entry.poolRaw == nullptr || !entry.pool.expired();
+}
+// The memoized pipeline, or nullptr (a miss, or a use that goes through the store).
+std::shared_ptr<Pipeline> find(const Context& context, const std::vector<std::byte>& key) {
+    for (auto& entry : table().entries) {
+        if (entry.key.size() != key.size() || entry.device != context.device || std::memcmp(entry.key.data(), key.data(), key.size()) != 0) continue;
+        if (!sameDevice(entry, context) || ++entry.uses % TouchEvery == 0) break;
+        if (auto pipeline = entry.pipeline.lock()) {
+            counters().hits.fetch_add(1, std::memory_order_relaxed);
+            return pipeline;
+        }
+        break;
+    }
+    counters().misses.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+}
+void remember(const Context& context, const std::vector<std::byte>& key, const std::shared_ptr<Pipeline>& pipeline) {
+    auto& memo = table();
+    Entry* slot = nullptr;
+    for (auto& entry : memo.entries) {
+        if (entry.key.size() == key.size() && entry.device == context.device && std::memcmp(entry.key.data(), key.data(), key.size()) == 0) {
+            slot = &entry;
+            break;
+        }
+    }
+    if (slot == nullptr) {
+        slot = &memo.entries[memo.next];
+        memo.next = (memo.next + 1) % Entries;
+        slot->key.assign(key.begin(), key.end());
+        slot->uses = 0;
+    }
+    slot->device = context.device;
+    slot->poolRaw = context.bufferPool.get();
+    slot->pool = context.bufferPool;
+    slot->pipeline = pipeline;
+}
+}
+
+std::string PipelineLookupMemoText() {
+    auto& counts = pipelineMemo::counters();
+    return "[pipeline-memo] cumulative: hits " + std::to_string(counts.hits.load(std::memory_order_relaxed)) + " misses " + std::to_string(counts.misses.load(std::memory_order_relaxed));
+}
+
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     return CachedPipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout);
 }
@@ -1365,6 +1453,10 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         ++store.uncached;
         ++store.totals.uncached;
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    }
+    const bool memo = pipelineMemo::active();
+    if (memo) {
+        if (auto pipeline = pipelineMemo::find(context, key)) return pipeline;
     }
     const auto hash = hashKey(key);
     // The store's entry of the key, or nullptr with `found` telling a miss (the key is new) from a
@@ -1394,6 +1486,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         if (auto pipeline = lookup(collision)) {
             ++store.hits;
             ++store.totals.hits;
+            if (memo) pipelineMemo::remember(context, key, pipeline);
             return pipeline;
         }
         if (collision) {
@@ -1452,6 +1545,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     }
     if (created != nullptr) *created = true;
     if (PipelineJournalEnabled() && !PipelineJournalReplaying()) RecordGraphicsPipeline(MakeGraphicsPipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout), shaders);
+    if (memo) pipelineMemo::remember(context, key, pipeline);
     return pipeline;
 }
 

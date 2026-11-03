@@ -3168,21 +3168,46 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
     unwrittenBytes += bytes;
 }
 
+Recorder::StorageSnapshotDiag& Recorder::SnapshotDiag() {
+    static auto* diag = new StorageSnapshotDiag();
+    return *diag;
+}
+
+bool Recorder::SnapshotDiagEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_DRAW_BINDINGS_DIAG");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset) {
     const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Snapshot);
+    const bool diag = use == SnapshotUse::Storage && SnapshotDiagEnabled();
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) {
         if (use != SnapshotUse::Storage || offset == nullptr) return {};
-        return containingDrawSnapshot(address, bytes, offset);
+        auto contained = containingDrawSnapshot(address, bytes, offset);
+        if (diag) (contained != nullptr ? SnapshotDiag().containing : SnapshotDiag().missing).fetch_add(1, std::memory_order_relaxed);
+        return contained;
     }
     if (offset != nullptr) *offset = 0;
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
-        if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
+        const auto refreshStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool refreshed = sameRegistry && generation != 0 && use == SnapshotUse::Storage && refreshDrawSnapshot(found->second, address, bytes);
+        if (diag) {
+            auto& counters = SnapshotDiag();
+            counters.compareNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - refreshStart).count()), std::memory_order_relaxed);
+            (refreshed ? counters.refreshed : counters.refreshFailed).fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!refreshed) {
             eraseDrawSnapshot(found);
             return {};
         }
         found->second.generation = generation;
+    } else if (diag) {
+        SnapshotDiag().exact.fetch_add(1, std::memory_order_relaxed);
     }
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
@@ -3242,6 +3267,11 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
     }
     equal.assign(spans.size(), 0);
     CompareSpans(spans, equal);
+    if (SnapshotDiagEnabled()) {
+        std::size_t compared = 0;
+        for (const auto& span : spans) compared += span.bytes;
+        SnapshotDiag().comparedBytes.fetch_add(compared, std::memory_order_relaxed);
+    }
     for (std::size_t k = 0; k < spans.size(); ++k) {
         if (equal[k] != 0) continue;
         const auto offset = static_cast<std::size_t>(static_cast<const std::byte*>(spans[k].first) - held.data());
@@ -3251,6 +3281,11 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         else differing.emplace_back(offset, length);
     }
     for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
+    if (SnapshotDiagEnabled()) {
+        std::size_t copied = 0;
+        for (const auto& [offset, length] : differing) copied += length;
+        SnapshotDiag().copiedBytes.fetch_add(copied, std::memory_order_relaxed);
+    }
     return true;
 }
 
