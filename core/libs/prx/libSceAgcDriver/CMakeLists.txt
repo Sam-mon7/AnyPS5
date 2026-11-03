@@ -584,9 +584,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_pipe_committer_mutex_priority_switch COMMAND agc_archb_c01_switches_tests --toggle PipeCommitterMutexPriority)
     add_test(NAME agc_archb_pipe_full_hysteresis_switch COMMAND agc_archb_c01_switches_tests --toggle PipeFullHysteresis)
     add_test(NAME agc_archb_pipe_dispatch_alias_switch COMMAND agc_archb_c01_switches_tests --toggle PipeDispatchAlias)
-    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_archb_pipe_collect_share_switch COMMAND agc_archb_c01_switches_tests --toggle PipeCollectShare)
+    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
@@ -1059,6 +1060,22 @@ if(BUILD_TESTING)
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
             set_tests_properties(agc_archb_fix_wt_bookkeeping_${bookkeepingCase}_verify PROPERTIES TIMEOUT 60
                 ENVIRONMENT "APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING=1;APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endforeach()
+        # APS5_ARCHB_PIPE_COLLECT_SHARE: committer collects answered from queue 0's walks of the same
+        # ordering point only (on), walked but counted (verify, with a mismatch), never (off).
+        foreach(shareMode IN ITEMS on verify off)
+            add_test(NAME agc_archb_pipe_collect_share_${shareMode} COMMAND agc_write_tracking_tests --collect-share-${shareMode})
+            set(shareValue 1)
+            if(shareMode STREQUAL "off")
+                set(shareValue 0)
+            endif()
+            set(shareVerify 0)
+            if(shareMode STREQUAL "verify")
+                set(shareVerify 1)
+            endif()
+            set_tests_properties(agc_archb_pipe_collect_share_${shareMode} PROPERTIES TIMEOUT 30
+                ENVIRONMENT "APS5_ARCHB_PIPE_Q0_COMMITTER=1;APS5_ARCHB_PIPE_COLLECT_SHARE=${shareValue};APS5_ARCHB_PIPE_COLLECT_SHARE_VERIFY=${shareVerify}"
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endforeach()
         add_test(NAME agc_write_tracking_wt_bookkeeping COMMAND agc_write_tracking_tests)

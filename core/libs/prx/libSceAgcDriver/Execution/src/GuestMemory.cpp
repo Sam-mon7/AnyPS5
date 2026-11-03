@@ -2150,9 +2150,16 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 }
 #endif
 
-bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool memoVirtualQuery = false) {
+bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool memoVirtualQuery = false, std::uint64_t* stamped = nullptr) {
     tracker.bump();
     StampRuns runs{tracker, kind, 0, window};
+    struct ReportStamped {
+        const StampRuns& runs;
+        std::uint64_t* stamped;
+        ~ReportStamped() {
+            if (stamped != nullptr) *stamped = runs.stamped;
+        }
+    } reportStamped{runs, stamped};
     // Write generations: a complete resetting walk covers its pages at the ticket read before its
     // OS query (rule V2); a failed one leaves its blocks unknown until a later walk succeeds (no
     // meta bump: the dirty bits it did not reset are reported by that walk).
@@ -2220,6 +2227,104 @@ CollectHitCache& collectHitCache() {
 // The queue-0 committer's collect counters (see GuestMemory.hpp).
 thread_local bool committerThread = false;
 
+// APS5_ARCHB_PIPE_COLLECT_SHARE (see GuestMemory.hpp): queue 0's completed walks, per page, with the
+// collect clock (nextCollectEpoch) each walk read before its OS query, under the tracker mutex. A
+// page holding clock c was walked after every epoch bump numbered <= c, so it covers an item whose
+// ordering point is such a bump. Each page also carries the table generation it was recorded in: a
+// walk under newer unwatch or mapping serials starts a new generation, retiring every older entry
+// (the clocks of older generations are kept in the top 16 bits' place, never compared).
+namespace collectShare {
+thread_local bool producer = false;
+constexpr std::uint64_t Unknown = std::numeric_limits<std::uint64_t>::max();
+// The committer's requirement: the ordering point of the item it commits (Unknown: nothing shared),
+// raised by its own ordering points (floor).
+thread_local std::uint64_t required = Unknown;
+thread_local std::uint64_t floor = 0;
+thread_local std::uint64_t memoHits = 0;
+
+bool active() {
+    return ArchB::Switches::Enabled(ArchB::Feature::PipeCollectShare);
+}
+
+bool verify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_PIPE_COLLECT_SHARE_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+#ifdef _WIN32
+struct Table {
+    static constexpr std::size_t ChunkPages = 16384;
+    static constexpr unsigned GenerationShift = 48;
+    static constexpr std::uint64_t ClockMask = (std::uint64_t{1} << GenerationShift) - 1;
+    std::vector<std::unique_ptr<std::uint64_t[]>> chunks;
+    std::uintptr_t base = 0;
+    bool initialized = false;
+    bool serialsKnown = false;
+    std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
+    std::uint64_t generation = 0;
+};
+
+Table& table() {
+    static auto* shared = new Table();
+    return *shared;
+}
+
+// Under the tracker mutex, with the tracker initialized and watched and [first, stop) inside it.
+void record(const WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, std::uint64_t clock, std::uint64_t unwatched, std::uint64_t mapping) {
+    auto& shared = table();
+    if (!shared.initialized) {
+        shared.initialized = true;
+        shared.base = tracker.base;
+        shared.chunks.resize(tracker.size / (Table::ChunkPages * WritePageBytes) + 1);
+    }
+    if (!shared.serialsKnown || unwatched != shared.unwatched || mapping != shared.mapping) {
+        // Serials only grow: a walk that read older ones is not recorded at all.
+        if (shared.serialsKnown && (unwatched < shared.unwatched || mapping < shared.mapping)) return;
+        // A new generation retires every entry; this walk (made under the new serials) is the first.
+        shared.serialsKnown = true;
+        shared.unwatched = unwatched;
+        shared.mapping = mapping;
+        shared.generation = (shared.generation + 1) & 0xffffu;
+        CommitterCollects().shareResets.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (clock > Table::ClockMask) return;
+    const auto value = shared.generation << Table::GenerationShift | clock;
+    for (auto page = (first - shared.base) / WritePageBytes, last = (stop - shared.base) / WritePageBytes; page < last;) {
+        auto& chunk = shared.chunks[page / Table::ChunkPages];
+        if (chunk == nullptr) chunk = std::make_unique<std::uint64_t[]>(Table::ChunkPages);
+        const auto end = std::min<std::uint64_t>(last, (page / Table::ChunkPages + 1) * Table::ChunkPages);
+        std::fill(chunk.get() + page % Table::ChunkPages, chunk.get() + page % Table::ChunkPages + (end - page), value);
+        page = end;
+    }
+    CommitterCollects().shareRecorded.fetch_add(1, std::memory_order_relaxed);
+    CommitterCollects().shareRecordedPages.fetch_add((stop - first) / WritePageBytes, std::memory_order_relaxed);
+}
+
+// Pages of [first, stop) walked at or after the committer's requirement under the current serials;
+// stops at the first uncovered page unless every page is to be counted.
+std::uint64_t covered(std::uint64_t first, std::uint64_t stop, std::uint64_t unwatched, std::uint64_t mapping, bool countAll) {
+    auto& shared = table();
+    if (required == Unknown || required > Table::ClockMask || !shared.serialsKnown || unwatched != shared.unwatched || mapping != shared.mapping || first < shared.base) return 0;
+    // Same generation and a clock at or above the requirement: one compare against a packed bound.
+    const auto low = shared.generation << Table::GenerationShift | required;
+    const auto high = shared.generation << Table::GenerationShift | Table::ClockMask;
+    std::uint64_t pages = 0;
+    for (auto page = (first - shared.base) / WritePageBytes, last = (stop - shared.base) / WritePageBytes; page < last; ++page) {
+        const auto chunk = page / Table::ChunkPages;
+        const auto value = chunk < shared.chunks.size() && shared.chunks[chunk] != nullptr ? shared.chunks[chunk][page % Table::ChunkPages] : 0;
+        const bool hit = value >= low && value <= high;
+        if (hit) ++pages;
+        else if (!countAll) return pages;
+    }
+    return pages;
+}
+#endif
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery, const std::source_location& site) {
     const census::Scope censusScope(memoized ? "collect" : "collect_uncached", &site);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
@@ -2267,7 +2372,19 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (cached != nullptr) *cached = {first, stop, epoch, unwatched, mapping};
         if (verifyHit) bookkeeping::count(bookkeeping::Verified);
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-        if (committerThread) CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
+        if (committerThread) {
+            CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
+            // APS5_ARCHB_PIPE_COLLECT_SHARE_VERIFY: every 32nd own-memo hit is walked anyway, the
+            // baseline rate of writes landing inside an epoch for the covered-walk mismatches.
+            if (collectShare::verify() && collectShare::active() && (++collectShare::memoHits & 31u) == 0) {
+                const auto lock = lockTracker(tracker);
+                std::uint64_t stamped = 0;
+                if (walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, memoVirtualQuery, &stamped)) {
+                    CommitterCollects().shareMemoSampled.fetch_add(1, std::memory_order_relaxed);
+                    if (stamped != 0) CommitterCollects().shareMemoDirty.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
         return tracker.stable.load(std::memory_order_acquire);
     };
     if (useMemo && !sharedCollectMemo()) {
@@ -2332,12 +2449,9 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
 #endif
     if (modeled && model.uncoveredPages == 0 && model.unknownBlocks == 0 && model.crossBlocks != 0) Gen::NoteModelCrossWalk();
-    if (committerThread && useMemo) {
-        CommitterCollects().walks.fetch_add(1, std::memory_order_relaxed);
-        CommitterCollects().walkPages.fetch_add((stop - first) / page, std::memory_order_relaxed);
-    }
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, memoVirtualQuery)) return fail();
-    // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
+    // Only a completed walk is remembered (or a range queue 0 walked for this epoch, below); a failed
+    // one (uncommitted pages) returns 0.
+    const auto remember = [&] {
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial, mapping};
@@ -2365,6 +2479,58 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
+    };
+    // APS5_ARCHB_PIPE_COLLECT_SHARE: the committer skips a walk queue 0 already made for this epoch;
+    // queue 0 records its walks. Not with the write-generation table (its sweep model follows walks).
+    const bool shareCommitter = committerThread && useMemo && !Gen::Active() && collectShare::active();
+    const bool shareProducer = collectShare::producer && !committerThread && !Gen::Active() && collectShare::active();
+    bool shareCovered = false;
+#ifdef _WIN32
+    if (shareCommitter) {
+        const auto pages = (stop - first) / page;
+        const bool verifying = collectShare::verify();
+        const auto coveredPages = collectShare::covered(first, stop, unwatched, mapping, verifying);
+        shareCovered = pages != 0 && coveredPages == pages;
+        auto& counters = CommitterCollects();
+        if (shareCovered) {
+            counters.shareCovered.fetch_add(1, std::memory_order_relaxed);
+            counters.shareCoveredPages.fetch_add(pages, std::memory_order_relaxed);
+            if (!verifying) {
+                // Answered like a memo hit (the current generation; queue 0's walk stamped what it found).
+                remember();
+                return tracker.generation.load(std::memory_order_relaxed);
+            }
+        } else counters.sharePartialPages.fetch_add(coveredPages, std::memory_order_relaxed);
+    }
+#endif
+    if (committerThread && useMemo) {
+        CommitterCollects().walks.fetch_add(1, std::memory_order_relaxed);
+        CommitterCollects().walkPages.fetch_add((stop - first) / page, std::memory_order_relaxed);
+    }
+    // The clock before the OS query: every bump at or below it happened before this walk.
+    const auto shareClock = shareProducer ? nextCollectEpoch.load(std::memory_order_acquire) : 0;
+    const auto walkStart = shareCommitter ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::uint64_t stamped = 0;
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, memoVirtualQuery, &stamped)) return fail();
+    if (shareCommitter) {
+        auto& counters = CommitterCollects();
+        const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count());
+        counters.shareWalkNs.fetch_add(ns, std::memory_order_relaxed);
+        if (shareCovered) {
+            counters.shareCoveredNs.fetch_add(ns, std::memory_order_relaxed);
+            if (stamped != 0) {
+                counters.shareMismatches.fetch_add(1, std::memory_order_relaxed);
+                counters.shareMismatchPages.fetch_add(stamped, std::memory_order_relaxed);
+            }
+        }
+    }
+#ifdef _WIN32
+    if (shareProducer) collectShare::record(tracker, first, stop, shareClock, unwatched, mapping);
+#else
+    static_cast<void>(shareClock);
+    static_cast<void>(shareCovered);
+#endif
+    remember();
     return tracker.generation;
 }
 
@@ -2451,6 +2617,16 @@ void BumpCollectEpoch(Gen::TicketReason reason) {
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+    // APS5_ARCHB_PIPE_COLLECT_SHARE: a committer's own ordering point (an unlocked wait) also bounds
+    // the queue-0 walks that may stand in for its own; following a commit's token resets the
+    // requirement until FollowCollectShare names the token's point.
+    if (committerThread) {
+        if (reason == Gen::TicketReason::Committer) collectShare::required = collectShare::Unknown;
+        else {
+            collectShare::floor = std::max(collectShare::floor, epoch);
+            if (collectShare::required != collectShare::Unknown) collectShare::required = std::max(collectShare::required, epoch);
+        }
+    }
     // Rule V1: a ticket at every ordering point, after the observation (the same points as the
     // epoch). A committer's ticket is the one its commit carried (Gen::Follow), not a fresh one.
     if (reason != Gen::TicketReason::Committer && Gen::Active()) static_cast<void>(Gen::Issue(reason));
@@ -2469,6 +2645,15 @@ void MarkCommitterThread() {
     committerThread = true;
 }
 
+void SetCollectShareProducer(bool producer) {
+    collectShare::producer = producer;
+}
+
+void FollowCollectShare(std::uint64_t clock) {
+    if (!committerThread) return;
+    collectShare::required = clock == 0 ? collectShare::Unknown : std::max(clock, collectShare::floor);
+}
+
 std::uint64_t UnwatchSerial() {
     return unwatchSerial.load(std::memory_order_acquire);
 }
@@ -2476,6 +2661,10 @@ std::uint64_t UnwatchSerial() {
 void AdoptLatestCollectEpoch() {
     const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
     if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);
+    if (committerThread) {
+        collectShare::floor = std::max(collectShare::floor, latest);
+        if (collectShare::required != collectShare::Unknown) collectShare::required = std::max(collectShare::required, latest);
+    }
     if (Gen::Active()) Gen::AdoptLatest();
 }
 

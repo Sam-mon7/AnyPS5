@@ -184,6 +184,7 @@ void Driver::execute(const Submission& submission) {
     const bool pipelined = submission.queue == 0 && DrawPipeline::SampleQueue0(pipeSwitch);
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     DrawPipeline::Active() = pipelined;
+    GuestMemory::SetCollectShareProducer(pipelined);
     DrawPipeline::DispatchItems() = pipelined && (pipelineDispatch() || pipeSwitch);
     const Submission* keepIndirectRegs = pipelined && ArchB::Switches::Enabled(ArchB::Feature::PipeKeepIndirectRegs) ? &submission : nullptr;
     if (submission.queue == 0) {

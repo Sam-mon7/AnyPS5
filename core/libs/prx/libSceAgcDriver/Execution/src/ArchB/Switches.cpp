@@ -44,6 +44,7 @@ constexpr Feature PipeDeepQueuePrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeCommitterMutexPriorityPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeFullHysteresisPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeDispatchAliasPrerequisites[] = {Feature::PipeQ0Committer};
+constexpr Feature PipeCollectSharePrerequisites[] = {Feature::PipeQ0Committer};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -82,6 +83,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::PipeCommitterMutexPriority, "PIPE_COMMITTER_MUTEX_PRIORITY", false, true, PipeCommitterMutexPriorityPrerequisites},
     {Feature::PipeFullHysteresis, "PIPE_FULL_HYSTERESIS", false, true, PipeFullHysteresisPrerequisites},
     {Feature::PipeDispatchAlias, "PIPE_DISPATCH_ALIAS", false, true, PipeDispatchAliasPrerequisites},
+    {Feature::PipeCollectShare, "PIPE_COLLECT_SHARE", false, true, PipeCollectSharePrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

@@ -45,6 +45,7 @@ enum class Feature : std::uint8_t {
     PipeCommitterMutexPriority,
     PipeFullHysteresis,
     PipeDispatchAlias,
+    PipeCollectShare,
     Count
 };
 

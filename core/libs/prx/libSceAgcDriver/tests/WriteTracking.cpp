@@ -2277,6 +2277,163 @@ void CheckVqMemo(std::wstring_view mode) {
 #endif
 
 #ifdef _WIN32
+// APS5_ARCHB_PIPE_COLLECT_SHARE (run with APS5_ARCHB_PIPE_Q0_COMMITTER=1 and the switch at 1, or 0 for
+// "off"; "verify" also sets APS5_ARCHB_PIPE_COLLECT_SHARE_VERIFY=1). Queue 0 (this thread, marked as
+// the producer) walks ranges; the committer (a separate thread per check, marked once) follows an
+// ordering point and collects. A committer collect is answered from queue 0's walks only when every
+// page of it was walked at or after the item's ordering point, under the same unwatch and mapping
+// serials; a write queue 0's walk found stays visible to the committer.
+void CheckCollectShare(std::wstring_view mode) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    Switches::Initialize();
+    const bool on = mode != L"off";
+    const bool verify = mode == L"verify";
+    Require(Switches::Enabled(Feature::PipeCollectShare) == on, "the collect-share switch is not as the test mode needs");
+    constexpr std::size_t bytes = 4 * Block;
+    constexpr std::size_t Page = 4096;
+    auto* memory = static_cast<volatile std::uint8_t*>(AllocateWatched(bytes));
+    const auto base = reinterpret_cast<std::uint64_t>(const_cast<std::uint8_t*>(memory));
+    struct Release {
+        void* memory;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uint64_t>(memory), bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+        }
+    } release{const_cast<std::uint8_t*>(memory)};
+    std::memset(const_cast<std::uint8_t*>(memory), 0, bytes);
+    SetCollectShareProducer(true);
+    auto& counters = CommitterCollects();
+    struct Snapshot {
+        std::uint64_t walks, covered, mismatches, recorded;
+    };
+    const auto snapshot = [&] {
+        return Snapshot{counters.walks.load(), counters.shareCovered.load(), counters.shareMismatches.load(), counters.shareRecorded.load()};
+    };
+    // Queue 0's ordering point (an epoch bump) and the clock the token carries for it.
+    const auto orderingPoint = [] {
+        BumpCollectEpoch();
+        return CollectEpoch();
+    };
+    // One committer collect after following `clock`, on a thread of its own; `before` runs first on it
+    // (an own ordering point), `since` is checked against the answer.
+    struct Committed {
+        std::uint64_t generation = 0;
+        bool unchangedSince = false;
+        Snapshot delta{};
+    };
+    const auto commit = [&](std::uint64_t clock, std::uint64_t address, std::size_t size, std::uint64_t since, bool ownBump = false) {
+        Committed result;
+        const auto start = snapshot();
+        std::thread([&] {
+            MarkCommitterThread();
+            BumpCollectEpoch(Gen::TicketReason::Committer);
+            FollowCollectShare(clock);
+            if (ownBump) BumpCollectEpoch(Gen::TicketReason::UnlockedWait);
+            result.generation = CollectWrites(address, size);
+            result.unchangedSince = UnchangedSince(address, size, since);
+        }).join();
+        const auto end = snapshot();
+        result.delta = {end.walks - start.walks, end.covered - start.covered, end.mismatches - start.mismatches, end.recorded - start.recorded};
+        return result;
+    };
+    // A covered collect skips its walk (verify: walks anyway and counts it as covered).
+    const auto requireShared = [&](const Committed& result, const char* what) {
+        Require(result.generation != 0, std::string(what) + ": the committer collect failed");
+        if (!on) {
+            Require(result.delta.walks == 1 && result.delta.covered == 0, std::string(what) + ": the switch is off but the committer did not walk");
+            return;
+        }
+        Require(result.delta.covered == 1, std::string(what) + ": the committer collect was not covered by queue 0's walk");
+        Require(result.delta.walks == (verify ? 1u : 0u), std::string(what) + ": the covered collect walked (or verify did not)");
+    };
+    const auto requireWalked = [&](const Committed& result, const char* what) {
+        Require(result.generation != 0, std::string(what) + ": the committer collect failed");
+        Require(result.delta.walks == 1 && result.delta.covered == 0, std::string(what) + ": the committer reused a walk that does not cover its item");
+    };
+
+    // Queue 0 walks after the ordering point; a write before the point is seen through its walk.
+    auto clock = orderingPoint();
+    const auto before = CollectWrites(base, bytes);
+    memory[Block + 1] = 1;
+    clock = orderingPoint();
+    auto start = snapshot();
+    const auto walked = CollectWrites(base, bytes);
+    Require(snapshot().recorded - start.recorded == (on ? 1u : 0u), "queue 0's walk was not recorded as the switch says");
+    auto result = commit(clock, base + Block, Block, before);
+    requireShared(result, "same epoch");
+    Require(!result.unchangedSince && result.generation >= walked, "the committer missed a write queue 0's walk found");
+
+    // A walk made before the item's ordering point never covers it, and a write between them is seen.
+    memory[2 * Block + 7] = 2;
+    const auto oldClock = clock;
+    clock = orderingPoint();
+    result = commit(clock, base + 2 * Block, Block, walked);
+    requireWalked(result, "walk before the ordering point");
+    Require(!result.unchangedSince, "a write before the item's ordering point was missed");
+
+    // A later queue-0 walk covers an item of an earlier ordering point.
+    CollectWrites(base, bytes);
+    result = commit(oldClock, base, Block, walked);
+    if (on) requireShared(result, "later walk");
+
+    // Partly covered: queue 0 walked only the first block of the range.
+    clock = orderingPoint();
+    CollectWrites(base, Block);
+    result = commit(clock, base, 2 * Block, walked);
+    requireWalked(result, "partly covered");
+    result = commit(clock, base + Page, Block - Page, walked);
+    if (on) requireShared(result, "inside the walked block");
+
+    // Unknown ordering point (token slot overwritten), or the committer's own later ordering point.
+    clock = orderingPoint();
+    CollectWrites(base, bytes);
+    requireWalked(commit(0, base, Block, walked), "unknown ordering point");
+    requireWalked(commit(clock, base, Block, walked, true), "committer's own ordering point");
+
+    // Unwatch and rewatch, then a mapping change: entries from before never count again.
+    clock = orderingPoint();
+    CollectWrites(base, bytes);
+    Unwatch(base + 3 * Block, Block);
+    const Runs restored{{base + 3 * Block, base + 4 * Block}};
+    Rewatch(restored);
+    requireWalked(commit(clock, base, Block, walked), "after an unwatch");
+    clock = orderingPoint();
+    CollectWrites(base, bytes);
+    CollectWrites(base, bytes);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(base + 3 * Block, Block);
+    requireWalked(commit(clock, base, Block, walked), "after a mapping change");
+    clock = orderingPoint();
+    CollectWrites(base, bytes);
+    CollectWrites(base, bytes);
+    if (on) requireShared(commit(clock, base, Block, walked), "recorded again after the serials moved");
+
+    // Verify: a write after queue 0's walk inside the epoch is a counted mismatch, and is seen.
+    if (verify) {
+        clock = orderingPoint();
+        const auto fresh = CollectWrites(base, bytes);
+        memory[5] = 3;
+        result = commit(clock, base, Block, fresh);
+        requireShared(result, "verify write after the walk");
+        Require(result.delta.mismatches == 1 && !result.unchangedSince, "verify did not count (or hid) a write the shared answer would miss");
+    }
+    // An uncached committer collect always walks.
+    clock = orderingPoint();
+    CollectWrites(base, bytes);
+    start = snapshot();
+    std::thread([&] {
+        MarkCommitterThread();
+        BumpCollectEpoch(Gen::TicketReason::Committer);
+        FollowCollectShare(clock);
+        Require(CollectWritesUncached(base, Block) != 0, "an uncached committer collect failed");
+    }).join();
+    Require(snapshot().covered == start.covered, "an uncached committer collect was answered from queue 0's walks");
+    SetCollectShareProducer(false);
+}
+#endif
+
+#ifdef _WIN32
 // APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING (run with it on; the verify variants also set
 // APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING=1, where every fast answer is checked against the original).
 // A CPU write between two collects of one epoch is seen by the next epoch, exactly as with the
@@ -2981,6 +3138,13 @@ int main(int argc, char** argv) {
         if (memo != std::wstring_view::npos) {
             Require(WriteWatched(), "query memo test needs write watching");
             CheckVqMemo(command.substr(memo + 10));
+            return 0;
+        }
+        const auto share = command.rfind(L"--collect-share-");
+        if (share != std::wstring_view::npos) {
+            Require(WriteWatched(), "the collect-share test needs write watching");
+            CheckCollectShare(command.substr(share + 16));
+            std::cout << "collect-share test passed\n";
             return 0;
         }
         const auto bookkeeping = command.rfind(L"--wt-bookkeeping-");

@@ -392,6 +392,18 @@ void DrawPipeline::RegisterCounters() {
         ArchB::Recorder::RegisterCounter("pipe_committer_collect_hits", collects.hits);
         ArchB::Recorder::RegisterCounter("pipe_committer_collect_walks", collects.walks);
         ArchB::Recorder::RegisterCounter("pipe_committer_collect_walk_pages", collects.walkPages);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_covered", collects.shareCovered);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_covered_pages", collects.shareCoveredPages);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_partial_pages", collects.sharePartialPages);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_walk_ns", collects.shareWalkNs);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_covered_ns", collects.shareCoveredNs);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_mismatches", collects.shareMismatches);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_mismatch_pages", collects.shareMismatchPages);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_memo_sampled", collects.shareMemoSampled);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_memo_dirty", collects.shareMemoDirty);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_recorded", collects.shareRecorded);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_recorded_pages", collects.shareRecordedPages);
+        ArchB::Recorder::RegisterCounter("pipe_collect_share_resets", collects.shareResets);
         // APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY: queue workers ask whether the committer is busy.
         GuestMemory::SetGpuLockPriorityHook([] { return Queue0().Outstanding() != 0; });
         return true;
@@ -459,6 +471,38 @@ void DrawPipeline::CountEpochBump(BumpCause cause) {
     if (cause < BumpCauses) pipeCounters().q0Bumps[cause].fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+// Token -> queue-0 collect epoch at the token's ordering point (APS5_ARCHB_PIPE_COLLECT_SHARE). The
+// committer trails queue 0 by at most a pipeline's depth of tokens; an overwritten slot reads as
+// unknown (nothing shared).
+struct EpochClocks {
+    static constexpr std::size_t Slots = 1024;
+    std::array<std::atomic<std::uint64_t>, Slots> tokens{};
+    std::array<std::atomic<std::uint64_t>, Slots> clocks{};
+};
+
+EpochClocks& epochClocks() {
+    static auto* clocks = new EpochClocks();
+    return *clocks;
+}
+
+std::uint64_t epochClock(std::uint64_t token) {
+    auto& table = epochClocks();
+    const auto slot = token % EpochClocks::Slots;
+    if (table.tokens[slot].load(std::memory_order_acquire) != token) return 0;
+    const auto clock = table.clocks[slot].load(std::memory_order_acquire);
+    return table.tokens[slot].load(std::memory_order_acquire) == token ? clock : 0;
+}
+}
+
+void DrawPipeline::NoteEpochClock(std::uint64_t token, std::uint64_t clock) {
+    auto& table = epochClocks();
+    const auto slot = token % EpochClocks::Slots;
+    table.tokens[slot].store(0, std::memory_order_release);
+    table.clocks[slot].store(clock, std::memory_order_release);
+    table.tokens[slot].store(token, std::memory_order_release);
+}
+
 void DrawPipeline::FollowEpoch(std::uint64_t token, std::uint64_t ticket) {
     // Write generations: the committer checks at the ticket the issuing thread held when it enqueued
     // the commit (carried explicitly, rule V1/V3), not at a fresh one of its own.
@@ -468,6 +512,7 @@ void DrawPipeline::FollowEpoch(std::uint64_t token, std::uint64_t ticket) {
     followed = token;
     pipeCounters().followBumps.fetch_add(1, std::memory_order_relaxed);
     GuestMemory::BumpCollectEpoch(GuestMemory::Gen::TicketReason::Committer);
+    GuestMemory::FollowCollectShare(epochClock(token));
 }
 
 unsigned DrawPipeline::Committers() {

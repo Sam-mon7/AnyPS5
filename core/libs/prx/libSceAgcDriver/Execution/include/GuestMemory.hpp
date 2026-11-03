@@ -127,9 +127,39 @@ struct CommitterCollectCounters {
     std::atomic<std::uint64_t> hits{0};
     std::atomic<std::uint64_t> walks{0};
     std::atomic<std::uint64_t> walkPages{0};
+    // APS5_ARCHB_PIPE_COLLECT_SHARE (and its _VERIFY mode): committer walks whose every page queue 0
+    // walked after the committed item's ordering point (covered; skipped unless verifying), the pages
+    // of those and the covered pages of partly covered walks, time in the committer's walks and in the
+    // covered ones (verify), covered walks that found written pages anyway (mismatches) and those
+    // pages, sampled own-memo hits re-walked in verify mode and the ones that found written pages,
+    // queue-0 walks recorded and their pages, and share-table resets (unwatch or mapping serials).
+    std::atomic<std::uint64_t> shareCovered{0};
+    std::atomic<std::uint64_t> shareCoveredPages{0};
+    std::atomic<std::uint64_t> sharePartialPages{0};
+    std::atomic<std::uint64_t> shareWalkNs{0};
+    std::atomic<std::uint64_t> shareCoveredNs{0};
+    std::atomic<std::uint64_t> shareMismatches{0};
+    std::atomic<std::uint64_t> shareMismatchPages{0};
+    std::atomic<std::uint64_t> shareMemoSampled{0};
+    std::atomic<std::uint64_t> shareMemoDirty{0};
+    std::atomic<std::uint64_t> shareRecorded{0};
+    std::atomic<std::uint64_t> shareRecordedPages{0};
+    std::atomic<std::uint64_t> shareResets{0};
 };
 CommitterCollectCounters& CommitterCollects();
 void MarkCommitterThread();
+// APS5_ARCHB_PIPE_COLLECT_SHARE: queue 0 marks itself while it runs a pipelined submission, and
+// its completed CollectWrites walks are recorded per page with the collect clock read before the
+// walk (the global epoch counter, CollectShareClock()). A committed item belongs to the ordering
+// point queue 0 had reached when it enqueued it (its epoch, carried with the epoch token): any walk
+// that started at or after that point saw every CPU write ordered before the item, exactly what the
+// committer's own walk in the same epoch would establish. FollowCollectShare(clock) gives the
+// committer that point (0: unknown, nothing shared); the committer's own ordering points (unlocked
+// waits, adopting the latest epoch) raise it. A memoized committer collect whose every page is so
+// covered is answered like a memo hit; APS5_ARCHB_PIPE_COLLECT_SHARE_VERIFY=1 walks anyway and
+// counts covered walks that found written pages.
+void SetCollectShareProducer(bool producer);
+void FollowCollectShare(std::uint64_t clock);
 std::uint64_t ProofSerial();
 std::uint64_t ResourceProofSerial();
 bool ResourceEpochProofsEnabled();
