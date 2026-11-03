@@ -9,7 +9,7 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[5] / "tools"))
 
 from archb_gate_config import GateError
-from archb_gate_stats import T_95, alternating_blocks, alternating_verdict, bootstrap, diagnostics, final_verdict, leg_summary, pair_report, sequential, t_critical, tail_check
+from archb_gate_stats import T_95, alternating_blocks, alternating_verdict, bootstrap, diagnostics, final_verdict, leg_summary, pair_report, sequential, session_health, t_critical, tail_check
 
 
 def fails(call, code=24):
@@ -438,6 +438,82 @@ if (-not (Test-Path (Join-Path $Output 'ub-report.json'))) { throw 'Missing repo
         command = "& {" + script + "} '" + str(tools / "archb_gate.ps1").replace("'", "''") + "' '" + directory.replace("'", "''") + "'"
         completed = subprocess.run(["pwsh", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=10)
         assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def summary_window(complete_ms, frames=25):
+    return {"archb": {"frames": frames, "presented": frames, "span_ms": 5000.0,
+                      "phases_ms": {"draw committer": {"Resources.Complete": complete_ms * frames, "Driver.DrawCommit": 4.0 * frames}}}}
+
+
+def session_health_flags_slow_sessions(directory):
+    directory = Path(directory)
+    summary = directory / "aps5-summary.jsonl"
+    # Normal zoo session: ~1.4 ms/frame of template builds; the menu's early windows may be anything.
+    summary.write_text("\n".join(json.dumps(summary_window(value)) for value in (40.0, 0.7, 1.4, 1.3, 1.5)) + "\n", encoding="utf-8")
+    healthy = session_health(directory)
+    assert healthy["healthy"] and healthy["reasons"] == [] and healthy["build_ms_per_frame"] == [1.4, 1.3, 1.5], healthy
+    # The 2026-11-03 pathology: ~140 ms/frame from scene load on, with a half-written last line (the game is running).
+    summary.write_text("\n".join(json.dumps(summary_window(value)) for value in (0.7, 1.4, 141.0, 143.5, 139.8)) + '\n{"archb": {"fra', encoding="utf-8")
+    slow = session_health(directory)
+    assert not slow["healthy"] and "141.4 ms/frame" in slow["reasons"][0], slow
+    # One slow window (a load spike) is not a pathological session.
+    summary.write_text("\n".join(json.dumps(summary_window(value)) for value in (1.4, 1.3, 141.0, 1.5)) + "\n", encoding="utf-8")
+    assert session_health(directory)["healthy"]
+    # Without recorder phases the large-texture report decides: each made once is normal, one made again and again is not.
+    summary.write_text(json.dumps({"archb": {"frames": 25}}) + "\n", encoding="utf-8")
+    line = "[texture-cache] large texture {} (1024x1024, 256 layers, format 174, 352 MiB guest, 342 MiB image, snapshot) made: absent; cached\n"
+    (directory / "stderr.log").write_text("".join(line.format(address) for address in ("0x10a0000000", "0x1009000000", "0x1003000000")), encoding="utf-8")
+    once = session_health(directory)
+    assert once["healthy"] and once["large_textures_made"]["0x1009000000"] == 1, once
+    (directory / "stderr.log").write_text(line.format("0x1003000000") + line.format("0x1009000000") * 5, encoding="utf-8")
+    remade = session_health(directory)
+    assert not remade["healthy"] and remade["reasons"] == ["large textures made again and again: 0x1009000000 x5"], remade
+    tools = Path(__file__).resolve().parents[5] / "tools"
+    completed = subprocess.run([sys.executable, str(tools / "archb_gate_stats.py"), "session", str(directory)], capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0 and json.loads(completed.stdout)["healthy"] is False, completed.stdout + completed.stderr
+
+
+GATE_RELAUNCH_SCRIPT = r"""
+. $args[0] -Control unused -Output unused
+$Output = $args[1]
+$script:AllLegs = [Collections.Generic.List[object]]::new()
+$script:SlowSessions = [Collections.Generic.List[object]]::new()
+$script:launches = 0
+function Invoke-GateLegOnce($Configuration, $Label, $Kind, $Seconds, $Measured, $Alternation) {
+    $script:launches++
+    $directory = Join-Path $Output $Label
+    $null = New-Item -ItemType Directory -Path $directory
+    $result = @{ label = $Label; directory = $directory; status = 'running' }
+    $script:AllLegs.Add($result)
+    if ($script:launches -le $script:slowLaunches) { Stop-GateFailure 28 'Pathological session: committer template builds 141.4 ms/frame' }
+    $result.status = 'completed'
+    return $result
+}
+$script:slowLaunches = 2
+$leg = Invoke-GateLeg @{ name = 'control' } 'warmup-control-control' 'measured' 60 $false
+if ($script:launches -ne 3 -or $leg.status -ne 'completed') { throw "expected a completed third launch, got $($script:launches)" }
+if ($script:AllLegs.Count -ne 1 -or $script:AllLegs[0].directory -ne (Join-Path $Output 'warmup-control-control')) { throw 'set-aside legs stayed in the leg list' }
+if ($script:SlowSessions.Count -ne 2 -or -not (Test-Path (Join-Path $Output 'warmup-control-control-slow1')) -or -not (Test-Path (Join-Path $Output 'warmup-control-control-slow2'))) { throw 'slow sessions not set aside' }
+$script:launches = 0
+$script:slowLaunches = 5
+$code = 0
+try { $null = Invoke-GateLeg @{ name = 'candidate' } 'warmup-candidate-candidate' 'measured' 60 $false } catch { $code = $_.Exception.Data['GateCode'] }
+if ($code -ne 28 -or $script:launches -ne 3) { throw "expected code 28 after 3 launches, got $code / $($script:launches)" }
+function Invoke-GateLegOnce($Configuration, $Label, $Kind, $Seconds, $Measured, $Alternation) { $script:launches++; Stop-GateFailure 26 'memory' }
+$script:launches = 0
+$code = 0
+try { $null = Invoke-GateLeg @{ name = 'x' } 'x' 'measured' 60 $false } catch { $code = $_.Exception.Data['GateCode'] }
+if ($code -ne 26 -or $script:launches -ne 1) { throw "other failures must not relaunch: $code / $($script:launches)" }
+"""
+
+
+def gate_relaunches_slow_session(directory):
+    if sys.platform != "win32":
+        return
+    tools = Path(__file__).resolve().parents[5] / "tools"
+    command = "& {" + GATE_RELAUNCH_SCRIPT + "} '" + str(tools / "archb_gate.ps1").replace("'", "''") + "' '" + str(directory).replace("'", "''") + "'"
+    completed = subprocess.run(["pwsh", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=60)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 if __name__ == "__main__":

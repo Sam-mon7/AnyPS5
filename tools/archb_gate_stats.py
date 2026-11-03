@@ -1,4 +1,5 @@
 import argparse
+import collections
 import json
 import math
 import re
@@ -289,6 +290,52 @@ def final_verdict(legs, baseline=None):
             **measurement_report({"candidate": legs}, baseline)}
 
 
+# A session stuck re-making a large texture every frame (2026-11-03: the zoo's 1024x1024x256 BC3 pool, ~1 in 6
+# sessions, from scene load to exit, either arm, any build): ~205 instead of ~60 ms/frame, with the committer's
+# template builds (Resources.Complete) at ~140-180 instead of ~1.3-1.8 ms/frame. Such a leg measures that
+# pathology, not the switches; the gate relaunches it (archb_gate.ps1, code 28).
+SLOW_BUILD_MS_PER_FRAME = 30.0
+SLOW_BUILD_WINDOWS = 3
+LARGE_TEXTURE_REMADE = 4
+LARGE_TEXTURE_LINE = re.compile(r"\[texture-cache\] large texture (0x[0-9a-f]+) \(")
+
+
+def read_shared(path):
+    try:
+        with open(path, "rb") as handle:
+            return handle.read().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def session_health(directory):
+    directory = Path(directory)
+    builds = []
+    for line in read_shared(directory / "aps5-summary.jsonl").splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        archb = item.get("archb") or {}
+        frames = archb.get("frames") or 0
+        phases = (archb.get("phases_ms") or {}).get("draw committer") or {}
+        if frames >= 5 and "Resources.Complete" in phases:
+            builds.append(phases["Resources.Complete"] / frames)
+    recent = builds[-SLOW_BUILD_WINDOWS:]
+    reasons = []
+    if len(recent) == SLOW_BUILD_WINDOWS and min(recent) > SLOW_BUILD_MS_PER_FRAME:
+        reasons.append(f"committer template builds {statistics.mean(recent):.1f} ms/frame over the last {SLOW_BUILD_WINDOWS} "
+                       f"recorder windows (normal ~1.5, limit {SLOW_BUILD_MS_PER_FRAME:g})")
+    made = collections.Counter()
+    for name in ("stderr.log", "stdout.log"):
+        made.update(match.group(1) for match in LARGE_TEXTURE_LINE.finditer(read_shared(directory / name)))
+    remade = sorted((address, count) for address, count in made.items() if count >= LARGE_TEXTURE_REMADE)
+    if remade:
+        reasons.append("large textures made again and again: " + ", ".join(f"{address} x{count}" for address, count in remade))
+    return {"healthy": not reasons, "reasons": reasons, "build_ms_per_frame": [round(value, 3) for value in recent],
+            "large_textures_made": dict(made), "code": 0}
+
+
 def recorder_diagnostics(directory):
     directory = Path(directory)
     path = directory / "aps5-summary.jsonl"
@@ -554,7 +601,9 @@ def main():
     report = sub.add_parser("ub-report")
     report.add_argument("experiments")
     report.add_argument("--table")
-    for command in (leg, decide, diagnostic, alternate, experiment, report):
+    session = sub.add_parser("session")
+    session.add_argument("directory")
+    for command in (leg, decide, diagnostic, alternate, experiment, report, session):
         command.add_argument("--output")
     args = parser.parse_args()
     try:
@@ -568,6 +617,8 @@ def main():
             result = leg_summary(args.path, args.start_ns, args.end_ns, args.hold_seconds)
         elif args.command == "diagnostic":
             result = diagnostics(args.directory)
+        elif args.command == "session":
+            result = session_health(args.directory)
         elif args.command == "alternating":
             result = alternating_verdict(args.directory, args.settle_seconds,
                                          read_json(args.baseline) if args.baseline else None, args.bootstrap)

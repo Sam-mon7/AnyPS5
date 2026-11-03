@@ -21,6 +21,7 @@ param(
     [switch]$Bisect,
     [switch]$Diagnostic,
     [switch]$RecorderOverhead,
+    [ValidateRange(0, 10)][int]$SlowSessionRetries = 2,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][string]$WatchdogManifest,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][int]$RunnerPid,
     [Parameter(Mandatory, ParameterSetName = 'Watchdog')][long]$RunnerStartTicks
@@ -486,7 +487,26 @@ function Invoke-GateBisection($Configuration, $Plan) {
     }
 }
 
+# A session that comes up pathological (archb_gate_stats.py session: the committer re-making a large texture every
+# frame, ~205 instead of ~60 ms/frame in ~1 of 6 zoo sessions on 2026-11-03, from scene load to exit, in either arm)
+# measures that state, not the switches: the leg is set aside as <label>-slow<k> and the game relaunched.
 function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Seconds, [bool]$Measured, $Alternation = $null) {
+    for ($attempt = 1; ; ++$attempt) {
+        try { return Invoke-GateLegOnce $Configuration $Label $Kind $Seconds $Measured $Alternation }
+        catch {
+            if ($_.Exception.Data['GateCode'] -ne 28 -or $attempt -gt $SlowSessionRetries) { throw }
+            $directory = Join-Path $Output $Label
+            $aside = Join-Path $Output "$Label-slow$attempt"
+            Move-Item -LiteralPath $directory -Destination $aside
+            $failed = @($script:AllLegs | Where-Object { $_.directory -eq $directory })
+            if ($failed.Count) { $null = $script:AllLegs.Remove($failed[-1]) }
+            $script:SlowSessions.Add(@{ label = $Label; attempt = $attempt; directory = $aside; reason = $_.Exception.Message })
+            [Console]::Error.WriteLine("[gate] ${Label}: pathological session set aside as $aside, relaunching ($($_.Exception.Message))")
+        }
+    }
+}
+
+function Invoke-GateLegOnce($Configuration, [string]$Label, [string]$Kind, [int]$Seconds, [bool]$Measured, $Alternation = $null) {
     $directory = Join-Path $Output $Label
     $null = New-Item -ItemType Directory -Path $directory
     $result = @{ label = $Label; kind = $Kind; directory = $directory; status = 'running'; measured = $Measured; min_available_memory = $null }
@@ -552,6 +572,8 @@ function Invoke-GateLeg($Configuration, [string]$Label, [string]$Kind, [int]$Sec
         $navigation = Get-Content -LiteralPath (Join-Path $directory 'navigation.json') -Raw | ConvertFrom-Json -AsHashtable
         $null = Invoke-GatePython 'archb_gate_nav.py' @('screenshot', '--pid', $process.Id, '--output', (Join-Path $directory 'start.png'))
         Wait-GateHold $process $directory $WarmupSeconds ([ref]$lowSince)
+        $result.session = Invoke-GatePython 'archb_gate_stats.py' @('session', $directory)
+        if (-not $result.session.healthy) { Stop-GateFailure 28 ("Pathological session: " + ($result.session.reasons -join '; ')) }
         $holdStart = Get-GateClock
         $stderrStart = $errStream.Position
         if ($upperBound) { $result.stage = 'blocks' }
@@ -644,6 +666,7 @@ function Invoke-ArchBGate {
     $Runtime = [IO.Path]::GetFullPath($Runtime)
     $NavigationRefs = [IO.Path]::GetFullPath($NavigationRefs)
     $script:AllLegs = [Collections.Generic.List[object]]::new()
+    $script:SlowSessions = [Collections.Generic.List[object]]::new()
     $script:AlternatingBootstrap = $Mode -eq 'Bootstrap' -and $script:AllowAlternating
     $script:RestoreManifest = Join-Path $Output 'restore.json'
     $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -884,6 +907,7 @@ function Invoke-ArchBGate {
             catch { $gate.code = 31; $gate.restoration = @{ status = 'failed'; error = $_.Exception.Message } }
         }
         $gate.legs = @($script:AllLegs.ToArray())
+        $gate.slow_sessions = @($script:SlowSessions.ToArray())
         $gate.verdict_notes = @(@($gate.results) + @($gate.experiments) | ForEach-Object { $_.verdict_notes } | Sort-Object -Unique)
         $gate.wall_clock_seconds = $watch.Elapsed.TotalSeconds
         if ($outputCreated) {
