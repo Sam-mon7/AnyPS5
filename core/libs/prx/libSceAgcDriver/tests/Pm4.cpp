@@ -1,4 +1,5 @@
 #include "prx/libkernel/include/Api.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -2005,6 +2006,52 @@ void testWaitRegMemPipelineDrain() {
     check(AgcDriver::DriverDetail::DrawPipeline::Queue0().Outstanding() == 0, "pipeline should be idle after overlapping wait drain");
 }
 
+// A producer blocked on a full queue-0 pipeline (capacity 4 from APS5_PIPELINED_DRAWS=4) resumes at
+// the first free slot, or at half capacity under APS5_ARCHB_PIPE_FULL_HYSTERESIS.
+void testFullResume(bool hysteresis) {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    using namespace std::chrono_literals;
+    check(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeFullHysteresis) == hysteresis, "PIPE_FULL_HYSTERESIS is in the state the test expects");
+    const auto capacity = DrawPipeline::Capacity();
+    check(capacity == 4, "the test needs a queue-0 pipeline of capacity 4");
+    const std::size_t resumeAt = hysteresis ? capacity / 2 : capacity - 1;
+    auto& pipeline = DrawPipeline::Queue0();
+    std::atomic<std::size_t> released{0};
+    std::atomic<std::size_t> committed{0};
+    for (std::size_t i = 0; i < capacity; ++i) {
+        pipeline.Enqueue([&released, &committed, i] {
+            while (released.load() <= i) std::this_thread::sleep_for(1ms);
+            committed.fetch_add(1);
+        }, {});
+    }
+    std::atomic<bool> enqueued{false};
+    std::thread producer([&] {
+        pipeline.Enqueue([&committed] { committed.fetch_add(1); }, {});
+        enqueued = true;
+    });
+    std::this_thread::sleep_for(30ms);
+    check(!enqueued.load(), "the producer blocks on a full pipeline");
+    for (std::size_t k = 1; k <= capacity; ++k) {
+        released = k;
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (committed.load() < k && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+        check(committed.load() >= k, "the committer finishes the released item");
+        const auto left = capacity - k;
+        if (left > resumeAt) {
+            std::this_thread::sleep_for(30ms);
+            check(!enqueued.load(), "the producer resumed before the pipeline drained to its resume point");
+            continue;
+        }
+        while (!enqueued.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+        check(enqueued.load(), "the producer resumes once the pipeline drained to its resume point");
+        break;
+    }
+    released = capacity + 1;
+    producer.join();
+    waitDrawPipelineIdle();
+    check(committed.load() == capacity + 1, "every queued item committed");
+}
+
 void testWaitRegMem64ZeroHighMaskDrain() {
     alignas(8) static std::uint32_t qword[2] = {42, 0};
     const auto base = reinterpret_cast<std::uintptr_t>(&qword[0]);
@@ -2041,7 +2088,8 @@ int main(int argc, char** argv) {
         const std::pair<const char*, void (*)()> ringModes[]{
             {"ring", testSubmissionRing}, {"ring-empty", testEmptySubmissionRing}, {"ring-disabled", testDisabledSubmissionRing},
             {"ring-invalid", testInvalidSubmissionRing}, {"ring-report", testSubmissionRingFailureReport}, {"stall-watchdog", testStallWatchdog},
-            {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"rewind-trace", testRewindTailTrace}};
+            {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"rewind-trace", testRewindTailTrace},
+            {"full-resume", [] { testFullResume(false); }}, {"full-resume-hysteresis", [] { testFullResume(true); }}};
         if (argc == 2 && std::string(argv[1]) == "ring-report-heap") {
 #ifdef _WIN32
             testSubmissionRingFailureReportHeap();

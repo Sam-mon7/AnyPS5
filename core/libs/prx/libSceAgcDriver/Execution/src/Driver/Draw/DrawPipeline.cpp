@@ -491,7 +491,11 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
             noteOvercommit("draw pipeline", items.size());
         } else {
             const auto start = std::chrono::steady_clock::now();
-            resumeAt = capacity - 1;
+            // APS5_ARCHB_PIPE_FULL_HYSTERESIS (sampled per full wait): resume at half capacity rather
+            // than at the first free slot, so a committer-bound stretch wakes the producer once per
+            // capacity/2 commits instead of after every commit (2026-11-03 profile: ~315 full waits
+            // per frame, each a committer notify and a producer context switch).
+            resumeAt = ArchB::Switches::Enabled(ArchB::Feature::PipeFullHysteresis) ? capacity / 2 : capacity - 1;
             ++idleWaiters;
             idle.wait(lock, [&] { return items.size() <= resumeAt; });
             --idleWaiters;

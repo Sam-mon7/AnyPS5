@@ -43,6 +43,7 @@ enum class Feature : std::uint8_t {
     FixDrawSetPool,
     PipeDeepQueue,
     PipeCommitterMutexPriority,
+    PipeFullHysteresis,
     Count
 };
 
