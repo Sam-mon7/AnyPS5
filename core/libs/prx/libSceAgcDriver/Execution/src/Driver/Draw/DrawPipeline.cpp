@@ -61,7 +61,26 @@ struct PipeCounters {
     // Collect epochs: queue-0 bumps by cause, and the epochs the committer (and finisher) began.
     std::array<std::atomic<std::uint64_t>, DrawPipeline::BumpCauses> q0Bumps{};
     std::atomic<std::uint64_t> followBumps{0};
+    // APS5_COLLECT_AHEAD_CENSUS: committed draw items by enqueue-to-commit window (buckets below),
+    // those whose preparation walked and their walk time; the walk time a helper starting right
+    // after the enqueue could have finished in the window (window >= walks + AheadLatencyNs) with its
+    // walk still standing at commit (the committer's requirement at most the clock at enqueue), and
+    // the walk time lost to a short window, a later requirement (the committer's own ordering
+    // points) or an unknown one.
+    std::atomic<std::uint64_t> aheadDraws{0};
+    std::atomic<std::uint64_t> aheadWindowNs{0};
+    std::array<std::atomic<std::uint64_t>, 5> aheadWindowItems{};
+    std::array<std::atomic<std::uint64_t>, 5> aheadWindowWalkItems{};
+    std::array<std::atomic<std::uint64_t>, 5> aheadWindowWalkNs{};
+    std::atomic<std::uint64_t> aheadFeasibleNs{0};
+    std::atomic<std::uint64_t> aheadLateNs{0};
+    std::atomic<std::uint64_t> aheadInvalidNs{0};
+    std::atomic<std::uint64_t> aheadUnknownNs{0};
 };
+// Window bucket upper bounds (us): < 50, < 150, < 400, < 1000, longer.
+constexpr std::array<std::uint64_t, 4> AheadWindowBoundsUs{50, 150, 400, 1000};
+// A parked helper's wake-up and hand-off before it can start walking (assumed).
+constexpr std::uint64_t AheadLatencyNs = 50'000;
 
 PipeCounters& pipeCounters() {
     static PipeCounters* counters = new PipeCounters();
@@ -405,6 +424,33 @@ void DrawPipeline::RegisterCounters() {
         ArchB::Recorder::RegisterCounter("pipe_collect_share_recorded", collects.shareRecorded);
         ArchB::Recorder::RegisterCounter("pipe_collect_share_recorded_pages", collects.shareRecordedPages);
         ArchB::Recorder::RegisterCounter("pipe_collect_share_resets", collects.shareResets);
+        if (GuestMemory::CollectAheadCensus()) {
+            const auto& census = GuestMemory::CollectAheadCensusCounts();
+            ArchB::Recorder::RegisterCounter("ahead_census_prelock_calls", census.prelockCalls);
+            ArchB::Recorder::RegisterCounter("ahead_census_prelock_ns", census.prelockNs);
+            ArchB::Recorder::RegisterCounter("ahead_census_prelock_walks", census.prelockWalks);
+            ArchB::Recorder::RegisterCounter("ahead_census_prelock_walk_pages", census.prelockWalkPages);
+            ArchB::Recorder::RegisterCounter("ahead_census_prelock_walk_ns", census.prelockWalkNs);
+            ArchB::Recorder::RegisterCounter("ahead_census_other_calls", census.otherCalls);
+            ArchB::Recorder::RegisterCounter("ahead_census_other_ns", census.otherNs);
+            ArchB::Recorder::RegisterCounter("ahead_census_other_walks", census.otherWalks);
+            ArchB::Recorder::RegisterCounter("ahead_census_other_walk_pages", census.otherWalkPages);
+            ArchB::Recorder::RegisterCounter("ahead_census_other_walk_ns", census.otherWalkNs);
+            ArchB::Recorder::RegisterCounter("ahead_census_draws", counters.aheadDraws);
+            ArchB::Recorder::RegisterCounter("ahead_census_window_ns", counters.aheadWindowNs);
+            static constexpr std::array<const char*, 5> itemNames{"ahead_census_win50_items", "ahead_census_win150_items", "ahead_census_win400_items", "ahead_census_win1000_items", "ahead_census_winlong_items"};
+            static constexpr std::array<const char*, 5> walkItemNames{"ahead_census_win50_walk_items", "ahead_census_win150_walk_items", "ahead_census_win400_walk_items", "ahead_census_win1000_walk_items", "ahead_census_winlong_walk_items"};
+            static constexpr std::array<const char*, 5> walkNsNames{"ahead_census_win50_walk_ns", "ahead_census_win150_walk_ns", "ahead_census_win400_walk_ns", "ahead_census_win1000_walk_ns", "ahead_census_winlong_walk_ns"};
+            for (std::size_t i = 0; i < itemNames.size(); ++i) {
+                ArchB::Recorder::RegisterCounter(itemNames[i], counters.aheadWindowItems[i]);
+                ArchB::Recorder::RegisterCounter(walkItemNames[i], counters.aheadWindowWalkItems[i]);
+                ArchB::Recorder::RegisterCounter(walkNsNames[i], counters.aheadWindowWalkNs[i]);
+            }
+            ArchB::Recorder::RegisterCounter("ahead_census_feasible_ns", counters.aheadFeasibleNs);
+            ArchB::Recorder::RegisterCounter("ahead_census_late_ns", counters.aheadLateNs);
+            ArchB::Recorder::RegisterCounter("ahead_census_invalid_ns", counters.aheadInvalidNs);
+            ArchB::Recorder::RegisterCounter("ahead_census_unknown_ns", counters.aheadUnknownNs);
+        }
         // APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY: queue workers ask whether the committer is busy.
         GuestMemory::SetGpuLockPriorityHook([] { return Queue0().Outstanding() != 0; });
         return true;
@@ -575,6 +621,11 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
     countWrites(writes, true);
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, kind});
+    static const bool aheadCensus = GuestMemory::CollectAheadCensus();
+    if (aheadCensus && kind == ItemKind::Draw) {
+        items.back().enqueuedNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        items.back().enqueueClock = GuestMemory::CollectClock();
+    }
     outstanding.fetch_add(1, std::memory_order_release);
     pipeCounters().enqueues.fetch_add(1, std::memory_order_relaxed);
     if (!thread.joinable()) {
@@ -677,6 +728,28 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 
+namespace {
+// APS5_COLLECT_AHEAD_CENSUS: one committed draw item (see PipeCounters).
+void countAheadWindow(std::uint64_t enqueuedNs, std::uint64_t enqueueClock, std::chrono::steady_clock::time_point started) {
+    const auto collects = GuestMemory::TakeCommitterItemCollects();
+    const auto startedNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(started.time_since_epoch()).count());
+    const auto window = startedNs > enqueuedNs ? startedNs - enqueuedNs : 0;
+    auto& counters = pipeCounters();
+    counters.aheadDraws.fetch_add(1, std::memory_order_relaxed);
+    counters.aheadWindowNs.fetch_add(window, std::memory_order_relaxed);
+    std::size_t bucket = 0;
+    while (bucket < AheadWindowBoundsUs.size() && window >= AheadWindowBoundsUs[bucket] * 1000) ++bucket;
+    counters.aheadWindowItems[bucket].fetch_add(1, std::memory_order_relaxed);
+    if (collects.walks == 0) return;
+    counters.aheadWindowWalkItems[bucket].fetch_add(1, std::memory_order_relaxed);
+    counters.aheadWindowWalkNs[bucket].fetch_add(collects.walkNs, std::memory_order_relaxed);
+    if (collects.required == std::numeric_limits<std::uint64_t>::max()) counters.aheadUnknownNs.fetch_add(collects.walkNs, std::memory_order_relaxed);
+    else if (collects.required > enqueueClock) counters.aheadInvalidNs.fetch_add(collects.walkNs, std::memory_order_relaxed);
+    else if (window < collects.walkNs + AheadLatencyNs) counters.aheadLateNs.fetch_add(collects.walkNs, std::memory_order_relaxed);
+    else counters.aheadFeasibleNs.fetch_add(collects.walkNs, std::memory_order_relaxed);
+}
+}
+
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     GuestMemory::MarkCommitterThread();
@@ -688,6 +761,8 @@ void DrawPipeline::run() {
         Commit* commit = nullptr;
         bool isDraw = false;
         ItemKind kind = ItemKind::Other;
+        std::uint64_t enqueuedNs = 0;
+        std::uint64_t enqueueClock = 0;
         // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
         const bool idleBefore = ArchB::Recorder::Enabled() && outstanding.load(std::memory_order_acquire) == 0;
         const auto idleStart = idleBefore ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -701,6 +776,8 @@ void DrawPipeline::run() {
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             kind = items.front().kind;
+            enqueuedNs = items.front().enqueuedNs;
+            enqueueClock = items.front().enqueueClock;
         }
         const auto start = std::chrono::steady_clock::now();
         if (idleBefore) {
@@ -724,6 +801,7 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        if (enqueuedNs != 0) countAheadWindow(enqueuedNs, enqueueClock, start);
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);

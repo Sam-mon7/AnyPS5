@@ -169,6 +169,9 @@ private:
         std::vector<Range> reads;
         bool draw = false;
         ItemKind kind = ItemKind::Other;
+        // APS5_COLLECT_AHEAD_CENSUS: when queue 0 enqueued the item, and the collect clock then.
+        std::uint64_t enqueuedNs = 0;
+        std::uint64_t enqueueClock = 0;
     };
     DrawPipeline() = default;
     void run();

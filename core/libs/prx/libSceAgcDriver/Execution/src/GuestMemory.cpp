@@ -2325,8 +2325,58 @@ std::uint64_t covered(std::uint64_t first, std::uint64_t stop, std::uint64_t unw
 #endif
 }
 
+// APS5_COLLECT_AHEAD_CENSUS (see GuestMemory.hpp).
+namespace aheadCensus {
+thread_local bool prelock = false;
+thread_local CommitterItemCollects item{};
+
+bool enabled() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_COLLECT_AHEAD_CENSUS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return on;
+}
+
+std::uint64_t nowNs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// One memoized committer collect: its time (memo hits included), and its walk if it made one.
+struct Scope {
+    bool on;
+    std::uint64_t start = 0;
+    explicit Scope(bool active) : on(active) {
+        if (on) start = nowNs();
+    }
+    void walked(std::uint64_t pages, std::uint64_t ns) const {
+        if (!on) return;
+        auto& counts = CollectAheadCensusCounts();
+        if (prelock) {
+            counts.prelockWalks.fetch_add(1, std::memory_order_relaxed);
+            counts.prelockWalkPages.fetch_add(pages, std::memory_order_relaxed);
+            counts.prelockWalkNs.fetch_add(ns, std::memory_order_relaxed);
+            ++item.walks;
+            item.walkNs += ns;
+        } else {
+            counts.otherWalks.fetch_add(1, std::memory_order_relaxed);
+            counts.otherWalkPages.fetch_add(pages, std::memory_order_relaxed);
+            counts.otherWalkNs.fetch_add(ns, std::memory_order_relaxed);
+        }
+    }
+    ~Scope() {
+        if (!on) return;
+        const auto ns = nowNs() - start;
+        auto& counts = CollectAheadCensusCounts();
+        (prelock ? counts.prelockCalls : counts.otherCalls).fetch_add(1, std::memory_order_relaxed);
+        (prelock ? counts.prelockNs : counts.otherNs).fetch_add(ns, std::memory_order_relaxed);
+    }
+};
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery, const std::source_location& site) {
     const census::Scope censusScope(memoized ? "collect" : "collect_uncached", &site);
+    const aheadCensus::Scope aheadScope(committerThread && memoized && aheadCensus::enabled());
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -2510,8 +2560,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // The clock before the OS query: every bump at or below it happened before this walk.
     const auto shareClock = shareProducer ? nextCollectEpoch.load(std::memory_order_acquire) : 0;
     const auto walkStart = shareCommitter ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto aheadWalkStart = aheadScope.on && useMemo ? aheadCensus::nowNs() : 0;
     std::uint64_t stamped = 0;
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, memoVirtualQuery, &stamped)) return fail();
+    const bool walkedOk = walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, memoVirtualQuery, &stamped);
+    if (aheadScope.on && useMemo) aheadScope.walked((stop - first) / page, aheadCensus::nowNs() - aheadWalkStart);
+    if (!walkedOk) return fail();
     if (shareCommitter) {
         auto& counters = CommitterCollects();
         const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count());
@@ -2652,6 +2705,34 @@ void SetCollectShareProducer(bool producer) {
 void FollowCollectShare(std::uint64_t clock) {
     if (!committerThread) return;
     collectShare::required = clock == 0 ? collectShare::Unknown : std::max(clock, collectShare::floor);
+}
+
+bool CollectAheadCensus() {
+    return aheadCensus::enabled();
+}
+
+CollectAheadCensusCounters& CollectAheadCensusCounts() {
+    static auto* counters = new CollectAheadCensusCounters();
+    return *counters;
+}
+
+void SetCommitterPrelock(bool prelock) {
+    if (!committerThread) return;
+    aheadCensus::prelock = prelock;
+    if (prelock && !aheadCensus::item.prepared) {
+        aheadCensus::item.prepared = true;
+        aheadCensus::item.required = collectShare::required == collectShare::Unknown ? collectShare::Unknown : std::max(collectShare::required, collectShare::floor);
+    }
+}
+
+CommitterItemCollects TakeCommitterItemCollects() {
+    const auto taken = aheadCensus::item;
+    aheadCensus::item = {};
+    return taken;
+}
+
+std::uint64_t CollectClock() {
+    return nextCollectEpoch.load(std::memory_order_acquire);
 }
 
 std::uint64_t UnwatchSerial() {

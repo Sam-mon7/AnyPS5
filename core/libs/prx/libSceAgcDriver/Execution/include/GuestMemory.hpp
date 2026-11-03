@@ -160,6 +160,39 @@ void MarkCommitterThread();
 // counts covered walks that found written pages.
 void SetCollectShareProducer(bool producer);
 void FollowCollectShare(std::uint64_t clock);
+// APS5_COLLECT_AHEAD_CENSUS=1 (diagnostic, read once): the committer's memoized collects split by
+// phase, inside a draw commit's unlocked preparation (PrepareDraw: target and template precollects,
+// whose ranges follow from the queued item alone) or anywhere else (under the GPU mutex, dispatches,
+// labels): calls and time in them (memo hits included), walks, pages and time in walks. Per item
+// (TakeCommitterItemCollects), the preparation's walks and the committer's ordering requirement when
+// the preparation began, for DrawPipeline's enqueue-to-commit window census.
+struct CollectAheadCensusCounters {
+    std::atomic<std::uint64_t> prelockCalls{0};
+    std::atomic<std::uint64_t> prelockNs{0};
+    std::atomic<std::uint64_t> prelockWalks{0};
+    std::atomic<std::uint64_t> prelockWalkPages{0};
+    std::atomic<std::uint64_t> prelockWalkNs{0};
+    std::atomic<std::uint64_t> otherCalls{0};
+    std::atomic<std::uint64_t> otherNs{0};
+    std::atomic<std::uint64_t> otherWalks{0};
+    std::atomic<std::uint64_t> otherWalkPages{0};
+    std::atomic<std::uint64_t> otherWalkNs{0};
+};
+bool CollectAheadCensus();
+CollectAheadCensusCounters& CollectAheadCensusCounts();
+// The committer enters (true) or leaves a draw's unlocked preparation.
+void SetCommitterPrelock(bool prelock);
+struct CommitterItemCollects {
+    std::uint64_t walks = 0;
+    std::uint64_t walkNs = 0;
+    // max(the committed token's ordering point, the committer's own ordering points) when the
+    // preparation began; Unknown (max) when the token's point was not known.
+    std::uint64_t required = 0;
+    bool prepared = false;
+};
+CommitterItemCollects TakeCommitterItemCollects();
+// The latest collect epoch any thread began (a walk starting now follows every bump up to it).
+std::uint64_t CollectClock();
 std::uint64_t ProofSerial();
 std::uint64_t ResourceProofSerial();
 bool ResourceEpochProofsEnabled();

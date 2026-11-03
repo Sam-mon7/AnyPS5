@@ -1643,6 +1643,16 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     DrawLockTiming lockTiming{profile};
     if (Graphics::DrawPrelockEnabled()) {
         const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        static const bool aheadCensus = GuestMemory::CollectAheadCensus();
+        struct PrelockPhase {
+            bool on;
+            explicit PrelockPhase(bool active) : on(active) {
+                if (on) GuestMemory::SetCommitterPrelock(true);
+            }
+            ~PrelockPhase() {
+                if (on) GuestMemory::SetCommitterPrelock(false);
+            }
+        } prelockPhase{aheadCensus};
         lockTiming.preparation = localDevice->PrepareDraw(graphics, drawParameters, stages, recipe.get(), memoVirtualQuery);
         if (profile) lockTiming.prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
