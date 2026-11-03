@@ -19,7 +19,13 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <string>
+#include <unordered_set>
+#include <vector>
 #include <stdexcept>
 #include <utility>
 
@@ -121,6 +127,131 @@ void NoteQ0Dispatch(Q0Dispatch outcome) {
     }();
     static_cast<void>(registered);
     q0Dispatches[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// APS5_DISPATCH_MISS_DIAG=1 (diagnostic): why queue-0 dispatch-cache keys keep changing. Every
+// queue-0 lookup is kept per program (its last 8 keys with their fields); a miss names the fields
+// that differ from the nearest earlier key of the program, whether the exact key had been seen
+// before (an eviction or an unstable capture rather than a new key), and whether an entry existed
+// (validation differed) or not. Lines: the first 300 misses, then every 50th; a per-program summary
+// with a field histogram every 2000 misses (the histogram restarts after each summary).
+struct MissDiagKey {
+    std::uint64_t key = 0;
+    std::uint64_t feedbackKey = 0;
+    std::uint32_t wave = 0;
+    std::array<std::uint32_t, 3> partial{};
+    std::array<std::uint32_t, 5> registers{};
+    std::vector<std::uint32_t> userData;
+    std::uintptr_t shader = 0;
+};
+
+struct MissDiagProgram {
+    std::deque<MissDiagKey> recent;
+    std::unordered_set<std::uint64_t> keys;
+    std::uint64_t dispatches = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t seenMisses = 0;
+    std::uint64_t differingMisses = 0;
+    std::map<std::string, std::uint64_t> fields;
+};
+
+bool MissDiagEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_DISPATCH_MISS_DIAG");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+std::vector<std::pair<std::string, std::string>> MissDiagDiff(const MissDiagKey& from, const MissDiagKey& to) {
+    std::vector<std::pair<std::string, std::string>> fields;
+    char text[96];
+    if (from.wave != to.wave) fields.emplace_back("wave", "wave");
+    if (from.partial != to.partial) {
+        std::snprintf(text, sizeof(text), "partial %x,%x,%x->%x,%x,%x", from.partial[0], from.partial[1], from.partial[2], to.partial[0], to.partial[1], to.partial[2]);
+        fields.emplace_back("partial", text);
+    }
+    constexpr std::array<std::uint32_t, 5> offsets{0x207u, 0x208u, 0x209u, 0x212u, 0x213u};
+    for (std::size_t i = 0; i < offsets.size(); ++i) {
+        if (from.registers[i] == to.registers[i]) continue;
+        std::snprintf(text, sizeof(text), "sh[%x] %08x->%08x", offsets[i], from.registers[i], to.registers[i]);
+        char name[16];
+        std::snprintf(name, sizeof(name), "sh[%x]", offsets[i]);
+        fields.emplace_back(name, text);
+    }
+    const auto words = std::max(from.userData.size(), to.userData.size());
+    for (std::size_t i = 0; i < words; ++i) {
+        const auto a = i < from.userData.size() ? from.userData[i] : 0u;
+        const auto b = i < to.userData.size() ? to.userData[i] : 0u;
+        if (a == b && i < from.userData.size() && i < to.userData.size()) continue;
+        std::snprintf(text, sizeof(text), "user[%zu] %08x->%08x", i, a, b);
+        char name[16];
+        std::snprintf(name, sizeof(name), "user[%zu]", i);
+        fields.emplace_back(name, text);
+    }
+    if (from.shader != to.shader) fields.emplace_back("shader", "shader object");
+    if (fields.empty() && from.key != to.key) fields.emplace_back("unexplained", "unexplained");
+    return fields;
+}
+
+void NoteDispatchMissDiag(std::uint64_t address, MissDiagKey current, bool hit, bool entryExisted, bool candidate) {
+    static std::mutex mutex;
+    static std::map<std::uint64_t, MissDiagProgram> programs;
+    static std::uint64_t misses = 0;
+    std::lock_guard lock(mutex);
+    auto& program = programs[address];
+    ++program.dispatches;
+    if (!hit) {
+        ++program.misses;
+        ++misses;
+        const bool seen = program.keys.contains(current.key);
+        if (seen) ++program.seenMisses;
+        if (entryExisted) ++program.differingMisses;
+        const MissDiagKey* nearest = nullptr;
+        std::vector<std::pair<std::string, std::string>> diff;
+        std::size_t back = 0;
+        for (std::size_t i = 0; i < program.recent.size(); ++i) {
+            auto fields = MissDiagDiff(program.recent[program.recent.size() - 1 - i], current);
+            if (nearest == nullptr || fields.size() < diff.size()) {
+                nearest = &program.recent[program.recent.size() - 1 - i];
+                diff = std::move(fields);
+                back = i + 1;
+            }
+        }
+        if (nearest == nullptr) ++program.fields["first"];
+        for (const auto& field : diff) ++program.fields[field.first];
+        if (misses <= 300 || misses % 50 == 0) {
+            std::string what;
+            for (const auto& field : diff) what += " " + field.second;
+            std::fprintf(stderr, "[dispatch-miss] #%llu 0x%llx key %016llx fb %016llx %s seen=%d entry=%d candidate=%d keys=%zu nearest=-%zu:%s\n", static_cast<unsigned long long>(misses), static_cast<unsigned long long>(address), static_cast<unsigned long long>(current.key), static_cast<unsigned long long>(current.feedbackKey), nearest == nullptr ? "first" : "near", seen ? 1 : 0, entryExisted ? 1 : 0, candidate ? 1 : 0, program.keys.size(), back, what.c_str());
+        }
+        if (misses % 2000 == 0) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> ranked;
+            for (const auto& [programAddress, state] : programs) {
+                if (state.misses != 0) ranked.emplace_back(state.misses, programAddress);
+            }
+            std::sort(ranked.rbegin(), ranked.rend());
+            std::string text;
+            for (std::size_t i = 0; i < ranked.size() && i < 16; ++i) {
+                auto& state = programs[ranked[i].second];
+                std::vector<std::pair<std::uint64_t, std::string>> top;
+                for (const auto& [name, count] : state.fields) top.emplace_back(count, name);
+                std::sort(top.rbegin(), top.rend());
+                char line[192];
+                std::snprintf(line, sizeof(line), "\n  0x%llx: dispatches %llu misses %llu (seen key %llu, entry existed %llu), keys %zu, fields:", static_cast<unsigned long long>(ranked[i].second), static_cast<unsigned long long>(state.dispatches), static_cast<unsigned long long>(state.misses), static_cast<unsigned long long>(state.seenMisses), static_cast<unsigned long long>(state.differingMisses), state.keys.size());
+                text += line;
+                for (std::size_t j = 0; j < top.size() && j < 8; ++j) text += " " + top[j].second + "=" + std::to_string(top[j].first);
+            }
+            std::fprintf(stderr, "[dispatch-miss-summary] %llu misses, %zu programs; top by misses since the last summary:%s\n", static_cast<unsigned long long>(misses), programs.size(), text.c_str());
+            for (auto& [programAddress, state] : programs) {
+                state.dispatches = state.misses = state.seenMisses = state.differingMisses = 0;
+                state.fields.clear();
+            }
+        }
+    }
+    program.keys.insert(current.key);
+    program.recent.push_back(std::move(current));
+    if (program.recent.size() > 8) program.recent.pop_front();
 }
 
 void ReportDispatchItems(bool profile) {
@@ -522,6 +653,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     timing.Mark("lookup_cache");
     if (pipelineCandidate && fallbackCause == DrawPipeline::DrainCause::DispatchMiss && cached) NoteQ0Dispatch(Q0Dispatch::MissThenHit);
+    if (submission.queue == 0 && !resolving && !noDispatchCache && MissDiagEnabled()) {
+        MissDiagKey diag{key, feedbackKey, packet[4] & 0x8000u, compute.partialThreads, {}, userData, reinterpret_cast<std::uintptr_t>(registeredShader.get())};
+        constexpr std::array<std::uint32_t, 5> offsets{0x207u, 0x208u, 0x209u, 0x212u, 0x213u};
+        for (std::size_t i = 0; i < offsets.size(); ++i) diag.registers[i] = readRegister(queue.shader, offsets[i]);
+        NoteDispatchMissDiag(address, std::move(diag), cached, missedEntry != nullptr, pipelineCandidate);
+    }
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
     if (readsClear) {
