@@ -120,7 +120,11 @@ public:
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
     // `ticket`: the issuing thread's write-generation ticket carried with the commit (0: none).
+    // Several queue-0 bumps between two commits make one committer epoch (pipe_committer_bumps).
     static void FollowEpoch(std::uint64_t token, std::uint64_t ticket = 0);
+    // Queue 0 bumped its collect epoch (counters pipe_q0_bumps_<cause>).
+    enum BumpCause : std::size_t { BumpSubmission, BumpWait, BumpDrain, BumpReap, BumpPacket, BumpCauses };
+    static void CountEpochBump(BumpCause cause);
     static unsigned Committers();
 
     // Never waits while the calling thread holds the GPU mutex: a full pipeline then takes the item

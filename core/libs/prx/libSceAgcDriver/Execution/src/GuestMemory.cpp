@@ -2217,6 +2217,9 @@ CollectHitCache& collectHitCache() {
     return *cache;
 }
 
+// The queue-0 committer's collect counters (see GuestMemory.hpp).
+thread_local bool committerThread = false;
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery, const std::source_location& site) {
     const census::Scope censusScope(memoized ? "collect" : "collect_uncached", &site);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
@@ -2231,6 +2234,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
+    if (committerThread && useMemo) CommitterCollects().collects.fetch_add(1, std::memory_order_relaxed);
     // Write generations: an uncached collect sweeps at a private fresh ticket (rule V4); a memoized
     // one is modeled under the shadow: what EnsureSwept would sweep at the thread's ticket, judged
     // before this call's own walk can cover anything.
@@ -2253,6 +2257,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             if (!bookkeeping::verify()) {
                 bookkeeping::count(bookkeeping::Hits);
                 if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (committerThread) CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.stable.load(std::memory_order_acquire);
             }
             verifyHit = true;
@@ -2262,6 +2267,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (cached != nullptr) *cached = {first, stop, epoch, unwatched, mapping};
         if (verifyHit) bookkeeping::count(bookkeeping::Verified);
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        if (committerThread) CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
         return tracker.stable.load(std::memory_order_acquire);
     };
     if (useMemo && !sharedCollectMemo()) {
@@ -2326,6 +2332,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
 #endif
     if (modeled && model.uncoveredPages == 0 && model.unknownBlocks == 0 && model.crossBlocks != 0) Gen::NoteModelCrossWalk();
+    if (committerThread && useMemo) {
+        CommitterCollects().walks.fetch_add(1, std::memory_order_relaxed);
+        CommitterCollects().walkPages.fetch_add((stop - first) / page, std::memory_order_relaxed);
+    }
     if (!walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, memoVirtualQuery)) return fail();
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
@@ -2448,6 +2458,15 @@ void BumpCollectEpoch(Gen::TicketReason reason) {
 
 std::uint64_t ThreadCollectEpoch() {
     return collectMemoEnabled() ? HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() : 0;
+}
+
+CommitterCollectCounters& CommitterCollects() {
+    static auto* counters = new CommitterCollectCounters();
+    return *counters;
+}
+
+void MarkCommitterThread() {
+    committerThread = true;
 }
 
 std::uint64_t UnwatchSerial() {

@@ -120,6 +120,16 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // `reason`; Committer only adopts the ticket the commit carried (see DrawPipeline::FollowEpoch).
 void BumpCollectEpoch(Gen::TicketReason reason = Gen::TicketReason::Other);
 void AdoptLatestCollectEpoch();
+// The queue-0 committer thread's memoized collects: calls, memo hits, walks and pages walked
+// (recorder counters pipe_committer_collect*).
+struct CommitterCollectCounters {
+    std::atomic<std::uint64_t> collects{0};
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> walks{0};
+    std::atomic<std::uint64_t> walkPages{0};
+};
+CommitterCollectCounters& CommitterCollects();
+void MarkCommitterThread();
 std::uint64_t ProofSerial();
 std::uint64_t ResourceProofSerial();
 bool ResourceEpochProofsEnabled();

@@ -57,6 +57,9 @@ struct PipeCounters {
     std::atomic<std::uint64_t> fullWaitNs{0};
     std::atomic<std::uint64_t> idleNs{0};
     std::atomic<std::uint64_t> enqueueNs{0};
+    // Collect epochs: queue-0 bumps by cause, and the epochs the committer (and finisher) began.
+    std::array<std::atomic<std::uint64_t>, DrawPipeline::BumpCauses> q0Bumps{};
+    std::atomic<std::uint64_t> followBumps{0};
 };
 
 PipeCounters& pipeCounters() {
@@ -381,6 +384,14 @@ void DrawPipeline::RegisterCounters() {
         ArchB::Recorder::RegisterCounter("pipe_drains_locked", counters.lockedDrains);
         ArchB::Recorder::RegisterCounter("pipe_full_waits", counters.fullWaits);
         ArchB::Recorder::RegisterCounter("pipe_full_overcommits", counters.fullOvercommits);
+        static constexpr std::array<const char*, BumpCauses> bumpNames{"pipe_q0_bumps_submission", "pipe_q0_bumps_wait", "pipe_q0_bumps_drain", "pipe_q0_bumps_reap", "pipe_q0_bumps_packet"};
+        for (std::size_t i = 0; i < bumpNames.size(); ++i) ArchB::Recorder::RegisterCounter(bumpNames[i], counters.q0Bumps[i]);
+        ArchB::Recorder::RegisterCounter("pipe_committer_bumps", counters.followBumps);
+        const auto& collects = GuestMemory::CommitterCollects();
+        ArchB::Recorder::RegisterCounter("pipe_committer_collects", collects.collects);
+        ArchB::Recorder::RegisterCounter("pipe_committer_collect_hits", collects.hits);
+        ArchB::Recorder::RegisterCounter("pipe_committer_collect_walks", collects.walks);
+        ArchB::Recorder::RegisterCounter("pipe_committer_collect_walk_pages", collects.walkPages);
         // APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY: queue workers ask whether the committer is busy.
         GuestMemory::SetGpuLockPriorityHook([] { return Queue0().Outstanding() != 0; });
         return true;
@@ -444,6 +455,10 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
     return token;
 }
 
+void DrawPipeline::CountEpochBump(BumpCause cause) {
+    if (cause < BumpCauses) pipeCounters().q0Bumps[cause].fetch_add(1, std::memory_order_relaxed);
+}
+
 void DrawPipeline::FollowEpoch(std::uint64_t token, std::uint64_t ticket) {
     // Write generations: the committer checks at the ticket the issuing thread held when it enqueued
     // the commit (carried explicitly, rule V1/V3), not at a fresh one of its own.
@@ -451,6 +466,7 @@ void DrawPipeline::FollowEpoch(std::uint64_t token, std::uint64_t ticket) {
     static thread_local std::uint64_t followed = 0;
     if (followed == token) return;
     followed = token;
+    pipeCounters().followBumps.fetch_add(1, std::memory_order_relaxed);
     GuestMemory::BumpCollectEpoch(GuestMemory::Gen::TicketReason::Committer);
 }
 
@@ -611,6 +627,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
+    GuestMemory::MarkCommitterThread();
     StartCommitterSampler();
     static std::atomic<std::uint64_t> recorderCommits{0};
     static const bool registered = [] { ArchB::Recorder::RegisterCounter("draw_pipeline_commits", recorderCommits); return true; }();

@@ -37,7 +37,10 @@ void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter, GuestMemory::Gen::Tic
         reason = counter == &EpochBumps::submissions ? TicketReason::Submission : counter == &EpochBumps::packets ? TicketReason::Packet : counter == &EpochBumps::drains ? TicketReason::Drain : counter == &EpochBumps::reaps ? TicketReason::Reap : TicketReason::WaitCpu;
     }
     GuestMemory::BumpCollectEpoch(reason);
-    if (DrawPipeline::Active()) DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed);
+    if (DrawPipeline::Active()) {
+        DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed);
+        DrawPipeline::CountEpochBump(counter == &EpochBumps::submissions ? DrawPipeline::BumpSubmission : counter == &EpochBumps::waits ? DrawPipeline::BumpWait : counter == &EpochBumps::drains ? DrawPipeline::BumpDrain : counter == &EpochBumps::reaps ? DrawPipeline::BumpReap : DrawPipeline::BumpPacket);
+    }
     ++(epochBumps().*counter);
 }
 
