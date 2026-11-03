@@ -87,6 +87,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::PipeCollectShare, "PIPE_COLLECT_SHARE", false, true, PipeCollectSharePrerequisites},
     {Feature::FixDispatchRelocation, "FIX_DISPATCH_RELOCATION", false, true, {}},
     {Feature::PipeCopyKernelItems, "PIPE_COPY_KERNEL_ITEMS", false, true, PipeCopyKernelItemsPrerequisites},
+    {Feature::FixStableFailedCollects, "FIX_STABLE_FAILED_COLLECTS", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

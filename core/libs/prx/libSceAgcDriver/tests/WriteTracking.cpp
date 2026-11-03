@@ -1979,11 +1979,28 @@ void CheckAllocChurnMemo() {
 }
 
 void CheckFailedCollectMemo() {
+    // APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS (+ _VERIFY): a failure is remembered across epochs while
+    // the page-state serials hold; every check below holds with it on, off and verified.
+    // It builds on the per-epoch failed memo (APS5_NO_FAILED_COLLECT_MEMO and the memo/map kill switches turn it off).
+    const bool stable = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixStableFailedCollects) && std::getenv("APS5_NO_FAILED_COLLECT_MEMO") == nullptr && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_NO_EPOCH_COLLECT_MAP") == nullptr && std::getenv("APS5_SHARED_COLLECT_MEMO") == nullptr;
+    const char* verifyText = std::getenv("APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS_VERIFY");
+    const bool verifying = verifyText != nullptr && std::string_view(verifyText) == "1";
+    auto& stableCounts = StableFailedCollects();
     PartlyCommitted range;
     range.Commit(0);
     const auto base = range.Address();
     BumpCollectEpoch();
     for (int repeat = 0; repeat < 3; ++repeat) Require(CollectWrites(base, PartlyCommitted::Bytes) == 0, "a repeated partial collection manufactured a generation");
+    {
+        const auto hits = stableCounts.hits.load();
+        const auto verified = stableCounts.verified.load();
+        const auto inserts = stableCounts.inserts.load();
+        BumpCollectEpoch();
+        Require(CollectWrites(base, PartlyCommitted::Bytes) == 0, "a failed collection succeeded in the next epoch without a page change");
+        if (!stable) Require(stableCounts.hits.load() == hits && stableCounts.inserts.load() == 0, "failures were remembered with the switch off");
+        else if (verifying) Require(stableCounts.verified.load() == verified + 1 && stableCounts.hits.load() == hits, "a remembered failure was not verified by its walk");
+        else Require(inserts != 0 && stableCounts.hits.load() == hits + 1, "a failure was not remembered across epochs");
+    }
     const auto first = CollectWrites(base, Block);
     Require(first != 0 && UnchangedSince(base, Block, first), "a failed full collection poisoned its committed subset");
     Require(MarkWritten(base, 4) != 0 && CollectWrites(base, PartlyCommitted::Bytes) == 0 && !UnchangedSince(base, Block, first), "a driver write turned a failed collection into a proof or lost its stamp");
@@ -1996,15 +2013,20 @@ void CheckFailedCollectMemo() {
     Require(CollectWrites(base, PartlyCommitted::Bytes) != 0, "committing the missing pages did not invalidate a failed collection in the same epoch");
     range.Decommit(1);
     Require(CollectWrites(base, PartlyCommitted::Bytes) == 0 && CollectWritesUncached(base, PartlyCommitted::Bytes) == 0, "decommitting pages retained a successful collection");
+    BumpCollectEpoch();
+    Require(CollectWrites(base, PartlyCommitted::Bytes) == 0, "a decommitted range collected in the next epoch");
     range.Commit(1);
     Require(CollectWrites(base, PartlyCommitted::Bytes) != 0, "recommitting pages retained a failed collection");
     Unwatch(base, Block);
     Require(CollectWrites(base, PartlyCommitted::Bytes) == 0, "unwatching pages retained a successful collection");
+    BumpCollectEpoch();
+    Require(CollectWrites(base, PartlyCommitted::Bytes) == 0, "an unwatched range collected in the next epoch");
 #ifdef _WIN32
     const Runs restored{{base, base + Block}};
     Rewatch(restored);
     Require(CollectWrites(base, PartlyCommitted::Bytes) != 0, "rewatching pages retained a failed collection");
 #endif
+    Require(stableCounts.mismatches.load() == 0, "a remembered failure no longer held (verify)");
 }
 
 #ifdef _WIN32

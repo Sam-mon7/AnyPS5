@@ -204,6 +204,24 @@ CommitterItemCollects TakeCommitterItemCollects();
 // (module offsets, s3/symbolize.py). A "[collect-census]" block on stderr every 10 s (cumulative,
 // with the flip count). The committer calls BeginCommitterCensusItem before each item.
 bool CommitterCollectCensus();
+// APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS (runtime, default off): a memoized collect that failed
+// (pages not collectable: outside the watched arena, not committed private memory, no-access or
+// unwatched views) without refusing any compared-when-shared or unreported page is remembered per
+// thread across collect epochs with the page-state serials read before it (mapping and commit
+// generations, the protection, unwatch and forget serials); the same range under the same serials
+// fails again without its walk (the result, 0, is what the walk would return, and such a failed
+// walk has no side effect: libc decides collectability before it reports or resets anything). A
+// failure that met compared or unreported pages (noteRefusedWalk stamps them and refreshes the
+// refused blocks UnchangedSince reads) is never remembered. _VERIFY=1 walks anyway and counts a
+// remembered failure that now succeeds or meets such pages (fix_stable_failed_collects_mismatches).
+struct StableFailedCollectCounters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> inserts{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> mismatches{0};
+};
+StableFailedCollectCounters& StableFailedCollects();
 void BeginCommitterCensusItem(std::uint8_t kind);
 // Queue 0 at each flip (the census divides by flips).
 void NoteCensusFlip();

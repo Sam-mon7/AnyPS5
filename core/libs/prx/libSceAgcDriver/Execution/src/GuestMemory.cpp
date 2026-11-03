@@ -2076,6 +2076,10 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 #endif
 }
 
+// APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS: the unreported and compared pages noteRefusedWalk met on
+// this thread (a failed walk that met none has no side effect and may be remembered).
+thread_local std::uint64_t refusedWalkPages = 0;
+
 #ifdef _WIN32
 std::atomic<FreshCollectHook> freshCollectHook{nullptr};
 
@@ -2135,10 +2139,14 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
         }
     };
     StampRuns runs{tracker, StampKind::Cpu};
-    pagesOf(&GuestArena::GuestArenaTakeUnreportedPages_nid_no_patch, [&](std::uintptr_t page) { stampWrittenRun(&runs, page, page + WritePageBytes); });
+    pagesOf(&GuestArena::GuestArenaTakeUnreportedPages_nid_no_patch, [&](std::uintptr_t page) {
+        ++refusedWalkPages;
+        stampWrittenRun(&runs, page, page + WritePageBytes);
+    });
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     const bool gen = Gen::Active();
     pagesOf(&GuestArena::GuestArenaComparedPages_nid_no_patch, [&](std::uintptr_t page) {
+        ++refusedWalkPages;
         // Compared-when-shared pages: the block reads Unknown(compared) until a walk tracks it again,
         // and its refusal is a per-block table field (lock-free answers), stored before the map's.
         if (gen) {
@@ -2657,6 +2665,86 @@ private:
 };
 }
 
+// APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS (see GuestMemory.hpp): this thread's remembered failures,
+// direct-mapped by exact page-rounded range, each with the serials read before its walk.
+namespace stableFailed {
+bool active() {
+    return ArchB::Switches::Enabled(ArchB::Feature::FixStableFailedCollects);
+}
+
+bool verify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+struct Serials {
+    std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
+    std::uint64_t committed = 0;
+    std::uint64_t protection = 0;
+    std::uint64_t forgotten = 0;
+    bool operator==(const Serials&) const = default;
+    // Page states are in flux (a protection change or ForgetPages under way): nothing is remembered.
+    bool settled() const {
+        return protection != 0 && (forgotten & 1u) == 0;
+    }
+};
+
+Serials read(std::uint64_t unwatched, std::uint64_t mapping) {
+    Serials serials{unwatched, mapping};
+#ifdef _WIN32
+    serials.committed = GuestArena::GuestArenaCommitGeneration_nid_postfix();
+    serials.protection = GuestArena::GuestArenaQueryProtectionSerial_nid_no_patch();
+#else
+    serials.protection = 0;
+#endif
+    serials.forgotten = ForgetSerial();
+    return serials;
+}
+
+struct Entry {
+    std::uint64_t first = 0;
+    std::uint64_t stop = 0;
+    Serials serials{};
+};
+
+struct Table {
+    static constexpr std::size_t Entries = 1024;
+    std::array<Entry, Entries> entries{};
+    Entry& at(std::uint64_t first, std::uint64_t stop) {
+        auto key = (first >> 12) * 0x9e3779b97f4a7c15ull ^ (stop >> 12) * 0xc2b2ae3d27d4eb4full;
+        key ^= key >> 29;
+        return entries[static_cast<std::size_t>(key % Entries)];
+    }
+};
+
+Table& table() {
+    struct Slot {};
+    auto* owned = HostThreadSlot<Table*, Slot>::Get();
+    if (owned == nullptr) {
+        ShaderRecompiler::ThreadOwned(owned);
+        HostThreadSlot<Table*, Slot>::Set(owned);
+    }
+    return *owned;
+}
+
+StableFailedCollectCounters& counters() {
+    static auto* made = [] {
+        auto* counts = new StableFailedCollectCounters();
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_collects_hits", counts->hits);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_collects_inserts", counts->inserts);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_collects_refused", counts->refused);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_collects_verified", counts->verified);
+        ArchB::Recorder::RegisterCounter("fix_stable_failed_collects_mismatches", counts->mismatches);
+        return counts;
+    }();
+    return *made;
+}
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery, const std::source_location& site) {
     const census::Scope censusScope(memoized ? "collect" : "collect_uncached", &site);
     const aheadCensus::Scope aheadScope(committerThread && memoized && aheadCensus::enabled());
@@ -2756,13 +2844,52 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const auto failedFirst = first;
     const auto failedStop = stop;
+    // APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS: a failure remembered from an earlier epoch under the same
+    // serials (read before the lock, so a change made during a walk never matches later).
+    const bool stableFailures = memoFailures && !Gen::Active() && stableFailed::active();
+    const auto stableSerials = stableFailures ? stableFailed::read(unwatched, mapping) : stableFailed::Serials{};
+    bool stableVerify = false;
+    if (stableFailures && stableSerials.settled()) {
+        const auto& entry = stableFailed::table().at(first, stop);
+        if (entry.first == first && entry.stop == stop && entry.serials == stableSerials) {
+            if (!stableFailed::verify()) {
+                stableFailed::counters().hits.fetch_add(1, std::memory_order_relaxed);
+                committerCall.hit(committerCensus::OutcomeFailedHit);
+                EpochMemoMap<WriteTracker::Memo>::SlotState state;
+                epochCollectMap(epoch).failedRanges.Slot(first, state) = {first, stop, epoch, unwatched, mapping};
+                noteMemoReuse(state);
+                return 0;
+            }
+            stableVerify = true;
+        }
+    }
+    const auto refusedBefore = refusedWalkPages;
     const auto fail = [&]() -> std::uint64_t {
         if (memoFailures) {
             EpochMemoMap<WriteTracker::Memo>::SlotState state;
             epochCollectMap(epoch).failedRanges.Slot(failedFirst, state) = {failedFirst, failedStop, epoch, unwatched, mapping};
             noteMemoReuse(state);
         }
+        if (stableFailures && stableSerials.settled()) {
+            auto& counts = stableFailed::counters();
+            if (refusedWalkPages != refusedBefore) {
+                // Compared or unreported pages: their walk has effects, never remembered.
+                counts.refused.fetch_add(1, std::memory_order_relaxed);
+                if (stableVerify) counts.mismatches.fetch_add(1, std::memory_order_relaxed);
+                stableFailed::table().at(failedFirst, failedStop) = {};
+            } else {
+                if (stableVerify) counts.verified.fetch_add(1, std::memory_order_relaxed);
+                else counts.inserts.fetch_add(1, std::memory_order_relaxed);
+                stableFailed::table().at(failedFirst, failedStop) = {failedFirst, failedStop, stableSerials};
+            }
+        }
         return 0;
+    };
+    // A remembered failure whose walk now succeeds (verification only).
+    const auto stableSucceeded = [&] {
+        if (!stableVerify) return;
+        stableFailed::counters().mismatches.fetch_add(1, std::memory_order_relaxed);
+        stableFailed::table().at(failedFirst, failedStop) = {};
     };
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2791,6 +2918,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // Only a completed walk is remembered (or a range queue 0 walked for this epoch, below); a failed
     // one (uncommitted pages) returns 0.
     const auto remember = [&] {
+    stableSucceeded();
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial, mapping};
@@ -3004,6 +3132,10 @@ void FollowCollectShare(std::uint64_t clock) {
 
 bool CollectAheadCensus() {
     return aheadCensus::enabled();
+}
+
+StableFailedCollectCounters& StableFailedCollects() {
+    return stableFailed::counters();
 }
 
 bool CommitterCollectCensus() {

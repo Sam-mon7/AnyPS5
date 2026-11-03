@@ -588,9 +588,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_pipe_collect_share_switch COMMAND agc_archb_c01_switches_tests --toggle PipeCollectShare)
     add_test(NAME agc_archb_fix_dispatch_relocation_switch COMMAND agc_archb_c01_switches_tests --toggle FixDispatchRelocation)
     add_test(NAME agc_archb_pipe_copy_kernel_items_switch COMMAND agc_archb_c01_switches_tests --toggle PipeCopyKernelItems)
-    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_archb_fix_stable_failed_collects_switch COMMAND agc_archb_c01_switches_tests --toggle FixStableFailedCollects)
+    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
@@ -1043,6 +1044,15 @@ if(BUILD_TESTING)
     set_tests_properties(agc_failed_collect_memo agc_failed_collect_memo_off PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     set_tests_properties(agc_failed_collect_memo_off PROPERTIES ENVIRONMENT "APS5_NO_FAILED_COLLECT_MEMO=1")
+    # APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS: failures remembered across epochs (on, verified), the
+    # failed-memo checks and the whole write-tracking suite with it on.
+    add_test(NAME agc_archb_fix_stable_failed_collects_on COMMAND agc_write_tracking_tests --failed-collect-memo)
+    add_test(NAME agc_archb_fix_stable_failed_collects_verify COMMAND agc_write_tracking_tests --failed-collect-memo)
+    add_test(NAME agc_archb_fix_stable_failed_collects_suite COMMAND agc_write_tracking_tests)
+    set_tests_properties(agc_archb_fix_stable_failed_collects_on agc_archb_fix_stable_failed_collects_verify agc_archb_fix_stable_failed_collects_suite PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    set_tests_properties(agc_archb_fix_stable_failed_collects_on agc_archb_fix_stable_failed_collects_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS=1")
+    set_tests_properties(agc_archb_fix_stable_failed_collects_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS=1;APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS_VERIFY=1")
     add_test(NAME agc_write_tracking_alloc_churn COMMAND agc_write_tracking_tests)
     add_test(NAME agc_failed_collect_memo_alloc_churn COMMAND agc_write_tracking_tests --failed-collect-memo)
     add_test(NAME agc_archb_fix_alloc_churn_memo COMMAND agc_write_tracking_tests --alloc-churn-memo)
@@ -1100,6 +1110,11 @@ if(BUILD_TESTING)
         set_tests_properties(agc_import_alias_shared PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
         add_test(NAME agc_compared_shared_generations COMMAND agc_write_tracking_tests --compared-shared-generations)
         set_tests_properties(agc_compared_shared_generations PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+        # APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS: compared-when-shared pages refuse walks that must keep running.
+        add_test(NAME agc_archb_fix_stable_failed_collects_compared COMMAND agc_write_tracking_tests --compared-shared-generations)
+        set_tests_properties(agc_archb_fix_stable_failed_collects_compared PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20
+            ENVIRONMENT "APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_write_tracking_rewatch_import_pages COMMAND agc_write_tracking_tests --rewatch-import-pages)
         set_tests_properties(agc_write_tracking_rewatch_import_pages PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
         set_tests_properties(agc_write_tracking agc_write_tracking_metadata_commit agc_resident_direct_remap agc_rewatched_direct_shared agc_import_alias_shared agc_compared_shared_generations agc_write_tracking_rewatch_import_pages PROPERTIES ENVIRONMENT_MODIFICATION
