@@ -4915,6 +4915,53 @@ void report() {
 
 }
 
+namespace crossCarry {
+
+bool Enabled() {
+    return AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuStagingCarry);
+}
+
+bool Verify() {
+    static const bool verify = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_GPU_STAGING_CARRY_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return verify;
+}
+
+bool liveCpuProof(std::uint64_t begin, std::uint64_t end, std::uint64_t clock, std::uint64_t generation) {
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    return clock != 0 && generation != 0 && GuestMemory::FaultUnchangedSince(begin, bytes, clock) && GuestMemory::UnchangedSince(begin, bytes, generation);
+}
+
+std::atomic<GuestBufferMemory::CarryCpuProof> cpuProof{&liveCpuProof};
+
+struct Counters {
+    std::atomic<std::uint64_t> carried{0}, carriedBytes{0}, crossBatch{0}, crossBytes{0}, copied{0}, noToken{0}, noted{0}, queued{0}, registry{0}, cpu{0}, tokens{0}, verified{0}, mismatches{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+Counters& counters() {
+    static Counters instance;
+    return instance;
+}
+
+void count(std::atomic<std::uint64_t>& counter, const char* name, std::uint64_t value = 1) {
+    counter.fetch_add(value, std::memory_order_relaxed);
+    AgcDriver::ArchB::Recorder::Count(name, static_cast<double>(value));
+}
+
+void report() {
+    auto& c = counters();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = c.lastReport.load();
+    if (nowMs - last < 10000 || !c.lastReport.compare_exchange_strong(last, nowMs)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[c-staging-carry] cumulative: %llu copy-ins skipped (%.1f MiB), %llu of them across batches (%.1f MiB); %llu copied (%llu without a token, %llu noted, %llu registry, %llu cpu); %llu tokens, %llu refused for queued stores; verify %llu checked, %llu mismatches\n",
+        static_cast<unsigned long long>(c.carried.load()), c.carriedBytes.load() / 1048576.0, static_cast<unsigned long long>(c.crossBatch.load()), c.crossBytes.load() / 1048576.0, static_cast<unsigned long long>(c.copied.load()), static_cast<unsigned long long>(c.noToken.load()), static_cast<unsigned long long>(c.noted.load()), static_cast<unsigned long long>(c.registry.load()), static_cast<unsigned long long>(c.cpu.load()), static_cast<unsigned long long>(c.tokens.load()), static_cast<unsigned long long>(c.queued.load()), static_cast<unsigned long long>(c.verified.load()), static_cast<unsigned long long>(c.mismatches.load()));
+}
+
+}
+
 void reportStaging() {
     auto& stats = Copies();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -5554,6 +5601,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         // A copied-in shadow starts a new use: no carry point until its copy-back.
         region->carrySerial = 0;
         region->carryWhole = false;
+        recorder->DropCarry(std::exchange(region->carryWatch, 0));
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
@@ -6294,7 +6342,8 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Region*> copies;
     std::vector<Region*> carried;
-    const bool carry = stagingCarry::Enabled();
+    const bool cross = crossCarry::Enabled();
+    const bool carry = !cross && stagingCarry::Enabled();
     for (auto& region : regions) {
         if (!region.gpuCopy || !region.deviceLocal) continue;
         // The previous use's copy-back was recorded by its MarkGpuWrites (or never, when that use
@@ -6302,6 +6351,42 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // copy-in refills. The import is the one the region was taken from (the caller checked its
         // serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
+        const auto watch = std::exchange(region.carryWatch, 0);
+        if (cross) {
+            auto& c = crossCarry::counters();
+            const bool token = region.copiedBack && region.carryWhole && watch != 0;
+            const bool sameBatch = token && region.carrySerial == recorder.OpenSerial();
+            region.copiedBack = false;
+            region.carrySerial = 0;
+            region.carryWhole = false;
+            bool take = false;
+            if (!token) {
+                recorder.DropCarry(watch);
+                crossCarry::count(c.noToken, "c_gpu_staging_carry_no_token");
+            } else if (!recorder.TakeCarry(watch)) {
+                crossCarry::count(c.noted, "c_gpu_staging_carry_noted");
+            } else if (!sameBatch && region.carryAllocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+                crossCarry::count(c.registry, "c_gpu_staging_carry_registry");
+            } else if (!sameBatch && !crossCarry::cpuProof.load(std::memory_order_relaxed)(region.begin, region.end, region.carryClock, region.carryGeneration)) {
+                crossCarry::count(c.cpu, "c_gpu_staging_carry_cpu");
+            } else {
+                take = true;
+            }
+            if (take) {
+                crossCarry::count(c.carried, "c_gpu_staging_carry_skipped");
+                crossCarry::count(c.carriedBytes, "c_gpu_staging_carry_bytes", region.end - region.begin);
+                if (!sameBatch) {
+                    crossCarry::count(c.crossBatch, "c_gpu_staging_carry_cross");
+                    crossCarry::count(c.crossBytes, "c_gpu_staging_carry_cross_bytes", region.end - region.begin);
+                }
+                carried.push_back(&region);
+                continue;
+            }
+            crossCarry::count(c.copied, "c_gpu_staging_carry_copied");
+            copies.push_back(&region);
+            continue;
+        }
+        recorder.DropCarry(watch);
         // APS5_ARCHB_GPU_STAGING_CARRY: the previous use (this build, this region object, so this
         // shadow) copied the whole region back in the open batch, and nothing noted since then can
         // have stored into it. The copy-in would read, at its point of the batch, the import as the
@@ -6337,11 +6422,12 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         copies.push_back(&region);
     }
     if (carry) stagingCarry::report();
+    if (cross) crossCarry::report();
     if (!carried.empty()) {
         // The shadow serves this use as it is; it stays kept by this batch (the copy-back below
         // reads it again after the work).
         for (auto* region : carried) recorder.Keep(region->buffer);
-        if (stagingCarry::Verify()) recordCarryVerify(recorder, carried);
+        if (cross ? crossCarry::Verify() : stagingCarry::Verify()) recordCarryVerify(recorder, carried, cross);
     }
     if (copies.empty()) return;
     Require(Recorder::Active() == &recorder, "staging copies recorded into a recorder that is not the device's");
@@ -6352,6 +6438,36 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
 GuestBufferMemory::StagingCarryCounts GuestBufferMemory::StagingCarry() {
     const auto& c = stagingCarry::counters();
     return {c.carried.load(), c.copied.load(), c.noPoint.load(), c.otherBatch.load(), c.noted.load(), c.verified.load(), c.mismatches.load()};
+}
+
+GuestBufferMemory::CrossCarryCounts GuestBufferMemory::CrossCarry() {
+    const auto& c = crossCarry::counters();
+    return {c.carried.load(), c.crossBatch.load(), c.copied.load(), c.noToken.load(), c.noted.load(), c.queued.load(), c.registry.load(), c.cpu.load(), c.verified.load(), c.mismatches.load()};
+}
+
+void GuestBufferMemory::SetCarryCpuProof(CarryCpuProof proof) {
+    crossCarry::cpuProof.store(proof != nullptr ? proof : &crossCarry::liveCpuProof, std::memory_order_relaxed);
+}
+
+void GuestBufferMemory::NoteStagingCarryTokens(Recorder& recorder) {
+    if (!uploaded || committed || !crossCarry::Enabled()) return;
+    for (auto& region : regions) {
+        if (!region.gpuCopy || !region.deviceLocal) continue;
+        recorder.DropCarry(std::exchange(region.carryWatch, 0));
+        if (!region.copiedBack || !region.carryWhole) continue;
+        const auto size = static_cast<std::size_t>(region.end - region.begin);
+        if (recorder.QueuedStoreOverlaps(region.begin, size) || recorder.QueuedKeyStoreOverlaps(region.begin, size)) {
+            region.carryWhole = false;
+            crossCarry::count(crossCarry::counters().queued, "c_gpu_staging_carry_queued");
+            continue;
+        }
+        region.carryWatch = recorder.WatchCarry(region.begin, region.end);
+        region.carrySerial = recorder.OpenSerial();
+        region.carryClock = GuestMemory::FaultClock();
+        region.carryGeneration = GuestMemory::WriteGeneration();
+        region.carryAllocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        crossCarry::count(crossCarry::counters().tokens, "c_gpu_staging_carry_tokens");
+    }
 }
 
 void GuestBufferMemory::NoteStagingCarryPoints(Recorder& recorder) {
@@ -6370,7 +6486,7 @@ void GuestBufferMemory::NoteStagingCarryPoints(Recorder& recorder) {
     }
 }
 
-void GuestBufferMemory::recordCarryVerify(Recorder& recorder, std::span<Region* const> carried) {
+void GuestBufferMemory::recordCarryVerify(Recorder& recorder, std::span<Region* const> carried, bool cross) {
     const auto commands = recorder.Commands();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     for (auto* region : carried) {
@@ -6381,16 +6497,19 @@ void GuestBufferMemory::recordCarryVerify(Recorder& recorder, std::span<Region* 
         CopyBuffer(context, commands, region->buffer->Handle(), 0, shadow->Handle(), 0, bytes);
         recorder.Keep(imported);
         recorder.Keep(shadow);
-        recorder.OnComplete([imported, shadow, begin = region->begin] {
+        recorder.OnComplete([imported, shadow, begin = region->begin, cross] {
             const auto expected = imported->Bytes();
             const auto actual = shadow->Bytes();
             auto& c = stagingCarry::counters();
-            stagingCarry::count(c.verified, "gpu_staging_carry_verified");
+            auto& x = crossCarry::counters();
+            if (cross) crossCarry::count(x.verified, "c_gpu_staging_carry_verified");
+            else stagingCarry::count(c.verified, "gpu_staging_carry_verified");
             if (std::memcmp(expected.data(), actual.data(), expected.size()) == 0) return;
             std::size_t first = 0;
             while (first < expected.size() && expected[first] == actual[first]) ++first;
-            if (c.mismatches.load(std::memory_order_relaxed) < 16) std::fprintf(stderr, "[staging-carry] MISMATCH: region 0x%llx+0x%zx first differing byte at +0x%zx\n", static_cast<unsigned long long>(begin), expected.size(), first);
-            stagingCarry::count(c.mismatches, "gpu_staging_carry_mismatches");
+            if ((cross ? x.mismatches : c.mismatches).load(std::memory_order_relaxed) < 16) std::fprintf(stderr, "[%sstaging-carry] MISMATCH: region 0x%llx+0x%zx first differing byte at +0x%zx\n", cross ? "c-" : "", static_cast<unsigned long long>(begin), expected.size(), first);
+            if (cross) crossCarry::count(x.mismatches, "c_gpu_staging_carry_mismatches");
+            else stagingCarry::count(c.mismatches, "gpu_staging_carry_mismatches");
         });
     }
     // The comparison copies read the shadow before the work stores into it again.

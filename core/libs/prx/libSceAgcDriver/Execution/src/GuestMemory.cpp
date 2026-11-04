@@ -3828,6 +3828,15 @@ bool FaultUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t
 #endif
 }
 
+std::uint64_t FaultClock() {
+#ifdef _WIN32
+    if (!wtFault::active.load(std::memory_order_acquire)) return 0;
+    return GuestArena::GuestWtFaultClock_nid_no_patch();
+#else
+    return 0;
+#endif
+}
+
 std::atomic<std::uint64_t>& CommitterTrackerWaits() {
     return committerTrackerWaits;
 }
