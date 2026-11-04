@@ -152,6 +152,12 @@ void MarkCommitterThread();
 // the collect-share table while ResolveShareActive() (PIPE_RESOLVE_POOL, APS5_PIPE_RESOLVE_SHARE != 0).
 void MarkResolverThread();
 bool ResolveShareActive();
+// APS5_ARCHB_WT_FAULT: true when every page of the range is armed by the fault tracker with an arm
+// stamp at most `generation` (a tracker generation; the clocks are shared), so no CPU store reached
+// the range since then (it would have faulted). Lock-free; false when tracking is off or a page is
+// open, untracked or armed later. Stores the driver stamps without a fault (MarkWritten of GPU
+// results) are not covered: pair it with UnchangedSince.
+bool FaultUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // The committer's tracker-mutex acquisitions that waited, and the nanoseconds waited.
 std::atomic<std::uint64_t>& CommitterTrackerWaits();
 std::atomic<std::uint64_t>& CommitterTrackerWaitNs();

@@ -3903,6 +3903,122 @@ ShaderResources::ResourceEpochProof ShaderResources::currentResourceEpochProof()
     return {GuestMemory::CollectEpoch(), GuestMemory::ResourceProofSerial(), StorageTexture::PendingSerial(), GuestMemory::TrackerGeneration(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), committed, GuestMemory::ForgetSerial(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial(), DepthSurfacesReleased()};
 }
 
+namespace {
+// Stage 4.2b: stamp-memo outcomes (recorder counters pipe_proof_memo_*).
+enum class StampRefusal : std::size_t { Cold, Unlocked, Audit, Serials, Cache, Images, Imports, Stored, Stamped, Count };
+// Why a passed proof was not kept: the serials or imports moved during it, a forget was under way,
+// or the object is not eligible (canRememberResourceEpoch: depth, partial, untracked, records).
+enum class StampSkip : std::size_t { Moved, Forgetting, Ineligible, Count };
+struct StampProofCounters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> remembered{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> mismatches{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StampRefusal::Count)> refusals{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StampSkip::Count)> skips{};
+};
+
+StampProofCounters& stampProofCounters() {
+    static auto* made = [] {
+        auto* counters = new StampProofCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_hits", counters->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_remembered", counters->remembered);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_verified", counters->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_mismatches", counters->mismatches);
+        static constexpr std::array<const char*, static_cast<std::size_t>(StampRefusal::Count)> names{"pipe_proof_memo_cold", "pipe_proof_memo_unlocked", "pipe_proof_memo_audit", "pipe_proof_memo_serials", "pipe_proof_memo_cache", "pipe_proof_memo_images", "pipe_proof_memo_imports", "pipe_proof_memo_stored", "pipe_proof_memo_stamped"};
+        for (std::size_t i = 0; i < names.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(names[i], counters->refusals[i]);
+        static constexpr std::array<const char*, static_cast<std::size_t>(StampSkip::Count)> skipNames{"pipe_proof_memo_skip_moved", "pipe_proof_memo_skip_forgetting", "pipe_proof_memo_skip_ineligible"};
+        for (std::size_t i = 0; i < skipNames.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(skipNames[i], counters->skips[i]);
+        return counters;
+    }();
+    return *made;
+}
+
+bool stampProofsActive() {
+    return ArchB::Switches::Enabled(ArchB::Feature::PipeResolveProofs) && ArchB::Switches::Enabled(ArchB::Feature::WtFault);
+}
+
+bool stampProofsVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_PIPE_RESOLVE_PROOFS_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+}
+
+ShaderResources::ResourceEpochProof ShaderResources::currentStampSerials() {
+    auto serials = currentResourceEpochProof();
+    serials.epoch = 0;
+    serials.writes = 0;
+    serials.tracker = 0;
+    return serials;
+}
+
+bool ShaderResources::stampProofHolds() {
+    auto& counters = stampProofCounters();
+    const auto refuse = [&](StampRefusal reason) {
+        counters.refusals[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (!stampProof.valid) return refuse(StampRefusal::Cold);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return refuse(StampRefusal::Unlocked);
+    if (TemplateAuditDue(lastFullWalk)) return refuse(StampRefusal::Audit);
+    if (currentStampSerials() != stampProof.serials) return refuse(StampRefusal::Serials);
+    if (HoldsReleasedTexture() || !HasCachedStorageImages()) return refuse(StampRefusal::Cache);
+    for (const auto& entry : stampProof.images) {
+        if (entry.image->Version() != entry.version || entry.image->Descriptor().dccAddress != entry.keys) return refuse(StampRefusal::Images);
+    }
+    if (HostImportsIdentity(context, false) != stampProof.imports) return refuse(StampRefusal::Imports);
+    thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
+    auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
+    queries.clear();
+    for (const auto& [begin, end] : stampProof.ranges) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (!GuestMemory::FaultUnchangedSince(begin, bytes, stampProof.generation)) return refuse(StampRefusal::Stored);
+        queries.push_back({begin, bytes, stampProof.generation});
+    }
+    if (!queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return refuse(StampRefusal::Stamped);
+    counters.hits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void ShaderResources::rememberStampProof(std::uint64_t generation, const ResourceEpochProof& serials, const HostImportsProof& imports) {
+    stampProof.valid = false;
+    stampProof.images.clear();
+    stampProof.ranges.clear();
+    auto& skips = stampProofCounters().skips;
+    if (generation == 0 || (serials.forgotten & 1u) != 0) {
+        skips[static_cast<std::size_t>(StampSkip::Forgetting)].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!canRememberResourceEpoch()) {
+        skips[static_cast<std::size_t>(StampSkip::Ineligible)].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto range = [&](std::uint64_t address, std::uint64_t bytes) {
+        if (address != 0 && bytes != 0) stampProof.ranges.emplace_back(address, address + bytes);
+    };
+    const auto image = [&](const StorageTexture* source) {
+        if (source == nullptr) return;
+        stampProof.images.push_back({source, source->Version(), source->Descriptor().dccAddress});
+        const auto& own = source->Descriptor();
+        range(own.baseAddress, source->GuestBytes());
+        if (own.dccAddress != 0) range(own.dccAddress, DccKeyBytes(source->GuestBytes()));
+    };
+    for (const auto& surface : validatedTextures) {
+        range(surface.resource.baseAddress, surface.bytes);
+        if (surface.resource.dccAddress != 0) range(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
+        image(surface.source);
+    }
+    for (const auto& storage : storageTextures) image(storage.get());
+    stampProof.generation = generation;
+    stampProof.serials = serials;
+    stampProof.imports = imports;
+    stampProof.valid = true;
+    stampProofCounters().remembered.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool ShaderResources::canRememberResourceEpoch() const {
     const auto fail = [](EpochIneligible reason) {
         if (BuildProfiled()) Revalidations().epochIneligible[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -3953,6 +4069,11 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool stampProofs = !epochProofs && stampProofsActive() && GuestMemory::GpuMutex().HeldByThisThread();
+    const auto stampGeneration = stampProofs ? GuestMemory::WriteGeneration() : 0;
+    const auto stampSerials = stampProofs ? currentStampSerials() : ResourceEpochProof{};
+    const auto stampImports = stampProofs ? HostImportsIdentity(context, false) : HostImportsProof{};
+    if (!stampProofs) stampProof.valid = false;
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
         CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
@@ -4004,8 +4125,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             if (!epochReused) Revalidations().epochRefusals[static_cast<std::size_t>(refusal)].fetch_add(1, std::memory_order_relaxed);
         }
     }
+    bool stampReused = false;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
-        if (ok) AgcDriver::ArchB::Recorder::Count(fast ? (epochReused ? "proof_fast_pass_epoch" : "proof_fast_pass_stamps") : "proof_full_pass");
+        if (ok) AgcDriver::ArchB::Recorder::Count(fast ? (epochReused ? "proof_fast_pass_epoch" : stampReused ? "proof_fast_pass_stamp_memo" : "proof_fast_pass_stamps") : "proof_full_pass");
+        if (!ok) stampProof.valid = false;
         if (!ok) AgcDriver::ArchB::Recorder::Count("proof_failed");
         if (ok) provedOnce = true;
         if (epochProofs && !ok) resourceEpochProof = {};
@@ -4107,12 +4230,35 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         captureValidation();
         return true;
     };
-    bool fast = epochReused;
-    if (epochReused && report != nullptr) report->path = ProofPath::Fast;
+    if (stampProofs && !noFast && !epochReused && stampProofHolds()) {
+        stampReused = true;
+        if (stampProofsVerify()) {
+            thread_local std::vector<PendingOverlap>* verifyOverlapSlot = nullptr;
+            thread_local std::vector<PendingOverlap>* verifyRefreshedSlot = nullptr;
+            auto& verifyOverlap = ShaderRecompiler::ThreadOwned(verifyOverlapSlot);
+            auto& verifyRefreshed = ShaderRecompiler::ThreadOwned(verifyRefreshedSlot);
+            verifyRefreshed.clear();
+            FastFail verifyReason = FastFail::Count;
+            bool verifyAccepted = false;
+            auto& counters = stampProofCounters();
+            counters.verified.fetch_add(1, std::memory_order_relaxed);
+            if (!fastRevalidate(serialBefore, verifyRefreshed, verifyReason, verifyOverlap, verifyAccepted)) {
+                const auto count = counters.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((count & (count - 1)) == 0) std::fprintf(stderr, "[rescache] PIPE_RESOLVE_PROOFS_VERIFY: the stamp memo held where the fast proof failed (reason %zu; %llu so far)\n", static_cast<std::size_t>(verifyReason), static_cast<unsigned long long>(count));
+                stampReused = false;
+                stampProof.valid = false;
+            }
+        }
+    }
+    bool fast = epochReused || stampReused;
+    if (fast && report != nullptr) report->path = ProofPath::Fast;
     if (epochReused) {
         for (const auto& entry : epochImages) entry.image->NoteProved();
     }
-    if (!epochReused) {
+    if (stampReused) {
+        for (const auto& entry : stampProof.images) entry.image->NoteProved();
+    }
+    if (!epochReused && !stampReused) {
         thread_local std::vector<PendingOverlap>* overlappingSlot = nullptr;
         auto& overlapping = ShaderRecompiler::ThreadOwned(overlappingSlot);
         thread_local std::vector<PendingOverlap>* refreshedSlot = nullptr;
@@ -4248,6 +4394,13 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+    }
+    if (stampProofs && !stampReused) {
+        if (StorageTexture::PendingSerial() == serialBefore && currentStampSerials() == stampSerials && HostImportsIdentity(context, false) == stampImports) rememberStampProof(stampGeneration, stampSerials, stampImports);
+        else {
+            stampProof.valid = false;
+            stampProofCounters().skips[static_cast<std::size_t>(StampSkip::Moved)].fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (epochProofs) {
         if (GuestMemory::GpuMutex().HeldByThisThread() && epochBefore.epoch != 0 && (epochBefore.forgotten & 1u) == 0 && (epochReused || canRememberResourceEpoch()) && currentResourceEpochProof() == epochBefore && HostImportsIdentity(context, false) == importsBefore) {
@@ -4549,6 +4702,7 @@ void ResourceCache::noteMiss(const Key& key) {
 }
 
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    mutationSerial.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard lock(mutex);
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
@@ -4595,6 +4749,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
+    mutationSerial.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard lock(mutex);
     if (object != nullptr) {
         const auto found = index.find(key);
@@ -4616,6 +4771,7 @@ bool ResourceCache::TryRemoveImage(const StorageTexture* image, std::vector<std:
 }
 
 void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    mutationSerial.fetch_add(1, std::memory_order_acq_rel);
     for (auto it = entries.begin(); it != entries.end();) {
         if (!it->second->ReadsImage(image)) {
             ++it;
@@ -4629,6 +4785,7 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
 }
 
 void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    mutationSerial.fetch_add(1, std::memory_order_acq_rel);
     if (!TexturesReleased().exchange(false, std::memory_order_acq_rel)) return;
     for (auto it = entries.begin(); it != entries.end();) {
         if (!it->second->HoldsReleasedTexture()) {
@@ -4661,6 +4818,7 @@ std::uint64_t ResourceCache::Touches() {
 }
 
 void ResourceCache::Clear() {
+    mutationSerial.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard lock(mutex);
     for (const auto& entry : entries) entry.second->SetCacheMembership(0);
     index.clear();
@@ -4709,6 +4867,7 @@ std::uint64_t ResourceCache::TableElements() const {
 }
 
 void ResourceCache::erase(const Key& key) {
+    mutationSerial.fetch_add(1, std::memory_order_acq_rel);
     const auto found = index.find(key);
     if (found == index.end()) return;
     found->second->second->SetCacheMembership(0);

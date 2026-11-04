@@ -64,6 +64,8 @@ enum class Feature : std::uint8_t {
     WtFaultDirtyArm,
     PipeResolveSplit,
     PipeResolvePool,
+    PipeResolveProofs,
+    PipeResolveHandoff,
     Count
 };
 

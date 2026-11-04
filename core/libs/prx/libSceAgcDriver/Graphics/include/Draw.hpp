@@ -51,6 +51,14 @@ struct DrawPreparation {
     std::shared_ptr<Pipeline> speculatedPipeline;
     std::uint32_t speculatedOutputs = 0;
     std::uint64_t speculatedProxied = 0;
+    // Stage 4.2b (APS5_ARCHB_PIPE_RESOLVE_HANDOFF): the resolve's answers apply takes instead of
+    // repeating them: the template find (`resolvedFind`, with the cache's mutation serial before it;
+    // used while the serial holds), the fragment outputs and the stages' vertex input layout.
+    bool resolvedFind = false;
+    std::uint64_t resolvedCacheSerial = 0;
+    bool resolvedOutputsKnown = false;
+    std::uint32_t resolvedOutputs = 0;
+    std::shared_ptr<const VertexInputLayout> resolvedVertexInput;
 };
 
 bool DrawPrelockEnabled();

@@ -3606,6 +3606,18 @@ bool ResolveShareActive() {
     return resolveShareActive();
 }
 
+bool FaultUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+#ifdef _WIN32
+    if (bytes == 0 || !wtFault::active.load(std::memory_order_acquire)) return false;
+    return GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, generation) == GuestArena::WtFaultAnswer::Unchanged;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(generation);
+    return false;
+#endif
+}
+
 std::atomic<std::uint64_t>& CommitterTrackerWaits() {
     return committerTrackerWaits;
 }
