@@ -38,7 +38,8 @@ public:
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Transition, Count };
     // What an item commits, for the pipe_commits_* counters only (the `draw` flag of Enqueue keeps
     // its own meaning: a non-draw item breaks proofs after it runs).
-    enum class ItemKind : std::uint8_t { Other, Draw, Dispatch, Label, Dma, Fill, Count };
+    // Seal: a pass's write-only hazards sealed at an event packet (no memory effect).
+    enum class ItemKind : std::uint8_t { Other, Draw, Dispatch, Label, Dma, Fill, Seal, Count };
     // Why a drain was needed, finer than DrainReason, for choosing the next drain cut (counters
     // pipe_drain_cause_<name>, counted only when the drain waited). None: not split.
     enum class DrainCause : std::uint8_t {

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -14,11 +16,29 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+// Stage 4.3 (APS5_ARCHB_PIPE_DEVICE_OWNER): a compute queue's label waits for the batches its
+// write-backs need with the GPU mutex given up (FIX_COMPUTE_SYNC_UNLOCKED's unlocked wait), right
+// after taking it and before recording anything, so the queue-0 committer, the device owner, does
+// not wait behind a compute hold that waits for the GPU. Whatever is recorded meanwhile is waited
+// for under the mutex as before (StoreReadbackBeforeLabel).
+void PreWaitComputeLabel(std::uint32_t queue) {
+    if (queue == 0 || !ArchB::Switches::Enabled(ArchB::Feature::PipeDeviceOwner)) return;
+    static std::atomic<std::uint64_t> prewaits{0};
+    static const bool registered = [] { ArchB::Recorder::RegisterCounter("owner_compute_label_prewaits", prewaits); return true; }();
+    static_cast<void>(registered);
+    prewaits.fetch_add(1, std::memory_order_relaxed);
+    const Graphics::Recorder::ComputeSyncScope computeSync(true);
+    Graphics::StorageTexture::PrepareReadbackBeforeLabel(true);
+}
+}
 
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
@@ -37,6 +57,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             bumpEpoch(&EpochBumps::drains);
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            PreWaitComputeLabel(submission.queue);
             const auto localDevice = device.Load();
             recordDeferredLabels(localDevice.get(), submission.queue);
             bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
@@ -101,6 +122,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             } else {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                PreWaitComputeLabel(submission.queue);
                 const auto localDevice = device.Load();
 
                 recordDeferredLabels(localDevice.get(), submission.queue);
