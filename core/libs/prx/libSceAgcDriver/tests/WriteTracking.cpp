@@ -2289,7 +2289,7 @@ void CheckWtFaultConsumers() {
         Require(g7 != 0 && !UnchangedSince(base + 7 * Page, Page, g6), "VERIFY did not stamp the missed store");
         GuestWtFaultForget_nid_no_patch(base + 7 * Page, Page);
     }
-    if (Switches::Enabled(Feature::WtSyncSkip)) {
+    if (Switches::Enabled(Feature::WtSyncSkip) && !verify) {
         std::map<std::string, double> totals;
         for (const auto& [name, value] : AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now()).counters) totals[name] += value;
         const char* skipVerify = std::getenv("APS5_ARCHB_WT_SYNC_SKIP_VERIFY");
