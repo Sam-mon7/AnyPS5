@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/general/ThreadName.hpp"
@@ -23,6 +24,7 @@ std::uint64_t WorkerAffinityMask() {
 
 void PinWorkerThread(const char* role) {
     TracyZone::NameThread(role);
+    GuestMemory::MarkDriverThread();
 #ifdef _WIN32
     const HRESULT nameResult = ThreadName::SetCurrent(role);
     if (FAILED(nameResult)) std::fprintf(stderr, "[thread-name] could not name %s (0x%08lx)\n", role, static_cast<unsigned long>(nameResult));

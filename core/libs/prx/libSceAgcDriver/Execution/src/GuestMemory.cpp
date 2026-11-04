@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -789,6 +790,9 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         const auto regionEnd = base + memory.RegionSize;
         std::uint32_t logicalProtection = memory.Protect;
         GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection);
+        // Pages the write tracker protected (APS5_ARCHB_WT_FAULT) keep the guest's writable protection,
+        // so the cached state does not change when they are armed or opened.
+        logicalProtection = static_cast<std::uint32_t>(GuestArena::GuestWtFaultGuestProtection_nid_no_patch(base, static_cast<std::size_t>(regionEnd - base), logicalProtection));
         const auto protection = logicalProtection & 0xffu;
         const bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
         const bool readable = committed && readableProtection(protection);
@@ -1045,6 +1049,102 @@ void noteHostWriteGen(std::uintptr_t address, std::size_t bytes, bool end) {
     else static_cast<void>(Gen::Note(Gen::Event::HostWriteBegin, address, address + bytes, Gen::Meta, 0, false));
 }
 
+// APS5_ARCHB_WT_FAULT (Stage 4 option 2; libc GuestWriteFault.hpp): write tracking by page protection.
+// Shadow mode: the tracker's walks make their pages candidates, the flip protects the pages written
+// since in contiguous runs, a write fault opens a page again, and GetWriteWatch stays the source of
+// truth. The tracker's generations come from the fault tracker's clock, so a page's arm stamp compares
+// directly with a generation. APS5_ARCHB_WT_FAULT_VERIFY checks every dirty page a resetting walk
+// reports against the fault states (wt_fault_mismatches must stay 0). APS5_ARCHB_WT_FAULT_CONSUMERS
+// answers the commit-time freshness checks from the fault states (see consumerAnswer).
+namespace wtFault {
+bool switchOn() {
+    static const bool on = ArchB::Switches::Enabled(ArchB::Feature::WtFault);
+    return on;
+}
+bool verifyOn() {
+    static const bool on = ArchB::Switches::Enabled(ArchB::Feature::WtFaultVerify);
+    return on;
+}
+// Set once the write tracker turned the fault tracker on (its first initialize with write watching).
+std::atomic<bool> active{false};
+bool consumersOn() {
+    return active.load(std::memory_order_relaxed) && ArchB::Switches::Enabled(ArchB::Feature::WtFaultConsumers);
+}
+// Driver stores up to this size keep their pages open across flips (the driver stores them again
+// every frame; larger ranges are landed GPU results, which never fault).
+constexpr std::size_t DriverHotBytes = 256u << 10u;
+
+struct Counters {
+    std::atomic<std::uint64_t> faults{0}, driverFaults{0}, handlerNs{0}, driverHandlerNs{0}, retries{0}, foreign{0};
+    std::atomic<std::uint64_t> armCalls{0}, armedPages{0}, armRuns{0}, armNs{0}, armProtectNs{0}, excluded{0}, keptHot{0};
+    std::atomic<std::uint64_t> holds{0}, heldOpened{0}, forgotten{0}, tracked{0};
+    std::atomic<std::uint64_t> verifyWalks{0}, verifyDirty{0}, verifyUntracked{0}, mismatches{0};
+    std::atomic<std::uint64_t> consumerUnchanged{0}, consumerChanged{0}, consumerFallback{0}, consumerVerified{0}, consumerMismatches{0};
+};
+Counters& counters() {
+    static auto* made = [] {
+        auto* c = new Counters();
+        const std::pair<const char*, std::atomic<std::uint64_t>*> named[] = {
+            {"wt_fault_faults", &c->faults}, {"wt_fault_driver_faults", &c->driverFaults}, {"wt_fault_handler_ns", &c->handlerNs},
+            {"wt_fault_driver_handler_ns", &c->driverHandlerNs}, {"wt_fault_retries", &c->retries}, {"wt_fault_foreign", &c->foreign},
+            {"wt_fault_arms", &c->armCalls}, {"wt_fault_armed_pages", &c->armedPages}, {"wt_fault_arm_runs", &c->armRuns}, {"wt_fault_arm_ns", &c->armNs},
+            {"wt_fault_arm_protect_ns", &c->armProtectNs}, {"wt_fault_excluded", &c->excluded}, {"wt_fault_kept_hot", &c->keptHot},
+            {"wt_fault_holds", &c->holds}, {"wt_fault_held_opened", &c->heldOpened}, {"wt_fault_forgotten", &c->forgotten}, {"wt_fault_tracked", &c->tracked},
+            {"wt_fault_verify_walks", &c->verifyWalks}, {"wt_fault_verify_dirty", &c->verifyDirty}, {"wt_fault_verify_untracked", &c->verifyUntracked},
+            {"wt_fault_mismatches", &c->mismatches}, {"wt_fault_consumer_unchanged", &c->consumerUnchanged}, {"wt_fault_consumer_changed", &c->consumerChanged},
+            {"wt_fault_consumer_fallback", &c->consumerFallback}, {"wt_fault_consumer_verified", &c->consumerVerified}, {"wt_fault_consumer_mismatches", &c->consumerMismatches}};
+        for (const auto& [name, counter] : named) ArchB::Recorder::RegisterCounter(name, *counter);
+        return c;
+    }();
+    return *made;
+}
+
+// Copies the fault tracker's cumulative counters into the recorder's (at flips and on demand).
+void publish() {
+    if (!active.load(std::memory_order_acquire)) return;
+    GuestArena::WtFaultCounters raw{};
+    GuestArena::GuestWtFaultCounters_nid_no_patch(&raw);
+    auto& c = counters();
+    c.faults.store(raw.faults, std::memory_order_relaxed);
+    c.driverFaults.store(raw.driverFaults, std::memory_order_relaxed);
+    c.handlerNs.store(raw.handlerNs, std::memory_order_relaxed);
+    c.driverHandlerNs.store(raw.driverHandlerNs, std::memory_order_relaxed);
+    c.retries.store(raw.retries, std::memory_order_relaxed);
+    c.foreign.store(raw.foreign, std::memory_order_relaxed);
+    c.armCalls.store(raw.armCalls, std::memory_order_relaxed);
+    c.armedPages.store(raw.armedPages, std::memory_order_relaxed);
+    c.armRuns.store(raw.armRuns, std::memory_order_relaxed);
+    c.armNs.store(raw.armNs, std::memory_order_relaxed);
+    c.armProtectNs.store(raw.armProtectNs, std::memory_order_relaxed);
+    c.excluded.store(raw.excluded, std::memory_order_relaxed);
+    c.keptHot.store(raw.keptHot, std::memory_order_relaxed);
+    c.holds.store(raw.holds, std::memory_order_relaxed);
+    c.heldOpened.store(raw.heldOpened, std::memory_order_relaxed);
+    c.forgotten.store(raw.forgotten, std::memory_order_relaxed);
+    c.tracked.store(raw.tracked, std::memory_order_relaxed);
+    c.verifyWalks.store(raw.verifyWalks, std::memory_order_relaxed);
+    c.verifyDirty.store(raw.verifyDirty, std::memory_order_relaxed);
+    c.verifyUntracked.store(raw.verifyUntracked, std::memory_order_relaxed);
+    c.mismatches.store(raw.verifyMismatches, std::memory_order_relaxed);
+}
+
+// The dirty pages of one walk, for VERIFY (filled under the tracker mutex).
+std::vector<void*>& dirtyScratch() {
+    static std::vector<void*> pages;
+    return pages;
+}
+
+void reportMismatches(std::uint64_t first, std::uint64_t stop, std::uint64_t mismatches, const GuestArena::WtFaultMismatch& mismatch, std::uint64_t walkClock) {
+    static std::atomic<std::uint32_t> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+    const auto state = mismatch.word & GuestArena::WtFaultStateMask;
+    std::fprintf(stderr, "[wt-fault] MISMATCH: walk 0x%llx..0x%llx at %llu reported %llu dirty page(s) the fault tracker reads as unchanged; first 0x%llx state %llu stamp %llu last reset %llu clock %llu\n",
+                 static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop), static_cast<unsigned long long>(walkClock), static_cast<unsigned long long>(mismatches),
+                 static_cast<unsigned long long>(mismatch.page), static_cast<unsigned long long>(state), static_cast<unsigned long long>(mismatch.word >> GuestArena::WtFaultStampShift),
+                 static_cast<unsigned long long>(mismatch.lastReset), static_cast<unsigned long long>(mismatch.clock));
+}
+}
+
 // APS5_ARCHB_FIX_UNSTAMPED_ALIAS (see lockedUnchangedCommittedSince): the unstamped-store slots never
 // decide for a range that is write-watched in full.
 bool unstampedAliasActive() {
@@ -1055,6 +1155,8 @@ struct WriteTracker {
     AgcDriver::Mutex mutex;
     bool initialized = false;
     bool watched = false;
+    // APS5_ARCHB_WT_FAULT: generations come from the fault tracker's clock (set by initialize()).
+    bool faultMode = false;
     static constexpr std::size_t CoarseBlocks = 64;
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
     struct Leaf {
@@ -1087,6 +1189,11 @@ struct WriteTracker {
     // values of that clock and every table event is ordered against them; only values change, the
     // order of every stamp and compare stays the same (no code does arithmetic on generations).
     std::uint64_t bump() {
+        if (faultMode) {
+            const auto next = GuestArena::GuestWtFaultClockBump_nid_no_patch();
+            generation.store(next, std::memory_order_release);
+            return next;
+        }
         if (Gen::Active()) {
             // Mapping changes reach the table through the page-state invalidator (ForgetPages),
             // installed with the page-state cache: the driver installs it at its first range check,
@@ -1129,6 +1236,18 @@ struct WriteTracker {
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
         GuestArena::GuestArenaSetHostWriteObserver_nid_no_patch(&noteHostWriteGen);
+        if (wtFault::switchOn()) {
+            if (Gen::Active()) {
+                std::fprintf(stderr, "[wt-fault] off: the write-generation table (GEN_TABLE) owns the tracker's generations\n");
+            } else {
+                GuestArena::GuestWtFaultEnable_nid_no_patch(wtFault::verifyOn(), generation.load(std::memory_order_relaxed));
+                faultMode = true;
+                static_cast<void>(wtFault::counters());
+                wtFault::active.store(true, std::memory_order_release);
+                GuestArena::GuestWtFaultMarkDriverThread_nid_no_patch();
+                std::fprintf(stderr, "[wt-fault] on: verify=%d consumers=%d\n", wtFault::verifyOn() ? 1 : 0, ArchB::Switches::Enabled(ArchB::Feature::WtFaultConsumers) ? 1 : 0);
+            }
+        }
         // Lock-free answers (slice S2) index the generation table by absolute 64 KiB blocks, which
         // are the tracker's blocks only when the arena starts on a block boundary.
         ready.store(base % WriteBlockBytes == 0, std::memory_order_release);
@@ -2141,6 +2260,8 @@ struct StampRuns {
     StampKind kind;
     std::size_t stamped = 0;
     const WindowCopy* window = nullptr;
+    // APS5_ARCHB_WT_FAULT_VERIFY: the dirty pages the walk reported.
+    std::vector<void*>* dirty = nullptr;
 };
 
 // Write generations (APS5_ARCHB_GEN_TABLE): the table event for a tracker stamp, with the stamp's
@@ -2168,6 +2289,9 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     ++runs.stamped;
     // Stage 4 M3 (APS5_WT_FAULT_CENSUS): every dirty page the OS reported, whoever stored it.
     Stage4::NoteCollectedPages(begin, end);
+    if (runs.dirty != nullptr) {
+        for (auto page = begin & ~std::uintptr_t{WritePageBytes - 1}; page < end; page += WritePageBytes) runs.dirty->push_back(reinterpret_cast<void*>(page));
+    }
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
     else tracker.noteWalkStore(begin, end, generation);
@@ -2275,9 +2399,71 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 }
 #endif
 
-bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool memoVirtualQuery = false, std::uint64_t* stamped = nullptr) {
+#ifdef _WIN32
+// APS5_ARCHB_WT_FAULT_CONSUMERS: a walk from the fault states instead of write watching over the whole
+// range. Pages armed no later than their last sync hold no store (it would have faulted) and cost no OS
+// call; every other page (open now, or armed after its last sync) gets a resetting write-watch walk of
+// its run, so the answer is exactly what a whole-range walk gives. The flip walks the runs it armed, so
+// in steady state only open pages are walked here. False
+// (nothing stamped) when a page is untracked or excluded or the lists overflow: the caller walks the
+// whole range. With VERIFY the whole range is walked as well, and every dirty page write watching
+// reports must be among the pages this walk stamped or walked (wt_fault_consumer_mismatches).
+bool faultSync(StampRuns& runs, std::uint64_t first, std::uint64_t stop, std::uint64_t walkClock) {
+    auto& c = wtFault::counters();
+    static std::vector<void*> dirty(4096);
+    static std::vector<std::uintptr_t> open(2 * 1024);
+    std::size_t dirtyCount = dirty.size();
+    std::size_t openCount = open.size() / 2;
+    if (!GuestArena::GuestWtFaultSync_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop), walkClock, dirty.data(), &dirtyCount, open.data(), &openCount)) {
+        c.consumerFallback.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    for (std::size_t i = 0; i < openCount; ++i) {
+        if (!collectWindowsWrites(runs, open[2 * i], open[2 * i + 1], false)) {
+            c.consumerFallback.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < dirtyCount; ++i) {
+        const auto page = reinterpret_cast<std::uintptr_t>(dirty[i]);
+        stampWrittenRun(&runs, page, page + WritePageBytes);
+    }
+    (dirtyCount != 0 || runs.stamped != 0 ? c.consumerChanged : c.consumerUnchanged).fetch_add(1, std::memory_order_relaxed);
+    if (wtFault::verifyOn()) {
+        std::vector<void*> reported;
+        StampRuns check{runs.tracker, runs.kind, 0, nullptr, &reported};
+        if (collectWindowsWrites(check, first, stop, false)) {
+            c.consumerVerified.fetch_add(1, std::memory_order_relaxed);
+            for (const auto* pointer : reported) {
+                const auto page = reinterpret_cast<std::uintptr_t>(pointer);
+                const bool synced = std::find(dirty.begin(), dirty.begin() + static_cast<std::ptrdiff_t>(dirtyCount), pointer) != dirty.begin() + static_cast<std::ptrdiff_t>(dirtyCount);
+                bool walked = false;
+                for (std::size_t i = 0; i < openCount && !walked; ++i) walked = page >= open[2 * i] && page < open[2 * i + 1];
+                if (synced || walked) continue;
+                if (c.consumerMismatches.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    const auto word = GuestArena::GuestWtFaultWord_nid_no_patch(page);
+                    std::fprintf(stderr, "[wt-fault] CONSUMER MISMATCH: page 0x%llx written (write watching) but neither synced nor open; state %llu stamp %llu walk clock %llu range 0x%llx..0x%llx\n",
+                                 static_cast<unsigned long long>(page), static_cast<unsigned long long>(word & GuestArena::WtFaultStateMask), static_cast<unsigned long long>(word >> GuestArena::WtFaultStampShift),
+                                 static_cast<unsigned long long>(walkClock), static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop));
+                }
+            }
+        }
+    }
+    return true;
+}
+#endif
+
+bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool memoVirtualQuery = false, std::uint64_t* stamped = nullptr, bool osWalk = false) {
     tracker.bump();
-    StampRuns runs{tracker, kind, 0, window};
+    // APS5_ARCHB_WT_FAULT: the walked pages become candidates of the fault tracker (the next flip
+    // protects them); VERIFY checks the walk's dirty pages against the fault states. The walk's clock
+    // is the generation just bumped, read before the OS query resets any dirty bit.
+    const bool faultWalk = tracker.faultMode && !armedOnly && (kind == StampKind::Cpu || kind == StampKind::Driver);
+    const auto walkClock = tracker.generation.load(std::memory_order_relaxed);
+    if (faultWalk) GuestArena::GuestWtFaultTrack_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
+    std::vector<void*>* dirty = faultWalk && wtFault::verifyOn() ? &wtFault::dirtyScratch() : nullptr;
+    if (dirty != nullptr) dirty->clear();
+    StampRuns runs{tracker, kind, 0, window, dirty};
     struct ReportStamped {
         const StampRuns& runs;
         std::uint64_t* stamped;
@@ -2297,8 +2483,20 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         static_cast<void>(Gen::Note(Gen::Event::FailedWalk, first, stop, 0, tracker.generation.load(std::memory_order_relaxed), false));
     };
 #ifdef _WIN32
+    if (faultWalk && !osWalk && window == nullptr && wtFault::consumersOn()) {
+        runs.dirty = nullptr;
+        if (faultSync(runs, first, stop, walkClock)) return true;
+        runs.dirty = dirty;
+    }
     if (collectWindowsWrites(runs, first, stop, armedOnly, memoVirtualQuery)) {
         if (sweep) Gen::NoteSweep(first, stop, ticket);
+        // The walk consumed every store made before its query: its pages take the walk's clock as their
+        // sync clock (CONSUMERS) and VERIFY checks its dirty pages against the fault states.
+        if (dirty != nullptr || (faultWalk && wtFault::consumersOn())) {
+            GuestArena::WtFaultMismatch mismatch{};
+            const auto mismatches = GuestArena::GuestWtFaultVerifyWalk_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop), dirty != nullptr ? dirty->data() : nullptr, dirty != nullptr ? dirty->size() : 0, walkClock, &mismatch);
+            if (mismatches != 0) wtFault::reportMismatches(first, stop, mismatches, mismatch, walkClock);
+        }
         return true;
     }
     failed();
@@ -3285,6 +3483,89 @@ CommitterCollectCounters& CommitterCollects() {
 
 void MarkCommitterThread() {
     committerThread = true;
+    MarkDriverThread();
+}
+
+void MarkDriverThread() {
+    if (wtFault::switchOn()) GuestArena::GuestWtFaultMarkDriverThread_nid_no_patch();
+}
+
+void WtFaultFlip(bool presenter) {
+    if (!wtFault::active.load(std::memory_order_acquire)) return;
+    // The presenter arms once it exists (off queue 0); without one (frame replay) queue 0 does at the
+    // flip packet.
+    static std::atomic<bool> presenterSeen{false};
+    if (presenter) presenterSeen.store(true, std::memory_order_relaxed);
+    else if (presenterSeen.load(std::memory_order_relaxed)) return;
+    // The runs just armed are walked by write watching (resetting, stamping what was stored before the
+    // protect, one tracker lock per run), so each armed page's sync clock passes its stamp. With
+    // CONSUMERS this keeps the fault-state answers exact: without it, every page stored while open would
+    // read as changed once more at its first collect after the flip (no write watching tells whether it
+    // was stored after its last walk), and in frame replays those extra re-reads change the display
+    // buffers. With VERIFY a later store that did not fault (a page unprotected behind the tracker's
+    // back) reads as a mismatch at its next walk.
+    constexpr std::size_t ArmedRuns = 4096;
+    static std::vector<std::uintptr_t> runs(2 * ArmedRuns);
+    const bool walkArmed = wtFault::verifyOn() || wtFault::consumersOn();
+    const auto armed = GuestArena::GuestWtFaultArm_nid_no_patch(runs.data(), walkArmed ? ArmedRuns : 0);
+    if (walkArmed && armed != 0) {
+        auto& tracker = Tracker();
+        for (std::size_t i = 0; i < armed && i < ArmedRuns; ++i) {
+            const auto lock = lockTracker(tracker);
+            walkWrites(tracker, runs[2 * i], runs[2 * i + 1], StampKind::Cpu, false, nullptr, false, nullptr, true);
+        }
+    }
+    wtFault::publish();
+    // A per-frame line every APS5_WT_FAULT_REPORT_FLIPS flips (default 300).
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_WT_FAULT_REPORT_FLIPS");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 300ull;
+        return value == 0 ? 300ull : value;
+    }();
+    static std::uint64_t flips = 0;
+    static GuestArena::WtFaultCounters last{};
+    static auto lastTime = std::chrono::steady_clock::now();
+    if (++flips % every != 0) return;
+    GuestArena::WtFaultCounters now{};
+    GuestArena::GuestWtFaultCounters_nid_no_patch(&now);
+    const auto time = std::chrono::steady_clock::now();
+    const double frames = static_cast<double>(every);
+    const auto per = [&](std::uint64_t value, std::uint64_t before) { return static_cast<double>(value - before) / frames; };
+    const auto& c = wtFault::counters();
+    static std::uint64_t lastUnchanged = 0, lastChanged = 0, lastFallback = 0;
+    const auto unchanged = c.consumerUnchanged.load(std::memory_order_relaxed);
+    const auto changed = c.consumerChanged.load(std::memory_order_relaxed);
+    const auto fallback = c.consumerFallback.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[wt-fault] per frame over %llu flips (%.2f ms/f): faults %.1f (driver %.1f) handler %.1f us (driver %.1f) retries %.2f foreign %.2f | arm %.1f us (protect %.1f query %.1f lock %.1f scan %.1f, %.1f leaves of %llu, %.1f queries) pages %.1f runs %.1f kept-hot %.1f excluded %.2f | holds %.2f forgotten %.1f tracked %.1f | verify dirty %.1f untracked %.1f mismatches %llu total | consumers unchanged %.1f changed %.1f fallback %.1f mismatches %llu total\n",
+                 static_cast<unsigned long long>(every), std::chrono::duration<double, std::milli>(time - lastTime).count() / frames,
+                 per(now.faults, last.faults), per(now.driverFaults, last.driverFaults), per(now.handlerNs, last.handlerNs) / 1000.0, per(now.driverHandlerNs, last.driverHandlerNs) / 1000.0,
+                 per(now.retries, last.retries), per(now.foreign, last.foreign), per(now.armNs, last.armNs) / 1000.0, per(now.armProtectNs, last.armProtectNs) / 1000.0, per(now.armQueryNs, last.armQueryNs) / 1000.0,
+                 per(now.armLockNs, last.armLockNs) / 1000.0, per(now.armScanNs, last.armScanNs) / 1000.0, per(now.armLeaves, last.armLeaves), static_cast<unsigned long long>(now.leaves), per(now.armQueries, last.armQueries),
+                 per(now.armedPages, last.armedPages), per(now.armRuns, last.armRuns), per(now.keptHot, last.keptHot), per(now.excluded, last.excluded),
+                 per(now.holds, last.holds), per(now.forgotten, last.forgotten), per(now.tracked, last.tracked), per(now.verifyDirty, last.verifyDirty),
+                 per(now.verifyUntracked, last.verifyUntracked), static_cast<unsigned long long>(now.verifyMismatches),
+                 per(unchanged, lastUnchanged), per(changed, lastChanged), per(fallback, lastFallback), static_cast<unsigned long long>(c.consumerMismatches.load(std::memory_order_relaxed)));
+    last = now;
+    lastTime = time;
+    lastUnchanged = unchanged;
+    lastChanged = changed;
+    lastFallback = fallback;
+}
+
+WtFaultStatus WtFault() {
+    WtFaultStatus status;
+    status.active = wtFault::active.load(std::memory_order_acquire);
+    if (!status.active) return status;
+    wtFault::publish();
+    const auto& c = wtFault::counters();
+    status.mismatches = c.mismatches.load(std::memory_order_relaxed);
+    status.faults = c.faults.load(std::memory_order_relaxed);
+    status.armedPages = c.armedPages.load(std::memory_order_relaxed);
+    status.consumerUnchanged = c.consumerUnchanged.load(std::memory_order_relaxed);
+    status.consumerChanged = c.consumerChanged.load(std::memory_order_relaxed);
+    status.consumerFallback = c.consumerFallback.load(std::memory_order_relaxed);
+    status.consumerMismatches = c.consumerMismatches.load(std::memory_order_relaxed);
+    return status;
 }
 
 bool IsCommitterThread() {
@@ -3321,6 +3602,7 @@ void BeginCommitterCensusItem(std::uint8_t kind) {
 }
 
 void NoteCensusFlip() {
+    WtFaultFlip(false);
     committerCensus::flips.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -3994,6 +4276,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     const census::Scope censusScope("store_own");
     const Stage4::TrackerScope stage4Scope(true, address, bytes);
     Stage4::NoteDriverWrite(address, bytes);
+    if (bytes <= wtFault::DriverHotBytes && wtFault::active.load(std::memory_order_relaxed)) GuestArena::GuestWtFaultNoteDriverStore_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
     BreakProofs();
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
@@ -4089,6 +4372,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes, std::source_
     const census::Scope censusScope("mark_written", &site);
     const Stage4::TrackerScope stage4Scope(true, address, bytes);
     Stage4::NoteDriverWrite(address, bytes);
+    if (bytes <= wtFault::DriverHotBytes && wtFault::active.load(std::memory_order_relaxed)) GuestArena::GuestWtFaultNoteDriverStore_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
     return markWritten(address, bytes, true);
 }
 
@@ -4096,6 +4380,7 @@ std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes, std:
     const census::Scope censusScope("mark_written", &site);
     const Stage4::TrackerScope stage4Scope(true, address, bytes);
     Stage4::NoteDriverWrite(address, bytes);
+    if (bytes <= wtFault::DriverHotBytes && wtFault::active.load(std::memory_order_relaxed)) GuestArena::GuestWtFaultNoteDriverStore_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
     return markWritten(address, bytes, false);
 }
 
@@ -4176,6 +4461,8 @@ void AdvanceTrackerGenerationForTest(std::uint64_t generation) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     if (generation > tracker.generation.load(std::memory_order_relaxed)) tracker.generation.store(generation, std::memory_order_relaxed);
+    // The fault tracker's clock follows (it hands out the generations in APS5_ARCHB_WT_FAULT mode).
+    if (tracker.faultMode) GuestArena::GuestWtFaultEnable_nid_no_patch(wtFault::verifyOn(), generation);
 }
 
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes) {

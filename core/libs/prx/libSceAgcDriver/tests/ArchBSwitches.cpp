@@ -105,6 +105,13 @@ void toggleCase(const std::string& name) {
     if (keyWriter) setEnvironment("APS5_ARCHB_FIX_PIPELINE_KEY_WRITER", nullptr);
     const bool stagingCarry = name == "GpuStagingCarry";
     if (stagingCarry) setEnvironment("APS5_ARCHB_GPU_STAGING_CARRY", nullptr);
+    const bool wtFaultConsumers = name == "WtFaultConsumers";
+    if (wtFaultConsumers) {
+        // WT_FAULT and WT_FAULT_VERIFY are startup-only; CONSUMERS is runtime and requires WT_FAULT.
+        setEnvironment("APS5_ARCHB_WT_FAULT", "1");
+        setEnvironment("APS5_ARCHB_WT_FAULT_VERIFY", nullptr);
+        setEnvironment("APS5_ARCHB_WT_FAULT_CONSUMERS", nullptr);
+    }
     // A2 cuts that require PIPE_Q0_COMMITTER: the same contract.
     struct PipeCut {
         Feature feature;
@@ -141,7 +148,30 @@ void toggleCase(const std::string& name) {
             Switches::PollControl();
         }
     };
-    if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping || pipeQ0 || dispatchRelocation || stableFailed || stableWide || pageRefresh || candidates || movedUpload || unstampedAlias || keyWriter || stagingCarry) {
+    if (wtFaultConsumers) {
+        int listed = 0;
+        for (const auto& entry : Switches::Table()) {
+            const std::string token = entry.name;
+            if (entry.feature == Feature::WtFault) {
+                ++listed;
+                check(token == "WT_FAULT" && !entry.defaultOn && !entry.runtime && entry.prerequisites.empty(), "WT_FAULT switch contract");
+            } else if (entry.feature == Feature::WtFaultVerify) {
+                ++listed;
+                check(token == "WT_FAULT_VERIFY" && !entry.defaultOn && !entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::WtFault, "WT_FAULT_VERIFY switch contract");
+            } else if (entry.feature == Feature::WtFaultConsumers) {
+                ++listed;
+                check(token == "WT_FAULT_CONSUMERS" && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::WtFault, "WT_FAULT_CONSUMERS switch contract");
+            }
+        }
+        check(listed == 3, "the fault-tracking switches are listed");
+        check(Switches::Enabled(Feature::WtFault) && !Switches::Enabled(Feature::WtFaultConsumers), "WT_FAULT did not follow the environment or CONSUMERS started on");
+        write("1 WT_FAULT_CONSUMERS=1");
+        check(Switches::Enabled(Feature::WtFaultConsumers), "CONSUMERS did not turn on");
+        write("2 WT_FAULT_CONSUMERS=0");
+        check(!Switches::Enabled(Feature::WtFaultConsumers) && Switches::Enabled(Feature::WtFault), "CONSUMERS did not turn off, or WT_FAULT followed it");
+        write("3 WT_FAULT_CONSUMERS=1");
+        check(Switches::Enabled(Feature::WtFaultConsumers), "CONSUMERS did not turn back on");
+    } else if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping || pipeQ0 || dispatchRelocation || stableFailed || stableWide || pageRefresh || candidates || movedUpload || unstampedAlias || keyWriter || stagingCarry) {
         const auto feature = stagingCarry ? Feature::GpuStagingCarry : keyWriter ? Feature::FixPipelineKeyWriter : unstampedAlias ? Feature::FixUnstampedAlias : movedUpload ? Feature::FixMovedWordUpload : candidates ? Feature::FixSnapshotCandidates : pageRefresh ? Feature::FixSnapshotPageRefresh : stableWide ? Feature::FixStableFailedWide : stableFailed ? Feature::FixStableFailedCollects : dispatchRelocation ? Feature::FixDispatchRelocation : pipeQ0 ? Feature::PipeQ0Committer : bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
         const std::string token = stagingCarry ? "GPU_STAGING_CARRY" : keyWriter ? "FIX_PIPELINE_KEY_WRITER" : unstampedAlias ? "FIX_UNSTAMPED_ALIAS" : movedUpload ? "FIX_MOVED_WORD_UPLOAD" : candidates ? "FIX_SNAPSHOT_CANDIDATES" : pageRefresh ? "FIX_SNAPSHOT_PAGE_REFRESH" : stableWide ? "FIX_STABLE_FAILED_WIDE" : stableFailed ? "FIX_STABLE_FAILED_COLLECTS" : dispatchRelocation ? "FIX_DISPATCH_RELOCATION" : pipeQ0 ? "PIPE_Q0_COMMITTER" : bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
         bool listed = false;

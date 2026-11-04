@@ -58,6 +58,9 @@ enum class Feature : std::uint8_t {
     FixUnstampedAlias,
     FixPipelineKeyWriter,
     GpuStagingCarry,
+    WtFault,
+    WtFaultVerify,
+    WtFaultConsumers,
     Count
 };
 

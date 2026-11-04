@@ -598,6 +598,11 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_fix_snapshot_candidates_switch COMMAND agc_archb_c01_switches_tests --toggle FixSnapshotCandidates)
     add_test(NAME agc_archb_fix_moved_word_upload_switch COMMAND agc_archb_c01_switches_tests --toggle FixMovedWordUpload)
     add_test(NAME agc_archb_fix_unstamped_alias_switch COMMAND agc_archb_c01_switches_tests --toggle FixUnstampedAlias)
+    add_test(NAME agc_archb_wt_fault_consumers_switch COMMAND agc_archb_c01_switches_tests --toggle WtFaultConsumers)
+    set_tests_properties(agc_archb_wt_fault_consumers_switch PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_wt_fault_consumers_switch PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_archb_gpu_staging_carry_switch COMMAND agc_archb_c01_switches_tests --toggle GpuStagingCarry)
     set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch agc_archb_pipe_draw_reuse_switch agc_archb_pipe_draw_lookup_memo_switch agc_archb_fix_stable_failed_wide_switch agc_archb_fix_snapshot_page_refresh_switch agc_archb_fix_snapshot_candidates_switch agc_archb_fix_moved_word_upload_switch agc_archb_fix_unstamped_alias_switch agc_archb_fix_pipeline_key_writer_switch agc_archb_gpu_staging_carry_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
@@ -1074,6 +1079,25 @@ if(BUILD_TESTING)
     set_tests_properties(agc_archb_fix_unstamped_alias_tracker_off agc_archb_fix_unstamped_alias_tracker_on agc_archb_fix_unstamped_alias_suite PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     set_tests_properties(agc_archb_fix_unstamped_alias_tracker_on agc_archb_fix_unstamped_alias_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_FIX_UNSTAMPED_ALIAS=1")
+    # APS5_ARCHB_WT_FAULT: write tracking by page protection in shadow mode (fault stamps, flip re-protect
+    # in runs, kernel-mode writes in host-write scopes, driver-hot pages, host imports, shared views and
+    # their alias left alone), with and without VERIFY; and the whole write-tracking suite with it on.
+    add_test(NAME agc_archb_wt_fault COMMAND agc_write_tracking_tests --wt-fault)
+    add_test(NAME agc_archb_wt_fault_verify COMMAND agc_write_tracking_tests --wt-fault)
+    add_test(NAME agc_archb_wt_fault_suite COMMAND agc_write_tracking_tests)
+    set_tests_properties(agc_archb_wt_fault agc_archb_wt_fault_verify agc_archb_wt_fault_suite PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    set_tests_properties(agc_archb_wt_fault PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1")
+    set_tests_properties(agc_archb_wt_fault_verify agc_archb_wt_fault_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1")
+    # APS5_ARCHB_WT_FAULT_CONSUMERS: collects from the fault states (no write-watch query for an armed
+    # range), with and without VERIFY; and the whole write-tracking suite with consumers on.
+    add_test(NAME agc_archb_wt_fault_consumers COMMAND agc_write_tracking_tests --wt-fault-consumers)
+    add_test(NAME agc_archb_wt_fault_consumers_verify COMMAND agc_write_tracking_tests --wt-fault-consumers)
+    add_test(NAME agc_archb_wt_fault_consumers_suite COMMAND agc_write_tracking_tests)
+    set_tests_properties(agc_archb_wt_fault_consumers agc_archb_wt_fault_consumers_verify agc_archb_wt_fault_consumers_suite PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    set_tests_properties(agc_archb_wt_fault_consumers PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1")
+    set_tests_properties(agc_archb_wt_fault_consumers_verify agc_archb_wt_fault_consumers_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1")
     add_test(NAME agc_failed_collect_memo COMMAND agc_write_tracking_tests --failed-collect-memo)
     add_test(NAME agc_failed_collect_memo_off COMMAND agc_write_tracking_tests --failed-collect-memo)
     set_tests_properties(agc_failed_collect_memo agc_failed_collect_memo_off PROPERTIES

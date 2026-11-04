@@ -148,6 +148,22 @@ struct CommitterCollectCounters {
 };
 CommitterCollectCounters& CommitterCollects();
 void MarkCommitterThread();
+// APS5_ARCHB_WT_FAULT (see GuestMemory.cpp, libc GuestWriteFault.hpp): a driver thread's write faults
+// count apart; WtFaultFlip protects the pages written since the last flip (Driver::Present).
+void MarkDriverThread();
+void WtFaultFlip(bool presenter = true);
+struct WtFaultStatus {
+    bool active = false;
+    std::uint64_t mismatches = 0;
+    std::uint64_t faults = 0;
+    std::uint64_t armedPages = 0;
+    std::uint64_t consumerUnchanged = 0;
+    std::uint64_t consumerChanged = 0;
+    std::uint64_t consumerFallback = 0;
+    std::uint64_t consumerMismatches = 0;
+};
+// The fault tracker's cumulative state (tests, replay summaries).
+WtFaultStatus WtFault();
 // Whether the calling thread is the queue-0 committer (MarkCommitterThread).
 bool IsCommitterThread();
 // APS5_ARCHB_PIPE_COLLECT_SHARE: queue 0 marks itself while it runs a pipelined submission, and

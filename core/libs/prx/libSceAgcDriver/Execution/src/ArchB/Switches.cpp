@@ -48,6 +48,7 @@ constexpr Feature PipeCollectSharePrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeCopyKernelItemsPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeDrawReusePrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeDrawLookupMemoPrerequisites[] = {Feature::PipeQ0Committer};
+constexpr Feature WtFaultPrerequisites[] = {Feature::WtFault};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -99,6 +100,12 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixUnstampedAlias, "FIX_UNSTAMPED_ALIAS", false, true, {}},
     {Feature::FixPipelineKeyWriter, "FIX_PIPELINE_KEY_WRITER", false, true, {}},
     {Feature::GpuStagingCarry, "GPU_STAGING_CARRY", false, true, {}},
+    // Write tracking by page protection (Stage 4 option 2): startup-only (the protected pages are set up
+    // with the write tracker), VERIFY keeps GetWriteWatch as the reference, CONSUMERS answers the
+    // commit-time freshness checks from the fault stamps (runtime: both arms of a gate track faults).
+    {Feature::WtFault, "WT_FAULT", false, false, {}},
+    {Feature::WtFaultVerify, "WT_FAULT_VERIFY", false, false, WtFaultPrerequisites},
+    {Feature::WtFaultConsumers, "WT_FAULT_CONSUMERS", false, true, WtFaultPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

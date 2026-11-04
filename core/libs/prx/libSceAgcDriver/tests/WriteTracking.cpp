@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -2004,6 +2005,294 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
+#ifdef _WIN32
+// APS5_ARCHB_WT_FAULT (+ _VERIFY from the environment): write tracking by page protection in shadow
+// mode. A walk makes its pages candidates and a flip protects them with one stamp newer than every
+// generation handed out before; the first store faults once and opens its page; the next flip protects
+// the opened pages again in contiguous runs; VERIFY counts no mismatch for stores the fault tracker
+// saw and one for a store into a page unprotected behind its back; a fault on a page the tracker does
+// not protect is not handled; a kernel-mode read into a protected page fails outside a host-write scope
+// and succeeds inside one, which holds the page open across flips; small driver stores keep their pages
+// open for one flip; a host import holds its pages open; resident direct memory that is mapped a
+// second time leaves the tracker (its views are the shared-mapping tracker's), so a store through the
+// read-write alias of the view never faults into the fault tracker.
+void CheckWtFault() {
+    using namespace GuestArena;
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    Require(Switches::Enabled(Feature::WtFault), "the fault-tracking switch does not follow the environment");
+    Require(WtFault().active, "the fault tracker did not turn on with write watching");
+    const bool verify = Switches::Enabled(Feature::WtFaultVerify);
+    const auto counters = [] {
+        WtFaultCounters value{};
+        GuestWtFaultCounters_nid_no_patch(&value);
+        return value;
+    };
+    const auto state = [](std::uint64_t address) { return GuestWtFaultWord_nid_no_patch(address) & WtFaultStateMask; };
+    const auto stamp = [](std::uint64_t address) { return GuestWtFaultWord_nid_no_patch(address) >> WtFaultStampShift; };
+    const auto protection = [](std::uint64_t address) {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info), "cannot query a fault-tracked page");
+        return info.Protect;
+    };
+    constexpr std::uint64_t Page = 4096;
+    PartlyCommitted range;
+    range.Commit(0);
+    range.Commit(1);
+    const auto base = range.Address();
+    volatile std::uint8_t* data = range.Data();
+    std::memset(range.Data(), 0x11, 2 * Block);
+    const auto mismatches0 = WtFault().mismatches;
+
+    // A walk makes its pages candidates; the flip protects them, stamped after the protect.
+    BumpCollectEpoch();
+    const auto g0 = CollectWrites(base, 2 * Block);
+    Require(g0 != 0 && state(base) == WtFaultOpen && state(base + 2 * Block - Page) == WtFaultOpen, "walked pages did not become candidates");
+    WtFaultFlip();
+    Require(state(base) == WtFaultArmed && state(base + 2 * Block - Page) == WtFaultArmed && stamp(base) > g0, "the flip did not protect the candidates with a stamp newer than the walk");
+    Require(protection(base) == PAGE_READONLY, "an armed page is not read-only");
+    Require(GuestWtFaultChangedSince_nid_no_patch(base, 2 * Block, GuestWtFaultClockBump_nid_no_patch()) == WtFaultAnswer::Unchanged, "armed pages read as changed since a later generation");
+    Require(GuestWtFaultChangedSince_nid_no_patch(base, 2 * Block, g0) == WtFaultAnswer::Changed, "pages armed after a generation read as unchanged since it");
+    Require(Accessible(reinterpret_cast<const void*>(base + Page), Page, true), "an armed page reads as not writable to the driver's probes");
+
+    // The first store into a page faults once and restores the guest's protection.
+    const auto beforeStores = counters();
+    data[0x10] = 0x22;
+    data[0x20] = 0x23;
+    data[3 * Page] = 0x24;
+    const auto afterStores = counters();
+    Require(afterStores.faults == beforeStores.faults + 2, "two written pages did not fault exactly twice");
+    Require(state(base) == WtFaultOpen && state(base + 3 * Page) == WtFaultOpen && state(base + Page) == WtFaultArmed, "a fault did not open exactly its page");
+    Require(protection(base) == PAGE_READWRITE, "a faulted page did not get the guest's protection back");
+    const auto now = GuestWtFaultClockBump_nid_no_patch();
+    Require(GuestWtFaultChangedSince_nid_no_patch(base, Page, now) == WtFaultAnswer::Changed && GuestWtFaultChangedSince_nid_no_patch(base + Page, Page, now) == WtFaultAnswer::Unchanged, "an open page read as unchanged or an armed one as changed");
+    BumpCollectEpoch();
+    const auto g1 = CollectWrites(base, 2 * Block);
+    Require(!UnchangedSince(base, Page, g0) && g1 > g0, "the reference tracker missed a store into a fault-tracked page");
+    if (verify) Require(WtFault().mismatches == mismatches0 && counters().verifyDirty >= afterStores.verifyDirty + 2, "VERIFY did not see the stores or counted a mismatch for them");
+
+    // The flip protects the opened pages again in contiguous runs: {0}, {3}, {8..15}, {20}.
+    for (std::uint64_t page = 8; page < 16; ++page) data[page * Page] = 0x30;
+    data[20 * Page] = 0x31;
+    const auto beforeArm = counters();
+    WtFaultFlip();
+    const auto afterArm = counters();
+    Require(afterArm.armedPages - beforeArm.armedPages == 11 && afterArm.armRuns - beforeArm.armRuns == 4, "the flip did not protect the 11 opened pages in 4 runs");
+    for (const std::uint64_t page : {0ull, 3ull, 8ull, 15ull, 20ull}) Require(state(base + page * Page) == WtFaultArmed && stamp(base + page * Page) > g1, "an opened page was not protected again with a newer stamp");
+
+    // VERIFY catches a store the fault tracker never saw (a page unprotected behind its back).
+    if (verify) {
+        DWORD previous = 0;
+        Require(VirtualProtect(reinterpret_cast<void*>(base + 5 * Page), Page, PAGE_READWRITE, &previous) && previous == PAGE_READONLY, "cannot unprotect a page behind the tracker");
+        const auto faults = counters().faults;
+        data[5 * Page] = 0x55;
+        Require(counters().faults == faults, "a store into a page unprotected behind the tracker faulted");
+        BumpCollectEpoch();
+        CollectWrites(base, 2 * Block);
+        Require(WtFault().mismatches == mismatches0 + 1, "VERIFY did not count the store the fault tracker missed");
+        GuestWtFaultForget_nid_no_patch(base + 5 * Page, Page);
+    }
+
+    // A fault on a page the tracker does not protect falls through to the next handler.
+    GuestArenaSetProtection_nid_postfix(base + 6 * Page, Page, PAGE_READONLY);
+    Require(state(base + 6 * Page) == WtFaultUntracked && !GuestWtFaultHandle_nid_no_patch(base + 6 * Page + 8), "a page the guest made read-only is still claimed by the fault tracker");
+    GuestArenaSetProtection_nid_postfix(base + 6 * Page, Page, PAGE_READWRITE);
+
+    // A kernel-mode read into a protected page fails; inside a host-write scope it succeeds and the page
+    // stays open across flips until the scope ends.
+    wchar_t directory[MAX_PATH];
+    wchar_t path[MAX_PATH];
+    Require(GetTempPathW(MAX_PATH, directory) != 0 && GetTempFileNameW(directory, L"wtf", 0, path) != 0, "cannot make a temporary file");
+    {
+        HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        Require(file != INVALID_HANDLE_VALUE, "cannot open the temporary file");
+        std::vector<std::uint8_t> bytes(Page, 0x77);
+        DWORD done = 0;
+        Require(WriteFile(file, bytes.data(), static_cast<DWORD>(Page), &done, nullptr) && done == Page, "cannot fill the temporary file");
+        auto* target = reinterpret_cast<void*>(base + 9 * Page);
+        Require(state(base + 9 * Page) == WtFaultArmed, "the kernel-write target is not armed");
+        SetFilePointer(file, 0, nullptr, FILE_BEGIN);
+        const bool unscoped = ReadFile(file, target, static_cast<DWORD>(Page), &done, nullptr) != 0;
+        const auto error = GetLastError();
+        Require(!unscoped && error == ERROR_NOACCESS, "a kernel-mode read into a protected page did not fail with ERROR_NOACCESS");
+        SetFilePointer(file, 0, nullptr, FILE_BEGIN);
+        {
+            const GuestArena::HostWrite scope(target, Page);
+            Require(state(base + 9 * Page) == WtFaultOpen, "a host-write scope did not open its protected page");
+            Require(ReadFile(file, target, static_cast<DWORD>(Page), &done, nullptr) && done == Page, "a kernel-mode read inside a host-write scope failed");
+            WtFaultFlip();
+            Require(state(base + 9 * Page) == WtFaultOpen, "a flip protected a page held open by a host-write scope");
+        }
+        CloseHandle(file);
+        Require(data[9 * Page] == 0x77 && data[9 * Page + Page - 1] == 0x77, "the kernel-mode read did not land");
+        WtFaultFlip();
+        Require(state(base + 9 * Page) == WtFaultArmed, "a page was not protected again after its host-write scope ended");
+    }
+
+    // Small driver stores keep their pages open for the next flip only.
+    data[12 * Page] = 0x40;
+    Require(MarkWritten(base + 12 * Page, 64) != 0, "a driver store into a fault-tracked page was not stamped");
+    WtFaultFlip();
+    Require(state(base + 12 * Page) == WtFaultOpen, "a flip protected a page the driver stored since the previous flip");
+    WtFaultFlip();
+    Require(state(base + 12 * Page) == WtFaultArmed, "a page the driver stopped storing stayed open");
+
+    // A host import holds its pages open.
+    Require(GuestArenaBeginHostImport_nid_no_patch(reinterpret_cast<void*>(base + 14 * Page), Page), "the host-import scope refused a fault-tracked page");
+    Require(state(base + 14 * Page) == WtFaultOpen && protection(base + 14 * Page) == PAGE_READWRITE, "a host import did not open its protected page");
+    WtFaultFlip();
+    Require(state(base + 14 * Page) == WtFaultOpen, "a flip protected a page held by a host import");
+    GuestArenaEndHostImport_nid_no_patch(reinterpret_cast<void*>(base + 14 * Page), Page);
+    WtFaultFlip();
+    Require(state(base + 14 * Page) == WtFaultArmed, "a page was not protected again after its host import ended");
+
+    // Resident direct memory is fault-tracked; mapped a second time, its views leave the tracker and a
+    // store through the read-write alias of a view never faults into it.
+    {
+        constexpr std::size_t Bytes = Block;
+        auto* memory = static_cast<std::uint8_t*>(GuestArenaAllocate_nid_postfix(2 * Bytes, Block));
+        HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, Bytes, nullptr);
+        Require(memory != nullptr && section != nullptr, "cannot create the direct memory fixture");
+        GuestArenaForgetSection_nid_postfix(section);
+        GuestArenaMapDirect_nid_postfix(memory, Bytes, section, 0, PAGE_READWRITE);
+        const auto direct = reinterpret_cast<std::uint64_t>(memory);
+        BumpCollectEpoch();
+        Require(CollectWrites(direct, Bytes) != 0, "resident direct memory was not collected");
+        WtFaultFlip();
+        Require(state(direct) == WtFaultArmed, "resident direct memory was not protected");
+        const auto faults = counters().faults;
+        memory[8] = 0x61;
+        Require(counters().faults == faults + 1 && state(direct) == WtFaultOpen, "a store into resident direct memory did not fault once");
+        GuestArenaMapDirect_nid_postfix(memory + Bytes, Bytes, section, 0, PAGE_READWRITE);
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(memory, &info, sizeof(info)) == sizeof(info) && info.Type == MEM_MAPPED, "a second mapping kept the direct memory resident");
+        BumpCollectEpoch();
+        CollectWrites(direct, Bytes);
+        WtFaultFlip();
+        Require(state(direct) == WtFaultExcluded || state(direct) == WtFaultUntracked, "a shared view was protected by the fault tracker");
+        auto* alias = static_cast<volatile std::uint8_t*>(GuestArenaMapAlias_nid_postfix(direct, Bytes));
+        Require(alias != nullptr, "no read-write alias of the shared view");
+        const auto aliasFaults = counters().faults;
+        alias[16] = 0x62;
+        memory[24] = 0x63;
+        Require(counters().faults == aliasFaults && memory[16] == 0x62, "a store through the alias or the view faulted into the fault tracker");
+        GuestArenaUnmapAlias_nid_postfix(const_cast<std::uint8_t*>(alias));
+        GuestArenaReset_nid_postfix(memory, 2 * Bytes);
+        GuestArenaRelease_nid_postfix(memory, 2 * Bytes);
+        GuestArenaForgetSection_nid_postfix(section);
+        CloseHandle(section);
+    }
+    if (verify) Require(WtFault().mismatches == mismatches0 + 1, "VERIFY counted mismatches beyond the provoked one");
+    const auto final = counters();
+    std::cout << "wt-fault: faults " << final.faults << " armed pages " << final.armedPages << " runs " << final.armRuns << " holds " << final.holds << " verify dirty " << final.verifyDirty << " untracked " << final.verifyUntracked << " mismatches " << final.verifyMismatches << "\n";
+}
+#endif
+
+#ifdef _WIN32
+// APS5_ARCHB_WT_FAULT_CONSUMERS (+ _VERIFY from the environment): collects answer from the fault
+// states. A fully armed range collects without a single GetWriteWatch query and reads as unchanged; a
+// written (open) page costs one walk of its own run and reads as changed once; protected again at a
+// flip (which walks the runs it armed), only a store made while open reads as changed and the collect
+// after makes no OS query again; committed-range answers follow; a range with a page the tracker does not track (a
+// shared view) walks write watching as before; VERIFY finds no store the fault states missed and
+// counts one for a page unprotected behind the tracker's back.
+void CheckWtFaultConsumers() {
+    using namespace GuestArena;
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    Require(Switches::Enabled(Feature::WtFaultConsumers) && WtFault().active, "the consumers switch does not follow the environment");
+    const bool verify = Switches::Enabled(Feature::WtFaultVerify);
+    const auto queries = [] { return GuestArenaWriteWatchCensus_nid_no_patch().queries; };
+    constexpr std::uint64_t Page = 4096;
+    PartlyCommitted range;
+    range.Commit(0);
+    range.Commit(1);
+    const auto base = range.Address();
+    volatile std::uint8_t* data = range.Data();
+    std::memset(range.Data(), 0x11, 2 * Block);
+    const auto collect = [&] {
+        BumpCollectEpoch();
+        return CollectWrites(base, 2 * Block);
+    };
+    const auto start = WtFault();
+    collect();
+    WtFaultFlip();
+    const auto g1 = collect();
+    // A fully armed range: no OS query, unchanged.
+    auto before = queries();
+    const auto g2 = collect();
+    Require(g2 > g1 && UnchangedSince(base, 2 * Block, g1), "a fully armed range read as changed");
+    if (!verify) Require(queries() == before, "a fully armed range was collected with write-watch queries");
+    // A written page: one walk of its own run, changed once.
+    data[4 * Page] = 0x21;
+    before = queries();
+    const auto g3 = collect();
+    Require(!UnchangedSince(base, 2 * Block, g2) && !UnchangedSince(base + 4 * Page, Page, g2) && UnchangedSince(base + 5 * Page, Page, g2), "the written page did not read as changed, or its neighbour did");
+    if (!verify) Require(queries() == before + 1, "the open page was not walked by itself");
+    const auto g4 = collect();
+    Require(UnchangedSince(base, 2 * Block, g3), "an open page that was not written again read as changed");
+    // Protected again at the flip: a store made while open reads as changed at the next collect; a page
+    // not stored since its last walk reads as unchanged (the flip walks the runs it armed).
+    data[6 * Page] = 0x22;
+    WtFaultFlip();
+    const auto g5 = collect();
+    Require(!UnchangedSince(base + 6 * Page, Page, g4) && UnchangedSince(base + 5 * Page, Page, g4), "a store made while open was missed after the flip, or an untouched page read as changed");
+    Require(UnchangedSince(base + 4 * Page, Page, g4), "a page not stored since its last walk read as changed after the flip's walk");
+    before = queries();
+    const auto g6 = collect();
+    Require(UnchangedSince(base, 2 * Block, g5), "a protected page read as changed twice");
+    if (!verify) Require(queries() == before, "a range protected again was collected with write-watch queries");
+    // Committed-range answers.
+    Runs runs;
+    const auto committed = CollectCommitted(range, runs);
+    Require(committed > g6 && UnchangedCommittedSince(runs, committed), "a committed range read as changed right after its collect");
+    data[Block + 8] = 0x31;
+    const auto after = CollectCommitted(range, runs);
+    Require(!UnchangedCommittedSince(runs, committed) && UnchangedCommittedSince(runs, after), "a store into the committed range was missed or kept reading as changed");
+    // Shared views (protected by the shared-mapping tracker, which forgets them here) are walked by
+    // write watching, whole or as open runs.
+    const auto fallback = WtFault().consumerFallback;
+    {
+        constexpr std::size_t Bytes = Block;
+        auto* memory = static_cast<std::uint8_t*>(GuestArenaAllocate_nid_postfix(2 * Bytes, Block));
+        HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, Bytes, nullptr);
+        Require(memory != nullptr && section != nullptr, "cannot create the shared fixture");
+        GuestArenaForgetSection_nid_postfix(section);
+        GuestArenaMapDirect_nid_postfix(memory, Bytes, section, 0, PAGE_READWRITE);
+        GuestArenaMapDirect_nid_postfix(memory + Bytes, Bytes, section, 0, PAGE_READWRITE);
+        const auto view = reinterpret_cast<std::uint64_t>(memory);
+        BumpCollectEpoch();
+        CollectWrites(view, Bytes);
+        WtFaultFlip();
+        BumpCollectEpoch();
+        const auto viewGeneration = CollectWrites(view, Bytes);
+        memory[64] = 0x41;
+        BumpCollectEpoch();
+        CollectWrites(view, Bytes);
+        Require(!UnchangedSince(view, Bytes, viewGeneration), "a store into a range of shared views was missed");
+        static_cast<void>(fallback);
+        GuestArenaReset_nid_postfix(memory, 2 * Bytes);
+        GuestArenaRelease_nid_postfix(memory, 2 * Bytes);
+        GuestArenaForgetSection_nid_postfix(section);
+        CloseHandle(section);
+    }
+    if (verify) {
+        Require(WtFault().consumerMismatches == start.consumerMismatches, "VERIFY counted a store the fault states saw as missed");
+        WtFaultFlip();
+        collect();
+        DWORD previous = 0;
+        Require(VirtualProtect(reinterpret_cast<void*>(base + 7 * Page), Page, PAGE_READWRITE, &previous) && previous == PAGE_READONLY, "cannot unprotect a page behind the tracker");
+        data[7 * Page] = 0x51;
+        const auto g7 = collect();
+        Require(WtFault().consumerMismatches == start.consumerMismatches + 1, "VERIFY did not count the store the fault states missed");
+        Require(g7 != 0 && !UnchangedSince(base + 7 * Page, Page, g6), "VERIFY did not stamp the missed store");
+        GuestWtFaultForget_nid_no_patch(base + 7 * Page, Page);
+    }
+    const auto end = WtFault();
+    std::cout << "wt-fault consumers: unchanged " << end.consumerUnchanged - start.consumerUnchanged << " changed " << end.consumerChanged - start.consumerChanged << " fallback " << end.consumerFallback - start.consumerFallback << " mismatches " << end.consumerMismatches - start.consumerMismatches << "\n";
+}
+#endif
+
 // APS5_ARCHB_FIX_UNSTAMPED_ALIAS (mode from the environment): a driver store into unwatched memory 4 GiB
 // away from a collected committed range sets the unstamped-store slots of the range's blocks (hashed
 // by block modulo 4 GiB). Off, the range then reads as changed (counted as aliased); on, it reads as
@@ -3318,6 +3607,18 @@ int main(int argc, char** argv) {
             std::cout << "changed pages test passed\n";
             return 0;
         }
+#ifdef _WIN32
+        if (argc == 2 && std::string_view(argv[1]) == "--wt-fault-consumers") {
+            CheckWtFaultConsumers();
+            std::cout << "fault tracking consumers test passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--wt-fault") {
+            CheckWtFault();
+            std::cout << "fault tracking test passed\n";
+            return 0;
+        }
+#endif
         if (argc == 2 && std::string_view(argv[1]) == "--unstamped-alias") {
             CheckUnstampedAlias();
             std::cout << "unstamped alias test passed\n";
