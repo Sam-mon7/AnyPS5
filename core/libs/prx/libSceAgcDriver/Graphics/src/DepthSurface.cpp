@@ -2163,8 +2163,8 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
         }
         auto& planes = stalePlanes();
         std::lock_guard staleLock(planes.mutex);
+        if (planes.ranges != remaining) stalePlanesSerial.fetch_add(1, std::memory_order_release);
         planes.ranges = std::move(remaining);
-        stalePlanesSerial.fetch_add(1, std::memory_order_release);
         publishStaleHull(planes);
     }
     for (auto& entry : stored) entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store");
@@ -2214,7 +2214,8 @@ void PrepareColorTargetDepth(VkDevice device, std::uint64_t address, std::size_t
         RetireDepthSurfaces(device, address, bytes);
         return;
     }
-    thread_local ColorTargetDepthMemo memo;
+    thread_local std::array<ColorTargetDepthMemo, 16> memos{};
+    auto& memo = memos[static_cast<std::size_t>((address >> 16) ^ (address >> 24) ^ bytes) % memos.size()];
     const auto planes = stalePlanesSerial.load(std::memory_order_acquire);
     const auto created = surfacesSerial.load(std::memory_order_acquire);
     if (memo.valid && memo.device == device && memo.address == address && memo.bytes == bytes && memo.planes == planes && memo.surfaces == created) {
