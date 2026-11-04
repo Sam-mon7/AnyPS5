@@ -1087,8 +1087,8 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_wt_fault_suite COMMAND agc_write_tracking_tests)
     set_tests_properties(agc_archb_wt_fault agc_archb_wt_fault_verify agc_archb_wt_fault_suite PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    set_tests_properties(agc_archb_wt_fault PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_WT_FAULT_GUEST_HOT=0")
-    set_tests_properties(agc_archb_wt_fault_verify agc_archb_wt_fault_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_WT_FAULT_GUEST_HOT=0")
+    set_tests_properties(agc_archb_wt_fault PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
+    set_tests_properties(agc_archb_wt_fault_verify agc_archb_wt_fault_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
     # APS5_ARCHB_WT_FAULT_CONSUMERS: collects from the fault states (no write-watch query for an armed
     # range), with and without VERIFY; and the whole write-tracking suite with consumers on.
     add_test(NAME agc_archb_wt_fault_consumers COMMAND agc_write_tracking_tests --wt-fault-consumers)
@@ -1096,12 +1096,12 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_wt_fault_consumers_suite COMMAND agc_write_tracking_tests)
     set_tests_properties(agc_archb_wt_fault_consumers agc_archb_wt_fault_consumers_verify agc_archb_wt_fault_consumers_suite PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    set_tests_properties(agc_archb_wt_fault_consumers PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_WT_FAULT_GUEST_HOT=0")
-    set_tests_properties(agc_archb_wt_fault_consumers_verify agc_archb_wt_fault_consumers_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_WT_FAULT_GUEST_HOT=0")
+    set_tests_properties(agc_archb_wt_fault_consumers PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
+    set_tests_properties(agc_archb_wt_fault_consumers_verify agc_archb_wt_fault_consumers_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
     # Hot pages (APS5_WT_FAULT_GUEST_HOT, default on): pages stored in a frame stay open across the next flip.
     add_test(NAME agc_archb_wt_fault_hot COMMAND agc_write_tracking_tests --wt-fault-hot)
     set_tests_properties(agc_archb_wt_fault_hot PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
-        ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=0"
+        ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     # APS5_ARCHB_WT_FAULT_DIRTY_ARM: pages stored since their last walk stay open across the flip, which walks
     # them, so the open set holds only pages stored between flips; alone, and with VERIFY and CONSUMERS.
