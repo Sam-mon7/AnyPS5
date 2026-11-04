@@ -4963,6 +4963,8 @@ struct Pending {
     std::uint64_t end = 0;
     Recorder::NotePoint point{};
     bool pointSet = false;
+    // VERIFY recorded readbacks right after this copy-back: it must execute (never cancelled later).
+    bool keep = false;
 };
 
 // Under GuestMemory::GpuMutex (every copy-back and staging decision is made under it).
@@ -5874,12 +5876,13 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             auto& s = lazyCopyBack::state();
             auto& lc = lazyCopyBack::counters();
             const auto handle = region.buffer->Handle();
+            const auto verifyBefore = lazyVerify.size();
             if (const auto found = s.pending.find(handle); found != s.pending.end()) {
                 const auto previous = found->second;
                 s.pending.erase(found);
                 if (previous.serial != recorder.OpenSerial()) {
                     lc.otherBatch.fetch_add(1, std::memory_order_relaxed);
-                } else if (!carriedSameBatch || previous.begin < region.begin || region.end < previous.end || !previous.pointSet) {
+                } else if (!carriedSameBatch || previous.begin < region.begin || region.end < previous.end || !previous.pointSet || previous.keep) {
                     lc.uncovered.fetch_add(1, std::memory_order_relaxed);
                 } else if (!Recorder::ReadTracking() || recorder.AccessedSince(previous.point, previous.begin, previous.end)) {
                     lc.accessed.fetch_add(1, std::memory_order_relaxed);
@@ -5904,7 +5907,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             }
             const auto bytes = region.end - region.begin;
             if (auto* slot = lazyCopyBack::Record(context, recorder, commands, region.buffer, region.copySource, region.begin - region.copySourceBase, bytes)) {
-                s.pending[handle] = {slot, recorder.OpenSerial(), region.begin, region.end, {}, false};
+                s.pending[handle] = {slot, recorder.OpenSerial(), region.begin, region.end, {}, false, lazyVerify.size() != verifyBefore};
                 ArchC::LazyCensus::Published(region.begin, region.end, ArchC::LazyCensus::Kind::StagingCopyBack, 30, recorder.OpenSerial());
                 copiedBytes += bytes;
                 recorder.Keep(region.buffer);
