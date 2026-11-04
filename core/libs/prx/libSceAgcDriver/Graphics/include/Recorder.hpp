@@ -197,6 +197,42 @@ public:
         std::uint64_t refreshes, fallbacks, comparedBytes, blockBytes, copiedBytes, verifiedPages, mismatches;
     };
     static PageRefreshStats PageRefreshTotals();
+    // Zero-copy draw inputs (Stage 4, 2026-11-04). A zero-copy check is one snapshot a draw binds
+    // (a storage element of PrepareDrawBindings or a vertex/index copy) that zero copy would read in
+    // place from guest memory instead. Noted on the open batch while checks are on
+    // (APS5_ZC_HAZARD_CENSUS=1, or a ZERO_COPY_*_VERIFY mode); the batch compares each distinct one with
+    // guest memory right before vkQueueSubmit and again at its GPU completion, before its completion
+    // actions (labels, write-backs) run. A difference means the guest stored into the range between
+    // the record and that point: in place, the GPU could have read the newer bytes. "nostore" also
+    // requires that no GPU store (a completion label stored on the GPU) was recorded into the batch
+    // after the check, so the guest cannot have seen a label behind the draw. zc_* counters.
+    enum class ZeroCopyKind : std::uint8_t { StorageSmall = 0, StorageLarge, Vertex, Index, Override, Count };
+    struct ZeroCopyCheck {
+        std::uint64_t address;
+        std::size_t bytes;
+        std::weak_ptr<Buffer> buffer;
+        const Buffer* identity;
+        VkDeviceSize offset;
+        ZeroCopyKind kind;
+        std::uint32_t storesAtNote;
+        bool submitDiffered = false;
+    };
+    // ZERO_COPY_STORAGE / ZERO_COPY_INPUTS on and their _VERIFY off (VERIFY keeps the snapshots).
+    static bool ZeroCopyStorageActive();
+    static bool ZeroCopyInputsActive();
+    // zc_storage_draws / zc_storage_in_place, zc_inputs_in_place(_bytes).
+    static void CountZeroCopyStorage(std::size_t elements);
+    static void CountZeroCopyInput(std::size_t bytes);
+    static bool ZeroCopyChecks();
+    void NoteZeroCopyCheck(std::uint64_t address, std::size_t bytes, const std::shared_ptr<Buffer>& buffer, VkDeviceSize offset, ZeroCopyKind kind);
+    // Census only (checks on): a vertex/index range copied that a host import covers at a usable
+    // offset (zero copy could bind it in place).
+    static void NoteZeroCopyImportable(ZeroCopyKind kind, std::size_t bytes, bool importable);
+    // Cumulative over every kind (tests): checks compared, and those differing at submit and at completion.
+    struct ZeroCopyCheckTotals {
+        std::uint64_t unique, submitDiffered, completeDiffered, storageInPlace;
+    };
+    static ZeroCopyCheckTotals ZeroCopyTotals();
     static constexpr std::size_t ContainingSnapshotProbes = 16;
     // APS5_DRAW_BINDINGS_DIAG (diagnostic, read once, default off): what ReusableDrawSnapshot did for
     // storage snapshots (PrepareDrawBindings' large-snapshot path), printed in "[draw-bindings]".
@@ -789,6 +825,9 @@ private:
             };
             std::vector<Queued> queued;
         } run;
+        // Zero-copy checks (NoteZeroCopyCheck) and the GPU stores recorded so far (RecordStore).
+        std::vector<ZeroCopyCheck> zeroCopyChecks;
+        std::uint32_t gpuStores = 0;
         // See Commands(): the accesses the last recorded command's trailing barrier covers.
         VkAccessFlags coveredAccess = 0;
         PassHazards computeHazards;
@@ -1039,6 +1078,8 @@ private:
     std::array<std::uint64_t, 3> unwrittenStamp{};
     std::size_t unwrittenBytes = 0;
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
+    void checkZeroCopyAtSubmit(Batch& batch);
+    void checkZeroCopyAtCompletion(Batch& batch);
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     struct IndexRange {

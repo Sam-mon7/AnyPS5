@@ -113,6 +113,12 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::PipeResolveProofs, "PIPE_RESOLVE_PROOFS", false, true, WtFaultPrerequisites},
     {Feature::PipeResolveHandoff, "PIPE_RESOLVE_HANDOFF", false, true, PipeResolveSplitPrerequisites},
     {Feature::PipeResolveSnapshots, "PIPE_RESOLVE_SNAPSHOTS", false, true, WtFaultPrerequisites},
+    // Zero-copy draw inputs (Stage 4, 2026-11-04): read-only guest storage elements and vertex/index
+    // ranges inside host imports are bound in place instead of snapshotted (see PrepareDrawBindings,
+    // InPlaceDrawInput); _VERIFY snapshots anyway and checks the snapshot against guest memory at
+    // submit and at GPU completion (Recorder zero-copy checks).
+    {Feature::ZeroCopyStorage, "ZERO_COPY_STORAGE", false, true, {}},
+    {Feature::ZeroCopyInputs, "ZERO_COPY_INPUTS", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

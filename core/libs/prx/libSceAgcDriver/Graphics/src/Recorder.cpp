@@ -1947,6 +1947,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     if (bytes.empty()) return;
     EndComputeChain();
     ensureOpen();
+    ++open->gpuStores;
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -3352,6 +3353,212 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
 }
 
 namespace {
+// Zero-copy checks (see Recorder::NoteZeroCopyCheck): per kind, the checks noted, their bytes, the
+// distinct ones compared, their bytes, and the distinct ones whose guest bytes differed from the
+// snapshot at submit, at completion, at completion with no GPU store recorded after the check, and the
+// bytes of those differing at completion; per input kind, the copies seen and those an import covers.
+struct ZeroCopyCheckCounters {
+    struct Kind {
+        std::atomic<std::uint64_t> notes{0}, noteBytes{0}, unique{0}, uniqueBytes{0}, submitDiffered{0}, completeDiffered{0}, completeDifferedNoStore{0}, completeDifferedBytes{0}, copies{0}, copyBytes{0}, importable{0}, importableBytes{0};
+    };
+    std::array<Kind, static_cast<std::size_t>(Recorder::ZeroCopyKind::Count)> kinds;
+    std::atomic<std::uint64_t> expired{0}, unreadable{0}, ns{0}, examples{0};
+};
+
+ZeroCopyCheckCounters& zeroCopyCheckCounters() {
+    static auto* made = [] {
+        auto* counters = new ZeroCopyCheckCounters();
+        static constexpr const char* KindNames[] = {"storage_small", "storage_large", "vertex", "index", "override"};
+        static constexpr const char* Fields[] = {"notes", "note_bytes", "unique", "unique_bytes", "submit_differed", "complete_differed", "complete_differed_nostore", "complete_differed_bytes", "copies", "copy_bytes", "importable", "importable_bytes"};
+        static std::vector<std::string> names;
+        names.reserve(std::size(KindNames) * std::size(Fields));
+        for (std::size_t k = 0; k < std::size(KindNames); ++k) {
+            auto& kind = counters->kinds[k];
+            const std::atomic<std::uint64_t>* values[] = {&kind.notes, &kind.noteBytes, &kind.unique, &kind.uniqueBytes, &kind.submitDiffered, &kind.completeDiffered, &kind.completeDifferedNoStore, &kind.completeDifferedBytes, &kind.copies, &kind.copyBytes, &kind.importable, &kind.importableBytes};
+            for (std::size_t f = 0; f < std::size(Fields); ++f) {
+                names.push_back(std::string("zc_") + KindNames[k] + "_" + Fields[f]);
+                AgcDriver::ArchB::Recorder::RegisterCounter(names.back().c_str(), *values[f]);
+            }
+        }
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_check_expired", counters->expired);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_check_unreadable", counters->unreadable);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_check_ns", counters->ns);
+        return counters;
+    }();
+    return *made;
+}
+
+const char* zeroCopyKindName(Recorder::ZeroCopyKind kind) {
+    static constexpr const char* Names[] = {"storage small", "storage large", "vertex", "index", "override"};
+    return Names[static_cast<std::size_t>(kind)];
+}
+
+// 0: the snapshot still holds the guest bytes; 1: they differ (first differing byte in `at`);
+// 2: the snapshot is gone; 3: the guest range is not readable any more.
+int compareZeroCopyCheck(const Recorder::ZeroCopyCheck& check, std::size_t& at) {
+    const auto buffer = check.buffer.lock();
+    if (buffer == nullptr || !buffer->Mapped()) return 2;
+    const auto bytes = buffer->Bytes();
+    if (bytes.size() < check.offset + check.bytes) return 2;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(check.address), check.bytes)) return 3;
+    const auto* held = bytes.data() + check.offset;
+    const auto* guest = reinterpret_cast<const std::byte*>(check.address);
+    if (std::memcmp(held, guest, check.bytes) == 0) return 0;
+    at = 0;
+    while (at < check.bytes && held[at] == guest[at]) ++at;
+    return 1;
+}
+
+void reportZeroCopyDifference(const Recorder::ZeroCopyCheck& check, std::size_t at, const char* when, std::uint64_t serial, bool storeAfter) {
+    auto& counters = zeroCopyCheckCounters();
+    const auto count = counters.examples.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count > 64 && (count & (count - 1)) != 0) return;
+    std::fprintf(stderr, "[zero-copy] %s: %s snapshot 0x%llx+0x%zx differs from guest memory from byte 0x%zx (batch %llu%s; %llu differences so far)\n", when, zeroCopyKindName(check.kind), static_cast<unsigned long long>(check.address), check.bytes, at, static_cast<unsigned long long>(serial), storeAfter ? ", a GPU store follows it in the batch" : "", static_cast<unsigned long long>(count));
+}
+}
+
+namespace {
+struct ZeroCopyPlaceCounters {
+    std::atomic<std::uint64_t> storageDraws{0}, storageSkipped{0}, inputs{0}, inputBytes{0};
+};
+
+ZeroCopyPlaceCounters& zeroCopyPlaceCounters() {
+    static auto* made = [] {
+        auto* counters = new ZeroCopyPlaceCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_storage_draws", counters->storageDraws);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_storage_in_place", counters->storageSkipped);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_inputs_in_place", counters->inputs);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_inputs_in_place_bytes", counters->inputBytes);
+        return counters;
+    }();
+    return *made;
+}
+
+bool zeroCopyVerify(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+}
+
+bool Recorder::ZeroCopyStorageActive() {
+    static const bool verify = zeroCopyVerify("APS5_ARCHB_ZERO_COPY_STORAGE_VERIFY");
+    return !verify && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ZeroCopyStorage);
+}
+
+bool Recorder::ZeroCopyInputsActive() {
+    static const bool verify = zeroCopyVerify("APS5_ARCHB_ZERO_COPY_INPUTS_VERIFY");
+    return !verify && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ZeroCopyInputs);
+}
+
+void Recorder::CountZeroCopyStorage(std::size_t elements) {
+    auto& counters = zeroCopyPlaceCounters();
+    counters.storageDraws.fetch_add(1, std::memory_order_relaxed);
+    counters.storageSkipped.fetch_add(elements, std::memory_order_relaxed);
+}
+
+void Recorder::CountZeroCopyInput(std::size_t bytes) {
+    auto& counters = zeroCopyPlaceCounters();
+    counters.inputs.fetch_add(1, std::memory_order_relaxed);
+    counters.inputBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+bool Recorder::ZeroCopyChecks() {
+    static const bool enabled = [] {
+        const auto set = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        };
+        const bool on = set("APS5_ZC_HAZARD_CENSUS") || set("APS5_ARCHB_ZERO_COPY_STORAGE_VERIFY") || set("APS5_ARCHB_ZERO_COPY_INPUTS_VERIFY");
+        if (on) static_cast<void>(zeroCopyCheckCounters());
+        return on;
+    }();
+    return enabled;
+}
+
+void Recorder::NoteZeroCopyCheck(std::uint64_t address, std::size_t bytes, const std::shared_ptr<Buffer>& buffer, VkDeviceSize offset, ZeroCopyKind kind) {
+    if (buffer == nullptr || bytes == 0 || !ZeroCopyChecks()) return;
+    ensureOpen();
+    auto& counters = zeroCopyCheckCounters().kinds[static_cast<std::size_t>(kind)];
+    counters.notes.fetch_add(1, std::memory_order_relaxed);
+    counters.noteBytes.fetch_add(bytes, std::memory_order_relaxed);
+    open->zeroCopyChecks.push_back({address, bytes, buffer, buffer.get(), offset, kind, open->gpuStores});
+}
+
+void Recorder::NoteZeroCopyImportable(ZeroCopyKind kind, std::size_t bytes, bool importable) {
+    auto& counters = zeroCopyCheckCounters().kinds[static_cast<std::size_t>(kind)];
+    counters.copies.fetch_add(1, std::memory_order_relaxed);
+    counters.copyBytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (!importable) return;
+    counters.importable.fetch_add(1, std::memory_order_relaxed);
+    counters.importableBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+Recorder::ZeroCopyCheckTotals Recorder::ZeroCopyTotals() {
+    ZeroCopyCheckTotals totals{};
+    for (const auto& kind : zeroCopyCheckCounters().kinds) {
+        totals.unique += kind.unique.load(std::memory_order_relaxed);
+        totals.submitDiffered += kind.submitDiffered.load(std::memory_order_relaxed);
+        totals.completeDiffered += kind.completeDiffered.load(std::memory_order_relaxed);
+    }
+    totals.storageInPlace = zeroCopyPlaceCounters().storageSkipped.load(std::memory_order_relaxed);
+    return totals;
+}
+
+void Recorder::checkZeroCopyAtSubmit(Batch& batch) {
+    if (batch.zeroCopyChecks.empty()) return;
+    const auto start = std::chrono::steady_clock::now();
+    auto& checks = batch.zeroCopyChecks;
+    // The last note of a (snapshot, range) stands for all of them: its store count is the highest.
+    std::stable_sort(checks.begin(), checks.end(), [](const auto& a, const auto& b) { return std::tie(a.identity, a.offset, a.address, a.bytes) < std::tie(b.identity, b.offset, b.address, b.bytes); });
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < checks.size(); ++i) {
+        if (kept != 0 && checks[kept - 1].identity == checks[i].identity && checks[kept - 1].offset == checks[i].offset && checks[kept - 1].address == checks[i].address && checks[kept - 1].bytes == checks[i].bytes) {
+            checks[kept - 1].storesAtNote = std::max(checks[kept - 1].storesAtNote, checks[i].storesAtNote);
+            continue;
+        }
+        if (kept != i) checks[kept] = std::move(checks[i]);
+        ++kept;
+    }
+    checks.resize(kept);
+    auto& counters = zeroCopyCheckCounters();
+    for (auto& check : checks) {
+        auto& kind = counters.kinds[static_cast<std::size_t>(check.kind)];
+        kind.unique.fetch_add(1, std::memory_order_relaxed);
+        kind.uniqueBytes.fetch_add(check.bytes, std::memory_order_relaxed);
+        std::size_t at = 0;
+        const int state = compareZeroCopyCheck(check, at);
+        if (state == 1) {
+            check.submitDiffered = true;
+            kind.submitDiffered.fetch_add(1, std::memory_order_relaxed);
+            reportZeroCopyDifference(check, at, "at submit", batch.serial, false);
+        } else if (state == 2) {
+            counters.expired.fetch_add(1, std::memory_order_relaxed);
+        } else if (state == 3) {
+            counters.unreadable.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    counters.ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
+void Recorder::checkZeroCopyAtCompletion(Batch& batch) {
+    if (batch.zeroCopyChecks.empty()) return;
+    const auto start = std::chrono::steady_clock::now();
+    auto& counters = zeroCopyCheckCounters();
+    for (const auto& check : batch.zeroCopyChecks) {
+        auto& kind = counters.kinds[static_cast<std::size_t>(check.kind)];
+        std::size_t at = 0;
+        if (compareZeroCopyCheck(check, at) != 1) continue;
+        const bool storeAfter = batch.gpuStores > check.storesAtNote;
+        kind.completeDiffered.fetch_add(1, std::memory_order_relaxed);
+        kind.completeDifferedBytes.fetch_add(check.bytes, std::memory_order_relaxed);
+        if (!storeAfter) kind.completeDifferedNoStore.fetch_add(1, std::memory_order_relaxed);
+        if (!check.submitDiffered) reportZeroCopyDifference(check, at, "at completion", batch.serial, storeAfter);
+    }
+    batch.zeroCopyChecks.clear();
+    counters.ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
+namespace {
 struct ArmedSnapshotCounters {
     std::atomic<std::uint64_t> hits{0};
     std::atomic<std::uint64_t> misses{0};
@@ -4386,6 +4593,7 @@ void Recorder::Submit() {
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
         for (const auto& [begin, end] : notedReads(*open)) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin));
     }
+    checkZeroCopyAtSubmit(*open);
     auto batch = std::move(open);
     struct DiscardUnsubmitted {
         Recorder& recorder;
@@ -5091,6 +5299,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             entry.reads = notedReads(*batch);
         }
     }
+    // Zero-copy checks: before the completions, which make this batch's CPU-stored labels visible.
+    checkZeroCopyAtCompletion(*batch);
     // Completions store GPU results to guest memory; a failing one is reported, the rest still run.
     // Timed (APS5_PROFILE_DRAW) with the release of the kept objects: both run under whichever hold
     // reaped or synced the batch. Inside them the flush hook makes no pending-write wait (SyncThrough).

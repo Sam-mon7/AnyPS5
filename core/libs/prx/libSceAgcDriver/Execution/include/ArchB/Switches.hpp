@@ -66,6 +66,8 @@ enum class Feature : std::uint8_t {
     PipeResolveProofs,
     PipeResolveHandoff,
     PipeResolveSnapshots,
+    ZeroCopyStorage,
+    ZeroCopyInputs,
     Count
 };
 

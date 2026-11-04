@@ -4881,6 +4881,101 @@ void drawSnapshotEpochTests(const Device& device) {
     std::cout << "draw snapshot reuse within a collect epoch: ok\n";
 }
 
+// APS5_ARCHB_ZERO_COPY_STORAGE (run off, on and verify by ctest): a read-only guest storage element inside a
+// host import is snapshotted with the switch off and in VERIFY, and left in place (no draw bindings) with it
+// on. VERIFY's zero-copy checks see a guest store made after the record: before the submit and at completion.
+void zeroCopyStorageTests(const Device& device) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    const bool on = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ZeroCopyStorage);
+    const char* verifyText = std::getenv("APS5_ARCHB_ZERO_COPY_STORAGE_VERIFY");
+    const bool verify = verifyText != nullptr && std::string_view(verifyText) == "1";
+    Require(Recorder::ZeroCopyStorageActive() == (on && !verify), "ZeroCopyStorageActive does not follow the switch and its VERIFY");
+    Require(Recorder::ZeroCopyChecks() == verify, "zero-copy checks run without VERIFY or the census");
+    constexpr std::size_t bytes = 1024 * 1024;
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: zero-copy storage not tested\n";
+        std::exit(77);
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: zero-copy storage not tested\n";
+        std::exit(77);
+    }
+    const auto elementAddress = address + 4096;
+    constexpr std::size_t elementBytes = 64 * 1024;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(elementAddress), static_cast<std::uint32_t>(elementAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    { auto flags = binding.Flags(); flags.bufferWritten = {false}; binding.SetFlags(std::move(flags)); }
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto snapshotContext = context;
+    DescriptorCache cache(snapshotContext);
+    snapshotContext.descriptorCache = &cache;
+    Recorder snapshotRecorder(snapshotContext);
+    snapshotRecorder.Activate();
+    ShaderResources resources(snapshotContext, compute);
+    const auto before = Recorder::ZeroCopyTotals();
+    {
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+        if (on && !verify) {
+            Require(bindings == nullptr, "a read-only imported element was snapshotted with ZERO_COPY_STORAGE on");
+            Require(Recorder::ZeroCopyTotals().storageInPlace > before.storageInPlace, "the element left in place was not counted");
+            snapshotRecorder.Sync();
+        } else {
+            Require(bindings != nullptr && bindings->snapshots.size() == 1 && bindings->snapshots[0].address == elementAddress, "a read-only imported element was not snapshotted with zero copy off or in VERIFY");
+            const auto contents = bindings->snapshots[0].buffer->Bytes();
+            std::memset(reinterpret_cast<void*>(elementAddress), 0x22, elementBytes);
+            Require(std::all_of(contents.begin(), contents.begin() + static_cast<std::ptrdiff_t>(elementBytes), [](std::byte value) { return value == std::byte{0x11}; }), "the snapshot observed the guest store");
+            snapshotRecorder.Sync();
+            const auto after = Recorder::ZeroCopyTotals();
+            if (verify) {
+                Require(after.unique == before.unique + 1, "VERIFY did not compare the snapshot once at submit");
+                Require(after.submitDiffered == before.submitDiffered + 1, "VERIFY missed a guest store made between the record and the submit");
+                Require(after.completeDiffered == before.completeDiffered + 1, "VERIFY missed a guest store made before the GPU completion");
+            } else {
+                Require(after.unique == before.unique, "zero-copy checks ran with the switch off");
+            }
+        }
+    }
+    if (verify) {
+        // Unchanged since the record: no difference at submit or at completion.
+        const auto quiet = Recorder::ZeroCopyTotals();
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(bindings != nullptr && bindings->snapshots.size() == 1, "VERIFY dropped the snapshot of an unchanged element");
+        snapshotRecorder.Sync();
+        const auto after = Recorder::ZeroCopyTotals();
+        Require(after.unique == quiet.unique + 1 && after.submitDiffered == quiet.submitDiffered && after.completeDiffered == quiet.completeDiffered, "VERIFY reported an unchanged snapshot as differing");
+    }
+}
+
 void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
@@ -12801,6 +12896,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--snapshot-candidates-only") {
             snapshotCandidateTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--zero-copy-storage-only") {
+            zeroCopyStorageTests(device);
+            std::cout << "Zero-copy storage tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-page-refresh-only") {
