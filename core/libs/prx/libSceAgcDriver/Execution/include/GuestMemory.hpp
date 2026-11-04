@@ -363,6 +363,16 @@ GpuMutexType& GpuMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
+// APS5_HOLD_LOG item marks (diag): on a thread that called EnableHoldMarks, each mark adds a record
+// {0xffffffff, mark, QPC, OS thread} to the hold log (readers that predate marks skip thread 0xffffffff).
+// Without APS5_HOLD_LOG or on other threads a mark is a thread-local load and a branch.
+enum class HoldMark : std::uint32_t { ItemTop = 1, ItemTaken, CommitBegin, CommitEnd, ItemDone, PrelockBegin, PrelockEnd, LockBegin, UnlockHookEnd };
+void EnableHoldMarks();
+void HoldMarkSlow(HoldMark mark);
+inline thread_local bool holdMarksOn = false;
+inline void HoldLogMark(HoldMark mark) {
+    if (holdMarksOn) HoldMarkSlow(mark);
+}
 // APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY (runtime, sampled per acquisition): `queued` says whether
 // the queue-0 committer has work queued or in progress. While it does, a queue worker other than
 // queue 0 (a thread tagged by TagGpuLockThread with a nonzero queue) waits before its outermost

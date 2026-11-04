@@ -1009,6 +1009,7 @@ void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     GuestMemory::MarkCommitterThread();
     Stage4::BindRole(Stage4::Role::Committer);
+    GuestMemory::EnableHoldMarks();
     // Stage 4 M4 (APS5_RESOLVE_CENSUS): the item's declared reads and writes, copied under the mutex
     // (ReleaseRunningReads clears the running item's reads during its commit).
     std::vector<Range> stage4Reads;
@@ -1025,6 +1026,7 @@ void DrawPipeline::run() {
         std::uint64_t enqueueClock = 0;
         std::shared_ptr<ResolveSlot> resolveSlot;
         std::uint64_t serial = 0;
+        GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemTop);
         // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
         const bool idleBefore = ArchB::Recorder::Enabled() && outstanding.load(std::memory_order_acquire) == 0;
         const auto idleStart = idleBefore ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1052,6 +1054,7 @@ void DrawPipeline::run() {
             }
         }
         stage4Idle.reset();
+        GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemTaken);
         if (Stage4::ResolveCensus()) Stage4::BeginItem(static_cast<std::uint8_t>(kind), stage4Reads, stage4Writes, Graphics::StorageTexture::PendingSerial());
         const auto start = std::chrono::steady_clock::now();
         if (idleBefore) {
@@ -1064,9 +1067,11 @@ void DrawPipeline::run() {
         bool shutdown = false;
         static const bool collectCensus = GuestMemory::CommitterCollectCensus();
         if (collectCensus) GuestMemory::BeginCommitterCensusItem(static_cast<std::uint8_t>(kind));
+        GuestMemory::HoldLogMark(GuestMemory::HoldMark::CommitBegin);
         try {
             if (commit != nullptr && resolveSlot != nullptr) resolveForApply(*resolveSlot, serial);
             if (commit != nullptr) (*commit)();
+            GuestMemory::HoldLogMark(GuestMemory::HoldMark::CommitEnd);
             if (!isDraw) GuestMemory::BreakProofs();
         } catch (const std::exception&) {
             failed = true;
@@ -1102,6 +1107,7 @@ void DrawPipeline::run() {
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
         if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+        GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemDone);
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }

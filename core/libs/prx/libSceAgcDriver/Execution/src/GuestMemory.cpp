@@ -5333,6 +5333,17 @@ public:
         ring.written.store(next + 1, std::memory_order_release);
     }
 
+    void Mark(std::uint32_t mark) {
+        auto& ring = local();
+        const auto next = ring.written.load(std::memory_order_relaxed);
+        if (next - ring.consumed.load(std::memory_order_acquire) == Ring::Capacity) {
+            ring.lost.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        ring.records[next % Ring::Capacity] = {0xffffffffu, mark, Now(), ring.thread};
+        ring.written.store(next + 1, std::memory_order_release);
+    }
+
 private:
     struct Ring {
         static constexpr std::size_t Capacity = std::size_t{1} << 15;
@@ -5563,6 +5574,20 @@ void SetGpuUnlockHook(void (*hook)()) {
     gpuUnlockHook.store(hook, std::memory_order_release);
 }
 
+void EnableHoldMarks() {
+#ifdef _WIN32
+    holdMarksOn = HoldLog::Instance() != nullptr;
+#endif
+}
+
+void HoldMarkSlow(HoldMark mark) {
+#ifdef _WIN32
+    if (auto* log = HoldLog::Instance(); log != nullptr) log->Mark(static_cast<std::uint32_t>(mark));
+#else
+    static_cast<void>(mark);
+#endif
+}
+
 std::uint64_t GpuHoldSerial() {
     return gpuHoldSerial.load(std::memory_order_relaxed);
 }
@@ -5597,6 +5622,7 @@ void GpuMutexType::unlock() {
     // of the hold nor waited for by the next holder.
     if (outermost) {
         if (auto* hook = gpuUnlockHook.load(std::memory_order_acquire); hook != nullptr) hook();
+        HoldLogMark(HoldMark::UnlockHookEnd);
     }
 }
 
@@ -5617,6 +5643,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    if (holdMarksOn && !HeldByThisThread()) HoldMarkSlow(HoldMark::LockBegin);
     // Before the wait timer: time given to the committer is counted apart (pipe_mutex_priority_*).
     DeferToCommitter(*this);
     PerformanceTimer recorderTiming("GpuMutex.wait");

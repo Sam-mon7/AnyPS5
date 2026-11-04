@@ -1655,6 +1655,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawLockTiming lockTiming{profile};
+    GuestMemory::HoldLogMark(GuestMemory::HoldMark::PrelockBegin);
     if (Graphics::DrawPrelockEnabled()) {
         const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         static const bool aheadCensus = GuestMemory::CollectAheadCensus() || GuestMemory::CommitterCollectCensus();
@@ -1670,6 +1671,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         lockTiming.preparation = localDevice->PrepareDraw(graphics, drawParameters, stages, recipe.get(), memoVirtualQuery, resolved);
         if (profile) lockTiming.prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
+    GuestMemory::HoldLogMark(GuestMemory::HoldMark::PrelockEnd);
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     lockTiming.Start();
