@@ -49,6 +49,8 @@ constexpr Feature PipeCopyKernelItemsPrerequisites[] = {Feature::PipeQ0Committer
 constexpr Feature PipeDrawReusePrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeDrawLookupMemoPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature WtFaultPrerequisites[] = {Feature::WtFault};
+constexpr Feature PipeResolveSplitPrerequisites[] = {Feature::PipeQ0Committer};
+constexpr Feature PipeResolvePoolPrerequisites[] = {Feature::PipeQ0Committer, Feature::PipeResolveSplit};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -107,6 +109,8 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::WtFaultVerify, "WT_FAULT_VERIFY", false, false, WtFaultPrerequisites},
     {Feature::WtFaultConsumers, "WT_FAULT_CONSUMERS", false, true, WtFaultPrerequisites},
     {Feature::WtFaultDirtyArm, "WT_FAULT_DIRTY_ARM", false, true, WtFaultPrerequisites},
+    {Feature::PipeResolveSplit, "PIPE_RESOLVE_SPLIT", false, true, PipeResolveSplitPrerequisites},
+    {Feature::PipeResolvePool, "PIPE_RESOLVE_POOL", false, true, PipeResolvePoolPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

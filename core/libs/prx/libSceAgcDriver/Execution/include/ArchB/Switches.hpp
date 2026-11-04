@@ -62,6 +62,8 @@ enum class Feature : std::uint8_t {
     WtFaultVerify,
     WtFaultConsumers,
     WtFaultDirtyArm,
+    PipeResolveSplit,
+    PipeResolvePool,
     Count
 };
 

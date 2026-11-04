@@ -148,6 +148,13 @@ struct CommitterCollectCounters {
 };
 CommitterCollectCounters& CommitterCollects();
 void MarkCommitterThread();
+// Stage 4.2: a draw resolver thread (DrawPipeline::runResolver); its walks feed the committer through
+// the collect-share table while ResolveShareActive() (PIPE_RESOLVE_POOL, APS5_PIPE_RESOLVE_SHARE != 0).
+void MarkResolverThread();
+bool ResolveShareActive();
+// The committer's tracker-mutex acquisitions that waited, and the nanoseconds waited.
+std::atomic<std::uint64_t>& CommitterTrackerWaits();
+std::atomic<std::uint64_t>& CommitterTrackerWaitNs();
 // APS5_ARCHB_WT_FAULT (see GuestMemory.cpp, libc GuestWriteFault.hpp): a driver thread's write faults
 // count apart; WtFaultFlip protects the pages written since the last flip (Driver::Present).
 void MarkDriverThread();

@@ -10,6 +10,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -75,6 +76,22 @@ public:
         Count
     };
 
+    // Stage 4.1/4.2 (APS5_ARCHB_PIPE_RESOLVE_SPLIT, _POOL): an item's resolve runs before its commit,
+    // inline on the committer (split) or ahead on a resolver thread (pool). `run` fills the ranges its
+    // result depends on and returns a plan hash; it never throws and may run again. The committer
+    // re-runs it inline when an item applied after the resolve began wrote one of those ranges.
+    struct ResolveSlot {
+        std::function<std::uint64_t(std::vector<Range>&)> run;
+        std::atomic<std::uint8_t> state{0};
+        std::uint64_t startedAt = 0;
+        std::uint64_t plan = 0;
+        std::uint64_t ns = 0;
+        std::vector<Range> reads;
+    };
+    static bool ResolveSplitActive();
+    static bool ResolvePoolActive();
+    static std::string ResolveText();
+
     static DrawPipeline& Queue0();
     // APS5_PIPELINED_DRAWS as read at startup (0 when unset or blocked); see SampleQueue0.
     static std::size_t Depth();
@@ -133,7 +150,7 @@ public:
 
     // Never waits while the calling thread holds the GPU mutex: a full pipeline then takes the item
     // past its capacity (the committer needs the mutex to make room).
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other);
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, std::shared_ptr<ResolveSlot> resolve = nullptr);
     // Waits until every queued item has committed. A caller holding the GPU mutex must drain before
     // taking it; if one does not, the wait runs with its hold given up (counted, see LockedDrains).
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100, DrainCause cause = DrainCause::None);
@@ -172,9 +189,19 @@ private:
         // APS5_COLLECT_AHEAD_CENSUS: when queue 0 enqueued the item, and the collect clock then.
         std::uint64_t enqueuedNs = 0;
         std::uint64_t enqueueClock = 0;
+        std::shared_ptr<ResolveSlot> resolve;
+    };
+    struct Applied {
+        std::uint64_t serial = 0;
+        std::vector<Range> writes;
     };
     DrawPipeline() = default;
     void run();
+    void runResolver();
+    void startResolvers();
+    void resolveForApply(ResolveSlot& slot, std::uint64_t serial);
+    bool appliedOverlap(const ResolveSlot& slot, std::uint64_t serial);
+    void noteApplied(const Item& item, std::uint64_t serial);
     void drainUnlocked(DrainReason reason, std::uint32_t opcode, DrainCause cause, bool finisherBusy);
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
@@ -199,6 +226,10 @@ private:
     std::uint64_t wakes = 0;
     std::uint64_t lockWaitNs = 0;
     std::thread thread;
+    std::vector<std::thread> resolvers;
+    std::condition_variable resolveWake;
+    std::condition_variable resolveDone;
+    std::deque<Applied> applied;
     std::uint64_t commits = 0;
     std::uint64_t commitNs = 0;
     std::uint64_t commitErrors = 0;

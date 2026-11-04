@@ -5215,6 +5215,11 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
     context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer.Handle(), 0, size, patched.data());
 }
 
+void ShaderResources::DescribedRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const {
+    out.reserve(out.size() + describedRanges.size());
+    for (const auto& range : describedRanges) out.emplace_back(range.address, range.address + range.bytes);
+}
+
 void ShaderResources::PrecollectSurfaces(bool memoVirtualQuery) const {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) {

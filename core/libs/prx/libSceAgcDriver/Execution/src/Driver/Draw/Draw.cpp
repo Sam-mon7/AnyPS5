@@ -1599,18 +1599,29 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto ticket = DrawFinisher::OnFinisherThread() ? tail.ticket : GuestMemory::Gen::Required();
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+        // Stage 4.1/4.2 (APS5_ARCHB_PIPE_RESOLVE_SPLIT, sampled per draw): the item's resolve runs the
+        // closure with `resolving` set (ResolveDraw into `resolution`, on the committer or a resolver),
+        // and the commit hands `resolution` to its preparation.
+        const bool resolveSplit = DrawPipeline::ResolveSplitActive() && Graphics::DrawPrelockEnabled();
+        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
+            if (resolving) return localDevice->ResolveDraw(decode->state, drawParameters, stages, recipe.get(), memoVirtualQuery, resolution, *resolveReads);
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             const ArchB::AllocChurnScope allocChurnScope(allocChurn);
             PerformanceTimer recorderTiming("Driver.DrawCommit");
             DrawPipeline::FollowEpoch(epoch, ticket);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             const auto committing = identity.programs != 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, pipelineStateReuse, memoVirtualQuery);
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, pipelineStateReuse, memoVirtualQuery, resolution.resolved ? &resolution : nullptr);
             if (identity.programs != 0) addDrawCommit(identity, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committing).count());
+            return 0;
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw);
+        std::shared_ptr<DrawPipeline::ResolveSlot> resolveSlot;
+        if (resolveSplit) {
+            resolveSlot = std::make_shared<DrawPipeline::ResolveSlot>();
+            resolveSlot->run = [held](std::vector<DrawPipeline::Range>& resolveReads) { return (*held)(true, &resolveReads); };
+        }
+        DrawPipeline::Queue0().Enqueue([held] { (*held)(false, nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(resolveSlot));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();
@@ -1637,7 +1648,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, bool pipelineStateReuse, bool memoVirtualQuery) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, bool pipelineStateReuse, bool memoVirtualQuery, Graphics::DrawPreparation* resolved) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawLockTiming lockTiming{profile};
@@ -1653,7 +1664,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
                 if (on) GuestMemory::SetCommitterPrelock(false);
             }
         } prelockPhase{aheadCensus};
-        lockTiming.preparation = localDevice->PrepareDraw(graphics, drawParameters, stages, recipe.get(), memoVirtualQuery);
+        lockTiming.preparation = localDevice->PrepareDraw(graphics, drawParameters, stages, recipe.get(), memoVirtualQuery, resolved);
         if (profile) lockTiming.prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);

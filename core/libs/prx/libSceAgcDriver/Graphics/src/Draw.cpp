@@ -1265,7 +1265,11 @@ void RecheckDrawPreparation(const Context& context, DrawPreparation& preparation
     if (preparation.device == VK_NULL_HANDLE) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profile && preparation.device != context.device && !preparation.resourceKey.empty()) preparation.keyInvalidated = true;
-    if (preparation.device != context.device) preparation.resourceKey.clear();
+    if (preparation.device != context.device) {
+        preparation.resourceKey.clear();
+        preparation.resolvedTemplate.reset();
+        preparation.speculatedPipeline.reset();
+    }
     if (profile) preparation.collectInvalidated |= preparation.device != context.device || preparation.epoch != GuestMemory::ThreadCollectEpoch() || preparation.mapping != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || preparation.unwatch != GuestMemory::UnwatchSerial();
 }
 
@@ -3138,6 +3142,58 @@ struct PreparedDraw {
     std::optional<DepthSampleLocations> depthLocations;
 };
 
+// Stage 4.1/4.2: Draw's use of a speculated pipeline (ResolveDraw): taken, refused (the draw's
+// template, outputs, proxied attachments or layout differ), and under
+// APS5_ARCHB_PIPE_RESOLVE_SPLIT_VERIFY=1 the lookups repeated and the ones that gave another pipeline.
+struct ResolvePipelineCounters {
+    std::atomic<std::uint64_t> speculated{0};
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> mismatches{0};
+};
+
+ResolvePipelineCounters& resolvePipelineCounters() {
+    static auto* counters = [] {
+        auto* made = new ResolvePipelineCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_resolve_pipeline_speculated", made->speculated);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_resolve_pipeline_hits", made->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_resolve_pipeline_misses", made->misses);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_resolve_pipeline_verified", made->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_resolve_pipeline_mismatches", made->mismatches);
+        return made;
+    }();
+    return *counters;
+}
+
+bool resolvePipelineVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_PIPE_RESOLVE_SPLIT_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t proxiedMask(const std::vector<TargetBinding>& targets) {
+    std::uint64_t mask = 0;
+    for (std::size_t index = 0; index < targets.size() && index < 64; ++index) {
+        if (targets[index].proxied) mask |= std::uint64_t{1} << index;
+    }
+    return mask;
+}
+
+// The pipeline state Draw builds for these fragment outputs and proxied attachments (prepareDraw).
+const State& pipelineStateFor(const Context& context, const State& state, std::uint32_t fragmentOutputs, std::uint64_t proxied, std::optional<State>& masked) {
+    masked = maskedState(state, fragmentOutputs);
+    for (std::size_t index = 0; index < state.colors.size() && index < 64; ++index) {
+        if ((proxied >> index & 1u) == 0) continue;
+        if (!masked.has_value()) masked = state;
+        masked->colors[index].format = AttachmentProxyFormat(context, state.colors[index].format);
+        masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
+    }
+    return masked.has_value() ? *masked : state;
+}
+
 bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
     auto*& recipeOut = prepared.recipeOut;
     auto& stencilReferences = prepared.stencilReferences;
@@ -3466,16 +3522,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto& masked = prepared.masked;
-    masked = maskedState(state, inputs.fragmentOutputs);
-    lookupDiag::mark(lookupDiag::StepMasked);
     if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) recipeOut = nullptr;
-    for (std::size_t index = 0; index < targets.size(); ++index) {
-        if (!targets[index].proxied) continue;
-        if (!masked.has_value()) masked = state;
-        masked->colors[index].format = AttachmentProxyFormat(context, state.colors[index].format);
-        masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
-    }
-    const State& pipelineState = masked.has_value() ? *masked : state;
+    const State& pipelineState = pipelineStateFor(context, state, inputs.fragmentOutputs, proxiedMask(targets), masked);
+    lookupDiag::mark(lookupDiag::StepMasked);
     static const bool verifySetLayouts = std::getenv("APS5_VERIFY_SET_LAYOUTS") != nullptr;
     if (verifySetLayouts && context.descriptorCache != nullptr) {
         const auto described = DescribeSetLayouts(context, shaders);
@@ -3494,7 +3543,18 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     auto& pipeline = prepared.pipeline;
     lookupDiag::mark(lookupDiag::StepRest);
-    pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    const auto* speculation = prepared.preparation != nullptr && prepared.preparation->device == context.device && prepared.preparation->speculatedPipeline != nullptr ? prepared.preparation : nullptr;
+    if (speculation != nullptr && stencilReplay.empty() && lean && speculation->resolvedTemplate == resources && speculation->speculatedOutputs == inputs.fragmentOutputs && speculation->speculatedProxied == proxiedMask(targets)) {
+        pipeline = speculation->speculatedPipeline;
+        resolvePipelineCounters().hits.fetch_add(1, std::memory_order_relaxed);
+        if (resolvePipelineVerify()) {
+            resolvePipelineCounters().verified.fetch_add(1, std::memory_order_relaxed);
+            if (CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, VK_IMAGE_LAYOUT_GENERAL) != pipeline) resolvePipelineCounters().mismatches.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        if (speculation != nullptr) resolvePipelineCounters().misses.fetch_add(1, std::memory_order_relaxed);
+        pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    }
     lookupDiag::mark(lookupDiag::StepPipeline);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
@@ -3908,7 +3968,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 
 }
 
-DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery) {
+DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery, DrawPreparation* resolved) {
     // Stage 4 M4: the committer's unlocked preparation (precollects, template find, target proofs).
     Stage4::Mark(Stage4::Bucket::Pre);
     struct Stage4Prelock {
@@ -3917,6 +3977,8 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
     const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Prelock);
     DrawPreparation prepared;
     if (!DrawPrelockEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return prepared;
+    const bool ahead = resolved != nullptr && resolved->resolved && resolved->device == context.device;
+    if (ahead) prepared = std::move(*resolved);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     prepared.device = context.device;
     const auto collectedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
@@ -3952,7 +4014,9 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         }
     }
     std::shared_ptr<ShaderResources> cached;
-    if (recipe != nullptr && recipe->device == context.device) {
+    if (ahead) {
+        cached = prepared.resolvedTemplate;
+    } else if (recipe != nullptr && recipe->device == context.device) {
         cached = recipe->templateRef.lock();
     } else if (RecordDraws() && DumpTargetLimit() == 0 && DrawResourcesCacheable(shaders)) {
         static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
@@ -3980,6 +4044,92 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         prepared.collectedBytes = GuestMemory::ThreadCollectedBytes() - collectedBefore;
     }
     return prepared;
+}
+
+namespace {
+bool resolvePrecollects() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_PIPE_RESOLVE_PRECOLLECT");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool resolvePipelines() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_PIPE_RESOLVE_PIPELINE");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t mixPlan(std::uint64_t hash, std::uint64_t value) {
+    hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+    return hash;
+}
+}
+
+std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery, DrawPreparation& out, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads) {
+    out = {};
+    reads.clear();
+    if (!DrawPrelockEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return 0;
+    std::uint64_t plan = 0x5245534fu;
+    try {
+        std::shared_ptr<ShaderResources> cached;
+        if (recipe != nullptr && recipe->device == context.device) {
+            cached = recipe->templateRef.lock();
+            plan = mixPlan(plan, 1);
+        } else if (RecordDraws() && DumpTargetLimit() == 0 && DrawResourcesCacheable(shaders)) {
+            static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+            out.resourceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
+            for (const auto word : out.resourceKey) plan = mixPlan(plan, word);
+            cached = SharedResourceCache().Find(out.resourceKey);
+        }
+        out.device = context.device;
+        out.resolved = true;
+        if (cached == nullptr) return plan;
+        out.resolvedTemplate = cached;
+        cached->DescribedRanges(reads);
+        if (resolvePrecollects() && !GuestMemory::IsCommitterThread()) {
+            GuestMemory::BumpCollectEpoch();
+            cached->PrecollectSurfaces(memoVirtualQuery);
+        }
+        if (recipe != nullptr || !resolvePipelines() || shaders.empty() || shaders.front().program == nullptr || state.colors.size() > 64) return plan;
+        for (const auto& shader : shaders) {
+            if (shader.program != nullptr && !shader.program->stencilReferences.empty()) return plan;
+        }
+        bool memoized = false;
+        bool hit = false;
+        const auto outputs = CachedFragmentOutputs(context, shaders, state, memoized, hit);
+        std::uint64_t proxied = 0;
+        for (std::size_t index = 0; index < state.colors.size(); ++index) {
+            if (state.colors[index].samples == 1 && AttachmentProxyFormat(context, state.colors[index].format) != VK_FORMAT_UNDEFINED) proxied |= std::uint64_t{1} << index;
+        }
+        const auto& attributes = shaders.front().program->vertexAttributes;
+        std::shared_ptr<const VertexInputLayout> retained;
+        VertexInputLayout built;
+        if (!attributes.empty()) {
+            if (context.vertexInputs != nullptr) retained = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+            if (retained == nullptr) built = BuildVertexInputLayout(context, attributes);
+        }
+        std::optional<State> masked;
+        const State& pipelineState = pipelineStateFor(context, state, outputs, proxied, masked);
+        out.speculatedPipeline = CachedPipeline(context, pipelineState, retained != nullptr ? *retained : built, *cached, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        out.speculatedOutputs = outputs;
+        out.speculatedProxied = proxied;
+        resolvePipelineCounters().speculated.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+        out = {};
+        reads.clear();
+        return 0;
+    }
+    return plan;
+}
+
+std::string ResolvePipelineText() {
+    auto& counters = resolvePipelineCounters();
+    const auto get = [](const std::atomic<std::uint64_t>& value) { return std::to_string(value.load(std::memory_order_relaxed)); };
+    return "[pipe-resolve-pipeline] cumulative: speculated " + get(counters.speculated) + " hits " + get(counters.hits) + " misses " + get(counters.misses) + " verified " + get(counters.verified) + " mismatches " + get(counters.mismatches);
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, DrawPreparation* preparation, bool pipelineStateReuse) {

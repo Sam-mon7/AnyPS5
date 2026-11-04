@@ -40,10 +40,29 @@ struct DrawPreparation {
     bool keyInvalidated = false;
     bool cacheChanged = false;
     bool collectInvalidated = false;
+    // Stage 4.1/4.2 (APS5_ARCHB_PIPE_RESOLVE_SPLIT): set by ResolveDraw. `resolvedTemplate` is the
+    // cache's template for `resourceKey` (or the recipe's) when it was resolved; PrepareDraw takes the
+    // key and template instead of finding them. The speculated pipeline is the one CachedPipeline
+    // gives for that template, the fragment outputs and proxied attachments below, the stages' vertex
+    // input layout and the general attachment layout: Draw uses it only when its own draw matches all
+    // of them (the same template object, a lean recorded draw, no stencil replay).
+    bool resolved = false;
+    std::shared_ptr<ShaderResources> resolvedTemplate;
+    std::shared_ptr<Pipeline> speculatedPipeline;
+    std::uint32_t speculatedOutputs = 0;
+    std::uint64_t speculatedProxied = 0;
 };
 
 bool DrawPrelockEnabled();
-DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe = nullptr, bool memoVirtualQuery = false);
+DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe = nullptr, bool memoVirtualQuery = false, DrawPreparation* resolved = nullptr);
+// Stage 4.1/4.2: the part of a draw commit that needs no GPU mutex and none of the draw's own target
+// state (template key and find, the template's precollects, the fragment-output validation memo and
+// the pipeline lookup), into `out`; `reads` receives the template's described ranges. Returns a plan
+// hash (the template key, which depends on the item alone); never throws (a failure leaves `out`
+// unresolved, so the commit does its own preparation).
+std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery, DrawPreparation& out, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads);
+// pipe_resolve_pipeline_* counters (Draw's use of a speculated pipeline).
+std::string ResolvePipelineText();
 void RecheckDrawPreparation(const Context& context, DrawPreparation& preparation);
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
