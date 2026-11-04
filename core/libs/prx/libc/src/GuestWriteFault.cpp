@@ -47,7 +47,7 @@ struct Leaf {
 struct Counters {
     std::atomic<std::uint64_t> faults{0}, driverFaults{0}, handlerTicks{0}, driverHandlerTicks{0}, retries{0}, foreign{0};
     std::atomic<std::uint64_t> armCalls{0}, armedPages{0}, armRuns{0}, armTicks{0}, armProtectTicks{0}, armQueries{0}, excluded{0}, keptHot{0};
-    std::atomic<std::uint64_t> armLockTicks{0}, armScanTicks{0}, armLeaves{0}, leaves{0}, armQueryTicks{0};
+    std::atomic<std::uint64_t> armLockTicks{0}, armScanTicks{0}, armLeaves{0}, leaves{0}, armQueryTicks{0}, keptDirty{0}, dirtyTicks{0};
     std::atomic<std::uint64_t> holds{0}, heldOpened{0}, opens{0}, forgotten{0}, tracked{0};
     std::atomic<std::uint64_t> verifyWalks{0}, verifyDirty{0}, verifyUntracked{0}, verifyMismatches{0}, queries{0};
 };
@@ -69,6 +69,8 @@ struct State {
     };
     std::vector<Run> runs;
     std::vector<Run> armedRuns;
+    std::vector<Run> cleanRuns;
+    std::vector<void*> dirtyPages = std::vector<void*>(4096);
     Counters counters;
     double ticksToNs = 1.0;
 };
@@ -412,6 +414,42 @@ std::size_t GuestWtFaultArm_nid_no_patch(std::uintptr_t* reported, std::size_t c
     state.counters.armLockTicks.fetch_add(static_cast<std::uint64_t>(locked - start), std::memory_order_relaxed);
     state.counters.armScanTicks.fetch_add(static_cast<std::uint64_t>(scannedAt - locked), std::memory_order_relaxed);
     state.counters.armLeaves.fetch_add(scanned, std::memory_order_relaxed);
+    // Hot pages: an open page stored since the tracker last walked it (its write-watch bit is still
+    // set; asked without resetting, so the tracker's next walk still reports it) stays open too, so a
+    // page the guest stores every frame after the frame's last walk of it does not fault every frame.
+    if (state.guestHot) {
+        const auto dirtyStart = ticks();
+        auto& clean = state.cleanRuns;
+        clean.clear();
+        std::uint64_t keptDirty = 0;
+        for (const auto& run : runs) {
+            ULONG_PTR count = state.dirtyPages.size();
+            DWORD granularity = 0;
+            if (GetWriteWatch(0, reinterpret_cast<void*>(run.begin), run.end - run.begin, state.dirtyPages.data(), &count, &granularity) != 0) {
+                clean.push_back(run);
+                continue;
+            }
+            if (count == state.dirtyPages.size()) {
+                keptDirty += (run.end - run.begin) / PageBytes;
+                leafAt(state, run.begin)->open.store(1, std::memory_order_release);
+                continue;
+            }
+            auto cursor = run.begin;
+            for (ULONG_PTR i = 0; i < count; ++i) {
+                const auto page = reinterpret_cast<std::uintptr_t>(state.dirtyPages[i]) & ~(PageBytes - 1);
+                if (page < cursor || page >= run.end) continue;
+                if (page > cursor) clean.push_back({cursor, page});
+                leafAt(state, page)->open.store(1, std::memory_order_release);
+                ++keptDirty;
+                cursor = page + PageBytes;
+            }
+            if (cursor < run.end) clean.push_back({cursor, run.end});
+        }
+        runs.swap(clean);
+        kept += keptDirty;
+        state.counters.keptDirty.fetch_add(keptDirty, std::memory_order_relaxed);
+        state.counters.dirtyTicks.fetch_add(static_cast<std::uint64_t>(ticks() - dirtyStart), std::memory_order_relaxed);
+    }
     // Check each run against the real mapping, mark its eligible pages arming and protect them.
     auto& armed = state.armedRuns;
     armed.clear();
@@ -792,6 +830,8 @@ void GuestWtFaultCounters_nid_no_patch(WtFaultCounters* out) {
     out->armLockNs = ns(c.armLockTicks);
     out->armScanNs = ns(c.armScanTicks);
     out->armQueryNs = ns(c.armQueryTicks);
+    out->keptDirty = c.keptDirty.load(std::memory_order_relaxed);
+    out->armDirtyNs = ns(c.dirtyTicks);
     out->armLeaves = c.armLeaves.load(std::memory_order_relaxed);
     out->leaves = c.leaves.load(std::memory_order_relaxed);
     out->excluded = c.excluded.load(std::memory_order_relaxed);

@@ -3539,12 +3539,12 @@ void WtFaultFlip(bool presenter) {
     const auto unchanged = c.consumerUnchanged.load(std::memory_order_relaxed);
     const auto changed = c.consumerChanged.load(std::memory_order_relaxed);
     const auto fallback = c.consumerFallback.load(std::memory_order_relaxed);
-    std::fprintf(stderr, "[wt-fault] per frame over %llu flips (%.2f ms/f): faults %.1f (driver %.1f) handler %.1f us (driver %.1f) retries %.2f foreign %.2f | arm %.1f us (protect %.1f query %.1f lock %.1f scan %.1f, %.1f leaves of %llu, %.1f queries) pages %.1f runs %.1f kept-hot %.1f excluded %.2f | holds %.2f forgotten %.1f tracked %.1f | verify dirty %.1f untracked %.1f mismatches %llu total | consumers unchanged %.1f changed %.1f fallback %.1f mismatches %llu total\n",
+    std::fprintf(stderr, "[wt-fault] per frame over %llu flips (%.2f ms/f): faults %.1f (driver %.1f) handler %.1f us (driver %.1f) retries %.2f foreign %.2f | arm %.1f us (protect %.1f query %.1f lock %.1f scan %.1f, %.1f leaves of %llu, %.1f queries) pages %.1f runs %.1f kept-hot %.1f (dirty %.1f, %.1f us) excluded %.2f | holds %.2f forgotten %.1f tracked %.1f | verify dirty %.1f untracked %.1f mismatches %llu total | consumers unchanged %.1f changed %.1f fallback %.1f mismatches %llu total\n",
                  static_cast<unsigned long long>(every), std::chrono::duration<double, std::milli>(time - lastTime).count() / frames,
                  per(now.faults, last.faults), per(now.driverFaults, last.driverFaults), per(now.handlerNs, last.handlerNs) / 1000.0, per(now.driverHandlerNs, last.driverHandlerNs) / 1000.0,
                  per(now.retries, last.retries), per(now.foreign, last.foreign), per(now.armNs, last.armNs) / 1000.0, per(now.armProtectNs, last.armProtectNs) / 1000.0, per(now.armQueryNs, last.armQueryNs) / 1000.0,
                  per(now.armLockNs, last.armLockNs) / 1000.0, per(now.armScanNs, last.armScanNs) / 1000.0, per(now.armLeaves, last.armLeaves), static_cast<unsigned long long>(now.leaves), per(now.armQueries, last.armQueries),
-                 per(now.armedPages, last.armedPages), per(now.armRuns, last.armRuns), per(now.keptHot, last.keptHot), per(now.excluded, last.excluded),
+                 per(now.armedPages, last.armedPages), per(now.armRuns, last.armRuns), per(now.keptHot, last.keptHot), per(now.keptDirty, last.keptDirty), per(now.armDirtyNs, last.armDirtyNs) / 1000.0, per(now.excluded, last.excluded),
                  per(now.holds, last.holds), per(now.forgotten, last.forgotten), per(now.tracked, last.tracked), per(now.verifyDirty, last.verifyDirty),
                  per(now.verifyUntracked, last.verifyUntracked), static_cast<unsigned long long>(now.verifyMismatches),
                  per(unchanged, lastUnchanged), per(changed, lastChanged), per(fallback, lastFallback), static_cast<unsigned long long>(c.consumerMismatches.load(std::memory_order_relaxed)));

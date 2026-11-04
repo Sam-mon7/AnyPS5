@@ -51,6 +51,8 @@ struct WtFaultCounters {
     std::uint64_t armLockNs = 0;       // of armNs, waiting for the tracker's mutex
     std::uint64_t armScanNs = 0;       // of armNs, scanning leaves for open pages
     std::uint64_t armQueryNs = 0;      // of armNs, VirtualQuery
+    std::uint64_t keptDirty = 0;       // of keptHot, open pages kept because write watching reports them stored
+    std::uint64_t armDirtyNs = 0;      // of armNs, the non-resetting write-watch queries for that
     std::uint64_t armLeaves = 0;       // leaves scanned
     std::uint64_t leaves = 0;          // leaves allocated (2 MiB of guest memory each)
     std::uint64_t excluded = 0;        // pages found untrackable by an arm
