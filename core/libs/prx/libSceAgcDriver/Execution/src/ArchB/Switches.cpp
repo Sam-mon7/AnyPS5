@@ -119,6 +119,9 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // submit and at GPU completion (Recorder zero-copy checks).
     {Feature::ZeroCopyStorage, "ZERO_COPY_STORAGE", false, true, {}},
     {Feature::ZeroCopyInputs, "ZERO_COPY_INPUTS", false, true, {}},
+    // Draws with moved buffers bind an immutable per-template set, cached by the moved content: moved
+    // addresses read in place through their import, data words in a buffer of the set's own.
+    {Feature::ZeroCopyMoved, "ZERO_COPY_MOVED", false, true, {}},
     {Feature::WtSyncSkip, "WT_SYNC_SKIP", false, true, WtFaultPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};

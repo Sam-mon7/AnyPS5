@@ -224,6 +224,8 @@ public:
     static void CountZeroCopyStorage(std::size_t elements);
     static void CountZeroCopyInput(std::size_t bytes);
     static bool ZeroCopyChecks();
+    // GPU stores (completion labels stored on the GPU) recorded into the open batch so far.
+    std::uint32_t OpenGpuStores() const;
     void NoteZeroCopyCheck(std::uint64_t address, std::size_t bytes, const std::shared_ptr<Buffer>& buffer, VkDeviceSize offset, ZeroCopyKind kind);
     // Census only (checks on): a vertex/index range copied that a host import covers at a usable
     // offset (zero copy could bind it in place).

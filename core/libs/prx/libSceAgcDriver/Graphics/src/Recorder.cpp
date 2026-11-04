@@ -3462,6 +3462,10 @@ void Recorder::CountZeroCopyInput(std::size_t bytes) {
     counters.inputBytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
+std::uint32_t Recorder::OpenGpuStores() const {
+    return open != nullptr ? open->gpuStores : 0;
+}
+
 bool Recorder::ZeroCopyChecks() {
     static const bool enabled = [] {
         const auto set = [](const char* name) {
