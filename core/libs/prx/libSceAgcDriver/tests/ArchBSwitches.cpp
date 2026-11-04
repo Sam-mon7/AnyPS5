@@ -103,6 +103,8 @@ void toggleCase(const std::string& name) {
     if (unstampedAlias) setEnvironment("APS5_ARCHB_FIX_UNSTAMPED_ALIAS", nullptr);
     const bool keyWriter = name == "FixPipelineKeyWriter";
     if (keyWriter) setEnvironment("APS5_ARCHB_FIX_PIPELINE_KEY_WRITER", nullptr);
+    const bool stagingCarry = name == "GpuStagingCarry";
+    if (stagingCarry) setEnvironment("APS5_ARCHB_GPU_STAGING_CARRY", nullptr);
     // A2 cuts that require PIPE_Q0_COMMITTER: the same contract.
     struct PipeCut {
         Feature feature;
@@ -139,9 +141,9 @@ void toggleCase(const std::string& name) {
             Switches::PollControl();
         }
     };
-    if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping || pipeQ0 || dispatchRelocation || stableFailed || stableWide || pageRefresh || candidates || movedUpload || unstampedAlias || keyWriter) {
-        const auto feature = keyWriter ? Feature::FixPipelineKeyWriter : unstampedAlias ? Feature::FixUnstampedAlias : movedUpload ? Feature::FixMovedWordUpload : candidates ? Feature::FixSnapshotCandidates : pageRefresh ? Feature::FixSnapshotPageRefresh : stableWide ? Feature::FixStableFailedWide : stableFailed ? Feature::FixStableFailedCollects : dispatchRelocation ? Feature::FixDispatchRelocation : pipeQ0 ? Feature::PipeQ0Committer : bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
-        const std::string token = keyWriter ? "FIX_PIPELINE_KEY_WRITER" : unstampedAlias ? "FIX_UNSTAMPED_ALIAS" : movedUpload ? "FIX_MOVED_WORD_UPLOAD" : candidates ? "FIX_SNAPSHOT_CANDIDATES" : pageRefresh ? "FIX_SNAPSHOT_PAGE_REFRESH" : stableWide ? "FIX_STABLE_FAILED_WIDE" : stableFailed ? "FIX_STABLE_FAILED_COLLECTS" : dispatchRelocation ? "FIX_DISPATCH_RELOCATION" : pipeQ0 ? "PIPE_Q0_COMMITTER" : bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
+    if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping || pipeQ0 || dispatchRelocation || stableFailed || stableWide || pageRefresh || candidates || movedUpload || unstampedAlias || keyWriter || stagingCarry) {
+        const auto feature = stagingCarry ? Feature::GpuStagingCarry : keyWriter ? Feature::FixPipelineKeyWriter : unstampedAlias ? Feature::FixUnstampedAlias : movedUpload ? Feature::FixMovedWordUpload : candidates ? Feature::FixSnapshotCandidates : pageRefresh ? Feature::FixSnapshotPageRefresh : stableWide ? Feature::FixStableFailedWide : stableFailed ? Feature::FixStableFailedCollects : dispatchRelocation ? Feature::FixDispatchRelocation : pipeQ0 ? Feature::PipeQ0Committer : bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
+        const std::string token = stagingCarry ? "GPU_STAGING_CARRY" : keyWriter ? "FIX_PIPELINE_KEY_WRITER" : unstampedAlias ? "FIX_UNSTAMPED_ALIAS" : movedUpload ? "FIX_MOVED_WORD_UPLOAD" : candidates ? "FIX_SNAPSHOT_CANDIDATES" : pageRefresh ? "FIX_SNAPSHOT_PAGE_REFRESH" : stableWide ? "FIX_STABLE_FAILED_WIDE" : stableFailed ? "FIX_STABLE_FAILED_COLLECTS" : dispatchRelocation ? "FIX_DISPATCH_RELOCATION" : pipeQ0 ? "PIPE_Q0_COMMITTER" : bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";
         bool listed = false;
         for (const auto& entry : Switches::Table()) {
             if (entry.feature != feature) continue;

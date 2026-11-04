@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirror.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -4801,6 +4803,118 @@ void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
     std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
 }
 
+// APS5_STAGING_CENSUS=1: how each device-local copy-in relates to the previous staged use of the
+// same range: none yet, in an earlier batch, or in the open batch with N recording entries since
+// that use's copy-back (0: nothing was recorded in between) and whether that copy-back covered the
+// whole range; printed every 10 s as [staging-census] (counts and MiB).
+namespace stagingCensus {
+
+bool Enabled() {
+    static const bool enabled = std::getenv("APS5_STAGING_CENSUS") != nullptr;
+    return enabled;
+}
+
+struct Last {
+    std::uint64_t serial = 0;
+    std::uint64_t sequence = 0;
+    bool covered = false;
+};
+
+struct State {
+    AgcDriver::Mutex mutex;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, Last> last;
+    // first, other batch, same batch uncovered, same batch covered by distance 0, 1, 2-3, 4-7, 8+
+    std::array<std::uint64_t, 8> count{}, bytes{};
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+State& state() {
+    static State instance;
+    return instance;
+}
+
+void CopyIn(std::uint64_t begin, std::uint64_t end, std::uint64_t serial, std::uint64_t sequence) {
+    auto& census = state();
+    std::lock_guard lock(census.mutex);
+    std::size_t bucket = 0;
+    if (const auto found = census.last.find({begin, end}); found != census.last.end()) {
+        if (found->second.serial != serial) bucket = 1;
+        else if (!found->second.covered) bucket = 2;
+        else {
+            const auto distance = sequence - found->second.sequence;
+            bucket = distance == 0 ? 3 : distance == 1 ? 4 : distance < 4 ? 5 : distance < 8 ? 6 : 7;
+        }
+    }
+    ++census.count[bucket];
+    census.bytes[bucket] += end - begin;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - census.reported < std::chrono::seconds(10)) return;
+    census.reported = now;
+    static constexpr const char* names[8] = {"first", "other-batch", "same-uncovered", "same+0", "same+1", "same+2-3", "same+4-7", "same+8"};
+    std::string line;
+    for (std::size_t i = 0; i < std::size(names); ++i) {
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s %llu/%.1fMiB", names[i], static_cast<unsigned long long>(census.count[i]), census.bytes[i] / 1048576.0);
+        line += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[staging-census] copy-ins (10 s):%s; %zu ranges\n", line.c_str(), census.last.size());
+    census.count = {};
+    census.bytes = {};
+}
+
+void CopyBack(std::uint64_t begin, std::uint64_t end, std::uint64_t serial, std::uint64_t sequence, bool covered) {
+    auto& census = state();
+    std::lock_guard lock(census.mutex);
+    census.last[{begin, end}] = {serial, sequence, covered};
+}
+
+}
+
+// APS5_ARCHB_GPU_STAGING_CARRY: device-local staging shadows carried from one use of a reused
+// build to its next use in the same batch (RecordStagingCopies skips the copy-in). Counters, also
+// on the ArchB recorder (gpu_staging_carry_*), and a [staging-carry] line every 10 s.
+namespace stagingCarry {
+
+bool Enabled() {
+    return AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::GpuStagingCarry);
+}
+
+// APS5_ARCHB_GPU_STAGING_CARRY_VERIFY=1: each carried region's shadow is compared on completion with
+// what its copy-in would have read (the import's bytes at that point of the batch).
+bool Verify() {
+    static const bool verify = [] {
+        const char* value = std::getenv("APS5_ARCHB_GPU_STAGING_CARRY_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return verify;
+}
+
+struct Counters {
+    std::atomic<std::uint64_t> carried{0}, carriedBytes{0}, copied{0}, noPoint{0}, otherBatch{0}, noted{0}, verified{0}, mismatches{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+Counters& counters() {
+    static Counters instance;
+    return instance;
+}
+
+void count(std::atomic<std::uint64_t>& counter, const char* name, std::uint64_t value = 1) {
+    counter.fetch_add(value, std::memory_order_relaxed);
+    AgcDriver::ArchB::Recorder::Count(name, static_cast<double>(value));
+}
+
+void report() {
+    auto& c = counters();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = c.lastReport.load();
+    if (nowMs - last < 10000 || !c.lastReport.compare_exchange_strong(last, nowMs)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[staging-carry] cumulative: %llu copy-ins skipped (%.1f MiB), %llu copied (%llu without a carry point, %llu from another batch, %llu with a noted write since); verify %llu checked, %llu mismatches\n",
+        static_cast<unsigned long long>(c.carried.load()), c.carriedBytes.load() / 1048576.0, static_cast<unsigned long long>(c.copied.load()), static_cast<unsigned long long>(c.noPoint.load()), static_cast<unsigned long long>(c.otherBatch.load()), static_cast<unsigned long long>(c.noted.load()), static_cast<unsigned long long>(c.verified.load()), static_cast<unsigned long long>(c.mismatches.load()));
+}
+
+}
+
 void reportStaging() {
     auto& stats = Copies();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -5418,6 +5532,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
     VkAccessFlags covered = 0;
+    const auto sequenceBefore = Recorder::RecordingSequence();
+    const auto openSerial = recorder->Submissions() + 1;
     const auto commands = recorder->Commands(&covered);
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
@@ -5435,6 +5551,9 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
         copiedBytes += bytes;
+        // A copied-in shadow starts a new use: no carry point until its copy-back.
+        region->carrySerial = 0;
+        region->carryWhole = false;
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
@@ -5495,6 +5614,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->Keep(region->buffer);
         region->snapshot.clear();
         if (region->deviceLocal) traceStaged(region->begin, region->end, region->atomic);
+        if (region->deviceLocal && stagingCensus::Enabled()) stagingCensus::CopyIn(region->begin, region->end, openSerial, sequenceBefore);
         if (profile) {
             Copies().gpuCopies.fetch_add(1, std::memory_order_relaxed);
             Copies().gpuCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -5582,6 +5702,9 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 if (region.deviceLocal) Copies().stagedOutBytes.fetch_add(to - from, std::memory_order_relaxed);
             }
         }
+        // APS5_ARCHB_GPU_STAGING_CARRY: the copy-back stores the whole region (the shadow and the
+        // import then agree on every byte), the precondition of carrying the shadow to a next use.
+        region.carryWhole = region.deviceLocal && std::any_of(merged.begin(), merged.end(), [&](const auto& range) { return range.first <= region.begin && region.end <= range.second; });
         // Only once its copies are recorded: a throw above leaves the region counted by
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the
         // staging bytes, instead of losing the shader's results.
@@ -5597,6 +5720,13 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     recorder.MarkCovered(copiedAccess);
     recorder.EndGpuTiming(timing, copiedBytes);
+    if (stagingCensus::Enabled()) {
+        for (const auto& region : regions) {
+            if (!region.gpuCopy || !region.deviceLocal || !region.copiedBack) continue;
+            const bool whole = std::any_of(merged.begin(), merged.end(), [&](const auto& range) { return range.first <= region.begin && region.end <= range.second; });
+            stagingCensus::CopyBack(region.begin, region.end, recorder.Submissions() + 1, Recorder::RecordingSequence(), whole);
+        }
+    }
 }
 
 VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {
@@ -6163,6 +6293,8 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Region*> copies;
+    std::vector<Region*> carried;
+    const bool carry = stagingCarry::Enabled();
     for (auto& region : regions) {
         if (!region.gpuCopy || !region.deviceLocal) continue;
         // The previous use's copy-back was recorded by its MarkGpuWrites (or never, when that use
@@ -6170,13 +6302,99 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // copy-in refills. The import is the one the region was taken from (the caller checked its
         // serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
+        // APS5_ARCHB_GPU_STAGING_CARRY: the previous use (this build, this region object, so this
+        // shadow) copied the whole region back in the open batch, and nothing noted since then can
+        // have stored into it. The copy-in would read, at its point of the batch, the import as the
+        // copy-back left it: the shadow's bytes. A CPU store into the region after that use was
+        // recorded lands before the batch runs, so its copy-back overwrites it either way. Queued
+        // label and key stores over the region are recorded first, so they count as noted writes.
+        const bool point = carry && region.copiedBack && region.carrySerial != 0 && region.carryWhole;
         region.copiedBack = false;
+        if (carry) {
+            if (!point) {
+                stagingCarry::count(stagingCarry::counters().noPoint, "gpu_staging_carry_no_point");
+            } else if (region.carrySerial != recorder.OpenSerial()) {
+                stagingCarry::count(stagingCarry::counters().otherBatch, "gpu_staging_carry_other_batch");
+            } else {
+                const auto size = static_cast<std::size_t>(region.end - region.begin);
+                recorder.FlushKeyStoresOverlapping(region.begin, size);
+                recorder.FlushStoresOverlapping(region.begin, size);
+                const Recorder::NotePoint since{region.carrySerial, region.carryWriteNote, region.carryReads, region.carryReadLists};
+                if (!recorder.NotedSince(since, region.begin, region.end)) {
+                    region.carrySerial = 0;
+                    region.carryWhole = false;
+                    stagingCarry::count(stagingCarry::counters().carried, "gpu_staging_carry_skipped");
+                    stagingCarry::count(stagingCarry::counters().carriedBytes, "gpu_staging_carry_bytes", region.end - region.begin);
+                    carried.push_back(&region);
+                    continue;
+                }
+                stagingCarry::count(stagingCarry::counters().noted, "gpu_staging_carry_noted");
+            }
+            stagingCarry::count(stagingCarry::counters().copied, "gpu_staging_carry_copied");
+        }
+        region.carrySerial = 0;
+        region.carryWhole = false;
         copies.push_back(&region);
+    }
+    if (carry) stagingCarry::report();
+    if (!carried.empty()) {
+        // The shadow serves this use as it is; it stays kept by this batch (the copy-back below
+        // reads it again after the work).
+        for (auto* region : carried) recorder.Keep(region->buffer);
+        if (stagingCarry::Verify()) recordCarryVerify(recorder, carried);
     }
     if (copies.empty()) return;
     Require(Recorder::Active() == &recorder, "staging copies recorded into a recorder that is not the device's");
     if (profile) Copies().stagedReused.fetch_add(copies.size(), std::memory_order_relaxed);
     recordGpuCopies(copies, false);
+}
+
+GuestBufferMemory::StagingCarryCounts GuestBufferMemory::StagingCarry() {
+    const auto& c = stagingCarry::counters();
+    return {c.carried.load(), c.copied.load(), c.noPoint.load(), c.otherBatch.load(), c.noted.load(), c.verified.load(), c.mismatches.load()};
+}
+
+void GuestBufferMemory::NoteStagingCarryPoints(Recorder& recorder) {
+    if (!stagingCarry::Enabled() || !uploaded || committed) return;
+    std::optional<Recorder::NotePoint> point;
+    for (auto& region : regions) {
+        if (!region.gpuCopy || !region.deviceLocal || !region.copiedBack || !region.carryWhole) {
+            region.carrySerial = 0;
+            continue;
+        }
+        if (!point) point = recorder.OpenNotePoint();
+        region.carrySerial = point->serial;
+        region.carryWriteNote = point->writeNote;
+        region.carryReads = point->reads;
+        region.carryReadLists = point->readLists;
+    }
+}
+
+void GuestBufferMemory::recordCarryVerify(Recorder& recorder, std::span<Region* const> carried) {
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (auto* region : carried) {
+        const auto bytes = region->end - region->begin;
+        auto imported = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto shadow = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CopyBuffer(context, commands, region->copySource, region->begin - region->copySourceBase, imported->Handle(), 0, bytes);
+        CopyBuffer(context, commands, region->buffer->Handle(), 0, shadow->Handle(), 0, bytes);
+        recorder.Keep(imported);
+        recorder.Keep(shadow);
+        recorder.OnComplete([imported, shadow, begin = region->begin] {
+            const auto expected = imported->Bytes();
+            const auto actual = shadow->Bytes();
+            auto& c = stagingCarry::counters();
+            stagingCarry::count(c.verified, "gpu_staging_carry_verified");
+            if (std::memcmp(expected.data(), actual.data(), expected.size()) == 0) return;
+            std::size_t first = 0;
+            while (first < expected.size() && expected[first] == actual[first]) ++first;
+            if (c.mismatches.load(std::memory_order_relaxed) < 16) std::fprintf(stderr, "[staging-carry] MISMATCH: region 0x%llx+0x%zx first differing byte at +0x%zx\n", static_cast<unsigned long long>(begin), expected.size(), first);
+            stagingCarry::count(c.mismatches, "gpu_staging_carry_mismatches");
+        });
+    }
+    // The comparison copies read the shadow before the work stores into it again.
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
 std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, std::size_t bytes) {

@@ -5556,7 +5556,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
         }
     }
-    const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    const auto dispatchTimingKey = record.programAddress != 0 ? record.programAddress : record.shader->program->variantId;
+    const auto gpuTiming = recorder.BeginGpuTiming(dispatchTimingKey);
+    // APS5_PROFILE_GPU: the program's description on the [gputime-top] line and its SPIR-V
+    // (APS5_PROFILE_GPU_SPIRV_DIR), on first sight.
+    if (gpuTiming != Graphics::Recorder::NoTiming && record.shader->program != nullptr && Graphics::Recorder::NoteTimingKey(dispatchTimingKey)) {
+        char text[128];
+        std::snprintf(text, sizeof(text), "dispatch cs:%llx/%zuw lds %u", static_cast<unsigned long long>(record.shader->program->PipelineVariantId()), record.shader->program->spirv.size(), record.shader->program->workgroupMemoryDwords);
+        Graphics::Recorder::DescribeTimingKey(dispatchTimingKey, text);
+        Graphics::Recorder::DumpTimingSpirv(dispatchTimingKey, "cs", record.shader->program->spirv.Words());
+    }
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
     const auto marker = state->bufferMarker != nullptr ? state->markerLog.Next(record.programAddress) : 0u;
     if (marker != 0) state->bufferMarker(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, state->markerBuffer, 0, marker);

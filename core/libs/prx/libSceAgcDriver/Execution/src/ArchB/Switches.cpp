@@ -98,6 +98,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixMovedWordUpload, "FIX_MOVED_WORD_UPLOAD", false, true, {}},
     {Feature::FixUnstampedAlias, "FIX_UNSTAMPED_ALIAS", false, true, {}},
     {Feature::FixPipelineKeyWriter, "FIX_PIPELINE_KEY_WRITER", false, true, {}},
+    {Feature::GpuStagingCarry, "GPU_STAGING_CARRY", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

@@ -1644,6 +1644,7 @@ void Recorder::NoteComputeHostAccess() {
 }
 
 Recorder::ComputeDispatchStart Recorder::BeginComputeDispatch(const PassAccess& access, bool eligible) {
+    recordingSequence.fetch_add(1, std::memory_order_relaxed);
     ComputeDispatchStart result;
     result.unchecked = UnsafeComputeChains();
     const auto valid = [](GuestRangeList ranges) { return std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
@@ -1736,6 +1737,7 @@ void Recorder::InvalidatePipelineState(const char* counter) {
 }
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+    recordingSequence.fetch_add(1, std::memory_order_relaxed);
     InvalidatePipelineState("fix_pso_reuse_invalidations_commands");
     EndComputeChain();
     ensureOpen();
@@ -1766,6 +1768,7 @@ void Recorder::MarkCovered(VkAccessFlags access) {
 }
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
+    recordingSequence.fetch_add(1, std::memory_order_relaxed);
     EndComputeChain();
     ensureOpen();
     auto& pass = open->renderPass;
@@ -2160,7 +2163,11 @@ void Recorder::FlushStores() {
 
 namespace {
 
-constexpr std::uint32_t MaxTimedRanges = 512;
+// Ranges per batch: 512, or 4096 with per-draw ranges (APS5_PROFILE_GPU_DRAWS).
+std::uint32_t MaxTimedRanges() {
+    static const std::uint32_t ranges = Recorder::GpuDrawTimingEnabled() ? 4096u : 512u;
+    return ranges;
+}
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
 constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
@@ -2184,6 +2191,11 @@ std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
 AgcDriver::Mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
+// Sub-key totals (TagGpuTiming: draw passes by render targets), key descriptions, the batch spans
+// of the window (for the GPU timeline's union and the gaps between batches) and dumped keys.
+std::map<std::uint64_t, TimingTotals> timingBySubKey;
+std::unordered_map<std::uint64_t, std::string> timingDescriptions;
+std::vector<std::pair<std::uint64_t, std::uint64_t>> timingBatchSpans;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
 
@@ -2249,8 +2261,29 @@ bool Recorder::GpuTimingEnabled() {
     return enabled;
 }
 
+namespace {
+
+// The ArchB recorder's GPU-busy counters (gpu_batch_us, gpu_batches: every batch's first-to-last
+// command span, from its two batch stamps), on whenever the recorder is (APS5_ARCHB_RECORDER=1), so
+// a gate reports GPU ms/f per arm; APS5_ARCHB_NO_GPU_BUSY=1 leaves the stamps out.
+bool GpuBusyCounted() {
+    static const bool counted = [] {
+        const char* recorder = std::getenv("APS5_ARCHB_RECORDER");
+        return recorder != nullptr && recorder[0] == '1' && std::getenv("APS5_ARCHB_NO_GPU_BUSY") == nullptr;
+    }();
+    return counted;
+}
+
+void countGpuBusy(double nanoseconds) {
+    if (!GpuBusyCounted()) return;
+    AgcDriver::ArchB::Recorder::Count("gpu_batch_us", nanoseconds / 1e3);
+    AgcDriver::ArchB::Recorder::Count("gpu_batches");
+}
+
+}
+
 bool Recorder::BatchStampsEnabled() {
-    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured() || Timeline::Enabled;
+    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured() || Timeline::Enabled || GpuBusyCounted();
 }
 
 void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
@@ -2361,7 +2394,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && BatchStampsEnabled())) return NoTiming;
     const auto commands = open->commands;
-    const std::uint32_t queryCount = full ? MaxTimedRanges * 2 : 2;
+    const std::uint32_t queryCount = full ? MaxTimedRanges() * 2 : 2;
     if (open->queries == VK_NULL_HANDLE) {
         if (!full && !sparePools.empty()) {
             open->queries = sparePools.back();
@@ -2384,6 +2417,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    open->timedSubKeys.push_back(0);
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2394,6 +2428,44 @@ void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
+}
+
+void Recorder::TagGpuTiming(std::uint32_t index, std::uint64_t subKey) {
+    if (index == NoTiming || open == nullptr || index >= open->timedSubKeys.size()) return;
+    open->timedSubKeys[index] = subKey;
+}
+
+std::uint32_t Recorder::BeginGpuTimingInPass(std::uint64_t key) {
+    if (!GpuTimingEnabled() || open == nullptr) return NoTiming;
+    return beginTiming(key);
+}
+
+bool Recorder::GpuDrawTimingEnabled() {
+    static const bool enabled = GpuTimingEnabled() && std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+    return enabled;
+}
+
+bool Recorder::NoteTimingKey(std::uint64_t key) {
+    if (!GpuTimingEnabled()) return false;
+    std::lock_guard lock(timingMutex);
+    return timingDescriptions.try_emplace(key).second;
+}
+
+void Recorder::DescribeTimingKey(std::uint64_t key, std::string description) {
+    if (!GpuTimingEnabled()) return;
+    std::lock_guard lock(timingMutex);
+    timingDescriptions[key] = std::move(description);
+}
+
+void Recorder::DumpTimingSpirv(std::uint64_t key, const char* stage, std::span<const std::uint32_t> words) {
+    static const char* directory = std::getenv("APS5_PROFILE_GPU_SPIRV_DIR");
+    if (directory == nullptr || words.empty() || !GpuTimingEnabled()) return;
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/%016llx-%s.spv", directory, static_cast<unsigned long long>(key), stage);
+    if (FILE* file = std::fopen(path, "wb")) {
+        std::fwrite(words.data(), sizeof(std::uint32_t), words.size(), file);
+        std::fclose(file);
+    }
 }
 
 bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup, bool chained) {
@@ -2984,6 +3056,7 @@ void Recorder::readGpuTiming(Batch& batch) {
             batch.gpuStartNs = static_cast<double>(stamps[0]) * period;
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
+            countGpuBusy(batch.gpuEndNs - batch.gpuStartNs);
         }
         return;
     }
@@ -3002,7 +3075,16 @@ void Recorder::readGpuTiming(Batch& batch) {
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
             timingBatchMs += ns / 1e6;
             AgcDriver::PerformanceCounters::AddGpuNanoseconds(static_cast<std::uint64_t>(ns));
+            if (stamps[i * 2 + 1] >= stamps[i * 2]) {
+                timingBatchSpans.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+                countGpuBusy(ns);
+            }
             continue;
+        }
+        if (i < batch.timedSubKeys.size() && batch.timedSubKeys[i] != 0) {
+            auto& sub = timingBySubKey[batch.timedSubKeys[i]];
+            ++sub.count;
+            sub.ms += ns / 1e6;
         }
         const auto key = batch.timedKeys[i];
         if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) PerformanceTrace::GpuRange(CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period, batch.traceId);
@@ -3040,9 +3122,59 @@ void Recorder::readGpuTiming(Batch& batch) {
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges());
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    // Per present; a run without presents (agc_frame_replay) prints 10 s totals instead.
+    const double scale = presents != 0 ? perPresent : 1.0;
+    const auto described = [](std::uint64_t key) -> const char* {
+        const auto found = timingDescriptions.find(key);
+        return found != timingDescriptions.end() && !found->second.empty() ? found->second.c_str() : "-";
+    };
+    // The costliest program keys (dispatch programs, and draw pipelines under APS5_PROFILE_GPU_DRAWS)
+    // per present, with their descriptions.
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime-top] %llu presents; by key (ms/present, count/present):", static_cast<unsigned long long>(presents));
+    for (std::size_t i = 0; i < hot.size() && i < 40; ++i) AgcDriver::ProfilePrint_nid_no_patch(" {0x%llx %.3f %.1f %s}", static_cast<unsigned long long>(hot[i].first), hot[i].second.ms * scale, static_cast<double>(hot[i].second.count) * scale, described(hot[i].first));
+    AgcDriver::ProfilePrint_nid_no_patch("\n");
+    if (!timingBySubKey.empty()) {
+        std::vector<std::pair<std::uint64_t, TimingTotals>> passes(timingBySubKey.begin(), timingBySubKey.end());
+        std::sort(passes.begin(), passes.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        double passMs = 0;
+        for (const auto& entry : passes) passMs += entry.second.ms;
+        AgcDriver::ProfilePrint_nid_no_patch("[gputime-passes] %.1f ms in %zu pass keys (%.3f ms/present); by pass (ms/present, passes/present):", passMs, passes.size(), passMs * scale);
+        for (std::size_t i = 0; i < passes.size() && i < 48; ++i) AgcDriver::ProfilePrint_nid_no_patch(" {0x%llx %.3f %.1f %s}", static_cast<unsigned long long>(passes[i].first), passes[i].second.ms * scale, static_cast<double>(passes[i].second.count) * scale, described(passes[i].first));
+        AgcDriver::ProfilePrint_nid_no_patch("\n");
+    }
+    if (!timingBatchSpans.empty()) {
+        // The GPU timeline of the recorder's batches: their union (busy), and the gaps between one
+        // batch's last command and the next batch's first (the queue had no recorded work: waiting
+        // for a submission, or for a semaphore), by size.
+        std::sort(timingBatchSpans.begin(), timingBatchSpans.end());
+        const auto period = static_cast<double>(context.limits.timestampPeriod);
+        std::uint64_t busyTicks = 0, end = timingBatchSpans.front().first;
+        std::array<std::uint64_t, 4> gapCount{}, gapTicks{};
+        constexpr std::array<double, 3> gapLimitsUs{20.0, 200.0, 2000.0};
+        for (const auto& [begin, finish] : timingBatchSpans) {
+            if (begin > end) {
+                const auto gap = begin - end;
+                const auto us = static_cast<double>(gap) * period / 1e3;
+                std::size_t bucket = 0;
+                while (bucket < gapLimitsUs.size() && us >= gapLimitsUs[bucket]) ++bucket;
+                ++gapCount[bucket];
+                gapTicks[bucket] += gap;
+            }
+            const auto from = std::max(begin, end);
+            if (finish > from) busyTicks += finish - from;
+            end = std::max(end, finish);
+        }
+        const auto spanMs = static_cast<double>(end - timingBatchSpans.front().first) * period / 1e6;
+        const auto busyMs = static_cast<double>(busyTicks) * period / 1e6;
+        const auto gapMs = [&](std::size_t bucket) { return static_cast<double>(gapTicks[bucket]) * period / 1e6 * scale; };
+        AgcDriver::ProfilePrint_nid_no_patch("[gputime-timeline] %zu batches over %.0f ms of GPU clock: busy %.1f ms (%.3f ms/present, %.1f batches/present); gaps per present: <20us x%.1f %.3f ms, 20-200us x%.1f %.3f ms, 0.2-2ms x%.1f %.3f ms, >=2ms x%.1f %.3f ms\n", timingBatchSpans.size(), spanMs, busyMs, busyMs * scale, static_cast<double>(timingBatchSpans.size()) * scale,
+            static_cast<double>(gapCount[0]) * scale, gapMs(0), static_cast<double>(gapCount[1]) * scale, gapMs(1), static_cast<double>(gapCount[2]) * scale, gapMs(2), static_cast<double>(gapCount[3]) * scale, gapMs(3));
+    }
+    timingBySubKey.clear();
+    timingBatchSpans.clear();
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
@@ -3608,6 +3740,41 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
     if (open != nullptr && overlaps(*open, address, end)) return true;
     for (const auto& batch : inFlight) {
         if (overlaps(*batch, address, end)) return true;
+    }
+    return false;
+}
+
+Recorder::NotePoint Recorder::OpenNotePoint() {
+    ensureOpen();
+    return {OpenSerial(), writeNoteCount, open->reads.size(), open->readLists.size()};
+}
+
+bool Recorder::NotedSince(const NotePoint& point, std::uint64_t begin, std::uint64_t end) const {
+    if (open == nullptr || point.serial != OpenSerial() || point.reads > open->reads.size() || point.readLists > open->readLists.size()) return true;
+    if (writeNoteCount != point.writeNote) {
+        // Note numbers grow within a batch: walk each batch's newest notes back to the point.
+        const auto newer = [&](const Batch& batch) {
+            for (auto index = batch.writes.size(); index-- > 0;) {
+                if (index >= batch.writeNotes.size() || batch.writeNotes[index] <= point.writeNote) break;
+                if (begin < batch.writes[index].second && batch.writes[index].first < end) return true;
+            }
+            return false;
+        };
+        if (newer(*open)) return true;
+        for (const auto& batch : inFlight) {
+            if (newer(*batch)) return true;
+        }
+    }
+    for (auto index = point.reads; index < open->reads.size(); ++index) {
+        const auto& read = open->reads[index];
+        if (read.kind == ReadKind::AddressBased && begin < read.end && read.begin < end) return true;
+    }
+    for (auto index = point.readLists; index < open->readLists.size(); ++index) {
+        const auto& note = open->readLists[index];
+        if (note.kind != ReadKind::AddressBased) continue;
+        const auto& list = *note.ranges;
+        const auto found = std::partition_point(list.begin(), list.end(), [&](const auto& range) { return range.second <= begin; });
+        if (found != list.end() && found->first < end) return true;
     }
     return false;
 }

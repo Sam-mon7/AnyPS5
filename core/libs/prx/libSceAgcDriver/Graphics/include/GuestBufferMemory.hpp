@@ -358,6 +358,16 @@ public:
     // regions was recorded (ShaderResources::MarkGpuWrites), under GuestMemory::GpuMutex. A use that
     // never calls it (a synchronous draw) stores the staging bytes from the CPU in WriteBack.
     void RecordCopyBacks(Recorder& recorder);
+    // APS5_ARCHB_GPU_STAGING_CARRY: called right after the use's pending-write note (MarkGpuWrites):
+    // a staged region whose copy-back covered it whole remembers the recorder's note point, so the
+    // next use of this build in the same batch can skip its copy-in when nothing noted since then
+    // overlaps the region (the shadow then holds exactly what the copy-in would read back).
+    void NoteStagingCarryPoints(Recorder& recorder);
+    // Cumulative APS5_ARCHB_GPU_STAGING_CARRY decisions of RecordStagingCopies (tests, reports).
+    struct StagingCarryCounts {
+        std::uint64_t carried = 0, copied = 0, noPoint = 0, otherBatch = 0, noted = 0, verified = 0, mismatches = 0;
+    };
+    static StagingCarryCounts StagingCarry();
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
@@ -455,6 +465,14 @@ private:
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
         bool overlay = false;
+        // APS5_ARCHB_GPU_STAGING_CARRY: this use's copy-back covered the whole region (set by
+        // RecordCopyBacks), and the note point right after the use's own pending-write note
+        // (NoteStagingCarryPoints); carrySerial 0 when there is none.
+        bool carryWhole = false;
+        std::uint64_t carrySerial = 0;
+        std::uint64_t carryWriteNote = 0;
+        std::size_t carryReads = 0;
+        std::size_t carryReadLists = 0;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -506,6 +524,7 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    void recordCarryVerify(Recorder& recorder, std::span<Region* const> carried);
     void takeHeapReferences();
     void bindShadowAddresses();
     Context context;

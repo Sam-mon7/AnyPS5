@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -1449,6 +1450,10 @@ int gpuTimingCompletionTests(const Device& device, bool incomplete) {
     int completed = 0;
     Recorder recorder(context);
     recorder.Activate();
+    Require(Recorder::PassTimingKey(0x77) >> 56u == 0xa5u && Recorder::DrawTimingKey(0x78) >> 56u == 0xd5u, "timing key tags");
+    const auto describedKey = Recorder::PassTimingKey(incomplete ? 0x99 : 0x98);
+    Require(Recorder::NoteTimingKey(describedKey) && !Recorder::NoteTimingKey(describedKey), "a timing key was not new exactly once");
+    Recorder::DescribeTimingKey(describedKey, "pass test");
     for (int round = 0; round < 3; ++round) {
         const bool missingEnd = incomplete && round == 1;
         const auto first = recorder.BeginGpuTiming(0x12340);
@@ -1456,6 +1461,11 @@ int gpuTimingCompletionTests(const Device& device, bool incomplete) {
         if (!missingEnd) recorder.EndGpuTiming(first);
         const auto second = recorder.BeginGpuTiming(0x12341);
         Require(second != Recorder::NoTiming && second != first, "second GPU timing range was not allocated");
+        // A pass sub key and a nested in-pass range (the [gputime-passes] / per-draw keys).
+        recorder.TagGpuTiming(second, Recorder::PassTimingKey(0x77));
+        const auto nested = recorder.BeginGpuTimingInPass(Recorder::DrawTimingKey(0x78));
+        Require(nested != Recorder::NoTiming && nested != second, "in-pass GPU timing range was not allocated");
+        recorder.EndGpuTiming(nested);
         recorder.EndGpuTiming(second);
         recorder.OnComplete([&] { ++completed; });
         const auto serial = recorder.Submissions() + 1;
@@ -3928,6 +3938,92 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         mutation.Remove(block);
     }
     HostImportFor(context, address, bytes);
+    return true;
+}
+
+// APS5_ARCHB_GPU_STAGING_CARRY: a reused build's next use in the same batch skips the copy-in of a
+// staged region whose copy-back stored it whole, unless a write was noted over it since or the batch
+// was submitted; off, every use copies in. _VERIFY compares each carried shadow with the import.
+bool stagingCarryTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: staging carry not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 4u << 20u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the test block");
+    std::memset(block, 0x5a, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: staging carry not tested\n";
+        return false;
+    }
+    const bool on = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::GpuStagingCarry);
+    const auto element = address + 4096;
+    constexpr std::size_t elementBytes = 1u << 20u;
+    {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(element, elementBytes, false, false);
+        memory.Upload(false);
+        Require(memory.InPlaceReads().empty(), "staging carry: the written 1 MiB element was not staged");
+        // One use's end as ShaderResources::MarkGpuWrites records it.
+        const auto finishUse = [&] {
+            memory.RecordCopyBacks(recorder);
+            recorder.NotePendingWrites(memory.Writes());
+            memory.NoteStagingCarryPoints(recorder);
+        };
+        finishUse();
+        const auto start = GuestBufferMemory::StagingCarry();
+        // Use 2, same batch, nothing noted since: carried when on.
+        memory.RecordStagingCopies(recorder);
+        auto now = GuestBufferMemory::StagingCarry();
+        Require(now.carried - start.carried == (on ? 1u : 0u), on ? "staging carry: an untouched shadow was copied in again" : "staging carry: a copy-in was skipped with the switch off");
+        finishUse();
+        // A CPU store into the element after the uses were recorded: the batch has not run, so it
+        // lands before every copy of the batch and reaches the shadow through the batch's first
+        // copy-in, carried or not (the final bytes below are the same either way).
+        static_cast<std::uint8_t*>(block)[4096 + 100] = 0x77;
+        // Use 3 after a GPU write noted over the element: copied.
+        recorder.NotePendingWrite(element + 256, 16);
+        memory.RecordStagingCopies(recorder);
+        now = GuestBufferMemory::StagingCarry();
+        Require(now.carried - start.carried == (on ? 1u : 0u) && now.noted - start.noted == (on ? 1u : 0u), "staging carry: a shadow was carried over a noted write");
+        finishUse();
+        // Use 4 after the batch was submitted: copied.
+        recorder.Submit();
+        memory.RecordStagingCopies(recorder);
+        now = GuestBufferMemory::StagingCarry();
+        Require(now.carried - start.carried == (on ? 1u : 0u) && now.otherBatch - start.otherBatch == (on ? 1u : 0u), "staging carry: a shadow was carried into another batch");
+        finishUse();
+        // Use 5, same batch again: carried when on.
+        memory.RecordStagingCopies(recorder);
+        now = GuestBufferMemory::StagingCarry();
+        Require(now.carried - start.carried == (on ? 2u : 0u), "staging carry: the second same-batch use was not carried");
+        finishUse();
+        recorder.Sync();
+        now = GuestBufferMemory::StagingCarry();
+        const char* verify = std::getenv("APS5_ARCHB_GPU_STAGING_CARRY_VERIFY");
+        if (verify != nullptr && verify[0] == '1') Require(now.verified - start.verified == now.carried - start.carried && now.mismatches == start.mismatches, "staging carry: a carried shadow differed from the import");
+    }
+    // The copy-backs stored the shadow: the original bytes with the CPU store, as without the switch.
+    const auto* guest = static_cast<const std::uint8_t*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) Require(guest[at] == (at == 4096 + 100 ? 0x77 : 0x5a), "staging carry: the guest bytes differ after the uses");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    std::cout << "staging carry checked, switch " << (on ? "on" : "off") << '\n';
     return true;
 }
 
@@ -12516,6 +12612,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--bda-staging-only") {
             if (!bdaStagingTests(device, recorder)) return 77;
             std::cout << "address-based staging tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--staging-carry-only") {
+            if (!stagingCarryTests(device, recorder)) return 77;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--read-written-staging-only") {

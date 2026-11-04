@@ -256,6 +256,94 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
 
 namespace {
 
+// APS5_PROFILE_GPU: the [gputime-passes] key of a draw pass, by its targets' guest addresses,
+// formats and extents (stable across frames, unlike the views DrawRenderPassKey mixes), described
+// on first sight: "pass WxH s<samples> L<layers> c<format>@<address> WxH ... d<format>@<address>".
+std::uint64_t timingPassKey(const State& state) {
+    std::uint64_t key = 14695981039346656037ull;
+    const auto mix = [&](std::uint64_t value) {
+        key ^= value;
+        key *= 1099511628211ull;
+    };
+    const auto extent = [](VkExtent2D size) { return static_cast<std::uint64_t>(size.width) | (static_cast<std::uint64_t>(size.height) << 32u); };
+    for (const auto& color : state.colors) {
+        mix(color.address);
+        mix(static_cast<std::uint64_t>(color.format));
+        mix(extent(color.extent));
+        mix(color.arraySlice | (static_cast<std::uint64_t>(color.mip) << 32u));
+    }
+    if (state.depth.has_value()) {
+        mix(0xde97ull);
+        mix(state.depth->address);
+        mix(static_cast<std::uint64_t>(state.depth->format));
+        mix(extent(state.depth->extent));
+        mix(state.depth->firstSlice);
+    }
+    mix(extent(state.renderExtent));
+    mix(state.samples);
+    mix(state.renderLayers);
+    const auto timingKey = Recorder::PassTimingKey(key);
+    if (Recorder::NoteTimingKey(timingKey)) {
+        char text[192];
+        std::snprintf(text, sizeof(text), "pass %ux%u s%u L%u", state.renderExtent.width, state.renderExtent.height, static_cast<unsigned>(state.samples), state.renderLayers);
+        std::string description = text;
+        for (const auto& color : state.colors) {
+            std::snprintf(text, sizeof(text), " c%d@0x%llx %ux%u", static_cast<int>(color.format), static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height);
+            description += text;
+        }
+        if (state.depth.has_value()) {
+            std::snprintf(text, sizeof(text), " d%d@0x%llx %ux%u%s%s", static_cast<int>(state.depth->format), static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, state.depthTest ? " test" : "", state.depthWrite ? " write" : "");
+            description += text;
+        }
+        Recorder::DescribeTimingKey(timingKey, std::move(description));
+    }
+    return timingKey;
+}
+
+const char* timingStageName(ShaderRecompiler::ShaderStage stage) {
+    switch (stage) {
+        case ShaderRecompiler::ShaderStage::Compute: return "cs";
+        case ShaderRecompiler::ShaderStage::Vertex: return "vs";
+        case ShaderRecompiler::ShaderStage::TessellationControl: return "hs";
+        case ShaderRecompiler::ShaderStage::TessellationEvaluation: return "ds";
+        case ShaderRecompiler::ShaderStage::Geometry: return "gs";
+        case ShaderRecompiler::ShaderStage::Fragment: return "ps";
+        case ShaderRecompiler::ShaderStage::Local: return "ls";
+        case ShaderRecompiler::ShaderStage::Mesh: return "ms";
+    }
+    return "xs";
+}
+
+// APS5_PROFILE_GPU_DRAWS: a draw's [gputime-top] key, by its stages' pipeline variants, described
+// (stage variants, SPIR-V words, the pass) and its SPIR-V dumped on first sight.
+std::uint64_t timingDrawKey(std::span<const CompiledShader> shaders, std::uint64_t passKey) {
+    std::uint64_t key = 14695981039346656037ull;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        key ^= shader.program->PipelineVariantId() + static_cast<std::uint64_t>(shader.stage);
+        key *= 1099511628211ull;
+    }
+    const auto timingKey = Recorder::DrawTimingKey(key);
+    if (Recorder::NoteTimingKey(timingKey)) {
+        std::string description = "draw";
+        char text[128];
+        for (const auto& shader : shaders) {
+            if (shader.program == nullptr) continue;
+            std::snprintf(text, sizeof(text), " %s:%llx/%zuw", timingStageName(shader.stage), static_cast<unsigned long long>(shader.program->PipelineVariantId()), shader.program->spirv.size());
+            description += text;
+            Recorder::DumpTimingSpirv(timingKey, timingStageName(shader.stage), shader.program->spirv.Words());
+        }
+        std::snprintf(text, sizeof(text), " in 0x%llx", static_cast<unsigned long long>(passKey));
+        description += text;
+        Recorder::DescribeTimingKey(timingKey, std::move(description));
+    }
+    return timingKey;
+}
+
+}
+
+namespace {
+
 GuestTextureResource ArraySurfaceForTarget(const ColorTarget& color) {
     Require(color.arrayLastSlice != 0, "the color target is not a view of a 2D array");
     auto surface = SurfaceForTarget(color);
@@ -2783,6 +2871,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    const auto passTimingKey = Recorder::GpuTimingEnabled() ? timingPassKey(state) : 0;
+    if (drawTiming != Recorder::NoTiming) recorder->TagGpuTiming(drawTiming, passTimingKey);
     if (!continued && Recorder::BarrierValidate()) {
         // APS5_ARCHB_FIX_ALLOC_CHURN: a per-thread scratch (NoteAccess reads it before returning).
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ownedReads;
@@ -2860,6 +2950,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), reuse);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    // APS5_PROFILE_GPU_DRAWS: the draw's own range inside its pass (not in a multiview pass, whose
+    // timestamps would need one query per view).
+    const auto ownTiming = Recorder::GpuDrawTimingEnabled() && state.renderLayers <= 1u ? recorder->BeginGpuTimingInPass(timingDrawKey(shaders, passTimingKey)) : Recorder::NoTiming;
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     else {
         recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages);
@@ -2873,6 +2966,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     }
+    recorder->EndGpuTiming(ownTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);

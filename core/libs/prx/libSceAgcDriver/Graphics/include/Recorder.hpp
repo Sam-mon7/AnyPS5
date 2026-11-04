@@ -97,6 +97,9 @@ public:
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
     VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    // Bumped by every recording entry (Commands, StartDrawPass, BeginComputeDispatch): two equal
+    // reads bracket a span in which nothing was recorded (the staging census and carry-over use it).
+    static std::uint64_t RecordingSequence() { return recordingSequence.load(std::memory_order_relaxed); }
     PipelineStateReuse* ReusePipelineState(bool enabled);
     void InvalidatePipelineState(const char* counter);
     static bool ComputeChainsEnabled();
@@ -143,6 +146,19 @@ public:
     bool Recording() const { return open != nullptr; }
     bool Idle() const { return open == nullptr && inFlight.empty(); }
     std::uint64_t OpenSerial() const { return submissions + 1; }
+    // A point in the recorder's notes (APS5_ARCHB_GPU_STAGING_CARRY): the open batch's serial, the
+    // newest write note number (any batch) and the open batch's read and read-list counts.
+    // NotedSince: whether a GPU write noted after the point (in the open batch or an in-flight one),
+    // or an address-based read noted after it in the open batch (a build that may store anywhere it
+    // reaches), overlaps [begin, end); true when the point's batch is no longer the open one.
+    struct NotePoint {
+        std::uint64_t serial = 0;
+        std::uint64_t writeNote = 0;
+        std::size_t reads = 0;
+        std::size_t readLists = 0;
+    };
+    NotePoint OpenNotePoint();
+    bool NotedSince(const NotePoint& point, std::uint64_t begin, std::uint64_t end) const;
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
@@ -565,6 +581,31 @@ public:
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
+    // A second key for a timed range (a draw pass's render-target key, PassTimingKey): its time is
+    // also summed per sub key, reported on the [gputime-passes] line with the description given to
+    // DescribeTimingKey. The range stays counted under its own key.
+    void TagGpuTiming(std::uint32_t index, std::uint64_t subKey);
+    // A range begun inside the open render pass (a draw's own range): unlike BeginGpuTiming it does
+    // not end the pass. NoTiming without an open batch.
+    std::uint32_t BeginGpuTimingInPass(std::uint64_t key);
+    // APS5_PROFILE_GPU_DRAWS=1 (with APS5_PROFILE_GPU): every draw gets its own range keyed by its
+    // pipeline's programs (DrawTimingKey), nested in its pass range: the draws' pipelines rank with
+    // the dispatch programs on the [gputime-top] line. Off by default: the per-draw stamps add GPU
+    // work of their own (the pass-level split does not need them).
+    static bool GpuDrawTimingEnabled();
+    // Tagged keys so pass and draw keys never meet a program address (< 2^48).
+    static constexpr std::uint64_t PassTimingTag = 0xa5ull << 56u;
+    static constexpr std::uint64_t DrawTimingTag = 0xd5ull << 56u;
+    static constexpr std::uint64_t PassTimingKey(std::uint64_t hash) { return PassTimingTag | (hash & 0x00ffffffffffffffull); }
+    static constexpr std::uint64_t DrawTimingKey(std::uint64_t hash) { return DrawTimingTag | (hash & 0x00ffffffffffffffull); }
+    // First sight of a timing key (true once per key and process, under a mutex): the caller then
+    // describes it (DescribeTimingKey) and may dump its programs (DumpTimingSpirv). False with
+    // APS5_PROFILE_GPU off.
+    static bool NoteTimingKey(std::uint64_t key);
+    static void DescribeTimingKey(std::uint64_t key, std::string description);
+    // APS5_PROFILE_GPU_SPIRV_DIR=<dir>: writes a timed program's SPIR-V as <dir>/<key>-<stage>.spv
+    // (once per key) so the costly programs can be disassembled offline.
+    static void DumpTimingSpirv(std::uint64_t key, const char* stage, std::span<const std::uint32_t> words);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;
@@ -641,6 +682,7 @@ public:
     static bool FlipReadCheck();
 
 private:
+    inline static std::atomic<std::uint64_t> recordingSequence{0};
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
@@ -689,6 +731,7 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        std::vector<std::uint64_t> timedSubKeys;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
