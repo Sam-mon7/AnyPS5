@@ -76,6 +76,8 @@ enum class Feature : std::uint8_t {
     PrelockFindHandoff,
     PrivateCompute,
     ZeroCopyMoved,
+    ArchcImageEpochs,
+    ArchcTargetFastpath,
     Count
 };
 

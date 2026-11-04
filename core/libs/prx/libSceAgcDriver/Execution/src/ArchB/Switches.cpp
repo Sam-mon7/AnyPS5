@@ -52,6 +52,8 @@ constexpr Feature WtFaultPrerequisites[] = {Feature::WtFault};
 constexpr Feature PipeResolveSplitPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeResolvePoolPrerequisites[] = {Feature::PipeQ0Committer, Feature::PipeResolveSplit};
 constexpr Feature PrelockStampSkipPrerequisites[] = {Feature::WtFault, Feature::PipeResolveProofs};
+constexpr Feature ArchcImageEpochsPrerequisites[] = {Feature::WtFault, Feature::WtFaultConsumers};
+constexpr Feature ArchcTargetFastpathPrerequisites[] = {Feature::ArchcImageEpochs};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -137,6 +139,8 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Draws with moved buffers bind an immutable per-template set, cached by the moved content: moved
     // addresses read in place through their import, data words in a buffer of the set's own.
     {Feature::ZeroCopyMoved, "ZERO_COPY_MOVED", false, true, {}},
+    {Feature::ArchcImageEpochs, "C_IMAGE_EPOCHS", false, true, ArchcImageEpochsPrerequisites},
+    {Feature::ArchcTargetFastpath, "C_TARGET_FASTPATH", false, true, ArchcTargetFastpathPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

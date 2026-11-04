@@ -357,6 +357,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleReadback.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleUpload.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ImageEpochs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/SampleOrder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BarrierBatch.cpp
@@ -1105,6 +1106,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_archb_wt_sync_skip agc_archb_wt_sync_skip_verify agc_archb_wt_sync_skip_suite PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     set_tests_properties(agc_archb_wt_sync_skip agc_archb_wt_sync_skip_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0;APS5_ARCHB_WT_SYNC_SKIP=1")
     set_tests_properties(agc_archb_wt_sync_skip_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0;APS5_ARCHB_WT_SYNC_SKIP=1;APS5_ARCHB_WT_SYNC_SKIP_VERIFY=1")
+    # Arch C P1: the fault log (store, forget, hold, overflow), cold pages, and the image-epoch index's event sources.
+    add_test(NAME agc_archc_log COMMAND agc_write_tracking_tests --archc-log)
+    add_test(NAME agc_archc_epochs COMMAND agc_write_tracking_tests --archc-epochs)
+    set_tests_properties(agc_archc_log agc_archc_epochs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+        ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0;APS5_ARCHB_C_IMAGE_EPOCHS=1"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     add_test(NAME agc_archb_wt_fault_hot COMMAND agc_write_tracking_tests --wt-fault-hot)
     set_tests_properties(agc_archb_wt_fault_hot PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
         ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0"

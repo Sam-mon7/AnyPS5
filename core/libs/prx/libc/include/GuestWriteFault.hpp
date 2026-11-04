@@ -67,6 +67,9 @@ struct WtFaultCounters {
     std::uint64_t verifyUntracked = 0; // dirty pages write watching reported that are not tracked
     std::uint64_t verifyMismatches = 0;
     std::uint64_t queries = 0;         // GuestWtFaultChangedSince calls
+    std::uint64_t logAppends = 0;
+    std::uint64_t logLost = 0;
+    std::uint64_t coldRearmed = 0;
 };
 
 struct WtFaultMismatch {
@@ -146,6 +149,10 @@ void GuestWtFaultCounters_nid_no_patch(WtFaultCounters* counters);
 std::uint64_t GuestWtFaultWord_nid_no_patch(std::uintptr_t address);
 // Diagnostics: whether a sync would skip the page now (armed no later than its last sync).
 bool GuestWtFaultSyncedClean_nid_no_patch(std::uintptr_t address);
+std::uint64_t GuestWtFaultLogHead_nid_no_patch();
+std::size_t GuestWtFaultLogRead_nid_no_patch(std::uint64_t* cursor, std::uint64_t* entries, std::size_t capacity, bool* lost);
+void GuestWtFaultSetCold_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool cold);
+void GuestWtFaultLogAppendForTest_nid_no_patch(std::uint64_t entry);
 
 }
 
@@ -162,6 +169,12 @@ inline constexpr std::uint64_t WtFaultExecBit = 8;
 inline constexpr std::uint64_t WtFaultCheckedBit = 16;
 inline constexpr std::uint64_t WtFaultFlagMask = WtFaultExecBit | WtFaultCheckedBit;
 inline constexpr unsigned WtFaultStampShift = 5;
+inline constexpr std::uint64_t WtFaultLogStore = 1;
+inline constexpr std::uint64_t WtFaultLogHold = 2;
+inline constexpr std::uint64_t WtFaultLogOpen = 3;
+inline constexpr std::uint64_t WtFaultLogForgetBegin = 4;
+inline constexpr std::uint64_t WtFaultLogForgetEnd = 5;
+inline constexpr std::size_t WtFaultLogSlots = 65536;
 
 }
 

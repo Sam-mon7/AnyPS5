@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
@@ -2152,6 +2154,239 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     return resident;
 }
 
+namespace archcTargets {
+
+using TargetKey = std::array<std::uint64_t, 16>;
+
+std::uint64_t nowNs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+TargetKey keyOf(const Context& context, const ColorTarget& color) {
+    TargetKey key{};
+    key[0] = color.address;
+    key[1] = (std::uint64_t{color.extent.width} << 32) | color.extent.height;
+    key[2] = (static_cast<std::uint64_t>(color.format) << 32) | (static_cast<std::uint64_t>(color.tileMode) << 16) | color.elementBytes;
+    key[3] = color.bytes;
+    key[4] = color.dccAddress;
+    key[5] = color.chainDccAddress ^ (std::uint64_t{color.dccAlphaOnMsb} << 62) ^ (std::uint64_t{color.dccPipeAligned} << 63);
+    key[6] = color.cmaskAddress;
+    key[7] = (static_cast<std::uint64_t>(color.cmaskBytes) << 1) | (color.cmaskFastClear ? 1u : 0u);
+    key[8] = color.surfaceAddress;
+    key[9] = (std::uint64_t{color.surfaceExtent.width} << 32) | color.surfaceExtent.height;
+    key[10] = (std::uint64_t{color.mipCount} << 40) | (std::uint64_t{color.mip} << 8) | (color.mipTail ? 1u : 0u);
+    key[11] = (std::uint64_t{color.clearWords[0]} << 32) | color.clearWords[1];
+    key[12] = (std::uint64_t{color.depth} << 32) | color.depthSlice;
+    key[13] = color.arrayAddress ^ (std::uint64_t{color.arrayLastSlice} << 48) ^ (std::uint64_t{color.arraySlice} << 32) ^ (std::uint64_t{color.layers} << 16);
+    key[14] = (std::uint64_t{color.pipeBankXor} << 40) | (std::uint64_t{color.samples} << 24) | (std::uint64_t{color.coverageSamples} << 16) | (color.dccControl & 0xffffu);
+    key[15] = color.fmaskAddress ^ reinterpret_cast<std::uintptr_t>(context.device);
+    return key;
+}
+
+struct Token {
+    TargetKey key{};
+    bool used = false;
+    std::weak_ptr<StorageTexture> image;
+    const StorageTexture* raw = nullptr;
+    std::uint64_t epoch = 0;
+    std::uint64_t loss = 0;
+    std::uint64_t surfaceSerial = 0;
+    bool valid = false;
+    std::uint64_t clock = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t pendingSerial = 0;
+    ArchC::EpochCensus census{};
+    std::array<ArchC::EpochRange, 3> ranges{};
+    std::size_t rangeCount = 0;
+};
+
+constexpr std::size_t TableSize = 64;
+
+std::array<Token, TableSize>& table() {
+    thread_local std::array<Token, TableSize> made{};
+    return made;
+}
+
+Token& slotFor(const TargetKey& key) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto word : key) {
+        hash ^= word;
+        hash *= 0x100000001b3ull;
+        hash ^= hash >> 29;
+    }
+    return table()[static_cast<std::size_t>(hash % TableSize)];
+}
+
+std::size_t rangesOf(const StorageTexture& image, const ColorTarget& color, std::array<ArchC::EpochRange, 3>& ranges) {
+    const auto& descriptor = image.Descriptor();
+    std::size_t used = 0;
+    ranges[used++] = {descriptor.baseAddress, descriptor.baseAddress + image.GuestBytes()};
+    if (descriptor.dccAddress != 0) ranges[used++] = {descriptor.dccAddress, descriptor.dccAddress + DccKeyBytes(image.GuestBytes())};
+    if (color.cmaskAddress != 0 && color.cmaskBytes != 0) ranges[used++] = {color.cmaskAddress, color.cmaskAddress + color.cmaskBytes};
+    return used;
+}
+
+bool rangesArmed(std::span<const ArchC::EpochRange> ranges, std::uint64_t clock) {
+    for (const auto& range : ranges) {
+        if (GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(range.begin), static_cast<std::size_t>(range.end - range.begin), clock) != GuestArena::WtFaultAnswer::Unchanged) return false;
+    }
+    return true;
+}
+
+enum Refusal : std::size_t { RefusedNew, RefusedImage, RefusedCached, RefusedKeys, RefusedCpu, RefusedStamp, RefusedPending, RefusedDepth, RefusedGpuNote, RefusedCmask, RefusedFmask, RefusedArray, RefusedMsaa, RefusalCount };
+constexpr std::array<const char*, RefusalCount> RefusalNames{"new", "image", "cached", "keys", "cpu", "stamp", "pending", "depth", "gpunote", "cmask", "fmask", "array", "msaa"};
+
+struct CensusCounters {
+    std::atomic<std::uint64_t> targetNs{0}, prelockNs{0}, depthNs{0}, lookups{0}, wouldhit{0}, wouldhitNs{0}, wouldhitPush{0}, wouldhitPushNs{0}, wouldhitPushCmask{0}, checkNs{0};
+    std::atomic<std::uint64_t> selfStamps{0}, otherStamps{0}, selfNotes{0}, otherNotes{0}, pushPending{0}, pushDepth{0}, recipeLookups{0};
+    std::array<std::atomic<std::uint64_t>, RefusalCount> refused{};
+    CensusCounters() {
+        using AgcDriver::ArchB::Recorder;
+        Recorder::RegisterCounter("archc_census_target_ns", targetNs);
+        Recorder::RegisterCounter("archc_census_prelock_target_ns", prelockNs);
+        Recorder::RegisterCounter("archc_census_target_depth_ns", depthNs);
+        Recorder::RegisterCounter("archc_census_target_lookups", lookups);
+        Recorder::RegisterCounter("archc_census_target_recipe_lookups", recipeLookups);
+        Recorder::RegisterCounter("archc_census_target_wouldhit", wouldhit);
+        Recorder::RegisterCounter("archc_census_target_wouldhit_ns", wouldhitNs);
+        Recorder::RegisterCounter("archc_census_target_wouldhit_push", wouldhitPush);
+        Recorder::RegisterCounter("archc_census_target_wouldhit_push_ns", wouldhitPushNs);
+        Recorder::RegisterCounter("archc_census_target_wouldhit_push_cmask", wouldhitPushCmask);
+        Recorder::RegisterCounter("archc_census_check_ns", checkNs);
+        Recorder::RegisterCounter("archc_census_self_stamps", selfStamps);
+        Recorder::RegisterCounter("archc_census_other_stamps", otherStamps);
+        Recorder::RegisterCounter("archc_census_self_notes", selfNotes);
+        Recorder::RegisterCounter("archc_census_other_notes", otherNotes);
+        Recorder::RegisterCounter("archc_census_push_pending", pushPending);
+        Recorder::RegisterCounter("archc_census_push_depth", pushDepth);
+        for (std::size_t i = 0; i < RefusalCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_census_refused_") + RefusalNames[i]))->c_str(), refused[i]);
+    }
+};
+
+CensusCounters& censusCounters() {
+    static CensusCounters made;
+    return made;
+}
+
+bool censusActive() {
+    return ArchC::ImageEpochs::CensusEnabled() && GuestMemory::IsCommitterThread();
+}
+
+std::array<std::uint64_t, 8>& prelockNs() {
+    thread_local std::array<std::uint64_t, 8> made{};
+    return made;
+}
+
+class CensusProbe {
+public:
+    CensusProbe(const Context& context, const ColorTarget& color, bool recipe) : context(context), color(color), recipe(recipe) {
+        if (!censusActive()) return;
+        active = true;
+        const auto start = nowNs();
+        key = keyOf(context, color);
+        slot = &slotFor(key);
+        refusal = classify();
+        checkNs += nowNs() - start;
+    }
+
+    void After(const std::shared_ptr<StorageTexture>& resident, std::uint64_t blockNs, std::uint64_t extraNs) {
+        if (!active) return;
+        const auto start = nowNs();
+        auto& counters = censusCounters();
+        if (resident != nullptr && (refusal == RefusalCount || pushHit) && resident.get() != current.get()) {
+            refusal = RefusedImage;
+            pushHit = false;
+        }
+        counters.lookups.fetch_add(1, std::memory_order_relaxed);
+        if (recipe) counters.recipeLookups.fetch_add(1, std::memory_order_relaxed);
+        counters.targetNs.fetch_add(blockNs, std::memory_order_relaxed);
+        if (refusal == RefusalCount) {
+            counters.wouldhit.fetch_add(1, std::memory_order_relaxed);
+            counters.wouldhitNs.fetch_add(blockNs + extraNs, std::memory_order_relaxed);
+        } else {
+            counters.refused[refusal].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (pushHit) {
+            counters.wouldhitPush.fetch_add(1, std::memory_order_relaxed);
+            counters.wouldhitPushNs.fetch_add(blockNs + extraNs, std::memory_order_relaxed);
+            if (color.cmaskAddress != 0) counters.wouldhitPushCmask.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (resident == nullptr) {
+            *slot = Token{};
+        } else {
+            if (!ArchC::ImageEpochs::Get().Registered(*resident) || color.cmaskAddress != 0) ArchC::ImageEpochs::RegisterImage(*resident, color.cmaskAddress, color.cmaskBytes);
+            auto& token = *slot;
+            token = Token{};
+            token.key = key;
+            token.used = true;
+            token.image = resident;
+            token.raw = resident.get();
+            token.epoch = resident->archcEpoch.load(std::memory_order_acquire);
+            token.clock = GuestArena::GuestWtFaultClock_nid_no_patch();
+            token.generation = GuestMemory::TrackerGeneration();
+            token.pendingSerial = StorageTexture::PendingSerial();
+            token.census = ArchC::ImageEpochs::Get().Census(*resident);
+            token.rangeCount = rangesOf(*resident, color, token.ranges);
+        }
+        counters.checkNs.fetch_add(checkNs + nowNs() - start, std::memory_order_relaxed);
+    }
+
+    bool Active() const { return active; }
+
+private:
+    Refusal classify() {
+        auto& counters = censusCounters();
+        if (color.samples > 1) return RefusedMsaa;
+        if (color.arrayLastSlice != 0) return RefusedArray;
+        if (color.fmaskAddress != 0) return RefusedFmask;
+        if (!slot->used || slot->key != key) return RefusedNew;
+        current = slot->image.lock();
+        if (current == nullptr || current.get() != slot->raw) return RefusedImage;
+        if (!current->Cached()) return RefusedCached;
+        if (!StorageImageServesKeys(*current, SurfaceForTarget(color).dccAddress)) return RefusedKeys;
+        const auto ranges = std::span<const ArchC::EpochRange>(slot->ranges.data(), slot->rangeCount);
+        const bool armed = rangesArmed(ranges, slot->clock);
+        const auto census = ArchC::ImageEpochs::Get().Census(*current);
+        if (census.otherStamps != slot->census.otherStamps) counters.otherStamps.fetch_add(1, std::memory_order_relaxed);
+        else if (census.selfStamps != slot->census.selfStamps) counters.selfStamps.fetch_add(1, std::memory_order_relaxed);
+        if (census.otherNotes != slot->census.otherNotes) counters.otherNotes.fetch_add(1, std::memory_order_relaxed);
+        else if (census.selfNotes != slot->census.selfNotes) counters.selfNotes.fetch_add(1, std::memory_order_relaxed);
+        if (census.pending != slot->census.pending) counters.pushPending.fetch_add(1, std::memory_order_relaxed);
+        if (census.depth != slot->census.depth) counters.pushDepth.fetch_add(1, std::memory_order_relaxed);
+        pushHit = armed && current->archcEpoch.load(std::memory_order_acquire) == slot->epoch;
+        if (!armed) return RefusedCpu;
+        std::array<GuestMemory::UnchangedQuery, 3> queries{};
+        for (std::size_t i = 0; i < ranges.size(); ++i) queries[i] = {ranges[i].begin, static_cast<std::size_t>(ranges[i].end - ranges[i].begin), slot->generation};
+        if (!GuestMemory::UnchangedSinceAll(std::span<const GuestMemory::UnchangedQuery>(queries.data(), ranges.size()))) return RefusedStamp;
+        if (StorageTexture::PendingSerial() != slot->pendingSerial) {
+            std::array<StorageTexture::PendingQuery, 1> pending{{{ranges[0].begin, ranges[0].end, current.get(), nullptr, false}}};
+            StorageTexture::ScanPending(pending);
+            if (pending[0].overlaps) return RefusedPending;
+        }
+        if (census.depth != slot->census.depth) return RefusedDepth;
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+            for (const auto& range : ranges) {
+                if (recorder->PendingWriteOverlaps(range.begin, static_cast<std::size_t>(range.end - range.begin))) return RefusedGpuNote;
+            }
+        }
+        if (color.cmaskAddress != 0) return RefusedCmask;
+        return RefusalCount;
+    }
+
+    const Context& context;
+    const ColorTarget& color;
+    bool recipe = false;
+    bool active = false;
+    bool pushHit = false;
+    TargetKey key{};
+    Token* slot = nullptr;
+    std::shared_ptr<StorageTexture> current;
+    Refusal refusal = RefusalCount;
+    std::uint64_t checkNs = 0;
+};
+
+}
+
 // APS5_DRAW_BINDINGS_DIAG (diagnostic): the committer's lookup work of full-path draws by step
 // (template Find, moved read-only buffers, alias checks, the indirect path decision, CachedPipeline,
 // AcquireFramebuffer, the rest of the pipeline phase); proofs are left out. DrawLookupDiagText.
@@ -3410,7 +3645,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
         const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        const auto censusDepthStart = archcTargets::censusActive() ? archcTargets::nowNs() : 0;
         PrepareColorTargetDepth(context.device, color.address, colorLayout.Bytes());
+        const auto censusDepthNs = censusDepthStart != 0 ? archcTargets::nowNs() - censusDepthStart : 0;
         if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         timer.phase(PhaseSetup);
@@ -3444,7 +3681,16 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
             };
+            archcTargets::CensusProbe censusProbe(context, color, false);
+            const auto censusStart = censusProbe.Active() ? archcTargets::nowNs() : 0;
             binding.resident = withTargetLookup(lookup, [&](const TargetLookup& target) { return refreshResidentTarget(context, state, color, draw, shaders, outcome, profile, target, targetPreparation); });
+            if (censusProbe.Active()) {
+                const auto blockNs = archcTargets::nowNs() - censusStart;
+                const auto prelock = index < 8 ? std::exchange(archcTargets::prelockNs()[index], 0) : 0;
+                archcTargets::censusCounters().depthNs.fetch_add(censusDepthNs, std::memory_order_relaxed);
+                archcTargets::censusCounters().prelockNs.fetch_add(prelock, std::memory_order_relaxed);
+                censusProbe.After(binding.resident, blockNs, censusDepthNs + prelock);
+            }
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
@@ -4181,9 +4427,21 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
     const bool collect = GuestMemory::ThreadCollectEpoch() != 0;
     static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
     static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
+    const bool census = archcTargets::censusActive();
+    if (census) archcTargets::prelockNs().fill(0);
     if (collect && residentTargets && context.detiler != nullptr) {
-        for (const auto& color : state.colors) {
+        for (std::size_t colorIndex = 0; colorIndex < state.colors.size(); ++colorIndex) {
+            const auto& color = state.colors[colorIndex];
             if (color.samples != 1 || (color.tileMode == ColorTileMode::Linear && !residentLinear)) continue;
+            const auto censusStart = census ? archcTargets::nowNs() : 0;
+            struct CensusSpan {
+                bool census;
+                std::size_t index;
+                std::uint64_t start;
+                ~CensusSpan() {
+                    if (census && index < 8) archcTargets::prelockNs()[index] += archcTargets::nowNs() - start;
+                }
+            } censusSpan{census, colorIndex, censusStart};
             std::optional<std::pair<GuestTextureResource, std::uint64_t>> described;
             try {
                 const auto requested = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
@@ -4227,12 +4485,15 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         for (std::size_t index = 0; index < state.colors.size(); ++index) {
             const auto& color = state.colors[index];
             if (color.samples != 1 || (color.tileMode == ColorTileMode::Linear && !residentLinear)) continue;
+            const auto censusStart = census ? archcTargets::nowNs() : 0;
             try {
                 const auto surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
                 prepared.targets[index] = PrepareStorageSurface(context, surface);
             } catch (const std::runtime_error&) {
+                if (census && index < 8) archcTargets::prelockNs()[index] += archcTargets::nowNs() - censusStart;
                 continue;
             }
+            if (census && index < 8) archcTargets::prelockNs()[index] += archcTargets::nowNs() - censusStart;
         }
         if (profile) prepared.targetProofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
     }
@@ -4405,7 +4666,15 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
             else stored->Refresh(targetProof);
             return stored;
         };
+        archcTargets::CensusProbe censusProbe(context, state.colors[index], true);
+        const auto censusStart = censusProbe.Active() ? archcTargets::nowNs() : 0;
         auto resident = withTargetLookup(lookup, [&](const TargetLookup& target) { return refreshResidentTarget(context, state, state.colors[index], draw, shaders, outcome, profile, target, targetPreparation); });
+        if (censusProbe.Active()) {
+            const auto blockNs = archcTargets::nowNs() - censusStart;
+            const auto prelock = index < 8 ? std::exchange(archcTargets::prelockNs()[index], 0) : 0;
+            archcTargets::censusCounters().prelockNs.fetch_add(prelock, std::memory_order_relaxed);
+            censusProbe.After(resident, blockNs, prelock);
+        }
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
         targets.push_back(std::move(resident));
