@@ -5021,6 +5021,124 @@ std::string WaitedBehindReport(const HolderMatrixValues& waited) {
 }
 
 namespace {
+#ifdef _WIN32
+struct HoldLogRecord {
+    std::uint32_t thread, tag;
+    std::uint64_t begin, end;
+};
+
+class HoldLog {
+public:
+    static HoldLog* Instance() {
+        static HoldLog* const log = []() -> HoldLog* {
+            const char* path = std::getenv("APS5_HOLD_LOG");
+            if (path == nullptr || *path == '\0') return nullptr;
+            return new HoldLog(path);
+        }();
+        return log;
+    }
+
+    static std::uint64_t Now() {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        return static_cast<std::uint64_t>(now.QuadPart);
+    }
+
+    void Push(std::uint32_t tag, std::uint64_t begin, std::uint64_t end) {
+        auto& ring = local();
+        const auto next = ring.written.load(std::memory_order_relaxed);
+        if (next - ring.consumed.load(std::memory_order_acquire) == Ring::Capacity) {
+            ring.lost.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        ring.records[next % Ring::Capacity] = {ring.thread, tag, begin, end};
+        ring.written.store(next + 1, std::memory_order_release);
+    }
+
+private:
+    struct Ring {
+        static constexpr std::size_t Capacity = std::size_t{1} << 15;
+        std::uint32_t thread = 0;
+        std::unique_ptr<HoldLogRecord[]> records = std::make_unique<HoldLogRecord[]>(Capacity);
+        alignas(64) std::atomic<std::size_t> written{0};
+        alignas(64) std::atomic<std::size_t> consumed{0};
+        std::atomic<std::uint64_t> lost{0};
+    };
+
+    using RegisterFn = ULONG(WINAPI*)(const GUID*, void*, void*, std::uint64_t*);
+    using WriteFn = ULONG(WINAPI*)(std::uint64_t, const void*, ULONG, void*);
+    struct Descriptor {
+        std::uint16_t id;
+        std::uint8_t version, channel, level, opcode;
+        std::uint16_t task;
+        std::uint64_t keyword;
+    };
+
+    explicit HoldLog(const char* path) : file(std::fopen(path, "wb")) {
+        if (file == nullptr) throw std::runtime_error("cannot open APS5_HOLD_LOG output");
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        const HoldLogRecord header{0xffffffffu, 0, static_cast<std::uint64_t>(frequency.QuadPart), 0};
+        std::fwrite(&header, sizeof(header), 1, file);
+        if (auto* advapi = LoadLibraryA("advapi32.dll"); advapi != nullptr) {
+            const auto registerProvider = reinterpret_cast<RegisterFn>(reinterpret_cast<void*>(GetProcAddress(advapi, "EventRegister")));
+            write = reinterpret_cast<WriteFn>(reinterpret_cast<void*>(GetProcAddress(advapi, "EventWrite")));
+            static const GUID provider{0xaf6e87a6, 0x484f, 0x453b, {0xa9, 0x42, 0xbf, 0x4c, 0x0e, 0x9a, 0xda, 0x47}};
+            if (registerProvider == nullptr || write == nullptr || registerProvider(&provider, nullptr, nullptr, &handle) != 0) write = nullptr;
+        }
+        std::thread([this] { run(); }).detach();
+    }
+
+    Ring& local() {
+        thread_local Ring* ring = nullptr;
+        if (ring == nullptr) {
+            auto owned = std::make_unique<Ring>();
+            owned->thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+            ring = owned.get();
+            std::lock_guard lock(mutex);
+            rings.push_back(std::move(owned));
+        }
+        return *ring;
+    }
+
+    void run() {
+        std::uint32_t sequence = 0;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            ++sequence;
+            const Descriptor descriptor{static_cast<std::uint16_t>(1 + sequence % 60000), 0, 0, 4, 0, 0, 1};
+            const auto before = Now();
+            if (write != nullptr) write(handle, &descriptor, 0, nullptr);
+            const HoldLogRecord sync{0, sequence, before, Now()};
+            std::fwrite(&sync, sizeof(sync), 1, file);
+            std::lock_guard lock(mutex);
+            for (auto& ring : rings) {
+                auto first = ring->consumed.load(std::memory_order_relaxed);
+                const auto last = ring->written.load(std::memory_order_acquire);
+                while (first != last) {
+                    const auto count = std::min(last - first, Ring::Capacity - first % Ring::Capacity);
+                    std::fwrite(ring->records.get() + first % Ring::Capacity, sizeof(HoldLogRecord), count, file);
+                    first += count;
+                    ring->consumed.store(first, std::memory_order_release);
+                }
+                if (const auto lost = ring->lost.exchange(0, std::memory_order_relaxed); lost != 0) {
+                    const HoldLogRecord dropped{ring->thread, 0xffffffffu, lost, 0};
+                    std::fwrite(&dropped, sizeof(dropped), 1, file);
+                }
+            }
+            if (sequence % 10 == 0) std::fflush(file);
+        }
+    }
+
+    std::FILE* file;
+    WriteFn write = nullptr;
+    std::uint64_t handle = 0;
+    std::mutex mutex;
+    std::vector<std::unique_ptr<Ring>> rings;
+};
+thread_local std::uint64_t holdLogBegin = 0;
+#endif
+
 std::atomic<std::uint64_t> gpuHoldSerial{0};
 thread_local std::chrono::steady_clock::time_point recorderHoldStart{};
 thread_local std::uint64_t recorderHoldGeneration = 0;
@@ -5098,6 +5216,9 @@ bool GpuMutexType::tryEnter() {
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
+#ifdef _WIN32
+        if (HoldLog::Instance() != nullptr) holdLogBegin = HoldLog::Now();
+#endif
         recorderHoldGeneration = ArchB::Recorder::Generation();
         recorderHoldStart = ArchB::Recorder::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
@@ -5186,6 +5307,12 @@ void GpuMutexType::unlock() {
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockRelease, 0, 0, 0, 0, 0, Timeline::LockSite);
+#ifdef _WIN32
+        if (auto* log = HoldLog::Instance(); log != nullptr && holdLogBegin != 0) {
+            log->Push(LockStats().tag, holdLogBegin, HoldLog::Now());
+            holdLogBegin = 0;
+        }
+#endif
         mutex.unlock();
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
