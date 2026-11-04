@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -4615,8 +4616,21 @@ std::chrono::nanoseconds GpuLockPriorityWindow() {
     return window;
 }
 
+// LockSpinning with the Stage 4 wait scope (M1/M4) around a contended acquisition.
+static void lockSpinningTracked(Mutex& mutex) {
+    if (!Stage4::Tracking()) {
+        LockSpinning(mutex, HandoffSpinWindow());
+        return;
+    }
+    if (mutex.try_lock()) return;
+    Stage4::WaitScope wait(Stage4::Wait::GpuMutex, true);
+    if (SpinUntil(HandoffSpinWindow(), [&] { return mutex.try_lock(); })) return;
+    wait.Blocking();
+    mutex.lock();
+}
+
 void GpuMutexType::enter() {
-    if (!HeldByThisThread()) LockSpinning(mutex, HandoffSpinWindow());
+    if (!HeldByThisThread()) lockSpinningTracked(mutex);
 }
 
 bool GpuMutexType::tryEnter() {
@@ -4757,7 +4771,7 @@ void GpuMutexType::lock() {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {
                 const auto start = std::chrono::steady_clock::now();
-                LockSpinning(mutex, HandoffSpinWindow());
+                lockSpinningTracked(mutex);
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -4775,7 +4789,7 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
-        LockSpinning(mutex, HandoffSpinWindow());
+        lockSpinningTracked(mutex);
         acquired();
         if (depth == 1) stats.holdSite = site;
         const auto now = std::chrono::steady_clock::now();

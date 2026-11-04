@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -255,6 +256,8 @@ public:
     std::uint32_t result = 0xffffffffu;
 private:
     std::uint64_t id = 0;
+    // Stage 4 M1/M4: a fence or timeline wait of queue 0 or the committer (blocked from the start).
+    AgcDriver::Stage4::WaitScope stage4{AgcDriver::Stage4::Wait::Fence, false};
 };
 
 class WaitScope {

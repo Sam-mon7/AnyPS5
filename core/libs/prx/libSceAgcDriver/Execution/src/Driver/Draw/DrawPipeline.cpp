@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -19,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 
 namespace AgcDriver::Graphics {
@@ -614,7 +616,10 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
             // per frame, each a committer notify and a producer context switch).
             resumeAt = ArchB::Switches::Enabled(ArchB::Feature::PipeFullHysteresis) ? capacity / 2 : capacity - 1;
             ++idleWaiters;
-            idle.wait(lock, [&] { return items.size() <= resumeAt; });
+            {
+                const Stage4::WaitScope stage4Wait(Stage4::Wait::PipeFull, false);
+                idle.wait(lock, [&] { return items.size() <= resumeAt; });
+            }
             --idleWaiters;
             resumeAt = 0;
             const auto waited = elapsedNs(start);
@@ -768,6 +773,11 @@ void countAheadWindow(std::uint64_t enqueuedNs, std::uint64_t enqueueClock, std:
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     GuestMemory::MarkCommitterThread();
+    Stage4::BindRole(Stage4::Role::Committer);
+    // Stage 4 M4 (APS5_RESOLVE_CENSUS): the item's declared reads and writes, copied under the mutex
+    // (ReleaseRunningReads clears the running item's reads during its commit).
+    std::vector<Range> stage4Reads;
+    std::vector<Range> stage4Writes;
     StartCommitterSampler();
     static std::atomic<std::uint64_t> recorderCommits{0};
     static const bool registered = [] { ArchB::Recorder::RegisterCounter("draw_pipeline_commits", recorderCommits); return true; }();
@@ -781,9 +791,13 @@ void DrawPipeline::run() {
         // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
         const bool idleBefore = ArchB::Recorder::Enabled() && outstanding.load(std::memory_order_acquire) == 0;
         const auto idleStart = idleBefore ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        // Stage 4 M1: the committer idles (spins, then sleeps until queue 0 enqueues).
+        std::optional<Stage4::WaitScope> stage4Idle;
+        if (Stage4::Tracking() && outstanding.load(std::memory_order_acquire) == 0) stage4Idle.emplace(Stage4::Wait::Idle, true);
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
+            if (stage4Idle && items.empty() && !closing) stage4Idle->Blocking();
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
@@ -794,6 +808,7 @@ void DrawPipeline::run() {
             enqueuedNs = items.front().enqueuedNs;
             enqueueClock = items.front().enqueueClock;
         }
+        stage4Idle.reset();
         const auto start = std::chrono::steady_clock::now();
         if (idleBefore) {
             const auto idleNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - idleStart).count());
@@ -888,11 +903,15 @@ void DrawPipeline::drainUnlocked(DrainReason reason, std::uint32_t opcode, Drain
     if (finisherBusy) DrawFinisher::Get().Drain();
     if (!Busy()) return;
     const auto start = std::chrono::steady_clock::now();
+    std::optional<Stage4::WaitScope> stage4Wait;
+    if (Stage4::Tracking()) stage4Wait.emplace(Stage4::Wait::PipeDrain, true);
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
+    if (stage4Wait && !items.empty()) stage4Wait->Blocking();
     ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });
     --idleWaiters;
+    stage4Wait.reset();
     const auto index = static_cast<std::size_t>(reason);
     const auto waited = elapsedNs(start);
     ++drains[index];

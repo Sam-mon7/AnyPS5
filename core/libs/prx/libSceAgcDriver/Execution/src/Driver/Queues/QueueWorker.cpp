@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -144,6 +145,7 @@ void Driver::run(std::uint32_t id) noexcept {
     char role[32];
     std::snprintf(role, sizeof role, "queue worker 0x%x", id);
     PinWorkerThread(role);
+    if (id == 0) Stage4::BindRole(Stage4::Role::Queue0);
 
     GuestMemory::TagGpuLockThread(id);
     static const auto sampledQueue = [] {
@@ -181,6 +183,8 @@ void Driver::run(std::uint32_t id) noexcept {
             {
                 PerformanceContext timingContext(id == 0 ? frameTiming() : FrameTiming::Async());
                 PerformanceTimer timing("Driver.WorkerWait");
+                // Stage 4 M1: queue 0 waiting for the guest's next submission (and polling completions).
+                Stage4::WaitScope stage4Wait(Stage4::Wait::Submission, false);
                 std::unique_lock lock(mutex);
                 timing.Mark("mutex_wait");
                 auto& worker = workers.at(id);

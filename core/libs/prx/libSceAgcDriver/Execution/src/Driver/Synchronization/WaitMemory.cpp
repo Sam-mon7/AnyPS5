@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
 #include <mutex>
@@ -169,10 +170,21 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::optional<Graphics::Recorder::WaitProfile> waitProfile;
     if (profile) waitProfile.emplace(queue, awaited, awaitedBytes);
+    // Stage 4 M1 (APS5_PIPE_IDLE_ATTRIB, queue 0 only): the wait spins first, then sleeps (Blocking).
+    Stage4::WaitScope stage4Wait(Stage4::Wait::Label, true);
+    // Recorded GPU work pending over the label when the wait began (a Polled end then names the GPU).
+    const bool stage4GpuPending = stage4Wait.Active() && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
+    const auto stage4Writer = [&](std::uint32_t writer, bool table) {
+        if (!stage4Wait.Active()) return;
+        using W = Stage4::Writer;
+        stage4Wait.SetWriter(writer == queue ? (table ? W::OwnTable : W::OwnStore) : (table ? W::OtherTable : W::OtherStore), writer);
+    };
     const auto finishProfile = [&](Graphics::Recorder::WaitEnd end) {
         timelineWait.end = static_cast<std::uint32_t>(end);
         if (PipeDrainDiag()) ThreadWaitDiag().end = static_cast<int>(end);
         if (profile) waitProfile->end = end;
+        stage4Wait.SetEnd(static_cast<std::uint8_t>(end));
+        if (end == Graphics::Recorder::WaitEnd::Fence) stage4Wait.SetWriter(Stage4::Writer::Gpu, 0);
     };
     static const bool submitLabels = std::getenv("APS5_NO_WAIT_LABEL_SUBMIT") == nullptr;
     const auto submitWriter = [&](std::uint32_t writer, bool locked = false) {
@@ -198,6 +210,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
         submitWriter(writer);
         if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(writer);
+        stage4Writer(writer, false);
         if (writer != queue) {
             notePendingWait(packet, queue, received);
             epochPoint.reason = GuestMemory::Gen::TicketReason::WaitGpuLabel;
@@ -228,6 +241,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     const auto takeLabel = [&](const std::optional<Graphics::Recorder::LabelHit>& hit, Graphics::Recorder::LabelRefusal refusal, bool polling, bool unlockedHit) {
         behindCompletion = refusal == Graphics::Recorder::LabelRefusal::BehindCompletion;
         const bool trace = traceLateLabels() && (refusal != Graphics::Recorder::LabelRefusal::None || (hit.has_value() && hit->late));
+        if (stage4Wait.Active()) {
+            using R = Stage4::LabelReason;
+            constexpr R reasons[] = {R::NoEntry, R::TrustOff, R::Queued, R::Overwritten, R::Unclosed, R::BehindCompletion};
+            if (!hit.has_value()) stage4Wait.SetReason(static_cast<std::size_t>(refusal) < sizeof(reasons) / sizeof(reasons[0]) ? reasons[static_cast<std::size_t>(refusal)] : R::NoEntry);
+            else if (!Pm4::WaitComparesValue(packet, hit->value)) stage4Wait.SetReason(R::ValueMismatch);
+        }
         if (!hit.has_value() || !Pm4::WaitComparesValue(packet, hit->value)) {
             if (trace) traceLate(hit.has_value() ? "value mismatch" : "refused by the table", hit, refusal);
             return false;
@@ -236,6 +255,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (hit->generation == refusedGeneration) return false;
             if (!GuestMemory::UnchangedSinceCollected(awaited, awaitedBytes, hit->generation)) {
                 ++outcomes.lateRefusedCpuStore;
+                stage4Wait.SetReason(Stage4::LabelReason::LateCpuStore);
                 refusedGeneration = hit->generation;
                 if (trace) traceLate("refused, CPU store since the group closed", hit, refusal);
                 return false;
@@ -245,6 +265,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
         if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(hit->queue);
+        stage4Writer(hit->queue, true);
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
@@ -385,7 +406,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (reap) {
             const auto withWorkBefore = pollProfile ? Graphics::Recorder::ReapsWithWork() : 0;
             localDevice->ReapRecorded();
-            if ((profile || Timeline::Enabled) && Pm4::WaitSatisfiedUnchecked(packet)) finishProfile(Graphics::Recorder::WaitEnd::Fence);
+            if ((profile || Timeline::Enabled || stage4Wait.Active()) && Pm4::WaitSatisfiedUnchecked(packet)) finishProfile(Graphics::Recorder::WaitEnd::Fence);
             ++outcomes.pollReaps;
             if (pollProfile) {
                 ++poll.reaps;
@@ -416,6 +437,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
             submitWriter(writer);
             if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(writer);
+            stage4Writer(writer, false);
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
             finishProfile(Graphics::Recorder::WaitEnd::History);
@@ -425,8 +447,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (spinning) {
             _mm_pause();
             if ((polls & 63u) != 0) continue;
-            if (std::chrono::steady_clock::now() - spinStart > spinLimit) spinning = false;
+            if (std::chrono::steady_clock::now() - spinStart > spinLimit) {
+                spinning = false;
+                stage4Wait.Blocking();
+            }
         } else if (pauseSpin || polls >= 4000) {
+            stage4Wait.Blocking();
             PollSleep();
         } else {
             std::this_thread::yield();
@@ -434,7 +460,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         CheckFailure();
         if (pollService(!spinning)) return;
         if (storeHeldResults && !spinning && (polls & 31u) == 0) {
-            const bool pending = (profile || Timeline::Enabled) && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
+            const bool pending = (profile || Timeline::Enabled || stage4Wait.Active()) && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
             GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
             if (pending && Pm4::WaitSatisfiedUnchecked(packet)) finishProfile(Graphics::Recorder::WaitEnd::Fence);
         }
@@ -493,6 +519,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     }
     ++outcomes.polled;
     if (timelineWait.end != static_cast<std::uint32_t>(Graphics::Recorder::WaitEnd::Fence)) finishProfile(Graphics::Recorder::WaitEnd::Polled);
+    if (stage4Wait.Active() && timelineWait.end != static_cast<std::uint32_t>(Graphics::Recorder::WaitEnd::Fence)) {
+        // A store in the label history (a queue's packet) satisfies it, else recorded GPU work was
+        // pending over it, else no driver record: a guest thread's store.
+        std::uint32_t writer = queue;
+        if (storedSince(packet, awaited, awaitedBytes, received, &writer, nullptr)) stage4Writer(writer, false);
+        else stage4Wait.SetWriter(stage4GpuPending ? Stage4::Writer::Gpu : Stage4::Writer::Guest, 0);
+    }
 }
 
 }
