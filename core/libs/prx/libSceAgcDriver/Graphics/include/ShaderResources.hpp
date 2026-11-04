@@ -766,6 +766,25 @@ private:
     HostImportsProof epochImports;
     std::uint64_t profiledResourceEpoch = 0;
     std::vector<EpochImage> epochImages;
+    // Stage 4.2b (APS5_ARCHB_PIPE_RESOLVE_PROOFS): the last proof of step (1) (textures and storage
+    // images) kept by per-range stamps instead of global serials. It holds while the slow-moving
+    // serials of the resource epoch proof (pending registry, depth surfaces, mappings, forgets,
+    // unwatches) and the import table did not move, no texture was released or image evicted or
+    // re-uploaded, and every surface, key and storage range is still armed by the fault tracker from
+    // before `generation` (no CPU store) with no tracker stamp after it (no driver or GPU-result
+    // store). `generation` is the tracker generation read before that proof's first collect.
+    struct StampProof {
+        bool valid = false;
+        std::uint64_t generation = 0;
+        ResourceEpochProof serials;
+        HostImportsProof imports;
+        std::vector<EpochImage> images;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    };
+    StampProof stampProof;
+    static ResourceEpochProof currentStampSerials();
+    bool stampProofHolds();
+    void rememberStampProof(std::uint64_t generation, const ResourceEpochProof& serials, const HostImportsProof& imports);
     static ResourceEpochProof currentResourceEpochProof();
     bool canRememberResourceEpoch() const;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, bool epochProofs = false);
@@ -844,6 +863,9 @@ public:
     static std::uint64_t Finds();
     static std::uint64_t Touches();
     void Clear();
+    // Stage 4.2b: bumped (under the cache mutex) before every change of the index, so a Find answer
+    // taken at serial s is what Find would answer while the serial is still s.
+    std::uint64_t Mutations() const { return mutationSerial.load(std::memory_order_acquire); }
     std::size_t Size() const;
     std::size_t Capacity() const;
     void SetBase(std::size_t entries, std::size_t shrinkWindow);
@@ -853,6 +875,7 @@ public:
     static constexpr std::size_t MaximumEntries = 16384;
 
 private:
+    std::atomic<std::uint64_t> mutationSerial{0};
     void erase(const Key& key);
     void noteMiss(const Key& key);
     void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);

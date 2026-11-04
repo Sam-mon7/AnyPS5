@@ -1269,6 +1269,9 @@ void RecheckDrawPreparation(const Context& context, DrawPreparation& preparation
         preparation.resourceKey.clear();
         preparation.resolvedTemplate.reset();
         preparation.speculatedPipeline.reset();
+        preparation.resolvedFind = false;
+        preparation.resolvedOutputsKnown = false;
+        preparation.resolvedVertexInput.reset();
     }
     if (profile) preparation.collectInvalidated |= preparation.device != context.device || preparation.epoch != GuestMemory::ThreadCollectEpoch() || preparation.mapping != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || preparation.unwatch != GuestMemory::UnwatchSerial();
 }
@@ -1594,7 +1597,32 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+bool resolveHandoff() {
+    return AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeResolveHandoff);
+}
+
+// Stage 4.2b: handed-over resolve answers taken by apply (fragment outputs, vertex layouts, finds).
+struct HandoffCounters {
+    std::atomic<std::uint64_t> outputs{0};
+    std::atomic<std::uint64_t> vertexInputs{0};
+    std::atomic<std::uint64_t> finds{0};
+    std::atomic<std::uint64_t> findsStale{0};
+};
+
+HandoffCounters& handoffCounters() {
+    static auto* made = [] {
+        auto* counters = new HandoffCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_handoff_outputs", counters->outputs);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_handoff_vertex_inputs", counters->vertexInputs);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_handoff_finds", counters->finds);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_handoff_finds_stale", counters->findsStale);
+        return counters;
+    }();
+    return *made;
+}
+
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawPreparation* preparation = nullptr) {
+    const auto* handoff = recipe == nullptr && preparation != nullptr && preparation->device == context.device && preparation->resolved && resolveHandoff() ? preparation : nullptr;
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1640,6 +1668,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
+    } else if (handoff != nullptr && handoff->resolvedOutputsKnown) {
+        inputs.fragmentOutputs = handoff->resolvedOutputs;
+        outcome.validateMemoized = true;
+        outcome.validateHit = true;
+        inputs.shaderStages = PipelineStages(shaders);
+        handoffCounters().outputs.fetch_add(1, std::memory_order_relaxed);
     } else {
         inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
@@ -1814,6 +1848,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) {
         inputs.vertexInput = recipe->vertexInput;
+    } else if (!attributes.empty() && handoff != nullptr && handoff->resolvedVertexInput != nullptr) {
+        inputs.retainedVertexInput = handoff->resolvedVertexInput;
+        handoffCounters().vertexInputs.fetch_add(1, std::memory_order_relaxed);
     } else if (!attributes.empty()) {
         if (context.vertexInputs != nullptr) inputs.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
         if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = BuildVertexInputLayout(context, attributes);
@@ -2139,12 +2176,22 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && DrawResourcesCacheable(shaders);
     if (resolved.cacheable) {
+        bool keyFromPreparation = false;
         if (preparation != nullptr && preparation->device == context.device && !preparation->resourceKey.empty()) {
+            keyFromPreparation = true;
             resolved.contentKey = std::exchange(preparation->resourceKey, {});
             if (timer.profile) preparation->keyUsed = true;
         } else resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         lookupDiag::start();
-        auto cached = lookupMemo::find(resolved.contentKey);
+        std::shared_ptr<ShaderResources> cached;
+        const bool handedFind = keyFromPreparation && preparation->resolvedFind && resolveHandoff();
+        if (handedFind && SharedResourceCache().Mutations() == preparation->resolvedCacheSerial) {
+            cached = preparation->resolvedTemplate;
+            handoffCounters().finds.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (handedFind) handoffCounters().findsStale.fetch_add(1, std::memory_order_relaxed);
+            cached = lookupMemo::find(resolved.contentKey);
+        }
         lookupDiag::mark(lookupDiag::StepFind);
         if (timer.profile && preparation != nullptr && preparation->device != VK_NULL_HANDLE) preparation->cacheChanged |= cached.owner_before(preparation->cached) || preparation->cached.owner_before(cached);
         if (cached != nullptr) {
@@ -3244,7 +3291,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
-    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared.preparation);
     if (inputs.nothing) return false;
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -4087,12 +4134,14 @@ std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4:
             static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
             out.resourceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
             for (const auto word : out.resourceKey) plan = mixPlan(plan, word);
+            out.resolvedCacheSerial = SharedResourceCache().Mutations();
             cached = SharedResourceCache().Find(out.resourceKey);
+            out.resolvedFind = true;
         }
         out.device = context.device;
         out.resolved = true;
-        if (cached == nullptr) return plan;
         out.resolvedTemplate = cached;
+        if (cached == nullptr) return plan;
         cached->DescribedRanges(reads);
         if (resolvePrecollects() && !GuestMemory::IsCommitterThread() && GuestMemory::ThreadCollectEpoch() != 0) {
             const auto start = std::chrono::steady_clock::now();
@@ -4120,6 +4169,9 @@ std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4:
         }
         std::optional<State> masked;
         const State& pipelineState = pipelineStateFor(context, state, outputs, proxied, masked);
+        out.resolvedOutputsKnown = true;
+        out.resolvedOutputs = outputs;
+        if (!attributes.empty()) out.resolvedVertexInput = retained != nullptr ? retained : std::make_shared<const VertexInputLayout>(built);
         out.speculatedPipeline = CachedPipeline(context, pipelineState, retained != nullptr ? *retained : built, *cached, shaders, VK_IMAGE_LAYOUT_GENERAL);
         out.speculatedOutputs = outputs;
         out.speculatedProxied = proxied;
