@@ -3151,6 +3151,8 @@ struct ResolvePipelineCounters {
     std::atomic<std::uint64_t> misses{0};
     std::atomic<std::uint64_t> verified{0};
     std::atomic<std::uint64_t> mismatches{0};
+    std::atomic<std::uint64_t> precollectNs{0};
+    std::atomic<std::uint64_t> pipelineNs{0};
 };
 
 ResolvePipelineCounters& resolvePipelineCounters() {
@@ -3161,6 +3163,8 @@ ResolvePipelineCounters& resolvePipelineCounters() {
         AgcDriver::ArchB::Recorder::RegisterCounter("pipe_resolve_pipeline_misses", made->misses);
         AgcDriver::ArchB::Recorder::RegisterCounter("pipe_resolve_pipeline_verified", made->verified);
         AgcDriver::ArchB::Recorder::RegisterCounter("pipe_resolve_pipeline_mismatches", made->mismatches);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_resolve_precollect_ns", made->precollectNs);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_resolve_pipeline_ns", made->pipelineNs);
         return made;
     }();
     return *counters;
@@ -4090,11 +4094,16 @@ std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4:
         if (cached == nullptr) return plan;
         out.resolvedTemplate = cached;
         cached->DescribedRanges(reads);
-        if (resolvePrecollects() && !GuestMemory::IsCommitterThread() && GuestMemory::ThreadCollectEpoch() != 0) cached->PrecollectSurfaces(memoVirtualQuery);
+        if (resolvePrecollects() && !GuestMemory::IsCommitterThread() && GuestMemory::ThreadCollectEpoch() != 0) {
+            const auto start = std::chrono::steady_clock::now();
+            cached->PrecollectSurfaces(memoVirtualQuery);
+            resolvePipelineCounters().precollectNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        }
         if (recipe != nullptr || !resolvePipelines() || shaders.empty() || shaders.front().program == nullptr || state.colors.size() > 64) return plan;
         for (const auto& shader : shaders) {
             if (shader.program != nullptr && !shader.program->stencilReferences.empty()) return plan;
         }
+        const auto pipelineStart = std::chrono::steady_clock::now();
         bool memoized = false;
         bool hit = false;
         const auto outputs = CachedFragmentOutputs(context, shaders, state, memoized, hit);
@@ -4115,6 +4124,7 @@ std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4:
         out.speculatedOutputs = outputs;
         out.speculatedProxied = proxied;
         resolvePipelineCounters().speculated.fetch_add(1, std::memory_order_relaxed);
+        resolvePipelineCounters().pipelineNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pipelineStart).count()), std::memory_order_relaxed);
     } catch (...) {
         out = {};
         reads.clear();

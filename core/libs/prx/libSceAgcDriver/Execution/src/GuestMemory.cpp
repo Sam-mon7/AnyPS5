@@ -172,9 +172,12 @@ std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 // Stage 4.2: the committer's tracker-mutex acquisitions that waited and the time waited (resolver
 // walks hold the same mutex).
-thread_local bool trackerTimedThread = false;
+thread_local std::atomic<std::uint64_t>* trackerTimedWaits = nullptr;
+thread_local std::atomic<std::uint64_t>* trackerTimedWaitNs = nullptr;
 std::atomic<std::uint64_t> committerTrackerWaits{0};
 std::atomic<std::uint64_t> committerTrackerWaitNs{0};
+std::atomic<std::uint64_t> resolverTrackerWaits{0};
+std::atomic<std::uint64_t> resolverTrackerWaitNs{0};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -1723,11 +1726,11 @@ public:
                 lock = std::unique_lock<AgcDriver::Mutex>(tracker.mutex, std::adopt_lock);
                 return;
             }
-            if (trackerTimedThread && !lock.try_lock()) {
+            if (trackerTimedWaits != nullptr && !lock.try_lock()) {
                 const auto start = std::chrono::steady_clock::now();
                 lock.lock();
-                committerTrackerWaits.fetch_add(1, std::memory_order_relaxed);
-                committerTrackerWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+                trackerTimedWaits->fetch_add(1, std::memory_order_relaxed);
+                trackerTimedWaitNs->fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
                 return;
             }
             if (!lock.owns_lock()) lock.lock();
@@ -3510,12 +3513,15 @@ CommitterCollectCounters& CommitterCollects() {
 
 void MarkCommitterThread() {
     committerThread = true;
-    trackerTimedThread = true;
+    trackerTimedWaits = &committerTrackerWaits;
+    trackerTimedWaitNs = &committerTrackerWaitNs;
     MarkDriverThread();
 }
 
 void MarkResolverThread() {
     resolverThread = true;
+    trackerTimedWaits = &resolverTrackerWaits;
+    trackerTimedWaitNs = &resolverTrackerWaitNs;
     MarkDriverThread();
 }
 
@@ -3529,6 +3535,14 @@ std::atomic<std::uint64_t>& CommitterTrackerWaits() {
 
 std::atomic<std::uint64_t>& CommitterTrackerWaitNs() {
     return committerTrackerWaitNs;
+}
+
+std::atomic<std::uint64_t>& ResolverTrackerWaits() {
+    return resolverTrackerWaits;
+}
+
+std::atomic<std::uint64_t>& ResolverTrackerWaitNs() {
+    return resolverTrackerWaitNs;
 }
 
 void MarkDriverThread() {

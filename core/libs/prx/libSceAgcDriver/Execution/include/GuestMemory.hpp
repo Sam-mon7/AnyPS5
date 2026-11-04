@@ -155,6 +155,9 @@ bool ResolveShareActive();
 // The committer's tracker-mutex acquisitions that waited, and the nanoseconds waited.
 std::atomic<std::uint64_t>& CommitterTrackerWaits();
 std::atomic<std::uint64_t>& CommitterTrackerWaitNs();
+// The same for the resolver threads together.
+std::atomic<std::uint64_t>& ResolverTrackerWaits();
+std::atomic<std::uint64_t>& ResolverTrackerWaitNs();
 // APS5_ARCHB_WT_FAULT (see GuestMemory.cpp, libc GuestWriteFault.hpp): a driver thread's write faults
 // count apart; WtFaultFlip protects the pages written since the last flip (Driver::Present).
 void MarkDriverThread();
