@@ -412,6 +412,9 @@ unsigned long long CodeOffset(const void* address);
 // every read and store through this interface calls first. Code that reads guest memory directly
 // calls FlushGpuWrites itself.
 void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
+enum class TrackerEvent : std::uint8_t { Stamp, Unwatch, Forget };
+void SetStampObserver(void (*observer)(std::uint64_t begin, std::uint64_t end, TrackerEvent event));
+void SetArmObserver(void (*observer)());
 void SetWriteProfileHook(void (*hook)(std::uint64_t address, std::size_t bytes, std::uint32_t queue, std::uint32_t opcode));
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
 void GuardRead(std::uint64_t address, std::size_t bytes);

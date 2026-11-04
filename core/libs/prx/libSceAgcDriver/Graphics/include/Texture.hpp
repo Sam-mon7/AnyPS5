@@ -253,6 +253,7 @@ public:
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
     static void BumpPendingSerial();
+    void notePendingChange() const;
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
@@ -318,6 +319,7 @@ public:
     void NoteProved() const;
     // Whether the storage cache holds this image (set and cleared by the cache under its mutex, the
     // clear before the eviction's flush): what a lookup of its surface would return.
+    std::atomic<std::uint64_t> archcEpoch{1};
     bool Cached() const { return cached.load(std::memory_order_acquire); }
     void SetCached(bool value) { cached.store(value, std::memory_order_release); }
     // The pending image whose surface starts at `address` and covers at least `bytes` (a mip chain

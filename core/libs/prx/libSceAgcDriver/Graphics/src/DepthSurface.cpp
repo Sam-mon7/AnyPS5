@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -1796,6 +1797,7 @@ void noteStalePlane(std::uint64_t begin, std::uint64_t end) {
     if (std::find(planes.ranges.begin(), planes.ranges.end(), std::pair{begin, end}) != planes.ranges.end()) return;
     planes.ranges.emplace_back(begin, end);
     stalePlanesSerial.fetch_add(1, std::memory_order_release);
+    ArchC::ImageEpochs::Note(begin, end, ArchC::EpochSource::Depth, nullptr);
     publishStaleHull(planes);
 }
 
@@ -1844,6 +1846,7 @@ void retire(DepthSurface& surface) {
     std::lock_guard lock(planes.mutex);
     std::erase(planes.ranges, plane);
     stalePlanesSerial.fetch_add(1, std::memory_order_release);
+    ArchC::ImageEpochs::Note(plane.first, plane.second, ArchC::EpochSource::Depth, nullptr);
     publishStaleHull(planes);
 }
 
@@ -2021,6 +2024,9 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         lock.lock();
         releaseRetired(context);
         surfacesSerial.fetch_add(1, std::memory_order_release);
+        ArchC::ImageEpochs::Note(target.address, target.address + depthBytes, ArchC::EpochSource::Depth, nullptr);
+        if (stencilBytes != 0u) ArchC::ImageEpochs::Note(target.stencilAddress, target.stencilAddress + stencilBytes, ArchC::EpochSource::Depth, nullptr);
+        if (metadataBytes != 0u) ArchC::ImageEpochs::Note(target.htileAddress, target.htileAddress + metadataBytes, ArchC::EpochSource::Depth, nullptr);
         // Write generations: a new depth representation over its planes (meta, range-qualified).
         if (GuestMemory::Gen::Active()) {
             static_cast<void>(GuestMemory::Gen::Note(GuestMemory::Gen::Event::Representation, target.address, target.address + depthBytes, GuestMemory::Gen::Meta, 0, false));
@@ -2163,7 +2169,15 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
         }
         auto& planes = stalePlanes();
         std::lock_guard staleLock(planes.mutex);
-        if (planes.ranges != remaining) stalePlanesSerial.fetch_add(1, std::memory_order_release);
+        if (planes.ranges != remaining) {
+            stalePlanesSerial.fetch_add(1, std::memory_order_release);
+            for (const auto& range : planes.ranges) {
+                if (std::find(remaining.begin(), remaining.end(), range) == remaining.end()) ArchC::ImageEpochs::Note(range.first, range.second, ArchC::EpochSource::Depth, nullptr);
+            }
+            for (const auto& range : remaining) {
+                if (std::find(planes.ranges.begin(), planes.ranges.end(), range) == planes.ranges.end()) ArchC::ImageEpochs::Note(range.first, range.second, ArchC::EpochSource::Depth, nullptr);
+            }
+        }
         planes.ranges = std::move(remaining);
         publishStaleHull(planes);
     }
@@ -2425,6 +2439,7 @@ void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
     drawnDepth = nullptr;
     surfacesSerial.fetch_add(1, std::memory_order_release);
+    ArchC::ImageEpochs::InvalidateAll();
     std::erase_if(depthOwners(), [&](const auto& entry) { return entry.first.first == device; });
     std::erase_if(stencilOwners(), [&](const auto& entry) { return entry.first.first == device; });
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });

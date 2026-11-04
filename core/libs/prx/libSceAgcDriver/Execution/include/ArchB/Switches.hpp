@@ -72,6 +72,8 @@ enum class Feature : std::uint8_t {
     TargetSetupMemo,
     ZeroCopyStorage,
     ZeroCopyInputs,
+    ArchcImageEpochs,
+    ArchcTargetFastpath,
     Count
 };
 
