@@ -4090,10 +4090,7 @@ std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4:
         if (cached == nullptr) return plan;
         out.resolvedTemplate = cached;
         cached->DescribedRanges(reads);
-        if (resolvePrecollects() && !GuestMemory::IsCommitterThread()) {
-            GuestMemory::BumpCollectEpoch();
-            cached->PrecollectSurfaces(memoVirtualQuery);
-        }
+        if (resolvePrecollects() && !GuestMemory::IsCommitterThread() && GuestMemory::ThreadCollectEpoch() != 0) cached->PrecollectSurfaces(memoVirtualQuery);
         if (recipe != nullptr || !resolvePipelines() || shaders.empty() || shaders.front().program == nullptr || state.colors.size() > 64) return plan;
         for (const auto& shader : shaders) {
             if (shader.program != nullptr && !shader.program->stencilReferences.empty()) return plan;

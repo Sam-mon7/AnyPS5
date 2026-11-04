@@ -655,6 +655,14 @@ void DrawPipeline::FollowEpoch(std::uint64_t token, std::uint64_t ticket) {
     GuestMemory::FollowCollectShare(epochClock(token));
 }
 
+void DrawPipeline::FollowResolveEpoch(std::uint64_t token) {
+    if (resolverIndex == ResolverSlots) return;
+    static thread_local std::uint64_t followed = 0;
+    if (followed == token) return;
+    followed = token;
+    GuestMemory::BumpCollectEpoch();
+}
+
 bool DrawPipeline::ResolveSplitActive() {
     return ArchB::Switches::Enabled(ArchB::Feature::PipeResolveSplit);
 }

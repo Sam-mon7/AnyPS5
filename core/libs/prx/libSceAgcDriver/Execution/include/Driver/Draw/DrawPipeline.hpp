@@ -89,6 +89,10 @@ public:
         std::vector<Range> reads;
     };
     static bool ResolveSplitActive();
+    // A resolver thread starts a collect epoch of its own whenever the item it resolves carries a
+    // newer epoch token than its last one (no-op on the committer, which follows tokens in commits):
+    // its precollects for items of one token then share one memo, like the committer's.
+    static void FollowResolveEpoch(std::uint64_t token);
     static bool ResolvePoolActive();
     static std::string ResolveText();
 
