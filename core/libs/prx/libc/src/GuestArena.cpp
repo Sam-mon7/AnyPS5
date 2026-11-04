@@ -1,5 +1,6 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
 #include <atomic>
@@ -46,6 +47,8 @@ std::uint64_t GuestArenaQueryProtectionSerial_nid_no_patch() {
 BOOL GuestArenaVirtualProtect_nid_no_patch(void* address, SIZE_T bytes, DWORD protection, DWORD* previous) {
     queryProtectionWriters.fetch_add(1, std::memory_order_acq_rel);
     const auto result = VirtualProtect(address, bytes, protection, previous);
+    // The write tracker's pages take the new protection as the guest's (APS5_ARCHB_WT_FAULT).
+    GuestWtFaultForget_nid_no_patch(reinterpret_cast<std::uintptr_t>(address), bytes);
     queryProtectionSerial.fetch_add(1, std::memory_order_release);
     queryProtectionWriters.fetch_sub(1, std::memory_order_release);
     return result;
@@ -466,6 +469,7 @@ std::invalid_argument OutsideArena(const char* operation, const void* pointer, s
 #ifdef _WIN32
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
     WindowsMappings::Get().SetProtection(address, bytes, protection);
+    GuestWtFaultForget_nid_no_patch(address, bytes);
     noteAccess(reinterpret_cast<const void*>(address), bytes);
 }
 
@@ -543,6 +547,7 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("commit", pointer, bytes);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     const auto created = WindowsMappings::Get().Commit(pointer, bytes, protection, granule, Arena::Get().WriteWatched());
+    GuestWtFaultForget_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) {
         for (const auto& [address, size] : created) callback(address, size, generation);
     }
@@ -552,11 +557,13 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
     WindowsMappings::Get().Reset(pointer, bytes);
+    GuestWtFaultForget_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("shared mapping", pointer, bytes);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false);
+    GuestWtFaultForget_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     noteAccess(pointer, bytes);
 }
 
@@ -570,6 +577,7 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
     } catch (...) {
         failure = std::current_exception();
     }
+    GuestWtFaultForget_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     try {
         if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) {
             for (const auto& [address, size] : created) callback(address, size, generation);
@@ -585,6 +593,7 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
 void GuestArenaMapFile_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection, std::uint32_t viewProtection, std::size_t sectionBytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("file mapping", pointer, bytes);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false, viewProtection, sectionBytes);
+    GuestWtFaultForget_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) {
@@ -697,6 +706,9 @@ void GuestArenaSetHostWriteObserver_nid_no_patch(void (*observer)(std::uintptr_t
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
     noteHostWrite(pointer, bytes, false);
 #ifdef _WIN32
+    // A kernel-mode write fails on a page the write tracker protected instead of faulting: the range
+    // stays open until EndHostWrite (APS5_ARCHB_WT_FAULT).
+    GuestWtFaultHold_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else
     GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(pointer, bytes);
@@ -706,17 +718,21 @@ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 
 #ifdef _WIN32
 bool GuestArenaBeginHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
+    // A host-pointer import probes and locks the pages: they stay open for its duration (APS5_ARCHB_WT_FAULT).
+    GuestWtFaultHold_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
 }
 
 void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
     WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
+    GuestWtFaultRelease_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 #endif
 
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #ifdef _WIN32
     WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    GuestWtFaultRelease_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else
     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);
 #endif

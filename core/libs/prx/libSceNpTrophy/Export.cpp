@@ -157,7 +157,10 @@ int CopyIcon(const Context& context, const std::string& name, void* buffer, std:
     if (*size < entry->second.size) return NP_TROPHY_ERROR_INSUFFICIENT_BUFFER;
     std::ifstream file(context.package, std::ios::binary);
     file.seekg(static_cast<std::streamoff>(entry->second.offset));
-    if (!file.read(static_cast<char*>(buffer), static_cast<std::streamsize>(entry->second.size))) return NP_TROPHY_ERROR_INVALID_TRP_FILE_FORMAT;
+    // Through a host buffer: a kernel-mode read fails on a guest page the write tracker protected.
+    std::vector<char> bounce(entry->second.size);
+    if (!file.read(bounce.data(), static_cast<std::streamsize>(bounce.size()))) return NP_TROPHY_ERROR_INVALID_TRP_FILE_FORMAT;
+    std::memcpy(buffer, bounce.data(), bounce.size());
     *size = entry->second.size;
     return 0;
 }

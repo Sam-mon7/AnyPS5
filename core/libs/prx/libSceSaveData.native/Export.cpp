@@ -564,10 +564,14 @@ static int getSaveDataMemory2(SaveDataMemoryGet2* get_param) {
             return SAVE_DATA_ERROR_INTERNAL;
         }
         f.seekg(static_cast<std::streamoff>(d->offset));
-        f.read(static_cast<char*>(d->buf), static_cast<std::streamsize>(d->buf_size));
+        // Through a host buffer: ifstream reads large requests straight into the destination from
+        // kernel mode, which fails on a guest page the write tracker protected (APS5_ARCHB_WT_FAULT).
+        std::vector<char> bounce(d->buf_size);
+        f.read(bounce.data(), static_cast<std::streamsize>(bounce.size()));
         if (!f) {
             return SAVE_DATA_ERROR_INTERNAL;
         }
+        std::memcpy(d->buf, bounce.data(), bounce.size());
     }
     if (get_param->param != nullptr) {
         std::memset(get_param->param, 0, sizeof(SaveDataParam));

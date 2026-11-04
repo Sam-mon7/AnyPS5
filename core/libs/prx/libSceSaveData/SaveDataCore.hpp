@@ -286,8 +286,12 @@ bool read_blob(const std::filesystem::path& path, void* data, std::size_t size) 
     if (!file) {
         return false;
     }
-    file.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
-    return static_cast<std::size_t>(file.gcount()) == size;
+    // Through a host buffer: a kernel-mode read fails on a guest page the write tracker protected.
+    std::vector<char> bounce(size);
+    file.read(bounce.data(), static_cast<std::streamsize>(size));
+    if (static_cast<std::size_t>(file.gcount()) != size) return false;
+    std::memcpy(data, bounce.data(), size);
+    return true;
 }
 
 int write_u64(const std::filesystem::path& path, std::uint64_t value) {

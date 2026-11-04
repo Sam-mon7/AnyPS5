@@ -1,5 +1,6 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libc/include/Api.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -381,6 +382,8 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
  #ifdef _WIN32
  MEMORY_BASIC_INFORMATION host{};
  if (VirtualQuery(addr, &host, sizeof(host)) == 0 || host.State != MEM_COMMIT) return SCE_KERNEL_ERROR_EACCES;
+ // A page the write tracker protected reads as the guest's writable protection (APS5_ARCHB_WT_FAULT).
+ host.Protect = GuestArena::GuestWtFaultGuestProtection_nid_no_patch(reinterpret_cast<uintptr_t>(addr) & ~uintptr_t{4095}, 4096, host.Protect);
  info->start = reinterpret_cast<uintptr_t>(host.BaseAddress);
  info->end = info->start + host.RegionSize;
  const bool writable = (host.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0;

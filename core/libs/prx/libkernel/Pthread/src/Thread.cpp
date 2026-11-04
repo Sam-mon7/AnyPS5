@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include "prx/libkernel/Pthread/include/ThreadLifecycle.hpp"
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/include/Api.hpp"
@@ -357,6 +358,7 @@ static void RestoreStackPages(std::uintptr_t start, std::size_t bytes) noexcept 
     DWORD previous = 0;
     const bool restored = VirtualAlloc(reinterpret_cast<void*>(start), bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr &&
         VirtualProtect(reinterpret_cast<void*>(start), bytes, PAGE_READWRITE, &previous) != 0;
+    GuestArena::GuestWtFaultForget_nid_no_patch(start, bytes);
 #else
     const bool restored = ::mprotect(reinterpret_cast<void*>(start), bytes, PROT_READ | PROT_WRITE) == 0;
 #endif

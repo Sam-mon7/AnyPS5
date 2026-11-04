@@ -2,6 +2,7 @@
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -173,6 +174,8 @@ static int mprotect(void* addr, size_t len, int prot) {
         }
         cursor = regionEnd;
     }
+    // The protection set above is the guest's: the write tracker forgets these pages (APS5_ARCHB_WT_FAULT).
+    GuestArena::GuestWtFaultForget_nid_no_patch(reinterpret_cast<std::uintptr_t>(addr), len);
     return 0;
 }
 #endif
@@ -1084,7 +1087,9 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bo
             const auto recorded = replacement.emplace(start, ProtectedRange{start + len, ReportedProtection(prot)}).first;
             result = SCE_KERNEL_ERROR_ENOMEM;
             if (!VirtualFree(*addr, len, MEM_DECOMMIT)) return false;
-            if (VirtualAlloc(*addr, len, MEM_COMMIT, WinProtFromPosix(LinuxProtFromSce(prot))) != *addr) {
+            const bool recommitted = VirtualAlloc(*addr, len, MEM_COMMIT, WinProtFromPosix(LinuxProtFromSce(prot))) == *addr;
+            GuestArena::GuestWtFaultForget_nid_no_patch(reinterpret_cast<std::uintptr_t>(*addr), len);
+            if (!recommitted) {
                 const auto error = GetLastError();
                 recorded->second.prot = 0;
                 g_protections.swap(replacement);
