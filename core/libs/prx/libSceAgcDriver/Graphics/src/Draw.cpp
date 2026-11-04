@@ -5610,7 +5610,7 @@ int ArchcTakeReplayOutcome() {
 }
 
 bool ArchcReplayLikely(VkDevice device, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity* identity, bool pipelineStateReuse) {
-    if (identity == nullptr || !draw.indirect.has_value() || !archcSlots::active() || !archcSlots::usableIdentity(*identity, state, shaders) || archcSlots::verifyPeriod() != 0) return false;
+    if (identity == nullptr || !draw.indirect.has_value() || !archcSlots::active() || !archcSlots::usableIdentity(*identity, state, shaders)) return false;
     const auto* slot = archcSlots::lookup(device, state, draw, shaders, *identity, pipelineStateReuse);
     if (slot == nullptr || !slot->replayedLast) return false;
     archcSlots::counters().prelockSkips.fetch_add(1, std::memory_order_relaxed);
