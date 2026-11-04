@@ -4024,7 +4024,7 @@ bool ShaderResources::stampProofHolds() {
 }
 
 void ShaderResources::rememberStampProof(std::uint64_t generation, const ResourceEpochProof& serials, const HostImportsProof& imports) {
-    stampProof.valid = false;
+    setStampValid(false);
     stampProof.images.clear();
     stampProof.ranges.clear();
     auto& skips = stampProofCounters().skips;
@@ -4069,7 +4069,7 @@ void ShaderResources::rememberStampProof(std::uint64_t generation, const Resourc
     stampProof.generation = generation;
     stampProof.serials = serials;
     stampProof.imports = imports;
-    stampProof.valid = true;
+    setStampValid(true);
     stampProofCounters().remembered.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -4162,7 +4162,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     const auto stampGeneration = stampProofs ? GuestMemory::WriteGeneration() : 0;
     const auto stampSerials = stampProofs ? currentStampSerials() : ResourceEpochProof{};
     const auto stampImports = stampProofs ? HostImportsIdentity(context, false) : HostImportsProof{};
-    if (!stampProofs) stampProof.valid = false;
+    if (!stampProofs) setStampValid(false);
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
         CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
@@ -4217,7 +4217,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     bool stampReused = false;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
         if (ok) AgcDriver::ArchB::Recorder::Count(fast ? (epochReused ? "proof_fast_pass_epoch" : stampReused ? "proof_fast_pass_stamp_memo" : "proof_fast_pass_stamps") : "proof_full_pass");
-        if (!ok) stampProof.valid = false;
+        if (!ok) setStampValid(false);
         if (!ok) AgcDriver::ArchB::Recorder::Count("proof_failed");
         if (ok) provedOnce = true;
         if (epochProofs && !ok) resourceEpochProof = {};
@@ -4335,7 +4335,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                 const auto count = counters.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
                 if ((count & (count - 1)) == 0) std::fprintf(stderr, "[rescache] PIPE_RESOLVE_PROOFS_VERIFY: the stamp memo held where the fast proof failed (reason %zu; %llu so far)\n", static_cast<std::size_t>(verifyReason), static_cast<unsigned long long>(count));
                 stampReused = false;
-                stampProof.valid = false;
+                setStampValid(false);
             }
         }
     }
@@ -4487,7 +4487,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (stampProofs && !stampReused) {
         if (StorageTexture::PendingSerial() == serialBefore && currentStampSerials() == stampSerials && HostImportsIdentity(context, false) == stampImports) rememberStampProof(stampGeneration, stampSerials, stampImports);
         else {
-            stampProof.valid = false;
+            setStampValid(false);
             stampProofCounters().skips[static_cast<std::size_t>(StampSkip::Moved)].fetch_add(1, std::memory_order_relaxed);
         }
     }

@@ -1654,6 +1654,36 @@ HandoffCounters& handoffCounters() {
     return *made;
 }
 
+// APS5_ARCHB_PRELOCK_FIND_HANDOFF (census 2): finds the locked draw took from its unlocked preparation,
+// handed finds refused because the cache index changed, and in _VERIFY mode the finds repeated and
+// those that answered another object.
+struct PrelockFindCounters {
+    std::atomic<std::uint64_t> handoffs{0};
+    std::atomic<std::uint64_t> stale{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> mismatches{0};
+};
+
+PrelockFindCounters& prelockFindCounters() {
+    static auto* made = [] {
+        auto* counters = new PrelockFindCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("prelock_find_handoffs", counters->handoffs);
+        AgcDriver::ArchB::Recorder::RegisterCounter("prelock_find_stale", counters->stale);
+        AgcDriver::ArchB::Recorder::RegisterCounter("prelock_find_verified", counters->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("prelock_find_mismatches", counters->mismatches);
+        return counters;
+    }();
+    return *made;
+}
+
+bool prelockFindVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_PRELOCK_FIND_HANDOFF_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawPreparation* preparation = nullptr) {
     const auto* handoff = recipe == nullptr && preparation != nullptr && preparation->device == context.device && preparation->resolved && resolveHandoff() ? preparation : nullptr;
     DrawInputs inputs;
@@ -2231,11 +2261,24 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         lookupDiag::start();
         std::shared_ptr<ShaderResources> cached;
         const bool handedFind = keyFromPreparation && preparation->resolvedFind && resolveHandoff();
-        if (handedFind && SharedResourceCache().Mutations() == preparation->resolvedCacheSerial) {
+        const bool prelockFind = !handedFind && keyFromPreparation && preparation->resolvedFind && !preparation->resolved && ArchB::Switches::Enabled(ArchB::Feature::PrelockFindHandoff);
+        if ((handedFind || prelockFind) && SharedResourceCache().Mutations() == preparation->resolvedCacheSerial) {
             cached = preparation->resolvedTemplate;
-            handoffCounters().finds.fetch_add(1, std::memory_order_relaxed);
+            if (handedFind) handoffCounters().finds.fetch_add(1, std::memory_order_relaxed);
+            else {
+                auto& counters = prelockFindCounters();
+                counters.handoffs.fetch_add(1, std::memory_order_relaxed);
+                if (prelockFindVerify()) {
+                    counters.verified.fetch_add(1, std::memory_order_relaxed);
+                    if (lookupMemo::find(resolved.contentKey) != cached) {
+                        const auto count = counters.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if ((count & (count - 1)) == 0) std::fprintf(stderr, "[draw] PRELOCK_FIND_HANDOFF_VERIFY: a handed find differs from the locked find (%llu so far)\n", static_cast<unsigned long long>(count));
+                    }
+                }
+            }
         } else {
             if (handedFind) handoffCounters().findsStale.fetch_add(1, std::memory_order_relaxed);
+            if (prelockFind) prelockFindCounters().stale.fetch_add(1, std::memory_order_relaxed);
             cached = lookupMemo::find(resolved.contentKey);
         }
         lookupDiag::mark(lookupDiag::StepFind);
@@ -4064,6 +4107,56 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 
 }
 
+namespace {
+// APS5_ARCHB_PRELOCK_STAMP_SKIP (census 2, 2026-11-04): template surface precollects made, skipped,
+// and in _VERIFY mode (skipped ones collected anyway) the time and walks the skip would have removed.
+struct PrelockStampSkipCounters {
+    std::atomic<std::uint64_t> precollects{0};
+    std::atomic<std::uint64_t> skips{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> verifyWalks{0};
+    std::atomic<std::uint64_t> verifyNs{0};
+};
+
+PrelockStampSkipCounters& prelockStampSkipCounters() {
+    static PrelockStampSkipCounters* const made = [] {
+        auto* counters = new PrelockStampSkipCounters;
+        AgcDriver::ArchB::Recorder::RegisterCounter("prelock_precollects", counters->precollects);
+        AgcDriver::ArchB::Recorder::RegisterCounter("prelock_stamp_skips", counters->skips);
+        AgcDriver::ArchB::Recorder::RegisterCounter("prelock_stamp_skip_verified", counters->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("prelock_stamp_skip_verify_walks", counters->verifyWalks);
+        AgcDriver::ArchB::Recorder::RegisterCounter("prelock_stamp_skip_verify_ns", counters->verifyNs);
+        return counters;
+    }();
+    return *made;
+}
+
+bool prelockStampSkipVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_PRELOCK_STAMP_SKIP_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+void prelockPrecollect(const ShaderResources& cached, bool memoVirtualQuery) {
+    auto& counters = prelockStampSkipCounters();
+    if (!cached.StampProofArmed() || !ArchB::Switches::Enabled(ArchB::Feature::PrelockStampSkip)) {
+        counters.precollects.fetch_add(1, std::memory_order_relaxed);
+        cached.PrecollectSurfaces(memoVirtualQuery);
+        return;
+    }
+    counters.skips.fetch_add(1, std::memory_order_relaxed);
+    if (!prelockStampSkipVerify()) return;
+    const auto walks = GuestMemory::CommitterCollects().walks.load(std::memory_order_relaxed);
+    const auto start = std::chrono::steady_clock::now();
+    cached.PrecollectSurfaces(memoVirtualQuery);
+    counters.verifyNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    counters.verifyWalks.fetch_add(GuestMemory::CommitterCollects().walks.load(std::memory_order_relaxed) - walks, std::memory_order_relaxed);
+    counters.verified.fetch_add(1, std::memory_order_relaxed);
+}
+}
+
 DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery, DrawPreparation* resolved) {
     // Stage 4 M4: the committer's unlocked preparation (precollects, template find, target proofs).
     Stage4::Mark(Stage4::Bucket::Pre);
@@ -4117,9 +4210,15 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
     } else if (RecordDraws() && DumpTargetLimit() == 0 && DrawResourcesCacheable(shaders)) {
         static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
         prepared.resourceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
+        const bool handoff = ArchB::Switches::Enabled(ArchB::Feature::PrelockFindHandoff);
+        if (handoff) prepared.resolvedCacheSerial = SharedResourceCache().Mutations();
         cached = SharedResourceCache().Find(prepared.resourceKey);
+        if (handoff) {
+            prepared.resolvedFind = true;
+            prepared.resolvedTemplate = cached;
+        }
     }
-    if (cached != nullptr && collect) cached->PrecollectSurfaces(memoVirtualQuery);
+    if (cached != nullptr && collect) prelockPrecollect(*cached, memoVirtualQuery);
     if (collect && residentTargets && context.detiler != nullptr && StorageTexture::DrawTargetPrelockEnabled()) {
         const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         prepared.targets.resize(state.colors.size());

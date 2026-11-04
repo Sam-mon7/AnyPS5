@@ -51,6 +51,7 @@ constexpr Feature PipeDrawLookupMemoPrerequisites[] = {Feature::PipeQ0Committer}
 constexpr Feature WtFaultPrerequisites[] = {Feature::WtFault};
 constexpr Feature PipeResolveSplitPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeResolvePoolPrerequisites[] = {Feature::PipeQ0Committer, Feature::PipeResolveSplit};
+constexpr Feature PrelockStampSkipPrerequisites[] = {Feature::WtFault, Feature::PipeResolveProofs};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -123,6 +124,12 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // submit and at GPU completion (Recorder zero-copy checks).
     {Feature::ZeroCopyStorage, "ZERO_COPY_STORAGE", false, true, {}},
     {Feature::ZeroCopyInputs, "ZERO_COPY_INPUTS", false, true, {}},
+    // Census 2 (2026-11-04): the committer's unlocked draw preparation skips a template's surface
+    // precollect when the template's stamp proof is armed (its locked proof then collects nothing).
+    {Feature::PrelockStampSkip, "PRELOCK_STAMP_SKIP", false, true, PrelockStampSkipPrerequisites},
+    // Census 2: the locked draw takes the template its unlocked preparation found (no second
+    // resource-cache Find) while the cache index did not change in between.
+    {Feature::PrelockFindHandoff, "PRELOCK_FIND_HANDOFF", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

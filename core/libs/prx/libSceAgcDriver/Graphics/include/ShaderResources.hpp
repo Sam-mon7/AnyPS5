@@ -343,6 +343,9 @@ public:
     // Walks the write watch over every image surface of a completed object (no device lock: the
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces(bool memoVirtualQuery = false) const;
+    // APS5_ARCHB_PRELOCK_STAMP_SKIP: the last proof left a stamp proof armed (PIPE_RESOLVE_PROOFS), so
+    // the next locked Revalidate first tries it, and it collects nothing (readable without the lock).
+    bool StampProofArmed() const noexcept { return stampArmed.load(std::memory_order_relaxed); }
     // The ranges PrecollectSurfaces collects, appended as [begin, end) (Stage 4.1 resolve read set).
     void DescribedRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
     bool Reusable() const { return reusable; }
@@ -786,6 +789,11 @@ private:
         std::vector<StorageTexture::PendingQuery> pending;
     };
     StampProof stampProof;
+    std::atomic<bool> stampArmed{false};
+    void setStampValid(bool valid) {
+        stampProof.valid = valid;
+        stampArmed.store(valid, std::memory_order_relaxed);
+    }
     bool stampEligible() const;
     static ResourceEpochProof currentStampSerials();
     bool stampProofHolds();
