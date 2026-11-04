@@ -70,6 +70,9 @@ struct WtFaultCounters {
     std::uint64_t logAppends = 0;
     std::uint64_t logLost = 0;
     std::uint64_t coldRearmed = 0;
+    std::uint64_t watchFaults = 0;
+    std::uint64_t watchHandlerNs = 0;
+    std::uint64_t watchedPages = 0;
 };
 
 struct WtFaultMismatch {
@@ -154,6 +157,12 @@ std::size_t GuestWtFaultLogRead_nid_no_patch(std::uint64_t* cursor, std::uint64_
 void GuestWtFaultSetCold_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool cold);
 void GuestWtFaultLogAppendForTest_nid_no_patch(std::uint64_t entry);
 bool GuestWtFaultStoredLastFrame_nid_no_patch(std::uintptr_t address);
+std::size_t GuestWtFaultWatch_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::size_t GuestWtFaultUnwatch_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+bool GuestWtFaultHandleRead_nid_no_patch(std::uintptr_t address);
+std::uint64_t GuestWtFaultWatchLogHead_nid_no_patch();
+std::size_t GuestWtFaultWatchLogRead_nid_no_patch(std::uint64_t* cursor, std::uint64_t* entries, std::uint64_t* stamps, std::size_t capacity, bool* lost);
+std::uint64_t GuestWtFaultTicks_nid_no_patch(double* nsPerTick);
 
 }
 
@@ -176,6 +185,13 @@ inline constexpr std::uint64_t WtFaultLogOpen = 3;
 inline constexpr std::uint64_t WtFaultLogForgetBegin = 4;
 inline constexpr std::uint64_t WtFaultLogForgetEnd = 5;
 inline constexpr std::size_t WtFaultLogSlots = 65536;
+inline constexpr std::uint64_t WtWatchRead = 1;
+inline constexpr std::uint64_t WtWatchWrite = 2;
+inline constexpr std::uint64_t WtWatchHold = 3;
+inline constexpr std::uint64_t WtWatchOpen = 4;
+inline constexpr std::uint64_t WtWatchForget = 5;
+inline constexpr std::uint64_t WtWatchKindMask = 7;
+inline constexpr std::uint64_t WtWatchDriver = 8;
 
 }
 

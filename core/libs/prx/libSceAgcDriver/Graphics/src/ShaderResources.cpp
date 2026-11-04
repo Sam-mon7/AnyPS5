@@ -47,6 +47,7 @@
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -7743,6 +7744,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
+    const ArchC::LazyCensus::UseScope censusScope;
     guestMemory.RecordCopyBacks(recorder);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.

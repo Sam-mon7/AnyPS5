@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteFault.hpp"
@@ -2397,6 +2398,96 @@ void CheckArchcLog() {
     std::cout << "agc_archc_cold_page_rearmed: ok\n";
 }
 
+void CheckArchcWatch() {
+    using namespace GuestArena;
+    using namespace AgcDriver::Graphics::ArchC;
+    Require(WtFault().active, "the fault tracker did not turn on with write watching");
+    const auto state = [](std::uint64_t address) { return GuestWtFaultWord_nid_no_patch(address) & WtFaultStateMask; };
+    const auto protection = [](std::uint64_t address) {
+        MEMORY_BASIC_INFORMATION memory{};
+        VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory));
+        return memory.Protect;
+    };
+    constexpr std::uint64_t Page = 4096;
+    PartlyCommitted range;
+    range.Commit(0);
+    const auto base = range.Address();
+    volatile std::uint8_t* data = range.Data();
+    std::memset(range.Data(), 0x11, Block);
+    BumpCollectEpoch();
+    CollectWrites(base, Block);
+    WtFaultFlip();
+    WtFaultFlip();
+    Require(state(base) == WtFaultArmed && state(base + 4 * Page) == WtFaultArmed, "the watch fixture was not armed");
+    std::array<std::uint64_t, 16> entries{};
+    std::array<std::uint64_t, 16> stamps{};
+    bool lost = false;
+    auto cursor = GuestWtFaultWatchLogHead_nid_no_patch();
+
+    Require(GuestWtFaultWatch_nid_no_patch(base, 2 * Page) == 2, "two armed pages were not watched");
+    Require(protection(base) == PAGE_NOACCESS && state(base) == WtFaultArmed, "a watched armed page is not PAGE_NOACCESS and armed");
+    Require(GuestWtFaultGuestProtection_nid_no_patch(base, Page, PAGE_NOACCESS) == PAGE_READWRITE, "a probe of a watched page does not read the guest protection");
+    Require(data[0x10] == 0x11, "a watched page read the wrong byte");
+    auto count = GuestWtFaultWatchLogRead_nid_no_patch(&cursor, entries.data(), stamps.data(), entries.size(), &lost);
+    Require(count == 1 && !lost && (entries[0] & ~WtWatchDriver) == (base | WtWatchRead) && stamps[0] != 0, "a read of a watched page was not logged once as a read");
+    Require(state(base) == WtFaultArmed && protection(base) == PAGE_READONLY, "a read of a watched page did not leave it armed and read-only");
+    const auto storeCursor = GuestWtFaultLogHead_nid_no_patch();
+    data[Page + 8] = 0x33;
+    count = GuestWtFaultWatchLogRead_nid_no_patch(&cursor, entries.data(), stamps.data(), entries.size(), &lost);
+    Require(count == 1 && (entries[0] & ~WtWatchDriver) == ((base + Page) | WtWatchWrite), "a store into a watched armed page was not logged as a write");
+    Require(GuestWtFaultLogHead_nid_no_patch() == storeCursor + 1 && state(base + Page) == WtFaultOpen && data[Page + 8] == 0x33, "a store into a watched armed page did not open it through the write tracker");
+    std::cout << "agc_archc_watch_read_write: ok\n";
+
+    Require(GuestWtFaultWatch_nid_no_patch(base + Page, Page) == 1 && protection(base + Page) == PAGE_NOACCESS, "an open page was not watched");
+    WtFaultFlip();
+    Require(state(base + Page) == WtFaultOpen && protection(base + Page) == PAGE_NOACCESS, "an arm took a watched open page");
+    data[Page + 16] = 0x44;
+    count = GuestWtFaultWatchLogRead_nid_no_patch(&cursor, entries.data(), stamps.data(), entries.size(), &lost);
+    Require(count == 1 && (entries[0] & ~WtWatchDriver) == ((base + Page) | WtWatchWrite) && state(base + Page) == WtFaultOpen && data[Page + 16] == 0x44, "a store into a watched open page was not logged or did not land");
+    std::cout << "agc_archc_watch_open_page: ok\n";
+
+    Require(GuestWtFaultWatch_nid_no_patch(base + 2 * Page, 2 * Page) == 2, "the hold fixture was not watched");
+    {
+        const GuestArena::HostWrite scope(reinterpret_cast<void*>(base + 2 * Page), Page);
+        data[2 * Page] = 0x55;
+    }
+    count = GuestWtFaultWatchLogRead_nid_no_patch(&cursor, entries.data(), stamps.data(), entries.size(), &lost);
+    Require(count == 1 && (entries[0] & ~WtWatchDriver) == ((base + 2 * Page) | WtWatchHold), "a hold over a watched page was not logged as an OS access");
+    Require(GuestWtFaultUnwatch_nid_no_patch(base + 3 * Page, Page) == 1 && protection(base + 3 * Page) == PAGE_READONLY && state(base + 3 * Page) == WtFaultArmed, "an unwatch did not restore the armed protection");
+    Require(GuestWtFaultWatchLogHead_nid_no_patch() == cursor, "an unwatch was logged");
+    Require(data[3 * Page] == 0x11, "an unwatched page read the wrong byte");
+    Require(GuestWtFaultWatchLogHead_nid_no_patch() == cursor, "a read after an unwatch faulted into the log");
+    std::cout << "agc_archc_watch_hold_unwatch: ok\n";
+
+    if (!LazyCensus::Enabled()) return;
+    LazyCensus::ResetForTest();
+    const auto copyBack = base + 8 * Page;
+    const auto twice = base + 10 * Page;
+    const auto aged = base + 12 * Page;
+    WtFaultFlip();
+    LazyCensus::Published(copyBack, copyBack + 2 * Page, LazyCensus::Kind::StagingCopyBack, 30);
+    LazyCensus::Published(twice, twice + Page, LazyCensus::Kind::WriteBack, 7);
+    {
+        const LazyCensus::UseScope scope;
+        LazyCensus::Published(aged, aged + Page, LazyCensus::Kind::ShadowPublish, 7);
+        LazyCensus::UsedByGpu(aged, aged + Page, LazyCensus::GpuUse::Write);
+    }
+    Require(data[8 * Page + Page + 4] == 0x11, "a published page read the wrong byte");
+    LazyCensus::UsedByGpu(copyBack, copyBack + Page, LazyCensus::GpuUse::StagingIn);
+    LazyCensus::Published(twice, twice + Page, LazyCensus::Kind::WriteBack, 7);
+    LazyCensus::UsedByGpu(twice, twice + Page, LazyCensus::GpuUse::StagingIn);
+    LazyCensus::Flip();
+    LazyCensus::Flip();
+    LazyCensus::Flip();
+    const auto totals = LazyCensus::Snapshot();
+    const auto at = [&](LazyCensus::Kind kind, LazyCensus::Outcome outcome) { return totals.count[static_cast<std::size_t>(kind)][static_cast<std::size_t>(outcome)]; };
+    Require(at(LazyCensus::Kind::StagingCopyBack, LazyCensus::Outcome::GuestRead) + at(LazyCensus::Kind::StagingCopyBack, LazyCensus::Outcome::DriverRead) == 1 && at(LazyCensus::Kind::StagingCopyBack, LazyCensus::Outcome::StagingIn) == 0, "a guest read of a copy-back was not its first touch");
+    Require(at(LazyCensus::Kind::WriteBack, LazyCensus::Outcome::Republished) == 1 && at(LazyCensus::Kind::WriteBack, LazyCensus::Outcome::StagingIn) == 1, "a write-back published again and then copied in was not counted as such");
+    Require(at(LazyCensus::Kind::ShadowPublish, LazyCensus::Outcome::Expired) == 1, "a publish untouched for three flips (its own use's write excluded) did not expire");
+    Require(totals.faults == 1 && protection(copyBack) == PAGE_READONLY, "the census did not count one fault and unwatch the range");
+    std::cout << "agc_archc_lazy_census: ok\n";
+}
+
 void CheckArchcEpochs() {
     using namespace GuestArena;
     using AgcDriver::Graphics::ArchC::EpochRange;
@@ -3923,6 +4014,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--archc-log") {
             CheckArchcLog();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--archc-watch") {
+            CheckArchcWatch();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--archc-epochs") {

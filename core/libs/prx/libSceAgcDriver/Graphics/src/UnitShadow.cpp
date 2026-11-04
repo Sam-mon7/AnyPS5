@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -385,7 +386,11 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         const auto packet = GuestMemory::CurrentPacket();
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
-    recordCopies(*shadow, copies, ranges, bytes);
+    {
+        const ArchC::LazyCensus::UseScope censusScope;
+        for (const auto& [begin, end] : ranges) ArchC::LazyCensus::Published(begin, end, ArchC::LazyCensus::Kind::ShadowPublish, static_cast<std::uint8_t>(reason));
+        recordCopies(*shadow, copies, ranges, bytes);
+    }
     if (ShadowVerify()) verifyPublished(*shadow, copies);
     return units;
 }

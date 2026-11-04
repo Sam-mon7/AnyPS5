@@ -161,7 +161,7 @@ std::atomic<std::uint64_t> forgetCalls{0};
 // See ForgetSerial: odd while a ForgetPages call stores its page states.
 std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<void (*)(std::uint64_t, std::uint64_t, TrackerEvent)> stampObserver{nullptr};
-std::atomic<void (*)()> armObserver{nullptr};
+std::array<std::atomic<void (*)()>, 4> armObservers{};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> failedCollectMemoHits{0};
@@ -3967,7 +3967,9 @@ void WtFaultFlip(bool presenter) {
         wc.dirtyWalkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
     }
     wtFault::publish();
-    if (const auto observer = armObserver.load(std::memory_order_acquire)) observer();
+    for (const auto& slot : armObservers) {
+        if (const auto observer = slot.load(std::memory_order_acquire)) observer();
+    }
     // A per-frame line every APS5_WT_FAULT_REPORT_FLIPS flips (default 300).
     static const std::uint64_t every = [] {
         const char* text = std::getenv("APS5_WT_FAULT_REPORT_FLIPS");
@@ -5885,7 +5887,10 @@ void SetStampObserver(void (*observer)(std::uint64_t, std::uint64_t, TrackerEven
 }
 
 void SetArmObserver(void (*observer)()) {
-    armObserver.store(observer, std::memory_order_release);
+    for (auto& slot : armObservers) {
+        void (*expected)() = nullptr;
+        if (slot.load(std::memory_order_acquire) == observer || slot.compare_exchange_strong(expected, observer, std::memory_order_acq_rel)) return;
+    }
 }
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {

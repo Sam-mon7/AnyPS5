@@ -55,6 +55,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -5752,6 +5753,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 recording = true;
             }
             heapReadbacks.emplace_back(from, region.mirror->resident->RecordReadback(commands, from, to - from));
+            ArchC::LazyCensus::Published(from, to, ArchC::LazyCensus::Kind::HeapReadback, 31);
             recorder.Keep(heapReadbacks.back().second);
             copiedBytes += to - from;
         }
@@ -5777,6 +5779,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             // Exactly the sub-range the shader may write, in place in the import: what the shader
             // would have stored there itself had the range been bindable.
             CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+            ArchC::LazyCensus::Published(from, to, ArchC::LazyCensus::Kind::StagingCopyBack, region.deviceLocal ? 30 : 29);
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
             if (profile) {
@@ -6465,6 +6468,7 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // The shadow serves this use as it is; it stays kept by this batch (the copy-back below
         // reads it again after the work).
         for (auto* region : carried) recorder.Keep(region->buffer);
+        for (auto* region : carried) ArchC::LazyCensus::UsedByGpu(region->begin, region->end, ArchC::LazyCensus::GpuUse::Carry);
         if (cross ? crossCarry::Verify() : stagingCarry::Verify()) recordCarryVerify(recorder, carried, cross);
     }
     if (copies.empty()) return;

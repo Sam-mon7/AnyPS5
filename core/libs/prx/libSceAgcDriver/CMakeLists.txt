@@ -358,6 +358,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleUpload.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ImageEpochs.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LazyCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/SampleOrder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BarrierBatch.cpp
@@ -1115,6 +1116,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_archc_epochs COMMAND agc_write_tracking_tests --archc-epochs)
     set_tests_properties(agc_archc_log agc_archc_epochs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
         ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0;APS5_ARCHB_C_IMAGE_EPOCHS=1"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    add_test(NAME agc_archc_lazy_watch COMMAND agc_write_tracking_tests --archc-watch)
+    set_tests_properties(agc_archc_lazy_watch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+        ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_C_LAZY_CENSUS=1"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     add_test(NAME agc_archb_wt_fault_hot COMMAND agc_write_tracking_tests --wt-fault-hot)
     set_tests_properties(agc_archb_wt_fault_hot PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60

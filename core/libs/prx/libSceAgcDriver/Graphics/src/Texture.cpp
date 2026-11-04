@@ -45,6 +45,8 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -4907,6 +4909,16 @@ void StorageTexture::PrepareReadbackBeforeLabel(bool computeSync) {
 void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
     static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
     if (disabled) return;
+    struct Census {
+        bool on = ArchC::LazyCensus::Enabled();
+        std::chrono::steady_clock::time_point start = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        std::uint64_t waited = on ? ArchC::LazyCensus::ThreadFenceWaitNs() : 0;
+        ~Census() {
+            if (!on) return;
+            const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            ArchC::LazyCensus::LabelFlush(ns, ArchC::LazyCensus::ThreadFenceWaitNs() - waited, GuestMemory::GpuLockThreadTag() == 0);
+        }
+    } census;
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     {
         auto& pending = Pending();
@@ -6355,6 +6367,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     const ArchC::SelfScope self(this);
+    const ArchC::LazyCensus::UseScope censusScope;
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -6385,6 +6398,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         lastStored = std::max(lastStored, layerBegin(layer) + layerBytes(layer));
     }
     if (lastStored <= firstStored) return;
+    ArchC::LazyCensus::Published(firstStored, lastStored, ArchC::LazyCensus::Kind::WriteBack, static_cast<std::uint8_t>(PublishReasonFor(flushReason)));
     constexpr std::uint64_t block = 65536;
     const auto spanBegin = firstStored & ~(block - 1);
     const auto spanBlocks = static_cast<std::size_t>((lastStored - spanBegin + block - 1) / block);
