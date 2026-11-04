@@ -49,6 +49,7 @@ constexpr Feature PipeCopyKernelItemsPrerequisites[] = {Feature::PipeQ0Committer
 constexpr Feature PipeDrawReusePrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeDrawLookupMemoPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature WtFaultPrerequisites[] = {Feature::WtFault};
+constexpr Feature PipeDeviceOwnerPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -106,6 +107,9 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::WtFault, "WT_FAULT", false, false, {}},
     {Feature::WtFaultVerify, "WT_FAULT_VERIFY", false, false, WtFaultPrerequisites},
     {Feature::WtFaultConsumers, "WT_FAULT_CONSUMERS", false, true, WtFaultPrerequisites},
+    // Stage 4.3 slice 1 (runtime): label items whose readback would wait on the GPU are parked on the
+    // committer while independent draws and dispatches commit (DrawPipeline.cpp, "device owner").
+    {Feature::PipeDeviceOwner, "PIPE_DEVICE_OWNER", false, true, PipeDeviceOwnerPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

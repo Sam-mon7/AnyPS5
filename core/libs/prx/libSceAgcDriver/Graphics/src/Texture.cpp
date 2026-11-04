@@ -4892,6 +4892,58 @@ void StorageTexture::PrepareReadbackBeforeLabel(bool computeSync) {
     }
 }
 
+namespace {
+// StorageTexture::LabelStoreScope: the ranges a parked label commits its write-backs for (nullptr: all).
+thread_local const std::vector<std::pair<std::uint64_t, std::uint64_t>>* labelStoreRanges = nullptr;
+
+bool InLabelStoreRanges(std::uint64_t address, std::uint64_t bytes) {
+    if (labelStoreRanges == nullptr) return true;
+    const auto end = address + bytes;
+    return std::any_of(labelStoreRanges->begin(), labelStoreRanges->end(), [&](const auto& range) { return address < range.second && range.first < end; });
+}
+}
+
+StorageTexture::LabelStoreScope::LabelStoreScope(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges) : previous(labelStoreRanges) {
+    labelStoreRanges = ranges;
+}
+
+StorageTexture::LabelStoreScope::~LabelStoreScope() {
+    labelStoreRanges = previous;
+}
+
+bool StorageTexture::AnyLabelStores(bool queue0) {
+    auto& pending = Pending();
+    if (queue0 && pending.drawnCount.load(std::memory_order_acquire) != 0) return true;
+    std::lock_guard lock(pending.mutex);
+    return std::any_of(pending.textures.begin(), pending.textures.end(), [](const StorageTexture* texture) { return texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes; });
+}
+
+std::optional<std::uint64_t> StorageTexture::LabelStoreWriter(bool queue0, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    ranges.clear();
+    if (StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"))) return std::nullopt;
+    static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
+    auto& pending = Pending();
+    {
+        std::lock_guard lock(pending.mutex);
+        // The selections of StoreDrawnLinear (queue 0) and StoreReadbackBeforeLabel.
+        if (queue0 && pending.drawnCount.load(std::memory_order_acquire) != 0) {
+            for (const auto& entry : pending.drawn) {
+                if (entry.texture->dirty) ranges.emplace_back(entry.texture->descriptor.baseAddress, entry.texture->descriptor.baseAddress + entry.texture->guestBytes);
+            }
+        }
+        if (!disabled) {
+            for (const auto* texture : pending.textures) {
+                if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+            }
+        }
+    }
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || ranges.empty()) return 0;
+    std::uint64_t writer = 0;
+    for (const auto& [begin, end] : ranges) writer = std::max(writer, recorder->PendingWriterSerial(begin, static_cast<std::size_t>(end - begin)));
+    return writer;
+}
+
 void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
     static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
     if (disabled) return;
@@ -4900,7 +4952,7 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         for (const auto* texture : pending.textures) {
-            if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
+            if ((texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) && InLabelStoreRanges(texture->descriptor.baseAddress, texture->guestBytes)) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
     }
     for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
@@ -4915,7 +4967,7 @@ std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
     {
         std::lock_guard lock(pending.mutex);
         for (const auto& entry : pending.drawn) {
-            if (entry.texture->dirty) ranges.emplace_back(entry.texture->descriptor.baseAddress, static_cast<std::size_t>(entry.texture->guestBytes));
+            if (entry.texture->dirty && InLabelStoreRanges(entry.texture->descriptor.baseAddress, entry.texture->guestBytes)) ranges.emplace_back(entry.texture->descriptor.baseAddress, static_cast<std::size_t>(entry.texture->guestBytes));
         }
     }
     std::size_t stored = 0;

@@ -12,6 +12,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -664,6 +666,51 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
 }
 
+namespace {
+std::atomic<std::uint64_t> recorderCommitsAll{0};
+// Stage 4.3 counters (recorder): labels parked, what committed them, and how long they stayed parked.
+struct OwnerCounters {
+    std::atomic<std::uint64_t> checks{0};       // label items the committer considered parking
+    std::atomic<std::uint64_t> checksLocked{0}; // ... that had write-backs to look at under the GPU mutex
+    std::atomic<std::uint64_t> parks{0};
+    std::atomic<std::uint64_t> passed{0};       // items committed ahead of a parked label
+    std::atomic<std::uint64_t> done{0}, idle{0}, barrier{0}, close{0};
+    std::atomic<std::uint64_t> parkedUs{0};
+    std::atomic<std::uint64_t> idleWaitUs{0};   // waitParked time (the committer had nothing else to do)
+    std::atomic<std::uint64_t> barrierLabel{0}, barrierOther{0}, barrierOverlap{0};  // why an item did not pass
+};
+OwnerCounters& ownerCounters() {
+    static OwnerCounters counters;
+    static const bool registered = [] {
+        ArchB::Recorder::RegisterCounter("owner_label_checks", counters.checks);
+        ArchB::Recorder::RegisterCounter("owner_label_checks_locked", counters.checksLocked);
+        ArchB::Recorder::RegisterCounter("owner_labels_parked", counters.parks);
+        ArchB::Recorder::RegisterCounter("owner_items_passed", counters.passed);
+        ArchB::Recorder::RegisterCounter("owner_park_commit_done", counters.done);
+        ArchB::Recorder::RegisterCounter("owner_park_commit_idle", counters.idle);
+        ArchB::Recorder::RegisterCounter("owner_park_commit_barrier", counters.barrier);
+        ArchB::Recorder::RegisterCounter("owner_park_commit_close", counters.close);
+        ArchB::Recorder::RegisterCounter("owner_parked_us", counters.parkedUs);
+        ArchB::Recorder::RegisterCounter("owner_idle_wait_us", counters.idleWaitUs);
+        ArchB::Recorder::RegisterCounter("owner_barrier_label", counters.barrierLabel);
+        ArchB::Recorder::RegisterCounter("owner_barrier_other_kind", counters.barrierOther);
+        ArchB::Recorder::RegisterCounter("owner_barrier_overlap", counters.barrierOverlap);
+        return true;
+    }();
+    static_cast<void>(registered);
+    return counters;
+}
+
+bool rangesOverlap(const std::vector<DrawPipeline::Range>& a, const std::vector<DrawPipeline::Range>& b) {
+    for (const auto& [begin, end] : a) {
+        for (const auto& [otherBegin, otherEnd] : b) {
+            if (begin < otherEnd && otherBegin < end) return true;
+        }
+    }
+    return false;
+}
+}
+
 std::string DrawPipeline::CumulativeText() {
     auto& counters = pipeCounters();
     std::string text = "[pipe] cumulative: commits";
@@ -702,6 +749,13 @@ std::string DrawPipeline::CumulativeText() {
     }
     text += DrawWriteDiagText();
     text += DrainDiagText();
+    {
+        auto& owner = ownerCounters();
+        const auto load = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+        char line[400];
+        std::snprintf(line, sizeof(line), "; owner: %llu label checks (%llu locked), %llu parked, %llu items passed, committed done %llu / idle %llu / barrier %llu (label %llu, other kind %llu, overlap %llu) / close %llu, parked %.1f ms, idle wait %.1f ms", load(owner.checks), load(owner.checksLocked), load(owner.parks), load(owner.passed), load(owner.done), load(owner.idle), load(owner.barrier), load(owner.barrierLabel), load(owner.barrierOther), load(owner.barrierOverlap), load(owner.close), static_cast<double>(load(owner.parkedUs)) / 1e3, static_cast<double>(load(owner.idleWaitUs)) / 1e3);
+        text += line;
+    }
     std::snprintf(item, sizeof(item), "; full: %llu waits (%.1f ms), %llu overcommits; locked drains %llu", static_cast<unsigned long long>(counters.fullWaits.load(std::memory_order_relaxed)), static_cast<double>(counters.fullWaitNs.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.fullOvercommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.lockedDrains.load(std::memory_order_relaxed)));
     text += item;
     return text;
@@ -779,8 +833,7 @@ void DrawPipeline::run() {
     std::vector<Range> stage4Reads;
     std::vector<Range> stage4Writes;
     StartCommitterSampler();
-    static std::atomic<std::uint64_t> recorderCommits{0};
-    static const bool registered = [] { ArchB::Recorder::RegisterCounter("draw_pipeline_commits", recorderCommits); return true; }();
+    static const bool registered = [] { ArchB::Recorder::RegisterCounter("draw_pipeline_commits", recorderCommitsAll); return true; }();
     static_cast<void>(registered);
     for (;;) {
         Commit* commit = nullptr;
@@ -788,20 +841,44 @@ void DrawPipeline::run() {
         ItemKind kind = ItemKind::Other;
         std::uint64_t enqueuedNs = 0;
         std::uint64_t enqueueClock = 0;
+        // APS5_ARCHB_PIPE_DEVICE_OWNER: a parked label commits as soon as its batch completed; idle
+        // with one parked, the committer waits for that batch (without the GPU mutex) until an item
+        // arrives. The parked item counts in `outstanding`.
+        while (!parked.empty()) {
+            if (parkedDone()) commitParked("done");
+            else if (outstanding.load(std::memory_order_acquire) <= parked.size() && waitParked()) commitParked("idle");
+            else break;
+        }
+        const std::size_t parkedCount = parked.size();
         // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
-        const bool idleBefore = ArchB::Recorder::Enabled() && outstanding.load(std::memory_order_acquire) == 0;
+        const bool idleBefore = ArchB::Recorder::Enabled() && outstanding.load(std::memory_order_acquire) == parkedCount;
         const auto idleStart = idleBefore ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // Stage 4 M1: the committer idles (spins, then sleeps until queue 0 enqueues).
         std::optional<Stage4::WaitScope> stage4Idle;
-        if (Stage4::Tracking() && outstanding.load(std::memory_order_acquire) == 0) stage4Idle.emplace(Stage4::Wait::Idle, true);
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+        if (Stage4::Tracking() && outstanding.load(std::memory_order_acquire) == parkedCount) stage4Idle.emplace(Stage4::Wait::Idle, true);
+        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) > parkedCount; });
+        bool commitParkedFirst = false;
+        bool parkFront = false;
         {
             std::unique_lock lock(mutex);
             if (stage4Idle && items.empty() && !closing) stage4Idle->Blocking();
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
-            if (items.empty()) break;
+            if (items.empty()) {
+                if (parked.empty()) break;
+                // Closing with a label parked: it commits before the committer exits.
+                lock.unlock();
+                stage4Idle.reset();
+                commitParked("close");
+                continue;
+            }
+            // A label behind parked ones parks too (in order; up to ParkLimit), whatever it stores.
+            constexpr std::size_t ParkLimit = 16;
+            const bool label = !stopped && items.front().kind == ItemKind::Label;
+            if (!parked.empty() && label && parked.size() < ParkLimit) parkFront = true;
+            else if (!parked.empty() && !mayPassParked(items.front())) commitParkedFirst = true;
+            else if (parked.empty() && label && ArchB::Switches::Enabled(ArchB::Feature::PipeDeviceOwner)) parkFront = true;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             kind = items.front().kind;
@@ -813,6 +890,12 @@ void DrawPipeline::run() {
             }
         }
         stage4Idle.reset();
+        // APS5_ARCHB_PIPE_DEVICE_OWNER: an item that may not pass the parked label commits it first
+        // (the front item stays in place: only this thread pops it); a label may park.
+        if (commitParkedFirst) {
+            while (!parked.empty()) commitParked("barrier");
+        }
+        if (parkFront && tryPark(!parked.empty())) continue;
         if (Stage4::ResolveCensus()) Stage4::BeginItem(static_cast<std::uint8_t>(kind), stage4Reads, stage4Writes, Graphics::StorageTexture::PendingSerial());
         const auto start = std::chrono::steady_clock::now();
         if (idleBefore) {
@@ -838,6 +921,7 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        if (!parked.empty()) ownerCounters().passed.fetch_add(1, std::memory_order_relaxed);
         if (Stage4::ResolveCensus()) Stage4::EndItem(Graphics::StorageTexture::PendingSerial(), !isDraw);
         if (enqueuedNs != 0) countAheadWindow(enqueuedNs, enqueueClock, start);
         if (fatal != nullptr && !stopped) {
@@ -845,20 +929,184 @@ void DrawPipeline::run() {
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
         std::lock_guard lock(mutex);
-        countWrites(items.front().writes, false);
-        retired.push_back(std::move(items.front()));
+        retire(items.front(), spent, failed, fatal, kind);
         items.pop_front();
-        retiredItems.fetch_add(1, std::memory_order_release);
-        ++commits;
-        recorderCommits.fetch_add(1, std::memory_order_relaxed);
-        pipeCounters().commits[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
-        commitNs += spent;
-        if (failed) ++commitErrors;
-        if (fatal != nullptr && failure == nullptr) failure = fatal;
-        outstanding.fetch_sub(1, std::memory_order_release);
         if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+// Under `mutex`: the bookkeeping of a committed item (the front one, or the parked label).
+void DrawPipeline::retire(Item& item, std::uint64_t spent, bool failed, std::exception_ptr fatal, ItemKind kind) {
+    countWrites(item.writes, false);
+    retired.push_back(std::move(item));
+    retiredItems.fetch_add(1, std::memory_order_release);
+    ++commits;
+    recorderCommitsAll.fetch_add(1, std::memory_order_relaxed);
+    pipeCounters().commits[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+    commitNs += spent;
+    if (failed) ++commitErrors;
+    if (fatal != nullptr && failure == nullptr) failure = fatal;
+    outstanding.fetch_sub(1, std::memory_order_release);
+}
+
+bool DrawPipeline::mayPassParked(const Item& item) const {
+    // Only draws and dispatches pass, and only when neither their declared writes nor their reads
+    // touch what a parked label stores (its write-back ranges and the label itself).
+    auto& counters = ownerCounters();
+    if (item.kind != ItemKind::Draw && item.kind != ItemKind::Dispatch) {
+        (item.kind == ItemKind::Label ? counters.barrierLabel : counters.barrierOther).fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    for (const auto& entry : parked) {
+        if (rangesOverlap(item.writes, entry.stores) || rangesOverlap(item.reads, entry.stores) || rangesOverlap(item.writes, entry.item.writes) || rangesOverlap(item.reads, entry.item.writes)) {
+            counters.barrierOverlap.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool DrawPipeline::tryPark(bool force) {
+    auto& counters = ownerCounters();
+    counters.checks.fetch_add(1, std::memory_order_relaxed);
+    Parked entry;
+    try {
+        if (!tryParkChecked(force, entry)) return false;
+    } catch (...) {
+        // A failure here (a lost device in Reap) is left to the item's own commit, which reports it.
+        // A label that must stay behind parked ones parks as storing everything, so nothing passes it.
+        if (!force) return false;
+        entry.stores.assign(1, Range{0, std::numeric_limits<std::uint64_t>::max()});
+        entry.serial = 0;
+    }
+    entry.at = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lock(mutex);
+        entry.item = std::move(items.front());
+        items.pop_front();
+        parked.push_back(std::move(entry));
+        ++parkEvents;
+        if (idleWaiters != 0 && items.size() <= resumeAt) idle.notify_all();
+    }
+    counters.parks.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool DrawPipeline::tryParkChecked(bool force, Parked& entry) {
+    auto& counters = ownerCounters();
+    if (Graphics::StorageTexture::AnyLabelStores(true)) {
+        counters.checksLocked.fetch_add(1, std::memory_order_relaxed);
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        auto* recorder = Graphics::Recorder::Active();
+        if (recorder == nullptr || !recorder->HasTimeline() || Graphics::Recorder::InCompletion()) {
+            if (!force) return false;
+        } else {
+            // As the label's own FlushPending would: batches already finished retire first.
+            recorder->Reap();
+            const auto found = Graphics::StorageTexture::LabelStoreWriter(true, entry.stores);
+            if (!found.has_value()) {
+                // It stores more than its ranges (APS5_STORE_AT_LABEL): it cannot be parked.
+                if (!force) return false;
+                entry.stores.assign(1, Range{0, std::numeric_limits<std::uint64_t>::max()});
+            } else if (*found > recorder->CompletedThrough()) {
+                entry.serial = *found;
+                // The open batch goes out now (the unparked commit would Sync it), so the timeline reaches it.
+                if (entry.serial >= recorder->OpenSerial()) recorder->Submit();
+            }
+        }
+    }
+    return force || entry.serial != 0;
+}
+
+bool DrawPipeline::parkedDone() {
+    const auto serial = parked.front().serial;
+    if (serial == 0) return true;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+    std::unique_lock gpu(GuestMemory::GpuMutex(), std::try_to_lock);
+    if (!gpu.owns_lock()) return false;
+    auto* recorder = Graphics::Recorder::Active();
+    if (recorder == nullptr || serial <= recorder->CompletedThrough()) return true;
+    Graphics::Recorder::TimelineWatch watch;
+    return watch.Begin(*recorder, serial) ? watch.Wait(0) : true;
+}
+
+bool DrawPipeline::waitParked() {
+    const auto serial = parked.front().serial;
+    if (serial == 0) return true;
+    Graphics::Recorder::TimelineWatch watch;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        auto* recorder = Graphics::Recorder::Active();
+        if (recorder == nullptr || serial <= recorder->CompletedThrough()) return true;
+        if (!watch.Begin(*recorder, serial)) return true;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const Stage4::WaitScope stage4Wait(Stage4::Wait::Fence, true);
+    bool done = false;
+    // Spin on the timeline (status queries) while queue 0 may enqueue soon, then block in slices.
+    const auto spinFor = HandoffSpinWindow();
+    const auto waiting = parked.size();
+    for (;;) {
+        if (watch.Wait(0)) {
+            done = true;
+            break;
+        }
+        if (outstanding.load(std::memory_order_acquire) > waiting) break;
+        if (std::chrono::steady_clock::now() - start < spinFor) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (watch.Wait(200'000)) {
+            done = true;
+            break;
+        }
+        std::lock_guard lock(mutex);
+        if (closing || !items.empty()) break;
+    }
+    watch.End();
+    ownerCounters().idleWaitUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    return done;
+}
+
+void DrawPipeline::commitParked(const char* when) {
+    auto& counters = ownerCounters();
+    auto& front = parked.front();
+    (std::strcmp(when, "done") == 0 ? counters.done : std::strcmp(when, "idle") == 0 ? counters.idle : std::strcmp(when, "barrier") == 0 ? counters.barrier : counters.close).fetch_add(1, std::memory_order_relaxed);
+    counters.parkedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - front.at).count()), std::memory_order_relaxed);
+    const auto start = std::chrono::steady_clock::now();
+    std::exception_ptr fatal;
+    bool failed = false;
+    bool shutdown = false;
+    try {
+        if (!stopped) {
+            // Only the write-backs it was parked for: the items that passed it store their own.
+            const Graphics::StorageTexture::LabelStoreScope scope(&front.stores);
+            front.item.commit();
+        }
+        GuestMemory::BreakProofs();
+    } catch (const std::exception&) {
+        failed = true;
+        fatal = std::current_exception();
+    } catch (const ProcessShutdown&) {
+        shutdown = true;
+        fatal = std::current_exception();
+    } catch (...) {
+        fatal = std::current_exception();
+    }
+    const auto spent = elapsedNs(start);
+    if (fatal != nullptr && !stopped) {
+        stopped = true;
+        if (!shutdown) Driver::Get().ReportFailure(fatal);
+    }
+    std::lock_guard lock(mutex);
+    const auto kind = front.item.kind;
+    retire(front.item, spent, failed, fatal, kind);
+    parked.pop_front();
+    ++parkEvents;
+    if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
 }
 
 void DrawPipeline::Stop() {
@@ -913,9 +1161,9 @@ void DrawPipeline::drainUnlocked(DrainReason reason, std::uint32_t opcode, Drain
     if (Stage4::Tracking()) stage4Wait.emplace(Stage4::Wait::PipeDrain, true);
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
-    if (stage4Wait && !items.empty()) stage4Wait->Blocking();
+    if (stage4Wait && (!items.empty() || !parked.empty())) stage4Wait->Blocking();
     ++idleWaiters;
-    idle.wait(lock, [&] { return items.empty(); });
+    idle.wait(lock, [&] { return items.empty() && parked.empty(); });
     --idleWaiters;
     stage4Wait.reset();
     const auto index = static_cast<std::size_t>(reason);
@@ -949,6 +1197,13 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
             return true;
         }
     }
+    for (const auto& entry : pipeline.parked) {
+        for (const auto& [begin, limit] : entry.item.reads) {
+            if (address >= limit || begin >= end) continue;
+            heldReadHits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
     return false;
 }
 
@@ -971,13 +1226,20 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     }
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
-    for (auto item = items.rbegin(); item != items.rend(); ++item) {
-        const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
-        if (!overlaps) continue;
-        if (item->labelBytes.empty() || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return std::nullopt;
+    // Newest first; a parked label is older than every queued item.
+    const auto held = [&](const Item& item) -> std::optional<std::optional<std::uint64_t>> {
+        const bool overlaps = std::any_of(item.writes.begin(), item.writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
+        if (!overlaps) return std::nullopt;
+        if (item.labelBytes.empty() || address < item.labelAddress || end > item.labelAddress + item.labelBytes.size()) return std::optional<std::uint64_t>{};
         std::uint64_t value = 0;
-        std::memcpy(&value, item->labelBytes.data() + (address - item->labelAddress), bytes);
-        return value;
+        std::memcpy(&value, item.labelBytes.data() + (address - item.labelAddress), bytes);
+        return std::optional<std::uint64_t>{value};
+    };
+    for (auto item = items.rbegin(); item != items.rend(); ++item) {
+        if (auto found = held(*item)) return *found;
+    }
+    for (auto entry = parked.rbegin(); entry != parked.rend(); ++entry) {
+        if (auto found = held(entry->item)) return *found;
     }
     return std::nullopt;
 }
@@ -1000,6 +1262,12 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
     std::lock_guard lock(mutex);
     Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
     for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
+    watch.parks = parkEvents;
+    watch.parked = !parked.empty();
+    for (const auto& entry : parked) {
+        ++watch.items;
+        watch.writes.insert(watch.writes.end(), entry.item.writes.begin(), entry.item.writes.end());
+    }
     return watch;
 }
 
@@ -1012,8 +1280,11 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
     std::lock_guard lock(mutex);
     if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;
+    if (std::any_of(parked.begin(), parked.end(), [&](const Parked& entry) { return overlaps(entry.item.writes); })) return true;
     const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
     if (retiredNow == watch.retired) return false;
+    // Retirement out of queue order around a parked label: which items retired is unknown.
+    if (watch.parked || watch.parks != parkEvents) return true;
     return retiredNow - watch.retired > watch.items || overlaps(watch.writes);
 }
 
@@ -1040,6 +1311,13 @@ std::optional<DrawPipeline::ItemKind> DrawPipeline::NewestWriter(std::uint64_t a
         if (write == item->writes.end()) continue;
         if (overlapped != nullptr) *overlapped = *write;
         return item->kind;
+    }
+    for (auto entry = parked.rbegin(); entry != parked.rend(); ++entry) {
+        const auto write = std::find_if(entry->item.writes.begin(), entry->item.writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
+        if (write != entry->item.writes.end()) {
+            if (overlapped != nullptr) *overlapped = *write;
+            return entry->item.kind;
+        }
     }
     return std::nullopt;
 }

@@ -61,6 +61,9 @@ enum class Feature : std::uint8_t {
     WtFault,
     WtFaultVerify,
     WtFaultConsumers,
+    // Stage 4.3 slice 1: the queue-0 committer (the device owner) parks a label item whose readback
+    // would wait on an unfinished batch and keeps committing independent draw/dispatch items.
+    PipeDeviceOwner,
     Count
 };
 

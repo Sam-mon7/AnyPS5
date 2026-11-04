@@ -4873,6 +4873,9 @@ std::string WaitedBehindReport(const HolderMatrixValues& waited) {
 
 namespace {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
+// Stage 4.3 diagnostic: the queue tag of the thread whose outermost hold is current (the committer
+// is 0xfffffffe), read by a waiting committer to charge its wait to the holder (recorder counters).
+std::atomic<std::uint32_t> gpuHolderTag{0xffffffffu};
 thread_local std::chrono::steady_clock::time_point recorderHoldStart{};
 thread_local std::uint64_t recorderHoldGeneration = 0;
 
@@ -4949,6 +4952,7 @@ bool GpuMutexType::tryEnter() {
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
+        gpuHolderTag.store(committerThread ? 0xfffffffeu : LockStats().tag, std::memory_order_relaxed);
         recorderHoldGeneration = ArchB::Recorder::Generation();
         recorderHoldStart = ArchB::Recorder::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
@@ -5063,6 +5067,24 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    // Stage 4.3 (recorder counters, committer only): the committer's waits for the mutex, charged to
+    // the holder seen when the wait began (queue 0, a compute queue, or another thread).
+    struct CommitterWait {
+        bool on;
+        std::uint32_t holder = 0xffffffffu;
+        std::chrono::steady_clock::time_point start{};
+        ~CommitterWait() {
+            if (!on) return;
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            if (ms < 0.002) return;
+            ArchB::Recorder::Count("owner_committer_mutex_ms", ms);
+            ArchB::Recorder::Count(holder == 0 ? "owner_committer_mutex_ms_q0" : holder == 0xffffffffu || holder == 0xfffffffeu ? "owner_committer_mutex_ms_other" : "owner_committer_mutex_ms_compute", ms);
+        }
+    } committerWait{committerThread && ArchB::Recorder::Enabled() && !HeldByThisThread()};
+    if (committerWait.on) {
+        committerWait.holder = gpuHolderTag.load(std::memory_order_relaxed);
+        committerWait.start = std::chrono::steady_clock::now();
+    }
     // Before the wait timer: time given to the committer is counted apart (pipe_mutex_priority_*).
     DeferToCommitter(*this);
     PerformanceTimer recorderTiming("GpuMutex.wait");

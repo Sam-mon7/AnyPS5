@@ -245,6 +245,25 @@ public:
     static void StoreReadbackBeforeLabel(const char* reason);
     static void PrepareReadbackBeforeLabel(bool computeSync = false);
     static std::size_t StoreDrawnLinear(const char* reason);
+    // Stage 4.3 (APS5_ARCHB_PIPE_DEVICE_OWNER), under the GPU mutex: the guest ranges a label commit's
+    // write-backs would store (StoreDrawnLinear for queue 0, StoreReadbackBeforeLabel) and the newest
+    // recorded batch with a pending write over any of them (0: none, nothing to wait for). Nullopt:
+    // the label stores more than these (APS5_STORE_AT_LABEL), so it must not be parked.
+    // Whether a label commit has any write-back to look at (no GPU mutex needed).
+    static bool AnyLabelStores(bool queue0);
+    static std::optional<std::uint64_t> LabelStoreWriter(bool queue0, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
+    // While one is alive on the thread, StoreReadbackBeforeLabel and StoreDrawnLinear store only the
+    // given ranges: a parked label commits the write-backs it was parked for, not the results of the
+    // draws and dispatches that committed while it waited (their declared writes never overlap them).
+    class LabelStoreScope {
+    public:
+        explicit LabelStoreScope(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges);
+        ~LabelStoreScope();
+        LabelStoreScope(const LabelStoreScope&) = delete;
+        LabelStoreScope& operator=(const LabelStoreScope&) = delete;
+    private:
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>>* previous;
+    };
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);

@@ -28,6 +28,10 @@ public:
         std::uint64_t retired = 0;
         std::size_t items = 0;
         std::vector<Range> writes;
+        // APS5_ARCHB_PIPE_DEVICE_OWNER: items may retire out of order around a parked label, so a
+        // watch taken with one parked, or across a park, answers conservatively.
+        std::uint64_t parks = 0;
+        bool parked = false;
     };
     // Transition: the first queue-0 submission after APS5_ARCHB_PIPE_Q0_COMMITTER turned off drains
     // what the pipelined submissions before it left queued.
@@ -175,6 +179,26 @@ private:
     };
     DrawPipeline() = default;
     void run();
+    // Stage 4.3 slice 1 (APS5_ARCHB_PIPE_DEVICE_OWNER), committer thread only. A label item whose
+    // write-backs (StoreDrawnLinear, StoreReadbackBeforeLabel) would wait for an unfinished batch is
+    // parked instead of committed: it leaves `items` for `parked`, still counts as outstanding and
+    // stays visible to every lookup (writes, held label value, reads). Labels behind it park too, in
+    // order (labels never pass each other), and later draw and dispatch items whose declared reads
+    // and writes miss every parked label's ranges commit ahead of them. Parked labels commit front
+    // first, each storing only the ranges it was parked for, once its batch completed, or all of
+    // them before an item that may not pass, a drain, or shutdown.
+    struct Parked;
+    bool tryPark(bool force);
+    bool tryParkChecked(bool force, Parked& entry);
+    bool mayPassParked(const Item& item) const;
+    // Commits the front parked label (waiting inside, as an unparked commit would, if its batch is
+    // still running); `when` names the cause for the owner_park_commit_* counters.
+    void commitParked(const char* when);
+    // Idle with labels parked: waits for the front one's batch without the GPU mutex, returning
+    // when it completed (true) or when an item arrives or the pipeline closes (false).
+    bool waitParked();
+    bool parkedDone();
+    void retire(Item& item, std::uint64_t spent, bool failed, std::exception_ptr fatal, ItemKind kind);
     void drainUnlocked(DrainReason reason, std::uint32_t opcode, DrainCause cause, bool finisherBusy);
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
@@ -184,6 +208,16 @@ private:
     std::condition_variable wake;
     std::condition_variable idle;
     std::deque<Item> items;
+    // APS5_ARCHB_PIPE_DEVICE_OWNER (see tryPark). `parked` and `parkEvents` change under `mutex`;
+    // the rest is the committer's own.
+    struct Parked {
+        Item item;
+        std::vector<Range> stores;
+        std::uint64_t serial = 0;
+        std::chrono::steady_clock::time_point at{};
+    };
+    std::deque<Parked> parked;
+    std::uint64_t parkEvents = 0;
     std::vector<std::pair<Range, std::uint32_t>> queuedWrites;
     std::vector<Item> retired;
     std::exception_ptr failure;

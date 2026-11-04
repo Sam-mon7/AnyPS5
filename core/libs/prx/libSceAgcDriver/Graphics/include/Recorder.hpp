@@ -319,6 +319,30 @@ public:
     };
     static bool ComputeSyncEnabled();
     bool FinishComputeSyncUnlocked(std::uint64_t serial);
+    // Stage 4.3 (APS5_ARCHB_PIPE_DEVICE_OWNER): a wait for batch `serial` that the caller makes
+    // without the GPU mutex. Begin, under the mutex, submits the open batch when `serial` is not
+    // submitted yet, copies the timeline handles and registers an unlocked waiter (the recorder's
+    // teardown completes every batch and then waits for registered waiters to leave, so the handles
+    // stay valid until End). Wait and End run without the mutex. Begin is false without a timeline.
+    class TimelineWatch {
+    public:
+        TimelineWatch() = default;
+        ~TimelineWatch() { End(); }
+        TimelineWatch(const TimelineWatch&) = delete;
+        TimelineWatch& operator=(const TimelineWatch&) = delete;
+        bool Begin(Recorder& recorder, std::uint64_t serial);
+        // Whether the batch completed within `timeoutNanos` (0: a status query).
+        bool Wait(std::uint64_t timeoutNanos);
+        void End();
+        bool Active() const { return waiters != nullptr; }
+    private:
+        VkDevice device = VK_NULL_HANDLE;
+        VkSemaphore timeline = VK_NULL_HANDLE;
+        PFN_vkWaitSemaphoresKHR waitSemaphores = nullptr;
+        std::uint64_t serial = 0;
+        std::atomic<int>* waiters = nullptr;
+        bool done = false;
+    };
     // Submits and waits for every batch, running completions in order.
     void Sync();
     void CountSamples();

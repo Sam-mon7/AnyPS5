@@ -194,11 +194,23 @@ std::size_t BeginSyncSite(int source, const void* site) {
     return previous;
 }
 
+// Stage 4.3 diagnostic (APS5_PROFILE_DRAW): the same table for the queue-0 committer alone, so its
+// fence waits are attributed to their sites apart from every other thread's.
+std::vector<SyncSiteWaits> committerSyncSites;
+
 void CountSiteWait(double ms) {
     if (activeSyncSite == NoSyncSite || activeSyncSite >= syncSites.size()) return;
     auto& entry = syncSites[activeSyncSite];
     ++entry.batches;
     entry.waitedMs += ms;
+    if (!GuestMemory::IsCommitterThread()) return;
+    auto it = std::find_if(committerSyncSites.begin(), committerSyncSites.end(), [&](const SyncSiteWaits& site) { return site.source == entry.source && site.site == entry.site; });
+    if (it == committerSyncSites.end()) {
+        if (committerSyncSites.size() >= SyncSiteLimit) return;
+        it = committerSyncSites.insert(committerSyncSites.end(), SyncSiteWaits{entry.source, entry.site, 0, 0, 0});
+    }
+    ++it->batches;
+    it->waitedMs += ms;
 }
 
 void CountComputeSyncWait(int source, bool signaled) {
@@ -208,10 +220,10 @@ void CountComputeSyncWait(int source, bool signaled) {
 
 // The sites by wait, longest first, as "source@+offset syncs/batches/wait" (offsets symbolize with
 // nm against the driver's image like the [guestmem] callers; +0x0 is the overflow entry).
-std::string SyncSiteReport() {
+std::string SyncSiteReport(const std::vector<SyncSiteWaits>& table = syncSites) {
     static const char* const names[5] = {"idle", "pending-write", "recorded-store", "address-based", "other"};
     std::vector<const SyncSiteWaits*> order;
-    for (const auto& entry : syncSites) order.push_back(&entry);
+    for (const auto& entry : table) order.push_back(&entry);
     std::sort(order.begin(), order.end(), [](const SyncSiteWaits* a, const SyncSiteWaits* b) { return a->waitedMs > b->waitedMs; });
     std::string report;
     for (std::size_t i = 0; i < order.size() && i < 8; ++i) {
@@ -238,7 +250,8 @@ thread_local double threadWaitedMs = 0;
 
 void CountThreadSync(int source, double ms) {
     threadWaitedMs += ms;
-    const auto tag = GuestMemory::GpuLockThreadTag();
+    // The committer carries no queue tag; it gets its own row (0xfffffffe) apart from the presenter.
+    const auto tag = GuestMemory::IsCommitterThread() ? 0xfffffffeu : GuestMemory::GpuLockThreadTag();
     std::lock_guard lock(threadSyncsMutex);
     auto it = std::find_if(threadSyncs.begin(), threadSyncs.end(), [&](const ThreadSyncs& thread) { return thread.tag == tag; });
     if (it == threadSyncs.end()) it = threadSyncs.insert(threadSyncs.end(), ThreadSyncs{tag, {}, {}});
@@ -252,7 +265,8 @@ std::string ThreadSyncReport() {
     std::lock_guard lock(threadSyncsMutex);
     for (const auto& thread : threadSyncs) {
         char text[64];
-        if (thread.tag == 0xffffffffu) std::snprintf(text, sizeof(text), " untagged:");
+        if (thread.tag == 0xfffffffeu) std::snprintf(text, sizeof(text), " committer:");
+        else if (thread.tag == 0xffffffffu) std::snprintf(text, sizeof(text), " untagged:");
         else std::snprintf(text, sizeof(text), " queue 0x%x:", thread.tag);
         report += text;
         for (int source = 0; source < 5; ++source) {
@@ -4433,6 +4447,14 @@ struct RestoreSyncSite {
 // leave after completing every batch, so the handles stay valid until this returns).
 VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial, std::uint64_t recorderId) {
     Timeline::GpuWaitScope timelineWait(serial, recorderId);
+    // Stage 4.3 (recorder counters, committer only): timeline waits apart from fence waits.
+    struct CommitterTimeline {
+        bool on = ArchB::Recorder::Enabled() && GuestMemory::IsCommitterThread();
+        std::chrono::steady_clock::time_point start = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~CommitterTimeline() {
+            if (on) ArchB::Recorder::Count("owner_committer_timeline_ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        }
+    } committerTimeline;
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
@@ -4567,6 +4589,41 @@ Recorder::ComputeSyncScope::~ComputeSyncScope() {
 
 bool Recorder::ComputeSyncEnabled() {
     return computeSyncEnabled;
+}
+
+bool Recorder::TimelineWatch::Begin(Recorder& recorder, std::uint64_t target) {
+    End();
+    if (recorder.timeline == VK_NULL_HANDLE || target == 0) return false;
+    if (target > recorder.submissions) recorder.Submit();
+    if (target > recorder.submissions) return false;
+    device = recorder.context.device;
+    timeline = recorder.timeline;
+    waitSemaphores = recorder.context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+    serial = target;
+    done = false;
+    waiters = &WaitersOf(recorder.id);
+    waiters->fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+bool Recorder::TimelineWatch::Wait(std::uint64_t timeoutNanos) {
+    if (waiters == nullptr || done) return done;
+    VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
+    wait.semaphoreCount = 1;
+    wait.pSemaphores = &timeline;
+    wait.pValues = &serial;
+    const auto result = waitSemaphores(device, &wait, timeoutNanos);
+    if (result == VK_TIMEOUT) return false;
+    // Any other outcome (a lost device included) ends the watch: the caller commits the parked item,
+    // whose own synchronous path reports the failure.
+    done = true;
+    return true;
+}
+
+void Recorder::TimelineWatch::End() {
+    if (waiters == nullptr) return;
+    waiters->fetch_sub(1, std::memory_order_acq_rel);
+    waiters = nullptr;
 }
 
 bool Recorder::FinishComputeSyncUnlocked(std::uint64_t serial) {
@@ -4976,6 +5033,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     lastReport = now;
                     const auto& h = holdCounters;
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] committer sync sites (source@caller -/batches/wait, cumulative):%s\n", SyncSiteReport(committerSyncSites).c_str());
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
                     const auto reads = Recorder::ReadCounts();
@@ -4984,6 +5042,21 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         Timeline::GpuWaitScope timelineWait(batch->serial, id, batch->timelineId);
+        // Stage 4.3 (recorder counters, committer only): the committer's fence waits, all and by sync
+        // source, so a gate row shows whether a change removed them or moved them.
+        struct CommitterFence {
+            bool on = ArchB::Recorder::Enabled() && GuestMemory::IsCommitterThread();
+            int source;
+            std::chrono::steady_clock::time_point start = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            ~CommitterFence() {
+                if (!on) return;
+                static const char* const names[5] = {"owner_committer_fence_ms_idle", "owner_committer_fence_ms_pending_write", "owner_committer_fence_ms_recorded_store", "owner_committer_fence_ms_address", "owner_committer_fence_ms_other"};
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                ArchB::Recorder::Count("owner_committer_fence_ms", ms);
+                ArchB::Recorder::Count("owner_committer_fences");
+                ArchB::Recorder::Count(names[source >= 0 && source < 5 ? source : 4], ms);
+            }
+        } committerFence{.source = source};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
