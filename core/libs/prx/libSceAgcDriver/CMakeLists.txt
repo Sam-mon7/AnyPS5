@@ -301,6 +301,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostAllocator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTrace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Stage4Diag.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTraceThread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
@@ -754,6 +755,19 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    # Stage 4 measurement helpers (M1/M3/M4 census model) and a smoke run of the driver hooks.
+    add_test_executable(agc_stage4_diag_tests tests/Stage4Diag.cpp Execution/src/Stage4Diag.cpp)
+    target_include_directories(agc_stage4_diag_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_stage4_diag_tests PRIVATE libc)
+    set_target_properties(agc_stage4_diag_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_stage4_diag_tests)
+    add_test(NAME agc_stage4_diag COMMAND agc_stage4_diag_tests)
+    set_tests_properties(agc_stage4_diag PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_stage4_diag PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(agc_capture_trace_tests tests/CaptureTrace.cpp)
     target_include_directories(agc_capture_trace_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_capture_trace_tests PRIVATE libc)
@@ -1147,6 +1161,7 @@ if(BUILD_TESTING AND NOT WIN32)
     add_test_executable(agc_collect_memo_generation_tests
             tests/CollectMemoGeneration.cpp
             Execution/src/GuestMemory.cpp
+            Execution/src/Stage4Diag.cpp
             Execution/src/PerformanceTraceThread.cpp
     )
     target_include_directories(agc_collect_memo_generation_tests PRIVATE ${LIBS_INCLUDE_DIR})
