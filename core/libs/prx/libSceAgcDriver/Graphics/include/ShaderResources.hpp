@@ -781,6 +781,9 @@ private:
         std::vector<EpochImage> images;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
         std::vector<std::size_t> partials;
+        // The pending-registry queries of every surface and storage image (fastRevalidate's, asking the
+        // identity of every compressed view): scanned when the registry's serial moved since the proof.
+        std::vector<StorageTexture::PendingQuery> pending;
     };
     StampProof stampProof;
     bool stampEligible() const;
