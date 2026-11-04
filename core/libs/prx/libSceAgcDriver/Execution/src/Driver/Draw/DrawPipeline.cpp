@@ -542,6 +542,8 @@ void DrawPipeline::RegisterCounters() {
         ArchB::Recorder::RegisterCounter("pipe_resolve_verify_mismatches", resolve.mismatches);
         ArchB::Recorder::RegisterCounter("pipe_committer_tracker_waits", GuestMemory::CommitterTrackerWaits());
         ArchB::Recorder::RegisterCounter("pipe_committer_tracker_wait_ns", GuestMemory::CommitterTrackerWaitNs());
+        ArchB::Recorder::RegisterCounter("pipe_resolver_tracker_waits", GuestMemory::ResolverTrackerWaits());
+        ArchB::Recorder::RegisterCounter("pipe_resolver_tracker_wait_ns", GuestMemory::ResolverTrackerWaitNs());
         static constexpr std::array<const char*, ResolverSlots + 1> threadNames{"pipe_resolver0_ns", "pipe_resolver1_ns", "pipe_resolver2_ns", "pipe_resolver3_ns", "pipe_resolver4_ns", "pipe_resolver5_ns", "pipe_resolver6_ns", "pipe_resolver7_ns", "pipe_resolve_committer_ns"};
         for (std::size_t i = 0; i < threadNames.size(); ++i) ArchB::Recorder::RegisterCounter(threadNames[i], resolve.threadNs[i]);
         // APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY: queue workers ask whether the committer is busy.
