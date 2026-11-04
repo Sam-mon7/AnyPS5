@@ -300,9 +300,9 @@ public:
     enum class ReadKind : std::uint8_t { DispatchElement = 0, GpuCopy, AddressBased, Indirect, StorageUpload, CopySource, DrawInput, Count };
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
-    void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
+    void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind, bool mayStore = true);
     using ReadList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
-    void NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind);
+    void NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind, bool mayStore = true);
     static bool ValidReadList(const ReadList& ranges);
     // Whether an unexecuted batch (open, or in flight with its fence unsignaled) reads the range in
     // place. A hit in an in-flight batch whose fence signaled meanwhile is a miss (one status
@@ -1057,9 +1057,9 @@ private:
     std::uint64_t carryWatchIds = 0;
     std::uint64_t carryWatchLow = ~std::uint64_t{0};
     std::uint64_t carryWatchHigh = 0;
-    void dropCarries(std::uint64_t begin, std::uint64_t end) { if (!carryWatches.empty() && begin < carryWatchHigh && carryWatchLow < end) dropOverlappingCarries(begin, end); }
-    void dropOverlappingCarries(std::uint64_t begin, std::uint64_t end);
-    void dropCarries(const ReadList& ranges);
+    void dropCarries(std::uint64_t begin, std::uint64_t end, const char* source) { if (!carryWatches.empty() && begin < carryWatchHigh && carryWatchLow < end) dropOverlappingCarries(begin, end, source); }
+    void dropOverlappingCarries(std::uint64_t begin, std::uint64_t end, const char* source);
+    void dropCarries(const ReadList& ranges, const char* source);
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per

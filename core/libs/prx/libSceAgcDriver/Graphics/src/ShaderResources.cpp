@@ -7717,17 +7717,18 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+    const bool mayStore = !BdaReadOnly();
     if (auto split = guestMemory.SplitInPlaceReads()) {
-        recorder.NotePendingReadList(std::move(split->space), kind);
-        recorder.NotePendingReads(split->own, kind);
+        recorder.NotePendingReadList(std::move(split->space), kind, mayStore);
+        recorder.NotePendingReads(split->own, kind, mayStore);
     } else if (AgcDriver::ArchB::AllocChurnActive()) {
         // APS5_ARCHB_FIX_ALLOC_CHURN: the same ranges in a per-thread scratch (NotePendingReads copies them).
         thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
         auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
         guestMemory.InPlaceReads(reads);
-        recorder.NotePendingReads(reads, kind);
+        recorder.NotePendingReads(reads, kind, mayStore);
     } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind, mayStore);
     }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {

@@ -4931,10 +4931,32 @@ bool Verify() {
 
 bool liveCpuProof(std::uint64_t begin, std::uint64_t end, std::uint64_t clock, std::uint64_t generation) {
     const auto bytes = static_cast<std::size_t>(end - begin);
-    return clock != 0 && generation != 0 && GuestMemory::FaultUnchangedSince(begin, bytes, clock) && GuestMemory::UnchangedSince(begin, bytes, generation);
+    if (clock == 0 || generation == 0) {
+        AgcDriver::ArchB::Recorder::Count("c_gpu_staging_carry_cpu_untracked");
+        return false;
+    }
+    if (!GuestMemory::FaultUnchangedSince(begin, bytes, clock)) {
+        AgcDriver::ArchB::Recorder::Count(GuestMemory::FaultUntracked(begin, bytes, clock) ? "c_gpu_staging_carry_cpu_untracked" : "c_gpu_staging_carry_cpu_fault");
+        return false;
+    }
+    if (!GuestMemory::UnchangedSince(begin, bytes, generation)) {
+        AgcDriver::ArchB::Recorder::Count("c_gpu_staging_carry_cpu_stamp");
+        return false;
+    }
+    return true;
 }
 
 std::atomic<GuestBufferMemory::CarryCpuProof> cpuProof{&liveCpuProof};
+
+struct ShadowPool {
+    AgcDriver::Mutex mutex;
+    std::map<std::tuple<VkDevice, std::uint64_t, std::uint64_t, VkBufferUsageFlags>, std::weak_ptr<void>> shadows;
+};
+
+ShadowPool& shadowPool() {
+    static ShadowPool pool;
+    return pool;
+}
 
 struct Counters {
     std::atomic<std::uint64_t> carried{0}, carriedBytes{0}, crossBatch{0}, crossBytes{0}, copied{0}, noToken{0}, noted{0}, queued{0}, registry{0}, cpu{0}, tokens{0}, verified{0}, mismatches{0};
@@ -4979,6 +5001,12 @@ void reportStaging() {
 }
 
 }
+
+struct GuestBufferMemory::CarryShadow {
+    std::shared_ptr<Buffer> buffer;
+    CarryToken token;
+    const void* busy = nullptr;
+};
 
 void ShutdownGuestBufferWorkers() {
     RefreshPool::Shutdown();
@@ -5180,7 +5208,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             const bool misaligned = !bindableInPlace(HostImportOffset(*entry, region.begin), addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
-                region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable));
+                region.buffer = stagingShadow(context, region, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable));
                 if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 if (region.buffer == nullptr) {
                     // No shadow to be had: in place when aligned, else the host copy below.
@@ -5193,6 +5221,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                     if (!gpuCopyEligible(region)) continue;
                     const auto allocateStart = std::chrono::steady_clock::now();
                     region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable), copyBufferProperties(false));
+                    region.shared.reset();
                     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 }
                 region.deviceLocal = staged;
@@ -5389,6 +5418,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 // A buffer UploadPrepare made for a GPU copy is not needed: the import serves the
                 // region in place (Descriptor prefers `direct`), and a kept buffer would count as copied.
                 region.buffer.reset();
+                region.shared.reset();
                 region.deviceLocal = false;
             } else if (entry != nullptr && recorder != nullptr && (staged || gpuCopyEligible(region))) {
                 // Misaligned in the import (or staged): the GPU copies the sub-range out of it. The
@@ -5437,6 +5467,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // The staging shadow UploadPrepare made cannot take the CPU copy (no host mapping): the
             // region falls back to a host buffer of its own.
             region.buffer.reset();
+            region.shared.reset();
             region.deviceLocal = false;
         }
         const auto copyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -5601,19 +5632,21 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         // A copied-in shadow starts a new use: no carry point until its copy-back.
         region->carrySerial = 0;
         region->carryWhole = false;
-        recorder->DropCarry(std::exchange(region->carryWatch, 0));
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
-            if (region->deviceLocal) region->buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
+            if (region->deviceLocal) region->buffer = stagingShadow(context, *region, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
             if (region->buffer == nullptr) {
                 // Or no shadow to be had: a host copy serves the region instead, aligned or not.
+                region->shared.reset();
                 region->deviceLocal = false;
                 region->unstaged = true;
                 region->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable), copyBufferProperties(false));
             }
             if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
         }
+        recorder->DropCarry(std::exchange(carryToken(*region).watch, 0));
+        beginCarryUse(*region);
         std::vector<std::byte> expected;
         const auto address = region->begin;
         const auto batch = static_cast<unsigned long long>(recorder->Submissions() + 1);
@@ -5753,6 +5786,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // APS5_ARCHB_GPU_STAGING_CARRY: the copy-back stores the whole region (the shadow and the
         // import then agree on every byte), the precondition of carrying the shadow to a next use.
         region.carryWhole = region.deviceLocal && std::any_of(merged.begin(), merged.end(), [&](const auto& range) { return range.first <= region.begin && region.end <= range.second; });
+        if (region.shared != nullptr && region.shared->busy == &region) region.shared->busy = nullptr;
         // Only once its copies are recorded: a throw above leaves the region counted by
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the
         // staging bytes, instead of losing the shader's results.
@@ -6351,11 +6385,12 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // copy-in refills. The import is the one the region was taken from (the caller checked its
         // serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
-        const auto watch = std::exchange(region.carryWatch, 0);
+        auto& held = carryToken(region);
+        const auto watch = std::exchange(held.watch, 0);
         if (cross) {
             auto& c = crossCarry::counters();
-            const bool token = region.copiedBack && region.carryWhole && watch != 0;
-            const bool sameBatch = token && region.carrySerial == recorder.OpenSerial();
+            const bool token = watch != 0;
+            const bool sameBatch = token && held.serial == recorder.OpenSerial();
             region.copiedBack = false;
             region.carrySerial = 0;
             region.carryWhole = false;
@@ -6365,9 +6400,9 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
                 crossCarry::count(c.noToken, "c_gpu_staging_carry_no_token");
             } else if (!recorder.TakeCarry(watch)) {
                 crossCarry::count(c.noted, "c_gpu_staging_carry_noted");
-            } else if (!sameBatch && region.carryAllocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+            } else if (!sameBatch && held.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
                 crossCarry::count(c.registry, "c_gpu_staging_carry_registry");
-            } else if (!sameBatch && !crossCarry::cpuProof.load(std::memory_order_relaxed)(region.begin, region.end, region.carryClock, region.carryGeneration)) {
+            } else if (!sameBatch && !crossCarry::cpuProof.load(std::memory_order_relaxed)(region.begin, region.end, held.clock, held.generation)) {
                 crossCarry::count(c.cpu, "c_gpu_staging_carry_cpu");
             } else {
                 take = true;
@@ -6379,6 +6414,7 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
                     crossCarry::count(c.crossBatch, "c_gpu_staging_carry_cross");
                     crossCarry::count(c.crossBytes, "c_gpu_staging_carry_cross_bytes", region.end - region.begin);
                 }
+                beginCarryUse(region);
                 carried.push_back(&region);
                 continue;
             }
@@ -6440,6 +6476,49 @@ GuestBufferMemory::StagingCarryCounts GuestBufferMemory::StagingCarry() {
     return {c.carried.load(), c.copied.load(), c.noPoint.load(), c.otherBatch.load(), c.noted.load(), c.verified.load(), c.mismatches.load()};
 }
 
+void GuestBufferMemory::beginCarryUse(Region& region) {
+    if (region.shared == nullptr) return;
+    if (region.shared->busy != nullptr && region.shared->busy != &region) AgcDriver::ArchB::Recorder::Count("c_gpu_staging_carry_shared_overlap");
+    region.shared->busy = &region;
+}
+
+GuestBufferMemory::CarryToken& GuestBufferMemory::carryToken(Region& region) {
+    return region.shared != nullptr ? region.shared->token : region.carry;
+}
+
+std::shared_ptr<Buffer> GuestBufferMemory::stagingShadow(const Context& context, Region& region, std::size_t bytes, VkBufferUsageFlags usage) {
+    region.shared.reset();
+    if (!crossCarry::Enabled()) return stagingBuffer(context, bytes, usage);
+    auto& pool = crossCarry::shadowPool();
+    const auto key = std::make_tuple(context.device, region.begin, region.end, usage);
+    {
+        std::lock_guard lock(pool.mutex);
+        if (const auto found = pool.shadows.find(key); found != pool.shadows.end()) {
+            if (auto alive = std::static_pointer_cast<CarryShadow>(found->second.lock())) {
+                region.shared = std::move(alive);
+                AgcDriver::ArchB::Recorder::Count("c_gpu_staging_carry_shared");
+                return region.shared->buffer;
+            }
+        }
+    }
+    auto buffer = stagingBuffer(context, bytes, usage);
+    if (buffer == nullptr) return nullptr;
+    auto made = std::make_shared<CarryShadow>();
+    made->buffer = buffer;
+    std::lock_guard lock(pool.mutex);
+    if (const auto found = pool.shadows.find(key); found != pool.shadows.end()) {
+        if (auto alive = std::static_pointer_cast<CarryShadow>(found->second.lock())) {
+            region.shared = std::move(alive);
+            AgcDriver::ArchB::Recorder::Count("c_gpu_staging_carry_shared");
+            return region.shared->buffer;
+        }
+    }
+    if (pool.shadows.size() >= 4096) std::erase_if(pool.shadows, [](const auto& entry) { return entry.second.expired(); });
+    pool.shadows[key] = made;
+    region.shared = std::move(made);
+    return buffer;
+}
+
 GuestBufferMemory::CrossCarryCounts GuestBufferMemory::CrossCarry() {
     const auto& c = crossCarry::counters();
     return {c.carried.load(), c.crossBatch.load(), c.copied.load(), c.noToken.load(), c.noted.load(), c.queued.load(), c.registry.load(), c.cpu.load(), c.verified.load(), c.mismatches.load()};
@@ -6453,7 +6532,8 @@ void GuestBufferMemory::NoteStagingCarryTokens(Recorder& recorder) {
     if (!uploaded || committed || !crossCarry::Enabled()) return;
     for (auto& region : regions) {
         if (!region.gpuCopy || !region.deviceLocal) continue;
-        recorder.DropCarry(std::exchange(region.carryWatch, 0));
+        auto& token = carryToken(region);
+        recorder.DropCarry(std::exchange(token.watch, 0));
         if (!region.copiedBack || !region.carryWhole) continue;
         const auto size = static_cast<std::size_t>(region.end - region.begin);
         if (recorder.QueuedStoreOverlaps(region.begin, size) || recorder.QueuedKeyStoreOverlaps(region.begin, size)) {
@@ -6461,11 +6541,12 @@ void GuestBufferMemory::NoteStagingCarryTokens(Recorder& recorder) {
             crossCarry::count(crossCarry::counters().queued, "c_gpu_staging_carry_queued");
             continue;
         }
-        region.carryWatch = recorder.WatchCarry(region.begin, region.end);
-        region.carrySerial = recorder.OpenSerial();
-        region.carryClock = GuestMemory::FaultClock();
-        region.carryGeneration = GuestMemory::WriteGeneration();
-        region.carryAllocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        static_cast<void>(GuestMemory::CollectWrites(region.begin, size));
+        token.watch = recorder.WatchCarry(region.begin, region.end);
+        token.serial = recorder.OpenSerial();
+        token.clock = GuestMemory::FaultClock();
+        token.generation = GuestMemory::WriteGeneration();
+        token.allocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         crossCarry::count(crossCarry::counters().tokens, "c_gpu_staging_carry_tokens");
     }
 }

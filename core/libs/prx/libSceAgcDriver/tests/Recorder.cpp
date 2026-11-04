@@ -4121,6 +4121,33 @@ bool crossCarryTests(const Device& device, Recorder& recorder) {
         if (on && verify) Require(now.verified - start.verified == now.carried - start.carried && now.mismatches == start.mismatches, "cross carry: a carried shadow differed from the import");
         Require(on || recorder.CarryWatches() == 0, "cross carry: a watch was registered with the switch off");
     }
+    {
+        GuestBufferMemory first(context);
+        GuestBufferMemory second(context);
+        for (auto* memory : {&first, &second}) {
+            memory->AllowDeviceStaging();
+            memory->AddWritable(element, elementBytes, false, false);
+            memory->Upload(false);
+        }
+        const auto finish = [&](GuestBufferMemory& memory) {
+            memory.RecordCopyBacks(recorder);
+            recorder.NotePendingWrites(memory.Writes());
+            memory.NoteStagingCarryPoints(recorder);
+            memory.MarkDirectWrites();
+            memory.NoteStagingCarryTokens(recorder);
+        };
+        finish(first);
+        finish(second);
+        const auto before = GuestBufferMemory::CrossCarry();
+        first.RecordStagingCopies(recorder);
+        finish(first);
+        second.RecordStagingCopies(recorder);
+        finish(second);
+        const auto after = GuestBufferMemory::CrossCarry();
+        Require(after.carried - before.carried == (on ? 2u : 0u), "cross carry: builds staging the same range did not carry one shared shadow");
+        recorder.Sync();
+        if (on && verify) Require(GuestBufferMemory::CrossCarry().mismatches == before.mismatches, "cross carry: a shared shadow differed from the import");
+    }
     GuestBufferMemory::SetCarryCpuProof(nullptr);
     const auto* guest = static_cast<const std::uint8_t*>(block);
     for (std::size_t at = 0; at < bytes; ++at) Require(guest[at] == (at == 4096 + 100 ? 0x77 : 0x5a), "cross carry: the guest bytes differ after the uses");

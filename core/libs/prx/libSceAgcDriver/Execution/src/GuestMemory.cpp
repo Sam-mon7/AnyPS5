@@ -3828,6 +3828,18 @@ bool FaultUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t
 #endif
 }
 
+bool FaultUntracked(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+#ifdef _WIN32
+    if (bytes == 0 || !wtFault::active.load(std::memory_order_acquire)) return true;
+    return GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, generation) == GuestArena::WtFaultAnswer::Untracked;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(generation);
+    return true;
+#endif
+}
+
 std::uint64_t FaultClock() {
 #ifdef _WIN32
     if (!wtFault::active.load(std::memory_order_acquire)) return 0;

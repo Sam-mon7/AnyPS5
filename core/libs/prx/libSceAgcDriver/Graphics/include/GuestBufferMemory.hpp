@@ -419,6 +419,14 @@ private:
         std::uint64_t unwatch = 0;
         std::uint64_t commit = 0;
     };
+    struct CarryToken {
+        std::uint64_t watch = 0;
+        std::uint64_t serial = 0;
+        std::uint64_t clock = 0;
+        std::uint64_t generation = 0;
+        std::uint64_t allocations = 0;
+    };
+    struct CarryShadow;
     struct Region {
         std::uint64_t begin;
         std::uint64_t end;
@@ -480,11 +488,12 @@ private:
         std::uint64_t carryWriteNote = 0;
         std::size_t carryReads = 0;
         std::size_t carryReadLists = 0;
-        std::uint64_t carryWatch = 0;
-        std::uint64_t carryClock = 0;
-        std::uint64_t carryGeneration = 0;
-        std::uint64_t carryAllocations = 0;
+        CarryToken carry {};
+        std::shared_ptr<CarryShadow> shared {};
     };
+    static CarryToken& carryToken(Region& region);
+    static void beginCarryUse(Region& region);
+    static std::shared_ptr<Buffer> stagingShadow(const Context& context, Region& region, std::size_t bytes, VkBufferUsageFlags usage);
 
     // How [begin, end) lies against the space's base regions.
     enum class BaseOverlap { None, Inside, Partial };
