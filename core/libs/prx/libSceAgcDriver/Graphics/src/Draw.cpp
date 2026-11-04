@@ -2201,12 +2201,19 @@ struct Token {
     std::size_t rangeCount = 0;
     bool registered = false;
     bool cmaskRegistered = false;
+    std::uint64_t lastUse = 0;
 };
 
-constexpr std::size_t TableSize = 64;
+constexpr std::size_t TableSets = 128;
+constexpr std::size_t TableWays = 4;
 
-std::array<Token, TableSize>& table() {
-    thread_local std::array<Token, TableSize> made{};
+struct TokenTable {
+    std::array<Token, TableSets * TableWays> slots{};
+    std::uint64_t uses = 0;
+};
+
+TokenTable& table() {
+    thread_local TokenTable made{};
     return made;
 }
 
@@ -2217,7 +2224,19 @@ Token& slotFor(const TargetKey& key) {
         hash *= 0x100000001b3ull;
         hash ^= hash >> 29;
     }
-    return table()[static_cast<std::size_t>(hash % TableSize)];
+    auto& made = table();
+    auto* set = &made.slots[static_cast<std::size_t>(hash % TableSets) * TableWays];
+    Token* victim = set;
+    for (std::size_t way = 0; way < TableWays; ++way) {
+        auto& slot = set[way];
+        if (slot.used && slot.key == key) {
+            slot.lastUse = ++made.uses;
+            return slot;
+        }
+        if (!slot.used) victim = victim->used ? &slot : victim;
+        else if (victim->used && slot.lastUse < victim->lastUse) victim = &slot;
+    }
+    return *victim;
 }
 
 std::size_t rangesOf(const StorageTexture& image, const ColorTarget& color, std::array<ArchC::EpochRange, 3>& ranges) {
@@ -2322,6 +2341,7 @@ public:
             token = Token{};
             token.key = key;
             token.used = true;
+            token.lastUse = ++table().uses;
             token.image = resident;
             token.raw = resident.get();
             token.epoch = resident->archcEpoch.load(std::memory_order_acquire);
@@ -2565,6 +2585,7 @@ public:
             token = Token{};
             token.key = key;
             token.used = true;
+            token.lastUse = ++table().uses;
             token.image = resident;
             token.raw = resident.get();
         }
