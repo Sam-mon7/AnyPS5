@@ -424,6 +424,12 @@ unsigned long long CodeOffset(const void* address);
 // every read and store through this interface calls first. Code that reads guest memory directly
 // calls FlushGpuWrites itself.
 void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
+// APS5_ARCHB_C_LAZY_STORE_HOOK: called by every driver store into guest memory (StoreOwnBytes, Write,
+// WriteChanged) and every driver read through this interface (Read, ReadCommitted[Unsynced],
+// EqualsCommittedUnsynced, CompareMapped, CopyMapped) before it touches the bytes, outside the tracker
+// lock: lazy publication publishes and opens a lazy range there, so the access does not fault on it
+// under the GPU mutex.
+void SetLazyStoreHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 enum class TrackerEvent : std::uint8_t { Stamp, Unwatch, Forget };
 void SetStampObserver(void (*observer)(std::uint64_t begin, std::uint64_t end, TrackerEvent event));
 void SetArmObserver(void (*observer)());

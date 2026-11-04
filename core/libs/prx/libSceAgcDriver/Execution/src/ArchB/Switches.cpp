@@ -57,6 +57,9 @@ constexpr Feature ArchcTargetFastpathPrerequisites[] = {Feature::ArchcImageEpoch
 constexpr Feature ArchcTemplateTokenPrerequisites[] = {Feature::ArchcImageEpochs, Feature::PipeResolveProofs};
 constexpr Feature ArchcDrawReplayPrerequisites[] = {Feature::ArchcTargetFastpath, Feature::ArchcTemplateToken, Feature::PipeQ0Committer};
 constexpr Feature CLazyPublishPrerequisites[] = {Feature::WtFault, Feature::WtFaultConsumers};
+constexpr Feature CWatchSplitPrerequisites[] = {Feature::WtFault};
+constexpr Feature CLazyStoreHookPrerequisites[] = {Feature::CLazyPublish};
+constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -146,6 +149,16 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::ArchcImageEpochs, "C_IMAGE_EPOCHS", false, true, ArchcImageEpochsPrerequisites},
     {Feature::ArchcTargetFastpath, "C_TARGET_FASTPATH", false, true, ArchcTargetFastpathPrerequisites},
     {Feature::CLazyPublish, "C_LAZY_PUBLISH", false, true, CLazyPublishPrerequisites},
+    // Arch C P5b: a census or lazy watch run that spans guest allocations (direct memory is committed in
+    // 16 KiB allocations) is protected one allocation at a time instead of failing whole.
+    {Feature::CWatchSplit, "C_WATCH_SPLIT", false, true, CWatchSplitPrerequisites},
+    // Arch C P5b: a driver store into a lazy label range publishes and opens the range first (the service,
+    // without the fault it would take under the GPU mutex).
+    {Feature::CLazyStoreHook, "C_LAZY_STORE_HOOK", false, true, CLazyStoreHookPrerequisites},
+    // Arch C P5b: a staged region's whole copy-back is recorded as a cancellable indirect copy
+    // (VK_KHR_copy_memory_indirect) and cancelled before submit when the same shadow's next use in the
+    // same batch carries it and copies it back whole, with nothing reading or writing the range between.
+    {Feature::CLazyCopyback, "C_LAZY_COPYBACK", false, true, CLazyCopybackPrerequisites},
     {Feature::ArchcTemplateToken, "C_TEMPLATE_TOKEN", false, true, ArchcTemplateTokenPrerequisites},
     {Feature::ArchcDrawReplay, "C_DRAW_REPLAY", false, true, ArchcDrawReplayPrerequisites},
 }};

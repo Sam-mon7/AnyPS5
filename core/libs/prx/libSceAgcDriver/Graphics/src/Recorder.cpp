@@ -4122,6 +4122,20 @@ bool Recorder::NotedSince(const NotePoint& point, std::uint64_t begin, std::uint
     return false;
 }
 
+bool Recorder::AccessedSince(const NotePoint& point, std::uint64_t begin, std::uint64_t end) const {
+    if (NotedSince(point, begin, end)) return true;
+    for (auto index = point.reads; index < open->reads.size(); ++index) {
+        const auto& read = open->reads[index];
+        if (begin < read.end && read.begin < end) return true;
+    }
+    for (auto index = point.readLists; index < open->readLists.size(); ++index) {
+        const auto& list = *open->readLists[index].ranges;
+        const auto found = std::partition_point(list.begin(), list.end(), [&](const auto& range) { return range.second <= begin; });
+        if (found != list.end() && found->first < end) return true;
+    }
+    return HasQueuedStores() && QueuedStoreOverlaps(begin, static_cast<std::size_t>(end - begin));
+}
+
 bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     return bytes != 0 && open != nullptr && overlaps(*open, address, address + bytes);
 }

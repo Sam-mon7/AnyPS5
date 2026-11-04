@@ -36,6 +36,7 @@
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LazyCopyBack.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
@@ -1755,6 +1756,22 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     maintenance8Features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     maintenance8Features.maintenance8 = VK_TRUE;
+    // APS5_ARCHB_C_LAZY_COPYBACK (Arch C P5b): cancellable staging copy-backs need indirect memory
+    // copies; the extension is enabled only when the switch's variable is set (to anything).
+    VkPhysicalDeviceCopyMemoryIndirectFeaturesKHR copyIndirectFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR};
+    bool copyIndirect = false;
+    if (std::getenv("APS5_ARCHB_C_LAZY_COPYBACK") != nullptr && hasExtension(VK_KHR_COPY_MEMORY_INDIRECT_EXTENSION_NAME)) {
+        VkPhysicalDeviceCopyMemoryIndirectPropertiesKHR copyIndirectProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &copyIndirectProperties};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &copyIndirectFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        copyIndirect = copyIndirectFeatures.indirectMemoryCopy == VK_TRUE && (copyIndirectProperties.supportedQueues & VK_QUEUE_GRAPHICS_BIT) != 0;
+        if (copyIndirect) deviceExtensions.push_back(VK_KHR_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
+        std::fprintf(stderr, "[gpu] C_LAZY_COPYBACK: VK_KHR_copy_memory_indirect %s (queues 0x%x)\n", copyIndirect ? "enabled" : "unusable", copyIndirectProperties.supportedQueues);
+    }
+    copyIndirectFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR};
+    copyIndirectFeatures.indirectMemoryCopy = VK_TRUE;
     VkPhysicalDeviceDepthClipControlFeaturesEXT depthClipFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &depthClipFeatures};
@@ -2057,6 +2074,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         maintenance8Features.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &maintenance8Features;
     }
+    if (copyIndirect) {
+        copyIndirectFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
+        deviceInfo.pNext = &copyIndirectFeatures;
+    }
     if (state->nonSeamlessCubeMap) {
         nonSeamlessCubeFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &nonSeamlessCubeFeatures;
@@ -2266,6 +2287,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     state->queueFamily = family;
+    if (copyIndirect && std::find(deviceExtensions.begin(), deviceExtensions.end(), std::string_view(VK_KHR_COPY_MEMORY_INDIRECT_EXTENSION_NAME)) != deviceExtensions.end()) {
+        Graphics::LazyCopyBack::SetIndirectCopy(state->DeviceFunction<PFN_vkCmdCopyMemoryIndirectKHR>("vkCmdCopyMemoryIndirectKHR"));
+    }
     if (plan.present) {
         state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, plan.presentIndex, &state->presentQueue);
         APS5_LOG_OUT("Presentation queue family=%u index=%u", family, plan.presentIndex);

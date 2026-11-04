@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
+#include "prx/libSceAgcDriver/Graphics/include/LazyCopyBack.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LazyPublish.hpp"
@@ -471,6 +472,20 @@ public:
                 robustness.pNext = address.pNext;
                 address.pNext = &robustness;
             }
+            // APS5_ARCHB_C_LAZY_COPYBACK: the indirect copy the cancellable copy-backs use.
+            VkPhysicalDeviceCopyMemoryIndirectFeaturesKHR copyIndirect{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR};
+            if (std::getenv("APS5_ARCHB_C_LAZY_COPYBACK") != nullptr && hasExtension(VK_KHR_COPY_MEMORY_INDIRECT_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &copyIndirect};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+            }
+            const bool copyIndirectOn = copyIndirect.indirectMemoryCopy == VK_TRUE;
+            copyIndirect = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR};
+            copyIndirect.indirectMemoryCopy = VK_TRUE;
+            if (copyIndirectOn) {
+                extensionsEnabled.push_back(VK_KHR_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
+                copyIndirect.pNext = address.pNext;
+                address.pNext = &copyIndirect;
+            }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             const std::array<VkDeviceQueueCreateInfo, 2> queueInfos{queue, settle};
             device.queueCreateInfoCount = settleFamily != noSettleFamily && settleFamily != family ? 2 : 1;
@@ -480,6 +495,7 @@ public:
             device.pEnabledFeatures = &enabled;
             Check(function<PFN_vkCreateDevice>("vkCreateDevice")(context.physical, &device, nullptr, &context.device), "vkCreateDevice");
             context.deviceProc = function<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
+            if (copyIndirectOn) AgcDriver::Graphics::LazyCopyBack::SetIndirectCopy(context.Function<PFN_vkCmdCopyMemoryIndirectKHR>("vkCmdCopyMemoryIndirectKHR"));
             function<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(context.physical, &context.memory);
             VkPhysicalDeviceProperties properties{};
             function<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(context.physical, &properties);
@@ -4074,6 +4090,7 @@ bool crossCarryTests(const Device& device, Recorder& recorder) {
             memory.NoteStagingCarryTokens(recorder);
         };
         const auto start = GuestBufferMemory::CrossCarry();
+        const auto lazyStart = AgcDriver::Graphics::LazyCopyBack::Totals();
         auto now = start;
         const auto expect = [&](std::uint64_t carried, std::uint64_t crossBatch, const char* what) {
             now = GuestBufferMemory::CrossCarry();
@@ -4122,6 +4139,12 @@ bool crossCarryTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
         now = GuestBufferMemory::CrossCarry();
         if (on && verify) Require(now.verified - start.verified == now.carried - start.carried && now.mismatches == start.mismatches, "cross carry: a carried shadow differed from the import");
+        if (AgcDriver::Graphics::LazyCopyBack::Active()) {
+            const auto lazy = AgcDriver::Graphics::LazyCopyBack::Totals();
+            Require(lazy.cancelled - lazyStart.cancelled + lazy.verified - lazyStart.verified >= 1, "lazy copy-back: the copy-back before a same-batch carry was neither cancelled nor verified");
+            Require(lazy.mismatches == lazyStart.mismatches, "lazy copy-back: after the surviving copy-back the import differed from the shadow");
+            std::cout << "lazy copy-back: " << lazy.indirect - lazyStart.indirect << " indirect, " << lazy.cancelled - lazyStart.cancelled << " cancelled, " << lazy.accessed - lazyStart.accessed << " refused (accessed), " << lazy.verified - lazyStart.verified << " verified\n";
+        }
         Require(on || recorder.CarryWatches() == 0, "cross carry: a watch was registered with the switch off");
     }
     {
@@ -11207,6 +11230,16 @@ int archcLazyTests(const Device& device, Recorder& recorder, std::string_view sc
         std::memcpy(seen.data(), block, surface);
         Require(std::all_of(seen.begin(), seen.begin() + 16, [](std::byte value) { return value == std::byte{0x77}; }), "the host write did not land");
         std::copy(published.begin(), published.begin() + 16, seen.begin());
+    } else if (scenario == "store") {
+        // A driver store into the lazy range under the GPU mutex (C_LAZY_STORE_HOOK: published by the
+        // store hook, no fault; without it the store faults and the service publishes).
+        AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const std::array<std::byte, 1> value{std::byte{0x99}};
+        AgcDriver::GuestMemory::Write(address + 8, value);
+        std::memcpy(seen.data(), block, surface);
+        Require(seen[8] == std::byte{0x99}, "the driver store did not land");
+        seen[8] = published[8];
     } else if (scenario == "write") {
         volatile std::byte* bytesSeen = block;
         bytesSeen[8] = std::byte{0x99};
@@ -11218,7 +11251,11 @@ int archcLazyTests(const Device& device, Recorder& recorder, std::string_view sc
     }
     Require(seen == published, "the CPU did not read the draw's results after the label");
     const auto served = Lazy::Totals();
-    if (on) {
+    const bool hooked = on && scenario == "store" && Switches::Enabled(Feature::CLazyStoreHook);
+    if (hooked) {
+        Require(served.services == deferred.services && served.storeHooks == deferred.storeHooks + 1, "the driver store was not published by the store hook alone");
+        Require(Lazy::Entries() == 0 && protection() != PAGE_NOACCESS, "the hooked range is still lazy");
+    } else if (on) {
         Require(served.services == deferred.services + 1, "the access was not served exactly once");
         Require(Lazy::Entries() == 0 && protection() != PAGE_NOACCESS, "the served range is still lazy");
         if (verify) Require(served.verified == deferred.verified + 1 && served.newer == deferred.newer, "VERIFY did not check the service, or found newer results than the label's");
