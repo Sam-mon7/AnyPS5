@@ -2981,6 +2981,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // Stage 4 M4: PrepareDrawBindings is resolve-class work inside the record phase.
     Stage4::Mark(Stage4::Bucket::Record);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    static const bool zcNoPassReads = std::getenv("APS5_ZC_MOVED_NO_PASSREADS") != nullptr;
+    if (!zcNoPassReads && drawBindings != nullptr && !drawBindings->inPlaceReads.empty()) passReads.insert(passReads.end(), drawBindings->inPlaceReads.begin(), drawBindings->inPlaceReads.end());
     Stage4::Mark(Stage4::Bucket::Pdb);
     recordPhase(RecordBindings);
     reuseCensus::mark(StructCensus::ReuseBindings);

@@ -6432,6 +6432,8 @@ DrawSetPoolCounters& drawSetPoolCounters() {
         AgcDriver::ArchB::Recorder::RegisterCounter("fix_draw_set_pool_misses", made->misses);
         AgcDriver::ArchB::Recorder::RegisterCounter("fix_draw_set_pool_full_elements", made->fullElements);
         AgcDriver::ArchB::Recorder::RegisterCounter("fix_draw_set_pool_written_elements", made->writtenElements);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_draw_set_pool_set_calls", made->setCalls[1]);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_draw_set_pool_set_ns", made->setNs[1]);
         return made;
     }();
     return *counters;
@@ -6803,7 +6805,7 @@ namespace {
 // key (this template, every moved element's index, address, size and words) was seen in the last 8,192
 // calls with moved buffers (about 12 frames): what a set cache keyed by the moved content would hit.
 struct MovedCensusCounters {
-    std::atomic<std::uint64_t> calls{0}, ns{0}, movedCalls{0}, movedNs{0}, addresses{0}, words{0}, importable{0}, repeats{0}, setCalls{0};
+    std::atomic<std::uint64_t> calls{0}, ns{0}, movedCalls{0}, movedNs{0}, addresses{0}, words{0}, importable{0}, repeats{0}, setCalls{0}, wordsNs{0};
 };
 
 MovedCensusCounters* movedCensus() {
@@ -6820,10 +6822,239 @@ MovedCensusCounters* movedCensus() {
         AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_moved_importable", counters->importable);
         AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_moved_repeats", counters->repeats);
         AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_set_calls", counters->setCalls);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_words_ns", counters->wordsNs);
         return counters;
     }();
     return made;
 }
+}
+
+namespace {
+// APS5_ARCHB_ZERO_COPY_MOVED counters: draws served by a cached set, sets built, draws refused (a moved
+// range not served by an import at a usable offset, a pending GPU write, or a GPU store already in the
+// open batch: the guest may see that label and rewrite the range before this draw reads it), entries
+// dropped because the import table changed, and the _VERIFY checks and mismatches.
+struct MovedSetCounters {
+    std::atomic<std::uint64_t> hits{0}, built{0}, refusedImport{0}, refusedPending{0}, refusedStore{0}, stale{0}, verified{0}, mismatches{0};
+};
+
+MovedSetCounters& movedSetCounters() {
+    static auto* made = [] {
+        auto* counters = new MovedSetCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_hits", counters->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_built", counters->built);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_refused_import", counters->refusedImport);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_refused_pending", counters->refusedPending);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_refused_store", counters->refusedStore);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_stale", counters->stale);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_verified", counters->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_mismatches", counters->mismatches);
+        return counters;
+    }();
+    return *made;
+}
+
+bool movedSetsVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_ZERO_COPY_MOVED_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+}
+
+// One immutable set per moved content: the object's own descriptors, the moved addresses pointing at
+// their imports and the data words in a buffer of the set's own. Never written after it is built, so
+// any number of in-flight draws may bind it; an entry holds it while cached, every draw while its batch
+// runs, and the last holder recycles it. Valid while the import table keeps the identity it was built
+// under (HostImportsUnchanged: no import retired, so every import buffer it points at still lives).
+struct ShaderResources::MovedSetCache {
+    struct Set {
+        DescriptorCache* cache = nullptr;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout fragmentLayout = VK_NULL_HANDLE;
+        DescriptorCache::SetAllocation allocation;
+        DescriptorCache::SetAllocation fragmentAllocation;
+        std::vector<std::shared_ptr<Buffer>> words;
+        ~Set() {
+            if (cache == nullptr) return;
+            if (allocation.set != VK_NULL_HANDLE) cache->Recycle(layout, allocation);
+            if (fragmentAllocation.set != VK_NULL_HANDLE) cache->Recycle(fragmentLayout, fragmentAllocation);
+        }
+    };
+    struct Entry {
+        std::vector<std::uint64_t> content;
+        std::shared_ptr<Set> set;
+        HostImportsProof proof;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+        // Per moved address: the import buffer and offset the set points at (_VERIFY).
+        std::vector<std::pair<VkBuffer, VkDeviceSize>> targets;
+        std::uint64_t lastUse = 0;
+    };
+    // Keyed by a hash of the content (the content itself decides a hit). Over capacity, every entry not
+    // used in the last Capacity uses goes.
+    static constexpr std::size_t Capacity = 1024;
+    std::unordered_map<std::uint64_t, Entry> entries;
+    std::uint64_t uses = 0;
+};
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+    auto& counters = movedSetCounters();
+    if (context.descriptorCache == nullptr) return {};
+    // A GPU store already in the open batch may be a label the guest waits on: once the GPU stores it,
+    // the guest may rewrite a moved range before this later draw reads it in place (the in-flight
+    // rewrites the zero-copy census found were all of moved ranges). Such draws keep their snapshots.
+    if (recorder.OpenGpuStores() != 0) {
+        counters.refusedStore.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    thread_local std::vector<std::uint64_t>* contentSlot = nullptr;
+    auto& content = ShaderRecompiler::ThreadOwned(contentSlot);
+    content.clear();
+    thread_local std::vector<std::pair<VkBuffer, VkDeviceSize>>* targetsSlot = nullptr;
+    auto& targets = ShaderRecompiler::ThreadOwned(targetsSlot);
+    targets.clear();
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+    auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    reads.clear();
+    const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+    for (const auto& entry : moved) {
+        content.push_back(entry.allocation);
+        content.push_back(entry.address);
+        content.push_back(entry.size);
+        content.push_back(entry.words.size());
+        for (const auto word : entry.words) content.push_back(word);
+        if (!entry.words.empty()) continue;
+        const auto& item = allocations[entry.allocation];
+        const auto begin = entry.address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
+        if (bytes == 0 || recorder.PendingWriteOverlaps(begin, bytes)) {
+            counters.refusedPending.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
+        reads.emplace_back(begin, begin + bytes);
+    }
+    // The import buffer and offset of every moved range (a miss builds with them, VERIFY compares them
+    // with the entry's); false when one is not served at a usable offset.
+    const auto lookupTargets = [&] {
+        targets.clear();
+        for (const auto& [begin, end] : reads) {
+            const auto* import = ExistingHostImportFor(context, begin, static_cast<std::size_t>(end - begin));
+            if (import == nullptr || HostImportOffset(*import, begin) % alignment != 0) {
+                counters.refusedImport.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            targets.emplace_back(import->buffer, HostImportOffset(*import, begin));
+        }
+        return true;
+    };
+    if (movedSetCache == nullptr) movedSetCache = std::make_shared<MovedSetCache>();
+    auto& cache = *movedSetCache;
+    ++cache.uses;
+    std::uint64_t key = 0xcbf29ce484222325ull;
+    for (const auto value : content) key = (key ^ value) * 0x100000001b3ull + (key >> 31u);
+    auto found = cache.entries.find(key);
+    if (found != cache.entries.end() && found->second.content != content) {
+        cache.entries.erase(found);
+        found = cache.entries.end();
+    }
+    if (found != cache.entries.end() && !HostImportsUnchanged(context, found->second.proof)) {
+        counters.stale.fetch_add(1, std::memory_order_relaxed);
+        cache.entries.erase(found);
+        found = cache.entries.end();
+    }
+    if (found == cache.entries.end()) {
+        if (!lookupTargets()) return {};
+        const auto proof = HostImportsIdentity(context);
+        if (proof == HostImportsProof{}) return {};
+        auto set = std::make_shared<MovedSetCache::Set>();
+        set->cache = context.descriptorCache;
+        std::array<bool, 2> described{};
+        std::array<std::vector<VkDescriptorPoolSize>, 2> counts;
+        for (const auto& binding : bindings) {
+            const auto which = setOf(binding);
+            described[which] = true;
+            const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+            if (count == 0) continue;
+            auto& sizes = counts[which];
+            const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& size) { return size.type == binding.layout.descriptorType; });
+            if (held != sizes.end()) held->descriptorCount += count;
+            else sizes.push_back({binding.layout.descriptorType, count});
+        }
+        for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+        const auto variableOf = [&](std::size_t which) { return tableBindings[which] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[which]].imageAllocations.size()))) : std::nullopt; };
+        if (described[0] || splitSets) {
+            set->allocation = set->cache->AllocateRewritten(_layout, counts[0], updateAfterBind, variableOf(0));
+            set->layout = _layout;
+            Require(set->allocation.set != VK_NULL_HANDLE, "cached moved set allocation failed");
+        }
+        if (described[1] || splitSets) {
+            set->fragmentAllocation = set->cache->AllocateRewritten(fragment.layout, counts[1], updateAfterBind, variableOf(1));
+            set->fragmentLayout = fragment.layout;
+            Require(set->fragmentAllocation.set != VK_NULL_HANDLE, "cached moved set allocation failed");
+        }
+        auto buffers = descriptorBuffers;
+        auto writes = descriptorWrites;
+        std::size_t target = 0;
+        for (const auto& entry : moved) {
+            // The element's descriptor slot: its binding's write, at the element's position.
+            bool placed = false;
+            for (const auto& binding : bindings) {
+                const auto position = std::find(binding.allocations.begin(), binding.allocations.end(), entry.allocation);
+                if (position == binding.allocations.end()) continue;
+                const auto original = setOf(binding) == 0 ? _set : fragment.set;
+                const auto write = std::find_if(writes.begin(), writes.end(), [&](const VkWriteDescriptorSet& candidate) { return candidate.dstBinding == binding.layout.binding && candidate.dstSet == original && candidate.pBufferInfo != nullptr; });
+                Require(write != writes.end(), "a moved element has no buffer descriptor write");
+                const auto slot = static_cast<std::size_t>(write->pBufferInfo - descriptorBuffers.data()) + static_cast<std::size_t>(position - binding.allocations.begin());
+                if (entry.words.empty()) {
+                    buffers[slot] = {targets[target].first, targets[target].second, static_cast<VkDeviceSize>(reads[target].second - reads[target].first)};
+                    ++target;
+                } else {
+                    auto words = std::make_shared<Buffer>(context, entry.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                    auto* bytes = words->Bytes().data();
+                    std::memcpy(bytes, entry.words.data(), entry.size);
+                    for (const auto& patch : dataPatches) {
+                        if (patch.allocation == entry.allocation && patch.byte < entry.size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                    }
+                    buffers[slot] = {words->Handle(), 0, entry.size};
+                    set->words.push_back(std::move(words));
+                }
+                placed = true;
+                break;
+            }
+            Require(placed, "a moved element has no binding");
+        }
+        for (auto& write : writes) {
+            write.dstSet = write.dstSet == _set ? set->allocation.set : set->fragmentAllocation.set;
+            if (write.pBufferInfo != nullptr) write.pBufferInfo = buffers.data() + (write.pBufferInfo - descriptorBuffers.data());
+        }
+        if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        if (cache.entries.size() >= MovedSetCache::Capacity) {
+            const auto floor = cache.uses > MovedSetCache::Capacity ? cache.uses - MovedSetCache::Capacity : 0;
+            std::erase_if(cache.entries, [&](const auto& entry) { return entry.second.lastUse < floor; });
+            if (cache.entries.size() >= MovedSetCache::Capacity) cache.entries.clear();
+        }
+        found = cache.entries.emplace(key, MovedSetCache::Entry{content, std::move(set), proof, reads, targets, 0}).first;
+        counters.built.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        counters.hits.fetch_add(1, std::memory_order_relaxed);
+        if (movedSetsVerify()) {
+            counters.verified.fetch_add(1, std::memory_order_relaxed);
+            if (!lookupTargets() || found->second.targets != targets || found->second.reads != reads) counters.mismatches.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    auto& entry = found->second;
+    entry.lastUse = cache.uses;
+    auto result = std::make_shared<DrawBindings>();
+    result->allocation = entry.set->allocation;
+    result->fragmentAllocation = entry.set->fragmentAllocation;
+    result->cachedSet = entry.set;
+    result->inPlaceReads = entry.reads;
+    static const bool noNotes = std::getenv("APS5_ZC_MOVED_NO_READNOTES") != nullptr;
+    if (!noNotes)
+    for (const auto& [begin, end] : entry.reads) recorder.NotePendingRead(begin, static_cast<std::size_t>(end - begin), Recorder::ReadKind::DispatchElement);
+    recorder.Keep(result);
+    return result;
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
@@ -6880,6 +7111,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             ringNext = (ringNext + 1) % Window;
         }
         ++seen[key];
+    }
+    // APS5_ARCHB_ZERO_COPY_MOVED (on top of ZERO_COPY_STORAGE, which leaves every other element as the
+    // object's set binds it): a cached immutable set for this moved content; nothing when refused.
+    if (!moved.empty() && Recorder::ZeroCopyStorageActive() && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ZeroCopyMoved)) {
+        if (auto cached = cachedMovedBindings(recorder, moved)) return cached;
     }
     // APS5_DRAW_BINDINGS_DIAG: the call's time by snapshot path (diagnostic).
     const bool diag = Recorder::SnapshotDiagEnabled();
@@ -6958,16 +7194,18 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     } zeroCopyReport{zeroCopy, zeroCopySkipped};
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
-        const auto checkStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto checkStart = diag || movedCensusScope.counters != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             struct MovedTime {
                 bool on;
+                MovedCensusCounters* census;
                 std::chrono::steady_clock::time_point start;
                 ~MovedTime() {
                     if (on) bindingsDiag().movedNs.fetch_add(diagNs(start), std::memory_order_relaxed);
+                    if (census != nullptr) census->wordsNs.fetch_add(diagNs(start), std::memory_order_relaxed);
                 }
-            } movedTime{diag, checkStart};
+            } movedTime{diag, movedCensusScope.counters, checkStart};
             constexpr std::size_t MovedWordBufferSlots = 8;
             const bool uploadWords = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixMovedWordUpload);
             const auto fill = [&](std::byte* bytes) {

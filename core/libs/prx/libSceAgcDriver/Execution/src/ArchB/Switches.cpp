@@ -134,6 +134,9 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // dispatch), so an alternating gate can toggle it: compute queues 0x20.. record bind+dispatch into
     // per-thread secondaries without the GPU mutex.
     {Feature::PrivateCompute, "PRIVATE_COMPUTE", false, true, {}},
+    // Draws with moved buffers bind an immutable per-template set, cached by the moved content: moved
+    // addresses read in place through their import, data words in a buffer of the set's own.
+    {Feature::ZeroCopyMoved, "ZERO_COPY_MOVED", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

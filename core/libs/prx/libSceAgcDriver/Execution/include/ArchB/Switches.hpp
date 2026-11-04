@@ -75,6 +75,7 @@ enum class Feature : std::uint8_t {
     PrelockStampSkip,
     PrelockFindHandoff,
     PrivateCompute,
+    ZeroCopyMoved,
     Count
 };
 

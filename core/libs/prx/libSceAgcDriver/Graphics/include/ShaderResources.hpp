@@ -218,6 +218,11 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // APS5_ARCHB_ZERO_COPY_MOVED: the cached set this draw binds (allocation names it; the holder
+        // returns it to the descriptor cache once no draw and no cache entry holds it), and the moved
+        // ranges it reads in place (the draw adds them to its pass reads).
+        std::shared_ptr<void> cachedSet;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
         // APS5_ARCHB_FIX_DRAW_SET_POOL: the pool the sets return to when this object is released (its
         // batch completed), and the allocation indices whose elements hold this draw's snapshots
         // instead of the template's own buffer descriptors.
@@ -704,6 +709,9 @@ private:
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // APS5_ARCHB_FIX_DRAW_SET_POOL: made with the descriptor writes (buildComplete), never replaced.
     std::shared_ptr<DrawSetPool> drawSetPool;
+    struct MovedSetCache;
+    mutable std::shared_ptr<MovedSetCache> movedSetCache;
+    std::shared_ptr<DrawBindings> cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
