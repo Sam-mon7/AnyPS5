@@ -56,6 +56,7 @@ constexpr Feature ArchcImageEpochsPrerequisites[] = {Feature::WtFault, Feature::
 constexpr Feature ArchcTargetFastpathPrerequisites[] = {Feature::ArchcImageEpochs};
 constexpr Feature ArchcTemplateTokenPrerequisites[] = {Feature::ArchcImageEpochs, Feature::PipeResolveProofs};
 constexpr Feature ArchcDrawReplayPrerequisites[] = {Feature::ArchcTargetFastpath, Feature::ArchcTemplateToken, Feature::PipeQ0Committer};
+constexpr Feature CLazyPublishPrerequisites[] = {Feature::WtFault, Feature::WtFaultConsumers};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -141,8 +142,10 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Draws with moved buffers bind an immutable per-template set, cached by the moved content: moved
     // addresses read in place through their import, data words in a buffer of the set's own.
     {Feature::ZeroCopyMoved, "ZERO_COPY_MOVED", false, true, {}},
+    {Feature::CGpuStagingCarry, "C_GPU_STAGING_CARRY", false, true, {}},
     {Feature::ArchcImageEpochs, "C_IMAGE_EPOCHS", false, true, ArchcImageEpochsPrerequisites},
     {Feature::ArchcTargetFastpath, "C_TARGET_FASTPATH", false, true, ArchcTargetFastpathPrerequisites},
+    {Feature::CLazyPublish, "C_LAZY_PUBLISH", false, true, CLazyPublishPrerequisites},
     {Feature::ArchcTemplateToken, "C_TEMPLATE_TOKEN", false, true, ArchcTemplateTokenPrerequisites},
     {Feature::ArchcDrawReplay, "C_DRAW_REPLAY", false, true, ArchcDrawReplayPrerequisites},
 }};

@@ -358,6 +358,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleUpload.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ImageEpochs.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LazyCensus.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LazyPublish.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/SampleOrder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BarrierBatch.cpp
@@ -605,9 +607,10 @@ if(BUILD_TESTING)
         set_tests_properties(agc_archb_wt_fault_consumers_switch PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_archb_gpu_staging_carry_switch COMMAND agc_archb_c01_switches_tests --toggle GpuStagingCarry)
-    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch agc_archb_pipe_draw_reuse_switch agc_archb_pipe_draw_lookup_memo_switch agc_archb_fix_stable_failed_wide_switch agc_archb_fix_snapshot_page_refresh_switch agc_archb_fix_snapshot_candidates_switch agc_archb_fix_moved_word_upload_switch agc_archb_fix_unstamped_alias_switch agc_archb_fix_pipeline_key_writer_switch agc_archb_gpu_staging_carry_switch PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_archb_c_gpu_staging_carry_switch COMMAND agc_archb_c01_switches_tests --toggle CGpuStagingCarry)
+    set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch agc_archb_pipe_draw_reuse_switch agc_archb_pipe_draw_lookup_memo_switch agc_archb_fix_stable_failed_wide_switch agc_archb_fix_snapshot_page_refresh_switch agc_archb_fix_snapshot_candidates_switch agc_archb_fix_moved_word_upload_switch agc_archb_fix_unstamped_alias_switch agc_archb_fix_pipeline_key_writer_switch agc_archb_gpu_staging_carry_switch agc_archb_c_gpu_staging_carry_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch agc_archb_pipe_draw_reuse_switch agc_archb_pipe_draw_lookup_memo_switch agc_archb_fix_stable_failed_wide_switch agc_archb_fix_snapshot_page_refresh_switch agc_archb_fix_snapshot_candidates_switch agc_archb_fix_moved_word_upload_switch agc_archb_fix_unstamped_alias_switch agc_archb_fix_pipeline_key_writer_switch agc_archb_gpu_staging_carry_switch PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_archb_fix_alloc_churn_switch agc_archb_fix_wt_bookkeeping_switch agc_archb_gen_table_switch agc_archb_gen_shadow_switch agc_archb_gen_lockfree_switch agc_archb_gen_draw_validation_switch agc_archb_pipe_q0_committer_switch agc_archb_pipe_keep_indirect_regs_switch agc_archb_pipe_indirect_gpu_args_switch agc_archb_pipe_narrow_draw_writes_switch agc_archb_pipe_narrow_sliced_depth_switch agc_archb_pipe_narrow_dispatch_writes_switch agc_archb_pipe_keep_own_label_waits_switch agc_archb_fix_draw_set_pool_switch agc_archb_pipe_deep_queue_switch agc_archb_pipe_committer_mutex_priority_switch agc_archb_pipe_full_hysteresis_switch agc_archb_pipe_dispatch_alias_switch agc_archb_pipe_collect_share_switch agc_archb_fix_dispatch_relocation_switch agc_archb_pipe_copy_kernel_items_switch agc_archb_fix_stable_failed_collects_switch agc_archb_pipe_draw_reuse_switch agc_archb_pipe_draw_lookup_memo_switch agc_archb_fix_stable_failed_wide_switch agc_archb_fix_snapshot_page_refresh_switch agc_archb_fix_snapshot_candidates_switch agc_archb_fix_moved_word_upload_switch agc_archb_fix_unstamped_alias_switch agc_archb_fix_pipeline_key_writer_switch agc_archb_gpu_staging_carry_switch agc_archb_c_gpu_staging_carry_switch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_archb_fix_v1_switch PROPERTIES TIMEOUT 30)
@@ -1114,6 +1117,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_archc_epochs COMMAND agc_write_tracking_tests --archc-epochs)
     set_tests_properties(agc_archc_log agc_archc_epochs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
         ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0;APS5_ARCHB_C_IMAGE_EPOCHS=1"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    add_test(NAME agc_archc_lazy_watch COMMAND agc_write_tracking_tests --archc-watch)
+    set_tests_properties(agc_archc_lazy_watch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+        ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_C_LAZY_CENSUS=1"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     add_test(NAME agc_archb_wt_fault_hot COMMAND agc_write_tracking_tests --wt-fault-hot)
     set_tests_properties(agc_archb_wt_fault_hot PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
@@ -2194,10 +2201,18 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_gpu_staging_carry_on COMMAND agc_driver_recorder_tests --staging-carry-only)
     add_test(NAME agc_archb_gpu_staging_carry_verify COMMAND agc_driver_recorder_tests --staging-carry-only)
     set_tests_properties(agc_archb_gpu_staging_carry_off agc_archb_gpu_staging_carry_on agc_archb_gpu_staging_carry_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    add_test(NAME agc_archb_c_gpu_staging_carry_off COMMAND agc_driver_recorder_tests --c-staging-carry-only)
+    add_test(NAME agc_archb_c_gpu_staging_carry_on COMMAND agc_driver_recorder_tests --c-staging-carry-only)
+    add_test(NAME agc_archb_c_gpu_staging_carry_verify COMMAND agc_driver_recorder_tests --c-staging-carry-only)
+    set_tests_properties(agc_archb_c_gpu_staging_carry_off agc_archb_c_gpu_staging_carry_on agc_archb_c_gpu_staging_carry_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_archb_c_gpu_staging_carry_on PROPERTIES ENVIRONMENT "APS5_ARCHB_C_GPU_STAGING_CARRY=1")
+    set_tests_properties(agc_archb_c_gpu_staging_carry_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_C_GPU_STAGING_CARRY=1;APS5_ARCHB_C_GPU_STAGING_CARRY_VERIFY=1")
     set_tests_properties(agc_archb_gpu_staging_carry_on PROPERTIES ENVIRONMENT "APS5_ARCHB_GPU_STAGING_CARRY=1")
     set_tests_properties(agc_archb_gpu_staging_carry_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_GPU_STAGING_CARRY=1;APS5_ARCHB_GPU_STAGING_CARRY_VERIFY=1")
     if(WIN32)
         set_tests_properties(agc_archb_gpu_staging_carry_off agc_archb_gpu_staging_carry_on agc_archb_gpu_staging_carry_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(agc_archb_c_gpu_staging_carry_off agc_archb_c_gpu_staging_carry_on agc_archb_c_gpu_staging_carry_verify PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_read_written_staging COMMAND agc_driver_recorder_tests --read-written-staging-only)
@@ -2782,6 +2797,21 @@ if(BUILD_TESTING)
     set_tests_properties(agc_archc_target_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_IMAGE_EPOCHS=1;APS5_ARCHB_C_TARGET_FASTPATH=1;APS5_ARCHB_C_TARGET_FASTPATH_VERIFY=1")
     if(WIN32)
         set_tests_properties(agc_archc_target_verify PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    foreach(archcLazy read write locked host_write)
+        add_test(NAME agc_archc_lazy_${archcLazy} COMMAND agc_driver_recorder_tests --archc-lazy ${archcLazy})
+        add_test(NAME agc_archc_lazy_${archcLazy}_off COMMAND agc_driver_recorder_tests --archc-lazy ${archcLazy})
+        set_tests_properties(agc_archc_lazy_${archcLazy} PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_LAZY_PUBLISH=1;APS5_WT_FAULT_GUEST_HOT=0")
+        set_tests_properties(agc_archc_lazy_${archcLazy}_off PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_LAZY_PUBLISH=0;APS5_WT_FAULT_GUEST_HOT=0")
+        set_tests_properties(agc_archc_lazy_${archcLazy} agc_archc_lazy_${archcLazy}_off PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archc_lazy_${archcLazy} agc_archc_lazy_${archcLazy}_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    add_test(NAME agc_archc_lazy_verify COMMAND agc_driver_recorder_tests --archc-lazy read)
+    set_tests_properties(agc_archc_lazy_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_LAZY_PUBLISH=1;APS5_ARCHB_C_LAZY_PUBLISH_VERIFY=1;APS5_WT_FAULT_GUEST_HOT=0")
+    if(WIN32)
+        set_tests_properties(agc_archc_lazy_verify PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_vertex_target_range_copied COMMAND agc_driver_recorder_tests --vertex-target-range-copied)
     add_test(NAME agc_driver_vertex_target_range_imported COMMAND agc_driver_recorder_tests --vertex-target-range-imported)

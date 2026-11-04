@@ -158,6 +158,8 @@ bool ResolveShareActive();
 // open, untracked or armed later. Stores the driver stamps without a fault (MarkWritten of GPU
 // results) are not covered: pair it with UnchangedSince.
 bool FaultUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+std::uint64_t FaultClock();
+bool FaultUntracked(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // The committer's tracker-mutex acquisitions that waited, and the nanoseconds waited.
 std::atomic<std::uint64_t>& CommitterTrackerWaits();
 std::atomic<std::uint64_t>& CommitterTrackerWaitNs();

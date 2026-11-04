@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
@@ -1830,6 +1831,7 @@ void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize l
     ensureOpen();
     // A queued label store over the keys lands first (program order: the key store is later).
     FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
+    dropCarries(begin, end, "c_gpu_staging_carry_drop_key_store");
     keyStoreCount.fetch_add(1, std::memory_order_relaxed);
     if (seed != nullptr) open->kept.push_back(seed);
     // The same range queued twice lands once: nothing wrote over it in between, or the writer
@@ -1948,6 +1950,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     if (bytes.empty()) return;
     EndComputeChain();
     ensureOpen();
+    dropCarries(address, address + bytes.size(), "c_gpu_staging_carry_drop_label_store");
     ++open->gpuStores;
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
@@ -3860,6 +3863,8 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    ArchC::LazyCensus::UsedByGpu(address, address + bytes, ownLabel ? ArchC::LazyCensus::GpuUse::LabelStore : ArchC::LazyCensus::GpuUse::Write);
+    dropCarries(address, address + bytes, ownLabel ? "c_gpu_staging_carry_drop_label" : "c_gpu_staging_carry_drop_write");
     ArchC::ImageEpochs::Note(address, address + bytes, ArchC::EpochSource::GpuNote, ArchC::SelfScope::Current());
     ensureOpen();
     // Write generations: a GPU write announced at recording (pending, before any later capture),
@@ -3889,6 +3894,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
 
 void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel) {
     if (bytes == 0) return;
+    if (&batch != open.get()) ArchC::LazyCensus::UsedByGpu(address, address + bytes, ownLabel ? ArchC::LazyCensus::GpuUse::LabelStore : ArchC::LazyCensus::GpuUse::Write);
     if (&batch == open.get()) {
         if (!noteWrite(address, bytes, ownLabel)) return;
         const std::array ranges{std::pair{address, address + bytes}};
@@ -3900,6 +3906,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+    dropCarries(address, address + bytes, "c_gpu_staging_carry_drop_write_inflight");
     if (GuestMemory::Gen::Active()) GuestMemory::Gen::NotePending(address, address + bytes, (std::uint64_t{GuestMemory::CurrentPacket().queue} << 32) | (reinterpret_cast<std::uintptr_t>(&batch) & 0xffffffffu));
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
@@ -4024,6 +4031,60 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
         if (overlaps(*batch, address, end)) return true;
     }
     return false;
+}
+
+std::uint64_t Recorder::WatchCarry(std::uint64_t begin, std::uint64_t end) {
+    if (carryWatches.size() >= CarryWatchLimit) {
+        carryWatches.clear();
+        carryWatchLow = ~std::uint64_t{0};
+        carryWatchHigh = 0;
+    }
+    const auto id = ++carryWatchIds;
+    carryWatches.push_back({begin, end, id});
+    carryWatchLow = std::min(carryWatchLow, begin);
+    carryWatchHigh = std::max(carryWatchHigh, end);
+    return id;
+}
+
+bool Recorder::TakeCarry(std::uint64_t id) {
+    for (auto it = carryWatches.begin(); it != carryWatches.end(); ++it) {
+        if (it->id != id) continue;
+        *it = carryWatches.back();
+        carryWatches.pop_back();
+        return true;
+    }
+    return false;
+}
+
+void Recorder::DropCarry(std::uint64_t id) {
+    if (id != 0) static_cast<void>(TakeCarry(id));
+}
+
+void Recorder::dropOverlappingCarries(std::uint64_t begin, std::uint64_t end, const char* source) {
+    std::uint64_t low = ~std::uint64_t{0};
+    std::uint64_t high = 0;
+    for (std::size_t index = 0; index < carryWatches.size();) {
+        const auto& watch = carryWatches[index];
+        if (watch.begin < end && begin < watch.end) {
+            AgcDriver::ArchB::Recorder::Count(source);
+            if (watch.begin == begin && watch.end == end) AgcDriver::ArchB::Recorder::Count("c_gpu_staging_carry_drop_same_range");
+            carryWatches[index] = carryWatches.back();
+            carryWatches.pop_back();
+            continue;
+        }
+        low = std::min(low, watch.begin);
+        high = std::max(high, watch.end);
+        ++index;
+    }
+    carryWatchLow = low;
+    carryWatchHigh = high;
+}
+
+void Recorder::dropCarries(const ReadList& ranges, const char* source) {
+    for (const auto& [begin, end] : ranges) {
+        if (carryWatches.empty()) return;
+        dropCarries(begin, end, source);
+    }
 }
 
 Recorder::NotePoint Recorder::OpenNotePoint() {
@@ -4155,14 +4216,20 @@ bool Recorder::ReadTracking() {
 }
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
+    if (bytes != 0) ArchC::LazyCensus::UsedByGpu(address, address + bytes, kind == ReadKind::GpuCopy ? ArchC::LazyCensus::GpuUse::StagingIn : kind == ReadKind::AddressBased ? ArchC::LazyCensus::GpuUse::AddressRead : ArchC::LazyCensus::GpuUse::Read);
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
+    if (kind == ReadKind::AddressBased && bytes != 0) dropCarries(address, address + bytes, "c_gpu_staging_carry_drop_address_read");
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
     open->reads.push_back({address, address + bytes, kind});
     readsNoted.fetch_add(1, std::memory_order_relaxed);
 }
 
-void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
+void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind, bool mayStore) {
+    ArchC::LazyCensus::UsedByGpu(ranges, kind == ReadKind::GpuCopy ? ArchC::LazyCensus::GpuUse::StagingIn : kind == ReadKind::AddressBased ? ArchC::LazyCensus::GpuUse::AddressRead : ArchC::LazyCensus::GpuUse::Read);
+    if (kind == ReadKind::AddressBased && mayStore) {
+        for (const auto& [begin, end] : ranges) dropCarries(begin, end, "c_gpu_staging_carry_drop_address_read");
+    }
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
@@ -4180,10 +4247,12 @@ bool Recorder::ValidReadList(const ReadList& ranges) {
     return true;
 }
 
-void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind) {
+void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind, bool mayStore) {
+    if (ranges != nullptr) ArchC::LazyCensus::UsedByGpu(*ranges, kind == ReadKind::AddressBased ? ArchC::LazyCensus::GpuUse::AddressRead : ArchC::LazyCensus::GpuUse::Read);
+    if (kind == ReadKind::AddressBased && mayStore && ranges != nullptr) dropCarries(*ranges, "c_gpu_staging_carry_drop_address_list");
     if (ranges == nullptr || ranges->empty() || !ReadTrackingEnabled()) return;
     if (CaptureTrace::Enabled() || FlipReadCheck()) {
-        NotePendingReads(*ranges, kind);
+        NotePendingReads(*ranges, kind, mayStore);
         return;
     }
     ensureOpen();
@@ -5122,7 +5191,9 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         // Registered before the release: a teardown can only start once the mutex is free.
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
+        const auto censusStart = ArchC::LazyCensus::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial, myId);
+        if (censusStart != std::chrono::steady_clock::time_point{}) ArchC::LazyCensus::NoteFenceWait(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - censusStart).count()));
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
     }
@@ -5235,6 +5306,12 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         static std::uint64_t waits = 0;
         static auto lastReport = std::chrono::steady_clock::now();
         const auto waitStart = std::chrono::steady_clock::now();
+        struct CensusWait {
+            std::chrono::steady_clock::time_point start;
+            ~CensusWait() {
+                if (ArchC::LazyCensus::Enabled()) ArchC::LazyCensus::NoteFenceWait(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+            }
+        } censusWait{waitStart};
         // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
         const bool signaledAtStart = !(profile || computeSyncEnabled) || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;

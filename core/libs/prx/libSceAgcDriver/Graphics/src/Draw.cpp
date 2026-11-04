@@ -3842,6 +3842,7 @@ struct PreparedDraw {
     std::optional<VkImageView> takenDepthView;
     const DrawSlotIdentity* identity = nullptr;
     bool slotVerify = false;
+    bool slotCapture = false;
 };
 
 // Stage 4.1/4.2: Draw's use of a speculated pipeline (ResolveDraw): taken, refused (the draw's
@@ -3997,14 +3998,6 @@ std::uint32_t currentSwitches() {
     return bits;
 }
 
-struct Input {
-    std::uint64_t begin = 0;
-    std::uint64_t end = 0;
-    std::size_t alignment = 1;
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceSize offset = 0;
-};
-
 struct Slot {
     std::uint64_t lastUse = 0;
     VkDevice device = VK_NULL_HANDLE;
@@ -4038,10 +4031,8 @@ struct Slot {
     const Pipeline* pipelineRaw = nullptr;
     std::weak_ptr<Framebuffer> framebuffer;
     const Framebuffer* framebufferRaw = nullptr;
-    bool indexInPlace = false;
-    Input index;
-    std::vector<Input> vertices;
-    DrawInputs inputs;
+    std::uint32_t fragmentOutputs = 0;
+    VkPipelineStageFlags shaderStages = 0;
     std::size_t argumentRead = 0;
     std::size_t argumentLinearRead = 0;
     SlotPassCapture pass;
@@ -4156,6 +4147,15 @@ void classifyMiss(const DrawSlotIdentity& identity, const Pm4::DrawParameters& d
     if (byShape.size() > 65536) byShape.clear();
 }
 
+bool sightedBefore(std::uint64_t key) {
+    constexpr std::size_t Sightings = 16384;
+    thread_local std::array<std::uint64_t, Sightings> seen{};
+    auto& entry = seen[static_cast<std::size_t>((key ^ (key >> 29u)) % Sightings)];
+    if (entry == key) return true;
+    entry = key;
+    return false;
+}
+
 Slot* lookup(VkDevice device, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity& identity, bool pipelineStateReuse) {
     auto& made = table();
     const auto found = made.slots.find(keyOf(device, identity, draw, shaders));
@@ -4184,7 +4184,7 @@ std::array<std::uint64_t, ComponentCount> fingerprint(const Slot& slot) {
     parts[ComponentTemplate] = mix(mix(mix(reinterpret_cast<std::uintptr_t>(slot.resourcesRaw), slot.membership), slot.contentKey.size()), slot.completion ? 1u : 0u);
     parts[ComponentObjects] = mix(reinterpret_cast<std::uintptr_t>(slot.pipelineRaw), reinterpret_cast<std::uintptr_t>(slot.framebufferRaw));
     auto& inputs = parts[ComponentInputs];
-    inputs = mix(mix(inputs, slot.inputs.fragmentOutputs), slot.inputs.shaderStages);
+    inputs = mix(mix(inputs, slot.fragmentOutputs), slot.shaderStages);
     parts[ComponentArgs] = mix(slot.argumentRead, slot.argumentLinearRead);
     auto& pass = parts[ComponentPass];
     pass = mix(pass, slot.pass.passKey);
@@ -4232,7 +4232,7 @@ void noteIneligible(Ineligible why) {
 }
 
 bool wantsCapture(const PreparedDraw& prepared) {
-    return prepared.identity != nullptr && prepared.args != nullptr && active() && !diagnosticsBlock();
+    return prepared.identity != nullptr && prepared.slotCapture && prepared.args != nullptr && active() && !diagnosticsBlock();
 }
 
 void capture(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, PreparedDraw& prepared, SlotPassCapture& pass, bool inputsInPlace, const std::optional<std::array<std::uint64_t, ComponentCount>>& predicted) {
@@ -4316,8 +4316,8 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     if (!std::equal(inputs.inPlaceReads.begin(), inputs.inPlaceReads.end(), pass.passReads.end() - static_cast<std::ptrdiff_t>(inputs.inPlaceReads.size())) || !std::equal(inputs.inPlaceReads.begin(), inputs.inPlaceReads.end(), pass.linearReads.end() - static_cast<std::ptrdiff_t>(inputs.inPlaceReads.size()))) return refuse(IneligibleInputs);
     pass.passReads.resize(pass.passReads.size() - inputs.inPlaceReads.size());
     pass.linearReads.resize(pass.linearReads.size() - inputs.inPlaceReads.size());
-    slot.inputs.fragmentOutputs = inputs.fragmentOutputs;
-    slot.inputs.shaderStages = inputs.shaderStages;
+    slot.fragmentOutputs = inputs.fragmentOutputs;
+    slot.shaderStages = inputs.shaderStages;
     const std::pair<std::uint64_t, std::uint64_t> argumentRange{args->arguments, args->arguments + args->RangeBytes()};
     const auto readAt = std::find(pass.passReads.begin(), pass.passReads.end(), argumentRange);
     const auto linearAt = std::find(pass.linearReads.begin(), pass.linearReads.end(), argumentRange);
@@ -4383,8 +4383,10 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     auto* slot = lookup(context.device, state, draw, shaders, identity, pipelineStateReuse);
     if (slot == nullptr) {
         if (stepTiming()) classifyMiss(identity, draw, shaders);
+        prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders));
         return refuse(RefusedNew);
     }
+    prepared.slotCapture = true;
     slot->replayedLast = false;
     slot->lastUse = ++table().uses;
     if (slot->switches != currentSwitches() || diagnosticsBlock()) return refuse(RefusedSwitches);
@@ -4413,7 +4415,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         lastOutcome() = OutcomeReplayed;
         return true;
     }
-    if (!inputs.restartTable.empty() || inputs.expandedIndexCount != 0 || inputs.fragmentOutputs != slot->inputs.fragmentOutputs || inputs.shaderStages != slot->inputs.shaderStages) return refuse(RefusedInputs);
+    if (!inputs.restartTable.empty() || inputs.expandedIndexCount != 0 || inputs.fragmentOutputs != slot->fragmentOutputs || inputs.shaderStages != slot->shaderStages) return refuse(RefusedInputs);
     const bool behind = inputs.vertexInputBehindGpuWrite;
     clock.Mark(StepInputs);
     work.targets.clear();
@@ -4439,7 +4441,10 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     clock.Mark(StepProof);
     auto moved = resources->MovedReadOnlyBuffers(shaders, *recorder);
     if (!moved.has_value()) return refuse(RefusedMoved);
-    SharedResourceCache().Touch(slot->contentKey);
+    if (const auto present = Recorder::Presents(); slot->touched != present) {
+        SharedResourceCache().Touch(slot->contentKey);
+        slot->touched = present;
+    }
     clock.Mark(StepMoved);
     const auto* argumentImport = HostImportFor(context, args->arguments, rangeBytes);
     if (argumentImport == nullptr || recorder->PendingLabelIn(args->arguments, rangeBytes) || StorageTexture::AnyPendingOverlaps(argumentRange)) return refuse(RefusedArgs);

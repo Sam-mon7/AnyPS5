@@ -5,6 +5,7 @@
 #include "Triangle_vert_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LazyPublish.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
@@ -4026,6 +4027,139 @@ bool stagingCarryTests(const Device& device, Recorder& recorder) {
     }
     HostImportFor(context, address, bytes);
     std::cout << "staging carry checked, switch " << (on ? "on" : "off") << '\n';
+    return true;
+}
+
+bool crossCarryTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: cross-batch staging carry not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 4u << 20u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the test block");
+    std::memset(block, 0x5a, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: cross-batch staging carry not tested\n";
+        return false;
+    }
+    const bool on = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuStagingCarry);
+    const char* verifyValue = std::getenv("APS5_ARCHB_C_GPU_STAGING_CARRY_VERIFY");
+    const bool verify = verifyValue != nullptr && verifyValue[0] == '1';
+    const auto element = address + 4096;
+    constexpr std::size_t elementBytes = 1u << 20u;
+    static bool cpuUnchanged = false;
+    GuestBufferMemory::SetCarryCpuProof([](std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) { return cpuUnchanged; });
+    {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(element, elementBytes, false, false);
+        memory.Upload(false);
+        Require(memory.InPlaceReads().empty(), "cross carry: the written 1 MiB element was not staged");
+        const auto finishUse = [&] {
+            memory.RecordCopyBacks(recorder);
+            recorder.NotePendingWrites(memory.Writes());
+            memory.NoteStagingCarryPoints(recorder);
+            memory.MarkDirectWrites();
+            memory.NoteStagingCarryTokens(recorder);
+        };
+        const auto start = GuestBufferMemory::CrossCarry();
+        auto now = start;
+        const auto expect = [&](std::uint64_t carried, std::uint64_t crossBatch, const char* what) {
+            now = GuestBufferMemory::CrossCarry();
+            Require(now.carried - start.carried == (on ? carried : 0u) && now.crossBatch - start.crossBatch == (on ? crossBatch : 0u), what);
+        };
+        finishUse();
+        static_cast<std::uint8_t*>(block)[4096 + 100] = 0x77;
+        memory.RecordStagingCopies(recorder);
+        expect(1, 0, "cross carry: an untouched shadow in the same batch was not carried (or carried with the switch off)");
+        finishUse();
+        recorder.NotePendingWrite(element + 256, 16);
+        memory.RecordStagingCopies(recorder);
+        expect(1, 0, "cross carry: a shadow was carried over a noted GPU write");
+        Require(!on || now.noted - start.noted == 1u, "cross carry: the noted write was not counted");
+        finishUse();
+        recorder.Submit();
+        memory.RecordStagingCopies(recorder);
+        expect(1, 0, "cross carry: a shadow was carried into another batch without the CPU proof");
+        Require(!on || now.cpu - start.cpu == 1u, "cross carry: the missing CPU proof was not counted");
+        cpuUnchanged = true;
+        finishUse();
+        recorder.Submit();
+        memory.RecordStagingCopies(recorder);
+        expect(2, 1, "cross carry: an untouched shadow was not carried into the next batch");
+        finishUse();
+        recorder.Submit();
+        recorder.NotePendingWrite(element + elementBytes - 16, 16);
+        memory.RecordStagingCopies(recorder);
+        expect(2, 1, "cross carry: a shadow was carried over a GPU write noted in a later batch");
+        finishUse();
+        recorder.Submit();
+        recorder.NotePendingRead(element - 4096, 8192, Recorder::ReadKind::AddressBased);
+        memory.RecordStagingCopies(recorder);
+        expect(2, 1, "cross carry: a shadow was carried over an address-based read noted since");
+        finishUse();
+        recorder.NotePendingRead(element, 4096, Recorder::ReadKind::DispatchElement);
+        recorder.Sync();
+        memory.RecordStagingCopies(recorder);
+        expect(3, 2, "cross carry: a shadow was not carried over a completed batch and a plain read");
+        finishUse();
+        recorder.Submit();
+        cpuUnchanged = false;
+        memory.RecordStagingCopies(recorder);
+        expect(3, 2, "cross carry: a shadow was carried over a CPU store");
+        finishUse();
+        recorder.Sync();
+        now = GuestBufferMemory::CrossCarry();
+        if (on && verify) Require(now.verified - start.verified == now.carried - start.carried && now.mismatches == start.mismatches, "cross carry: a carried shadow differed from the import");
+        Require(on || recorder.CarryWatches() == 0, "cross carry: a watch was registered with the switch off");
+    }
+    {
+        GuestBufferMemory first(context);
+        GuestBufferMemory second(context);
+        for (auto* memory : {&first, &second}) {
+            memory->AllowDeviceStaging();
+            memory->AddWritable(element, elementBytes, false, false);
+            memory->Upload(false);
+        }
+        const auto finish = [&](GuestBufferMemory& memory) {
+            memory.RecordCopyBacks(recorder);
+            recorder.NotePendingWrites(memory.Writes());
+            memory.NoteStagingCarryPoints(recorder);
+            memory.MarkDirectWrites();
+            memory.NoteStagingCarryTokens(recorder);
+        };
+        finish(first);
+        finish(second);
+        const auto before = GuestBufferMemory::CrossCarry();
+        first.RecordStagingCopies(recorder);
+        finish(first);
+        second.RecordStagingCopies(recorder);
+        finish(second);
+        const auto after = GuestBufferMemory::CrossCarry();
+        Require(after.carried - before.carried == (on ? 2u : 0u), "cross carry: builds staging the same range did not carry one shared shadow");
+        recorder.Sync();
+        if (on && verify) Require(GuestBufferMemory::CrossCarry().mismatches == before.mismatches, "cross carry: a shared shadow differed from the import");
+    }
+    GuestBufferMemory::SetCarryCpuProof(nullptr);
+    const auto* guest = static_cast<const std::uint8_t*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) Require(guest[at] == (at == 4096 + 100 ? 0x77 : 0x5a), "cross carry: the guest bytes differ after the uses");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    std::cout << "cross-batch staging carry checked, switch " << (on ? "on" : "off") << (verify ? ", verify" : "") << '\n';
     return true;
 }
 
@@ -10948,6 +11082,151 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
     return true;
 }
 
+int archcLazyTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    namespace Lazy = AgcDriver::Graphics::ArchC::LazyPublish;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
+    const bool on = Switches::Enabled(Feature::CLazyPublish);
+    const char* verifyText = std::getenv("APS5_ARCHB_C_LAZY_PUBLISH_VERIFY");
+    const bool verify = verifyText != nullptr && std::string_view(verifyText) == "1";
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 2;
+    constexpr std::size_t surface = 64 * 64 * 4;
+    void* watched = AllocateWatched(bytes, unit);
+    if (watched == nullptr) return 77;
+    struct Release {
+        void* watched;
+        ~Release() { ReleaseWatched(watched, bytes); }
+    } release{watched};
+    auto* block = static_cast<std::byte*>(watched);
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            Lazy::PublishAll();
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (HostImportFor(context, address, bytes) == nullptr) return 77;
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    if (on) Require(GuestArena::GuestWtFaultEnabled_nid_no_patch(), "lazy publication needs the fault tracker, which is off");
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto vertex = shader(COVER_VERT_SPV, 301);
+    auto pixel = shader(COVER_FRAG_SPV, 302);
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    const auto draw = [&] {
+        Draw(context, state, triangle, shaders);
+        WaitForOptimizedPipelines(context.device);
+    };
+    for (int i = 0; i < 3; ++i) {
+        draw();
+        StorageTexture::FlushAllPending("archc lazy test");
+        recorder.Sync();
+        AgcDriver::GuestMemory::WtFaultFlip();
+    }
+    std::vector<std::byte> published(surface);
+    std::memcpy(published.data(), block, surface);
+    Require(std::any_of(published.begin(), published.end(), [](std::byte value) { return value != std::byte{0}; }), "the draw stored nothing");
+    std::fill_n(block, surface, std::byte{0x11});
+    AgcDriver::GuestMemory::CollectWrites(address, bytes);
+    GuestArena::GuestWtFaultTrack_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    AgcDriver::GuestMemory::WtFaultFlip();
+    AgcDriver::GuestMemory::WtFaultFlip();
+    draw();
+    Require(StorageTexture::PendingStoreInside(address, surface), "the draw left no pending results");
+    const auto before = Lazy::Totals();
+    StorageTexture::StoreReadbackBeforeLabel("readback before label");
+    const auto deferred = Lazy::Totals();
+    const auto protection = [&] {
+        MEMORY_BASIC_INFORMATION memory{};
+        VirtualQuery(block, &memory, sizeof(memory));
+        return memory.Protect;
+    };
+    if (on) {
+        Require(deferred.deferred == before.deferred + 1, "the label store was not deferred");
+        Require(protection() == PAGE_NOACCESS, "deferred results are not protected");
+        if (!verify) Require(StorageTexture::PendingStoreInside(address, surface), "a deferred label store stored the results");
+    } else {
+        Require(deferred.deferred == before.deferred && !StorageTexture::PendingStoreInside(address, surface), "the label store was not made with the switch off");
+    }
+    if (!on) recorder.Sync();
+    std::vector<std::byte> seen(surface);
+    if (scenario == "read") {
+        const volatile std::byte* bytesSeen = block;
+        for (std::size_t i = 0; i < surface; ++i) seen[i] = bytesSeen[i];
+    } else if (scenario == "locked") {
+        AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const volatile std::byte* bytesSeen = block;
+        for (std::size_t i = 0; i < surface; ++i) seen[i] = bytesSeen[i];
+    } else if (scenario == "host_write") {
+        {
+            const GuestArena::HostWrite write(block, 16);
+            std::memset(block, 0x77, 16);
+        }
+        std::memcpy(seen.data(), block, surface);
+        Require(std::all_of(seen.begin(), seen.begin() + 16, [](std::byte value) { return value == std::byte{0x77}; }), "the host write did not land");
+        std::copy(published.begin(), published.begin() + 16, seen.begin());
+    } else if (scenario == "write") {
+        volatile std::byte* bytesSeen = block;
+        bytesSeen[8] = std::byte{0x99};
+        std::memcpy(seen.data(), block, surface);
+        Require(seen[8] == std::byte{0x99}, "the store did not land");
+        seen[8] = published[8];
+    } else {
+        return 2;
+    }
+    Require(seen == published, "the CPU did not read the draw's results after the label");
+    const auto served = Lazy::Totals();
+    if (on) {
+        Require(served.services == deferred.services + 1, "the access was not served exactly once");
+        Require(Lazy::Entries() == 0 && protection() != PAGE_NOACCESS, "the served range is still lazy");
+        if (verify) Require(served.verified == deferred.verified + 1 && served.newer == deferred.newer, "VERIFY did not check the service, or found newer results than the label's");
+    }
+    std::cout << "agc_archc_lazy_" << scenario << (on ? (verify ? " (verify)" : "") : " (off)") << ": ok\n";
+    return 0;
+}
+
 int archcTargetTests(const Device& device, Recorder& recorder, std::string_view scenario) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
@@ -13180,6 +13459,10 @@ int main(int argc, char** argv) {
             if (!stagingCarryTests(device, recorder)) return 77;
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--c-staging-carry-only") {
+            if (!crossCarryTests(device, recorder)) return 77;
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--read-written-staging-only") {
             if (!readWrittenStagingTests(device, recorder)) return 77;
             std::cout << "read and written staging tests passed\n";
@@ -13387,6 +13670,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--archc-template-token") {
             return archcTemplateTokenTests(device, recorder);
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--archc-lazy") {
+            return archcLazyTests(device, recorder, argv[2]);
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported")) {
             return vertexTargetRangeTests(device, recorder, std::string_view(argv[1]) == "--vertex-target-range-imported") ? 0 : 77;

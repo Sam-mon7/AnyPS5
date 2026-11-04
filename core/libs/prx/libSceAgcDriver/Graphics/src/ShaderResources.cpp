@@ -49,6 +49,7 @@
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -7861,17 +7862,18 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+    const bool mayStore = !BdaReadOnly();
     if (auto split = guestMemory.SplitInPlaceReads()) {
-        recorder.NotePendingReadList(std::move(split->space), kind);
-        recorder.NotePendingReads(split->own, kind);
+        recorder.NotePendingReadList(std::move(split->space), kind, mayStore);
+        recorder.NotePendingReads(split->own, kind, mayStore);
     } else if (AgcDriver::ArchB::AllocChurnActive()) {
         // APS5_ARCHB_FIX_ALLOC_CHURN: the same ranges in a per-thread scratch (NotePendingReads copies them).
         thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
         auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
         guestMemory.InPlaceReads(reads);
-        recorder.NotePendingReads(reads, kind);
+        recorder.NotePendingReads(reads, kind, mayStore);
     } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind, mayStore);
     }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -7882,12 +7884,14 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
+    const ArchC::LazyCensus::UseScope censusScope;
     guestMemory.RecordCopyBacks(recorder);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
     guestMemory.NoteStagingCarryPoints(recorder);
     guestMemory.MarkDirectWrites();
+    guestMemory.NoteStagingCarryTokens(recorder);
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in
