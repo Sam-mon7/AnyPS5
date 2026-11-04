@@ -209,6 +209,17 @@ public:
         }
         return false;
     }
+    // The ranges of this set that overlap none of `other`'s.
+    RangeSet Without(const RangeSet& other) const noexcept {
+        RangeSet out;
+        for (std::size_t i = 0; i < count; ++i) {
+            RangeSet one;
+            one.Add(ranges[i].begin, ranges[i].end);
+            if (!one.Overlaps(other)) out.Add(ranges[i].begin, ranges[i].end);
+        }
+        out.overflowed = overflowed;
+        return out;
+    }
     bool Empty() const noexcept { return count == 0; }
     std::size_t Size() const noexcept { return count; }
     bool Overflowed() const noexcept { return overflowed; }
@@ -228,6 +239,10 @@ private:
 struct ItemFootprint {
     RangeSet reads;
     RangeSet allReads;
+    // `reads` less every range that overlaps the item's own writes (its targets: bookkeeping of what it
+    // writes, apply-class), and the item's declared device reads alone.
+    RangeSet foreignReads;
+    RangeSet declaredReads;
     RangeSet writes;
     const void* templateObject = nullptr;
     bool builtTemplate = false;
@@ -244,6 +259,8 @@ struct ItemFootprint {
 struct Conflict {
     bool memory = false;
     bool memoryAll = false;
+    bool memoryForeign = false;
+    bool memoryDeclared = false;
     bool templateBuilt = false;
     bool templateShared = false;
     bool pending = false;
@@ -263,6 +280,8 @@ public:
             const auto& other = ring[(next + Depth - back) % Depth];
             if (!result.memory && other.writes.Overlaps(item.reads)) result.memory = true;
             if (!result.memoryAll && other.writes.Overlaps(item.allReads)) result.memoryAll = true;
+            if (!result.memoryForeign && other.writes.Overlaps(item.foreignReads)) result.memoryForeign = true;
+            if (!result.memoryDeclared && other.writes.Overlaps(item.declaredReads)) result.memoryDeclared = true;
             if (item.templateObject != nullptr && other.templateObject == item.templateObject) {
                 result.templateShared = true;
                 if (other.builtTemplate) result.templateBuilt = true;

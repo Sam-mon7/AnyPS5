@@ -111,6 +111,15 @@ void CheckRangeSet() {
     probe.Clear();
     probe.Add(0, 1);
     Require(full.Overlaps(probe), "an earlier range is lost by the overflow merge");
+    RangeSet own;
+    own.Add(105, 110);
+    const auto foreign = set.Without(own);
+    Require(foreign.Empty(), "Without keeps a range overlapping the other set");
+    RangeSet two;
+    two.Add(0, 10);
+    two.Add(100, 110);
+    const auto kept = two.Without(own);
+    Require(kept.Size() == 1 && kept[0].begin == 0, "Without drops a range overlapping nothing");
     RangeSet merged;
     merged.Add(10, 20);
     merged.Merge(full);

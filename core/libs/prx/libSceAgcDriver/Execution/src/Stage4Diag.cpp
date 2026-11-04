@@ -125,6 +125,7 @@ CommitterItem& committerItem() {
     return *item;
 }
 struct ConflictTotals {
+    Counter memoryForeign{0}, memoryDeclared{0};
     Counter items{0}, fine{0}, memory{0}, memoryAll{0}, templateBuilt{0}, templateShared{0}, pending{0}, proofs{0}, global{0};
 };
 struct M4Totals {
@@ -316,11 +317,13 @@ void BeginItem(std::uint8_t kind, std::span<const std::pair<std::uint64_t, std::
     auto& footprint = item->footprint;
     footprint.reads.Clear();
     footprint.allReads.Clear();
+    footprint.declaredReads.Clear();
     footprint.writes.Clear();
     item->phaseReads.Clear();
     for (const auto& [begin, end] : reads) {
         footprint.reads.Add(begin, end);
         footprint.allReads.Add(begin, end);
+        footprint.declaredReads.Add(begin, end);
     }
     for (const auto& [begin, end] : writes) footprint.writes.Add(begin, end);
     footprint.templateObject = nullptr;
@@ -349,6 +352,7 @@ void EndItem(std::uint64_t pendingSerial, bool breaksProofs) {
     add(totals.resolveNs[item->kind], resolve);
     add(totals.applyNs[item->kind], apply);
     auto& footprint = item->footprint;
+    footprint.foreignReads = footprint.reads.Without(footprint.writes);
     footprint.pendingChanged = pendingSerial != item->pendingAtStart;
     footprint.breaksProofs = breaksProofs;
     if (footprint.reads.Overflowed()) add(totals.overflowedReads, std::uint64_t{1});
@@ -361,6 +365,8 @@ void EndItem(std::uint64_t pendingSerial, bool breaksProofs) {
             add(counts.fine, std::uint64_t{conflict.Fine()});
             add(counts.memory, std::uint64_t{conflict.memory});
             add(counts.memoryAll, std::uint64_t{conflict.memoryAll});
+            add(counts.memoryForeign, std::uint64_t{conflict.memoryForeign});
+            add(counts.memoryDeclared, std::uint64_t{conflict.memoryDeclared});
             add(counts.templateBuilt, std::uint64_t{conflict.templateBuilt});
             add(counts.templateShared, std::uint64_t{conflict.templateShared});
             add(counts.pending, std::uint64_t{conflict.pending});
@@ -464,7 +470,7 @@ private:
     struct M4Snapshot {
         std::array<std::uint64_t, Buckets> bucketNs{};
         std::array<std::uint64_t, ItemKinds> items{}, resolveNs{}, applyNs{};
-        std::array<std::array<std::uint64_t, 9>, 2> conflicts{};
+        std::array<std::array<std::uint64_t, 11>, 2> conflicts{};
         std::uint64_t overflowedReads = 0, overflowedWrites = 0;
     };
 
@@ -510,7 +516,7 @@ private:
         s.applyNs = load(t.applyNs);
         for (std::size_t w = 0; w < 2; ++w) {
             const auto& c = t.conflicts[w];
-            s.conflicts[w] = {c.items.load(), c.fine.load(), c.memory.load(), c.templateBuilt.load(), c.templateShared.load(), c.pending.load(), c.proofs.load(), c.global.load(), c.memoryAll.load()};
+            s.conflicts[w] = {c.items.load(), c.fine.load(), c.memory.load(), c.templateBuilt.load(), c.templateShared.load(), c.pending.load(), c.proofs.load(), c.global.load(), c.memoryAll.load(), c.memoryForeign.load(), c.memoryDeclared.load()};
         }
         s.overflowedReads = t.overflowedReads.load();
         s.overflowedWrites = t.overflowedWrites.load();
@@ -708,11 +714,11 @@ private:
             AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
             line = "[stage4-m4-conflict] resolving items (draw+dispatch), % conflicting:";
             for (std::size_t w = 0; w < 2; ++w) {
-                std::array<std::uint64_t, 9> v{};
+                std::array<std::uint64_t, 11> v{};
                 for (std::size_t i = 0; i < v.size(); ++i) v[i] = s.conflicts[w][i] - m4Base.conflicts[w][i];
                 const double items = v[0] != 0 ? static_cast<double>(v[0]) : 1.0;
                 const auto pct = [&](std::uint64_t value) { return 100.0 * static_cast<double>(value) / items; };
-                std::snprintf(item, sizeof(item), " K=%zu items/f=%.1f fine=%.1f%% (memory=%.1f%% template-built=%.1f%%) memory-any-phase=%.1f%% template-shared=%.1f%% pending-serial=%.1f%% proof-break=%.1f%% global=%.1f%%;", WindowSizes[w], static_cast<double>(v[0]) / f, pct(v[1]), pct(v[2]), pct(v[3]), pct(v[8]), pct(v[4]), pct(v[5]), pct(v[6]), pct(v[7]));
+                std::snprintf(item, sizeof(item), " K=%zu items/f=%.1f fine=%.1f%% (memory=%.1f%% template-built=%.1f%%) memory-any-phase=%.1f%% memory-foreign=%.1f%% memory-declared=%.1f%% template-shared=%.1f%% pending-serial=%.1f%% proof-break=%.1f%% global=%.1f%%;", WindowSizes[w], static_cast<double>(v[0]) / f, pct(v[1]), pct(v[2]), pct(v[3]), pct(v[8]), pct(v[9]), pct(v[10]), pct(v[4]), pct(v[5]), pct(v[6]), pct(v[7]));
                 line += item;
             }
             std::snprintf(item, sizeof(item), " range sets overflowed: reads %llu writes %llu of %llu items", static_cast<unsigned long long>(s.overflowedReads - m4Base.overflowedReads), static_cast<unsigned long long>(s.overflowedWrites - m4Base.overflowedWrites), static_cast<unsigned long long>(totalItems));
