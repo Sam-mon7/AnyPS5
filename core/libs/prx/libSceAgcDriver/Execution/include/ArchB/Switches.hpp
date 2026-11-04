@@ -68,6 +68,7 @@ enum class Feature : std::uint8_t {
     PipeResolveHandoff,
     PageStateMemo,
     PipeResolveSnapshots,
+    WtSyncSkip,
     Count
 };
 

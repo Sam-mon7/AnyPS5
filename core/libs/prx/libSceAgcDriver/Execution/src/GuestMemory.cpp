@@ -2639,6 +2639,72 @@ bool faultSync(StampRuns& runs, std::uint64_t first, std::uint64_t stop, std::ui
     }
     return true;
 }
+
+// APS5_ARCHB_WT_SYNC_SKIP: the clock of each range's last complete CPU walk (exact ranges, under the
+// tracker mutex). A range whose every page is still armed with a stamp at most that clock had no store
+// since (any store faults and opens its page), so its next consumer walk is skipped: no bump, no
+// stamps, no sync. APS5_ARCHB_WT_SYNC_SKIP_VERIFY=1 walks anyway and counts walks that found writes.
+namespace syncSkip {
+struct Entry {
+    std::uint64_t first = 0;
+    std::uint64_t stop = 0;
+    std::uint64_t clock = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
+};
+
+struct Table {
+    static constexpr std::size_t Entries = 8192;
+    std::array<Entry, Entries> entries{};
+    Entry& at(std::uint64_t first, std::uint64_t stop) {
+        auto key = (first >> 12) * 0x9e3779b97f4a7c15ull ^ (stop >> 12) * 0xc2b2ae3d27d4eb4full;
+        key ^= key >> 29;
+        return entries[static_cast<std::size_t>(key % Entries)];
+    }
+};
+
+Table& table() {
+    static auto* made = new Table();
+    return *made;
+}
+
+struct Counters {
+    std::atomic<std::uint64_t> skips{0}, refused{0}, recorded{0}, verified{0}, mismatches{0}, verifiedNs{0};
+};
+
+Counters& counters() {
+    static auto* made = [] {
+        auto* c = new Counters();
+        const std::pair<const char*, std::atomic<std::uint64_t>*> named[] = {
+            {"wt_sync_skips", &c->skips}, {"wt_sync_skip_refused", &c->refused}, {"wt_sync_skip_recorded", &c->recorded},
+            {"wt_sync_skip_verified", &c->verified}, {"wt_sync_skip_mismatches", &c->mismatches}, {"wt_sync_skip_verified_ns", &c->verifiedNs}};
+        for (const auto& [name, counter] : named) ArchB::Recorder::RegisterCounter(name, *counter);
+        return c;
+    }();
+    return *made;
+}
+
+bool active() {
+    return ArchB::Switches::Enabled(ArchB::Feature::WtSyncSkip);
+}
+
+bool verify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_WT_SYNC_SKIP_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t mapping() {
+    return GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+}
+
+void record(std::uint64_t first, std::uint64_t stop, std::uint64_t clock, std::uint64_t unwatched, std::uint64_t mappingSerial) {
+    table().at(first, stop) = {first, stop, clock, unwatched, mappingSerial};
+    counters().recorded.fetch_add(1, std::memory_order_relaxed);
+}
+}
 #endif
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool memoVirtualQuery = false, std::uint64_t* stamped = nullptr, bool osWalk = false) {
@@ -2649,6 +2715,42 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         }
         ~CallerScope() { stampTrace::walkCaller = saved; }
     } callerScope{__builtin_return_address(0)};
+#ifdef _WIN32
+    const bool skipCandidate = tracker.faultMode && !armedOnly && kind == StampKind::Cpu && !osWalk && window == nullptr && !Gen::Active() && wtFault::consumersOn() && syncSkip::active();
+    const auto skipUnwatched = skipCandidate ? unwatchSerial.load(std::memory_order_acquire) : 0;
+    const auto skipMapping = skipCandidate ? syncSkip::mapping() : 0;
+    bool skipVerifying = false;
+    if (skipCandidate) {
+        const auto& entry = syncSkip::table().at(first, stop);
+        if (entry.first == first && entry.stop == stop && entry.unwatched == skipUnwatched && entry.mapping == skipMapping) {
+            if (GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), entry.clock) == GuestArena::WtFaultAnswer::Unchanged) {
+                if (!syncSkip::verify()) {
+                    tracker.bump();
+                    syncSkip::counters().skips.fetch_add(1, std::memory_order_relaxed);
+                    if (stamped != nullptr) *stamped = 0;
+                    return true;
+                }
+                skipVerifying = true;
+            } else {
+                syncSkip::counters().refused.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    const auto skipStart = skipVerifying ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    struct SkipVerify {
+        bool on;
+        std::chrono::steady_clock::time_point start;
+        std::uint64_t found = 0;
+        bool completed = false;
+        ~SkipVerify() {
+            if (!on) return;
+            auto& c = syncSkip::counters();
+            c.verified.fetch_add(1, std::memory_order_relaxed);
+            c.verifiedNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+            if (!completed || found != 0) c.mismatches.fetch_add(1, std::memory_order_relaxed);
+        }
+    } skipVerify{skipVerifying, skipStart};
+#endif
     tracker.bump();
     // APS5_ARCHB_WT_FAULT: the walked pages become candidates of the fault tracker (the next flip
     // protects them); VERIFY checks the walk's dirty pages against the fault states. The walk's clock
@@ -2680,10 +2782,18 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #ifdef _WIN32
     if (faultWalk && !osWalk && window == nullptr && wtFault::consumersOn()) {
         runs.dirty = nullptr;
-        if (faultSync(runs, first, stop, walkClock)) return true;
+        if (faultSync(runs, first, stop, walkClock)) {
+            if (skipCandidate) syncSkip::record(first, stop, walkClock, skipUnwatched, skipMapping);
+            skipVerify.completed = true;
+            skipVerify.found = runs.stamped;
+            return true;
+        }
         runs.dirty = dirty;
     }
     if (collectWindowsWrites(runs, first, stop, armedOnly, memoVirtualQuery)) {
+        if (skipCandidate) syncSkip::record(first, stop, walkClock, skipUnwatched, skipMapping);
+        skipVerify.completed = true;
+        skipVerify.found = runs.stamped;
         if (sweep) Gen::NoteSweep(first, stop, ticket);
         // The walk consumed every store made before its query: its pages take the walk's clock as their
         // sync clock (CONSUMERS) and VERIFY checks its dirty pages against the fault states.

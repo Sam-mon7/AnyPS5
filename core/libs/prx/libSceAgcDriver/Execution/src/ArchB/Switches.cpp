@@ -115,6 +115,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::PipeResolveHandoff, "PIPE_RESOLVE_HANDOFF", false, true, PipeResolveSplitPrerequisites},
     {Feature::PageStateMemo, "PAGE_STATE_MEMO", false, true, {}},
     {Feature::PipeResolveSnapshots, "PIPE_RESOLVE_SNAPSHOTS", false, true, WtFaultPrerequisites},
+    {Feature::WtSyncSkip, "WT_SYNC_SKIP", false, true, WtFaultPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

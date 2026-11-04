@@ -2201,6 +2201,7 @@ void CheckWtFaultConsumers() {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
     Require(Switches::Enabled(Feature::WtFaultConsumers) && WtFault().active, "the consumers switch does not follow the environment");
+    AgcDriver::ArchB::Recorder::Boundary(true, 0, AgcDriver::ArchB::Recorder::Clock::now());
     const bool verify = Switches::Enabled(Feature::WtFaultVerify);
     const auto queries = [] { return GuestArenaWriteWatchCensus_nid_no_patch().queries; };
     constexpr std::uint64_t Page = 4096;
@@ -2287,6 +2288,16 @@ void CheckWtFaultConsumers() {
         Require(WtFault().consumerMismatches == start.consumerMismatches + 1, "VERIFY did not count the store the fault states missed");
         Require(g7 != 0 && !UnchangedSince(base + 7 * Page, Page, g6), "VERIFY did not stamp the missed store");
         GuestWtFaultForget_nid_no_patch(base + 7 * Page, Page);
+    }
+    if (Switches::Enabled(Feature::WtSyncSkip)) {
+        std::map<std::string, double> totals;
+        for (const auto& [name, value] : AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now()).counters) totals[name] += value;
+        const char* skipVerify = std::getenv("APS5_ARCHB_WT_SYNC_SKIP_VERIFY");
+        const bool verifying = skipVerify != nullptr && std::string_view(skipVerify) == "1";
+        std::cout << "wt-sync-skip: skips " << totals["wt_sync_skips"] << " verified " << totals["wt_sync_skip_verified"] << " refused " << totals["wt_sync_skip_refused"] << " mismatches " << totals["wt_sync_skip_mismatches"] << "\n";
+        Require(totals[verifying ? "wt_sync_skip_verified" : "wt_sync_skips"] >= 2, "unchanged armed ranges were walked again instead of skipped");
+        Require(totals["wt_sync_skip_refused"] >= 1, "a range with a store since its last walk was not refused");
+        Require(totals["wt_sync_skip_mismatches"] == 0, "a skipped walk would have found writes");
     }
     const auto end = WtFault();
     std::cout << "wt-fault consumers: unchanged " << end.consumerUnchanged - start.consumerUnchanged << " changed " << end.consumerChanged - start.consumerChanged << " fallback " << end.consumerFallback - start.consumerFallback << " mismatches " << end.consumerMismatches - start.consumerMismatches << "\n";
