@@ -345,13 +345,14 @@ bool PrivateComputeQueue() {
         const auto* value = std::getenv("APS5_PRIVATE_COMPUTE");
         return value != nullptr && std::string_view(value) == "1";
     }();
-    if (!enabled) return false;
+    const bool switched = !enabled && ArchB::Switches::Enabled(ArchB::Feature::PrivateCompute);
+    if (!enabled && !switched) return false;
     const auto queue = GuestMemory::GpuLockThreadTag();
     static const bool all = [] {
         const auto* value = std::getenv("APS5_PRIVATE_COMPUTE_ALL");
         return value != nullptr && std::string_view(value) == "1";
     }();
-    return queue == 0x28 || (all && queue >= 0x20 && queue < DriverDetail::SubmissionQueueEnd);
+    return queue == 0x28 || ((all || switched) && queue >= 0x20 && queue < DriverDetail::SubmissionQueueEnd);
 }
 
 enum class PrivateFallback : std::size_t { Template, Locked, Indirect, Descriptors, Dimensions, Changed, Bindings, Query, Count };

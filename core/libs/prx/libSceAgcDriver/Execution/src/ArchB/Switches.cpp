@@ -130,6 +130,10 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Census 2: the locked draw takes the template its unlocked preparation found (no second
     // resource-cache Find) while the cache index did not change in between.
     {Feature::PrelockFindHandoff, "PRELOCK_FIND_HANDOFF", false, true, {}},
+    // Census 2: APS5_PRIVATE_COMPUTE=1 + APS5_PRIVATE_COMPUTE_ALL=1 as a runtime switch (sampled per
+    // dispatch), so an alternating gate can toggle it: compute queues 0x20.. record bind+dispatch into
+    // per-thread secondaries without the GPU mutex.
+    {Feature::PrivateCompute, "PRIVATE_COMPUTE", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
