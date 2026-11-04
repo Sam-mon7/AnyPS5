@@ -7422,6 +7422,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     recorder.NotePendingWrites(guestMemory.Writes());
     guestMemory.NoteStagingCarryPoints(recorder);
     guestMemory.MarkDirectWrites();
+    guestMemory.NoteStagingCarryTokens(recorder);
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

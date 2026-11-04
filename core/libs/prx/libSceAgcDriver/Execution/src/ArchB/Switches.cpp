@@ -123,6 +123,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // submit and at GPU completion (Recorder zero-copy checks).
     {Feature::ZeroCopyStorage, "ZERO_COPY_STORAGE", false, true, {}},
     {Feature::ZeroCopyInputs, "ZERO_COPY_INPUTS", false, true, {}},
+    {Feature::CGpuStagingCarry, "C_GPU_STAGING_CARRY", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

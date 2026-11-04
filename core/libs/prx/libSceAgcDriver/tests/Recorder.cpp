@@ -4027,6 +4027,112 @@ bool stagingCarryTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+bool crossCarryTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: cross-batch staging carry not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 4u << 20u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the test block");
+    std::memset(block, 0x5a, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: cross-batch staging carry not tested\n";
+        return false;
+    }
+    const bool on = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuStagingCarry);
+    const char* verifyValue = std::getenv("APS5_ARCHB_C_GPU_STAGING_CARRY_VERIFY");
+    const bool verify = verifyValue != nullptr && verifyValue[0] == '1';
+    const auto element = address + 4096;
+    constexpr std::size_t elementBytes = 1u << 20u;
+    static bool cpuUnchanged = false;
+    GuestBufferMemory::SetCarryCpuProof([](std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) { return cpuUnchanged; });
+    {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(element, elementBytes, false, false);
+        memory.Upload(false);
+        Require(memory.InPlaceReads().empty(), "cross carry: the written 1 MiB element was not staged");
+        const auto finishUse = [&] {
+            memory.RecordCopyBacks(recorder);
+            recorder.NotePendingWrites(memory.Writes());
+            memory.NoteStagingCarryPoints(recorder);
+            memory.MarkDirectWrites();
+            memory.NoteStagingCarryTokens(recorder);
+        };
+        const auto start = GuestBufferMemory::CrossCarry();
+        auto now = start;
+        const auto expect = [&](std::uint64_t carried, std::uint64_t crossBatch, const char* what) {
+            now = GuestBufferMemory::CrossCarry();
+            Require(now.carried - start.carried == (on ? carried : 0u) && now.crossBatch - start.crossBatch == (on ? crossBatch : 0u), what);
+        };
+        finishUse();
+        static_cast<std::uint8_t*>(block)[4096 + 100] = 0x77;
+        memory.RecordStagingCopies(recorder);
+        expect(1, 0, "cross carry: an untouched shadow in the same batch was not carried (or carried with the switch off)");
+        finishUse();
+        recorder.NotePendingWrite(element + 256, 16);
+        memory.RecordStagingCopies(recorder);
+        expect(1, 0, "cross carry: a shadow was carried over a noted GPU write");
+        Require(!on || now.noted - start.noted == 1u, "cross carry: the noted write was not counted");
+        finishUse();
+        recorder.Submit();
+        memory.RecordStagingCopies(recorder);
+        expect(1, 0, "cross carry: a shadow was carried into another batch without the CPU proof");
+        Require(!on || now.cpu - start.cpu == 1u, "cross carry: the missing CPU proof was not counted");
+        cpuUnchanged = true;
+        finishUse();
+        recorder.Submit();
+        memory.RecordStagingCopies(recorder);
+        expect(2, 1, "cross carry: an untouched shadow was not carried into the next batch");
+        finishUse();
+        recorder.Submit();
+        recorder.NotePendingWrite(element + elementBytes - 16, 16);
+        memory.RecordStagingCopies(recorder);
+        expect(2, 1, "cross carry: a shadow was carried over a GPU write noted in a later batch");
+        finishUse();
+        recorder.Submit();
+        recorder.NotePendingRead(element - 4096, 8192, Recorder::ReadKind::AddressBased);
+        memory.RecordStagingCopies(recorder);
+        expect(2, 1, "cross carry: a shadow was carried over an address-based read noted since");
+        finishUse();
+        recorder.NotePendingRead(element, 4096, Recorder::ReadKind::DispatchElement);
+        recorder.Sync();
+        memory.RecordStagingCopies(recorder);
+        expect(3, 2, "cross carry: a shadow was not carried over a completed batch and a plain read");
+        finishUse();
+        recorder.Submit();
+        cpuUnchanged = false;
+        memory.RecordStagingCopies(recorder);
+        expect(3, 2, "cross carry: a shadow was carried over a CPU store");
+        finishUse();
+        recorder.Sync();
+        now = GuestBufferMemory::CrossCarry();
+        if (on && verify) Require(now.verified - start.verified == now.carried - start.carried && now.mismatches == start.mismatches, "cross carry: a carried shadow differed from the import");
+        Require(on || recorder.CarryWatches() == 0, "cross carry: a watch was registered with the switch off");
+    }
+    GuestBufferMemory::SetCarryCpuProof(nullptr);
+    const auto* guest = static_cast<const std::uint8_t*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) Require(guest[at] == (at == 4096 + 100 ? 0x77 : 0x5a), "cross carry: the guest bytes differ after the uses");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    std::cout << "cross-batch staging carry checked, switch " << (on ? "on" : "off") << (verify ? ", verify" : "") << '\n';
+    return true;
+}
+
 bool sparseRunImportTests(const Device& device, bool copied) {
     const auto& context = device.GetContext();
     constexpr std::size_t unit = 65536;
@@ -12711,6 +12817,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--staging-carry-only") {
             if (!stagingCarryTests(device, recorder)) return 77;
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--c-staging-carry-only") {
+            if (!crossCarryTests(device, recorder)) return 77;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--read-written-staging-only") {

@@ -1829,6 +1829,7 @@ void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize l
     ensureOpen();
     // A queued label store over the keys lands first (program order: the key store is later).
     FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
+    dropCarries(begin, end);
     keyStoreCount.fetch_add(1, std::memory_order_relaxed);
     if (seed != nullptr) open->kept.push_back(seed);
     // The same range queued twice lands once: nothing wrote over it in between, or the writer
@@ -1947,6 +1948,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     if (bytes.empty()) return;
     EndComputeChain();
     ensureOpen();
+    dropCarries(address, address + bytes.size());
     ++open->gpuStores;
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
@@ -3855,6 +3857,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    dropCarries(address, address + bytes);
     ensureOpen();
     // Write generations: a GPU write announced at recording (pending, before any later capture),
     // tagged with the recording queue and the batch it joins.
@@ -3893,6 +3896,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+    dropCarries(address, address + bytes);
     if (GuestMemory::Gen::Active()) GuestMemory::Gen::NotePending(address, address + bytes, (std::uint64_t{GuestMemory::CurrentPacket().queue} << 32) | (reinterpret_cast<std::uintptr_t>(&batch) & 0xffffffffu));
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
@@ -4017,6 +4021,58 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
         if (overlaps(*batch, address, end)) return true;
     }
     return false;
+}
+
+std::uint64_t Recorder::WatchCarry(std::uint64_t begin, std::uint64_t end) {
+    if (carryWatches.size() >= CarryWatchLimit) {
+        carryWatches.clear();
+        carryWatchLow = ~std::uint64_t{0};
+        carryWatchHigh = 0;
+    }
+    const auto id = ++carryWatchIds;
+    carryWatches.push_back({begin, end, id});
+    carryWatchLow = std::min(carryWatchLow, begin);
+    carryWatchHigh = std::max(carryWatchHigh, end);
+    return id;
+}
+
+bool Recorder::TakeCarry(std::uint64_t id) {
+    for (auto it = carryWatches.begin(); it != carryWatches.end(); ++it) {
+        if (it->id != id) continue;
+        *it = carryWatches.back();
+        carryWatches.pop_back();
+        return true;
+    }
+    return false;
+}
+
+void Recorder::DropCarry(std::uint64_t id) {
+    if (id != 0) static_cast<void>(TakeCarry(id));
+}
+
+void Recorder::dropOverlappingCarries(std::uint64_t begin, std::uint64_t end) {
+    std::uint64_t low = ~std::uint64_t{0};
+    std::uint64_t high = 0;
+    for (std::size_t index = 0; index < carryWatches.size();) {
+        const auto& watch = carryWatches[index];
+        if (watch.begin < end && begin < watch.end) {
+            carryWatches[index] = carryWatches.back();
+            carryWatches.pop_back();
+            continue;
+        }
+        low = std::min(low, watch.begin);
+        high = std::max(high, watch.end);
+        ++index;
+    }
+    carryWatchLow = low;
+    carryWatchHigh = high;
+}
+
+void Recorder::dropCarries(const ReadList& ranges) {
+    for (const auto& [begin, end] : ranges) {
+        if (carryWatches.empty()) return;
+        dropCarries(begin, end);
+    }
 }
 
 Recorder::NotePoint Recorder::OpenNotePoint() {
@@ -4149,6 +4205,7 @@ bool Recorder::ReadTracking() {
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
+    if (kind == ReadKind::AddressBased && bytes != 0) dropCarries(address, address + bytes);
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
     open->reads.push_back({address, address + bytes, kind});
@@ -4156,6 +4213,9 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
+    if (kind == ReadKind::AddressBased) {
+        for (const auto& [begin, end] : ranges) dropCarries(begin, end);
+    }
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
@@ -4174,6 +4234,7 @@ bool Recorder::ValidReadList(const ReadList& ranges) {
 }
 
 void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind) {
+    if (kind == ReadKind::AddressBased && ranges != nullptr) dropCarries(*ranges);
     if (ranges == nullptr || ranges->empty() || !ReadTrackingEnabled()) return;
     if (CaptureTrace::Enabled() || FlipReadCheck()) {
         NotePendingReads(*ranges, kind);
