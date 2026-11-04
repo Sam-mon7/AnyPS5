@@ -1479,8 +1479,22 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        if (Recorder::ArmedSnapshotsActive()) {
+            std::uint32_t derived = 0;
+            if (auto armed = recorder->ArmedDrawSnapshot(address, bytes, use, &derived); armed != nullptr) {
+                if (Recorder::ArmedSnapshotsVerify()) {
+                    std::uint32_t slowDerived = 0;
+                    const auto slow = GuestMemory::CollectWrites(address, bytes) != 0 ? recorder->ReusableDrawSnapshot(address, bytes, use, &slowDerived) : nullptr;
+                    Recorder::NoteArmedSnapshotVerify(slow == armed && slowDerived == derived);
+                }
+                copy.buffer = std::move(armed);
+                copy.derived = derived;
+                copy.reused = true;
+                return copy;
+            }
+        }
         copy.generation = GuestMemory::CollectWrites(address, bytes);
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, Recorder::ArmedSnapshotsActive() ? copy.generation : 0);
         if (copy.buffer != nullptr) {
             copy.reused = true;
             return copy;

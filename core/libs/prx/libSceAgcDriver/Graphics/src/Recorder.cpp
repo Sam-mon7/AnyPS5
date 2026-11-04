@@ -3340,9 +3340,77 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
             return {};
         }
         found->second.generation = generation;
-    } else if (diag) {
-        SnapshotDiag().exact.fetch_add(1, std::memory_order_relaxed);
+        found->second.verifiedAt = generation;
+    } else {
+        if (generation != 0) found->second.verifiedAt = std::max(found->second.verifiedAt, generation);
+        if (diag) SnapshotDiag().exact.fetch_add(1, std::memory_order_relaxed);
     }
+    auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
+    recency.splice(recency.end(), recency, found->second.recent);
+    if (derived != nullptr) *derived = found->second.derived;
+    return found->second.buffer;
+}
+
+namespace {
+struct ArmedSnapshotCounters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> stored{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> mismatches{0};
+};
+
+ArmedSnapshotCounters& armedSnapshotCounters() {
+    static auto* made = [] {
+        auto* counters = new ArmedSnapshotCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_snapshot_armed_hits", counters->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_snapshot_armed_misses", counters->misses);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_snapshot_armed_stored", counters->stored);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_snapshot_armed_verified", counters->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_snapshot_armed_mismatches", counters->mismatches);
+        return counters;
+    }();
+    return *made;
+}
+}
+
+bool Recorder::ArmedSnapshotsActive() {
+    return AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeResolveSnapshots) && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::WtFault);
+}
+
+bool Recorder::ArmedSnapshotsVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_PIPE_RESOLVE_SNAPSHOTS_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+void Recorder::NoteArmedSnapshotVerify(bool same) {
+    auto& counters = armedSnapshotCounters();
+    counters.verified.fetch_add(1, std::memory_order_relaxed);
+    if (!same) {
+        const auto count = counters.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((count & (count - 1)) == 0) std::fprintf(stderr, "[draw-snapshots] PIPE_RESOLVE_SNAPSHOTS_VERIFY: an armed answer differs from the collect path (%llu so far)\n", static_cast<unsigned long long>(count));
+    }
+}
+
+std::shared_ptr<Buffer> Recorder::ArmedDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, VkDeviceSize* offset) {
+    auto& counters = armedSnapshotCounters();
+    auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
+    if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) {
+        counters.misses.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    const auto generation = found->second.generation;
+    const auto verifiedAt = found->second.verifiedAt;
+    if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || generation == 0 || verifiedAt == 0 || !GuestMemory::FaultUnchangedSince(address, bytes, verifiedAt) || !GuestMemory::UnchangedSince(address, bytes, generation)) {
+        counters.stored.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    counters.hits.fetch_add(1, std::memory_order_relaxed);
+    if (offset != nullptr) *offset = 0;
+    if (use == SnapshotUse::Storage && SnapshotDiagEnabled()) SnapshotDiag().exact.fetch_add(1, std::memory_order_relaxed);
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
     if (derived != nullptr) *derived = found->second.derived;
@@ -3527,7 +3595,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     const DrawSnapshotKey key{address, use, bytes};
     pool.recency.push_back(key);
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
+        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, generation});
     } catch (...) {
         pool.recency.pop_back();
         throw;
