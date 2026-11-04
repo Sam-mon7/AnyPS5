@@ -2338,6 +2338,54 @@ void CheckWtFaultHot() {
     data[Page] = 3;
     Require(faults() == before + 3 && state(base + Page) == WtFaultOpen, "a store into a page protected again did not fault");
 }
+
+// APS5_ARCHB_WT_FAULT_DIRTY_ARM: an open page that write watching reports stored since its last walk stays
+// open across the flip, and the flip walks it (resetting, stamped), so a page not stored again before the
+// next flip is protected then: the open set holds only pages stored between flips.
+void CheckWtFaultDirtyArm() {
+    using namespace GuestArena;
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    Require(WtFault().active && Switches::Enabled(Feature::WtFaultDirtyArm), "the dirty-arm switch does not follow the environment");
+    const auto state = [](std::uint64_t address) { return GuestWtFaultWord_nid_no_patch(address) & WtFaultStateMask; };
+    const auto counters = [] {
+        WtFaultCounters value{};
+        GuestWtFaultCounters_nid_no_patch(&value);
+        return value;
+    };
+    constexpr std::uint64_t Page = 4096;
+    PartlyCommitted range;
+    range.Commit(0);
+    const auto base = range.Address();
+    volatile std::uint8_t* data = range.Data();
+    std::memset(range.Data(), 0x11, Block);
+    BumpCollectEpoch();
+    CollectWrites(base, Block);
+    WtFaultFlip();
+    WtFaultFlip();
+    Require(state(base) == WtFaultArmed && state(base + Page) == WtFaultArmed, "the dirty-arm fixture was not protected");
+    data[0] = 1;
+    data[Page] = 1;
+    WtFaultFlip();
+    Require(state(base) == WtFaultOpen && state(base + Page) == WtFaultOpen, "a page that faulted was protected at the next flip");
+    BumpCollectEpoch();
+    CollectWrites(base, Block);
+    const auto since = GuestWtFaultClockBump_nid_no_patch();
+    data[0] = 2;
+    WtFaultFlip();
+    Require(state(base) == WtFaultOpen && state(base + Page) == WtFaultOpen, "a page the walk found stored was protected at the next flip");
+    const auto before = counters();
+    WtFaultFlip();
+    const auto after = counters();
+    Require(state(base) == WtFaultOpen && after.keptDirty == before.keptDirty + 1, "a page stored since its last walk was not kept open by the dirty arm");
+    Require(state(base + Page) == WtFaultArmed, "a page stored before its last walk only was kept open");
+    Require(!UnchangedSince(base, Page, since), "the flip's walk of the kept page did not stamp its store");
+    WtFaultFlip();
+    Require(state(base) == WtFaultArmed && counters().keptDirty == after.keptDirty, "a kept page not stored again stayed open (its dirty bit was not consumed)");
+    const auto faulted = counters().faults;
+    data[0] = 3;
+    Require(counters().faults == faulted + 1 && state(base) == WtFaultOpen, "a store into the page protected again did not fault");
+}
 #endif
 
 // APS5_ARCHB_FIX_UNSTAMPED_ALIAS (mode from the environment): a driver store into unwatched memory 4 GiB
@@ -3658,6 +3706,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--wt-fault-hot") {
             CheckWtFaultHot();
             std::cout << "fault tracking hot pages test passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--wt-fault-dirty-arm") {
+            CheckWtFaultDirtyArm();
+            std::cout << "fault tracking dirty-arm test passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--wt-fault-consumers") {

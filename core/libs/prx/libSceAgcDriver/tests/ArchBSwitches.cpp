@@ -161,9 +161,12 @@ void toggleCase(const std::string& name) {
             } else if (entry.feature == Feature::WtFaultConsumers) {
                 ++listed;
                 check(token == "WT_FAULT_CONSUMERS" && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::WtFault, "WT_FAULT_CONSUMERS switch contract");
+            } else if (entry.feature == Feature::WtFaultDirtyArm) {
+                ++listed;
+                check(token == "WT_FAULT_DIRTY_ARM" && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 1 && entry.prerequisites[0] == Feature::WtFault, "WT_FAULT_DIRTY_ARM switch contract");
             }
         }
-        check(listed == 3, "the fault-tracking switches are listed");
+        check(listed == 4, "the fault-tracking switches are listed");
         check(Switches::Enabled(Feature::WtFault) && !Switches::Enabled(Feature::WtFaultConsumers), "WT_FAULT did not follow the environment or CONSUMERS started on");
         write("1 WT_FAULT_CONSUMERS=1");
         check(Switches::Enabled(Feature::WtFaultConsumers), "CONSUMERS did not turn on");

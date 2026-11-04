@@ -91,6 +91,16 @@ struct WriteWatchSweep {
     std::uint64_t queryNs = 0;
 };
 WriteWatchSweep GuestArenaWriteWatchSweep_nid_no_patch();
+// Process-wide cost of the OS calls behind write-tracking collects (cumulative, all threads): the
+// VirtualQuery calls that size a private region before its GetWriteWatch, and the GetWriteWatch calls.
+struct WalkCost {
+    std::uint64_t vqCalls = 0;
+    std::uint64_t vqNs = 0;
+    std::uint64_t gwwCalls = 0;
+    std::uint64_t gwwNs = 0;
+    std::uint64_t gwwPages = 0;
+};
+WalkCost GuestArenaWalkCost_nid_no_patch();
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes);
 // The same answer by binary search over the host regions sorted once (the regions do not change after
 // the arena is reserved); the driver uses it under APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING.

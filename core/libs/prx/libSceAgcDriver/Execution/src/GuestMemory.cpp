@@ -1080,7 +1080,12 @@ struct Counters {
     std::atomic<std::uint64_t> holds{0}, heldOpened{0}, forgotten{0}, tracked{0};
     std::atomic<std::uint64_t> verifyWalks{0}, verifyDirty{0}, verifyUntracked{0}, mismatches{0};
     std::atomic<std::uint64_t> consumerUnchanged{0}, consumerChanged{0}, consumerFallback{0}, consumerVerified{0}, consumerMismatches{0};
+    std::atomic<std::uint64_t> keptDirty{0}, armDirtyNs{0}, dirtyWalks{0}, dirtyWalkNs{0}, armedWalkNs{0};
 };
+bool dirtyArmOn() {
+    return active.load(std::memory_order_relaxed) && ArchB::Switches::Enabled(ArchB::Feature::WtFaultDirtyArm);
+}
+thread_local bool flipDirtyWalk = false;
 Counters& counters() {
     static auto* made = [] {
         auto* c = new Counters();
@@ -1092,7 +1097,9 @@ Counters& counters() {
             {"wt_fault_holds", &c->holds}, {"wt_fault_held_opened", &c->heldOpened}, {"wt_fault_forgotten", &c->forgotten}, {"wt_fault_tracked", &c->tracked},
             {"wt_fault_verify_walks", &c->verifyWalks}, {"wt_fault_verify_dirty", &c->verifyDirty}, {"wt_fault_verify_untracked", &c->verifyUntracked},
             {"wt_fault_mismatches", &c->mismatches}, {"wt_fault_consumer_unchanged", &c->consumerUnchanged}, {"wt_fault_consumer_changed", &c->consumerChanged},
-            {"wt_fault_consumer_fallback", &c->consumerFallback}, {"wt_fault_consumer_verified", &c->consumerVerified}, {"wt_fault_consumer_mismatches", &c->consumerMismatches}};
+            {"wt_fault_consumer_fallback", &c->consumerFallback}, {"wt_fault_consumer_verified", &c->consumerVerified}, {"wt_fault_consumer_mismatches", &c->consumerMismatches},
+            {"wt_fault_kept_dirty", &c->keptDirty}, {"wt_fault_arm_dirty_ns", &c->armDirtyNs}, {"wt_fault_dirty_walks", &c->dirtyWalks}, {"wt_fault_dirty_walk_ns", &c->dirtyWalkNs},
+            {"wt_fault_armed_walk_ns", &c->armedWalkNs}};
         for (const auto& [name, counter] : named) ArchB::Recorder::RegisterCounter(name, *counter);
         return c;
     }();
@@ -1126,6 +1133,8 @@ void publish() {
     c.verifyDirty.store(raw.verifyDirty, std::memory_order_relaxed);
     c.verifyUntracked.store(raw.verifyUntracked, std::memory_order_relaxed);
     c.mismatches.store(raw.verifyMismatches, std::memory_order_relaxed);
+    c.keptDirty.store(raw.keptDirty, std::memory_order_relaxed);
+    c.armDirtyNs.store(raw.armDirtyNs, std::memory_order_relaxed);
 }
 
 // The dirty pages of one walk, for VERIFY (filled under the tracker mutex).
@@ -2294,7 +2303,7 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     }
     // APS5_ARCHB_WT_FAULT: a page found stored stays open across the next flip (hot pages count as
     // changed and do not fault every frame).
-    if (tracker.faultMode) GuestArena::GuestWtFaultNoteStored_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
+    if (tracker.faultMode && !wtFault::flipDirtyWalk) GuestArena::GuestWtFaultNoteStored_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
     else tracker.noteWalkStore(begin, end, generation);
@@ -3493,13 +3502,54 @@ void MarkDriverThread() {
     if (wtFault::switchOn()) GuestArena::GuestWtFaultMarkDriverThread_nid_no_patch();
 }
 
+namespace walkCost {
+struct Counters {
+    std::atomic<std::uint64_t> vqCalls{0}, vqNs{0}, gwwCalls{0}, gwwNs{0}, gwwPages{0};
+};
+void flip() {
+    static auto* made = [] {
+        auto* c = new Counters();
+        const std::pair<const char*, std::atomic<std::uint64_t>*> named[] = {
+            {"walk_vq_calls", &c->vqCalls}, {"walk_vq_ns", &c->vqNs}, {"walk_gww_calls", &c->gwwCalls}, {"walk_gww_ns", &c->gwwNs}, {"walk_gww_pages", &c->gwwPages}};
+        for (const auto& [name, counter] : named) ArchB::Recorder::RegisterCounter(name, *counter);
+        return c;
+    }();
+#ifdef _WIN32
+    const auto now = GuestArena::GuestArenaWalkCost_nid_no_patch();
+    made->vqCalls.store(now.vqCalls, std::memory_order_relaxed);
+    made->vqNs.store(now.vqNs, std::memory_order_relaxed);
+    made->gwwCalls.store(now.gwwCalls, std::memory_order_relaxed);
+    made->gwwNs.store(now.gwwNs, std::memory_order_relaxed);
+    made->gwwPages.store(now.gwwPages, std::memory_order_relaxed);
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_WALK_COST_REPORT_FLIPS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    if (every == 0) return;
+    static std::uint64_t flips = 0;
+    static GuestArena::WalkCost last{};
+    if (++flips % every != 0) return;
+    const double frames = static_cast<double>(every);
+    const auto vqCalls = static_cast<double>(now.vqCalls - last.vqCalls);
+    const auto vqNs = static_cast<double>(now.vqNs - last.vqNs);
+    const auto gwwCalls = static_cast<double>(now.gwwCalls - last.gwwCalls);
+    const auto gwwNs = static_cast<double>(now.gwwNs - last.gwwNs);
+    std::fprintf(stderr, "[walk-cost] per frame over %llu flips: VirtualQuery %.1f calls %.1f us (%.2f us/call), GetWriteWatch %.1f calls %.1f us (%.2f us/call, %.0f pages/call)\n", static_cast<unsigned long long>(every), vqCalls / frames,
+                 vqNs / frames / 1000.0, vqCalls > 0 ? vqNs / vqCalls / 1000.0 : 0.0, gwwCalls / frames, gwwNs / frames / 1000.0, gwwCalls > 0 ? gwwNs / gwwCalls / 1000.0 : 0.0,
+                 gwwCalls > 0 ? static_cast<double>(now.gwwPages - last.gwwPages) / gwwCalls : 0.0);
+    last = now;
+#endif
+}
+}
+
 void WtFaultFlip(bool presenter) {
-    if (!wtFault::active.load(std::memory_order_acquire)) return;
     // The presenter arms once it exists (off queue 0); without one (frame replay) queue 0 does at the
     // flip packet.
     static std::atomic<bool> presenterSeen{false};
     if (presenter) presenterSeen.store(true, std::memory_order_relaxed);
     else if (presenterSeen.load(std::memory_order_relaxed)) return;
+    walkCost::flip();
+    if (!wtFault::active.load(std::memory_order_acquire)) return;
     // The runs just armed are walked by write watching (resetting, stamping what was stored before the
     // protect, one tracker lock per run), so each armed page's sync clock passes its stamp. With
     // CONSUMERS this keeps the fault-state answers exact: without it, every page stored while open would
@@ -3510,13 +3560,31 @@ void WtFaultFlip(bool presenter) {
     constexpr std::size_t ArmedRuns = 4096;
     static std::vector<std::uintptr_t> runs(2 * ArmedRuns);
     const bool walkArmed = wtFault::verifyOn() || wtFault::consumersOn();
-    const auto armed = GuestArena::GuestWtFaultArm_nid_no_patch(runs.data(), walkArmed ? ArmedRuns : 0);
+    static std::vector<std::uintptr_t> dirtyRuns(2 * ArmedRuns);
+    std::size_t dirtyCount = 0;
+    const auto armed = wtFault::dirtyArmOn() ? GuestArena::GuestWtFaultArmKeepDirty_nid_no_patch(runs.data(), walkArmed ? ArmedRuns : 0, dirtyRuns.data(), ArmedRuns, &dirtyCount) :
+                                               GuestArena::GuestWtFaultArm_nid_no_patch(runs.data(), walkArmed ? ArmedRuns : 0);
+    auto& wc = wtFault::counters();
     if (walkArmed && armed != 0) {
+        const auto walkStart = std::chrono::steady_clock::now();
         auto& tracker = Tracker();
         for (std::size_t i = 0; i < armed && i < ArmedRuns; ++i) {
             const auto lock = lockTracker(tracker);
             walkWrites(tracker, runs[2 * i], runs[2 * i + 1], StampKind::Cpu, false, nullptr, false, nullptr, true);
         }
+        wc.armedWalkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
+    }
+    if (dirtyCount != 0) {
+        const auto walkStart = std::chrono::steady_clock::now();
+        auto& tracker = Tracker();
+        wtFault::flipDirtyWalk = true;
+        for (std::size_t i = 0; i < dirtyCount; ++i) {
+            const auto lock = lockTracker(tracker);
+            walkWrites(tracker, dirtyRuns[2 * i], dirtyRuns[2 * i + 1], StampKind::Cpu, false, nullptr, false, nullptr, true);
+        }
+        wtFault::flipDirtyWalk = false;
+        wc.dirtyWalks.fetch_add(dirtyCount, std::memory_order_relaxed);
+        wc.dirtyWalkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
     }
     wtFault::publish();
     // A per-frame line every APS5_WT_FAULT_REPORT_FLIPS flips (default 300).
@@ -3535,10 +3603,17 @@ void WtFaultFlip(bool presenter) {
     const double frames = static_cast<double>(every);
     const auto per = [&](std::uint64_t value, std::uint64_t before) { return static_cast<double>(value - before) / frames; };
     const auto& c = wtFault::counters();
-    static std::uint64_t lastUnchanged = 0, lastChanged = 0, lastFallback = 0;
+    static std::uint64_t lastUnchanged = 0, lastChanged = 0, lastFallback = 0, lastDirtyWalks = 0, lastDirtyWalkNs = 0, lastArmedWalkNs = 0;
     const auto unchanged = c.consumerUnchanged.load(std::memory_order_relaxed);
     const auto changed = c.consumerChanged.load(std::memory_order_relaxed);
     const auto fallback = c.consumerFallback.load(std::memory_order_relaxed);
+    const auto dirtyWalks = c.dirtyWalks.load(std::memory_order_relaxed);
+    const auto dirtyWalkNs = c.dirtyWalkNs.load(std::memory_order_relaxed);
+    const auto armedWalkNs = c.armedWalkNs.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[wt-fault] flip walks per frame: armed %.1f us, kept-dirty %.1f runs %.1f us\n", per(armedWalkNs, lastArmedWalkNs) / 1000.0, per(dirtyWalks, lastDirtyWalks), per(dirtyWalkNs, lastDirtyWalkNs) / 1000.0);
+    lastDirtyWalks = dirtyWalks;
+    lastDirtyWalkNs = dirtyWalkNs;
+    lastArmedWalkNs = armedWalkNs;
     std::fprintf(stderr, "[wt-fault] per frame over %llu flips (%.2f ms/f): faults %.1f (driver %.1f) handler %.1f us (driver %.1f) retries %.2f foreign %.2f | arm %.1f us (protect %.1f query %.1f lock %.1f scan %.1f, %.1f leaves of %llu, %.1f queries) pages %.1f runs %.1f kept-hot %.1f (dirty %.1f, %.1f us) excluded %.2f | holds %.2f forgotten %.1f tracked %.1f | verify dirty %.1f untracked %.1f mismatches %llu total | consumers unchanged %.1f changed %.1f fallback %.1f mismatches %llu total\n",
                  static_cast<unsigned long long>(every), std::chrono::duration<double, std::milli>(time - lastTime).count() / frames,
                  per(now.faults, last.faults), per(now.driverFaults, last.driverFaults), per(now.handlerNs, last.handlerNs) / 1000.0, per(now.driverHandlerNs, last.driverHandlerNs) / 1000.0,

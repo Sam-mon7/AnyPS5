@@ -51,7 +51,7 @@ struct WtFaultCounters {
     std::uint64_t armLockNs = 0;       // of armNs, waiting for the tracker's mutex
     std::uint64_t armScanNs = 0;       // of armNs, scanning leaves for open pages
     std::uint64_t armQueryNs = 0;      // of armNs, VirtualQuery
-    std::uint64_t keptDirty = 0;       // of keptHot, open pages kept because write watching reports them stored
+    std::uint64_t keptDirty = 0;       // of keptHot, open pages kept because write watching reports them stored (GuestWtFaultArmKeepDirty)
     std::uint64_t armDirtyNs = 0;      // of armNs, the non-resetting write-watch queries for that
     std::uint64_t armLeaves = 0;       // leaves scanned
     std::uint64_t leaves = 0;          // leaves allocated (2 MiB of guest memory each)
@@ -100,6 +100,11 @@ void GuestWtFaultNoteStored_nid_no_patch(std::uintptr_t address, std::size_t byt
 // Returns the number of runs armed and stores the first `capacity` of them as [begin, end) pairs in
 // `runs` (2 * capacity words; null with capacity 0 when not wanted).
 std::size_t GuestWtFaultArm_nid_no_patch(std::uintptr_t* runs, std::size_t capacity);
+// GuestWtFaultArm that first asks write watching (without resetting) about the candidates: pages stored
+// since their last resetting walk stay open, and their runs (at most `dirtyCapacity`, coalesced; a page
+// that does not fit is armed) go to `dirtyRuns`. The caller walks those runs with a resetting walk, so a
+// page stays open only while it is stored between flips (APS5_ARCHB_WT_FAULT_DIRTY_ARM).
+std::size_t GuestWtFaultArmKeepDirty_nid_no_patch(std::uintptr_t* runs, std::size_t capacity, std::uintptr_t* dirtyRuns, std::size_t dirtyCapacity, std::size_t* dirtyCount);
 // Forgets the pages of the range (a mapping or protection change made their protection the caller's).
 void GuestWtFaultForget_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 // Opens the armed pages of the range and keeps them open until the matching release (kernel-mode

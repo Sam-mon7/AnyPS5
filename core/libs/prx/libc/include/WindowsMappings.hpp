@@ -9,9 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
-#ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
-#endif
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +23,12 @@
 #include <system_error>
 
 namespace GuestArena {
+
+inline std::atomic<std::uint64_t> costVqCalls{0};
+inline std::atomic<std::uint64_t> costVqNs{0};
+inline std::atomic<std::uint64_t> costGwwCalls{0};
+inline std::atomic<std::uint64_t> costGwwNs{0};
+inline std::atomic<std::uint64_t> costGwwPages{0};
 
 class WindowsMappings {
 public:
@@ -461,6 +465,10 @@ public:
         return census;
     }
 
+    static WalkCost Cost() {
+        return {costVqCalls.load(std::memory_order_relaxed), costVqNs.load(std::memory_order_relaxed), costGwwCalls.load(std::memory_order_relaxed), costGwwNs.load(std::memory_order_relaxed), costGwwPages.load(std::memory_order_relaxed)};
+    }
+
     WriteWatchSweep Sweep() {
         WriteWatchSweep result;
         std::lock_guard lock(mutex);
@@ -813,6 +821,21 @@ private:
     static inline thread_local WriteWatchTiming timing;
     static inline thread_local WriteWatchCensus census;
 
+    static std::uint64_t costTicks() {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        return static_cast<std::uint64_t>(now.QuadPart);
+    }
+
+    static std::uint64_t costNs(std::uint64_t ticks) {
+        static const double scale = [] {
+            LARGE_INTEGER frequency;
+            QueryPerformanceFrequency(&frequency);
+            return 1e9 / static_cast<double>(frequency.QuadPart);
+        }();
+        return static_cast<std::uint64_t>(static_cast<double>(ticks) * scale);
+    }
+
     struct CollectTimer {
         bool profile = profileWrites();
         std::chrono::steady_clock::time_point start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -836,7 +859,11 @@ private:
         census.pages += (bytes + 4095) / 4096;
         const bool timed = profileWrites() || censusWrites();
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto costStart = costTicks();
         const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        costGwwNs.fetch_add(costNs(costTicks() - costStart), std::memory_order_relaxed);
+        costGwwCalls.fetch_add(1, std::memory_order_relaxed);
+        costGwwPages.fetch_add((bytes + 4095) / 4096, std::memory_order_relaxed);
         if (result == 0) census.dirty += *count;
         if (timed) {
             const auto elapsed = std::chrono::steady_clock::now() - start;
@@ -1178,7 +1205,10 @@ private:
 #ifdef APS5_COUNT_MAPPING_QUERIES
         queries.fetch_add(1, std::memory_order_relaxed);
 #endif
+        const auto costStart = costTicks();
         if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) != sizeof(memory)) fail("query guest memory");
+        costVqNs.fetch_add(costNs(costTicks() - costStart), std::memory_order_relaxed);
+        costVqCalls.fetch_add(1, std::memory_order_relaxed);
         return memory;
     }
 

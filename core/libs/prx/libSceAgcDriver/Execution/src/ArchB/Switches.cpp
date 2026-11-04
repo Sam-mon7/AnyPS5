@@ -106,6 +106,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::WtFault, "WT_FAULT", false, false, {}},
     {Feature::WtFaultVerify, "WT_FAULT_VERIFY", false, false, WtFaultPrerequisites},
     {Feature::WtFaultConsumers, "WT_FAULT_CONSUMERS", false, true, WtFaultPrerequisites},
+    {Feature::WtFaultDirtyArm, "WT_FAULT_DIRTY_ARM", false, true, WtFaultPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
