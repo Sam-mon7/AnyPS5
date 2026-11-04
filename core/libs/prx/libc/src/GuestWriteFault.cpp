@@ -1260,6 +1260,8 @@ std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::si
     const auto skip = [&](std::size_t cause, std::uint64_t pages) {
         if (causes != nullptr) causes[cause] += pages;
     };
+    std::uintptr_t queriedEnd = 0;
+    bool queriedOk = false;
     for (auto page = first; page < stop; page += PageBytes) {
         auto* leaf = leafAt(state, page);
         if (leaf == nullptr) {
@@ -1292,8 +1294,17 @@ std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::si
             continue;
         }
         if ((value & WtFaultCheckedBit) == 0) {
-            skip(WtWatchSkipUnchecked, 1);
-            continue;
+            if (current == WtFaultOpen && page >= queriedEnd) {
+                MEMORY_BASIC_INFORMATION memory{};
+                queriedOk = VirtualQuery(reinterpret_cast<void*>(page), &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT && memory.Type == MEM_PRIVATE && memory.Protect == PAGE_READWRITE;
+                queriedEnd = queriedOk ? reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize : page + PageBytes;
+            }
+            const bool eligible = current == WtFaultOpen && queriedOk;
+            if (!eligible || !word.compare_exchange_strong(value, value | WtFaultCheckedBit, std::memory_order_acq_rel)) {
+                skip(WtWatchSkipUnchecked, 1);
+                continue;
+            }
+            value |= WtFaultCheckedBit;
         }
         if (isExec(value)) {
             skip(WtWatchSkipExec, 1);
