@@ -1757,6 +1757,10 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
     return cachedStorageTexture(context, {}, resource, 0, 0, false, std::nullopt, preparation);
 }
 
+std::uint64_t StorageSurfaceSerial() {
+    return ExtendedChains().serial.load(std::memory_order_acquire);
+}
+
 std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, const GuestTextureResource& resource, std::uint32_t firstLayer, std::uint32_t layerCount) {
     return cachedStorageTexture(context, {}, resource, 0, 0, false, std::pair{firstLayer, layerCount});
 }
