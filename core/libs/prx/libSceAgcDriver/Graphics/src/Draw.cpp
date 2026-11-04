@@ -4033,6 +4033,9 @@ struct Slot {
     const Framebuffer* framebufferRaw = nullptr;
     std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
+    bool movedStatic = false;
+    std::vector<ShaderResources::MovedBuffer> moved;
+    std::vector<std::vector<std::uint32_t>> movedWords;
     std::size_t argumentRead = 0;
     std::size_t argumentLinearRead = 0;
     SlotPassCapture pass;
@@ -4182,6 +4185,11 @@ std::array<std::uint64_t, ComponentCount> fingerprint(const Slot& slot) {
     for (const auto view : slot.views) targets = mix(targets, reinterpret_cast<std::uintptr_t>(view));
     for (const auto& [first, count] : slot.slices) targets = mix(targets, (static_cast<std::uint64_t>(first) << 32u) | count);
     parts[ComponentTemplate] = mix(mix(mix(reinterpret_cast<std::uintptr_t>(slot.resourcesRaw), slot.membership), slot.contentKey.size()), slot.completion ? 1u : 0u);
+    parts[ComponentTemplate] = mix(parts[ComponentTemplate], slot.movedStatic ? 1u : 0u);
+    for (const auto& entry : slot.moved) {
+        parts[ComponentTemplate] = mix(mix(mix(parts[ComponentTemplate], entry.allocation), entry.address), entry.size);
+        for (const auto word : entry.words) parts[ComponentTemplate] = mix(parts[ComponentTemplate], word);
+    }
     parts[ComponentObjects] = mix(reinterpret_cast<std::uintptr_t>(slot.pipelineRaw), reinterpret_cast<std::uintptr_t>(slot.framebufferRaw));
     auto& inputs = parts[ComponentInputs];
     inputs = mix(mix(inputs, slot.fragmentOutputs), slot.shaderStages);
@@ -4317,6 +4325,16 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     pass.passReads.resize(pass.passReads.size() - inputs.inPlaceReads.size());
     pass.linearReads.resize(pass.linearReads.size() - inputs.inPlaceReads.size());
     slot.fragmentOutputs = inputs.fragmentOutputs;
+    slot.movedStatic = std::ranges::all_of(prepared.resolved.moved, [](const ShaderResources::MovedBuffer& entry) { return !entry.words.empty(); });
+    if (slot.movedStatic) {
+        slot.movedWords.reserve(prepared.resolved.moved.size());
+        for (const auto& entry : prepared.resolved.moved) slot.movedWords.emplace_back(entry.words.begin(), entry.words.end());
+        for (std::size_t i = 0; i < prepared.resolved.moved.size(); ++i) {
+            auto entry = prepared.resolved.moved[i];
+            entry.words = slot.movedWords[i];
+            slot.moved.push_back(entry);
+        }
+    }
     slot.shaderStages = inputs.shaderStages;
     const std::pair<std::uint64_t, std::uint64_t> argumentRange{args->arguments, args->arguments + args->RangeBytes()};
     const auto readAt = std::find(pass.passReads.begin(), pass.passReads.end(), argumentRange);
@@ -4377,6 +4395,8 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     const auto refuse = [&](Refusal why) {
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
         lastOutcome() = why == RefusedNew ? OutcomeNew : OutcomeRefused;
+        scratch().inputs = DrawInputs{};
+        scratch().targets.clear();
         return false;
     };
     if (!usableIdentity(identity, state, shaders) || draw.indirect == std::nullopt || state.colors.size() > 64) return refuse(RefusedNew);
@@ -4410,6 +4430,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     work.inputs = prepareDrawInputs(context, state, draw, shaders, replayOutcome(), replayTimer(), nullptr, nullptr);
     auto& inputs = work.inputs;
     if (inputs.nothing) {
+        work.inputs = DrawInputs{};
         clock.Finish();
         counts.hits.fetch_add(1, std::memory_order_relaxed);
         lastOutcome() = OutcomeReplayed;
@@ -4439,8 +4460,12 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         return refuse(RefusedProof);
     }
     clock.Mark(StepProof);
-    auto moved = resources->MovedReadOnlyBuffers(shaders, *recorder);
-    if (!moved.has_value()) return refuse(RefusedMoved);
+    std::optional<std::vector<ShaderResources::MovedBuffer>> liveMoved;
+    if (!slot->movedStatic) {
+        liveMoved = resources->MovedReadOnlyBuffers(shaders, *recorder);
+        if (!liveMoved.has_value()) return refuse(RefusedMoved);
+    }
+    const std::span<const ShaderResources::MovedBuffer> moved = slot->movedStatic ? std::span<const ShaderResources::MovedBuffer>(slot->moved) : std::span<const ShaderResources::MovedBuffer>(*liveMoved);
     if (const auto present = Recorder::Presents(); slot->touched != present) {
         SharedResourceCache().Touch(slot->contentKey);
         slot->touched = present;
@@ -4455,6 +4480,8 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         counts.verifyChecks.fetch_add(1, std::memory_order_relaxed);
         prepared.slotVerify = true;
         lastOutcome() = OutcomeVerified;
+        work.inputs = DrawInputs{};
+        work.targets.clear();
         return false;
     }
     PerformanceTimer timing("Graphics.DrawReplay", AgcDriver::ArchB::Recorder::Phase::Record);
@@ -4479,7 +4506,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     linearReads.insert(linearReads.begin() + static_cast<std::ptrdiff_t>(slot->argumentLinearRead), argumentRange.front());
     linearReads.insert(linearReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(linearReads.begin(), linearReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources->WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, slot->pass.unknownMemory));
-    const auto drawBindings = resources->PrepareDrawBindings(*recorder, *moved);
+    const auto drawBindings = resources->PrepareDrawBindings(*recorder, moved);
     static const bool zcNoPassReads = std::getenv("APS5_ZC_MOVED_NO_PASSREADS") != nullptr;
     auto& passReads = work.passReads;
     passReads.assign(slot->pass.passReads.begin(), slot->pass.passReads.end());
@@ -4543,6 +4570,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     clock.Mark(StepRecord);
     keepRecordedDraw(*recorder, resources, std::move(pipeline), std::move(framebuffer), inputs, std::move(work.targets), slot->slices, state.scissor, std::move(argumentScratch), {}, false, slot->completion, replayOutcome());
     work.targets.clear();
+    work.inputs = DrawInputs{};
     clock.Mark(StepKeep);
     clock.Finish();
     slot->replayedLast = true;
