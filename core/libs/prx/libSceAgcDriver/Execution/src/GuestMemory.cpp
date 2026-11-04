@@ -170,6 +170,11 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+// Stage 4.2: the committer's tracker-mutex acquisitions that waited and the time waited (resolver
+// walks hold the same mutex).
+thread_local bool trackerTimedThread = false;
+std::atomic<std::uint64_t> committerTrackerWaits{0};
+std::atomic<std::uint64_t> committerTrackerWaitNs{0};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -1718,7 +1723,14 @@ public:
                 lock = std::unique_lock<AgcDriver::Mutex>(tracker.mutex, std::adopt_lock);
                 return;
             }
-            lock.lock();
+            if (trackerTimedThread && !lock.try_lock()) {
+                const auto start = std::chrono::steady_clock::now();
+                lock.lock();
+                committerTrackerWaits.fetch_add(1, std::memory_order_relaxed);
+                committerTrackerWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+                return;
+            }
+            if (!lock.owns_lock()) lock.lock();
             return;
         }
         if (!lock.try_lock()) {
@@ -2552,6 +2564,18 @@ CollectHitCache& collectHitCache() {
 
 // The queue-0 committer's collect counters (see GuestMemory.hpp).
 thread_local bool committerThread = false;
+// Stage 4.2 (APS5_ARCHB_PIPE_RESOLVE_POOL): a draw resolver thread. Its walks (made after the item's
+// ordering point, like queue 0's) go into the collect-share table, which the committer then reads
+// even with PIPE_COLLECT_SHARE off; APS5_PIPE_RESOLVE_SHARE=0 leaves both out.
+thread_local bool resolverThread = false;
+
+bool resolveShareActive() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_PIPE_RESOLVE_SHARE");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled && ArchB::Switches::Enabled(ArchB::Feature::PipeResolvePool) && ArchB::Switches::Enabled(ArchB::Feature::PipeResolveSplit);
+}
 
 // APS5_ARCHB_PIPE_COLLECT_SHARE (see GuestMemory.hpp): queue 0's completed walks, per page, with the
 // collect clock (nextCollectEpoch) each walk read before its OS query, under the tracker mutex. A
@@ -3320,8 +3344,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     };
     // APS5_ARCHB_PIPE_COLLECT_SHARE: the committer skips a walk queue 0 already made for this epoch;
     // queue 0 records its walks. Not with the write-generation table (its sweep model follows walks).
-    const bool shareCommitter = committerThread && useMemo && !Gen::Active() && collectShare::active();
-    const bool shareProducer = collectShare::producer && !committerThread && !Gen::Active() && collectShare::active();
+    const bool shareCommitter = committerThread && useMemo && !Gen::Active() && (collectShare::active() || resolveShareActive());
+    const bool shareProducer = !committerThread && !Gen::Active() && ((collectShare::producer && collectShare::active()) || (resolverThread && resolveShareActive()));
     bool shareCovered = false;
 #ifdef _WIN32
     if (shareCommitter) {
@@ -3486,7 +3510,25 @@ CommitterCollectCounters& CommitterCollects() {
 
 void MarkCommitterThread() {
     committerThread = true;
+    trackerTimedThread = true;
     MarkDriverThread();
+}
+
+void MarkResolverThread() {
+    resolverThread = true;
+    MarkDriverThread();
+}
+
+bool ResolveShareActive() {
+    return resolveShareActive();
+}
+
+std::atomic<std::uint64_t>& CommitterTrackerWaits() {
+    return committerTrackerWaits;
+}
+
+std::atomic<std::uint64_t>& CommitterTrackerWaitNs() {
+    return committerTrackerWaitNs;
 }
 
 void MarkDriverThread() {

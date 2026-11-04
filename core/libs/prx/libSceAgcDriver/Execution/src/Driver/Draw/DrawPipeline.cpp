@@ -30,6 +30,8 @@ std::string DrawLookupDiagText();
 std::string DrawLookupMemoText();
 // APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO (Pipeline.cpp): the committer's pipeline memo counters.
 std::string PipelineLookupMemoText();
+// Stage 4.1/4.2 (Draw.cpp): speculated pipelines taken and refused.
+std::string ResolvePipelineText();
 }
 #include <string>
 
@@ -139,6 +141,69 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
 std::atomic<std::uint64_t> heldReadRanges{0};
 std::atomic<std::uint64_t> heldReadQueries{0};
 std::atomic<std::uint64_t> heldReadHits{0};
+
+// Stage 4.1/4.2 (APS5_ARCHB_PIPE_RESOLVE_SPLIT, _POOL): resolves by where they ran, the resolves the
+// committer re-ran because an item applied in between wrote one of their ranges (conflicts), the
+// committer's waits for a resolver still running its item, the resolve time by thread (resolver i, the
+// committer last), the committer's item time while the split is on (apply, waits included), and the
+// _VERIFY re-runs whose plan hash differed.
+constexpr std::size_t ResolverSlots = 8;
+struct ResolveCounters {
+    std::atomic<std::uint64_t> items{0};
+    std::atomic<std::uint64_t> pooled{0};
+    std::atomic<std::uint64_t> inlined{0};
+    std::atomic<std::uint64_t> conflicts{0};
+    std::atomic<std::uint64_t> waits{0};
+    std::atomic<std::uint64_t> waitNs{0};
+    std::atomic<std::uint64_t> resolveNs{0};
+    std::atomic<std::uint64_t> poolNs{0};
+    std::atomic<std::uint64_t> applyNs{0};
+    std::atomic<std::uint64_t> applyItems{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> mismatches{0};
+    std::array<std::atomic<std::uint64_t>, ResolverSlots + 1> threadNs{};
+    std::array<std::atomic<std::uint64_t>, ResolverSlots + 1> threadItems{};
+};
+
+ResolveCounters& resolveCounters() {
+    static auto* counters = new ResolveCounters();
+    return *counters;
+}
+
+std::size_t resolverCount() {
+    static const std::size_t count = [] {
+        const char* value = std::getenv("APS5_PIPE_RESOLVERS");
+        const auto parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 3ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(parsed, 1ull, ResolverSlots));
+    }();
+    return count;
+}
+
+bool resolveVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_PIPE_RESOLVE_SPLIT_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+thread_local std::size_t resolverIndex = ResolverSlots;
+
+// Applied items' writes kept for the conflict check (a resolve older than the oldest kept counts as
+// conflicting).
+constexpr std::size_t AppliedKept = 512;
+
+void runResolveSlot(DrawPipeline::ResolveSlot& slot) {
+    const auto start = std::chrono::steady_clock::now();
+    slot.reads.clear();
+    slot.plan = slot.run(slot.reads);
+    slot.ns = elapsedNs(start);
+    auto& counters = resolveCounters();
+    counters.items.fetch_add(1, std::memory_order_relaxed);
+    counters.resolveNs.fetch_add(slot.ns, std::memory_order_relaxed);
+    counters.threadNs[resolverIndex].fetch_add(slot.ns, std::memory_order_relaxed);
+    counters.threadItems[resolverIndex].fetch_add(1, std::memory_order_relaxed);
+}
 
 }
 
@@ -462,6 +527,23 @@ void DrawPipeline::RegisterCounters() {
             ArchB::Recorder::RegisterCounter("ahead_census_invalid_ns", counters.aheadInvalidNs);
             ArchB::Recorder::RegisterCounter("ahead_census_unknown_ns", counters.aheadUnknownNs);
         }
+        auto& resolve = resolveCounters();
+        ArchB::Recorder::RegisterCounter("pipe_resolve_items", resolve.items);
+        ArchB::Recorder::RegisterCounter("pipe_resolve_pool_items", resolve.pooled);
+        ArchB::Recorder::RegisterCounter("pipe_resolve_inline", resolve.inlined);
+        ArchB::Recorder::RegisterCounter("pipe_resolve_conflicts", resolve.conflicts);
+        ArchB::Recorder::RegisterCounter("pipe_resolve_waits", resolve.waits);
+        ArchB::Recorder::RegisterCounter("pipe_resolve_wait_ns", resolve.waitNs);
+        ArchB::Recorder::RegisterCounter("pipe_resolve_ns", resolve.resolveNs);
+        ArchB::Recorder::RegisterCounter("pipe_resolve_pool_ns", resolve.poolNs);
+        ArchB::Recorder::RegisterCounter("pipe_apply_ns", resolve.applyNs);
+        ArchB::Recorder::RegisterCounter("pipe_apply_items", resolve.applyItems);
+        ArchB::Recorder::RegisterCounter("pipe_resolve_verified", resolve.verified);
+        ArchB::Recorder::RegisterCounter("pipe_resolve_verify_mismatches", resolve.mismatches);
+        ArchB::Recorder::RegisterCounter("pipe_committer_tracker_waits", GuestMemory::CommitterTrackerWaits());
+        ArchB::Recorder::RegisterCounter("pipe_committer_tracker_wait_ns", GuestMemory::CommitterTrackerWaitNs());
+        static constexpr std::array<const char*, ResolverSlots + 1> threadNames{"pipe_resolver0_ns", "pipe_resolver1_ns", "pipe_resolver2_ns", "pipe_resolver3_ns", "pipe_resolver4_ns", "pipe_resolver5_ns", "pipe_resolver6_ns", "pipe_resolver7_ns", "pipe_resolve_committer_ns"};
+        for (std::size_t i = 0; i < threadNames.size(); ++i) ArchB::Recorder::RegisterCounter(threadNames[i], resolve.threadNs[i]);
         // APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY: queue workers ask whether the committer is busy.
         GuestMemory::SetGpuLockPriorityHook([] { return Queue0().Outstanding() != 0; });
         return true;
@@ -573,6 +655,141 @@ void DrawPipeline::FollowEpoch(std::uint64_t token, std::uint64_t ticket) {
     GuestMemory::FollowCollectShare(epochClock(token));
 }
 
+bool DrawPipeline::ResolveSplitActive() {
+    return ArchB::Switches::Enabled(ArchB::Feature::PipeResolveSplit);
+}
+
+bool DrawPipeline::ResolvePoolActive() {
+    return ArchB::Switches::Enabled(ArchB::Feature::PipeResolvePool) && ArchB::Switches::Enabled(ArchB::Feature::PipeResolveSplit);
+}
+
+std::string DrawPipeline::ResolveText() {
+    auto& counters = resolveCounters();
+    const auto get = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    char line[512];
+    std::snprintf(line, sizeof(line), "[pipe-resolve] cumulative: resolves %llu (pool %llu, inline %llu), conflicts %llu, waits %llu (%.1f ms), resolve %.1f ms, apply %.1f ms over %llu items, verified %llu, mismatches %llu; by thread ms:", get(counters.items), get(counters.pooled), get(counters.inlined), get(counters.conflicts), get(counters.waits), static_cast<double>(get(counters.waitNs)) / 1e6, static_cast<double>(get(counters.resolveNs)) / 1e6, static_cast<double>(get(counters.applyNs)) / 1e6, get(counters.applyItems), get(counters.verified), get(counters.mismatches));
+    std::string text = line;
+    for (std::size_t i = 0; i <= ResolverSlots; ++i) {
+        if (get(counters.threadItems[i]) == 0) continue;
+        std::snprintf(line, sizeof(line), " %s=%.1f/%llu", i == ResolverSlots ? "committer" : ("r" + std::to_string(i)).c_str(), static_cast<double>(get(counters.threadNs[i])) / 1e6, get(counters.threadItems[i]));
+        text += line;
+    }
+    return text;
+}
+
+// Under `mutex`.
+void DrawPipeline::startResolvers() {
+    const auto count = resolverCount();
+    resolvers.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        resolvers.emplace_back([this, i] {
+            resolverIndex = i;
+            PerformanceTrace::BindThread("draw resolver");
+            GuestMemory::MarkResolverThread();
+            runResolver();
+        });
+    }
+}
+
+// A resolver takes the oldest queued item whose resolve nobody claimed, past the front item (which the
+// committer takes next or is applying; a hand-off there would only add latency), and resolves it with
+// the count of items applied so far: the items from there up to it are the ones whose writes the
+// committer checks against the resolve's ranges.
+void DrawPipeline::runResolver() {
+    const auto claimable = [this]() -> std::shared_ptr<ResolveSlot> {
+        for (std::size_t index = 1; index < items.size(); ++index) {
+            auto& slot = items[index].resolve;
+            if (slot != nullptr && slot->state.load(std::memory_order_acquire) == 0) return slot;
+        }
+        return nullptr;
+    };
+    for (;;) {
+        std::shared_ptr<ResolveSlot> slot;
+        {
+            std::unique_lock lock(mutex);
+            resolveWake.wait(lock, [&] { return closing || (slot = claimable()) != nullptr; });
+            if (closing) break;
+            std::uint8_t expected = 0;
+            if (!slot->state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) continue;
+            slot->startedAt = retiredItems.load(std::memory_order_relaxed);
+            if (claimable() != nullptr) resolveWake.notify_one();
+        }
+        runResolveSlot(*slot);
+        resolveCounters().poolNs.fetch_add(slot->ns, std::memory_order_relaxed);
+        {
+            std::lock_guard lock(mutex);
+            slot->state.store(2, std::memory_order_release);
+        }
+        resolveDone.notify_all();
+    }
+}
+
+// Under `mutex`: the writes of the item applied as number `serial` (its label store included).
+void DrawPipeline::noteApplied(const Item& item, std::uint64_t serial) {
+    Applied entry{serial, item.writes};
+    if (item.labelAddress != 0 && !item.labelBytes.empty()) entry.writes.emplace_back(item.labelAddress, item.labelAddress + item.labelBytes.size());
+    applied.push_back(std::move(entry));
+    while (applied.size() > AppliedKept) applied.pop_front();
+}
+
+// Under `mutex`: whether an item applied after the resolve began and before item `serial` wrote one of
+// the resolve's ranges (or such an item is no longer known).
+bool DrawPipeline::appliedOverlap(const ResolveSlot& slot, std::uint64_t serial) {
+    if (slot.startedAt >= serial) return false;
+    if (applied.empty() || applied.front().serial > slot.startedAt) return true;
+    for (auto entry = applied.rbegin(); entry != applied.rend() && entry->serial >= slot.startedAt; ++entry) {
+        if (entry->serial >= serial) continue;
+        for (const auto& write : entry->writes) {
+            for (const auto& read : slot.reads) {
+                if (read.first < write.second && write.first < read.second) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The committer before applying item `serial`: resolves it inline unless a resolver claimed it, waits
+// for a running resolve, and re-resolves inline when an item applied meanwhile wrote one of its ranges.
+void DrawPipeline::resolveForApply(ResolveSlot& slot, std::uint64_t serial) {
+    auto& counters = resolveCounters();
+    std::uint8_t expected = 0;
+    if (slot.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+        slot.startedAt = serial;
+        runResolveSlot(slot);
+        slot.state.store(2, std::memory_order_release);
+        counters.inlined.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        if (slot.state.load(std::memory_order_acquire) != 2) {
+            const auto waitStart = std::chrono::steady_clock::now();
+            SpinUntil(HandoffSpinWindow(), [&] { return slot.state.load(std::memory_order_acquire) == 2; });
+            if (slot.state.load(std::memory_order_acquire) != 2) {
+                std::unique_lock lock(mutex);
+                resolveDone.wait(lock, [&] { return slot.state.load(std::memory_order_acquire) == 2; });
+            }
+            counters.waits.fetch_add(1, std::memory_order_relaxed);
+            counters.waitNs.fetch_add(elapsedNs(waitStart), std::memory_order_relaxed);
+        }
+        bool conflict = false;
+        {
+            std::lock_guard lock(mutex);
+            conflict = appliedOverlap(slot, serial);
+        }
+        if (conflict) {
+            counters.conflicts.fetch_add(1, std::memory_order_relaxed);
+            slot.startedAt = serial;
+            runResolveSlot(slot);
+        } else counters.pooled.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!resolveVerify()) return;
+    const auto plan = slot.plan;
+    runResolveSlot(slot);
+    counters.verified.fetch_add(1, std::memory_order_relaxed);
+    if (slot.plan != plan) {
+        const auto count = counters.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((count & (count - 1)) == 0) std::fprintf(stderr, "[pipe-resolve] VERIFY: a re-resolved plan differs (%llu so far)\n", static_cast<unsigned long long>(count));
+    }
+}
+
 unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
@@ -583,7 +800,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind, std::shared_ptr<ResolveSlot> resolve) {
     const bool recorder = ArchB::Recorder::Enabled();
     const auto enqueueStart = recorder ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
@@ -598,6 +815,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     rethrowFailure();
     if (closing) {
         lock.unlock();
+        if (resolve != nullptr) runResolveSlot(*resolve);
         commit();
         return;
     }
@@ -634,7 +852,9 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     ++enqueued;
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
     countWrites(writes, true);
+    const bool pooledResolve = resolve != nullptr && ResolvePoolActive();
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, kind});
+    items.back().resolve = std::move(resolve);
     static const bool aheadCensus = GuestMemory::CollectAheadCensus();
     if (aheadCensus && kind == ItemKind::Draw) {
         items.back().enqueuedNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -652,6 +872,10 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (committerWaiting) {
         ++wakes;
         wake.notify_one();
+    }
+    if (pooledResolve) {
+        if (resolvers.empty()) startResolvers();
+        if (items.size() > 1) resolveWake.notify_one();
     }
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (recorder) {
@@ -738,6 +962,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     drains = {};
     drainWaitNs = {};
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CumulativeText().c_str());
+    if (resolveCounters().items.load(std::memory_order_relaxed) != 0) AgcDriver::ProfilePrint_nid_no_patch("%s\n%s\n", ResolveText().c_str(), Graphics::ResolvePipelineText().c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", Graphics::ShaderResources::DrawSetPoolText().c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", Graphics::ShaderResources::DrawReuseText().c_str());
     if (const auto fixes = Graphics::ShaderResources::SnapshotFixesText(); !fixes.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", fixes.c_str());
@@ -788,6 +1013,8 @@ void DrawPipeline::run() {
         ItemKind kind = ItemKind::Other;
         std::uint64_t enqueuedNs = 0;
         std::uint64_t enqueueClock = 0;
+        std::shared_ptr<ResolveSlot> resolveSlot;
+        std::uint64_t serial = 0;
         // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
         const bool idleBefore = ArchB::Recorder::Enabled() && outstanding.load(std::memory_order_acquire) == 0;
         const auto idleStart = idleBefore ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -807,6 +1034,8 @@ void DrawPipeline::run() {
             kind = items.front().kind;
             enqueuedNs = items.front().enqueuedNs;
             enqueueClock = items.front().enqueueClock;
+            resolveSlot = items.front().resolve;
+            serial = retiredItems.load(std::memory_order_relaxed);
             if (Stage4::ResolveCensus()) {
                 stage4Reads.assign(items.front().reads.begin(), items.front().reads.end());
                 stage4Writes.assign(items.front().writes.begin(), items.front().writes.end());
@@ -826,6 +1055,7 @@ void DrawPipeline::run() {
         static const bool collectCensus = GuestMemory::CommitterCollectCensus();
         if (collectCensus) GuestMemory::BeginCommitterCensusItem(static_cast<std::uint8_t>(kind));
         try {
+            if (commit != nullptr && resolveSlot != nullptr) resolveForApply(*resolveSlot, serial);
             if (commit != nullptr) (*commit)();
             if (!isDraw) GuestMemory::BreakProofs();
         } catch (const std::exception&) {
@@ -838,6 +1068,10 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        if (resolveSlot != nullptr) {
+            resolveCounters().applyNs.fetch_add(spent, std::memory_order_relaxed);
+            resolveCounters().applyItems.fetch_add(1, std::memory_order_relaxed);
+        }
         if (Stage4::ResolveCensus()) Stage4::EndItem(Graphics::StorageTexture::PendingSerial(), !isDraw);
         if (enqueuedNs != 0) countAheadWindow(enqueuedNs, enqueueClock, start);
         if (fatal != nullptr && !stopped) {
@@ -846,6 +1080,7 @@ void DrawPipeline::run() {
         }
         std::lock_guard lock(mutex);
         countWrites(items.front().writes, false);
+        if (!resolvers.empty()) noteApplied(items.front(), serial);
         retired.push_back(std::move(items.front()));
         items.pop_front();
         retiredItems.fetch_add(1, std::memory_order_release);
@@ -865,6 +1100,7 @@ void DrawPipeline::Stop() {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (stats && pipeCounters().enqueues.load(std::memory_order_relaxed) != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", CumulativeText().c_str());
+        if (resolveCounters().items.load(std::memory_order_relaxed) != 0) AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n%s (at shutdown)\n", ResolveText().c_str(), Graphics::ResolvePipelineText().c_str());
         AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", Graphics::ShaderResources::DrawSetPoolText().c_str());
         AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", Graphics::ShaderResources::DrawReuseText().c_str());
         if (const auto fixes = Graphics::ShaderResources::SnapshotFixesText(); !fixes.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", fixes.c_str());
@@ -874,12 +1110,21 @@ void DrawPipeline::Stop() {
         AgcDriver::ProfilePrint_nid_no_patch("%s (at shutdown)\n", Graphics::PipelineLookupMemoText().c_str());
     }
     std::thread committer;
+    std::vector<std::thread> stoppedResolvers;
     {
         std::lock_guard lock(mutex);
         closing = true;
         committer = std::move(thread);
+        stoppedResolvers = std::move(resolvers);
+        resolvers.clear();
     }
     wake.notify_all();
+    resolveWake.notify_all();
+    resolveDone.notify_all();
+    for (auto& resolver : stoppedResolvers) {
+        if (resolver.get_id() == std::this_thread::get_id()) resolver.detach();
+        else if (resolver.joinable()) resolver.join();
+    }
     if (!committer.joinable()) return;
     if (committer.get_id() == std::this_thread::get_id()) committer.detach();
     else committer.join();

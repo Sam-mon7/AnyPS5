@@ -343,6 +343,8 @@ public:
     // Walks the write watch over every image surface of a completed object (no device lock: the
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces(bool memoVirtualQuery = false) const;
+    // The ranges PrecollectSurfaces collects, appended as [begin, end) (Stage 4.1 resolve read set).
+    void DescribedRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
     bool Reusable() const { return reusable; }
     // APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO: a serial unique to this object's insertion into the shared
     // resource cache while the cache holds it, 0 once it left (ResourceCache sets it under its mutex),

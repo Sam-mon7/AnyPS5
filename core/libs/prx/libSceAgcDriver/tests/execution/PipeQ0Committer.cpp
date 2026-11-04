@@ -10,6 +10,13 @@
 //   --keep-registers   (with APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS=1) a SET_CONTEXT_REG_INDIRECT whose table a
 //                 queued item writes keeps the pipeline: its valid list was read at submission.
 //   --registers-drain  (without it) the same packet drains, as before the cut.
+//   --resolve-split    (APS5_ARCHB_PIPE_RESOLVE_SPLIT=1) an item's resolve runs on the committer right
+//                 before its commit, once.
+//   --resolve-pool     (and _POOL=1) resolves of queued items behind a blocked front item run ahead on
+//                 resolver threads; the commits then take them without re-running, in FIFO order.
+//   --resolve-conflict (pool) an item applied after a resolve began that writes one of the resolve's
+//                 ranges makes the committer re-run it inline (pipe_resolve_conflicts); a write
+//                 elsewhere does not.
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -232,6 +239,123 @@ void Registers(bool keep) {
 
 }
 
+// Stage 4.1/4.2: one resolvable item. Its resolve notes the thread and reads `read`; its commit notes
+// the order and that the resolve came first.
+struct ResolveProbe {
+    std::atomic<int> resolves{0};
+    std::atomic<bool> resolvedOffCommitter{false};
+    std::atomic<bool> lastResolveOnCommitter{false};
+    std::atomic<bool> resolvedBeforeCommit{true};
+    std::thread::id committer;
+};
+
+void Resolve(std::string_view mode) {
+    auto& pipeline = DrawPipeline::Queue0();
+    check(DrawPipeline::ResolveSplitActive(), "test setup: PIPE_RESOLVE_SPLIT is off");
+    const bool pool = mode != "--resolve-split";
+    check(DrawPipeline::ResolvePoolActive() == pool, "test setup: PIPE_RESOLVE_POOL does not match the mode");
+    using Range = DrawPipeline::Range;
+    std::mutex orderMutex;
+    std::vector<int> order;
+    std::atomic<bool> release{false};
+    std::atomic<bool> blocking{false};
+    std::thread::id committerId;
+    const auto blocker = [&] {
+        committerId = std::this_thread::get_id();
+        blocking.store(true);
+        while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::lock_guard guard(orderMutex);
+        order.push_back(-1);
+    };
+    const auto plain = [&](int index) {
+        return [&, index] {
+            std::lock_guard guard(orderMutex);
+            order.push_back(index);
+        };
+    };
+    std::vector<std::shared_ptr<ResolveProbe>> probes;
+    const auto resolvable = [&](int index, Range read) {
+        auto probe = std::make_shared<ResolveProbe>();
+        probes.push_back(probe);
+        auto slot = std::make_shared<DrawPipeline::ResolveSlot>();
+        slot->run = [probe, read, &committerId](std::vector<Range>& reads) -> std::uint64_t {
+            const bool onCommitter = std::this_thread::get_id() == committerId;
+            probe->lastResolveOnCommitter.store(onCommitter);
+            if (!onCommitter) probe->resolvedOffCommitter.store(true);
+            probe->resolves.fetch_add(1);
+            reads.push_back(read);
+            return 7;
+        };
+        auto commit = [&, index, probe] {
+            if (probe->resolves.load() == 0) probe->resolvedBeforeCommit.store(false);
+            std::lock_guard guard(orderMutex);
+            order.push_back(index);
+        };
+        pipeline.Enqueue(commit, {}, 0, {}, {}, true, DrawPipeline::ItemKind::Draw, std::move(slot));
+    };
+    const auto waitResolved = [&](std::size_t count) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (;;) {
+            std::size_t done = 0;
+            for (std::size_t i = 0; i < count; ++i) done += probes[i]->resolves.load() != 0;
+            if (done == count) return;
+            check(std::chrono::steady_clock::now() < deadline, "queued resolves did not run ahead while the front item blocked");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+    const Range target{0x100000, 0x101000};
+    if (mode == "--resolve-split") {
+        pipeline.Enqueue(blocker, {});
+        while (!blocking.load()) std::this_thread::yield();
+        for (int i = 0; i < 4; ++i) resolvable(i, target);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        for (const auto& probe : probes) check(probe->resolves.load() == 0, "a resolve ran before the committer reached its item with the pool off");
+        release.store(true);
+        pipeline.Drain(DrawPipeline::DrainReason::Flush);
+        for (const auto& probe : probes) {
+            check(probe->resolves.load() == 1, "a resolve did not run exactly once");
+            check(!probe->resolvedOffCommitter.load(), "a resolve ran off the committer with the pool off");
+            check(probe->resolvedBeforeCommit.load(), "a commit ran before its resolve");
+        }
+    } else if (mode == "--resolve-pool") {
+        pipeline.Enqueue(blocker, {});
+        while (!blocking.load()) std::this_thread::yield();
+        for (int i = 0; i < 6; ++i) resolvable(i, target);
+        waitResolved(probes.size());
+        release.store(true);
+        pipeline.Drain(DrawPipeline::DrainReason::Flush);
+        for (const auto& probe : probes) {
+            check(probe->resolves.load() == 1, "a resolve ran ahead was run again without a conflict");
+            check(probe->resolvedOffCommitter.load(), "a queued resolve did not run on a resolver thread");
+        }
+        const auto text = DrawPipeline::ResolveText();
+        check(text.find("pool 6") != std::string::npos, "pipe_resolve_pool_items did not count the six resolves: " + text);
+    } else {
+        const Range elsewhere{0x200000, 0x201000};
+        pipeline.Enqueue(blocker, {});
+        while (!blocking.load()) std::this_thread::yield();
+        resolvable(0, target);
+        resolvable(1, elsewhere);
+        waitResolved(2);
+        pipeline.Enqueue(plain(10), {target});
+        resolvable(2, target);
+        resolvable(3, elsewhere);
+        waitResolved(4);
+        release.store(true);
+        pipeline.Drain(DrawPipeline::DrainReason::Flush);
+        check(probes[0]->resolves.load() == 1 && probes[1]->resolves.load() == 1, "a resolve with no item applied in between was re-run");
+        check(probes[2]->resolves.load() == 2, "a resolve whose range an earlier unapplied item wrote was not re-run");
+        check(probes[2]->lastResolveOnCommitter.load(), "the conflict re-resolve did not run on the committer");
+        check(probes[3]->resolves.load() == 1, "a resolve whose range nobody wrote was re-run");
+        const auto text = DrawPipeline::ResolveText();
+        check(text.find("conflicts 1,") != std::string::npos, "pipe_resolve_conflicts did not count exactly the one conflict: " + text);
+    }
+    std::lock_guard guard(orderMutex);
+    for (std::size_t i = 1; i < order.size(); ++i) {
+        if (order[i] >= 0 && order[i - 1] >= 0 && order[i] < 10 && order[i - 1] < 10) check(order[i] > order[i - 1], "commits ran out of order");
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         const auto mode = argc > 1 ? std::string_view(argv[1]) : std::string_view{};
@@ -240,6 +364,7 @@ int main(int argc, char** argv) {
         else if (mode == "--transition") Transition();
         else if (mode == "--keep-registers") Registers(true);
         else if (mode == "--registers-drain") Registers(false);
+        else if (mode.starts_with("--resolve")) Resolve(mode);
         else throw std::runtime_error("unknown mode");
         return 0;
     } catch (const std::exception& error) {
