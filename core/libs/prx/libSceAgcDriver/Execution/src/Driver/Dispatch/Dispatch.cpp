@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
@@ -965,18 +966,24 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 NoteCommit(commit);
             }
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+            // Stage 4 M4 (APS5_RESOLVE_CENSUS): the item's preamble, its preparation (resolve), its
+            // labels (apply) and its device call (proofs, refreshes and recording: not split).
+            Stage4::Mark(Stage4::Bucket::Pre);
             try {
                 std::shared_ptr<RecipeHit> recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(recipe, false);
                 std::shared_ptr<const Recipe> builtRecipe;
                 RecipeBuildFailure recipeFailure = RecipeBuildFailure::NotAttempted;
                 bool writersNoted = false;
+                Stage4::Mark(Stage4::Bucket::DispatchPrepare);
                 for (;;) {
                     std::shared_ptr<PreparedDispatch> prepared;
                     if (recipeHit == nullptr || VulkanDevice::VerifyRecipes() || htileClearCompletion.has_value()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots);
+                    Stage4::Mark(Stage4::Bucket::DispatchPrepare);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     Graphics::Recorder::ComputeSyncScope computeSyncScope(computeSync);
                     recordLabelsForPacket(localDevice.get(), queueId);
+                    Stage4::Mark(Stage4::Bucket::Labels);
                     if (noteWrites && writerKeyedEvidence() && !writersNoted) {
                         noteWrittenBuffers(address, queueId, compiledCommit);
                         writersNoted = true;
@@ -988,13 +995,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                             recipeHit = nullptr;
                             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
                             itemRebuilds.fetch_add(1, std::memory_order_relaxed);
+                            Stage4::Mark(Stage4::Bucket::DispatchDevice);
                             continue;
                         }
                     } else {
                         localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : &builtRecipe, htileClearCompletion, profile ? &recipeFailure : nullptr);
                     }
+                    Stage4::Mark(Stage4::Bucket::DispatchDevice);
                     break;
                 }
+                if (Stage4::ResolveCensus()) Stage4::NoteTemplate(keepVariant.get(), recipeHit == nullptr);
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
                 if (profile && recipeHit == nullptr) keepVariant->recipeFailure.store(recipeFailure, std::memory_order_relaxed);
                 if (builtRecipe != nullptr) {

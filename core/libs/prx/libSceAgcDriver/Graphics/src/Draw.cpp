@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -1373,6 +1374,13 @@ void markPhase(std::size_t drawPhase);
 void mark(StructCensus::ReuseStage stage);
 }
 
+// Stage 4 M4 (APS5_RESOLVE_CENSUS): the census bucket each DrawPhase's time goes to. Resolve-class:
+// validate, vertex (inputs/index), setup, lookup (template lookup/proof), resources, pipeline;
+// apply-class: readTarget and prepare (target bookkeeping), record, keep, sync, writeBack, describe.
+constexpr std::array<Stage4::Bucket, PhaseCount> Stage4PhaseBuckets{
+    Stage4::Bucket::Validate, Stage4::Bucket::Vertex, Stage4::Bucket::Setup, Stage4::Bucket::ReadTarget, Stage4::Bucket::Prepare, Stage4::Bucket::Lookup,
+    Stage4::Bucket::Resources, Stage4::Bucket::Pipeline, Stage4::Bucket::Record, Stage4::Bucket::Keep, Stage4::Bucket::Sync, Stage4::Bucket::WriteBack, Stage4::Bucket::Describe};
+
 struct DrawTimer {
     bool profile;
     std::chrono::steady_clock::time_point phaseStart;
@@ -1381,12 +1389,15 @@ struct DrawTimer {
     std::uint64_t heldStart;
     std::uint64_t phaseHeldStart;
     explicit DrawTimer(bool profile) : profile(profile), phaseStart(profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {
+        // The item's time before this draw's first phase (lock wait excluded by its own scope).
+        Stage4::Mark(Stage4::Bucket::Pre);
         if (!profile) return;
         heldNs.fill(0);
         heldStart = phaseHeldStart = GuestMemory::ThreadGpuHeldNs();
     }
     void phase(DrawPhase which) {
         reuseCensus::markPhase(which);
+        Stage4::Mark(Stage4PhaseBuckets[which]);
         if (!profile) return;
         const auto now = std::chrono::steady_clock::now();
         const auto held = GuestMemory::ThreadGpuHeldNs();
@@ -2827,7 +2838,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     recordPhase(RecordAccess);
     reuseCensus::mark(StructCensus::ReuseAccess);
+    // Stage 4 M4: PrepareDrawBindings is resolve-class work inside the record phase.
+    Stage4::Mark(Stage4::Bucket::Record);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    Stage4::Mark(Stage4::Bucket::Pdb);
     recordPhase(RecordBindings);
     reuseCensus::mark(StructCensus::ReuseBindings);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
@@ -3509,6 +3523,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     lookupDiag::mark(lookupDiag::StepTail);
     lookupDiag::finish(outcome.kind == KindTemplateHit);
     timer.phase(PhasePipeline);
+    if (Stage4::ResolveCensus()) Stage4::NoteTemplate(resolved.resources.get(), outcome.kind == KindBuild || outcome.kind == KindBda);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     return true;
 }
@@ -3894,6 +3909,11 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 }
 
 DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery) {
+    // Stage 4 M4: the committer's unlocked preparation (precollects, template find, target proofs).
+    Stage4::Mark(Stage4::Bucket::Pre);
+    struct Stage4Prelock {
+        ~Stage4Prelock() { Stage4::Mark(Stage4::Bucket::Prelock); }
+    } stage4Prelock;
     const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Prelock);
     DrawPreparation prepared;
     if (!DrawPrelockEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return prepared;
@@ -4078,6 +4098,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);
+    if (Stage4::ResolveCensus()) Stage4::NoteTemplate(resources.get(), false);
     outcome.completion = resources->ChecksFaults();
     outcome.recorded = true;
     // The pipeline is the recipe's while the pipeline store still holds it (its device's teardown

@@ -807,8 +807,13 @@ void DrawPipeline::run() {
             kind = items.front().kind;
             enqueuedNs = items.front().enqueuedNs;
             enqueueClock = items.front().enqueueClock;
+            if (Stage4::ResolveCensus()) {
+                stage4Reads.assign(items.front().reads.begin(), items.front().reads.end());
+                stage4Writes.assign(items.front().writes.begin(), items.front().writes.end());
+            }
         }
         stage4Idle.reset();
+        if (Stage4::ResolveCensus()) Stage4::BeginItem(static_cast<std::uint8_t>(kind), stage4Reads, stage4Writes, Graphics::StorageTexture::PendingSerial());
         const auto start = std::chrono::steady_clock::now();
         if (idleBefore) {
             const auto idleNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - idleStart).count());
@@ -833,6 +838,7 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        if (Stage4::ResolveCensus()) Stage4::EndItem(Graphics::StorageTexture::PendingSerial(), !isDraw);
         if (enqueuedNs != 0) countAheadWindow(enqueuedNs, enqueueClock, start);
         if (fatal != nullptr && !stopped) {
             stopped = true;

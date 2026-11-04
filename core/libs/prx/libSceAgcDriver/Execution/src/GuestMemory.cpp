@@ -2901,6 +2901,7 @@ StableFailedCollectCounters& counters() {
 
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery, const std::source_location& site) {
     const census::Scope censusScope(memoized ? "collect" : "collect_uncached", &site);
+    const Stage4::TrackerScope stage4Scope(false, address, bytes);
     const aheadCensus::Scope aheadScope(committerThread && memoized && aheadCensus::enabled());
     committerCensus::Call committerCall(committerThread && committerCensus::enabled(), site, memoized);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
@@ -3693,6 +3694,7 @@ bool lockedUnchangedSince(const WriteTracker& tracker, std::uint64_t address, st
 }
 
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
+    const Stage4::TrackerScope stage4Scope(false, address, bytes);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
     if (lockFree(tracker)) {
@@ -3778,6 +3780,8 @@ FastAnswer fastUnchangedAll(const WriteTracker& tracker, std::span<const Unchang
 }
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries, std::source_location site) {
+    Stage4::TrackerScope stage4Scope(false, 0, 0);
+    if (Stage4::ResolveCensus()) for (const auto& query : queries) stage4Scope.AddRead(query.address, query.bytes);
     auto& tracker = Tracker();
     if (lockFree(tracker)) {
         if (const auto fast = fastUnchangedAll(tracker, queries); fast != FastAnswer::Inconclusive) {
@@ -3804,6 +3808,8 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries, std::source_loca
 bool UnchangedSinceClean(std::span<const UnchangedQuery> queries, std::source_location site) {
 #ifdef _WIN32
     const census::Scope censusScope("unchanged_clean", &site);
+    Stage4::TrackerScope stage4Scope(false, 0, 0);
+    if (Stage4::ResolveCensus()) for (const auto& query : queries) stage4Scope.AddRead(query.address, query.bytes);
     if (queries.empty()) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
@@ -4261,6 +4267,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes, std::sourc
 
 bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
     const census::Scope censusScope("unchanged_since_collected", &site);
+    const Stage4::TrackerScope stage4Scope(false, address, bytes);
     if (CollectWritesUncached(address, bytes) == 0) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
@@ -4348,6 +4355,7 @@ FastAnswer fastChangedBlocks(const WriteTracker& tracker, std::uint64_t address,
 }
 
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu, std::source_location site) {
+    const Stage4::TrackerScope stage4Scope(false, address, bytes);
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
     auto& tracker = Tracker();
@@ -4412,6 +4420,7 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
 }
 
 bool ChangedPages(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs) {
+    const Stage4::TrackerScope stage4Scope(false, address, bytes);
     runs.clear();
     if (bytes == 0 || generation == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
