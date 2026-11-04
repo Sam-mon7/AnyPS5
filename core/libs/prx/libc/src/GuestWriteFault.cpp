@@ -884,6 +884,17 @@ void GuestWtFaultCounters_nid_no_patch(WtFaultCounters* out) {
     out->queries = c.queries.load(std::memory_order_relaxed);
 }
 
+bool GuestWtFaultSyncedClean_nid_no_patch(std::uintptr_t address) {
+    if (!g_enabled.load(std::memory_order_acquire)) return false;
+    const auto& state = *g_state;
+    if (address < state.base || address >= state.end) return false;
+    auto* leaf = leafAt(state, address);
+    if (leaf == nullptr) return false;
+    const auto index = (address >> PageShift) & (LeafPages - 1);
+    const auto word = leaf->words[index].load(std::memory_order_acquire);
+    return stateOf(word) == WtFaultArmed && stampOf(word) <= std::max(leaf->leafReset.load(std::memory_order_acquire), leaf->resets[index].load(std::memory_order_acquire));
+}
+
 std::uint64_t GuestWtFaultWord_nid_no_patch(std::uintptr_t address) {
     if (!g_enabled.load(std::memory_order_acquire)) return 0;
     const auto& state = *g_state;
@@ -923,6 +934,7 @@ unsigned long GuestWtFaultGuestProtection_nid_no_patch(std::uintptr_t, std::size
 bool GuestWtFaultProtects_nid_no_patch(std::uintptr_t, std::size_t) { return false; }
 void GuestWtFaultCounters_nid_no_patch(WtFaultCounters* counters) { *counters = {}; }
 std::uint64_t GuestWtFaultWord_nid_no_patch(std::uintptr_t) { return 0; }
+bool GuestWtFaultSyncedClean_nid_no_patch(std::uintptr_t) { return false; }
 
 #endif
 

@@ -2290,11 +2290,40 @@ void noteDriverStoreGen(std::uint64_t begin, std::uint64_t end, std::uint64_t ge
     if (end > begin && Gen::Active()) static_cast<void>(Gen::Note(Gen::Event::DriverStore, begin, end, Gen::Data, generation));
 }
 
+namespace stampTrace {
+thread_local const void* walkCaller = nullptr;
+thread_local int walkTag = 0;
+std::pair<std::uint64_t, std::uint64_t> range() {
+    static const auto parsed = [] {
+        const char* text = std::getenv("APS5_WT_TRACE_RANGE");
+        std::pair<std::uint64_t, std::uint64_t> value{0, 0};
+        if (text == nullptr) return value;
+        char* rest = nullptr;
+        value.first = std::strtoull(text, &rest, 16);
+        if (rest != nullptr && *rest == ':') value.second = std::strtoull(rest + 1, nullptr, 16);
+        return value;
+    }();
+    return parsed;
+}
+void note(const char* what, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, int kind) {
+    const auto [first, stop] = range();
+    if (stop <= first || end <= first || begin >= stop) return;
+    std::fprintf(stderr, "[wt-trace] %s 0x%llx..0x%llx gen %llu kind %d tag %d caller +0x%llx thread %lu\n", what, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(generation), kind, walkTag,
+                 walkCaller != nullptr ? ModuleOffset(walkCaller) : 0ull,
+#ifdef _WIN32
+                 static_cast<unsigned long>(GetCurrentThreadId()));
+#else
+                 0ul);
+#endif
+}
+}
+
 void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     auto& runs = *static_cast<StampRuns*>(context);
     auto& tracker = runs.tracker;
     const auto kind = runs.kind;
     if (end <= begin) return;
+    stampTrace::note("stamp", begin, end, tracker.generation.load(std::memory_order_relaxed), static_cast<int>(kind));
     ++runs.stamped;
     // Stage 4 M3 (APS5_WT_FAULT_CENSUS): every dirty page the OS reported, whoever stored it.
     Stage4::NoteCollectedPages(begin, end);
@@ -2430,6 +2459,12 @@ bool faultSync(StampRuns& runs, std::uint64_t first, std::uint64_t stop, std::ui
         c.consumerFallback.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    const auto savedTag = stampTrace::walkTag;
+    stampTrace::walkTag = 3;
+    struct TagRestore {
+        int saved;
+        ~TagRestore() { stampTrace::walkTag = saved; }
+    } tagRestore{savedTag};
     for (std::size_t i = 0; i < openCount; ++i) {
         if (!collectWindowsWrites(runs, open[2 * i], open[2 * i + 1], false)) {
             c.consumerFallback.fetch_add(1, std::memory_order_relaxed);
@@ -2441,6 +2476,32 @@ bool faultSync(StampRuns& runs, std::uint64_t first, std::uint64_t stop, std::ui
         stampWrittenRun(&runs, page, page + WritePageBytes);
     }
     (dirtyCount != 0 || runs.stamped != 0 ? c.consumerChanged : c.consumerUnchanged).fetch_add(1, std::memory_order_relaxed);
+    static const bool syncCheck = [] {
+        const char* text = std::getenv("APS5_WT_FAULT_SYNC_CHECK");
+        return text != nullptr && text[0] == '1';
+    }();
+    if (syncCheck) {
+        static std::vector<void*> written(4096);
+        static std::atomic<std::uint64_t> checks{0}, misses{0};
+        for (auto cursor = first; cursor < stop;) {
+            ULONG_PTR count = written.size();
+            DWORD granularity = 0;
+            if (GetWriteWatch(0, reinterpret_cast<void*>(cursor), static_cast<SIZE_T>(stop - cursor), written.data(), &count, &granularity) != 0) break;
+            for (ULONG_PTR i = 0; i < count; ++i) {
+                const auto page = reinterpret_cast<std::uintptr_t>(written[i]);
+                if (!GuestArena::GuestWtFaultSyncedClean_nid_no_patch(page)) continue;
+                const auto missed = misses.fetch_add(1, std::memory_order_relaxed);
+                if (missed < 32) {
+                    const auto word = GuestArena::GuestWtFaultWord_nid_no_patch(page);
+                    std::fprintf(stderr, "[wt-fault] SYNC MISS: page 0x%llx is dirty but armed no later than its last sync; stamp %llu walk clock %llu range 0x%llx..0x%llx\n", static_cast<unsigned long long>(page),
+                                 static_cast<unsigned long long>(word >> GuestArena::WtFaultStampShift), static_cast<unsigned long long>(walkClock), static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop));
+                }
+            }
+            if (count < written.size()) break;
+            cursor = reinterpret_cast<std::uintptr_t>(written[count - 1]) + WritePageBytes;
+        }
+        if (checks.fetch_add(1, std::memory_order_relaxed) % 20000 == 19999) std::fprintf(stderr, "[wt-fault] sync check: %llu syncs checked, %llu misses\n", static_cast<unsigned long long>(checks.load()), static_cast<unsigned long long>(misses.load()));
+    }
     if (wtFault::verifyOn()) {
         std::vector<void*> reported;
         StampRuns check{runs.tracker, runs.kind, 0, nullptr, &reported};
@@ -2466,6 +2527,13 @@ bool faultSync(StampRuns& runs, std::uint64_t first, std::uint64_t stop, std::ui
 #endif
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool memoVirtualQuery = false, std::uint64_t* stamped = nullptr, bool osWalk = false) {
+    struct CallerScope {
+        const void* saved = stampTrace::walkCaller;
+        explicit CallerScope(const void* caller) {
+            if (saved == nullptr) stampTrace::walkCaller = caller;
+        }
+        ~CallerScope() { stampTrace::walkCaller = saved; }
+    } callerScope{__builtin_return_address(0)};
     tracker.bump();
     // APS5_ARCHB_WT_FAULT: the walked pages become candidates of the fault tracker (the next flip
     // protects them); VERIFY checks the walk's dirty pages against the fault states. The walk's clock
@@ -3568,21 +3636,25 @@ void WtFaultFlip(bool presenter) {
     if (walkArmed && armed != 0) {
         const auto walkStart = std::chrono::steady_clock::now();
         auto& tracker = Tracker();
+        stampTrace::walkTag = 1;
         for (std::size_t i = 0; i < armed && i < ArmedRuns; ++i) {
             const auto lock = lockTracker(tracker);
             walkWrites(tracker, runs[2 * i], runs[2 * i + 1], StampKind::Cpu, false, nullptr, false, nullptr, true);
         }
+        stampTrace::walkTag = 0;
         wc.armedWalkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
     }
     if (dirtyCount != 0) {
         const auto walkStart = std::chrono::steady_clock::now();
         auto& tracker = Tracker();
         wtFault::flipDirtyWalk = true;
+        stampTrace::walkTag = 2;
         for (std::size_t i = 0; i < dirtyCount; ++i) {
             const auto lock = lockTracker(tracker);
             walkWrites(tracker, dirtyRuns[2 * i], dirtyRuns[2 * i + 1], StampKind::Cpu, false, nullptr, false, nullptr, true);
         }
         wtFault::flipDirtyWalk = false;
+        stampTrace::walkTag = 0;
         wc.dirtyWalks.fetch_add(dirtyCount, std::memory_order_relaxed);
         wc.dirtyWalkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
     }
@@ -4359,6 +4431,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         tracker.bump();
+        stampTrace::note("store-own", stored.first, stored.second, tracker.generation.load(std::memory_order_relaxed), -1);
         noteDriverStoreGen(stored.first, stored.second, tracker.generation.load(std::memory_order_relaxed));
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
             tracker.noteUnstampedStore(stored.first, stored.second);
@@ -4438,6 +4511,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
     }
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
+    stampTrace::note("mark-written", address, address + bytes, tracker.generation.load(std::memory_order_relaxed), complete ? -2 : -3);
     noteDriverStoreGen(address, address + bytes, tracker.generation.load(std::memory_order_relaxed));
     for (auto block = first; block <= last; ++block) {
         tracker.stamp(block, tracker.generation, StampKind::Driver);

@@ -144,6 +144,8 @@ bool GuestWtFaultProtects_nid_no_patch(std::uintptr_t address, std::size_t bytes
 void GuestWtFaultCounters_nid_no_patch(WtFaultCounters* counters);
 // Test support: the raw state word of a page (0 when untracked).
 std::uint64_t GuestWtFaultWord_nid_no_patch(std::uintptr_t address);
+// Diagnostics: whether a sync would skip the page now (armed no later than its last sync).
+bool GuestWtFaultSyncedClean_nid_no_patch(std::uintptr_t address);
 
 }
 
