@@ -2976,6 +2976,44 @@ void CheckCollectShare(std::wstring_view mode) {
 // original memo; an epoch boundary (a submission, a CPU-satisfiable label wait, a drain or a reap all
 // call BumpCollectEpoch) always forces a fresh walk; unwatching, remapping and decommitting retire
 // the cached answer; the generation a hit returns is the tracker's current one.
+void CheckPageStateMemo() {
+    using Recorder = AgcDriver::ArchB::Recorder;
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    Switches::Initialize();
+    Require(Switches::Enabled(Feature::PageStateMemo), "the page-state memo switch is off");
+    Recorder::Boundary(true, 0, Recorder::Clock::now());
+    constexpr std::size_t Page = 4096;
+    PartlyCommitted range;
+    const auto at = range.Address();
+    const auto whole = [&](std::uint64_t address, std::size_t bytes) {
+        const auto runs = CommittedRanges(address, bytes);
+        return runs.size() == 1 && runs[0].first == address && runs[0].second == address + bytes;
+    };
+    range.Commit(1);
+    for (int pass = 0; pass < 600; ++pass) {
+        Require(whole(at + Block, Block), "a committed block lost its run");
+        Require(whole(at + Block + 3, 5 * Page + 1), "an unaligned committed range lost its run");
+        Require(Accessible(reinterpret_cast<const void*>(at + Block + 8), 64, true), "a committed range is not accessible");
+        Require(CommittedRanges(at, Block).empty(), "a reserved block has a committed run");
+    }
+    range.Decommit(1);
+    Require(CommittedRanges(at + Block, Block).empty(), "a decommitted block kept its memoized run");
+    Require(!Accessible(reinterpret_cast<const void*>(at + Block + 8), 64, false), "a decommitted range stayed accessible");
+    range.Commit(1);
+    Require(whole(at + Block, Block), "a recommitted block has no run");
+    range.Commit(2);
+    Require(whole(at + Block, 2 * Block), "two committed blocks are not one run");
+    range.Decommit(2);
+    const auto runs = CommittedRanges(at + Block, 2 * Block);
+    Require(runs.size() == 1 && runs[0].first == at + Block && runs[0].second == at + 2 * Block, "a partly decommitted range kept its memoized run");
+    Require(whole(at + Block, Block), "the remaining block lost its run");
+    std::map<std::string, double> totals;
+    for (const auto& [name, value] : Recorder::Collect(Recorder::Clock::now()).counters) totals[name] += value;
+    Require(totals["page_memo_hits"] >= 256, "the page-state memo did not answer repeated ranges");
+    std::cout << "page-state memo test passed (" << totals["page_memo_hits"] << " hits, " << totals["page_memo_misses"] << " misses)\n";
+}
+
 void CheckWriteTrackingBookkeeping(std::wstring_view mode) {
     using Recorder = AgcDriver::ArchB::Recorder;
     using AgcDriver::ArchB::Feature;
@@ -3681,6 +3719,10 @@ int main(int argc, char** argv) {
             Require(WriteWatched(), "the collect-share test needs write watching");
             CheckCollectShare(command.substr(share + 16));
             std::cout << "collect-share test passed\n";
+            return 0;
+        }
+        if (command.rfind(L"--page-state-memo") != std::wstring_view::npos) {
+            CheckPageStateMemo();
             return 0;
         }
         const auto bookkeeping = command.rfind(L"--wt-bookkeeping-");

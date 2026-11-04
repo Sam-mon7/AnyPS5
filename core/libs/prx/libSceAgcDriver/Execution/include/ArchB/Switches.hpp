@@ -66,6 +66,7 @@ enum class Feature : std::uint8_t {
     PipeResolvePool,
     PipeResolveProofs,
     PipeResolveHandoff,
+    PageStateMemo,
     Count
 };
 

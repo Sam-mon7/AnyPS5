@@ -1149,6 +1149,16 @@ if(BUILD_TESTING)
                 ENVIRONMENT "APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING=1;APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING=1"
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endforeach()
+        add_test(NAME agc_archb_page_state_memo COMMAND agc_write_tracking_tests --page-state-memo)
+        set_tests_properties(agc_archb_page_state_memo PROPERTIES TIMEOUT 60
+            ENVIRONMENT "APS5_ARCHB_PAGE_STATE_MEMO=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        foreach(bookkeepingCase IN ITEMS runs remap regions)
+            add_test(NAME agc_archb_page_state_memo_bookkeeping_${bookkeepingCase} COMMAND agc_write_tracking_tests --wt-bookkeeping-${bookkeepingCase})
+            set_tests_properties(agc_archb_page_state_memo_bookkeeping_${bookkeepingCase} PROPERTIES TIMEOUT 60
+                ENVIRONMENT "APS5_ARCHB_FIX_WRITE_TRACKING_BOOKKEEPING=1;APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING=1;APS5_ARCHB_PAGE_STATE_MEMO=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endforeach()
         # APS5_ARCHB_PIPE_COLLECT_SHARE: committer collects answered from queue 0's walks of the same
         # ordering point only (on), walked but counted (verify, with a mismatch), never (off).
         foreach(shareMode IN ITEMS on verify off)

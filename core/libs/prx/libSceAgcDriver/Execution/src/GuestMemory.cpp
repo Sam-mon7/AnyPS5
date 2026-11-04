@@ -108,7 +108,10 @@ void mismatch(const char* what) {
 
 #ifdef _WIN32
 bool hostRegionOverlaps(std::uintptr_t address, std::size_t bytes) {
-    if (!active()) return GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes);
+    if (!active()) {
+        if (ArchB::Switches::Enabled(ArchB::Feature::PageStateMemo)) return GuestArena::GuestArenaHostRegionOverlapsSorted_nid_no_patch(address, bytes);
+        return GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes);
+    }
     const bool sorted = GuestArena::GuestArenaHostRegionOverlapsSorted_nid_no_patch(address, bytes);
     count(Regions);
     if (!verify()) return sorted;
@@ -752,6 +755,86 @@ struct PageRun {
 };
 
 
+// APS5_ARCHB_PAGE_STATE_MEMO: a range whose cached page states form one known run answers the same
+// run until a page state is forgotten (ForgetPages, ForgetInaccessiblePages) or the allocation
+// registry changes, so the per-page scan is not repeated for it. Per thread, exact ranges.
+namespace pageMemo {
+struct Entry {
+    std::uintptr_t address = 0;
+    std::uintptr_t end = 0;
+    std::uint64_t forget = 0;
+    std::uint64_t access = 0;
+    std::uint64_t mapping = 0;
+    std::uint8_t value = 0;
+};
+
+struct Cache {
+    static constexpr std::size_t Entries = 1024;
+    std::array<Entry, Entries> entries{};
+    std::uint32_t hits = 0;
+    std::uint32_t misses = 0;
+};
+
+struct Serials {
+    std::uint64_t forget;
+    std::uint64_t access;
+    std::uint64_t mapping;
+    bool operator==(const Serials&) const = default;
+};
+
+struct Counters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+};
+
+Counters& counters() {
+    static Counters* const made = [] {
+        auto* created = new Counters();
+        ArchB::Recorder::RegisterCounter("page_memo_hits", created->hits);
+        ArchB::Recorder::RegisterCounter("page_memo_misses", created->misses);
+        return created;
+    }();
+    return *made;
+}
+
+bool active() {
+    return ArchB::Switches::Enabled(ArchB::Feature::PageStateMemo);
+}
+
+Cache& cache() {
+    struct Slot {};
+    auto* found = HostThreadSlot<Cache*, Slot>::Get();
+    if (found == nullptr) {
+        ShaderRecompiler::ThreadOwned(found);
+        HostThreadSlot<Cache*, Slot>::Set(found);
+        static_cast<void>(counters());
+    }
+    return *found;
+}
+
+Entry& slot(Cache& table, std::uintptr_t address, std::uintptr_t end) {
+    auto key = (address >> 6) * 0x9e3779b97f4a7c15ull ^ (end >> 6) * 0xc2b2ae3d27d4eb4full;
+    key ^= key >> 31;
+    return table.entries[static_cast<std::size_t>(key % Cache::Entries)];
+}
+
+Serials read(const PageStates& pages) {
+    return {forgetSerial.load(std::memory_order_acquire), pages.accessSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
+}
+
+void countHit(Cache& table) {
+    if (++table.hits < 256) return;
+    counters().hits.fetch_add(table.hits, std::memory_order_relaxed);
+    table.hits = 0;
+}
+
+void countMiss(Cache& table) {
+    if (++table.misses < 256) return;
+    counters().misses.fetch_add(table.misses, std::memory_order_relaxed);
+    table.misses = 0;
+}
+}
+
 // Calls `emit` with consecutive runs of uniform accessibility covering [address, address + bytes) in
 // order, stopping early when it returns false. Returns false when the address space cannot be queried.
 template <class Emit>
@@ -760,11 +843,28 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
     pages.initialize();
     const auto end = address + bytes;
     auto cursor = address;
+    pageMemo::Cache* memo = nullptr;
+    pageMemo::Serials serials{};
+    if (bytes != 0 && pageMemo::active()) {
+        memo = &pageMemo::cache();
+        serials = pageMemo::read(pages);
+        const auto& entry = pageMemo::slot(*memo, address, end);
+        if ((serials.forget & 1u) == 0 && entry.value != 0 && entry.address == address && entry.end == end && entry.forget == serials.forget && entry.access == serials.access && entry.mapping == serials.mapping) {
+            pageMemo::countHit(*memo);
+            static_cast<void>(emit(PageRun{address, end, (entry.value & PageReadable) != 0, (entry.value & PageWritable) != 0}));
+            return true;
+        }
+        pageMemo::countMiss(*memo);
+    }
     while (cursor < end) {
         if (const auto* span = pages.spanOf(cursor)) {
             const auto value = span->load(cursor);
             if (value != 0) {
                 const auto next = span->runEnd(cursor, value, end);
+                if (memo != nullptr && cursor == address && next == end && (serials.forget & 1u) == 0 && pageMemo::read(pages) == serials) {
+                    auto& entry = pageMemo::slot(*memo, address, end);
+                    entry = {address, end, serials.forget, serials.access, serials.mapping, value};
+                }
                 if (!emit(PageRun{cursor, next, (value & PageReadable) != 0, (value & PageWritable) != 0})) return true;
                 cursor = next;
                 continue;
