@@ -54,6 +54,7 @@ constexpr Feature PipeResolvePoolPrerequisites[] = {Feature::PipeQ0Committer, Fe
 constexpr Feature PrelockStampSkipPrerequisites[] = {Feature::WtFault, Feature::PipeResolveProofs};
 constexpr Feature ArchcImageEpochsPrerequisites[] = {Feature::WtFault, Feature::WtFaultConsumers};
 constexpr Feature ArchcTargetFastpathPrerequisites[] = {Feature::ArchcImageEpochs};
+constexpr Feature CLazyPublishPrerequisites[] = {Feature::WtFault, Feature::WtFaultConsumers};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -142,6 +143,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::CGpuStagingCarry, "C_GPU_STAGING_CARRY", false, true, {}},
     {Feature::ArchcImageEpochs, "C_IMAGE_EPOCHS", false, true, ArchcImageEpochsPrerequisites},
     {Feature::ArchcTargetFastpath, "C_TARGET_FASTPATH", false, true, ArchcTargetFastpathPrerequisites},
+    {Feature::CLazyPublish, "C_LAZY_PUBLISH", false, true, CLazyPublishPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

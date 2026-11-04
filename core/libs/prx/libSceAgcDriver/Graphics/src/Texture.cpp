@@ -46,6 +46,7 @@
 #include <unordered_map>
 #include <utility>
 #include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LazyPublish.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 
 namespace AgcDriver::Graphics {
@@ -4927,7 +4928,11 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
             if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
     }
-    for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
+    ArchC::LazyPublish::BeforeLabelStores();
+    for (const auto& [address, bytes] : ranges) {
+        if (ArchC::LazyPublish::DeferLabelStore(address, bytes)) continue;
+        if (FlushPending(address, bytes, nullptr, reason) && census.on) ArchC::LazyCensus::LabelStored(GuestMemory::GpuLockThreadTag() == 0);
+    }
 }
 
 std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
@@ -4971,6 +4976,14 @@ std::size_t StorageTexture::StoreDrawnLinearTouching(const char* reason, const s
         if (FlushPending(address, bytes, nullptr, reason)) ++stored;
     }
     return stored;
+}
+
+bool StorageTexture::PendingStoreInside(std::uint64_t address, std::size_t bytes) {
+    auto& pending = Pending();
+    if (pending.flushingCount.load(std::memory_order_acquire) != 0) return true;
+    if (pending.textures.SurelyClear(address, bytes)) return false;
+    std::lock_guard lock(pending.mutex);
+    return pending.textures.MayOverlap(address, bytes) && std::any_of(pending.textures.begin(), pending.textures.end(), [&](const StorageTexture* texture) { return texture->overlaps(address, bytes) && texture->pendingUnitInside(address, bytes); });
 }
 
 bool StorageTexture::AnyPending() {
@@ -6398,7 +6411,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         lastStored = std::max(lastStored, layerBegin(layer) + layerBytes(layer));
     }
     if (lastStored <= firstStored) return;
-    ArchC::LazyCensus::Published(firstStored, lastStored, ArchC::LazyCensus::Kind::WriteBack, static_cast<std::uint8_t>(PublishReasonFor(flushReason)));
+    ArchC::LazyCensus::Published(firstStored, lastStored, ArchC::LazyCensus::Kind::WriteBack, ArchC::LazyCensus::ReasonFor(flushReason));
     constexpr std::uint64_t block = 65536;
     const auto spanBegin = firstStored & ~(block - 1);
     const auto spanBlocks = static_cast<std::size_t>((lastStored - spanBegin + block - 1) / block);

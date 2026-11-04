@@ -79,6 +79,7 @@ enum class Feature : std::uint8_t {
     CGpuStagingCarry,
     ArchcImageEpochs,
     ArchcTargetFastpath,
+    CLazyPublish,
     Count
 };
 

@@ -359,6 +359,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ImageEpochs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LazyCensus.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LazyPublish.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/SampleOrder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BarrierBatch.cpp
@@ -2775,6 +2776,21 @@ if(BUILD_TESTING)
     set_tests_properties(agc_archc_target_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_IMAGE_EPOCHS=1;APS5_ARCHB_C_TARGET_FASTPATH=1;APS5_ARCHB_C_TARGET_FASTPATH_VERIFY=1")
     if(WIN32)
         set_tests_properties(agc_archc_target_verify PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    foreach(archcLazy read write locked host_write)
+        add_test(NAME agc_archc_lazy_${archcLazy} COMMAND agc_driver_recorder_tests --archc-lazy ${archcLazy})
+        add_test(NAME agc_archc_lazy_${archcLazy}_off COMMAND agc_driver_recorder_tests --archc-lazy ${archcLazy})
+        set_tests_properties(agc_archc_lazy_${archcLazy} PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_LAZY_PUBLISH=1;APS5_WT_FAULT_GUEST_HOT=0")
+        set_tests_properties(agc_archc_lazy_${archcLazy}_off PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_LAZY_PUBLISH=0;APS5_WT_FAULT_GUEST_HOT=0")
+        set_tests_properties(agc_archc_lazy_${archcLazy} agc_archc_lazy_${archcLazy}_off PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archc_lazy_${archcLazy} agc_archc_lazy_${archcLazy}_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    add_test(NAME agc_archc_lazy_verify COMMAND agc_driver_recorder_tests --archc-lazy read)
+    set_tests_properties(agc_archc_lazy_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_LAZY_PUBLISH=1;APS5_ARCHB_C_LAZY_PUBLISH_VERIFY=1;APS5_WT_FAULT_GUEST_HOT=0")
+    if(WIN32)
+        set_tests_properties(agc_archc_lazy_verify PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_vertex_target_range_copied COMMAND agc_driver_recorder_tests --vertex-target-range-copied)
     add_test(NAME agc_driver_vertex_target_range_imported COMMAND agc_driver_recorder_tests --vertex-target-range-imported)

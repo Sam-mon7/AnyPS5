@@ -37,6 +37,7 @@ struct Leaf {
     std::atomic<std::uint64_t> stored[LeafPages / 64];
     std::atomic<std::uint64_t> storedLast[LeafPages / 64];
     std::atomic<std::uint64_t> watch[LeafPages / 64];
+    std::atomic<std::uint64_t> lazy[LeafPages / 64];
     // Hint: may hold open pages (an arm scans the leaf). Set by every transition to Open.
     std::atomic<std::uint32_t> open{0};
     // Pages not armed (any state but Armed): 0 with `newest` at most a clock answers a whole leaf.
@@ -149,9 +150,21 @@ bool watchedPage(const Leaf& leaf, std::uintptr_t page) {
     return ((leaf.watch[index / 64].load(std::memory_order_acquire) >> (index % 64)) & 1) != 0;
 }
 
+struct LazyServiceTag {};
+using LazyServiceDepth = HostThreadSlot<std::uintptr_t, LazyServiceTag>;
+std::atomic<void (*)(std::uintptr_t, bool)> g_lazyService{nullptr};
+std::atomic<std::uint64_t> g_lazyServices{0};
+std::atomic<std::uint64_t> g_lazyNested{0};
+
+bool lazyPage(const Leaf& leaf, std::uintptr_t page) {
+    const auto index = (page >> PageShift) & (LeafPages - 1);
+    return ((leaf.lazy[index / 64].load(std::memory_order_acquire) >> (index % 64)) & 1) != 0;
+}
+
 bool clearWatch(Leaf& leaf, std::uintptr_t page) {
     const auto index = (page >> PageShift) & (LeafPages - 1);
     const auto bit = std::uint64_t{1} << (index % 64);
+    leaf.lazy[index / 64].fetch_and(~bit, std::memory_order_acq_rel);
     if ((leaf.watch[index / 64].fetch_and(~bit, std::memory_order_acq_rel) & bit) == 0) return false;
     g_watchedPages.fetch_sub(1, std::memory_order_relaxed);
     return true;
@@ -217,6 +230,7 @@ Leaf& leafFor(State& state, std::uintptr_t address) {
     for (auto& bits : leaf->stored) bits.store(0, std::memory_order_relaxed);
     for (auto& bits : leaf->storedLast) bits.store(0, std::memory_order_relaxed);
     for (auto& bits : leaf->watch) bits.store(0, std::memory_order_relaxed);
+    for (auto& bits : leaf->lazy) bits.store(0, std::memory_order_relaxed);
     leaf->base = state.base + (((address - state.base) >> LeafShift) << LeafShift);
     leaf->next = state.allocated;
     state.allocated = leaf;
@@ -437,6 +451,7 @@ void GuestWtFaultEnable_nid_no_patch(bool verify, std::uint64_t clockAbove) {
         state->ticksToNs = 1e9 / static_cast<double>(frequency.QuadPart);
         // The thread slot's TLS index is allocated here, never inside the handler.
         static_cast<void>(DriverThread::Get());
+        static_cast<void>(LazyServiceDepth::Get());
         g_state = state;
         g_enabled.store(true, std::memory_order_release);
     });
@@ -450,6 +465,21 @@ void GuestWtFaultMarkDriverThread_nid_no_patch() {
     if (g_enabled.load(std::memory_order_acquire)) DriverThread::Set(1);
 }
 
+bool serveLazy(Leaf& leaf, std::uintptr_t page, bool write) {
+    if (!lazyPage(leaf, page)) return false;
+    const auto service = g_lazyService.load(std::memory_order_acquire);
+    if (service == nullptr) return false;
+    if (LazyServiceDepth::Get() != 0) {
+        g_lazyNested.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    LazyServiceDepth::Set(1);
+    service(page, write);
+    LazyServiceDepth::Set(0);
+    g_lazyServices.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 bool GuestWtFaultHandle_nid_no_patch(std::uintptr_t address) {
     if (!g_enabled.load(std::memory_order_acquire)) return false;
     auto& state = *g_state;
@@ -458,6 +488,7 @@ bool GuestWtFaultHandle_nid_no_patch(std::uintptr_t address) {
     if (leaf == nullptr) return false;
     const auto start = ticks();
     const auto page = address & ~(PageBytes - 1);
+    if (serveLazy(*leaf, page, true)) return true;
     auto& word = wordOf(*leaf, page);
     bool waited = false;
     for (unsigned spins = 0;; ++spins) {
@@ -1217,7 +1248,7 @@ bool GuestWtFaultStoredLastFrame_nid_no_patch(std::uintptr_t address) {
     return ((leaf->storedLast[index / 64].load(std::memory_order_acquire) >> (index % 64)) & 1) != 0;
 }
 
-std::size_t GuestWtFaultWatch_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* causes) {
     if (!g_enabled.load(std::memory_order_acquire)) return 0;
     auto& state = *g_state;
     std::uintptr_t first = 0;
@@ -1226,18 +1257,52 @@ std::size_t GuestWtFaultWatch_nid_no_patch(std::uintptr_t address, std::size_t b
     std::lock_guard lock(state.mutex);
     g_watchEver.store(true, std::memory_order_release);
     std::vector<WatchClaim> claims;
+    const auto skip = [&](std::size_t cause, std::uint64_t pages) {
+        if (causes != nullptr) causes[cause] += pages;
+    };
     for (auto page = first; page < stop; page += PageBytes) {
         auto* leaf = leafAt(state, page);
         if (leaf == nullptr) {
-            page = std::min(stop, state.base + ((((page - state.base) >> LeafShift) + 1) << LeafShift)) - PageBytes;
+            const auto next = std::min(stop, state.base + ((((page - state.base) >> LeafShift) + 1) << LeafShift));
+            skip(WtWatchSkipNoLeaf, (next - page) / PageBytes);
+            page = next - PageBytes;
             continue;
         }
-        if (watchedPage(*leaf, page) || heldPage(state, page)) continue;
+        if (watchedPage(*leaf, page)) {
+            skip(WtWatchSkipWatched, 1);
+            continue;
+        }
+        if (heldPage(state, page)) {
+            skip(WtWatchSkipHeld, 1);
+            continue;
+        }
         auto& word = wordOf(*leaf, page);
         auto value = word.load(std::memory_order_acquire);
         const auto current = stateOf(value);
-        if ((current != WtFaultArmed && current != WtFaultOpen) || (value & WtFaultCheckedBit) == 0 || isExec(value)) continue;
-        if (!word.compare_exchange_strong(value, (value & ~WtFaultStateMask) | WtFaultOpening, std::memory_order_acq_rel)) continue;
+        if (current == WtFaultUntracked) {
+            skip(WtWatchSkipUntracked, 1);
+            continue;
+        }
+        if (current == WtFaultExcluded) {
+            skip(WtWatchSkipExcluded, 1);
+            continue;
+        }
+        if (current != WtFaultArmed && current != WtFaultOpen) {
+            skip(WtWatchSkipBusy, 1);
+            continue;
+        }
+        if ((value & WtFaultCheckedBit) == 0) {
+            skip(WtWatchSkipUnchecked, 1);
+            continue;
+        }
+        if (isExec(value)) {
+            skip(WtWatchSkipExec, 1);
+            continue;
+        }
+        if (!word.compare_exchange_strong(value, (value & ~WtFaultStateMask) | WtFaultOpening, std::memory_order_acq_rel)) {
+            skip(WtWatchSkipBusy, 1);
+            continue;
+        }
         if (current == WtFaultArmed) leaf->notArmed.fetch_add(1, std::memory_order_relaxed);
         claims.push_back({page, value, leaf});
     }
@@ -1262,6 +1327,68 @@ std::size_t GuestWtFaultWatch_nid_no_patch(std::uintptr_t address, std::size_t b
     return watched;
 }
 
+std::size_t GuestWtFaultWatch_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return GuestWtFaultWatchCauses_nid_no_patch(address, bytes, nullptr);
+}
+
+std::size_t GuestWtFaultWatchLazy_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    const auto watched = GuestWtFaultWatch_nid_no_patch(address, bytes);
+    if (watched == 0) return 0;
+    auto& state = *g_state;
+    std::uintptr_t first = 0;
+    std::uintptr_t stop = 0;
+    if (!clamp(state, address, bytes, first, stop)) return watched;
+    std::size_t marked = 0;
+    for (auto page = first; page < stop; page += PageBytes) {
+        auto* leaf = leafAt(state, page);
+        if (leaf == nullptr || !watchedPage(*leaf, page)) continue;
+        const auto index = (page >> PageShift) & (LeafPages - 1);
+        leaf->lazy[index / 64].fetch_or(std::uint64_t{1} << (index % 64), std::memory_order_acq_rel);
+        ++marked;
+    }
+    return marked;
+}
+
+std::size_t GuestWtFaultWatchedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    if (!g_enabled.load(std::memory_order_acquire) || !g_watchEver.load(std::memory_order_acquire)) return 0;
+    auto& state = *g_state;
+    std::uintptr_t first = 0;
+    std::uintptr_t stop = 0;
+    if (!clamp(state, address, bytes, first, stop)) return 0;
+    std::size_t watched = 0;
+    for (auto page = first; page < stop; page += PageBytes) {
+        const auto* leaf = leafAt(state, page);
+        if (leaf != nullptr && watchedPage(*leaf, page)) ++watched;
+    }
+    return watched;
+}
+
+void GuestWtFaultSetLazyService_nid_no_patch(void (*service)(std::uintptr_t page, bool write)) {
+    if (g_enabled.load(std::memory_order_acquire)) static_cast<void>(LazyServiceDepth::Get());
+    g_lazyService.store(service, std::memory_order_release);
+}
+
+void GuestWtFaultServeLazyRange_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    if (!g_enabled.load(std::memory_order_acquire) || !g_watchEver.load(std::memory_order_acquire) || g_lazyService.load(std::memory_order_acquire) == nullptr) return;
+    auto& state = *g_state;
+    std::uintptr_t first = 0;
+    std::uintptr_t stop = 0;
+    if (!clamp(state, address, bytes, first, stop)) return;
+    for (auto page = first; page < stop; page += PageBytes) {
+        auto* leaf = leafAt(state, page);
+        if (leaf == nullptr) {
+            page = std::min(stop, state.base + ((((page - state.base) >> LeafShift) + 1) << LeafShift)) - PageBytes;
+            continue;
+        }
+        if (lazyPage(*leaf, page)) serveLazy(*leaf, page, true);
+    }
+}
+
+void GuestWtFaultLazyCounters_nid_no_patch(std::uint64_t* services, std::uint64_t* nested) {
+    *services = g_lazyServices.load(std::memory_order_relaxed);
+    *nested = g_lazyNested.load(std::memory_order_relaxed);
+}
+
 std::size_t GuestWtFaultUnwatch_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     if (!g_enabled.load(std::memory_order_acquire) || !g_watchEver.load(std::memory_order_acquire)) return 0;
     auto& state = *g_state;
@@ -1280,6 +1407,7 @@ bool GuestWtFaultHandleRead_nid_no_patch(std::uintptr_t address) {
     if (leaf == nullptr) return false;
     const auto start = ticks();
     const auto page = address & ~(PageBytes - 1);
+    if (serveLazy(*leaf, page, false)) return true;
     for (unsigned spins = 0;; ++spins) {
         if (watchedPage(*leaf, page)) {
             unwatchPage(*leaf, page, WtWatchRead);
@@ -1388,7 +1516,16 @@ void GuestWtFaultSetCold_nid_no_patch(std::uintptr_t, std::size_t, bool) {}
 void GuestWtFaultLogAppendForTest_nid_no_patch(std::uint64_t) {}
 bool GuestWtFaultStoredLastFrame_nid_no_patch(std::uintptr_t) { return false; }
 std::size_t GuestWtFaultWatch_nid_no_patch(std::uintptr_t, std::size_t) { return 0; }
+std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*) { return 0; }
 std::size_t GuestWtFaultUnwatch_nid_no_patch(std::uintptr_t, std::size_t) { return 0; }
+std::size_t GuestWtFaultWatchLazy_nid_no_patch(std::uintptr_t, std::size_t) { return 0; }
+std::size_t GuestWtFaultWatchedPages_nid_no_patch(std::uintptr_t, std::size_t) { return 0; }
+void GuestWtFaultSetLazyService_nid_no_patch(void (*)(std::uintptr_t, bool)) {}
+void GuestWtFaultServeLazyRange_nid_no_patch(std::uintptr_t, std::size_t) {}
+void GuestWtFaultLazyCounters_nid_no_patch(std::uint64_t* services, std::uint64_t* nested) {
+    *services = 0;
+    *nested = 0;
+}
 bool GuestWtFaultHandleRead_nid_no_patch(std::uintptr_t) { return false; }
 std::uint64_t GuestWtFaultWatchLogHead_nid_no_patch() { return 0; }
 std::size_t GuestWtFaultWatchLogRead_nid_no_patch(std::uint64_t*, std::uint64_t*, std::uint64_t*, std::size_t, bool* lost) {

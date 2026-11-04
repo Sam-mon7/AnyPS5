@@ -13,10 +13,12 @@ enum class GpuUse : std::uint8_t { StagingIn, Carry, Read, AddressRead, Write, L
 enum class Outcome : std::uint8_t { GuestRead, GuestWrite, DriverRead, DriverWrite, Os, Forget, StagingIn, Carry, GpuRead, GpuAddressRead, GpuWrite, LabelStore, Republished, Expired, Unwatchable, Count };
 
 bool Enabled();
+std::uint8_t ReasonFor(const char* flushReason);
 void Published(std::uint64_t begin, std::uint64_t end, Kind kind, std::uint8_t reason);
 void UsedByGpu(std::uint64_t begin, std::uint64_t end, GpuUse use);
 void UsedByGpu(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, GpuUse use);
 void LabelFlush(std::uint64_t ns, std::uint64_t waitedNs, bool queue0);
+void LabelStored(bool queue0);
 void NoteFenceWait(std::uint64_t ns);
 std::uint64_t ThreadFenceWaitNs();
 void Flip();

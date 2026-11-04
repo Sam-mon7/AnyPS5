@@ -247,6 +247,7 @@ public:
     static std::size_t StoreDrawnLinear(const char* reason);
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();
+    static bool PendingStoreInside(std::uint64_t address, std::size_t bytes);
     static void FlushDumpSelected(const char* reason);
     static bool StoreAtFlipRequested(const char* value);
     static bool StoreAtLabelRequested(const char* value);

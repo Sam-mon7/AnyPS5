@@ -1155,6 +1155,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 void noteHostWriteGen(std::uintptr_t address, std::size_t bytes, bool end) {
     // Stage 4 M3 (APS5_WT_FAULT_CENSUS): pages an HLE host write (ReadFile, AIO, ...) stored, at its end.
     if (end) Stage4::NoteHostWrite(address, bytes);
+    else GuestArena::GuestWtFaultServeLazyRange_nid_no_patch(address, bytes);
     if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address || !Gen::Active()) return;
     if (end) static_cast<void>(Gen::Note(Gen::Event::HostWriteEnd, address, address + bytes, Gen::Data | Gen::Cpu, 0, false));
     else static_cast<void>(Gen::Note(Gen::Event::HostWriteBegin, address, address + bytes, Gen::Meta, 0, false));

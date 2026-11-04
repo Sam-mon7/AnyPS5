@@ -54,6 +54,8 @@ struct Counters {
     std::atomic<std::uint64_t> watchHandlerNs{0};
     std::atomic<std::uint64_t> logLost{0};
     std::atomic<std::uint64_t> live{0};
+    std::atomic<std::uint64_t> skipped[Kinds][GuestArena::WtWatchSkipCauses]{};
+    std::atomic<std::uint64_t> labelStored[2]{};
     Counters() {
         const auto add = [](const std::string& name, const std::atomic<std::uint64_t>& counter) { AgcDriver::ArchB::Recorder::RegisterCounter((new std::string(name))->c_str(), counter); };
         for (std::size_t k = 0; k < Kinds; ++k) {
@@ -92,6 +94,12 @@ struct Counters {
         add("p5c_watch_handler_ns", watchHandlerNs);
         add("p5c_log_lost", logLost);
         add("p5c_live", live);
+        constexpr std::array<const char*, GuestArena::WtWatchSkipCauses> causeNames{"noleaf", "untracked", "excluded", "unchecked", "exec", "held", "busy", "watched"};
+        for (std::size_t k = 0; k < Kinds; ++k) {
+            for (std::size_t cause = 0; cause < causeNames.size(); ++cause) add(std::string("p5c_") + KindNames[k] + "_skip_" + causeNames[cause], skipped[k][cause]);
+        }
+        add("p5c_label_stored_q0", labelStored[0]);
+        add("p5c_label_stored_other", labelStored[1]);
     }
 };
 
@@ -238,8 +246,13 @@ void commit(const Deferred& item) {
     c.publishedBytes[k].fetch_add(item.end - item.begin, std::memory_order_relaxed);
     const auto pages = ((item.end + 4095) / 4096) - (item.begin / 4096);
     c.pages[k].fetch_add(pages, std::memory_order_relaxed);
-    const auto watched = GuestArena::GuestWtFaultWatch_nid_no_patch(static_cast<std::uintptr_t>(item.begin), static_cast<std::size_t>(item.end - item.begin));
+    std::array<std::uint64_t, GuestArena::WtWatchSkipCauses> causes{};
+    const auto watched = GuestArena::GuestWtFaultWatchCauses_nid_no_patch(static_cast<std::uintptr_t>(item.begin), static_cast<std::size_t>(item.end - item.begin), causes.data());
     c.watchedPages[k].fetch_add(watched, std::memory_order_relaxed);
+    for (std::size_t cause = 0; cause < causes.size(); ++cause) {
+        if (causes[cause] != 0) c.skipped[k][cause].fetch_add(causes[cause], std::memory_order_relaxed);
+    }
+    if (causes[GuestArena::WtWatchSkipUntracked] != 0) GuestArena::GuestWtFaultTrack_nid_no_patch(static_cast<std::uintptr_t>(item.begin), static_cast<std::size_t>(item.end - item.begin));
     if (watched == 0) {
         c.count[k][static_cast<std::size_t>(Outcome::Unwatchable)].fetch_add(1, std::memory_order_relaxed);
         c.bytes[k][static_cast<std::size_t>(Outcome::Unwatchable)].fetch_add(item.end - item.begin, std::memory_order_relaxed);
@@ -268,6 +281,15 @@ bool Enabled() {
         return value != nullptr && value[0] == '1';
     }();
     return enabled && GuestArena::GuestWtFaultEnabled_nid_no_patch();
+}
+
+std::uint8_t ReasonFor(const char* flushReason) {
+    static constexpr std::array<std::pair<const char*, std::uint8_t>, 12> names{{{"readback before label", 19}, {"readback before interrupt", 19}, {"label", 7}, {"interrupt", 7}, {"flip", 9}, {"memory access", 0}, {"sampled texture", 18}, {"written buffer range", 1}, {"in-place vertex input", 1}, {"imported buffer region", 1}, {"copied buffer region", 1}, {"idle", 15}}};
+    if (flushReason == nullptr) return 31;
+    for (const auto& [name, reason] : names) {
+        if (std::strcmp(flushReason, name) == 0) return reason;
+    }
+    return 30;
 }
 
 UseScope::UseScope() : active(Enabled()) {
@@ -317,6 +339,10 @@ void UsedByGpu(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, 
         if (s.live.empty()) return;
         if (end > begin) closeOverlaps(s, begin, end, outcomeOf(use), now);
     }
+}
+
+void LabelStored(bool queue0) {
+    if (Enabled()) counters().labelStored[queue0 ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
 }
 
 void LabelFlush(std::uint64_t ns, std::uint64_t waitedNs, bool queue0) {

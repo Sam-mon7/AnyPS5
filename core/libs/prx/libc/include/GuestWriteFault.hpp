@@ -158,7 +158,13 @@ void GuestWtFaultSetCold_nid_no_patch(std::uintptr_t address, std::size_t bytes,
 void GuestWtFaultLogAppendForTest_nid_no_patch(std::uint64_t entry);
 bool GuestWtFaultStoredLastFrame_nid_no_patch(std::uintptr_t address);
 std::size_t GuestWtFaultWatch_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* causes);
 std::size_t GuestWtFaultUnwatch_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::size_t GuestWtFaultWatchLazy_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::size_t GuestWtFaultWatchedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestWtFaultSetLazyService_nid_no_patch(void (*service)(std::uintptr_t page, bool write));
+void GuestWtFaultServeLazyRange_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestWtFaultLazyCounters_nid_no_patch(std::uint64_t* services, std::uint64_t* nested);
 bool GuestWtFaultHandleRead_nid_no_patch(std::uintptr_t address);
 std::uint64_t GuestWtFaultWatchLogHead_nid_no_patch();
 std::size_t GuestWtFaultWatchLogRead_nid_no_patch(std::uint64_t* cursor, std::uint64_t* entries, std::uint64_t* stamps, std::size_t capacity, bool* lost);
@@ -192,6 +198,15 @@ inline constexpr std::uint64_t WtWatchOpen = 4;
 inline constexpr std::uint64_t WtWatchForget = 5;
 inline constexpr std::uint64_t WtWatchKindMask = 7;
 inline constexpr std::uint64_t WtWatchDriver = 8;
+inline constexpr std::size_t WtWatchSkipNoLeaf = 0;
+inline constexpr std::size_t WtWatchSkipUntracked = 1;
+inline constexpr std::size_t WtWatchSkipExcluded = 2;
+inline constexpr std::size_t WtWatchSkipUnchecked = 3;
+inline constexpr std::size_t WtWatchSkipExec = 4;
+inline constexpr std::size_t WtWatchSkipHeld = 5;
+inline constexpr std::size_t WtWatchSkipBusy = 6;
+inline constexpr std::size_t WtWatchSkipWatched = 7;
+inline constexpr std::size_t WtWatchSkipCauses = 8;
 
 }
 
