@@ -2420,12 +2420,25 @@ bool fastActive() {
     return AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ArchcTargetFastpath) && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ArchcImageEpochs) && GuestMemory::IsCommitterThread();
 }
 
-bool fastVerify() {
-    static const bool enabled = [] {
+std::uint64_t verifyPeriod() {
+    static const std::uint64_t period = [] {
         const char* value = std::getenv("APS5_ARCHB_C_TARGET_FASTPATH_VERIFY");
-        return value != nullptr && value[0] == '1';
+        if (value == nullptr) return std::uint64_t{0};
+        const auto parsed = std::strtoull(value, nullptr, 10);
+        return static_cast<std::uint64_t>(parsed);
     }();
-    return enabled;
+    return period;
+}
+
+bool fastVerify() {
+    return verifyPeriod() == 1;
+}
+
+bool verifyHitNow() {
+    const auto period = verifyPeriod();
+    if (period == 0) return false;
+    thread_local std::uint64_t hits = 0;
+    return ++hits % period == 0;
 }
 
 bool admitCmask() {
@@ -3883,7 +3896,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
         static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
         auto fastResident = residentTargets && context.detiler != nullptr && archcTargets::fastActive() ? archcTargets::tryTarget(context, color, nullptr) : nullptr;
-        const bool fastHit = fastResident != nullptr && !archcTargets::fastVerify();
+        const bool fastHit = fastResident != nullptr && !archcTargets::verifyHitNow();
         const archcTargets::VerifyHit verifyHit(fastHit ? nullptr : fastResident);
         const auto censusDepthStart = archcTargets::censusActive() ? archcTargets::nowNs() : 0;
         if (!fastHit) PrepareColorTargetDepth(context.device, color.address, colorLayout.Bytes());
@@ -4918,7 +4931,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto fastStored = archcTargets::fastActive() ? archcTargets::tryTarget(context, state.colors[index], stored.get()) : nullptr;
-        if (fastStored != nullptr && !archcTargets::fastVerify()) {
+        if (fastStored != nullptr && !archcTargets::verifyHitNow()) {
             timer.phase(PhaseReadTarget);
             targets.push_back(std::move(fastStored));
             continue;
