@@ -2539,7 +2539,7 @@ void record(std::uint64_t first, std::uint64_t stop, std::uint64_t clock, std::u
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool memoVirtualQuery = false, std::uint64_t* stamped = nullptr, bool osWalk = false) {
 #ifdef _WIN32
-    const bool skipCandidate = tracker.faultMode && !armedOnly && kind == StampKind::Cpu && !osWalk && window == nullptr && !Gen::Active() && wtFault::consumersOn() && syncSkip::active();
+    const bool skipCandidate = tracker.faultMode && !armedOnly && kind == StampKind::Cpu && !osWalk && window == nullptr && !Gen::Active() && !wtFault::verifyOn() && wtFault::consumersOn() && syncSkip::active();
     const auto skipUnwatched = skipCandidate ? unwatchSerial.load(std::memory_order_acquire) : 0;
     const auto skipMapping = skipCandidate ? syncSkip::mapping() : 0;
     bool skipVerifying = false;
