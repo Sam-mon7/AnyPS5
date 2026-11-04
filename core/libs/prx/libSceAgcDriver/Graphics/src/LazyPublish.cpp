@@ -152,7 +152,15 @@ void drainLocked(State& s, std::vector<std::pair<std::uint64_t, std::uint64_t>>&
 }
 
 void publishOrphans(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& orphans) {
+    if (orphans.empty()) return;
+    // C_LAZY_STORE_HOOK: an explicit publication (FlushForAccess reads the range raw: a fault there only
+    // opens its page, it does not run the service again).
+    const bool explicitScope = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CLazyStoreHook);
+    const bool entered = explicitScope && GuestArena::GuestWtFaultEnterLazyService_nid_no_patch();
+    if (explicitScope) ++publishing;
     for (const auto& [begin, end] : orphans) publish(begin, end);
+    if (explicitScope) --publishing;
+    if (entered) GuestArena::GuestWtFaultLeaveLazyService_nid_no_patch();
 }
 
 // APS5_ARCHB_C_LAZY_PUBLISH_STACKS=N (diagnostic): the first N services on a thread holding the GPU

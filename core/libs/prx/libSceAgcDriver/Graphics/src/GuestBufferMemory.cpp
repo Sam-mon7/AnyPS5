@@ -4968,13 +4968,14 @@ struct Pending {
 // Under GuestMemory::GpuMutex (every copy-back and staging decision is made under it).
 struct State {
     std::unordered_map<VkBuffer, Pending> pending;
-    std::shared_ptr<Buffer> slots;
+    // The open batch's slot buffer; the batch keeps it (a strong reference here would outlive the device).
+    std::weak_ptr<Buffer> slots;
     std::size_t used = 0;
     std::uint64_t serial = 0;
     std::uint64_t candidates = 0;
 };
 
-// Never destroyed: its slot buffer must not outlive the device at process exit.
+// Never destroyed (no device objects in it, see `slots`).
 State& state() {
     static auto* made = new State;
     return *made;
@@ -4996,17 +4997,19 @@ VkCopyMemoryIndirectCommandKHR* Record(const Context& context, Recorder& recorde
     const auto source = BufferAddress(context, shadow->Handle());
     const auto destination = BufferAddress(context, import);
     if (source == 0 || destination == 0) return nullptr;
-    if (s.slots == nullptr || s.serial != recorder.OpenSerial() || s.used == SlotsPerBuffer) {
-        s.slots = std::make_shared<Buffer>(context, SlotsPerBuffer * sizeof(VkCopyMemoryIndirectCommandKHR), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto slots = s.slots.lock();
+    if (slots == nullptr || s.serial != recorder.OpenSerial() || s.used == SlotsPerBuffer) {
+        slots = std::make_shared<Buffer>(context, SlotsPerBuffer * sizeof(VkCopyMemoryIndirectCommandKHR), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        s.slots = slots;
         s.used = 0;
         s.serial = recorder.OpenSerial();
-        recorder.Keep(s.slots);
+        recorder.Keep(slots);
     }
-    auto* slot = reinterpret_cast<VkCopyMemoryIndirectCommandKHR*>(s.slots->Bytes().data()) + s.used;
+    auto* slot = reinterpret_cast<VkCopyMemoryIndirectCommandKHR*>(slots->Bytes().data()) + s.used;
     *slot = {source, destination + importOffset, bytes};
     VkCopyMemoryIndirectInfoKHR info{VK_STRUCTURE_TYPE_COPY_MEMORY_INDIRECT_INFO_KHR};
     info.copyCount = 1;
-    info.copyAddressRange = {s.slots->DeviceAddress() + s.used * sizeof(VkCopyMemoryIndirectCommandKHR), sizeof(VkCopyMemoryIndirectCommandKHR), sizeof(VkCopyMemoryIndirectCommandKHR)};
+    info.copyAddressRange = {slots->DeviceAddress() + s.used * sizeof(VkCopyMemoryIndirectCommandKHR), sizeof(VkCopyMemoryIndirectCommandKHR), sizeof(VkCopyMemoryIndirectCommandKHR)};
     ++s.used;
     copy(commands, &info);
     counters().indirect.fetch_add(1, std::memory_order_relaxed);
