@@ -80,6 +80,7 @@ struct ArchcTargetTotals {
     std::uint64_t verifyMismatches = 0;
 };
 ArchcTargetTotals ArchcTargetCounts();
+int ArchcTakeRecipeBuild();
 void RecheckDrawPreparation(const Context& context, DrawPreparation& preparation);
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw

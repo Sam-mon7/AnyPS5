@@ -650,6 +650,11 @@ constexpr std::array<const char*, LookupPhaseCount> LookupPhaseNames{"key/find/m
 enum RecipeBuild : std::size_t { RecipeNotRequested, RecipeDisabled, RecipeUncacheable, RecipeWaited, RecipeIndirect, RecipeNotReusable, RecipeMovedDisabled, RecipeMultisampled, RecipeReordered, RecipeBuilt, RecipeBuildCount };
 constexpr std::array<const char*, RecipeBuildCount> RecipeBuildNames{"not requested/shape", "disabled", "uncacheable", "waited", "indirect", "not reusable", "moved disabled", "multisampled", "sample order", "built"};
 
+int& archcLastRecipeBuild() {
+    thread_local int last = -1;
+    return last;
+}
+
 bool DrawMovedRecipes() {
     static const bool enabled = std::getenv("APS5_NO_DRAW_MOVED_RECIPES") == nullptr;
     return enabled;
@@ -2202,6 +2207,7 @@ struct Token {
     bool registered = false;
     bool cmaskRegistered = false;
     std::uint64_t lastUse = 0;
+    std::uint64_t touched = ~std::uint64_t{0};
 };
 
 constexpr std::size_t TableSets = 128;
@@ -2533,10 +2539,16 @@ std::shared_ptr<StorageTexture> tryTarget(const Context& context, const ColorTar
         slot = nullptr;
         refusal = FastKeys;
     }
-    if (slot != nullptr && stored == nullptr && !StorageImageCached(context, image.get())) {
-        slot->valid = false;
-        slot = nullptr;
-        refusal = FastCached;
+    if (slot != nullptr && stored == nullptr) {
+        const auto present = Recorder::Presents();
+        const bool cached = slot->touched == present ? image->Cached() : StorageImageCached(context, image.get());
+        if (!cached) {
+            slot->valid = false;
+            slot = nullptr;
+            refusal = FastCached;
+        } else {
+            slot->touched = present;
+        }
     }
     if (slot == nullptr) {
         counters.refused[refusal].fetch_add(1, std::memory_order_relaxed);
@@ -4323,6 +4335,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
         const auto recipeBuild = recipeOut == nullptr ? RecipeNotRequested : !DrawRecipes() ? RecipeDisabled : !cacheable ? RecipeUncacheable : outcome.waited ? RecipeWaited : args != nullptr ? RecipeIndirect : !resources->Reusable() ? RecipeNotReusable : !resolved.moved.empty() && !DrawMovedRecipes() ? RecipeMovedDisabled : multisampled ? RecipeMultisampled : pipeline->ReordersSamples() ? RecipeReordered : RecipeBuilt;
         if (profile) outcome.recipeBuild = recipeBuild;
+        archcLastRecipeBuild() = static_cast<int>(recipeBuild);
         if (recipeBuild == RecipeBuilt) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
@@ -4876,6 +4889,10 @@ std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4:
         return 0;
     }
     return plan;
+}
+
+int ArchcTakeRecipeBuild() {
+    return std::exchange(archcLastRecipeBuild(), -1);
 }
 
 ArchcTargetTotals ArchcTargetCounts() {

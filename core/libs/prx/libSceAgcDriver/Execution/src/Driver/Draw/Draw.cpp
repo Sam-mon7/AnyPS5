@@ -1651,7 +1651,77 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     return drawn();
 }
 
+namespace {
+
+namespace archcSlotCensus {
+
+enum Kind : std::size_t { RecipeHit, RecipeMiss, Indirect, NoStages, BuildNotRequested, BuildDisabled, BuildUncacheable, BuildWaited, BuildIndirect, BuildNotReusable, BuildMovedDisabled, BuildMultisampled, BuildReordered, BuildBuilt, Unknown, KindCount };
+constexpr std::array<const char*, KindCount> KindNames{"recipe_hit", "recipe_miss", "indirect", "no_stages", "build_not_requested", "build_disabled", "build_uncacheable", "build_waited", "build_indirect", "build_not_reusable", "build_moved_disabled", "build_multisampled", "build_reordered", "build_built", "unknown"};
+
+struct Counters {
+    std::array<std::atomic<std::uint64_t>, KindCount> draws{};
+    std::array<std::atomic<std::uint64_t>, KindCount> ns{};
+    std::array<std::atomic<std::uint64_t>, KindCount> lockedNs{};
+    Counters() {
+        for (std::size_t i = 0; i < KindCount; ++i) {
+            ArchB::Recorder::RegisterCounter((new std::string(std::string("archc_slot_draws_") + KindNames[i]))->c_str(), draws[i]);
+            ArchB::Recorder::RegisterCounter((new std::string(std::string("archc_slot_ns_") + KindNames[i]))->c_str(), ns[i]);
+            ArchB::Recorder::RegisterCounter((new std::string(std::string("archc_slot_locked_ns_") + KindNames[i]))->c_str(), lockedNs[i]);
+        }
+    }
+};
+
+bool enabled() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_SLOT_CENSUS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return on;
+}
+
+Counters& counters() {
+    static Counters made;
+    return made;
+}
+
+std::uint64_t now() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+struct Probe {
+    bool on = enabled();
+    std::uint64_t start = on ? now() : 0;
+    std::uint64_t locked = 0;
+    Kind kind = Unknown;
+    ~Probe() {
+        if (!on) return;
+        const auto end = now();
+        auto& made = counters();
+        made.draws[kind].fetch_add(1, std::memory_order_relaxed);
+        made.ns[kind].fetch_add(end - start, std::memory_order_relaxed);
+        if (locked != 0) made.lockedNs[kind].fetch_add(end - locked, std::memory_order_relaxed);
+    }
+    void Locked() {
+        if (on) locked = now();
+    }
+    void Built() {
+        if (!on) return;
+        const auto build = Graphics::ArchcTakeRecipeBuild();
+        if (kind == RecipeMiss) return;
+        kind = build < 0 ? Unknown : static_cast<Kind>(BuildNotRequested + static_cast<std::size_t>(build));
+    }
+};
+
+}
+
+}
+
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, bool pipelineStateReuse, bool memoVirtualQuery, Graphics::DrawPreparation* resolved) {
+    archcSlotCensus::Probe slotProbe;
+    if (slotProbe.on) {
+        static_cast<void>(Graphics::ArchcTakeRecipeBuild());
+        slotProbe.kind = drawParameters.indirect ? archcSlotCensus::Indirect : recipeStages.empty() ? archcSlotCensus::NoStages : archcSlotCensus::Unknown;
+    }
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawLockTiming lockTiming{profile};
@@ -1675,6 +1745,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     lockTiming.Start();
+    slotProbe.Locked();
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     struct SubmitDue {
         Driver& driver;
@@ -1686,11 +1757,16 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(stages, queue);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, &lockTiming.preparation, pipelineStateReuse) == RecipeOutcome::Recorded) return;
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, &lockTiming.preparation, pipelineStateReuse) == RecipeOutcome::Recorded) {
+            slotProbe.kind = archcSlotCensus::RecipeHit;
+            return;
+        }
+        slotProbe.kind = archcSlotCensus::RecipeMiss;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, &lockTiming.preparation, pipelineStateReuse);
+    if (slotProbe.kind != archcSlotCensus::Indirect && slotProbe.kind != archcSlotCensus::NoStages) slotProbe.Built();
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 
