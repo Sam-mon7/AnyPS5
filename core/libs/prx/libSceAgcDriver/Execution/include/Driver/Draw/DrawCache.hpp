@@ -42,6 +42,7 @@ struct DrawDecode {
     ShaderRecompiler::ShaderPixelStageInfo pixel;
     std::vector<DrawProgram> programs;
     std::vector<ShaderRecompiler::ProgramRole> roles;
+    std::shared_ptr<const DrawDecode> stateOrigin;
 };
 
 void ReadUserWords(const QueueState& queue, DrawProgram& program, bool staticAbi);

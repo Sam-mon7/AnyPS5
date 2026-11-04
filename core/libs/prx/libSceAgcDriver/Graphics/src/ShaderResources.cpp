@@ -14,6 +14,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -3964,6 +3966,117 @@ bool stampProofsVerify() {
     }();
     return enabled;
 }
+
+enum class TemplateTokenRefusal : std::size_t { None, Generation, Drain, Epoch, Loss, Open, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(TemplateTokenRefusal::Count)> TemplateTokenRefusalNames{"none", "generation", "drain", "epoch", "loss", "open"};
+
+struct TemplateTokenCounters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> made{0};
+    std::atomic<std::uint64_t> verifyChecks{0};
+    std::atomic<std::uint64_t> verifyMismatches{0};
+    std::atomic<std::uint64_t> attempts{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TemplateTokenRefusal::Count)> refused{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TemplateTokenRefusal::Count)> notMade{};
+};
+
+TemplateTokenCounters& templateTokenCounters() {
+    static auto* made = [] {
+        auto* counters = new TemplateTokenCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_template_token_hits", counters->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_template_tokens", counters->made);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_template_token_verify_checks", counters->verifyChecks);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_template_token_verify_mismatches", counters->verifyMismatches);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_template_token_attempts", counters->attempts);
+        for (std::size_t i = 0; i < TemplateTokenRefusalNames.size(); ++i) {
+            AgcDriver::ArchB::Recorder::RegisterCounter((new std::string(std::string("archc_template_token_refused_") + TemplateTokenRefusalNames[i]))->c_str(), counters->refused[i]);
+            AgcDriver::ArchB::Recorder::RegisterCounter((new std::string(std::string("archc_template_token_unmade_") + TemplateTokenRefusalNames[i]))->c_str(), counters->notMade[i]);
+        }
+        return counters;
+    }();
+    return *made;
+}
+
+bool templateTokensActive() {
+    return ArchB::Switches::Enabled(ArchB::Feature::ArchcTemplateToken) && ArchB::Switches::Enabled(ArchB::Feature::ArchcImageEpochs);
+}
+
+std::uint64_t templateTokenVerifyPeriod() {
+    static const std::uint64_t period = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_TEMPLATE_TOKEN_VERIFY");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+    }();
+    return period;
+}
+
+bool templateTokenVerifyNow() {
+    const auto period = templateTokenVerifyPeriod();
+    if (period == 0) return false;
+    thread_local std::uint64_t hits = 0;
+    return ++hits % period == 0;
+}
+
+constexpr std::uint32_t TemplateTokenSources = ArchC::SourceBit(ArchC::EpochSource::CpuStore) | ArchC::SourceBit(ArchC::EpochSource::Hold) | ArchC::SourceBit(ArchC::EpochSource::Open) | ArchC::SourceBit(ArchC::EpochSource::Forget) | ArchC::SourceBit(ArchC::EpochSource::TrackerStamp) | ArchC::SourceBit(ArchC::EpochSource::Depth) | ArchC::SourceBit(ArchC::EpochSource::Unwatch);
+}
+
+bool ShaderResources::archcTokenHolds() {
+    auto& counters = templateTokenCounters();
+    const auto refuse = [&](TemplateTokenRefusal why) {
+        archcToken.valid = false;
+        counters.refused[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (!archcToken.valid) return false;
+    if (archcToken.generation != stampProof.generation) return refuse(TemplateTokenRefusal::Generation);
+    if (!ArchC::ImageEpochs::Get().DrainIfNew()) return refuse(TemplateTokenRefusal::Drain);
+    if (archcEpoch.load(std::memory_order_acquire) != archcToken.epoch) return refuse(TemplateTokenRefusal::Epoch);
+    if (ArchC::ImageEpochs::Get().Loss() != archcToken.loss) return refuse(TemplateTokenRefusal::Loss);
+    if (templateTokenVerifyNow()) {
+        counters.verifyChecks.fetch_add(1, std::memory_order_relaxed);
+        bool unchanged = true;
+        thread_local std::vector<GuestMemory::UnchangedQuery>* verifySlot = nullptr;
+        auto& queries = ShaderRecompiler::ThreadOwned(verifySlot);
+        queries.clear();
+        for (const auto& [begin, end] : stampProof.ranges) {
+            const auto bytes = static_cast<std::size_t>(end - begin);
+            if (!GuestMemory::FaultUnchangedSince(begin, bytes, stampProof.generation)) unchanged = false;
+            queries.push_back({begin, bytes, stampProof.generation});
+        }
+        if (unchanged && !queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) unchanged = false;
+        if (!unchanged) {
+            const auto previous = counters.verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+            if (previous < 8) std::fprintf(stderr, "[archc] template token VERIFY mismatch: the stamp proof's ranges changed while the token held\n");
+            archcToken.valid = false;
+            return false;
+        }
+    }
+    counters.hits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+ArchcTemplateTokenTotals ArchcTemplateTokenCounts() {
+    auto& counters = templateTokenCounters();
+    std::uint64_t unmade = 0;
+    for (const auto& count : counters.notMade) unmade += count.load();
+    return {counters.hits.load(), counters.made.load(), counters.verifyChecks.load(), counters.verifyMismatches.load(), counters.attempts.load(), unmade, counters.notMade[static_cast<std::size_t>(TemplateTokenRefusal::Open)].load()};
+}
+
+void ShaderResources::archcTokenMake(bool drained, std::uint64_t epochBefore, std::uint64_t lossBefore) {
+    auto& counters = templateTokenCounters();
+    const auto unmade = [&](TemplateTokenRefusal why) { counters.notMade[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed); };
+    archcToken.valid = false;
+    if (!drained || !ArchC::ImageEpochs::Get().DrainIfNew()) return unmade(TemplateTokenRefusal::Drain);
+    if (archcEpoch.load(std::memory_order_acquire) != epochBefore) return unmade(TemplateTokenRefusal::Epoch);
+    if (ArchC::ImageEpochs::Get().Loss() != lossBefore) return unmade(TemplateTokenRefusal::Loss);
+    const auto clock = GuestArena::GuestWtFaultClock_nid_no_patch();
+    for (const auto& [begin, end] : stampProof.ranges) {
+        if (GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), clock) != GuestArena::WtFaultAnswer::Unchanged) return unmade(TemplateTokenRefusal::Open);
+    }
+    archcToken.valid = true;
+    archcToken.epoch = epochBefore;
+    archcToken.loss = lossBefore;
+    archcToken.generation = stampProof.generation;
+    counters.made.fetch_add(1, std::memory_order_relaxed);
 }
 
 ShaderResources::ResourceEpochProof ShaderResources::currentStampSerials() {
@@ -4013,6 +4126,30 @@ bool ShaderResources::stampProofHolds() {
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (SampledFromStorageEligible(context, surface.resource, surface.bytes) || Recorder::SnapshotWriteOverlaps(address, bytes) || AnyShadowedOverlaps(address, bytes)) return refuse(StampRefusal::Partial);
     }
+    const bool tokens = templateTokensActive() && stampProof.partials.empty() && !stampProof.ranges.empty();
+    if (tokens && archcTokenHolds()) {
+        counters.hits.fetch_add(1, std::memory_order_relaxed);
+        if (!GuestMemory::IsCommitterThread()) counters.hitsOther.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    bool tokenDrained = false;
+    std::uint64_t tokenEpoch = 0;
+    std::uint64_t tokenLoss = 0;
+    if (tokens) {
+        templateTokenCounters().attempts.fetch_add(1, std::memory_order_relaxed);
+        if (!archcToken.registered || archcRanges != stampProof.ranges) {
+            thread_local std::vector<ArchC::EpochRange>* rangesSlot = nullptr;
+            auto& ranges = ShaderRecompiler::ThreadOwned(rangesSlot);
+            ranges.clear();
+            for (const auto& [begin, end] : stampProof.ranges) ranges.push_back({begin, end});
+            ArchC::ImageEpochs::Get().RegisterOwner(this, archcEpoch, ranges, TemplateTokenSources);
+            archcToken.registered = true;
+            archcRanges = stampProof.ranges;
+        }
+        tokenDrained = ArchC::ImageEpochs::Get().DrainIfNew();
+        tokenEpoch = archcEpoch.load(std::memory_order_acquire);
+        tokenLoss = ArchC::ImageEpochs::Get().Loss();
+    }
     thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
     auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
     queries.clear();
@@ -4022,6 +4159,7 @@ bool ShaderResources::stampProofHolds() {
         queries.push_back({begin, bytes, stampProof.generation});
     }
     if (!queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return refuse(StampRefusal::Stamped);
+    if (tokens) archcTokenMake(tokenDrained, tokenEpoch, tokenLoss);
     counters.hits.fetch_add(1, std::memory_order_relaxed);
     if (!GuestMemory::IsCommitterThread()) counters.hitsOther.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -4029,6 +4167,7 @@ bool ShaderResources::stampProofHolds() {
 
 void ShaderResources::rememberStampProof(std::uint64_t generation, const ResourceEpochProof& serials, const HostImportsProof& imports) {
     setStampValid(false);
+    archcToken.valid = false;
     stampProof.images.clear();
     stampProof.ranges.clear();
     auto& skips = stampProofCounters().skips;
@@ -6354,6 +6493,7 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
 }
 
 ShaderResources::~ShaderResources() {
+    if (archcToken.registered) ArchC::ImageEpochs::Get().UnregisterOwner(this);
     release();
 }
 

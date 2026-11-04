@@ -806,6 +806,18 @@ private:
     bool stampEligible() const;
     static ResourceEpochProof currentStampSerials();
     bool stampProofHolds();
+    struct ArchcTemplateToken {
+        bool valid = false;
+        bool registered = false;
+        std::uint64_t epoch = 0;
+        std::uint64_t loss = 0;
+        std::uint64_t generation = 0;
+    };
+    std::atomic<std::uint64_t> archcEpoch{1};
+    ArchcTemplateToken archcToken;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> archcRanges;
+    bool archcTokenHolds();
+    void archcTokenMake(bool drained, std::uint64_t epochBefore, std::uint64_t lossBefore);
     void rememberStampProof(std::uint64_t generation, const ResourceEpochProof& serials, const HostImportsProof& imports);
     static ResourceEpochProof currentResourceEpochProof();
     bool canRememberResourceEpoch() const;
@@ -863,6 +875,17 @@ private:
 // and dropped by that device's Clear(). APS5_NO_RESOURCE_CACHE=1 (dispatches) and
 // APS5_NO_DRAW_RESOURCE_CACHE=1 (draws) build every object as before; the device clears the cache at
 // teardown before its descriptor caches go.
+struct ArchcTemplateTokenTotals {
+    std::uint64_t hits = 0;
+    std::uint64_t made = 0;
+    std::uint64_t verifyChecks = 0;
+    std::uint64_t verifyMismatches = 0;
+    std::uint64_t attempts = 0;
+    std::uint64_t unmade = 0;
+    std::uint64_t unmadeOpen = 0;
+};
+ArchcTemplateTokenTotals ArchcTemplateTokenCounts();
+
 class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;

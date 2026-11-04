@@ -20,6 +20,12 @@ struct EpochRange {
 
 enum class EpochSource : std::uint8_t { CpuStore, Hold, Open, Forget, TrackerStamp, GpuNote, Pending, Depth, Unwatch, Count };
 
+constexpr std::uint32_t SourceBit(EpochSource source) {
+    return std::uint32_t{1} << static_cast<unsigned>(source);
+}
+
+constexpr std::uint32_t AllSources = (std::uint32_t{1} << static_cast<unsigned>(EpochSource::Count)) - 1u;
+
 struct EpochCensus {
     std::uint64_t selfStamps = 0;
     std::uint64_t otherStamps = 0;
@@ -36,7 +42,7 @@ public:
     static bool Active();
     static bool CensusEnabled();
     void Register(StorageTexture& image, std::span<const EpochRange> ranges);
-    void RegisterOwner(const void* owner, std::atomic<std::uint64_t>& epoch, std::span<const EpochRange> ranges);
+    void RegisterOwner(const void* owner, std::atomic<std::uint64_t>& epoch, std::span<const EpochRange> ranges, std::uint32_t sources = AllSources);
     void Unregister(const StorageTexture& image);
     void UnregisterOwner(const void* owner);
     static void RegisterImage(StorageTexture& image, std::uint64_t cmaskAddress, std::uint64_t cmaskBytes);

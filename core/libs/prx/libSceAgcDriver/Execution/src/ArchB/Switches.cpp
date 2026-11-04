@@ -54,6 +54,8 @@ constexpr Feature PipeResolvePoolPrerequisites[] = {Feature::PipeQ0Committer, Fe
 constexpr Feature PrelockStampSkipPrerequisites[] = {Feature::WtFault, Feature::PipeResolveProofs};
 constexpr Feature ArchcImageEpochsPrerequisites[] = {Feature::WtFault, Feature::WtFaultConsumers};
 constexpr Feature ArchcTargetFastpathPrerequisites[] = {Feature::ArchcImageEpochs};
+constexpr Feature ArchcTemplateTokenPrerequisites[] = {Feature::ArchcImageEpochs, Feature::PipeResolveProofs};
+constexpr Feature ArchcDrawReplayPrerequisites[] = {Feature::ArchcTargetFastpath, Feature::ArchcTemplateToken, Feature::PipeQ0Committer};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -141,6 +143,8 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::ZeroCopyMoved, "ZERO_COPY_MOVED", false, true, {}},
     {Feature::ArchcImageEpochs, "C_IMAGE_EPOCHS", false, true, ArchcImageEpochsPrerequisites},
     {Feature::ArchcTargetFastpath, "C_TARGET_FASTPATH", false, true, ArchcTargetFastpathPrerequisites},
+    {Feature::ArchcTemplateToken, "C_TEMPLATE_TOKEN", false, true, ArchcTemplateTokenPrerequisites},
+    {Feature::ArchcDrawReplay, "C_DRAW_REPLAY", false, true, ArchcDrawReplayPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

@@ -78,6 +78,8 @@ enum class Feature : std::uint8_t {
     ZeroCopyMoved,
     ArchcImageEpochs,
     ArchcTargetFastpath,
+    ArchcTemplateToken,
+    ArchcDrawReplay,
     Count
 };
 

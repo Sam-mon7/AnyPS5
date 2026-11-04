@@ -29,6 +29,7 @@ struct Slot {
     std::atomic<std::uint64_t>* epoch;
     std::uint64_t begin;
     std::uint64_t end;
+    std::uint32_t sources;
 };
 
 struct Record {
@@ -206,7 +207,7 @@ void ImageEpochs::Register(StorageTexture& image, std::span<const EpochRange> ra
     RegisterOwner(&image, image.archcEpoch, ranges);
 }
 
-void ImageEpochs::RegisterOwner(const void* owner, std::atomic<std::uint64_t>& epoch, std::span<const EpochRange> ranges) {
+void ImageEpochs::RegisterOwner(const void* owner, std::atomic<std::uint64_t>& epoch, std::span<const EpochRange> ranges, std::uint32_t sources) {
     InstallHooks();
     auto& made = index();
     std::vector<EpochRange> added;
@@ -223,7 +224,7 @@ void ImageEpochs::RegisterOwner(const void* owner, std::atomic<std::uint64_t>& e
             record.ranges.push_back(range);
             added.push_back(range);
             for (auto block = range.begin >> BlockShift; block <= (range.end - 1) >> BlockShift; ++block) {
-                made.blocks[block].push_back({owner, &epoch, range.begin, range.end});
+                made.blocks[block].push_back({owner, &epoch, range.begin, range.end, sources});
                 const auto bit = filterBit(block);
                 made.filter[bit / 64].fetch_or(std::uint64_t{1} << (bit % 64), std::memory_order_release);
             }
@@ -231,7 +232,7 @@ void ImageEpochs::RegisterOwner(const void* owner, std::atomic<std::uint64_t>& e
     }
     if (added.empty()) return;
     epoch.fetch_add(1, std::memory_order_acq_rel);
-    if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ArchcImageEpochs)) return;
+    if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ArchcImageEpochs) || (sources & SourceBit(EpochSource::CpuStore)) == 0) return;
     for (const auto& range : added) GuestArena::GuestWtFaultSetCold_nid_no_patch(static_cast<std::uintptr_t>(range.begin), static_cast<std::size_t>(range.end - range.begin), true);
 }
 
@@ -301,7 +302,7 @@ void ImageEpochs::Invalidate(std::uint64_t begin, std::uint64_t end, EpochSource
                     else if (source == EpochSource::Pending) ++record.pending;
                     else if (source == EpochSource::Depth) ++record.depth;
                 }
-                if (slot.image == except) continue;
+                if (slot.image == except || (slot.sources & SourceBit(source)) == 0) continue;
                 slot.epoch->fetch_add(1, std::memory_order_acq_rel);
                 ++bumped;
             }
@@ -360,7 +361,7 @@ bool ImageEpochs::DrainIfNew() {
                 const auto slots = made.blocks.find(block);
                 if (slots == made.blocks.end()) continue;
                 for (const auto& slot : slots->second) {
-                    if (slot.begin >= stop || first >= slot.end) continue;
+                    if (slot.begin >= stop || first >= slot.end || (slot.sources & SourceBit(source)) == 0) continue;
                     slot.epoch->fetch_add(1, std::memory_order_acq_rel);
                     ++bumped;
                 }

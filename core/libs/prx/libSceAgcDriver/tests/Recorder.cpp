@@ -11119,6 +11119,300 @@ int archcTargetTests(const Device& device, Recorder& recorder, std::string_view 
     throw std::runtime_error("unknown Arch C target scenario");
 }
 
+int archcReplayTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
+    const bool on = Switches::Enabled(Feature::ArchcDrawReplay) && Switches::Enabled(Feature::ArchcTargetFastpath) && Switches::Enabled(Feature::ArchcImageEpochs);
+    const char* verifyText = std::getenv("APS5_ARCHB_C_DRAW_REPLAY_VERIFY");
+    const bool verify = verifyText != nullptr && std::string_view(verifyText) == "1";
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 2;
+    void* watched = AllocateWatched(bytes, unit);
+    if (watched == nullptr) return 77;
+    struct Release {
+        void* watched;
+        ~Release() { ReleaseWatched(watched, bytes); }
+    } release{watched};
+    auto* block = static_cast<std::byte*>(watched);
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (HostImportFor(context, address, bytes) == nullptr) return 77;
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        auto program = std::make_shared<ShaderRecompiler::RecompileResult>();
+        program->spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program->variantId = variant;
+        return program;
+    };
+    const auto vertex = shader(COVER_VERT_SPV, 301);
+    const auto pixel = shader(COVER_FRAG_SPV, 302);
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, vertex.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, pixel.get(), 0}};
+    const auto stateFor = [](std::uint64_t base, std::int32_t width) {
+        auto state = std::make_shared<State>();
+        state->stages.path = ShaderPath::Vertex;
+        state->color = {base, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+        state->colors = {state->color};
+        state->hasColorTarget = true;
+        state->renderExtent = {64, 64};
+        state->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state->viewport = {0, 64, 64, -64, 0, 1};
+        state->scissor = {{0, 0}, {static_cast<std::uint32_t>(width), 64}};
+        state->frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        state->blend.colorWriteMask = 15;
+        state->blends = {state->blend};
+        return state;
+    };
+    const auto whole = stateFor(address, 64);
+    const auto left = stateFor(address, 32);
+    const auto arguments = address + unit;
+    const auto writeArguments = [&](std::uint32_t vertices) {
+        const std::array<std::uint32_t, 4> record{vertices, 1, 0, 0};
+        AgcDriver::GuestMemory::Write(arguments, std::as_bytes(std::span(record)));
+    };
+    writeArguments(3);
+    AgcDriver::Pm4::DrawParameters indirect{0, 0, 0, 0, 0, false};
+    indirect.indirect.emplace();
+    indirect.indirect->arguments = arguments;
+    indirect.indirect->opcode = 0x24;
+    indirect.indirect->recordBytes = 16;
+    indirect.indirect->stride = 16;
+    indirect.indirect->count = 1;
+    indirect.indirect->countIndirect = false;
+    indirect.indirect->countAddress = 0;
+    indirect.indirect->vertexRule = AgcDriver::Pm4::DrawParameters::IndirectDraw::Rule::InPlace;
+    indirect.indirect->instanceRule = AgcDriver::Pm4::DrawParameters::IndirectDraw::Rule::InPlace;
+    const DrawSlotIdentity wholeIdentity{whole, {{vertex}, {pixel}}};
+    const DrawSlotIdentity leftIdentity{left, {{vertex}, {pixel}}};
+    const auto draw = [&](const std::shared_ptr<State>& state, const DrawSlotIdentity& identity) {
+        Draw(context, *state, indirect, shaders, {}, nullptr, nullptr, nullptr, false, &identity);
+        WaitForOptimizedPipelines(context.device);
+    };
+    const auto settle = [&] {
+        StorageTexture::FlushAllPending("archc replay test");
+        recorder.Sync();
+        AgcDriver::GuestMemory::WtFaultFlip();
+    };
+    const auto texels = [&](const State& state) {
+        std::vector<std::byte> read(64 * 64 * 4);
+        recorder.Sync();
+        ReadColorTarget(state.color, read);
+        return read;
+    };
+    const auto counts = [] { return ArchcReplayCounts(); };
+    for (int i = 0; i < 4; ++i) {
+        draw(whole, wholeIdentity);
+        settle();
+    }
+    draw(whole, wholeIdentity);
+    draw(whole, wholeIdentity);
+    const auto warmed = counts();
+    if (!on) Require(warmed.hits == 0 && warmed.captures == 0, "the draw replay ran with its switches off");
+    else if (verify) Require(warmed.hits == 0 && warmed.verifyChecks != 0 && warmed.verifyMismatches == 0, "VERIFY replayed a draw, checked none, or counted a mismatch on clean draws");
+    else Require(warmed.captures != 0 && warmed.hits != 0, "a repeated indirect draw into an unchanged target was not replayed");
+    if (scenario == "hit") {
+        const auto before = counts();
+        draw(whole, wholeIdentity);
+        const auto after = counts();
+        if (on && !verify) Require(after.hits == before.hits + 1, "the repeated indirect draw did not replay");
+        if (verify) Require(after.verifyChecks == before.verifyChecks + 1 && after.verifyMismatches == 0, "VERIFY did not check the draw or counted a mismatch");
+        const auto read = texels(*whole);
+        Require(std::all_of(read.begin(), read.end(), [](std::byte value) { return value == std::byte{255}; }), "the replayed draw did not cover its target");
+        std::cout << "agc_archc_replay_hit: ok\n";
+        return 0;
+    }
+    if (scenario == "cpu_store") {
+        for (int i = 0; i < 3; ++i) {
+            draw(left, leftIdentity);
+            settle();
+        }
+        draw(left, leftIdentity);
+        const auto before = counts();
+        std::fill_n(block, unit, std::byte{0x40});
+        draw(left, leftIdentity);
+        const auto after = counts();
+        Require(after.hits == before.hits, "a draw after a CPU store into its target was replayed");
+        const auto read = texels(*left);
+        for (std::size_t y = 0; y < 64; ++y) {
+            for (std::size_t x = 0; x < 64; ++x) {
+                const auto expected = x < 32 ? std::byte{255} : std::byte{0x40};
+                for (std::size_t channel = 0; channel < 4; ++channel) Require(read[(y * 64 + x) * 4 + channel] == expected, "the CPU's bytes did not survive in the undrawn half");
+            }
+        }
+        std::cout << "agc_archc_replay_cpu_store: ok\n";
+        return 0;
+    }
+    if (scenario == "arguments") {
+        settle();
+        writeArguments(0);
+        std::fill_n(block, unit, std::byte{0x40});
+        settle();
+        draw(whole, wholeIdentity);
+        draw(whole, wholeIdentity);
+        const auto empty = counts();
+        auto read = texels(*whole);
+        Require(std::all_of(read.begin(), read.end(), [](std::byte value) { return value == std::byte{0x40}; }), "a draw whose records hold no vertices changed its target");
+        settle();
+        writeArguments(3);
+        draw(whole, wholeIdentity);
+        const auto after = counts();
+        if (on && !verify) Require(empty.hits != warmed.hits && after.hits == empty.hits + 1, "the draws with changed records were not replayed");
+        read = texels(*whole);
+        Require(std::all_of(read.begin(), read.end(), [](std::byte value) { return value == std::byte{255}; }), "the replayed draw did not read its current records");
+        std::cout << "agc_archc_replay_arguments: ok\n";
+        return 0;
+    }
+    if (scenario == "identity") {
+        const auto other = shader(COVER_FRAG_SPV, 303);
+        const std::array otherShaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, vertex.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, other.get(), 0}};
+        const DrawSlotIdentity otherIdentity{whole, {{vertex}, {other}}};
+        const auto before = counts();
+        Draw(context, *whole, indirect, otherShaders, {}, nullptr, nullptr, nullptr, false, &otherIdentity);
+        WaitForOptimizedPipelines(context.device);
+        Require(counts().hits == before.hits, "a draw with other stages replayed another draw's slot");
+        const DrawSlotIdentity mismatched{whole, {{vertex}, {vertex}}};
+        Draw(context, *whole, indirect, shaders, {}, nullptr, nullptr, nullptr, false, &mismatched);
+        WaitForOptimizedPipelines(context.device);
+        Require(counts().hits == before.hits, "a draw whose identity does not own its stages was replayed");
+        std::cout << "agc_archc_replay_identity: ok\n";
+        return 0;
+    }
+    throw std::runtime_error("unknown Arch C replay scenario");
+}
+
+int archcTemplateTokenTests(const Device& device, Recorder& recorder) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
+    const bool on = Switches::Enabled(Feature::ArchcTemplateToken) && Switches::Enabled(Feature::ArchcImageEpochs) && Switches::Enabled(Feature::PipeResolveProofs) && Switches::Enabled(Feature::WtFault);
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 2;
+    void* watched = AllocateWatched(bytes, unit);
+    if (watched == nullptr) return 77;
+    struct Release {
+        void* watched;
+        ~Release() { ReleaseWatched(watched, bytes); }
+    } release{watched};
+    auto* block = static_cast<std::byte*>(watched);
+    std::fill_n(block, bytes, std::byte{0x2e});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    context.nullDescriptors = device.NullDescriptors();
+    if (!context.nullDescriptors) return 77;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    TextureDetiler detiler(context);
+    auto imageContext = context;
+    imageContext.detiler = &detiler;
+    TextureCache textureCache(imageContext);
+    imageContext.textureCache = &textureCache;
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (HostImportFor(context, address, bytes) == nullptr) return 77;
+    ShaderRecompiler::RecompileResult imageProgram;
+    ShaderRecompiler::DescriptorBinding imageBinding;
+    imageBinding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    imageBinding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    imageBinding.descriptorSet = 0;
+    imageBinding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding;
+    imageBinding.count = 1;
+    imageBinding.imageSamplers = {0};
+    imageBinding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    imageBinding.guestDescriptor = {static_cast<std::uint32_t>(address >> 8), static_cast<std::uint32_t>(address >> 40) | (56u << 20) | (3u << 30), 15u | (63u << 14), 0x91b00fac, 0, 0, 0, 0};
+    imageProgram.bindings.push_back(imageBinding);
+    const CompiledShader imageCompute{ShaderRecompiler::ShaderStage::Compute, &imageProgram, 0};
+    Buffer readback(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    AgcDriver::GuestMemory::MarkWritten(address + unit, 4);
+    auto sampled = std::make_shared<ShaderResources>(imageContext, imageCompute);
+    recorder.Sync();
+        const auto prove = [&] {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        return sampled->Revalidate(std::span(&imageCompute, 1));
+    };
+    const auto texel = [&] {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        const auto images = sampled->StorageImages();
+        Require(images.size() == 1, "the sampled texture is not resident");
+        const auto commands = recorder.Commands();
+        recorder.Keep(sampled);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {1, 1, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, images.front().first, VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        std::uint32_t value = 0;
+        std::memcpy(&value, readback.Bytes().data(), sizeof(value));
+        return value;
+    };
+    const auto first = texel();
+    for (int i = 0; i < 4; ++i) {
+        Require(prove(), "an unchanged sampled template failed its proof");
+        AgcDriver::GuestMemory::WtFaultFlip();
+    }
+    if (!sampled->StampProofArmed()) {
+        std::cout << "agc_archc_template_token: skipped (the stamp memo does not arm for this template)" << std::endl;
+        return 77;
+    }
+    const auto hitsBefore = ArchcTemplateTokenCounts().hits;
+    Require(prove() && prove(), "an unchanged sampled template failed its proof");
+    const auto hitsAfter = ArchcTemplateTokenCounts().hits;
+    const auto tokenCounts = ArchcTemplateTokenCounts();
+    if (on && (tokenCounts.made == 0 || hitsAfter <= hitsBefore)) std::cout << "template token: attempts " << tokenCounts.attempts << " made " << tokenCounts.made << " unmade " << tokenCounts.unmade << " (open " << tokenCounts.unmadeOpen << ") hits " << tokenCounts.hits << "\n";
+    if (on) Require(tokenCounts.made != 0 && hitsAfter > hitsBefore, "an unchanged template's proof did not use its token");
+    else Require(hitsAfter == hitsBefore, "a template token was used with the switch off");
+    Require(texel() == first, "the unchanged texture changed");
+    std::fill_n(block, 256, std::byte{0x51});
+    const auto storedHits = ArchcTemplateTokenCounts().hits;
+    const bool proved = prove();
+    Require(ArchcTemplateTokenCounts().hits == storedHits, "a template token held across a CPU store into its texture");
+    if (proved) Require(texel() != first, "the texture kept stale texels after a CPU store");
+    std::cout << "agc_archc_template_token: ok (proof after the store " << proved << ")\n";
+    return 0;
+}
+
 std::uint64_t processPrivateBytes() {
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS_EX counters{};
@@ -13087,6 +13381,12 @@ int main(int argc, char** argv) {
 
         if (argc == 3 && std::string_view(argv[1]) == "--archc-target") {
             return archcTargetTests(device, recorder, argv[2]);
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--archc-replay") {
+            return archcReplayTests(device, recorder, argv[2]);
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--archc-template-token") {
+            return archcTemplateTokenTests(device, recorder);
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported")) {
             return vertexTargetRangeTests(device, recorder, std::string_view(argv[1]) == "--vertex-target-range-imported") ? 0 : 77;

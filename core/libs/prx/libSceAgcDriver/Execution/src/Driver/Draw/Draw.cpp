@@ -713,6 +713,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     if (dataEntry != nullptr) {
         auto refreshed = std::make_shared<DrawDecode>(*dataEntry->decode);
+        refreshed->stateOrigin = dataEntry->decode->stateOrigin != nullptr ? dataEntry->decode->stateOrigin : dataEntry->decode;
         for (auto& program : refreshed->programs) {
             ReadUserWords(queue, program, false);
             if (program.merged) InitializeMerged(queue, program, program.mergedPointer, program.mergedPointerRequired, false);
@@ -1004,6 +1005,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (!userPatches.empty() && !drawHit) {
         auto current = std::make_shared<DrawDecode>(*decode);
+        current->stateOrigin = decode->stateOrigin != nullptr ? decode->stateOrigin : decode;
         for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
         decode = std::move(current);
     }
@@ -1614,7 +1616,44 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             DrawPipeline::FollowEpoch(epoch, ticket);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             const auto committing = identity.programs != 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, pipelineStateReuse, memoVirtualQuery, resolution.resolved ? &resolution : nullptr);
+            Graphics::DrawSlotIdentity slotIdentity;
+            bool identified = false;
+            if (drawParameters.indirect.has_value() && Graphics::ArchcReplayActive()) {
+                const auto ownerOf = [&](const ShaderRecompiler::RecompileResult* program) -> std::shared_ptr<const void> {
+                    for (const auto& data : stageData) {
+                        if (data.compiled != nullptr && data.compiled.get() == program) return data.compiled;
+                    }
+                    for (const auto& variant : matched) {
+                        if (variant != nullptr && variant->compiled != nullptr && variant->compiled.get() == program) return variant->compiled;
+                    }
+                    for (const auto& variant : fresh) {
+                        if (variant != nullptr && variant->compiled != nullptr && variant->compiled.get() == program) return variant->compiled;
+                    }
+                    for (const auto& compiled : compiledStages) {
+                        if (compiled != nullptr && compiled.get() == program) return compiled;
+                    }
+                    return {};
+                };
+                identified = decode != nullptr;
+                slotIdentity.state = decode != nullptr && decode->stateOrigin != nullptr ? std::shared_ptr<const void>(decode->stateOrigin) : std::shared_ptr<const void>(decode);
+                slotIdentity.stages.reserve(stages.size());
+                for (const auto& stage : stages) {
+                    Graphics::DrawSlotStage entry;
+                    for (std::size_t i = 0; i < stageData.size() && i < matched.size(); ++i) {
+                        if (stageData[i].compiled == nullptr || stageData[i].compiled.get() != stage.program || matched[i] == nullptr || matched[i]->compiled == nullptr) continue;
+                        entry.owner = matched[i]->compiled;
+                        entry.variant = matched[i];
+                        entry.words = stageData[i].words;
+                        entry.patched = true;
+                        entry.bufferBases = stageData[i].bufferBaseHit;
+                        break;
+                    }
+                    if (!entry.patched) entry.owner = ownerOf(stage.program);
+                    if (entry.owner == nullptr) identified = false;
+                    slotIdentity.stages.push_back(std::move(entry));
+                }
+            }
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, pipelineStateReuse, memoVirtualQuery, resolution.resolved ? &resolution : nullptr, identified ? &slotIdentity : nullptr);
             if (identity.programs != 0) addDrawCommit(identity, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committing).count());
             return 0;
         };
@@ -1655,8 +1694,8 @@ namespace {
 
 namespace archcSlotCensus {
 
-enum Kind : std::size_t { RecipeHit, RecipeMiss, Indirect, NoStages, BuildNotRequested, BuildDisabled, BuildUncacheable, BuildWaited, BuildIndirect, BuildNotReusable, BuildMovedDisabled, BuildMultisampled, BuildReordered, BuildBuilt, Unknown, KindCount };
-constexpr std::array<const char*, KindCount> KindNames{"recipe_hit", "recipe_miss", "indirect", "no_stages", "build_not_requested", "build_disabled", "build_uncacheable", "build_waited", "build_indirect", "build_not_reusable", "build_moved_disabled", "build_multisampled", "build_reordered", "build_built", "unknown"};
+enum Kind : std::size_t { RecipeHit, RecipeMiss, Indirect, NoStages, BuildNotRequested, BuildDisabled, BuildUncacheable, BuildWaited, BuildIndirect, BuildNotReusable, BuildMovedDisabled, BuildMultisampled, BuildReordered, BuildBuilt, Unknown, IndirectReplayed, IndirectVerified, IndirectRefused, IndirectNew, KindCount };
+constexpr std::array<const char*, KindCount> KindNames{"recipe_hit", "recipe_miss", "indirect", "no_stages", "build_not_requested", "build_disabled", "build_uncacheable", "build_waited", "build_indirect", "build_not_reusable", "build_moved_disabled", "build_multisampled", "build_reordered", "build_built", "unknown", "indirect_replayed", "indirect_verified", "indirect_refused", "indirect_new"};
 
 struct Counters {
     std::array<std::atomic<std::uint64_t>, KindCount> draws{};
@@ -1704,6 +1743,11 @@ struct Probe {
     void Locked() {
         if (on) locked = now();
     }
+    void Replay() {
+        const auto outcome = Graphics::ArchcTakeReplayOutcome();
+        if (!on || kind != Indirect || outcome < 0) return;
+        kind = static_cast<Kind>(IndirectReplayed + static_cast<std::size_t>(outcome));
+    }
     void Built() {
         if (!on) return;
         const auto build = Graphics::ArchcTakeRecipeBuild();
@@ -1716,7 +1760,7 @@ struct Probe {
 
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, bool pipelineStateReuse, bool memoVirtualQuery, Graphics::DrawPreparation* resolved) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, bool pipelineStateReuse, bool memoVirtualQuery, Graphics::DrawPreparation* resolved, const Graphics::DrawSlotIdentity* identity) {
     archcSlotCensus::Probe slotProbe;
     if (slotProbe.on) {
         static_cast<void>(Graphics::ArchcTakeRecipeBuild());
@@ -1726,7 +1770,8 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawLockTiming lockTiming{profile};
     GuestMemory::HoldLogMark(GuestMemory::HoldMark::PrelockBegin);
-    if (Graphics::DrawPrelockEnabled()) {
+    const bool replayLikely = identity != nullptr && recipe == nullptr && Graphics::ArchcReplayLikely(localDevice->Device(), graphics, drawParameters, stages, identity, pipelineStateReuse);
+    if (Graphics::DrawPrelockEnabled() && !replayLikely) {
         const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         static const bool aheadCensus = GuestMemory::CollectAheadCensus() || GuestMemory::CommitterCollectCensus();
         struct PrelockPhase {
@@ -1765,8 +1810,9 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, &lockTiming.preparation, pipelineStateReuse);
-    if (slotProbe.kind != archcSlotCensus::Indirect && slotProbe.kind != archcSlotCensus::NoStages) slotProbe.Built();
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, &lockTiming.preparation, pipelineStateReuse, recipe == nullptr ? identity : nullptr);
+    slotProbe.Replay();
+    if (slotProbe.kind != archcSlotCensus::Indirect && slotProbe.kind < archcSlotCensus::IndirectReplayed && slotProbe.kind != archcSlotCensus::NoStages) slotProbe.Built();
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 

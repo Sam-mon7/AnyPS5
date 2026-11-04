@@ -16,6 +16,19 @@ namespace AgcDriver::Graphics {
 
 struct HostImport;
 
+struct DrawSlotStage {
+    std::shared_ptr<const void> owner;
+    std::shared_ptr<const void> variant;
+    std::vector<std::uint32_t> words;
+    bool patched = false;
+    bool bufferBases = false;
+};
+
+struct DrawSlotIdentity {
+    std::shared_ptr<const void> state;
+    std::vector<DrawSlotStage> stages;
+};
+
 struct DrawTraceContext {
     std::uint64_t token = 0;
     std::uint64_t submission = 0;
@@ -81,12 +94,23 @@ struct ArchcTargetTotals {
 };
 ArchcTargetTotals ArchcTargetCounts();
 int ArchcTakeRecipeBuild();
+int ArchcTakeReplayOutcome();
+bool ArchcReplayLikely(VkDevice device, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity* identity, bool pipelineStateReuse);
+bool ArchcReplayActive();
+struct ArchcReplayTotals {
+    std::uint64_t hits = 0;
+    std::uint64_t captures = 0;
+    std::uint64_t legacy = 0;
+    std::uint64_t verifyChecks = 0;
+    std::uint64_t verifyMismatches = 0;
+};
+ArchcReplayTotals ArchcReplayCounts();
 void RecheckDrawPreparation(const Context& context, DrawPreparation& preparation);
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, DrawPreparation* preparation = nullptr, bool pipelineStateReuse = false);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, DrawPreparation* preparation = nullptr, bool pipelineStateReuse = false, const DrawSlotIdentity* identity = nullptr);
 
 struct PixelFunctionLdsLayouts {
     VkDescriptorSetLayout empty = VK_NULL_HANDLE;
