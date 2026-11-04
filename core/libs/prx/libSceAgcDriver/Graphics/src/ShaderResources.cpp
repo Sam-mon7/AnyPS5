@@ -3905,7 +3905,7 @@ ShaderResources::ResourceEpochProof ShaderResources::currentResourceEpochProof()
 
 namespace {
 // Stage 4.2b: stamp-memo outcomes (recorder counters pipe_proof_memo_*).
-enum class StampRefusal : std::size_t { Cold, Unlocked, Audit, Serials, Cache, Images, Imports, Stored, Stamped, Partial, Count };
+enum class StampRefusal : std::size_t { Cold, Unlocked, Audit, Serials, Cache, Images, Imports, Stored, Stamped, Partial, Pending, Forgetting, Unwatched, Depth, Commits, Count };
 // Why a passed proof was not kept: the serials or imports moved during it, a forget was under way,
 // or the object is not eligible (canRememberResourceEpoch: depth, partial, untracked, records).
 enum class StampSkip : std::size_t { Moved, Forgetting, Ineligible, Count };
@@ -3917,6 +3917,7 @@ struct StampProofCounters {
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StampRefusal::Count)> refusals{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StampSkip::Count)> skips{};
     std::array<std::atomic<std::uint64_t>, 5> ineligible{};
+    std::atomic<std::uint64_t> pendingScans{0};
 };
 
 StampProofCounters& stampProofCounters() {
@@ -3926,12 +3927,13 @@ StampProofCounters& stampProofCounters() {
         AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_remembered", counters->remembered);
         AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_verified", counters->verified);
         AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_mismatches", counters->mismatches);
-        static constexpr std::array<const char*, static_cast<std::size_t>(StampRefusal::Count)> names{"pipe_proof_memo_cold", "pipe_proof_memo_unlocked", "pipe_proof_memo_audit", "pipe_proof_memo_serials", "pipe_proof_memo_cache", "pipe_proof_memo_images", "pipe_proof_memo_imports", "pipe_proof_memo_stored", "pipe_proof_memo_stamped", "pipe_proof_memo_partial"};
+        static constexpr std::array<const char*, static_cast<std::size_t>(StampRefusal::Count)> names{"pipe_proof_memo_cold", "pipe_proof_memo_unlocked", "pipe_proof_memo_audit", "pipe_proof_memo_serials", "pipe_proof_memo_cache", "pipe_proof_memo_images", "pipe_proof_memo_imports", "pipe_proof_memo_stored", "pipe_proof_memo_stamped", "pipe_proof_memo_partial", "pipe_proof_memo_pending", "pipe_proof_memo_forgetting", "pipe_proof_memo_unwatched", "pipe_proof_memo_depth", "pipe_proof_memo_commits"};
         for (std::size_t i = 0; i < names.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(names[i], counters->refusals[i]);
         static constexpr std::array<const char*, static_cast<std::size_t>(StampSkip::Count)> skipNames{"pipe_proof_memo_skip_moved", "pipe_proof_memo_skip_forgetting", "pipe_proof_memo_skip_ineligible"};
         for (std::size_t i = 0; i < skipNames.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(skipNames[i], counters->skips[i]);
         static constexpr std::array<const char*, 5> ineligibleNames{"pipe_proof_memo_ineligible_records", "pipe_proof_memo_ineligible_depth", "pipe_proof_memo_ineligible_partial", "pipe_proof_memo_ineligible_tracking", "pipe_proof_memo_ineligible_cache"};
         for (std::size_t i = 0; i < ineligibleNames.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(ineligibleNames[i], counters->ineligible[i]);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_pending_scans", counters->pendingScans);
         return counters;
     }();
     return *made;
@@ -3967,12 +3969,30 @@ bool ShaderResources::stampProofHolds() {
     if (!stampProof.valid) return refuse(StampRefusal::Cold);
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return refuse(StampRefusal::Unlocked);
     if (TemplateAuditDue(lastFullWalk)) return refuse(StampRefusal::Audit);
-    if (currentStampSerials() != stampProof.serials) return refuse(StampRefusal::Serials);
+    // Serials: a forget under way refuses; mapping, commit and forget changes elsewhere are left to the
+    // per-range fault check below (a mapping or protection change forgets its pages, which then read as
+    // untracked), except the commit generation while partial snapshots are covered (their committed
+    // layout); unwatches and depth-surface changes refuse; a pending-registry change rescans.
+    const auto now = currentStampSerials();
+    if ((now.forgotten & 1u) != 0) return refuse(StampRefusal::Forgetting);
+    if (now.unwatched != stampProof.serials.unwatched) return refuse(StampRefusal::Unwatched);
+    if (now.depth != stampProof.serials.depth || now.depthReleased != stampProof.serials.depthReleased) return refuse(StampRefusal::Depth);
+    if (!stampProof.partials.empty() && now.commits != stampProof.serials.commits) return refuse(StampRefusal::Commits);
     if (HoldsReleasedTexture() || !HasCachedStorageImages()) return refuse(StampRefusal::Cache);
     for (const auto& entry : stampProof.images) {
         if (entry.image->Version() != entry.version || entry.image->Descriptor().dccAddress != entry.keys) return refuse(StampRefusal::Images);
     }
     if (HostImportsIdentity(context, false) != stampProof.imports) return refuse(StampRefusal::Imports);
+    if (now.pending != stampProof.serials.pending && !stampProof.pending.empty()) {
+        thread_local std::vector<StorageTexture::PendingQuery>* scanSlot = nullptr;
+        auto& scan = ShaderRecompiler::ThreadOwned(scanSlot);
+        scan.assign(stampProof.pending.begin(), stampProof.pending.end());
+        stampProofCounters().pendingScans.fetch_add(1, std::memory_order_relaxed);
+        if (!StorageTexture::ScanPending(scan)) return refuse(StampRefusal::Pending);
+        for (const auto& query : scan) {
+            if (query.overlaps) return refuse(StampRefusal::Pending);
+        }
+    }
     for (const auto index : stampProof.partials) {
         const auto& surface = validatedTextures[index];
         const auto address = surface.resource.baseAddress;
@@ -4006,6 +4026,7 @@ void ShaderResources::rememberStampProof(std::uint64_t generation, const Resourc
         return;
     }
     stampProof.partials.clear();
+    stampProof.pending.clear();
     const auto range = [&](std::uint64_t address, std::uint64_t bytes) {
         if (address != 0 && bytes != 0) stampProof.ranges.emplace_back(address, address + bytes);
     };
@@ -4018,8 +4039,11 @@ void ShaderResources::rememberStampProof(std::uint64_t generation, const Resourc
     };
     for (std::size_t index = 0; index < validatedTextures.size(); ++index) {
         const auto& surface = validatedTextures[index];
+        const auto begin = surface.resource.baseAddress;
+        const auto end = begin + surface.bytes;
+        stampProof.pending.push_back({begin, end, surface.source, surface.source != nullptr && surface.keys != DccKeys::Uncompressed ? surface.source : nullptr, false});
         if (surface.committed.has_value()) {
-            for (const auto& [begin, end] : *surface.committed) range(begin, end - begin);
+            for (const auto& [first, stop] : *surface.committed) range(first, stop - first);
             stampProof.partials.push_back(index);
             continue;
         }
@@ -4027,7 +4051,10 @@ void ShaderResources::rememberStampProof(std::uint64_t generation, const Resourc
         if (surface.resource.dccAddress != 0) range(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
         image(surface.source);
     }
-    for (const auto& storage : storageTextures) image(storage.get());
+    for (const auto& storage : storageTextures) {
+        image(storage.get());
+        if (storage != nullptr) stampProof.pending.push_back({storage->Descriptor().baseAddress, storage->Descriptor().baseAddress + storage->GuestBytes(), storage.get(), nullptr, false});
+    }
     stampProof.generation = generation;
     stampProof.serials = serials;
     stampProof.imports = imports;
