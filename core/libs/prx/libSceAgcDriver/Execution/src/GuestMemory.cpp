@@ -2292,6 +2292,9 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     if (runs.dirty != nullptr) {
         for (auto page = begin & ~std::uintptr_t{WritePageBytes - 1}; page < end; page += WritePageBytes) runs.dirty->push_back(reinterpret_cast<void*>(page));
     }
+    // APS5_ARCHB_WT_FAULT: a page found stored stays open across the next flip (hot pages count as
+    // changed and do not fault every frame).
+    if (tracker.faultMode) GuestArena::GuestWtFaultNoteStored_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
     else tracker.noteWalkStore(begin, end, generation);

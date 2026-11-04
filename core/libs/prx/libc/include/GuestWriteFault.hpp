@@ -90,6 +90,10 @@ void GuestWtFaultTrack_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 // Pages of the range were stored by the driver: an arm in the next `frames` flips leaves them open
 // (the driver keeps storing them, each first store after an arm would fault).
 void GuestWtFaultNoteDriverStore_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+// Pages of the range were found stored in this frame (a write-watch walk reported them dirty): like a
+// fault, this keeps them open across the next flip, so a page the guest stores every frame faults once
+// instead of once per frame (APS5_WT_FAULT_GUEST_HOT=0 turns both off).
+void GuestWtFaultNoteStored_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 // Protects every open candidate not held open, in contiguous runs; one clock value stamps them all.
 // Returns the number of runs armed and stores the first `capacity` of them as [begin, end) pairs in
 // `runs` (2 * capacity words; null with capacity 0 when not wanted).

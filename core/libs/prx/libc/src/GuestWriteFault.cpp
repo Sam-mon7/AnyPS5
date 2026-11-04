@@ -59,6 +59,7 @@ struct State {
     std::atomic<Leaf*>* leaves = nullptr;
     bool verify = false;
     bool driverHot = true;
+    bool guestHot = true;
     std::mutex mutex;
     Leaf* allocated = nullptr;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> held;
@@ -243,6 +244,7 @@ void GuestWtFaultEnable_nid_no_patch(bool verify, std::uint64_t clockAbove) {
         state->verify = verify;
         char text[8] = {};
         if (GetEnvironmentVariableA("APS5_WT_FAULT_DRIVER_HOT", text, sizeof(text)) != 0 && text[0] == '0') state->driverHot = false;
+        if (GetEnvironmentVariableA("APS5_WT_FAULT_GUEST_HOT", text, sizeof(text)) != 0 && text[0] == '0') state->guestHot = false;
         LARGE_INTEGER frequency;
         QueryPerformanceFrequency(&frequency);
         state->ticksToNs = 1e9 / static_cast<double>(frequency.QuadPart);
@@ -279,6 +281,11 @@ bool GuestWtFaultHandle_nid_no_patch(std::uintptr_t address) {
             if (!word.compare_exchange_weak(value, opening, std::memory_order_acq_rel)) continue;
             if (current == WtFaultArmed) leaf->notArmed.fetch_add(1, std::memory_order_relaxed);
             if (!finishOpening(state, page, page + PageBytes, isExec(value))) return false;
+            // A page stored in this frame stays open across the next flip (see GuestWtFaultNoteStored).
+            if (state.guestHot) {
+                const auto index = (page >> PageShift) & (LeafPages - 1);
+                leaf->hot[index / 64].fetch_or(std::uint64_t{1} << (index % 64), std::memory_order_relaxed);
+            }
             const auto elapsed = static_cast<std::uint64_t>(ticks() - start);
             state.counters.faults.fetch_add(1, std::memory_order_relaxed);
             state.counters.handlerTicks.fetch_add(elapsed, std::memory_order_relaxed);
@@ -347,10 +354,15 @@ void GuestWtFaultTrack_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     state.counters.tracked.fetch_add(made, std::memory_order_relaxed);
 }
 
+void GuestWtFaultNoteStored_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    if (!g_enabled.load(std::memory_order_acquire) || !g_state->guestHot) return;
+    GuestWtFaultNoteDriverStore_nid_no_patch(address, bytes);
+}
+
 void GuestWtFaultNoteDriverStore_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     if (!g_enabled.load(std::memory_order_acquire)) return;
     auto& state = *g_state;
-    if (!state.driverHot) return;
+    if (!state.driverHot && !state.guestHot) return;
     std::uintptr_t first = 0;
     std::uintptr_t stop = 0;
     if (!clamp(state, address, bytes, first, stop)) return;
@@ -812,6 +824,7 @@ bool GuestWtFaultHandle_nid_no_patch(std::uintptr_t) { return false; }
 void GuestWtFaultMarkDriverThread_nid_no_patch() {}
 void GuestWtFaultTrack_nid_no_patch(std::uintptr_t, std::size_t) {}
 void GuestWtFaultNoteDriverStore_nid_no_patch(std::uintptr_t, std::size_t) {}
+void GuestWtFaultNoteStored_nid_no_patch(std::uintptr_t, std::size_t) {}
 std::size_t GuestWtFaultArm_nid_no_patch(std::uintptr_t*, std::size_t) { return 0; }
 void GuestWtFaultForget_nid_no_patch(std::uintptr_t, std::size_t) {}
 void GuestWtFaultHold_nid_no_patch(std::uintptr_t, std::size_t) {}

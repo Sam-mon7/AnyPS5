@@ -2293,6 +2293,53 @@ void CheckWtFaultConsumers() {
 }
 #endif
 
+#ifdef _WIN32
+// APS5_ARCHB_WT_FAULT hot pages (APS5_WT_FAULT_GUEST_HOT, default on): a page that faulted stays open
+// across the next flip; a page a walk finds stored while open stays open across the flip after; a page
+// neither faulted nor found stored since the last flip is protected again, and its next store faults.
+void CheckWtFaultHot() {
+    using namespace GuestArena;
+    Require(WtFault().active, "the fault tracker did not turn on with write watching");
+    const auto state = [](std::uint64_t address) { return GuestWtFaultWord_nid_no_patch(address) & WtFaultStateMask; };
+    const auto faults = [] {
+        WtFaultCounters value{};
+        GuestWtFaultCounters_nid_no_patch(&value);
+        return value.faults;
+    };
+    constexpr std::uint64_t Page = 4096;
+    PartlyCommitted range;
+    range.Commit(0);
+    const auto base = range.Address();
+    volatile std::uint8_t* data = range.Data();
+    std::memset(range.Data(), 0x11, Block);
+    const auto collect = [&] {
+        BumpCollectEpoch();
+        return CollectWrites(base, Block);
+    };
+    collect();
+    WtFaultFlip();
+    Require(state(base) == WtFaultOpen, "pages the walk found stored (the fixture's fill) were protected at the next flip");
+    WtFaultFlip();
+    Require(state(base) == WtFaultArmed && state(base + Page) == WtFaultArmed, "the hot-page fixture was not protected");
+    const auto before = faults();
+    data[0] = 1;
+    data[Page] = 1;
+    Require(faults() == before + 2, "the first stores did not fault");
+    collect();
+    WtFaultFlip();
+    Require(state(base) == WtFaultOpen && state(base + Page) == WtFaultOpen, "a page that faulted was protected at the next flip");
+    data[0] = 2;
+    collect();
+    WtFaultFlip();
+    Require(state(base) == WtFaultOpen, "a page found stored while open was protected at the flip");
+    Require(state(base + Page) == WtFaultArmed, "a page not stored since the last flip stayed open");
+    data[0] = 3;
+    Require(faults() == before + 2, "a store into a hot page faulted");
+    data[Page] = 3;
+    Require(faults() == before + 3 && state(base + Page) == WtFaultOpen, "a store into a page protected again did not fault");
+}
+#endif
+
 // APS5_ARCHB_FIX_UNSTAMPED_ALIAS (mode from the environment): a driver store into unwatched memory 4 GiB
 // away from a collected committed range sets the unstamped-store slots of the range's blocks (hashed
 // by block modulo 4 GiB). Off, the range then reads as changed (counted as aliased); on, it reads as
@@ -3608,6 +3655,11 @@ int main(int argc, char** argv) {
             return 0;
         }
 #ifdef _WIN32
+        if (argc == 2 && std::string_view(argv[1]) == "--wt-fault-hot") {
+            CheckWtFaultHot();
+            std::cout << "fault tracking hot pages test passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--wt-fault-consumers") {
             CheckWtFaultConsumers();
             std::cout << "fault tracking consumers test passed\n";
