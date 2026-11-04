@@ -780,8 +780,10 @@ private:
         HostImportsProof imports;
         std::vector<EpochImage> images;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        std::vector<std::size_t> partials;
     };
     StampProof stampProof;
+    bool stampEligible() const;
     static ResourceEpochProof currentStampSerials();
     bool stampProofHolds();
     void rememberStampProof(std::uint64_t generation, const ResourceEpochProof& serials, const HostImportsProof& imports);

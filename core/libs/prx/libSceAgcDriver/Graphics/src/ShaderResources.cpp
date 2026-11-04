@@ -3905,7 +3905,7 @@ ShaderResources::ResourceEpochProof ShaderResources::currentResourceEpochProof()
 
 namespace {
 // Stage 4.2b: stamp-memo outcomes (recorder counters pipe_proof_memo_*).
-enum class StampRefusal : std::size_t { Cold, Unlocked, Audit, Serials, Cache, Images, Imports, Stored, Stamped, Count };
+enum class StampRefusal : std::size_t { Cold, Unlocked, Audit, Serials, Cache, Images, Imports, Stored, Stamped, Partial, Count };
 // Why a passed proof was not kept: the serials or imports moved during it, a forget was under way,
 // or the object is not eligible (canRememberResourceEpoch: depth, partial, untracked, records).
 enum class StampSkip : std::size_t { Moved, Forgetting, Ineligible, Count };
@@ -3916,6 +3916,7 @@ struct StampProofCounters {
     std::atomic<std::uint64_t> mismatches{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StampRefusal::Count)> refusals{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StampSkip::Count)> skips{};
+    std::array<std::atomic<std::uint64_t>, 5> ineligible{};
 };
 
 StampProofCounters& stampProofCounters() {
@@ -3925,10 +3926,12 @@ StampProofCounters& stampProofCounters() {
         AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_remembered", counters->remembered);
         AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_verified", counters->verified);
         AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_mismatches", counters->mismatches);
-        static constexpr std::array<const char*, static_cast<std::size_t>(StampRefusal::Count)> names{"pipe_proof_memo_cold", "pipe_proof_memo_unlocked", "pipe_proof_memo_audit", "pipe_proof_memo_serials", "pipe_proof_memo_cache", "pipe_proof_memo_images", "pipe_proof_memo_imports", "pipe_proof_memo_stored", "pipe_proof_memo_stamped"};
+        static constexpr std::array<const char*, static_cast<std::size_t>(StampRefusal::Count)> names{"pipe_proof_memo_cold", "pipe_proof_memo_unlocked", "pipe_proof_memo_audit", "pipe_proof_memo_serials", "pipe_proof_memo_cache", "pipe_proof_memo_images", "pipe_proof_memo_imports", "pipe_proof_memo_stored", "pipe_proof_memo_stamped", "pipe_proof_memo_partial"};
         for (std::size_t i = 0; i < names.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(names[i], counters->refusals[i]);
         static constexpr std::array<const char*, static_cast<std::size_t>(StampSkip::Count)> skipNames{"pipe_proof_memo_skip_moved", "pipe_proof_memo_skip_forgetting", "pipe_proof_memo_skip_ineligible"};
         for (std::size_t i = 0; i < skipNames.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(skipNames[i], counters->skips[i]);
+        static constexpr std::array<const char*, 5> ineligibleNames{"pipe_proof_memo_ineligible_records", "pipe_proof_memo_ineligible_depth", "pipe_proof_memo_ineligible_partial", "pipe_proof_memo_ineligible_tracking", "pipe_proof_memo_ineligible_cache"};
+        for (std::size_t i = 0; i < ineligibleNames.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(ineligibleNames[i], counters->ineligible[i]);
         return counters;
     }();
     return *made;
@@ -3970,6 +3973,12 @@ bool ShaderResources::stampProofHolds() {
         if (entry.image->Version() != entry.version || entry.image->Descriptor().dccAddress != entry.keys) return refuse(StampRefusal::Images);
     }
     if (HostImportsIdentity(context, false) != stampProof.imports) return refuse(StampRefusal::Imports);
+    for (const auto index : stampProof.partials) {
+        const auto& surface = validatedTextures[index];
+        const auto address = surface.resource.baseAddress;
+        const auto bytes = static_cast<std::size_t>(surface.bytes);
+        if (SampledFromStorageEligible(context, surface.resource, surface.bytes) || Recorder::SnapshotWriteOverlaps(address, bytes) || AnyShadowedOverlaps(address, bytes)) return refuse(StampRefusal::Partial);
+    }
     thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
     auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
     queries.clear();
@@ -3992,10 +4001,11 @@ void ShaderResources::rememberStampProof(std::uint64_t generation, const Resourc
         skips[static_cast<std::size_t>(StampSkip::Forgetting)].fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (!canRememberResourceEpoch()) {
+    if (!stampEligible()) {
         skips[static_cast<std::size_t>(StampSkip::Ineligible)].fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    stampProof.partials.clear();
     const auto range = [&](std::uint64_t address, std::uint64_t bytes) {
         if (address != 0 && bytes != 0) stampProof.ranges.emplace_back(address, address + bytes);
     };
@@ -4006,7 +4016,13 @@ void ShaderResources::rememberStampProof(std::uint64_t generation, const Resourc
         range(own.baseAddress, source->GuestBytes());
         if (own.dccAddress != 0) range(own.dccAddress, DccKeyBytes(source->GuestBytes()));
     };
-    for (const auto& surface : validatedTextures) {
+    for (std::size_t index = 0; index < validatedTextures.size(); ++index) {
+        const auto& surface = validatedTextures[index];
+        if (surface.committed.has_value()) {
+            for (const auto& [begin, end] : *surface.committed) range(begin, end - begin);
+            stampProof.partials.push_back(index);
+            continue;
+        }
         range(surface.resource.baseAddress, surface.bytes);
         if (surface.resource.dccAddress != 0) range(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
         image(surface.source);
@@ -4019,9 +4035,40 @@ void ShaderResources::rememberStampProof(std::uint64_t generation, const Resourc
     stampProofCounters().remembered.fetch_add(1, std::memory_order_relaxed);
 }
 
+// canRememberResourceEpoch, but a partially committed snapshot surface (no source, uncompressed,
+// stamped) is admitted: the stamp memo covers its committed ranges (the commit generation is one of
+// its serials) and repeats its registry checks (finishPartialSnapshots) at every use.
+bool ShaderResources::stampEligible() const {
+    if (validatedTextures.size() != textures.size()) return false;
+    if (HoldsReleasedTexture() || !HasCachedStorageImages()) return false;
+    const auto trackedKeys = [](const GuestTextureResource& resource, std::uint64_t bytes) {
+        return resource.dccAddress == 0 || GuestMemory::Watched(resource.dccAddress, DccKeyBytes(bytes));
+    };
+    for (const auto& surface : validatedTextures) {
+        if (!surface.valid || surface.depth || DepthSurfaceOverlaps(context.device, surface.resource.baseAddress, surface.bytes)) return false;
+        if (surface.committed.has_value()) {
+            if (surface.source != nullptr || surface.keys != DccKeys::Uncompressed || surface.generation == 0 || surface.committed->empty()) return false;
+            for (const auto& [begin, end] : *surface.committed) {
+                if (end <= begin || !GuestMemory::Watched(begin, static_cast<std::size_t>(end - begin))) return false;
+            }
+            continue;
+        }
+        if (!trackedKeys(surface.resource, surface.bytes) || (surface.source == nullptr ? surface.generation == 0 : surface.source->Generation() == 0)) return false;
+        if (!GuestMemory::Watched(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes))) return false;
+        if (surface.source != nullptr && !trackedKeys(surface.source->Descriptor(), surface.source->GuestBytes())) return false;
+    }
+    for (const auto& image : storageTextures) {
+        if (image == nullptr) return false;
+        if (DepthSurfaceOverlaps(context.device, image->Descriptor().baseAddress, image->GuestBytes())) return false;
+        if (image->Generation() == 0 || !trackedKeys(image->Descriptor(), image->GuestBytes()) || !GuestMemory::Watched(image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()))) return false;
+    }
+    return true;
+}
+
 bool ShaderResources::canRememberResourceEpoch() const {
     const auto fail = [](EpochIneligible reason) {
         if (BuildProfiled()) Revalidations().epochIneligible[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+        if (stampProofsActive() && static_cast<std::size_t>(reason) < 5) stampProofCounters().ineligible[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
         return false;
     };
     if (validatedTextures.size() != textures.size()) return fail(EpochIneligible::Records);
