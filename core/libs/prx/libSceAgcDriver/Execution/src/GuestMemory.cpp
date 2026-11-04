@@ -1038,6 +1038,8 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 // Write generations: host writes (file I/O, AIO, network) into guest memory. Meta at the start, so
 // a capture made while the host write runs never reads clean; data and cpu once it finished.
 void noteHostWriteGen(std::uintptr_t address, std::size_t bytes, bool end) {
+    // Stage 4 M3 (APS5_WT_FAULT_CENSUS): pages an HLE host write (ReadFile, AIO, ...) stored, at its end.
+    if (end) Stage4::NoteHostWrite(address, bytes);
     if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address || !Gen::Active()) return;
     if (end) static_cast<void>(Gen::Note(Gen::Event::HostWriteEnd, address, address + bytes, Gen::Data | Gen::Cpu, 0, false));
     else static_cast<void>(Gen::Note(Gen::Event::HostWriteBegin, address, address + bytes, Gen::Meta, 0, false));
@@ -2164,6 +2166,8 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     const auto kind = runs.kind;
     if (end <= begin) return;
     ++runs.stamped;
+    // Stage 4 M3 (APS5_WT_FAULT_CENSUS): every dirty page the OS reported, whoever stored it.
+    Stage4::NoteCollectedPages(begin, end);
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
     else tracker.noteWalkStore(begin, end, generation);
@@ -3982,6 +3986,8 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
     const census::Scope censusScope("store_own");
+    const Stage4::TrackerScope stage4Scope(true, address, bytes);
+    Stage4::NoteDriverWrite(address, bytes);
     BreakProofs();
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
@@ -4075,11 +4081,15 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes, std::source_location site) {
     const census::Scope censusScope("mark_written", &site);
+    const Stage4::TrackerScope stage4Scope(true, address, bytes);
+    Stage4::NoteDriverWrite(address, bytes);
     return markWritten(address, bytes, true);
 }
 
 std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes, std::source_location site) {
     const census::Scope censusScope("mark_written", &site);
+    const Stage4::TrackerScope stage4Scope(true, address, bytes);
+    Stage4::NoteDriverWrite(address, bytes);
     return markWritten(address, bytes, false);
 }
 
