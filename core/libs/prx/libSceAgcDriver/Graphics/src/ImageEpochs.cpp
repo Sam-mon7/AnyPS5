@@ -125,6 +125,16 @@ void stampObserver(std::uint64_t begin, std::uint64_t end, GuestMemory::TrackerE
 
 std::atomic<std::uint64_t> hotPages{0};
 std::atomic<std::uint64_t> hotChecks{0};
+std::atomic<std::uint64_t> storedPages{0};
+std::atomic<std::uint64_t> storedHotPages{0};
+
+bool storedPage(std::uint64_t page) {
+    return GuestArena::GuestWtFaultStoredLastFrame_nid_no_patch(static_cast<std::uintptr_t>(page));
+}
+
+bool storedHotPage(std::uint64_t page) {
+    return GuestArena::GuestWtFaultStoredLastFrame_nid_no_patch(static_cast<std::uintptr_t>(page)) && (GuestArena::GuestWtFaultWord_nid_no_patch(static_cast<std::uintptr_t>(page)) & GuestArena::WtFaultStateMask) == GuestArena::WtFaultOpen;
+}
 
 bool openPage(std::uint64_t page) {
     return (GuestArena::GuestWtFaultWord_nid_no_patch(static_cast<std::uintptr_t>(page)) & GuestArena::WtFaultStateMask) == GuestArena::WtFaultOpen;
@@ -133,6 +143,8 @@ bool openPage(std::uint64_t page) {
 void armObserver() {
     if (!ImageEpochs::CensusEnabled()) return;
     hotPages.fetch_add(ImageEpochs::Get().CountImagePages(&openPage), std::memory_order_relaxed);
+    storedPages.fetch_add(ImageEpochs::Get().CountImagePages(&storedPage), std::memory_order_relaxed);
+    storedHotPages.fetch_add(ImageEpochs::Get().CountImagePages(&storedHotPage), std::memory_order_relaxed);
     hotChecks.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -183,6 +195,8 @@ void ImageEpochs::InstallHooks() {
         GuestMemory::SetArmObserver(&armObserver);
         AgcDriver::ArchB::Recorder::RegisterCounter("archc_census_image_hot_pages", hotPages);
         AgcDriver::ArchB::Recorder::RegisterCounter("archc_census_image_hot_arms", hotChecks);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_census_image_stored_pages", storedPages);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_census_image_stored_hot_pages", storedHotPages);
         return true;
     }();
     static_cast<void>(installed);

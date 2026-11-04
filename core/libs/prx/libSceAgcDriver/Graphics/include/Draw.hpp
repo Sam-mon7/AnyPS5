@@ -71,6 +71,15 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
 std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery, DrawPreparation& out, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads);
 // pipe_resolve_pipeline_* counters (Draw's use of a speculated pipeline).
 std::string ResolvePipelineText();
+struct ArchcTargetTotals {
+    std::uint64_t lookups = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t tokens = 0;
+    std::uint64_t legacyPasses = 0;
+    std::uint64_t verifyChecks = 0;
+    std::uint64_t verifyMismatches = 0;
+};
+ArchcTargetTotals ArchcTargetCounts();
 void RecheckDrawPreparation(const Context& context, DrawPreparation& preparation);
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw

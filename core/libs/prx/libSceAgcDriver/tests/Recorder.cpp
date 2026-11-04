@@ -4,6 +4,7 @@
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
@@ -10946,6 +10947,177 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
     return true;
 }
 
+int archcTargetTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
+    const bool on = Switches::Enabled(Feature::ArchcTargetFastpath) && Switches::Enabled(Feature::ArchcImageEpochs);
+    const char* verifyText = std::getenv("APS5_ARCHB_C_TARGET_FASTPATH_VERIFY");
+    const bool verify = verifyText != nullptr && std::string_view(verifyText) == "1";
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 2;
+    void* watched = AllocateWatched(bytes, unit);
+    if (watched == nullptr) return 77;
+    struct Release {
+        void* watched;
+        ~Release() { ReleaseWatched(watched, bytes); }
+    } release{watched};
+    auto* block = static_cast<std::byte*>(watched);
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (HostImportFor(context, address, bytes) == nullptr) return 77;
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    if (on) Require(GuestArena::GuestWtFaultEnabled_nid_no_patch(), "the fast path needs the fault tracker, which is off");
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto vertex = shader(COVER_VERT_SPV, 201);
+    auto pixel = shader(COVER_FRAG_SPV, 202);
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+    const auto stateFor = [](std::uint64_t base, VkFormat format, std::int32_t width) {
+        State state{};
+        state.stages.path = ShaderPath::Vertex;
+        state.color = {base, {64, 64}, format, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+        state.colors = {state.color};
+        state.hasColorTarget = true;
+        state.renderExtent = {64, 64};
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state.viewport = {0, 64, 64, -64, 0, 1};
+        state.scissor = {{0, 0}, {static_cast<std::uint32_t>(width), 64}};
+        state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        state.blend.colorWriteMask = 15;
+        state.blends = {state.blend};
+        return state;
+    };
+    const auto whole = stateFor(address, VK_FORMAT_R8G8B8A8_UNORM, 64);
+    const auto left = stateFor(address, VK_FORMAT_R8G8B8A8_UNORM, 32);
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    const auto draw = [&](const State& state) {
+        Draw(context, state, triangle, shaders);
+        WaitForOptimizedPipelines(context.device);
+    };
+    const auto settle = [&] {
+        StorageTexture::FlushAllPending("archc test");
+        recorder.Sync();
+        AgcDriver::GuestMemory::WtFaultFlip();
+    };
+    const auto counts = [] { return ArchcTargetCounts(); };
+    for (int i = 0; i < 4; ++i) {
+        draw(whole);
+        settle();
+    }
+    draw(whole);
+    draw(whole);
+    const auto warmed = counts();
+    if (on) Require(warmed.tokens != 0, "no target token was made over armed, unchanged pages");
+    else Require(warmed.hits == 0 && warmed.tokens == 0, "the fast path ran with its switches off");
+    if (scenario == "fast_hit") {
+        const auto before = counts();
+        draw(whole);
+        const auto after = counts();
+        if (on) Require(after.hits == before.hits + 1 && (verify || after.legacyPasses == before.legacyPasses), "a draw into an unchanged target did not take the fast path");
+        else Require(after.hits == before.hits, "a hit was counted with the switches off");
+        if (verify) Require(after.verifyChecks == before.verifyChecks + 1 && after.verifyMismatches == 0, "VERIFY did not check the hit or counted a mismatch on a clean hit");
+        std::cout << "agc_archc_target_fast_hit: ok\n";
+        return 0;
+    }
+    if (scenario == "cpu_store_after_token" || scenario == "open_page_no_token") {
+        settle();
+        draw(whole);
+        const auto before = counts();
+        std::fill_n(block, unit, std::byte{0x40});
+        draw(left);
+        const auto after = counts();
+        Require(after.hits == before.hits, "a draw after a CPU store into its target took the fast path");
+        std::vector<std::byte> texels(64 * 64 * 4);
+        ReadColorTarget(left.color, texels);
+        for (std::size_t y = 0; y < 64; ++y) {
+            for (std::size_t x = 0; x < 64; ++x) {
+                const auto expected = x < 32 ? std::byte{255} : std::byte{0x40};
+                for (std::size_t channel = 0; channel < 4; ++channel) Require(texels[(y * 64 + x) * 4 + channel] == expected, "the CPU's bytes did not survive in the undrawn half (the image was not re-uploaded)");
+            }
+        }
+        std::cout << "agc_archc_target_cpu_store_after_token: ok\n";
+        if (scenario == "cpu_store_after_token") return 0;
+        const auto open = counts();
+        draw(whole);
+        draw(whole);
+        if (on) Require(counts().hits == open.hits, "a token was made while a target page was open");
+        settle();
+        draw(whole);
+        const auto armed = counts();
+        draw(whole);
+        if (on) Require(counts().hits == armed.hits + 1, "no token after the page was armed again");
+        std::cout << "agc_archc_target_open_page_no_token: ok\n";
+        return 0;
+    }
+    if (scenario == "alias_pending") {
+        const auto alias = stateFor(address, VK_FORMAT_R16G16_UNORM, 64);
+        draw(alias);
+        const std::array range{std::pair{address, address + unit}};
+        const auto before = counts();
+        const bool aliasPending = StorageTexture::AnyPendingOverlaps(range);
+        draw(whole);
+        if (on && aliasPending) Require(counts().hits == before.hits, "a draw took the fast path while another image over its memory was pending");
+        std::vector<std::byte> texels(64 * 64 * 4);
+        ReadColorTarget(whole.color, texels);
+        Require(std::all_of(texels.begin(), texels.end(), [](std::byte value) { return value == std::byte{255}; }), "the target lost its texels across the alias");
+        std::cout << "agc_archc_target_alias_pending: ok (alias pending " << aliasPending << ")\n";
+        return 0;
+    }
+    if (scenario == "verify") {
+        Require(verify && on, "the verify scenario needs the switches and VERIFY");
+        const auto before = counts();
+        draw(whole);
+        const auto clean = counts();
+        Require(clean.verifyChecks == before.verifyChecks + 1 && clean.verifyMismatches == before.verifyMismatches, "VERIFY counted a mismatch on a clean hit");
+        settle();
+        draw(whole);
+        draw(whole);
+        using AgcDriver::Graphics::ArchC::EpochSource;
+        using AgcDriver::Graphics::ArchC::ImageEpochs;
+        for (const auto source : {EpochSource::CpuStore, EpochSource::TrackerStamp}) ImageEpochs::SetSuppressed(source, true);
+        const auto quiet = counts();
+        std::fill_n(block + 48 * 4, 16, std::byte{0x41});
+        draw(whole);
+        for (const auto source : {EpochSource::CpuStore, EpochSource::TrackerStamp}) ImageEpochs::SetSuppressed(source, false);
+        const auto missed = counts();
+        Require(missed.hits == quiet.hits + 1 && missed.verifyMismatches == quiet.verifyMismatches + 1, "VERIFY did not count the hit whose invalidation hooks were disabled");
+        std::cout << "agc_archc_target_verify: ok\n";
+        return 0;
+    }
+    throw std::runtime_error("unknown Arch C target scenario");
+}
+
 std::uint64_t processPrivateBytes() {
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS_EX counters{};
@@ -12912,6 +13084,9 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (argc == 3 && std::string_view(argv[1]) == "--archc-target") {
+            return archcTargetTests(device, recorder, argv[2]);
+        }
         if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported")) {
             return vertexTargetRangeTests(device, recorder, std::string_view(argv[1]) == "--vertex-target-range-imported") ? 0 : 77;
         }
