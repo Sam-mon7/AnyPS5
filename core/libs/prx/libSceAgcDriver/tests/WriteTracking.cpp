@@ -2306,6 +2306,26 @@ void CheckWtFaultConsumers() {
 #endif
 
 #ifdef _WIN32
+void CheckArchcSwitches() {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    const AgcDriver::ArchB::SwitchInfo* epochs = nullptr;
+    const AgcDriver::ArchB::SwitchInfo* fastpath = nullptr;
+    for (const auto& entry : Switches::Table()) {
+        if (entry.feature == Feature::ArchcImageEpochs) epochs = &entry;
+        if (entry.feature == Feature::ArchcTargetFastpath) fastpath = &entry;
+    }
+    Require(epochs != nullptr && fastpath != nullptr, "the Arch C switches are not in the table");
+    Require(std::string_view(epochs->name) == "C_IMAGE_EPOCHS" && std::string_view(fastpath->name) == "C_TARGET_FASTPATH", "the Arch C switch names changed");
+    Require(!epochs->defaultOn && !fastpath->defaultOn && epochs->runtime && fastpath->runtime, "the Arch C switches are not default-off runtime switches");
+    Require(epochs->prerequisites.size() == 2 && epochs->prerequisites[0] == Feature::WtFault && epochs->prerequisites[1] == Feature::WtFaultConsumers, "C_IMAGE_EPOCHS does not require WT_FAULT and WT_FAULT_CONSUMERS");
+    Require(fastpath->prerequisites.size() == 1 && fastpath->prerequisites[0] == Feature::ArchcImageEpochs, "C_TARGET_FASTPATH does not require C_IMAGE_EPOCHS");
+    const char* fast = std::getenv("APS5_ARCHB_C_TARGET_FASTPATH");
+    const char* image = std::getenv("APS5_ARCHB_C_IMAGE_EPOCHS");
+    if (fast != nullptr && std::string_view(fast) == "1" && (image == nullptr || std::string_view(image) != "1")) Require(!Switches::Enabled(Feature::ArchcTargetFastpath), "C_TARGET_FASTPATH stayed on without C_IMAGE_EPOCHS");
+    std::cout << "agc_archc_switches: ok\n";
+}
+
 void CheckArchcLog() {
     using namespace GuestArena;
     Require(WtFault().active, "the fault tracker did not turn on with write watching");
@@ -3897,6 +3917,10 @@ int main(int argc, char** argv) {
             return 0;
         }
 #ifdef _WIN32
+        if (argc == 2 && std::string_view(argv[1]) == "--archc-switches") {
+            CheckArchcSwitches();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--archc-log") {
             CheckArchcLog();
             return 0;

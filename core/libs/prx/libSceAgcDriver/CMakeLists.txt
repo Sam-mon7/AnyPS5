@@ -1107,6 +1107,9 @@ if(BUILD_TESTING)
     set_tests_properties(agc_archb_wt_sync_skip agc_archb_wt_sync_skip_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0;APS5_ARCHB_WT_SYNC_SKIP=1")
     set_tests_properties(agc_archb_wt_sync_skip_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0;APS5_ARCHB_WT_SYNC_SKIP=1;APS5_ARCHB_WT_SYNC_SKIP_VERIFY=1")
     # Arch C P1: the fault log (store, forget, hold, overflow), cold pages, and the image-epoch index's event sources.
+    add_test(NAME agc_archc_switches COMMAND agc_write_tracking_tests --archc-switches)
+    set_tests_properties(agc_archc_switches PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_C_TARGET_FASTPATH=1"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     add_test(NAME agc_archc_log COMMAND agc_write_tracking_tests --archc-log)
     add_test(NAME agc_archc_epochs COMMAND agc_write_tracking_tests --archc-epochs)
     set_tests_properties(agc_archc_log agc_archc_epochs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
@@ -2742,6 +2745,23 @@ endforeach()
 target_sources(agc_driver_recorder_tests PRIVATE ${agcVertexRangeHeaders})
 
 if(BUILD_TESTING)
+    # Arch C P1 (C_IMAGE_EPOCHS + C_TARGET_FASTPATH): a color target whose epoch token holds skips its lookup and Refresh;
+    # a CPU store, an open page or another image pending over its memory sends it down the legacy path; VERIFY.
+    foreach(archcScenario fast_hit cpu_store_after_token open_page_no_token alias_pending)
+        add_test(NAME agc_archc_target_${archcScenario} COMMAND agc_driver_recorder_tests --archc-target ${archcScenario})
+        add_test(NAME agc_archc_target_${archcScenario}_off COMMAND agc_driver_recorder_tests --archc-target ${archcScenario})
+        set_tests_properties(agc_archc_target_${archcScenario} PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_IMAGE_EPOCHS=1;APS5_ARCHB_C_TARGET_FASTPATH=1")
+        set_tests_properties(agc_archc_target_${archcScenario}_off PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1")
+        set_tests_properties(agc_archc_target_${archcScenario} agc_archc_target_${archcScenario}_off PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archc_target_${archcScenario} agc_archc_target_${archcScenario}_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    add_test(NAME agc_archc_target_verify COMMAND agc_driver_recorder_tests --archc-target verify)
+    set_tests_properties(agc_archc_target_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_IMAGE_EPOCHS=1;APS5_ARCHB_C_TARGET_FASTPATH=1;APS5_ARCHB_C_TARGET_FASTPATH_VERIFY=1")
+    if(WIN32)
+        set_tests_properties(agc_archc_target_verify PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_vertex_target_range_copied COMMAND agc_driver_recorder_tests --vertex-target-range-copied)
     add_test(NAME agc_driver_vertex_target_range_imported COMMAND agc_driver_recorder_tests --vertex-target-range-imported)
     set_tests_properties(agc_driver_vertex_target_range_copied agc_driver_vertex_target_range_imported PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)

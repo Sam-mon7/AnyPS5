@@ -34,6 +34,8 @@ struct Leaf {
     // Driver-stored pages since the last arm (an arm leaves them open, see NoteDriverStore).
     std::atomic<std::uint64_t> hot[LeafPages / 64];
     std::atomic<std::uint64_t> cold[LeafPages / 64];
+    std::atomic<std::uint64_t> stored[LeafPages / 64];
+    std::atomic<std::uint64_t> storedLast[LeafPages / 64];
     // Hint: may hold open pages (an arm scans the leaf). Set by every transition to Open.
     std::atomic<std::uint32_t> open{0};
     // Pages not armed (any state but Armed): 0 with `newest` at most a clock answers a whole leaf.
@@ -174,6 +176,8 @@ Leaf& leafFor(State& state, std::uintptr_t address) {
     for (auto& reset : leaf->resets) reset.store(0, std::memory_order_relaxed);
     for (auto& bits : leaf->hot) bits.store(0, std::memory_order_relaxed);
     for (auto& bits : leaf->cold) bits.store(0, std::memory_order_relaxed);
+    for (auto& bits : leaf->stored) bits.store(0, std::memory_order_relaxed);
+    for (auto& bits : leaf->storedLast) bits.store(0, std::memory_order_relaxed);
     leaf->base = state.base + (((address - state.base) >> LeafShift) << LeafShift);
     leaf->next = state.allocated;
     state.allocated = leaf;
@@ -322,6 +326,10 @@ bool GuestWtFaultHandle_nid_no_patch(std::uintptr_t address) {
             logAppend(static_cast<std::uint64_t>(page) | WtFaultLogStore, 0, false);
             if (!finishOpening(state, page, page + PageBytes, isExec(value))) return false;
             // A page stored in this frame stays open across the next flip (see GuestWtFaultNoteStored).
+            {
+                const auto index = (page >> PageShift) & (LeafPages - 1);
+                leaf->stored[index / 64].fetch_or(std::uint64_t{1} << (index % 64), std::memory_order_relaxed);
+            }
             if (state.guestHot && !coldPage(*leaf, page)) {
                 const auto index = (page >> PageShift) & (LeafPages - 1);
                 leaf->hot[index / 64].fetch_or(std::uint64_t{1} << (index % 64), std::memory_order_relaxed);
@@ -395,7 +403,21 @@ void GuestWtFaultTrack_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
 }
 
 void GuestWtFaultNoteStored_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
-    if (!g_enabled.load(std::memory_order_acquire) || !g_state->guestHot) return;
+    if (!g_enabled.load(std::memory_order_acquire)) return;
+    {
+        auto& state = *g_state;
+        std::uintptr_t first = 0;
+        std::uintptr_t stop = 0;
+        if (clamp(state, address, bytes, first, stop)) {
+            for (auto page = first; page < stop; page += PageBytes) {
+                auto* leaf = leafAt(state, page);
+                if (leaf == nullptr) continue;
+                const auto index = (page >> PageShift) & (LeafPages - 1);
+                leaf->stored[index / 64].fetch_or(std::uint64_t{1} << (index % 64), std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!g_state->guestHot) return;
     GuestWtFaultNoteDriverStore_nid_no_patch(address, bytes);
 }
 
@@ -435,6 +457,7 @@ std::size_t arm(std::uintptr_t* reported, std::size_t capacity, std::uintptr_t* 
     std::uint64_t kept = 0;
     std::uint64_t scanned = 0;
     for (auto* leaf = state.allocated; leaf != nullptr; leaf = leaf->next) {
+        for (std::size_t group = 0; group < LeafPages / 64; ++group) leaf->storedLast[group].store(leaf->stored[group].exchange(0, std::memory_order_acq_rel), std::memory_order_release);
         if (leaf->open.exchange(0, std::memory_order_acq_rel) == 0) continue;
         ++scanned;
         bool stillOpen = false;
@@ -1008,6 +1031,16 @@ void GuestWtFaultLogAppendForTest_nid_no_patch(std::uint64_t entry) {
     logAppend(entry, 0, false);
 }
 
+bool GuestWtFaultStoredLastFrame_nid_no_patch(std::uintptr_t address) {
+    if (!g_enabled.load(std::memory_order_acquire)) return false;
+    const auto& state = *g_state;
+    if (address < state.base || address >= state.end) return false;
+    const auto* leaf = leafAt(state, address);
+    if (leaf == nullptr) return false;
+    const auto index = (address >> PageShift) & (LeafPages - 1);
+    return ((leaf->storedLast[index / 64].load(std::memory_order_acquire) >> (index % 64)) & 1) != 0;
+}
+
 #else
 
 void GuestWtFaultEnable_nid_no_patch(bool, std::uint64_t) {}
@@ -1047,6 +1080,7 @@ std::size_t GuestWtFaultLogRead_nid_no_patch(std::uint64_t*, std::uint64_t*, std
 }
 void GuestWtFaultSetCold_nid_no_patch(std::uintptr_t, std::size_t, bool) {}
 void GuestWtFaultLogAppendForTest_nid_no_patch(std::uint64_t) {}
+bool GuestWtFaultStoredLastFrame_nid_no_patch(std::uintptr_t) { return false; }
 
 #endif
 

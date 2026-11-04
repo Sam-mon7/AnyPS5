@@ -31,6 +31,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <bit>
 #include <exception>
 #include <array>
 #include <atomic>
@@ -2168,6 +2169,8 @@ struct Token {
     ArchC::EpochCensus census{};
     std::array<ArchC::EpochRange, 3> ranges{};
     std::size_t rangeCount = 0;
+    bool registered = false;
+    bool cmaskRegistered = false;
 };
 
 constexpr std::size_t TableSize = 64;
@@ -2353,6 +2356,237 @@ private:
     std::shared_ptr<StorageTexture> current;
     Refusal refusal = RefusalCount;
     std::uint64_t checkNs = 0;
+};
+
+enum FastRefusal : std::size_t { FastNone, FastImage, FastCached, FastKeys, FastEpoch, FastLoss, FastCmask, FastFmask, FastArray, FastMsaa, FastSurface, FastDrain, FastLinear, FastRefusalCount };
+constexpr std::array<const char*, FastRefusalCount> FastRefusalNames{"none", "image", "cached", "keys", "epoch", "loss", "cmask", "fmask", "array", "msaa", "surface", "drain", "linear"};
+enum TokenRefusal : std::size_t { TokenImage, TokenEpoch, TokenOpen, TokenLoss, TokenSurface, TokenDrain, TokenPending, TokenDepth, TokenRefusalCount };
+constexpr std::array<const char*, TokenRefusalCount> TokenRefusalNames{"image", "epoch", "open", "loss", "surface", "drain", "pending", "depth"};
+
+struct FastCounters {
+    std::atomic<std::uint64_t> lookups{0}, hits{0}, tokens{0}, verifyChecks{0}, verifyMismatches{0}, prelockSkips{0}, legacyPasses{0};
+    std::array<std::atomic<std::uint64_t>, FastRefusalCount> refused{};
+    std::array<std::atomic<std::uint64_t>, TokenRefusalCount> tokenRefused{};
+    FastCounters() {
+        using AgcDriver::ArchB::Recorder;
+        Recorder::RegisterCounter("archc_target_fast_lookups", lookups);
+        Recorder::RegisterCounter("archc_target_fast_hits", hits);
+        Recorder::RegisterCounter("archc_target_tokens", tokens);
+        Recorder::RegisterCounter("archc_target_legacy_passes", legacyPasses);
+        Recorder::RegisterCounter("archc_target_verify_checks", verifyChecks);
+        Recorder::RegisterCounter("archc_target_verify_mismatches", verifyMismatches);
+        Recorder::RegisterCounter("archc_target_prelock_skips", prelockSkips);
+        for (std::size_t i = 0; i < FastRefusalCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_target_fast_refused_") + FastRefusalNames[i]))->c_str(), refused[i]);
+        for (std::size_t i = 0; i < TokenRefusalCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_target_token_refused_") + TokenRefusalNames[i]))->c_str(), tokenRefused[i]);
+    }
+};
+
+FastCounters& fastCounters() {
+    static FastCounters made;
+    return made;
+}
+
+bool fastActive() {
+    return AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ArchcTargetFastpath) && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ArchcImageEpochs) && GuestMemory::IsCommitterThread();
+}
+
+bool fastVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_TARGET_FASTPATH_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+bool admitCmask() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_TARGET_FASTPATH_CMASK");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t dccOf(const ColorTarget& color) {
+    return color.dccAddress != 0 ? color.dccAddress : color.chainDccAddress;
+}
+
+FastRefusal shapeRefusal(const ColorTarget& color) {
+    if (color.samples > 1) return FastMsaa;
+    if (color.arrayLastSlice != 0) return FastArray;
+    if (color.fmaskAddress != 0) return FastFmask;
+    if (color.cmaskAddress != 0 && !admitCmask()) return FastCmask;
+    if (color.tileMode == ColorTileMode::Linear) return FastLinear;
+    return FastRefusalCount;
+}
+
+Token* holdingToken(const Context& context, const ColorTarget& color, FastRefusal& refusal, std::shared_ptr<StorageTexture>& image) {
+    refusal = shapeRefusal(color);
+    if (refusal != FastRefusalCount) return nullptr;
+    if (!ArchC::ImageEpochs::Get().DrainIfNew()) {
+        refusal = FastDrain;
+        return nullptr;
+    }
+    const auto key = keyOf(context, color);
+    auto& slot = slotFor(key);
+    if (!slot.used || !slot.valid || slot.key != key) {
+        refusal = FastNone;
+        return nullptr;
+    }
+    image = slot.image.lock();
+    if (image == nullptr || image.get() != slot.raw) {
+        slot.valid = false;
+        refusal = FastImage;
+        return nullptr;
+    }
+    if (image->archcEpoch.load(std::memory_order_acquire) != slot.epoch) {
+        slot.valid = false;
+        refusal = FastEpoch;
+        return nullptr;
+    }
+    if (ArchC::ImageEpochs::Get().Loss() != slot.loss) {
+        slot.valid = false;
+        refusal = FastLoss;
+        return nullptr;
+    }
+    if (StorageSurfaceSerial() != slot.surfaceSerial) {
+        slot.valid = false;
+        refusal = FastSurface;
+        return nullptr;
+    }
+    return &slot;
+}
+
+std::shared_ptr<StorageTexture> tryTarget(const Context& context, const ColorTarget& color, const StorageTexture* stored) {
+    auto& counters = fastCounters();
+    counters.lookups.fetch_add(1, std::memory_order_relaxed);
+    FastRefusal refusal = FastRefusalCount;
+    std::shared_ptr<StorageTexture> image;
+    auto* slot = holdingToken(context, color, refusal, image);
+    if (slot != nullptr && stored != nullptr && stored != image.get()) {
+        slot = nullptr;
+        refusal = FastImage;
+    }
+    if (slot != nullptr && !StorageImageServesKeys(*image, dccOf(color))) {
+        slot = nullptr;
+        refusal = FastKeys;
+    }
+    if (slot != nullptr && stored == nullptr && !StorageImageCached(context, image.get())) {
+        slot->valid = false;
+        slot = nullptr;
+        refusal = FastCached;
+    }
+    if (slot == nullptr) {
+        counters.refused[refusal].fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    image->NoteProved();
+    counters.hits.fetch_add(1, std::memory_order_relaxed);
+    return image;
+}
+
+bool tokenHolds(const Context& context, const ColorTarget& color) {
+    FastRefusal refusal = FastRefusalCount;
+    std::shared_ptr<StorageTexture> image;
+    return holdingToken(context, color, refusal, image) != nullptr && StorageImageServesKeys(*image, dccOf(color));
+}
+
+class LegacyPass {
+public:
+    LegacyPass(const Context& context, const ColorTarget& color) : context(context), color(color) {
+        if (!fastActive() || shapeRefusal(color) != FastRefusalCount) return;
+        active = true;
+        fastCounters().legacyPasses.fetch_add(1, std::memory_order_relaxed);
+        key = keyOf(context, color);
+        slot = &slotFor(key);
+        if (slot->used && slot->key == key) before = slot->image.lock();
+        if (before != nullptr && before.get() == slot->raw && (!slot->registered || (color.cmaskAddress != 0 && !slot->cmaskRegistered))) {
+            ArchC::ImageEpochs::RegisterImage(*before, color.cmaskAddress, color.cmaskBytes);
+            slot->registered = true;
+            slot->cmaskRegistered = color.cmaskAddress != 0;
+        }
+        drained = ArchC::ImageEpochs::Get().DrainIfNew();
+        if (before != nullptr) epochBefore = before->archcEpoch.load(std::memory_order_acquire);
+        lossBefore = ArchC::ImageEpochs::Get().Loss();
+        serialBefore = StorageSurfaceSerial();
+    }
+
+    void Finish(const std::shared_ptr<StorageTexture>& resident) {
+        if (!active) return;
+        auto& counters = fastCounters();
+        auto& token = *slot;
+        if (resident == nullptr) {
+            token = Token{};
+            return;
+        }
+        if (!token.used || token.key != key || token.raw != resident.get()) {
+            token = Token{};
+            token.key = key;
+            token.used = true;
+            token.image = resident;
+            token.raw = resident.get();
+        }
+        token.valid = false;
+        const auto refuse = [&](TokenRefusal refusal) { counters.tokenRefused[refusal].fetch_add(1, std::memory_order_relaxed); };
+        if (before != resident) {
+            if (!ArchC::ImageEpochs::Get().Registered(*resident) || color.cmaskAddress != 0) ArchC::ImageEpochs::RegisterImage(*resident, color.cmaskAddress, color.cmaskBytes);
+            token.registered = true;
+            token.cmaskRegistered = color.cmaskAddress != 0;
+            return refuse(TokenImage);
+        }
+        const bool drainedAfter = ArchC::ImageEpochs::Get().DrainIfNew();
+        if (!drained || !drainedAfter) return refuse(TokenDrain);
+        if (resident->archcEpoch.load(std::memory_order_acquire) != epochBefore) return refuse(TokenEpoch);
+        if (ArchC::ImageEpochs::Get().Loss() != lossBefore) return refuse(TokenLoss);
+        if (StorageSurfaceSerial() != serialBefore) return refuse(TokenSurface);
+        std::array<ArchC::EpochRange, 3> ranges{};
+        const auto used = rangesOf(*resident, color, ranges);
+        if (!rangesArmed(std::span<const ArchC::EpochRange>(ranges.data(), used), GuestArena::GuestWtFaultClock_nid_no_patch())) return refuse(TokenOpen);
+        std::array<StorageTexture::PendingQuery, 1> pending{{{ranges[0].begin, ranges[0].end, resident.get(), nullptr, false}}};
+        StorageTexture::ScanPending(pending);
+        if (pending[0].overlaps) return refuse(TokenPending);
+        if (DepthSurfaceOverlaps(context.device, ranges[0].begin, ranges[0].end - ranges[0].begin)) return refuse(TokenDepth);
+        token.valid = true;
+        token.epoch = epochBefore;
+        token.loss = lossBefore;
+        token.surfaceSerial = serialBefore;
+        counters.tokens.fetch_add(1, std::memory_order_relaxed);
+    }
+
+private:
+    const Context& context;
+    const ColorTarget& color;
+    bool active = false;
+    bool drained = false;
+    TargetKey key{};
+    Token* slot = nullptr;
+    std::shared_ptr<StorageTexture> before;
+    std::uint64_t epochBefore = 0;
+    std::uint64_t lossBefore = 0;
+    std::uint64_t serialBefore = 0;
+};
+
+class VerifyHit {
+public:
+    explicit VerifyHit(const std::shared_ptr<StorageTexture>& fast) : fast(fast) {
+        if (fast == nullptr) return;
+        version = fast->Version();
+        epoch = fast->archcEpoch.load(std::memory_order_acquire);
+    }
+
+    void Check(const std::shared_ptr<StorageTexture>& resident) const {
+        if (fast == nullptr) return;
+        auto& counters = fastCounters();
+        counters.verifyChecks.fetch_add(1, std::memory_order_relaxed);
+        if (resident != fast || fast->Version() != version || fast->archcEpoch.load(std::memory_order_acquire) != epoch) {
+            const auto previous = counters.verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+            if (previous < 8) std::fprintf(stderr, "[archc] target fast-path VERIFY mismatch: image 0x%llx (%s)\n", static_cast<unsigned long long>(fast->Descriptor().baseAddress), resident != fast ? "another image" : fast->Version() != version ? "refreshed" : "invalidated during the legacy pass");
+        }
+    }
+
+private:
+    std::shared_ptr<StorageTexture> fast;
+    std::uint64_t version = 0;
+    std::uint64_t epoch = 0;
 };
 
 }
@@ -3600,17 +3834,22 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
         const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
+        static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
+        static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
+        auto fastResident = residentTargets && context.detiler != nullptr && archcTargets::fastActive() ? archcTargets::tryTarget(context, color, nullptr) : nullptr;
+        const bool fastHit = fastResident != nullptr && !archcTargets::fastVerify();
+        const archcTargets::VerifyHit verifyHit(fastHit ? nullptr : fastResident);
         const auto censusDepthStart = archcTargets::censusActive() ? archcTargets::nowNs() : 0;
-        PrepareColorTargetDepth(context.device, color.address, colorLayout.Bytes());
+        if (!fastHit) PrepareColorTargetDepth(context.device, color.address, colorLayout.Bytes());
         const auto censusDepthNs = censusDepthStart != 0 ? archcTargets::nowNs() - censusDepthStart : 0;
         if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         timer.phase(PhaseSetup);
-        // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
-        static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
-        static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
         const bool linearResident = residentLinear && color.tileMode == ColorTileMode::Linear && ExistingHostImportFor(context, color.address, colorLayout.Bytes()) != nullptr;
-        if ((binding.gpuTiling || ((color.tileMode != ColorTileMode::Linear || linearResident) && context.detiler != nullptr)) && residentTargets) {
+        if (fastHit) {
+            binding.resident = std::move(fastResident);
+        } else if ((binding.gpuTiling || ((color.tileMode != ColorTileMode::Linear || linearResident) && context.detiler != nullptr)) && residentTargets) {
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
             // UnchangedSince). The page walk is skipped while the worker's collect epoch lasts
@@ -3638,7 +3877,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             };
             archcTargets::CensusProbe censusProbe(context, color, false);
             const auto censusStart = censusProbe.Active() ? archcTargets::nowNs() : 0;
+            archcTargets::LegacyPass legacyPass(context, color);
             binding.resident = withTargetLookup(lookup, [&](const TargetLookup& target) { return refreshResidentTarget(context, state, color, draw, shaders, outcome, profile, target, targetPreparation); });
+            verifyHit.Check(binding.resident);
+            legacyPass.Finish(binding.resident);
             if (censusProbe.Active()) {
                 const auto blockNs = archcTargets::nowNs() - censusStart;
                 const auto prelock = index < 8 ? std::exchange(archcTargets::prelockNs()[index], 0) : 0;
@@ -4334,10 +4576,19 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
     static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
     const bool census = archcTargets::censusActive();
     if (census) archcTargets::prelockNs().fill(0);
+    const bool fastTargets = archcTargets::fastActive() && !archcTargets::fastVerify();
+    std::uint64_t fastSkipped = 0;
+    if (fastTargets && collect && residentTargets && context.detiler != nullptr) {
+        for (std::size_t colorIndex = 0; colorIndex < state.colors.size() && colorIndex < 64; ++colorIndex) {
+            if (archcTargets::tokenHolds(context, state.colors[colorIndex])) fastSkipped |= std::uint64_t{1} << colorIndex;
+        }
+        if (fastSkipped != 0) archcTargets::fastCounters().prelockSkips.fetch_add(static_cast<std::uint64_t>(std::popcount(fastSkipped)), std::memory_order_relaxed);
+    }
     if (collect && residentTargets && context.detiler != nullptr) {
         for (std::size_t colorIndex = 0; colorIndex < state.colors.size(); ++colorIndex) {
             const auto& color = state.colors[colorIndex];
             if (color.samples != 1 || (color.tileMode == ColorTileMode::Linear && !residentLinear)) continue;
+            if (colorIndex < 64 && ((fastSkipped >> colorIndex) & 1) != 0) continue;
             const auto censusStart = census ? archcTargets::nowNs() : 0;
             struct CensusSpan {
                 bool census;
@@ -4384,6 +4635,7 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         for (std::size_t index = 0; index < state.colors.size(); ++index) {
             const auto& color = state.colors[index];
             if (color.samples != 1 || (color.tileMode == ColorTileMode::Linear && !residentLinear)) continue;
+            if (index < 64 && ((fastSkipped >> index) & 1) != 0) continue;
             const auto censusStart = census ? archcTargets::nowNs() : 0;
             try {
                 const auto surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
@@ -4491,6 +4743,11 @@ std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4:
     return plan;
 }
 
+ArchcTargetTotals ArchcTargetCounts() {
+    auto& counters = archcTargets::fastCounters();
+    return {counters.lookups.load(), counters.hits.load(), counters.tokens.load(), counters.legacyPasses.load(), counters.verifyChecks.load(), counters.verifyMismatches.load()};
+}
+
 std::string ResolvePipelineText() {
     auto& counters = resolvePipelineCounters();
     const auto get = [](const std::atomic<std::uint64_t>& value) { return std::to_string(value.load(std::memory_order_relaxed)); };
@@ -4559,6 +4816,13 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
+        auto fastStored = archcTargets::fastActive() ? archcTargets::tryTarget(context, state.colors[index], stored.get()) : nullptr;
+        if (fastStored != nullptr && !archcTargets::fastVerify()) {
+            timer.phase(PhaseReadTarget);
+            targets.push_back(std::move(fastStored));
+            continue;
+        }
+        const archcTargets::VerifyHit verifyHit(fastStored);
         auto* targetPreparation = preparation != nullptr && preparation->device == context.device && index < preparation->targets.size() ? &preparation->targets[index] : nullptr;
         const auto lookup = [&](StorageTexture::RefreshPreparation* targetProof) {
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
@@ -4567,7 +4831,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         };
         archcTargets::CensusProbe censusProbe(context, state.colors[index], true);
         const auto censusStart = censusProbe.Active() ? archcTargets::nowNs() : 0;
+        archcTargets::LegacyPass legacyPass(context, state.colors[index]);
         auto resident = withTargetLookup(lookup, [&](const TargetLookup& target) { return refreshResidentTarget(context, state, state.colors[index], draw, shaders, outcome, profile, target, targetPreparation); });
+        verifyHit.Check(resident);
+        legacyPass.Finish(resident);
         if (censusProbe.Active()) {
             const auto blockNs = archcTargets::nowNs() - censusStart;
             const auto prelock = index < 8 ? std::exchange(archcTargets::prelockNs()[index], 0) : 0;

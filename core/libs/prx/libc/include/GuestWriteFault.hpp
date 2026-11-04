@@ -153,6 +153,7 @@ std::uint64_t GuestWtFaultLogHead_nid_no_patch();
 std::size_t GuestWtFaultLogRead_nid_no_patch(std::uint64_t* cursor, std::uint64_t* entries, std::size_t capacity, bool* lost);
 void GuestWtFaultSetCold_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool cold);
 void GuestWtFaultLogAppendForTest_nid_no_patch(std::uint64_t entry);
+bool GuestWtFaultStoredLastFrame_nid_no_patch(std::uintptr_t address);
 
 }
 
