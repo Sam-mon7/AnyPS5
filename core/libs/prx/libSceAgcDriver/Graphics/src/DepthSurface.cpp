@@ -11,6 +11,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -1775,6 +1777,8 @@ StalePlanes& stalePlanes() {
     return *planes;
 }
 
+std::atomic<std::uint64_t> stalePlanesSerial{0};
+
 void publishStaleHull(StalePlanes& planes) {
     auto begin = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t end = 0;
@@ -1791,6 +1795,7 @@ void noteStalePlane(std::uint64_t begin, std::uint64_t end) {
     std::lock_guard lock(planes.mutex);
     if (std::find(planes.ranges.begin(), planes.ranges.end(), std::pair{begin, end}) != planes.ranges.end()) return;
     planes.ranges.emplace_back(begin, end);
+    stalePlanesSerial.fetch_add(1, std::memory_order_release);
     publishStaleHull(planes);
 }
 
@@ -1838,6 +1843,7 @@ void retire(DepthSurface& surface) {
     auto& planes = stalePlanes();
     std::lock_guard lock(planes.mutex);
     std::erase(planes.ranges, plane);
+    stalePlanesSerial.fetch_add(1, std::memory_order_release);
     publishStaleHull(planes);
 }
 
@@ -2158,6 +2164,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
         auto& planes = stalePlanes();
         std::lock_guard staleLock(planes.mutex);
         planes.ranges = std::move(remaining);
+        stalePlanesSerial.fetch_add(1, std::memory_order_release);
         publishStaleHull(planes);
     }
     for (auto& entry : stored) entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store");
@@ -2169,6 +2176,78 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
         entry.surface->NoteMemory();
     }
     return ranges;
+}
+
+namespace {
+struct ColorTargetDepthMemo {
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t planes = 0;
+    std::uint64_t surfaces = 0;
+    bool valid = false;
+};
+
+struct ColorTargetDepthCounters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> mismatches{0};
+};
+
+ColorTargetDepthCounters& colorTargetDepthCounters() {
+    static auto* made = [] {
+        auto* created = new ColorTargetDepthCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("target_setup_depth_hits", created->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("target_setup_depth_misses", created->misses);
+        AgcDriver::ArchB::Recorder::RegisterCounter("target_setup_depth_verified", created->verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("target_setup_depth_mismatches", created->mismatches);
+        return created;
+    }();
+    return *made;
+}
+}
+
+void PrepareColorTargetDepth(VkDevice device, std::uint64_t address, std::size_t bytes) {
+    if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::TargetSetupMemo)) {
+        static_cast<void>(FlushDepthPlanes(address, bytes, DepthPlaneScope::Whole));
+        RetireDepthSurfaces(device, address, bytes);
+        return;
+    }
+    thread_local ColorTargetDepthMemo memo;
+    const auto planes = stalePlanesSerial.load(std::memory_order_acquire);
+    const auto created = surfacesSerial.load(std::memory_order_acquire);
+    if (memo.valid && memo.device == device && memo.address == address && memo.bytes == bytes && memo.planes == planes && memo.surfaces == created) {
+        colorTargetDepthCounters().hits.fetch_add(1, std::memory_order_relaxed);
+        static const bool verify = [] {
+            const char* value = std::getenv("APS5_ARCHB_TARGET_SETUP_MEMO_VERIFY");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (!verify) return;
+        bool overlapped = false;
+        {
+            std::lock_guard lock(surfacesMutex());
+            overlapped = std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->context.device == device && !surface->retired && surface->Overlaps(address, bytes); });
+        }
+        const bool flushed = !FlushDepthPlanes(address, bytes, DepthPlaneScope::Whole).empty();
+        RetireDepthSurfaces(device, address, bytes);
+        colorTargetDepthCounters().verified.fetch_add(1, std::memory_order_relaxed);
+        if (overlapped || flushed) colorTargetDepthCounters().mismatches.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    colorTargetDepthCounters().misses.fetch_add(1, std::memory_order_relaxed);
+    memo.valid = false;
+    static_cast<void>(FlushDepthPlanes(address, bytes, DepthPlaneScope::Whole));
+    RetireDepthSurfaces(device, address, bytes);
+    const auto planesAfter = stalePlanesSerial.load(std::memory_order_acquire);
+    const auto createdAfter = surfacesSerial.load(std::memory_order_acquire);
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    if (overlapsStalePlane(address, end)) return;
+    {
+        std::lock_guard lock(surfacesMutex());
+        if (std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->context.device == device && !surface->retired && surface->Overlaps(address, bytes); })) return;
+    }
+    memo = {device, address, bytes, planesAfter, createdAfter, true};
 }
 
 DepthPlaneStoreStatistics DepthPlaneStoreCounts() {

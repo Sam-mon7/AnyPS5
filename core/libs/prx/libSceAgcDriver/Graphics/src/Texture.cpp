@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -4123,7 +4124,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
     // this image's content). An alias written since keeps its own newer results pending.
-    if (auto source = borrowedFrom.lock(); source != nullptr && borrowedUnits.size() == trackedLayers) {
+    if (auto source = borrowedUnits.size() == trackedLayers || !AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::TargetSetupMemo) ? borrowedFrom.lock() : std::shared_ptr<StorageTexture>{}; source != nullptr && borrowedUnits.size() == trackedLayers) {
         bool superseded = false;
         for (std::uint32_t unit = first; unit < first + count; ++unit) {
             if (!borrowedUnits[unit]) continue;
