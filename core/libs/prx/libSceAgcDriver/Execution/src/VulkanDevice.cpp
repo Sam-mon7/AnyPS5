@@ -370,6 +370,17 @@ PrivateComputeCounters& PrivateCounters() {
 }
 
 void NotePrivateDispatch(std::optional<PrivateFallback> fallback, std::uint64_t recordingNs) {
+    struct RecorderCounts {
+        std::atomic<std::uint64_t> recorded{0};
+        std::atomic<std::uint64_t> fallbacks{0};
+    };
+    static RecorderCounts* const recorderCounts = [] {
+        auto* counts = new RecorderCounts;
+        ArchB::Recorder::RegisterCounter("private_compute_recorded", counts->recorded);
+        ArchB::Recorder::RegisterCounter("private_compute_fallbacks", counts->fallbacks);
+        return counts;
+    }();
+    (fallback ? recorderCounts->fallbacks : recorderCounts->recorded).fetch_add(1, std::memory_order_relaxed);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
     auto& counters = PrivateCounters();
@@ -5448,7 +5459,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         else if (ready->committed || record.resources != ready->resources || record.objects != ready->objects || record.pushStages != ready->pushStages || *record.pushBytes != ready->pushBytes || std::array{record.x, record.y, record.z} != ready->groups || !Graphics::HostImportEpochUnchanged(ready->imports)) fallback = PrivateFallback::Changed;
         else if (!recorder.CanExecutePrivate()) fallback = PrivateFallback::Query;
         privateReady = !fallback.has_value();
-        if (fallback && timer.profile) NotePrivateDispatch(fallback, 0);
+        if (fallback) NotePrivateDispatch(fallback, 0);
     }
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
@@ -5576,7 +5587,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (privateReady) {
         recorder.ExecutePrivate(record.privateDispatch->slot.commands, record.privateDispatch);
         record.privateDispatch->committed = true;
-        if (timer.profile) NotePrivateDispatch(std::nullopt, record.privateDispatch->recordingNs);
+        NotePrivateDispatch(std::nullopt, record.privateDispatch->recordingNs);
     } else if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, indirectBuffer, indirectOffset);
     } else {
