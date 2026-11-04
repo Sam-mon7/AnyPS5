@@ -72,14 +72,11 @@ enum class Feature : std::uint8_t {
     TargetSetupMemo,
     ZeroCopyStorage,
     ZeroCopyInputs,
-<<<<<<< HEAD
     PrelockStampSkip,
     PrelockFindHandoff,
     PrivateCompute,
     ZeroCopyMoved,
-=======
     CGpuStagingCarry,
->>>>>>> 9e38f84ad6 (perf(agc): carry staging shadows across batches (C_GPU_STAGING_CARRY, default off))
     Count
 };
 

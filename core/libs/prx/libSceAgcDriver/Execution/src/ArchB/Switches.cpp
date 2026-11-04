@@ -124,7 +124,6 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // submit and at GPU completion (Recorder zero-copy checks).
     {Feature::ZeroCopyStorage, "ZERO_COPY_STORAGE", false, true, {}},
     {Feature::ZeroCopyInputs, "ZERO_COPY_INPUTS", false, true, {}},
-<<<<<<< HEAD
     // Census 2 (2026-11-04): the committer's unlocked draw preparation skips a template's surface
     // precollect when the template's stamp proof is armed (its locked proof then collects nothing).
     {Feature::PrelockStampSkip, "PRELOCK_STAMP_SKIP", false, true, PrelockStampSkipPrerequisites},
@@ -138,9 +137,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Draws with moved buffers bind an immutable per-template set, cached by the moved content: moved
     // addresses read in place through their import, data words in a buffer of the set's own.
     {Feature::ZeroCopyMoved, "ZERO_COPY_MOVED", false, true, {}},
-=======
     {Feature::CGpuStagingCarry, "C_GPU_STAGING_CARRY", false, true, {}},
->>>>>>> 9e38f84ad6 (perf(agc): carry staging shadows across batches (C_GPU_STAGING_CARRY, default off))
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
