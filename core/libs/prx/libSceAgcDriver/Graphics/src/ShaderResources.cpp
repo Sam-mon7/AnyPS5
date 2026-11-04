@@ -6860,6 +6860,19 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     slotElements.clear();
     slotSizes.clear();
     slotSnapshots.clear();
+    // APS5_ARCHB_ZERO_COPY_STORAGE: a guest element stays as the template's set binds it (a read-only
+    // element inside a host import is read in place there, its read noted by MarkGpuWrites); only
+    // moved buffers (data words, or another address) still get a binding of their own.
+    const bool zeroCopy = Recorder::ZeroCopyStorageActive();
+    const bool zeroCopyChecks = Recorder::ZeroCopyChecks();
+    std::size_t zeroCopySkipped = 0;
+    struct ZeroCopyReport {
+        const bool& on;
+        const std::size_t& skipped;
+        ~ZeroCopyReport() {
+            if (on) Recorder::CountZeroCopyStorage(skipped);
+        }
+    } zeroCopyReport{zeroCopy, zeroCopySkipped};
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto checkStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -6920,6 +6933,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (slotted) drawReuseCounters().sharedElements.fetch_add(1, std::memory_order_relaxed);
             selected.push_back(index);
             keep({0, std::move(buffer), wordOffset, override->size});
+            continue;
+        }
+        if (zeroCopy && override == moved.end()) {
+            ++zeroCopySkipped;
             continue;
         }
         std::uint64_t address = item.address;
@@ -7064,6 +7081,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             bindingsDiag().largeBytes.fetch_add(bytes, std::memory_order_relaxed);
         }
         if (slotted) drawReuseCounters().sharedElements.fetch_add(1, std::memory_order_relaxed);
+        if (zeroCopyChecks) recorder.NoteZeroCopyCheck(begin, bytes, buffer, offset, override != moved.end() ? Recorder::ZeroCopyKind::Override : bytes <= uploadLimit ? Recorder::ZeroCopyKind::StorageSmall : Recorder::ZeroCopyKind::StorageLarge);
         selected.push_back(index);
         keep({begin, std::move(buffer), offset, bytes});
         totalSnapshotBytes += bytes;

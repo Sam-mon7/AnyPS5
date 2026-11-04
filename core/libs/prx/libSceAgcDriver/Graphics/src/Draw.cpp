@@ -1529,7 +1529,8 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
 
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
     auto* recorder = context.recorder;
-    if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace) return nullptr;
+    // APS5_ARCHB_ZERO_COPY_INPUTS binds them in place where the device copies them by default.
+    if (recorder == nullptr || bytes == 0 || (!context.drawInputsInPlace && !Recorder::ZeroCopyInputsActive())) return nullptr;
     bool behind = false;
     if (behindGpuWrite == nullptr) {
         GuestMemory::FlushGpuWrites(address, bytes);
@@ -1547,7 +1548,25 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
     recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
     if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
+    if (!context.drawInputsInPlace) Recorder::CountZeroCopyInput(bytes);
     return import;
+}
+
+namespace {
+// Zero-copy census (Recorder::ZeroCopyChecks): whether InPlaceDrawInput could have bound a copied
+// range in place (an import at a usable offset, no queued label or store, no copied writer), without
+// its side effects (no flush, no read note).
+bool zeroCopyInputImportable(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
+    auto* recorder = context.recorder;
+    if (recorder == nullptr || bytes == 0) return false;
+    if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return false;
+    const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return false;
+    const auto drawWriters = DrawCopiedWriters();
+    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return false;
+    const auto* import = ExistingHostImportFor(context, address, bytes);
+    return import != nullptr && HostImportOffset(*import, address) % alignment == 0;
+}
 }
 
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
@@ -1806,7 +1825,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
-        if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        bool zeroCopyCopied = false;
+        if (import == nullptr) {
+            copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+            zeroCopyCopied = true;
+        }
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         if (import != nullptr) {
@@ -1833,6 +1856,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
                 highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
                 import = nullptr;
+                zeroCopyCopied = false;
                 copy = DrawInputCopy{};
                 copy.buffer = std::move(clamped);
                 if (!highest) {
@@ -1853,6 +1877,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.indexOffset = HostImportOffset(*import, draw.indexAddress);
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
         } else {
+            if (zeroCopyCopied && Recorder::ZeroCopyChecks() && context.recorder != nullptr) {
+                Recorder::NoteZeroCopyImportable(Recorder::ZeroCopyKind::Index, static_cast<std::size_t>(indexBytes), zeroCopyInputImportable(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize));
+                context.recorder->NoteZeroCopyCheck(draw.indexAddress, static_cast<std::size_t>(indexBytes), copy.buffer, 0, Recorder::ZeroCopyKind::Index);
+            }
             inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
         }
@@ -1934,6 +1962,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
+        if (Recorder::ZeroCopyChecks() && context.recorder != nullptr) {
+            Recorder::NoteZeroCopyImportable(Recorder::ZeroCopyKind::Vertex, bytes, zeroCopyInputImportable(context, begin, bytes, plan.alignments[range]));
+            context.recorder->NoteZeroCopyCheck(begin, bytes, copy.buffer, 0, Recorder::ZeroCopyKind::Vertex);
+        }
         rangeHandles.push_back(copy.buffer->Handle());
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));

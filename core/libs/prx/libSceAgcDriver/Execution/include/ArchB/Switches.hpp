@@ -70,6 +70,8 @@ enum class Feature : std::uint8_t {
     PipeResolveSnapshots,
     WtSyncSkip,
     TargetSetupMemo,
+    ZeroCopyStorage,
+    ZeroCopyInputs,
     Count
 };
 
