@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestWriteFault.hpp"
@@ -28,7 +29,7 @@ constexpr int Flips = 3;
 constexpr std::size_t EagerPerSecond = 64;
 
 constexpr std::array<const char*, Kinds> KindNames{"copyback", "readback", "writeback", "publish"};
-constexpr std::array<const char*, Outcomes> OutcomeNames{"guest_read", "guest_write", "driver_read", "driver_write", "os", "forget", "staging_in", "carry", "gpu_read", "gpu_address_read", "gpu_write", "label_store", "republished", "expired", "unwatchable"};
+constexpr std::array<const char*, Outcomes> OutcomeNames{"guest_read", "guest_write", "driver_read", "driver_write", "os", "forget", "staging_in", "carry", "gpu_read", "gpu_address_read", "gpu_write", "label_store", "republished", "expired", "unwatchable", "staging_in_same", "carry_cross", "staging_in_same_cross"};
 constexpr std::array<const char*, Buckets> BucketNames{"lt1ms", "lt5ms", "lt20ms", "lt60ms", "ge60ms"};
 
 struct Counters {
@@ -56,6 +57,7 @@ struct Counters {
     std::atomic<std::uint64_t> live{0};
     std::atomic<std::uint64_t> skipped[Kinds][GuestArena::WtWatchSkipCauses]{};
     std::atomic<std::uint64_t> labelStored[2]{};
+    std::atomic<std::uint64_t> watchNs{0}, watchCalls{0}, splitRuns{0}, splitPieces{0};
     Counters() {
         const auto add = [](const std::string& name, const std::atomic<std::uint64_t>& counter) { AgcDriver::ArchB::Recorder::RegisterCounter((new std::string(name))->c_str(), counter); };
         for (std::size_t k = 0; k < Kinds; ++k) {
@@ -94,12 +96,16 @@ struct Counters {
         add("p5c_watch_handler_ns", watchHandlerNs);
         add("p5c_log_lost", logLost);
         add("p5c_live", live);
-        constexpr std::array<const char*, GuestArena::WtWatchSkipCauses> causeNames{"noleaf", "untracked", "excluded", "unchecked", "exec", "held", "busy", "watched"};
+        constexpr std::array<const char*, GuestArena::WtWatchSkipCauses> causeNames{"noleaf", "untracked", "excluded", "unchecked", "exec", "held", "busy", "watched", "protect"};
         for (std::size_t k = 0; k < Kinds; ++k) {
             for (std::size_t cause = 0; cause < causeNames.size(); ++cause) add(std::string("p5c_") + KindNames[k] + "_skip_" + causeNames[cause], skipped[k][cause]);
         }
         add("p5c_label_stored_q0", labelStored[0]);
         add("p5c_label_stored_other", labelStored[1]);
+        add("p5c_watch_ns", watchNs);
+        add("p5c_watch_calls", watchCalls);
+        add("p5c_watch_split_runs", splitRuns);
+        add("p5c_watch_split_pieces", splitPieces);
     }
 };
 
@@ -114,6 +120,7 @@ struct Entry {
     std::uint8_t reason;
     std::uint64_t ticks;
     int flips;
+    std::uint64_t serial;
 };
 
 struct RangeKey {
@@ -150,6 +157,7 @@ struct Deferred {
     std::uint64_t end;
     Kind kind;
     std::uint8_t reason;
+    std::uint64_t serial;
 };
 
 thread_local int scopeDepth = 0;
@@ -198,10 +206,17 @@ std::map<std::uint64_t, Entry>::iterator firstOverlap(State& s, std::uint64_t be
     return it;
 }
 
-void closeOverlaps(State& s, std::uint64_t begin, std::uint64_t end, Outcome outcome, std::uint64_t ticks) {
+void closeOverlaps(State& s, std::uint64_t begin, std::uint64_t end, Outcome outcome, std::uint64_t ticks, std::uint64_t serial = 0) {
     for (auto it = firstOverlap(s, begin); it != s.live.end() && it->first < end;) {
         const auto next = std::next(it);
-        if (it->second.end > begin) closeEntry(s, it, outcome, ticks);
+        if (it->second.end > begin) {
+            auto closing = outcome;
+            if (serial != 0 && it->second.serial != 0 && serial != it->second.serial) {
+                if (outcome == Outcome::Carry) closing = Outcome::CarryCross;
+                if (outcome == Outcome::StagingInSame) closing = Outcome::StagingInSameCross;
+            }
+            closeEntry(s, it, closing, ticks);
+        }
         it = next;
     }
 }
@@ -247,7 +262,11 @@ void commit(const Deferred& item) {
     const auto pages = ((item.end + 4095) / 4096) - (item.begin / 4096);
     c.pages[k].fetch_add(pages, std::memory_order_relaxed);
     std::array<std::uint64_t, GuestArena::WtWatchSkipCauses> causes{};
+    GuestArena::GuestWtFaultSetWatchSplit_nid_no_patch(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CWatchSplit));
+    const auto watchStart = GuestArena::GuestWtFaultTicks_nid_no_patch(nullptr);
     const auto watched = GuestArena::GuestWtFaultWatchCauses_nid_no_patch(static_cast<std::uintptr_t>(item.begin), static_cast<std::size_t>(item.end - item.begin), causes.data());
+    c.watchNs.fetch_add(static_cast<std::uint64_t>(static_cast<double>(GuestArena::GuestWtFaultTicks_nid_no_patch(nullptr) - watchStart) * s.nsPerTick), std::memory_order_relaxed);
+    c.watchCalls.fetch_add(1, std::memory_order_relaxed);
     c.watchedPages[k].fetch_add(watched, std::memory_order_relaxed);
     for (std::size_t cause = 0; cause < causes.size(); ++cause) {
         if (causes[cause] != 0) c.skipped[k][cause].fetch_add(causes[cause], std::memory_order_relaxed);
@@ -258,7 +277,7 @@ void commit(const Deferred& item) {
         c.bytes[k][static_cast<std::size_t>(Outcome::Unwatchable)].fetch_add(item.end - item.begin, std::memory_order_relaxed);
         return;
     }
-    s.live[item.begin] = {item.end, item.kind, item.reason, now, Flips};
+    s.live[item.begin] = {item.end, item.kind, item.reason, now, Flips, item.serial};
     c.live.store(s.live.size(), std::memory_order_relaxed);
 }
 
@@ -269,6 +288,7 @@ Outcome outcomeOf(GpuUse use) {
     case GpuUse::Read: return Outcome::GpuRead;
     case GpuUse::AddressRead: return Outcome::GpuAddressRead;
     case GpuUse::Write: return Outcome::GpuWrite;
+    case GpuUse::StagingInSame: return Outcome::StagingInSame;
     default: return Outcome::LabelStore;
     }
 }
@@ -303,7 +323,7 @@ UseScope::~UseScope() {
     for (const auto& item : items) commit(item);
 }
 
-void Published(std::uint64_t begin, std::uint64_t end, Kind kind, std::uint8_t reason) {
+void Published(std::uint64_t begin, std::uint64_t end, Kind kind, std::uint8_t reason, std::uint64_t serial) {
     if (!Enabled() || end <= begin) return;
     static const bool installed = [] {
         static_cast<void>(counters());
@@ -313,19 +333,19 @@ void Published(std::uint64_t begin, std::uint64_t end, Kind kind, std::uint8_t r
     static_cast<void>(installed);
     if (scopeDepth > 0) {
         if (deferred == nullptr) deferred = new std::vector<Deferred>();
-        deferred->push_back({begin, end, kind, reason});
+        deferred->push_back({begin, end, kind, reason, serial});
         return;
     }
-    commit({begin, end, kind, reason});
+    commit({begin, end, kind, reason, serial});
 }
 
-void UsedByGpu(std::uint64_t begin, std::uint64_t end, GpuUse use) {
+void UsedByGpu(std::uint64_t begin, std::uint64_t end, GpuUse use, std::uint64_t serial) {
     if (!Enabled() || end <= begin) return;
     auto& s = state();
     std::lock_guard lock(s.mutex);
     if (s.live.empty()) return;
     drainLocked(s);
-    closeOverlaps(s, begin, end, outcomeOf(use), GuestArena::GuestWtFaultTicks_nid_no_patch(nullptr));
+    closeOverlaps(s, begin, end, outcomeOf(use), GuestArena::GuestWtFaultTicks_nid_no_patch(nullptr), serial);
 }
 
 void UsedByGpu(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, GpuUse use) {
@@ -385,6 +405,11 @@ void Flip() {
     GuestArena::GuestWtFaultCounters_nid_no_patch(&libc);
     c.watchFaults.store(libc.watchFaults, std::memory_order_relaxed);
     c.watchHandlerNs.store(libc.watchHandlerNs, std::memory_order_relaxed);
+    std::uint64_t runs = 0;
+    std::uint64_t pieces = 0;
+    GuestArena::GuestWtFaultWatchSplitCounters_nid_no_patch(&runs, &pieces);
+    c.splitRuns.store(runs, std::memory_order_relaxed);
+    c.splitPieces.store(pieces, std::memory_order_relaxed);
 }
 
 Totals Snapshot() {

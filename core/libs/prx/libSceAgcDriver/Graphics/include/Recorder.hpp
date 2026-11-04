@@ -159,6 +159,10 @@ public:
     };
     NotePoint OpenNotePoint();
     bool NotedSince(const NotePoint& point, std::uint64_t begin, std::uint64_t end) const;
+    // C_LAZY_COPYBACK: NotedSince, plus any read note of any kind (and any read list) on the open
+    // batch after the point, and any queued store over the range: whether recorded work since the
+    // point may read or write [begin, end) through the import.
+    bool AccessedSince(const NotePoint& point, std::uint64_t begin, std::uint64_t end) const;
     std::uint64_t WatchCarry(std::uint64_t begin, std::uint64_t end);
     bool TakeCarry(std::uint64_t id);
     void DropCarry(std::uint64_t id);

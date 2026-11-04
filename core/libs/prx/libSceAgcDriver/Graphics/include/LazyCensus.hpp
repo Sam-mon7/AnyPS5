@@ -9,13 +9,17 @@
 namespace AgcDriver::Graphics::ArchC::LazyCensus {
 
 enum class Kind : std::uint8_t { StagingCopyBack, HeapReadback, WriteBack, ShadowPublish, Count };
-enum class GpuUse : std::uint8_t { StagingIn, Carry, Read, AddressRead, Write, LabelStore, Count };
-enum class Outcome : std::uint8_t { GuestRead, GuestWrite, DriverRead, DriverWrite, Os, Forget, StagingIn, Carry, GpuRead, GpuAddressRead, GpuWrite, LabelStore, Republished, Expired, Unwatchable, Count };
+// StagingInSame (P5b): the copy-in of a staged region by a later use of the same build (RecordStagingCopies),
+// so into the same shadow the copy-back came from; StagingIn is then a copy-in by another build.
+enum class GpuUse : std::uint8_t { StagingIn, Carry, Read, AddressRead, Write, LabelStore, StagingInSame, Count };
+enum class Outcome : std::uint8_t { GuestRead, GuestWrite, DriverRead, DriverWrite, Os, Forget, StagingIn, Carry, GpuRead, GpuAddressRead, GpuWrite, LabelStore, Republished, Expired, Unwatchable, StagingInSame, CarryCross, StagingInSameCross, Count };
 
 bool Enabled();
 std::uint8_t ReasonFor(const char* flushReason);
-void Published(std::uint64_t begin, std::uint64_t end, Kind kind, std::uint8_t reason);
-void UsedByGpu(std::uint64_t begin, std::uint64_t end, GpuUse use);
+// `serial` (P5b, copy-backs and their carry/copy-in uses): the recorder batch; a same-shadow use in a later
+// batch than the copy-back closes as CarryCross / StagingInSameCross.
+void Published(std::uint64_t begin, std::uint64_t end, Kind kind, std::uint8_t reason, std::uint64_t serial = 0);
+void UsedByGpu(std::uint64_t begin, std::uint64_t end, GpuUse use, std::uint64_t serial = 0);
 void UsedByGpu(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, GpuUse use);
 void LabelFlush(std::uint64_t ns, std::uint64_t waitedNs, bool queue0);
 void LabelStored(bool queue0);

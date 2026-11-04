@@ -484,6 +484,8 @@ private:
         // RecordCopyBacks), and the note point right after the use's own pending-write note
         // (NoteStagingCarryPoints); carrySerial 0 when there is none.
         bool carryWhole = false;
+        // C_LAZY_COPYBACK: this use carried the shadow from a copy-back recorded in the open batch.
+        bool carriedSameBatch = false;
         std::uint64_t carrySerial = 0;
         std::uint64_t carryWriteNote = 0;
         std::size_t carryReads = 0;

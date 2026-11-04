@@ -80,6 +80,9 @@ enum class Feature : std::uint8_t {
     ArchcImageEpochs,
     ArchcTargetFastpath,
     CLazyPublish,
+    CWatchSplit,
+    CLazyStoreHook,
+    CLazyCopyback,
     Count
 };
 

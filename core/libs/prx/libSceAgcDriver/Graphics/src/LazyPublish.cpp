@@ -9,6 +9,12 @@
 #include "prx/libc/include/GuestArena.hpp"
 
 #include <cstdio>
+#include <cstring>
+#include <string>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -30,7 +36,7 @@ constexpr std::size_t EagerPerSecond = 64;
 constexpr std::uint64_t PageBytes = 4096;
 
 struct Counters {
-    std::atomic<std::uint64_t> deferred{0}, renewed{0}, services{0}, serviceNs{0}, lockedServices{0}, pageServices{0}, partial{0}, eager{0}, eagerKeys{0}, dropped{0}, drained{0}, verified{0}, newer{0}, overlaps{0}, full{0};
+    std::atomic<std::uint64_t> deferred{0}, renewed{0}, services{0}, serviceNs{0}, lockedServices{0}, lockedWrites{0}, storeHooks{0}, storeHookBytes{0}, storeHookOrphans{0}, storeHookNested{0}, pageServices{0}, partial{0}, eager{0}, eagerKeys{0}, dropped{0}, drained{0}, verified{0}, newer{0}, overlaps{0}, full{0};
     Counters() {
         const auto add = [](const char* name, const std::atomic<std::uint64_t>& counter) { AgcDriver::ArchB::Recorder::RegisterCounter(name, counter); };
         add("c_lazy_publish_deferred", deferred);
@@ -38,6 +44,11 @@ struct Counters {
         add("c_lazy_publish_services", services);
         add("c_lazy_publish_service_ns", serviceNs);
         add("c_lazy_publish_locked_services", lockedServices);
+        add("c_lazy_publish_locked_writes", lockedWrites);
+        add("c_lazy_store_hooks", storeHooks);
+        add("c_lazy_store_hook_bytes", storeHookBytes);
+        add("c_lazy_store_hook_orphans", storeHookOrphans);
+        add("c_lazy_store_hook_nested", storeHookNested);
         add("c_lazy_publish_page_services", pageServices);
         add("c_lazy_publish_partial", partial);
         add("c_lazy_publish_eager", eager);
@@ -91,6 +102,16 @@ State& state() {
     return made;
 }
 
+// s.live.size(), readable without the mutex (the store hook's fast exit).
+std::atomic<std::size_t> liveCount{0};
+// Inside a publication of a lazy range on this thread (the service, or the store hook's own): a driver
+// store then belongs to it and only needs its pages opened.
+thread_local int publishing = 0;
+
+void syncCount(const State& s) {
+    liveCount.store(s.live.size(), std::memory_order_relaxed);
+}
+
 bool verify() {
     static const bool on = [] {
         const char* value = std::getenv("APS5_ARCHB_C_LAZY_PUBLISH_VERIFY");
@@ -123,6 +144,7 @@ void drainLocked(State& s, std::vector<std::pair<std::uint64_t, std::uint64_t>>&
             if (it == s.live.end() || it->second.serving) continue;
             orphans.emplace_back(it->first, it->second.end);
             s.live.erase(it);
+            syncCount(s);
             counters().dropped.fetch_add(1, std::memory_order_relaxed);
         }
         if (count < s.entries.size()) return;
@@ -133,7 +155,57 @@ void publishOrphans(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& 
     for (const auto& [begin, end] : orphans) publish(begin, end);
 }
 
-void service(std::uintptr_t page, bool) {
+// APS5_ARCHB_C_LAZY_PUBLISH_STACKS=N (diagnostic): the first N services on a thread holding the GPU
+// mutex print their stack as module+offset (s3/symbolize.py), naming the driver code that touched a
+// lazy range without a hook.
+void traceLockedService(std::uintptr_t page, bool write) {
+#ifdef _WIN32
+    static std::atomic<int> left{[] {
+        const char* text = std::getenv("APS5_ARCHB_C_LAZY_PUBLISH_STACKS");
+        return text != nullptr ? std::atoi(text) : 0;
+    }()};
+    if (left.load(std::memory_order_relaxed) <= 0 || left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+    // The handler runs without unwind tables (-fno-asynchronous-unwind-tables): the faulting instruction,
+    // then the stack words that point into a module (return-address candidates, innermost first).
+    std::uintptr_t ip = 0;
+    std::uintptr_t sp = 0;
+    GuestArena::GuestWtFaultFaultContext_nid_no_patch(&ip, &sp);
+    std::string text = "[lazy-publish] locked service " + std::string(write ? "write" : "read") + " page 0x";
+    char buffer[160];
+    std::snprintf(buffer, sizeof(buffer), "%llx:", static_cast<unsigned long long>(page));
+    text += buffer;
+    const auto describe = [&](std::uintptr_t address) {
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module) || module == nullptr) return false;
+        char name[MAX_PATH] = "?";
+        GetModuleFileNameA(module, name, sizeof(name));
+        const char* base = std::strrchr(name, '\\');
+        std::snprintf(buffer, sizeof(buffer), " %s+0x%llx", base != nullptr ? base + 1 : name, static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(module)));
+        text += buffer;
+        return true;
+    };
+    if (ip != 0) describe(ip);
+    text += " | stack:";
+    int found = 0;
+    for (std::uintptr_t at = sp; sp != 0 && at < sp + 4096 && found < 24; at += sizeof(std::uintptr_t)) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if ((at & 4095) == 0 || at == sp) {
+            if (VirtualQuery(reinterpret_cast<void*>(at), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT || (memory.Protect & (PAGE_READWRITE | PAGE_READONLY)) == 0) break;
+        }
+        const auto value = *reinterpret_cast<const std::uintptr_t*>(at);
+        if (value < 0x10000) continue;
+        MEMORY_BASIC_INFORMATION code{};
+        if (VirtualQuery(reinterpret_cast<void*>(value), &code, sizeof(code)) != sizeof(code) || code.Type != MEM_IMAGE || (code.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE | PAGE_EXECUTE_READWRITE)) == 0) continue;
+        if (describe(value)) ++found;
+    }
+    std::fprintf(stderr, "%s\n", text.c_str());
+#else
+    static_cast<void>(page);
+    static_cast<void>(write);
+#endif
+}
+
+void service(std::uintptr_t page, bool write) {
     auto& s = state();
     auto& c = counters();
     const auto start = GuestArena::GuestWtFaultTicks_nid_no_patch(nullptr);
@@ -151,19 +223,28 @@ void service(std::uintptr_t page, bool) {
         }
     }
     publishOrphans(orphans);
-    if (GuestMemory::GpuMutex().HeldByThisThread()) c.lockedServices.fetch_add(1, std::memory_order_relaxed);
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        c.lockedServices.fetch_add(1, std::memory_order_relaxed);
+        if (write) c.lockedWrites.fetch_add(1, std::memory_order_relaxed);
+        traceLockedService(page, write);
+    }
     if (end == 0) {
         c.pageServices.fetch_add(1, std::memory_order_relaxed);
+        ++publishing;
         publish(page, page + PageBytes);
+        --publishing;
         return;
     }
     if (verify() && (StorageTexture::PendingStoreInside(begin, static_cast<std::size_t>(end - begin)) || AnyShadowedOverlaps(begin, static_cast<std::size_t>(end - begin)))) c.newer.fetch_add(1, std::memory_order_relaxed);
     if (verify()) c.verified.fetch_add(1, std::memory_order_relaxed);
+    ++publishing;
     publish(begin, end);
+    --publishing;
     const auto now = GuestArena::GuestWtFaultTicks_nid_no_patch(nullptr);
     {
         std::lock_guard lock(s.mutex);
         if (const auto it = s.live.find(begin); it != s.live.end() && it->second.serving) s.live.erase(it);
+        syncCount(s);
         auto& seen = s.touches[{begin, end}];
         const auto window = static_cast<std::uint64_t>(1e9 / s.nsPerTick);
         while (!seen.empty() && seen.front() + window < now) seen.pop_front();
@@ -181,12 +262,67 @@ bool switchOn() {
 
 }
 
+// APS5_ARCHB_C_LAZY_STORE_HOOK: every driver store into guest memory (GuestMemory::storeOwn) and every
+// driver read through GuestMemory (ReadCommitted for a storage texture's upload, EqualsCommittedUnsynced
+// for writeBackLayers' untracked compare: the readers P5b's fault trace named) calls this first. A store into a lazy range would fault there, under the GPU mutex, and the fault would run the
+// service: publish the whole range (re-entering the flush hook) and open it. The hook does the same
+// work explicitly, before the store: the overlapping entries leave the table and are published with
+// their pages opened by each publishing store right before it writes (the nested calls below), so no
+// page faults. Lazy pages without an entry (a range a hook or service dropped while a page stayed
+// watched) are published page-range-wise, as the service's page path would.
+void beforeDriverAccess(std::uint64_t address, std::size_t bytes) {
+    if (liveCount.load(std::memory_order_relaxed) == 0 && publishing == 0) return;
+    if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CLazyStoreHook)) return;
+    if (GuestArena::GuestWtFaultWatchedPages_nid_no_patch(static_cast<std::uintptr_t>(address), bytes) == 0) return;
+    auto& c = counters();
+    if (publishing != 0) {
+        // An access of the publication in progress on this thread: open its pages, then it proceeds.
+        c.storeHookNested.fetch_add(1, std::memory_order_relaxed);
+        GuestArena::GuestWtFaultUnwatch_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+        return;
+    }
+    auto& s = state();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> orphans;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> taken;
+    const auto end = address + bytes;
+    {
+        std::lock_guard lock(s.mutex);
+        drainLocked(s, orphans);
+        auto it = s.live.upper_bound(address);
+        if (it != s.live.begin() && std::prev(it)->second.end > address) --it;
+        while (it != s.live.end() && it->first < end) {
+            if (it->second.end > address && !it->second.serving) {
+                taken.emplace_back(it->first, it->second.end);
+                it = s.live.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        syncCount(s);
+    }
+    publishOrphans(orphans);
+    if (taken.empty()) {
+        c.storeHookOrphans.fetch_add(1, std::memory_order_relaxed);
+        taken.emplace_back(address & ~(PageBytes - 1), (end + PageBytes - 1) & ~(PageBytes - 1));
+    }
+    const bool entered = GuestArena::GuestWtFaultEnterLazyService_nid_no_patch();
+    ++publishing;
+    for (const auto& [begin, stop] : taken) {
+        publish(begin, stop);
+        c.storeHooks.fetch_add(1, std::memory_order_relaxed);
+        c.storeHookBytes.fetch_add(stop - begin, std::memory_order_relaxed);
+    }
+    --publishing;
+    if (entered) GuestArena::GuestWtFaultLeaveLazyService_nid_no_patch();
+}
+
 bool Active() {
     if (!switchOn()) return false;
     static const bool installed = [] {
         static_cast<void>(counters());
         static_cast<void>(state());
         GuestArena::GuestWtFaultSetLazyService_nid_no_patch(&service);
+        GuestMemory::SetLazyStoreHook(&beforeDriverAccess);
         return true;
     }();
     return installed;
@@ -211,6 +347,7 @@ void PublishAll() {
             all.emplace_back(it->first, it->second.end);
             it = s.live.erase(it);
         }
+        syncCount(s);
     }
     counters().drained.fetch_add(all.size(), std::memory_order_relaxed);
     publishOrphans(all);
@@ -252,6 +389,7 @@ bool DeferLabelStore(std::uint64_t address, std::size_t bytes) {
                 c.full.fetch_add(1, std::memory_order_relaxed);
             } else {
                 const auto pages = ((end + PageBytes - 1) / PageBytes) - (address / PageBytes);
+                GuestArena::GuestWtFaultSetWatchSplit_nid_no_patch(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CWatchSplit));
                 const auto watched = GuestArena::GuestWtFaultWatchLazy_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
                 if (watched != pages) {
                     GuestArena::GuestWtFaultUnwatch_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
@@ -267,10 +405,11 @@ bool DeferLabelStore(std::uint64_t address, std::size_t bytes) {
                         std::array<std::uint64_t, GuestArena::WtWatchSkipCauses> causes{};
                         GuestArena::GuestWtFaultWatchCauses_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, causes.data());
                         GuestArena::GuestWtFaultUnwatch_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
-                        std::fprintf(stderr, "[lazy-publish] not protectable 0x%llx+0x%zx: %llu of %llu pages watchable (untracked %llu excluded %llu unchecked %llu held %llu busy %llu noleaf %llu watched %llu, word 0x%llx); arena 0x%llx-0x%llx\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(watched), static_cast<unsigned long long>(pages), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipUntracked]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipExcluded]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipUnchecked]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipHeld]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipBusy]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipNoLeaf]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipWatched]), static_cast<unsigned long long>(GuestArena::GuestWtFaultWord_nid_no_patch(static_cast<std::uintptr_t>(address))), static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(arenaBase + arenaBytes));
+                        std::fprintf(stderr, "[lazy-publish] not protectable 0x%llx+0x%zx: %llu of %llu pages watchable (untracked %llu excluded %llu unchecked %llu held %llu busy %llu noleaf %llu watched %llu protect %llu, word 0x%llx); arena 0x%llx-0x%llx\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(watched), static_cast<unsigned long long>(pages), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipUntracked]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipExcluded]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipUnchecked]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipHeld]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipBusy]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipNoLeaf]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipWatched]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipProtect]), static_cast<unsigned long long>(GuestArena::GuestWtFaultWord_nid_no_patch(static_cast<std::uintptr_t>(address))), static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(arenaBase + arenaBytes));
                     }
                 } else {
                     s.live[address] = {end, false};
+                    syncCount(s);
                     c.deferred.fetch_add(1, std::memory_order_relaxed);
                     deferred = true;
                 }
@@ -292,6 +431,8 @@ Counts Totals() {
     counts.dropped = c.dropped.load();
     counts.verified = c.verified.load();
     counts.newer = c.newer.load();
+    counts.lockedServices = c.lockedServices.load();
+    counts.storeHooks = c.storeHooks.load();
     return counts;
 }
 

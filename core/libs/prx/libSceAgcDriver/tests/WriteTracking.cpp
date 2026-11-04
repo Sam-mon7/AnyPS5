@@ -2459,6 +2459,37 @@ void CheckArchcWatch() {
     Require(GuestWtFaultWatchLogHead_nid_no_patch() == cursor, "a read after an unwatch faulted into the log");
     std::cout << "agc_archc_watch_hold_unwatch: ok\n";
 
+    // APS5_ARCHB_C_WATCH_SPLIT: live direct memory is committed in 16 KiB allocations (one VirtualAlloc2
+    // per PS5 page), and one VirtualProtect cannot span two allocations.
+    {
+        const auto split = base + 2 * Block;
+        GuestArenaCommit_nid_postfix(range.Data() + 2 * Block, Block, PAGE_READWRITE, 0x4000);
+        std::memset(range.Data() + 2 * Block, 0x22, Block);
+        BumpCollectEpoch();
+        CollectWrites(split, Block);
+        WtFaultFlip();
+        WtFaultFlip();
+        Require(state(split + 2 * Page) == WtFaultArmed && state(split + 5 * Page) == WtFaultArmed, "the 16 KiB-allocation fixture was not armed");
+        std::array<std::uint64_t, WtWatchSkipCauses> causes{};
+        GuestWtFaultSetWatchSplit_nid_no_patch(false);
+        Require(GuestWtFaultWatchCauses_nid_no_patch(split + 2 * Page, 4 * Page, causes.data()) == 0 && causes[WtWatchSkipProtect] == 4, "a watch across two allocations did not fail whole as a protect refusal without the split");
+        Require(protection(split + 2 * Page) == PAGE_READONLY && protection(split + 4 * Page) == PAGE_READONLY && GuestWtFaultWatchedPages_nid_no_patch(split, Block) == 0, "a refused watch left a page watched or protected");
+        GuestWtFaultSetWatchSplit_nid_no_patch(true);
+        causes = {};
+        Require(GuestWtFaultWatchCauses_nid_no_patch(split + 2 * Page, 4 * Page, causes.data()) == 4 && causes[WtWatchSkipProtect] == 0, "a split watch across two allocations did not watch every page");
+        Require(protection(split + 2 * Page) == PAGE_NOACCESS && protection(split + 5 * Page) == PAGE_NOACCESS && protection(split + 6 * Page) == PAGE_READONLY, "a split watch did not protect exactly its pages");
+        Require(GuestWtFaultUnwatch_nid_no_patch(split + 2 * Page, 4 * Page) == 4 && protection(split + 2 * Page) == PAGE_READONLY && protection(split + 5 * Page) == PAGE_READONLY, "an unwatch across two allocations did not restore both");
+        Require(GuestWtFaultWatchCauses_nid_no_patch(split + 2 * Page, 4 * Page, causes.data()) == 4, "the split range could not be watched again");
+        auto splitCursor = GuestWtFaultWatchLogHead_nid_no_patch();
+        Require(data[2 * Block + 5 * Page + 1] == 0x22, "a split-watched page read the wrong byte");
+        count = GuestWtFaultWatchLogRead_nid_no_patch(&splitCursor, entries.data(), stamps.data(), entries.size(), &lost);
+        Require(count == 1 && (entries[0] & ~WtWatchDriver) == ((split + 5 * Page) | WtWatchRead) && protection(split + 5 * Page) == PAGE_READONLY && protection(split + 2 * Page) == PAGE_NOACCESS, "a read of one split-watched page was not logged or unwatched only it");
+        Require(GuestWtFaultUnwatch_nid_no_patch(split, Block) == 3 && protection(split + 2 * Page) == PAGE_READONLY && protection(split + 4 * Page) == PAGE_READONLY, "the rest of the split range did not unwatch");
+        cursor = GuestWtFaultWatchLogHead_nid_no_patch();
+        GuestWtFaultSetWatchSplit_nid_no_patch(false);
+        std::cout << "agc_archc_watch_split: ok\n";
+    }
+
     if (!LazyCensus::Enabled()) return;
     LazyCensus::ResetForTest();
     const auto copyBack = base + 8 * Page;

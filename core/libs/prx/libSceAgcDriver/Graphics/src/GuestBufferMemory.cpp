@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LazyCopyBack.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -4677,7 +4678,7 @@ std::uint64_t gpuCopyLimit() {
 }
 
 VkBufferUsageFlags gpuCopyUsage(bool addressable) {
-    return VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (addressable ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
+    return VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (addressable || LazyCopyBack::Active() ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
 }
 
 // Device-local staging. A written V# element bound in place makes the shader store into host
@@ -4912,6 +4913,104 @@ void report() {
     if (nowMs - last < 10000 || !c.lastReport.compare_exchange_strong(last, nowMs)) return;
     AgcDriver::ProfilePrint_nid_no_patch("[staging-carry] cumulative: %llu copy-ins skipped (%.1f MiB), %llu copied (%llu without a carry point, %llu from another batch, %llu with a noted write since); verify %llu checked, %llu mismatches\n",
         static_cast<unsigned long long>(c.carried.load()), c.carriedBytes.load() / 1048576.0, static_cast<unsigned long long>(c.copied.load()), static_cast<unsigned long long>(c.noPoint.load()), static_cast<unsigned long long>(c.otherBatch.load()), static_cast<unsigned long long>(c.noted.load()), static_cast<unsigned long long>(c.verified.load()), static_cast<unsigned long long>(c.mismatches.load()));
+}
+
+}
+
+namespace lazyCopyBack {
+
+std::atomic<PFN_vkCmdCopyMemoryIndirectKHR> indirectCopy{nullptr};
+
+struct Counters {
+    std::atomic<std::uint64_t> indirect{0}, cancelled{0}, cancelledBytes{0}, accessed{0}, uncovered{0}, otherBatch{0}, fallback{0}, verified{0}, mismatches{0};
+    Counters() {
+        const auto add = [](const char* name, const std::atomic<std::uint64_t>& counter) { AgcDriver::ArchB::Recorder::RegisterCounter(name, counter); };
+        add("c_lazy_copyback_indirect", indirect);
+        add("c_lazy_copyback_cancelled", cancelled);
+        add("c_lazy_copyback_cancelled_bytes", cancelledBytes);
+        add("c_lazy_copyback_accessed", accessed);
+        add("c_lazy_copyback_uncovered", uncovered);
+        add("c_lazy_copyback_other_batch", otherBatch);
+        add("c_lazy_copyback_fallback", fallback);
+        add("c_lazy_copyback_verified", verified);
+        add("c_lazy_copyback_verify_mismatches", mismatches);
+    }
+};
+
+Counters& counters() {
+    static Counters made;
+    return made;
+}
+
+bool Active() {
+    return indirectCopy.load(std::memory_order_relaxed) != nullptr && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CLazyCopyback);
+}
+
+std::uint32_t VerifyEvery() {
+    static const std::uint32_t every = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_LAZY_COPYBACK_VERIFY");
+        return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+    return every;
+}
+
+// A recorded indirect copy-back that may still be cancelled: its parameters in the open batch's
+// host-visible slot, the range it stores, and the note point after its use's own notes.
+struct Pending {
+    VkCopyMemoryIndirectCommandKHR* slot = nullptr;
+    std::uint64_t serial = 0;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    Recorder::NotePoint point{};
+    bool pointSet = false;
+};
+
+// Under GuestMemory::GpuMutex (every copy-back and staging decision is made under it).
+struct State {
+    std::unordered_map<VkBuffer, Pending> pending;
+    std::shared_ptr<Buffer> slots;
+    std::size_t used = 0;
+    std::uint64_t serial = 0;
+    std::uint64_t candidates = 0;
+};
+
+// Never destroyed: its slot buffer must not outlive the device at process exit.
+State& state() {
+    static auto* made = new State;
+    return *made;
+}
+
+constexpr std::size_t SlotsPerBuffer = 256;
+
+VkDeviceAddress BufferAddress(const Context& context, VkBuffer buffer) {
+    const VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
+    return context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &info);
+}
+
+// Records shadow[0, bytes) -> import at `destination` as a one-command indirect copy; null when it cannot
+// (the caller records the plain copy).
+VkCopyMemoryIndirectCommandKHR* Record(const Context& context, Recorder& recorder, VkCommandBuffer commands, const std::shared_ptr<Buffer>& shadow, VkBuffer import, VkDeviceSize importOffset, VkDeviceSize bytes) {
+    auto& s = state();
+    const auto copy = indirectCopy.load(std::memory_order_relaxed);
+    if (copy == nullptr || bytes == 0 || bytes % 4 != 0 || importOffset % 4 != 0) return nullptr;
+    const auto source = BufferAddress(context, shadow->Handle());
+    const auto destination = BufferAddress(context, import);
+    if (source == 0 || destination == 0) return nullptr;
+    if (s.slots == nullptr || s.serial != recorder.OpenSerial() || s.used == SlotsPerBuffer) {
+        s.slots = std::make_shared<Buffer>(context, SlotsPerBuffer * sizeof(VkCopyMemoryIndirectCommandKHR), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        s.used = 0;
+        s.serial = recorder.OpenSerial();
+        recorder.Keep(s.slots);
+    }
+    auto* slot = reinterpret_cast<VkCopyMemoryIndirectCommandKHR*>(s.slots->Bytes().data()) + s.used;
+    *slot = {source, destination + importOffset, bytes};
+    VkCopyMemoryIndirectInfoKHR info{VK_STRUCTURE_TYPE_COPY_MEMORY_INDIRECT_INFO_KHR};
+    info.copyCount = 1;
+    info.copyAddressRange = {s.slots->DeviceAddress() + s.used * sizeof(VkCopyMemoryIndirectCommandKHR), sizeof(VkCopyMemoryIndirectCommandKHR), sizeof(VkCopyMemoryIndirectCommandKHR)};
+    ++s.used;
+    copy(commands, &info);
+    counters().indirect.fetch_add(1, std::memory_order_relaxed);
+    return slot;
 }
 
 }
@@ -5758,8 +5857,66 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             copiedBytes += to - from;
         }
     }
+    const bool lazy = lazyCopyBack::Active();
+    std::vector<std::tuple<std::shared_ptr<Buffer>, VkBuffer, VkDeviceSize, VkDeviceSize>> lazyVerify;
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
+        const bool carriedSameBatch = std::exchange(region.carriedSameBatch, false);
+        // C_LAZY_COPYBACK: a whole copy-back of a device-local shadow is recorded cancellable; the
+        // previous one of this shadow in the open batch dies when this use carried the shadow from it
+        // and nothing since its use read or wrote the range (this copy-back stores every byte of it).
+        const bool lazyWhole = lazy && region.deviceLocal && region.buffer != nullptr && std::any_of(merged.begin(), merged.end(), [&](const auto& range) { return range.first <= region.begin && region.end <= range.second; });
+        if (lazy && region.buffer != nullptr && !lazyWhole) lazyCopyBack::state().pending.erase(region.buffer->Handle());
+        if (lazyWhole) {
+            auto& s = lazyCopyBack::state();
+            auto& lc = lazyCopyBack::counters();
+            const auto handle = region.buffer->Handle();
+            if (const auto found = s.pending.find(handle); found != s.pending.end()) {
+                const auto previous = found->second;
+                s.pending.erase(found);
+                if (previous.serial != recorder.OpenSerial()) {
+                    lc.otherBatch.fetch_add(1, std::memory_order_relaxed);
+                } else if (!carriedSameBatch || previous.begin < region.begin || region.end < previous.end || !previous.pointSet) {
+                    lc.uncovered.fetch_add(1, std::memory_order_relaxed);
+                } else if (!Recorder::ReadTracking() || recorder.AccessedSince(previous.point, previous.begin, previous.end)) {
+                    lc.accessed.fetch_add(1, std::memory_order_relaxed);
+                } else if (const auto every = lazyCopyBack::VerifyEvery(); every != 0 && s.candidates++ % every == 0) {
+                    lazyVerify.emplace_back(region.buffer, region.copySource, region.begin - region.copySourceBase, region.end - region.begin);
+                } else {
+                    lc.cancelled.fetch_add(1, std::memory_order_relaxed);
+                    lc.cancelledBytes.fetch_add(previous.slot->size, std::memory_order_relaxed);
+                    previous.slot->size = 0;
+                }
+            }
+            if (!recording) {
+                VkAccessFlags covered = 0;
+                commands = recorder.Commands(&covered);
+                timing = recorder.BeginGpuTiming(StagingCopyBackKey);
+                constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+                if (!Recorder::ElideCovered(Recorder::CommandClass::StagingOut, leading, covered)) {
+                    RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
+                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                }
+                recording = true;
+            }
+            const auto bytes = region.end - region.begin;
+            if (auto* slot = lazyCopyBack::Record(context, recorder, commands, region.buffer, region.copySource, region.begin - region.copySourceBase, bytes)) {
+                s.pending[handle] = {slot, recorder.OpenSerial(), region.begin, region.end, {}, false};
+                ArchC::LazyCensus::Published(region.begin, region.end, ArchC::LazyCensus::Kind::StagingCopyBack, 30, recorder.OpenSerial());
+                copiedBytes += bytes;
+                recorder.Keep(region.buffer);
+                if (profile) {
+                    Copies().gpuCopyBacks.fetch_add(1, std::memory_order_relaxed);
+                    Copies().gpuCopyBackBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    Copies().stagedOutBytes.fetch_add(bytes, std::memory_order_relaxed);
+                }
+                region.carryWhole = true;
+                if (region.shared != nullptr && region.shared->busy == &region) region.shared->busy = nullptr;
+                region.copiedBack = true;
+                continue;
+            }
+            lc.fallback.fetch_add(1, std::memory_order_relaxed);
+        }
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
@@ -5779,7 +5936,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             // Exactly the sub-range the shader may write, in place in the import: what the shader
             // would have stored there itself had the range been bindable.
             CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
-            ArchC::LazyCensus::Published(from, to, ArchC::LazyCensus::Kind::StagingCopyBack, region.deviceLocal ? 30 : 29);
+            ArchC::LazyCensus::Published(from, to, ArchC::LazyCensus::Kind::StagingCopyBack, region.deviceLocal ? 30 : 29, recorder.OpenSerial());
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
             if (profile) {
@@ -5807,6 +5964,28 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     recorder.MarkCovered(copiedAccess);
     recorder.EndGpuTiming(timing, copiedBytes);
+    if (!lazyVerify.empty()) {
+        // VERIFY: after this copy-back (the cancellation's survivor), the import must hold the shadow's
+        // bytes over the whole range the cancelled copy-back would have stored.
+        for (const auto& [shadow, import, offset, bytes] : lazyVerify) {
+            auto imported = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            auto shadowed = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            CopyBuffer(context, commands, import, offset, imported->Handle(), 0, bytes);
+            CopyBuffer(context, commands, shadow->Handle(), 0, shadowed->Handle(), 0, bytes);
+            recorder.Keep(imported);
+            recorder.Keep(shadowed);
+            recorder.OnComplete([imported, shadowed] {
+                auto& lc = lazyCopyBack::counters();
+                lc.verified.fetch_add(1, std::memory_order_relaxed);
+                imported->Invalidate();
+                shadowed->Invalidate();
+                const auto a = imported->Bytes();
+                const auto b = shadowed->Bytes();
+                if (!std::equal(a.begin(), a.end(), b.begin(), b.end())) lc.mismatches.fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
     if (stagingCensus::Enabled()) {
         for (const auto& region : regions) {
             if (!region.gpuCopy || !region.deviceLocal || !region.copiedBack) continue;
@@ -6412,6 +6591,7 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
             } else {
                 take = true;
             }
+            region.carriedSameBatch = take && sameBatch;
             if (take) {
                 crossCarry::count(c.carried, "c_gpu_staging_carry_skipped");
                 crossCarry::count(c.carriedBytes, "c_gpu_staging_carry_bytes", region.end - region.begin);
@@ -6468,10 +6648,13 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // The shadow serves this use as it is; it stays kept by this batch (the copy-back below
         // reads it again after the work).
         for (auto* region : carried) recorder.Keep(region->buffer);
-        for (auto* region : carried) ArchC::LazyCensus::UsedByGpu(region->begin, region->end, ArchC::LazyCensus::GpuUse::Carry);
+        for (auto* region : carried) ArchC::LazyCensus::UsedByGpu(region->begin, region->end, ArchC::LazyCensus::GpuUse::Carry, recorder.OpenSerial());
         if (cross ? crossCarry::Verify() : stagingCarry::Verify()) recordCarryVerify(recorder, carried, cross);
     }
     if (copies.empty()) return;
+    if (ArchC::LazyCensus::Enabled()) {
+        for (auto* region : copies) ArchC::LazyCensus::UsedByGpu(region->begin, region->end, ArchC::LazyCensus::GpuUse::StagingInSame, recorder.OpenSerial());
+    }
     Require(Recorder::Active() == &recorder, "staging copies recorded into a recorder that is not the device's");
     if (profile) Copies().stagedReused.fetch_add(copies.size(), std::memory_order_relaxed);
     recordGpuCopies(copies, false);
@@ -6558,6 +6741,19 @@ void GuestBufferMemory::NoteStagingCarryTokens(Recorder& recorder) {
 }
 
 void GuestBufferMemory::NoteStagingCarryPoints(Recorder& recorder) {
+    if (uploaded && !committed && lazyCopyBack::Active()) {
+        auto& s = lazyCopyBack::state();
+        std::optional<Recorder::NotePoint> lazyPoint;
+        for (const auto& region : regions) {
+            if (!region.gpuCopy || !region.deviceLocal || region.buffer == nullptr) continue;
+            const auto found = s.pending.find(region.buffer->Handle());
+            if (found == s.pending.end() || found->second.pointSet || found->second.serial != recorder.OpenSerial()) continue;
+            if (!lazyPoint) lazyPoint = recorder.OpenNotePoint();
+            found->second.point = *lazyPoint;
+            found->second.pointSet = true;
+        }
+        if (s.pending.size() > 4096) std::erase_if(s.pending, [&](const auto& entry) { return entry.second.serial != recorder.OpenSerial(); });
+    }
     if (!stagingCarry::Enabled() || !uploaded || committed) return;
     std::optional<Recorder::NotePoint> point;
     for (auto& region : regions) {
@@ -6660,6 +6856,25 @@ HostImportsProof HostImportsIdentity(const Context& context, bool requireCurrent
     std::lock_guard lock(state.mutex);
     if (requireCurrent && importsStale(context, state)) return {};
     return {state.device, state.epoch, state.refreshedGeneration};
+}
+
+
+namespace LazyCopyBack {
+
+void SetIndirectCopy(PFN_vkCmdCopyMemoryIndirectKHR function) {
+    lazyCopyBack::indirectCopy.store(function, std::memory_order_relaxed);
+    if (function != nullptr) static_cast<void>(lazyCopyBack::counters());
+}
+
+bool Active() {
+    return lazyCopyBack::Active();
+}
+
+Counts Totals() {
+    const auto& c = lazyCopyBack::counters();
+    return {c.indirect.load(), c.cancelled.load(), c.cancelledBytes.load(), c.accessed.load(), c.verified.load(), c.mismatches.load()};
+}
+
 }
 
 }

@@ -134,6 +134,13 @@ std::atomic<std::uint64_t> g_watchHead{0};
 std::atomic<std::uint64_t> g_watchedPages{0};
 std::atomic<std::uint64_t> g_watchFaults{0};
 std::atomic<std::uint64_t> g_watchFaultTicks{0};
+// APS5_ARCHB_C_WATCH_SPLIT (set by the driver, GuestWtFaultSetWatchSplit): a watch run one VirtualProtect
+// refuses is protected piece by piece. VirtualProtect takes one allocation per call, and live guest direct
+// memory is committed in 16 KiB allocations (GuestArenaCommit's granule), so without it every watch range
+// longer than an allocation fails whole, with no per-page cause (the P5.0 census's "clamp" refusals).
+std::atomic<bool> g_watchSplit{false};
+std::atomic<std::uint64_t> g_watchSplitRuns{0};
+std::atomic<std::uint64_t> g_watchSplitPieces{0};
 
 std::int64_t ticks();
 
@@ -152,6 +159,12 @@ bool watchedPage(const Leaf& leaf, std::uintptr_t page) {
 
 struct LazyServiceTag {};
 using LazyServiceDepth = HostThreadSlot<std::uintptr_t, LazyServiceTag>;
+// The faulting instruction and stack pointer of the thread's last access violation while a watch
+// exists (diagnostics: the lazy service names the driver code that touched a lazy range).
+struct FaultIpTag {};
+struct FaultSpTag {};
+using FaultIp = HostThreadSlot<std::uintptr_t, FaultIpTag>;
+using FaultSp = HostThreadSlot<std::uintptr_t, FaultSpTag>;
 std::atomic<void (*)(std::uintptr_t, bool)> g_lazyService{nullptr};
 std::atomic<std::uint64_t> g_lazyServices{0};
 std::atomic<std::uint64_t> g_lazyNested{0};
@@ -332,6 +345,34 @@ void spinOnce(unsigned spins) {
     else SwitchToThread();
 }
 
+// Protects [begin, end) with one VirtualProtect; when that fails and `split`, once per VirtualQuery region
+// (a region never spans allocations). `failed(pieceBegin, pieceEnd)` for what stayed unprotected.
+template <typename Failed>
+bool protectPieces(std::uintptr_t begin, std::uintptr_t end, DWORD protection, bool split, Failed&& failed) {
+    DWORD previous;
+    if (VirtualProtect(reinterpret_cast<void*>(begin), end - begin, protection, &previous) != 0) return true;
+    if (!split) {
+        failed(begin, end);
+        return false;
+    }
+    g_watchSplitRuns.fetch_add(1, std::memory_order_relaxed);
+    bool all = true;
+    for (auto cursor = begin; cursor < end;) {
+        MEMORY_BASIC_INFORMATION memory{};
+        auto pieceEnd = cursor + PageBytes;
+        if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) == sizeof(memory) && memory.RegionSize != 0) {
+            pieceEnd = std::min(end, std::max(pieceEnd, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize));
+        }
+        g_watchSplitPieces.fetch_add(1, std::memory_order_relaxed);
+        if (VirtualProtect(reinterpret_cast<void*>(cursor), pieceEnd - cursor, protection, &previous) == 0) {
+            failed(cursor, pieceEnd);
+            all = false;
+        }
+        cursor = pieceEnd;
+    }
+    return all;
+}
+
 bool unwatchPage(Leaf& leaf, std::uintptr_t page, std::uint64_t kind) {
     auto& word = wordOf(leaf, page);
     for (unsigned spins = 0;; ++spins) {
@@ -412,8 +453,8 @@ std::size_t unwatchRange(State& state, std::uintptr_t first, std::uintptr_t stop
         const auto protection = trackedProtection(claims[i].value);
         auto j = i + 1;
         while (j < claims.size() && claims[j].page == claims[j - 1].page + PageBytes && trackedProtection(claims[j].value) == protection) ++j;
-        DWORD previous;
-        VirtualProtect(reinterpret_cast<void*>(claims[i].page), claims[j - 1].page + PageBytes - claims[i].page, protection, &previous);
+        // Split on failure whatever the switch: adjacent ranges watched apart may lie in different allocations.
+        protectPieces(claims[i].page, claims[j - 1].page + PageBytes, protection, true, [](std::uintptr_t, std::uintptr_t) {});
         for (auto k = i; k < j; ++k) {
             if (clearWatch(*claims[k].leaf, claims[k].page)) {
                 ++unwatched;
@@ -452,6 +493,8 @@ void GuestWtFaultEnable_nid_no_patch(bool verify, std::uint64_t clockAbove) {
         // The thread slot's TLS index is allocated here, never inside the handler.
         static_cast<void>(DriverThread::Get());
         static_cast<void>(LazyServiceDepth::Get());
+        static_cast<void>(FaultIp::Get());
+        static_cast<void>(FaultSp::Get());
         g_state = state;
         g_enabled.store(true, std::memory_order_release);
     });
@@ -1326,12 +1369,16 @@ std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::si
             claims[k].leaf->watch[index / 64].fetch_or(std::uint64_t{1} << (index % 64), std::memory_order_acq_rel);
         }
         g_watchedPages.fetch_add(j - i, std::memory_order_relaxed);
-        DWORD previous;
-        if (VirtualProtect(reinterpret_cast<void*>(claims[i].page), claims[j - 1].page + PageBytes - claims[i].page, PAGE_NOACCESS, &previous) != 0) {
-            watched += j - i;
-        } else {
-            for (auto k = i; k < j; ++k) clearWatch(*claims[k].leaf, claims[k].page);
-        }
+        auto done = j - i;
+        protectPieces(claims[i].page, claims[j - 1].page + PageBytes, PAGE_NOACCESS, g_watchSplit.load(std::memory_order_relaxed), [&](std::uintptr_t begin, std::uintptr_t end) {
+            for (auto k = i; k < j; ++k) {
+                if (claims[k].page < begin || claims[k].page >= end) continue;
+                clearWatch(*claims[k].leaf, claims[k].page);
+                skip(WtWatchSkipProtect, 1);
+                --done;
+            }
+        });
+        watched += done;
         i = j;
     }
     releaseClaims(claims);
@@ -1398,6 +1445,37 @@ void GuestWtFaultServeLazyRange_nid_no_patch(std::uintptr_t address, std::size_t
 void GuestWtFaultLazyCounters_nid_no_patch(std::uint64_t* services, std::uint64_t* nested) {
     *services = g_lazyServices.load(std::memory_order_relaxed);
     *nested = g_lazyNested.load(std::memory_order_relaxed);
+}
+
+bool GuestWtFaultEnterLazyService_nid_no_patch() {
+    if (!g_enabled.load(std::memory_order_acquire)) return false;
+    if (LazyServiceDepth::Get() != 0) return false;
+    LazyServiceDepth::Set(1);
+    return true;
+}
+
+void GuestWtFaultLeaveLazyService_nid_no_patch() {
+    LazyServiceDepth::Set(0);
+}
+
+void GuestWtFaultNoteFaultContext_nid_no_patch(std::uintptr_t ip, std::uintptr_t sp) {
+    if (!g_enabled.load(std::memory_order_acquire) || !g_watchEver.load(std::memory_order_acquire)) return;
+    FaultIp::Set(ip);
+    FaultSp::Set(sp);
+}
+
+void GuestWtFaultFaultContext_nid_no_patch(std::uintptr_t* ip, std::uintptr_t* sp) {
+    *ip = g_enabled.load(std::memory_order_acquire) ? FaultIp::Get() : 0;
+    *sp = g_enabled.load(std::memory_order_acquire) ? FaultSp::Get() : 0;
+}
+
+void GuestWtFaultSetWatchSplit_nid_no_patch(bool split) {
+    if (g_watchSplit.load(std::memory_order_relaxed) != split) g_watchSplit.store(split, std::memory_order_relaxed);
+}
+
+void GuestWtFaultWatchSplitCounters_nid_no_patch(std::uint64_t* runs, std::uint64_t* pieces) {
+    *runs = g_watchSplitRuns.load(std::memory_order_relaxed);
+    *pieces = g_watchSplitPieces.load(std::memory_order_relaxed);
 }
 
 std::size_t GuestWtFaultUnwatch_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
@@ -1536,6 +1614,18 @@ void GuestWtFaultServeLazyRange_nid_no_patch(std::uintptr_t, std::size_t) {}
 void GuestWtFaultLazyCounters_nid_no_patch(std::uint64_t* services, std::uint64_t* nested) {
     *services = 0;
     *nested = 0;
+}
+void GuestWtFaultSetWatchSplit_nid_no_patch(bool) {}
+void GuestWtFaultNoteFaultContext_nid_no_patch(std::uintptr_t, std::uintptr_t) {}
+void GuestWtFaultFaultContext_nid_no_patch(std::uintptr_t* ip, std::uintptr_t* sp) {
+    *ip = 0;
+    *sp = 0;
+}
+bool GuestWtFaultEnterLazyService_nid_no_patch() { return false; }
+void GuestWtFaultLeaveLazyService_nid_no_patch() {}
+void GuestWtFaultWatchSplitCounters_nid_no_patch(std::uint64_t* runs, std::uint64_t* pieces) {
+    *runs = 0;
+    *pieces = 0;
 }
 bool GuestWtFaultHandleRead_nid_no_patch(std::uintptr_t) { return false; }
 std::uint64_t GuestWtFaultWatchLogHead_nid_no_patch() { return 0; }

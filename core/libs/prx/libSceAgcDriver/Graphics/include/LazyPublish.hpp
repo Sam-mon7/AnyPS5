@@ -21,6 +21,8 @@ struct Counts {
     std::uint64_t dropped = 0;
     std::uint64_t verified = 0;
     std::uint64_t newer = 0;
+    std::uint64_t lockedServices = 0;
+    std::uint64_t storeHooks = 0;
 };
 Counts Totals();
 
