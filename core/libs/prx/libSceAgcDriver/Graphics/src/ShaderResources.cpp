@@ -6796,8 +6796,91 @@ std::size_t ShaderResources::DrawUploadLimit() {
     return limit;
 }
 
+namespace {
+// APS5_ZC_MOVED_CENSUS (diagnostic, read once): PrepareDrawBindings' cost and what its moved buffers are.
+// Per call: all calls and their ns; calls with moved buffers, their ns, their moved-address and data-word
+// elements, the moved-address elements an import serves at a storage-aligned offset, and the calls whose
+// key (this template, every moved element's index, address, size and words) was seen in the last 8,192
+// calls with moved buffers (about 12 frames): what a set cache keyed by the moved content would hit.
+struct MovedCensusCounters {
+    std::atomic<std::uint64_t> calls{0}, ns{0}, movedCalls{0}, movedNs{0}, addresses{0}, words{0}, importable{0}, repeats{0}, setCalls{0};
+};
+
+MovedCensusCounters* movedCensus() {
+    static MovedCensusCounters* made = [] {
+        const char* value = std::getenv("APS5_ZC_MOVED_CENSUS");
+        if (value == nullptr || std::strcmp(value, "1") != 0) return static_cast<MovedCensusCounters*>(nullptr);
+        auto* counters = new MovedCensusCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_calls", counters->calls);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_ns", counters->ns);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_moved_calls", counters->movedCalls);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_moved_ns", counters->movedNs);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_moved_addresses", counters->addresses);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_moved_words", counters->words);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_moved_importable", counters->importable);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_moved_repeats", counters->repeats);
+        AgcDriver::ArchB::Recorder::RegisterCounter("zc_pdb_set_calls", counters->setCalls);
+        return counters;
+    }();
+    return made;
+}
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    struct MovedCensusScope {
+        MovedCensusCounters* counters;
+        bool moved;
+        std::chrono::steady_clock::time_point start;
+        bool set = false;
+        ~MovedCensusScope() {
+            if (counters == nullptr) return;
+            const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            counters->calls.fetch_add(1, std::memory_order_relaxed);
+            counters->ns.fetch_add(ns, std::memory_order_relaxed);
+            if (set) counters->setCalls.fetch_add(1, std::memory_order_relaxed);
+            if (!moved) return;
+            counters->movedCalls.fetch_add(1, std::memory_order_relaxed);
+            counters->movedNs.fetch_add(ns, std::memory_order_relaxed);
+        }
+    } movedCensusScope{movedCensus(), !moved.empty(), movedCensus() != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
+    if (movedCensusScope.counters != nullptr && !moved.empty()) {
+        auto* counters = movedCensusScope.counters;
+        std::uint64_t key = std::hash<const void*>{}(this);
+        const auto mix = [&](std::uint64_t value) { key = (key ^ value) * 0x100000001b3ull + (key >> 29u); };
+        const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+        for (const auto& entry : moved) {
+            mix(entry.allocation);
+            mix(entry.address);
+            mix(entry.size);
+            for (const auto word : entry.words) mix(word);
+            if (!entry.words.empty()) {
+                counters->words.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            counters->addresses.fetch_add(1, std::memory_order_relaxed);
+            const auto begin = entry.address - allocations[entry.allocation].adjustment;
+            const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, allocations[entry.allocation].adjustment));
+            const auto* import = ExistingHostImportFor(context, begin, bytes);
+            if (import != nullptr && HostImportOffset(*import, begin) % alignment == 0) counters->importable.fetch_add(1, std::memory_order_relaxed);
+        }
+        thread_local std::vector<std::uint64_t>* ringSlot = nullptr;
+        thread_local std::unordered_map<std::uint64_t, std::uint32_t>* seenSlot = nullptr;
+        thread_local std::size_t ringNext = 0;
+        auto& ring = ShaderRecompiler::ThreadOwned(ringSlot);
+        auto& seen = ShaderRecompiler::ThreadOwned(seenSlot);
+        constexpr std::size_t Window = 8192;
+        if (seen.contains(key)) counters->repeats.fetch_add(1, std::memory_order_relaxed);
+        if (ring.size() < Window) {
+            ring.push_back(key);
+        } else {
+            const auto old = ring[ringNext];
+            if (auto found = seen.find(old); found != seen.end() && --found->second == 0) seen.erase(found);
+            ring[ringNext] = key;
+            ringNext = (ringNext + 1) % Window;
+        }
+        ++seen[key];
+    }
     // APS5_DRAW_BINDINGS_DIAG: the call's time by snapshot path (diagnostic).
     const bool diag = Recorder::SnapshotDiagEnabled();
     const auto diagStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -7107,6 +7190,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     } setTiming{timeSets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    movedCensusScope.set = true;
     result->cache = context.descriptorCache;
     // APS5_ARCHB_FIX_DRAW_SET_POOL (sampled per call): a set back from an earlier draw of this object
     // keeps everything but the snapshot elements (see DrawSetPool).
