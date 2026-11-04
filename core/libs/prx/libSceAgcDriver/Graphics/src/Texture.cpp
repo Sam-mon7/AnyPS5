@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -1483,6 +1484,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
         std::lock_guard lock(live.mutex);
         live.textures.push_back(texture.get());
     }
+    if (ArchC::ImageEpochs::Active()) ArchC::ImageEpochs::RegisterImage(*texture, 0, 0);
     if (profile) {
         auto& totals = Profile();
         totals.storageCreate += timer.lap();
@@ -2633,6 +2635,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, 
         if (replacedPending) {
             reconcilePending();
             BumpPendingSerial();
+            notePendingChange();
         }
         refreshGeneration();
     }
@@ -4159,12 +4162,16 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     ++version;
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent) BumpPendingSerial();
+        if (wasLent) {
+            BumpPendingSerial();
+            notePendingChange();
+        }
         return;
     }
     dirty = true;
     pending.textures.push_back(this);
     BumpPendingSerial();
+    notePendingChange();
 }
 
 void StorageTexture::reconcilePending() {
@@ -4177,6 +4184,7 @@ void StorageTexture::reconcilePending() {
     if (any) pending.textures.push_back(this);
     else pending.textures.remove(this);
     BumpPendingSerial();
+    notePendingChange();
 }
 
 bool StorageTexture::Dirty() const {
@@ -4411,6 +4419,7 @@ void StorageTexture::Flush() {
         dirty = false;
         pending.textures.remove(this);
         BumpPendingSerial();
+        notePendingChange();
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
     const auto previous = std::exchange(flushReason, "cache eviction");
@@ -4517,6 +4526,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) pending.flushing.push_back(texture.get());
         pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
         if (!flush.empty()) BumpPendingSerial();
+        for (const auto& texture : flush) texture->notePendingChange();
         for (const auto& texture : flush) {
             if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
         }
@@ -4539,6 +4549,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             for (const auto& texture : flush) std::erase(pending.flushing, texture.get());
             pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
             BumpPendingSerial();
+            for (const auto& texture : flush) texture->notePendingChange();
         }
     } unregister{flush};
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
@@ -5313,6 +5324,10 @@ void StorageTexture::BumpPendingSerial() {
     pendingSerial.fetch_add(1, std::memory_order_release);
 }
 
+void StorageTexture::notePendingChange() const {
+    ArchC::ImageEpochs::Note(descriptor.baseAddress, descriptor.baseAddress + guestBytes, ArchC::EpochSource::Pending, this);
+}
+
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
@@ -5475,6 +5490,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
                 dropped = true;
             }
             if (dropped) ++discarded;
+            if (dropped) texture->notePendingChange();
             if (dropped && !texture->anyLayerPending()) {
                 texture->dirty = false;
                 it = pending.textures.erase(it);
@@ -5644,6 +5660,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
             dirty = false;
             pending.textures.remove(this);
             BumpPendingSerial();
+            notePendingChange();
         }
     }
     const auto commands = recorder->Commands();
@@ -5687,6 +5704,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
 }
 
 bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear) {
+    const ArchC::SelfScope self(this);
     // Debug aid (APS5_TRACE_FILL_COVER=1): the first layer covers refused, with the surface, the
     // pattern and the generation the refusal was memoized at (ClassifyFill's layerRefusedGeneration).
     static const bool trace = std::getenv("APS5_TRACE_FILL_COVER") != nullptr;
@@ -5883,6 +5901,7 @@ const char* StorageTexture::CopyRefusal(const Context& context, const StorageTex
 }
 
 bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
+    const ArchC::SelfScope self(this);
     refusal = CopyRefusal(context, this, source, descriptor.baseAddress);
     if (refusal != nullptr) return false;
     auto* recorder = Recorder::Active();
@@ -6335,6 +6354,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    const ArchC::SelfScope self(this);
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -6823,6 +6843,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
 }
 
 StorageTexture::~StorageTexture() {
+    ArchC::ImageEpochs::Get().Unregister(*this);
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
@@ -6837,6 +6858,7 @@ StorageTexture::~StorageTexture() {
             dirty = false;
             pending.textures.remove(this);
             BumpPendingSerial();
+            notePendingChange();
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx destroyed with GPU results pending\n", static_cast<unsigned long long>(descriptor.baseAddress));
         }

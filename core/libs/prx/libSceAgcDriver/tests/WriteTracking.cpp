@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteFault.hpp"
@@ -2305,6 +2306,146 @@ void CheckWtFaultConsumers() {
 #endif
 
 #ifdef _WIN32
+void CheckArchcLog() {
+    using namespace GuestArena;
+    Require(WtFault().active, "the fault tracker did not turn on with write watching");
+    const auto state = [](std::uint64_t address) { return GuestWtFaultWord_nid_no_patch(address) & WtFaultStateMask; };
+    constexpr std::uint64_t Page = 4096;
+    PartlyCommitted range;
+    range.Commit(0);
+    const auto base = range.Address();
+    volatile std::uint8_t* data = range.Data();
+    std::memset(range.Data(), 0x11, Block);
+    BumpCollectEpoch();
+    CollectWrites(base, Block);
+    WtFaultFlip();
+    WtFaultFlip();
+    Require(state(base) == WtFaultArmed && state(base + Page) == WtFaultArmed, "the log fixture was not armed");
+    std::array<std::uint64_t, 16> entries{};
+    bool lost = false;
+
+    auto cursor = GuestWtFaultLogHead_nid_no_patch();
+    data[0x40] = 0x22;
+    data[0x80] = 0x23;
+    Require(GuestWtFaultLogHead_nid_no_patch() == cursor + 1, "one store into an armed page did not append exactly one log entry");
+    auto count = GuestWtFaultLogRead_nid_no_patch(&cursor, entries.data(), entries.size(), &lost);
+    Require(count == 1 && !lost && entries[0] == (base | WtFaultLogStore), "the log entry is not a Store of the faulted page");
+    Require(GuestWtFaultLogRead_nid_no_patch(&cursor, entries.data(), entries.size(), &lost) == 0 && !lost, "a drained log read again");
+    std::cout << "agc_archc_log_append_on_fault: ok\n";
+
+    GuestWtFaultForget_nid_no_patch(base + Page, Page);
+    count = GuestWtFaultLogRead_nid_no_patch(&cursor, entries.data(), entries.size(), &lost);
+    Require(count == 2 && entries[0] == ((base + Page) | WtFaultLogForgetBegin) && entries[1] == ((base + 2 * Page) | WtFaultLogForgetEnd), "a forget of a tracked page was not logged as a begin/end pair");
+    GuestWtFaultForget_nid_no_patch(base + Page, Page);
+    Require(GuestWtFaultLogHead_nid_no_patch() == cursor, "a forget of an untracked page was logged");
+    std::cout << "agc_archc_forget_logged: ok\n";
+
+    {
+        const GuestArena::HostWrite scope(reinterpret_cast<void*>(base + 2 * Page), Page);
+        count = GuestWtFaultLogRead_nid_no_patch(&cursor, entries.data(), entries.size(), &lost);
+        Require(count == 2 && entries[0] == ((base + 2 * Page) | WtFaultLogHold) && entries[1] == ((base + 3 * Page) | WtFaultLogForgetEnd), "a hold of an armed page was not logged as a run");
+    }
+
+    const auto start = GuestWtFaultLogHead_nid_no_patch();
+    auto stale = start;
+    for (std::size_t i = 0; i <= WtFaultLogSlots; ++i) GuestWtFaultLogAppendForTest_nid_no_patch(base | WtFaultLogStore);
+    count = GuestWtFaultLogRead_nid_no_patch(&stale, entries.data(), entries.size(), &lost);
+    Require(lost && count == 0 && stale == GuestWtFaultLogHead_nid_no_patch(), "a reader 65,537 entries behind was not told it lost entries");
+    std::cout << "agc_archc_log_overflow_lost: ok\n";
+
+    const auto cold = base + 4 * Page;
+    const auto hot = base + 5 * Page;
+    GuestWtFaultSetCold_nid_no_patch(cold, Page, true);
+    data[4 * Page] = 1;
+    data[5 * Page] = 1;
+    Require(state(cold) == WtFaultOpen && state(hot) == WtFaultOpen, "the cold fixture stores did not open their pages");
+    GuestWtFaultNoteDriverStore_nid_no_patch(cold, Page);
+    GuestWtFaultNoteStored_nid_no_patch(cold, Page);
+    GuestWtFaultNoteDriverStore_nid_no_patch(hot, Page);
+    WtFaultCounters before{};
+    GuestWtFaultCounters_nid_no_patch(&before);
+    WtFaultFlip();
+    WtFaultCounters after{};
+    GuestWtFaultCounters_nid_no_patch(&after);
+    Require(state(cold) == WtFaultArmed, "a stored cold page was kept open by its hot marks");
+    Require(state(hot) == WtFaultOpen, "a driver-stored page that is not cold was armed");
+    Require(after.coldRearmed > before.coldRearmed, "the cold re-arm was not counted");
+    cursor = GuestWtFaultLogHead_nid_no_patch();
+    data[4 * Page + 8] = 2;
+    Require(GuestWtFaultLogHead_nid_no_patch() == cursor + 1, "the next store into a re-armed cold page did not fault into the log");
+    GuestWtFaultSetCold_nid_no_patch(cold, Page, false);
+    std::cout << "agc_archc_cold_page_rearmed: ok\n";
+}
+
+void CheckArchcEpochs() {
+    using namespace GuestArena;
+    using AgcDriver::Graphics::ArchC::EpochRange;
+    using AgcDriver::Graphics::ArchC::EpochSource;
+    using AgcDriver::Graphics::ArchC::ImageEpochs;
+    Require(WtFault().active, "the fault tracker did not turn on with write watching");
+    Require(ImageEpochs::Active(), "IMAGE_EPOCHS is not on");
+    constexpr std::uint64_t Page = 4096;
+    PartlyCommitted range;
+    range.Commit(0);
+    range.Commit(1);
+    const auto base = range.Address();
+    volatile std::uint8_t* data = range.Data();
+    std::memset(range.Data(), 0x11, 2 * Block);
+    auto& index = ImageEpochs::Get();
+    std::atomic<std::uint64_t> first{1};
+    std::atomic<std::uint64_t> second{1};
+    char ownerA = 0;
+    char ownerB = 0;
+    const std::array rangesA{EpochRange{base, base + Block}};
+    const std::array rangesB{EpochRange{base + Block / 2, base + Block + Page}};
+    index.RegisterOwner(&ownerA, first, rangesA);
+    index.RegisterOwner(&ownerB, second, rangesB);
+    BumpCollectEpoch();
+    CollectWrites(base, 2 * Block);
+    WtFaultFlip();
+    WtFaultFlip();
+    Require(index.DrainIfNew(), "the log did not drain");
+
+    auto a = first.load();
+    auto b = second.load();
+    data[Page] = 0x33;
+    Require(first.load() == a, "a CPU store bumped the epoch before the drain");
+    Require(index.DrainIfNew() && first.load() > a && second.load() == b, "a drained CPU store did not bump exactly the owner whose range it hit");
+    std::cout << "agc_archc_epochs_cpu_store_invalidates: ok\n";
+
+    a = first.load();
+    b = second.load();
+    MarkWritten(base + Block + 64, 64);
+    Require(first.load() == a && second.load() > b, "a tracker stamp did not bump exactly the owner whose block it stamped");
+    std::cout << "agc_archc_epochs_tracker_stamp_invalidates: ok\n";
+
+    a = first.load();
+    b = second.load();
+    ImageEpochs::Note(base + Block / 2, base + Block / 2 + 64, EpochSource::GpuNote, &ownerA);
+    Require(first.load() == a && second.load() > b, "a GPU write note bumped its writer or missed another owner");
+    std::cout << "agc_archc_epochs_gpu_note_except_writer: ok\n";
+
+    a = first.load();
+    b = second.load();
+    ImageEpochs::Note(base, base + Block, EpochSource::Pending, &ownerA);
+    Require(first.load() == a && second.load() > b, "a pending transition bumped the image itself or missed an overlapping one");
+    std::cout << "agc_archc_epochs_pending_transition_except_self: ok\n";
+
+    a = first.load();
+    b = second.load();
+    ImageEpochs::Note(base + Page, base + 2 * Page, EpochSource::Depth, nullptr);
+    Require(first.load() > a && second.load() == b, "a depth-surface event did not bump exactly the overlapping owner");
+    std::cout << "agc_archc_epochs_depth_surface_invalidates: ok\n";
+
+    index.UnregisterOwner(&ownerA);
+    a = first.load();
+    b = second.load();
+    ImageEpochs::Note(base, base + 2 * Block, EpochSource::Depth, nullptr);
+    Require(first.load() == a && second.load() > b, "an unregistered owner was still bumped");
+    index.UnregisterOwner(&ownerB);
+    std::cout << "agc_archc_epochs_unregister_on_destroy: ok\n";
+}
+
 // APS5_ARCHB_WT_FAULT hot pages (APS5_WT_FAULT_GUEST_HOT, default on): a page that faulted stays open
 // across the next flip; a page a walk finds stored while open stays open across the flip after; a page
 // neither faulted nor found stored since the last flip is protected again, and its next store faults.
@@ -3756,6 +3897,14 @@ int main(int argc, char** argv) {
             return 0;
         }
 #ifdef _WIN32
+        if (argc == 2 && std::string_view(argv[1]) == "--archc-log") {
+            CheckArchcLog();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--archc-epochs") {
+            CheckArchcEpochs();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--wt-fault-hot") {
             CheckWtFaultHot();
             std::cout << "fault tracking hot pages test passed\n";

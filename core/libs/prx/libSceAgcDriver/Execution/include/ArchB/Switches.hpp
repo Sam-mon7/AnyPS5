@@ -77,6 +77,8 @@ enum class Feature : std::uint8_t {
     PrivateCompute,
     ZeroCopyMoved,
     CGpuStagingCarry,
+    ArchcImageEpochs,
+    ArchcTargetFastpath,
     Count
 };
 

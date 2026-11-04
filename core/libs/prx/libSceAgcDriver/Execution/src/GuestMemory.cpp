@@ -160,6 +160,8 @@ namespace {
 std::atomic<std::uint64_t> forgetCalls{0};
 // See ForgetSerial: odd while a ForgetPages call stores its page states.
 std::atomic<std::uint64_t> forgetSerial{0};
+std::atomic<void (*)(std::uint64_t, std::uint64_t, TrackerEvent)> stampObserver{nullptr};
+std::atomic<void (*)()> armObserver{nullptr};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> failedCollectMemoHits{0};
@@ -673,6 +675,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetSerial.fetch_add(1, std::memory_order_release);
     Pages().forget(address, bytes);
     forgetSerial.fetch_add(1, std::memory_order_release);
+    if (const auto observer = stampObserver.load(std::memory_order_acquire); observer != nullptr && bytes != 0) observer(address, address + bytes, TrackerEvent::Forget);
     // Write generations: a mapping change (meta + data) published before libc returns; the blocks'
     // sweeps no longer cover them. Leaves never touched stay missing (a later leaf is born after).
     if (bytes != 0 && Gen::Active()) {
@@ -1189,6 +1192,7 @@ struct Counters {
     std::atomic<std::uint64_t> verifyWalks{0}, verifyDirty{0}, verifyUntracked{0}, mismatches{0};
     std::atomic<std::uint64_t> consumerUnchanged{0}, consumerChanged{0}, consumerFallback{0}, consumerVerified{0}, consumerMismatches{0};
     std::atomic<std::uint64_t> keptDirty{0}, armDirtyNs{0}, dirtyWalks{0}, dirtyWalkNs{0}, armedWalkNs{0};
+    std::atomic<std::uint64_t> logAppends{0}, logLost{0}, coldRearmed{0};
 };
 bool dirtyArmOn() {
     return active.load(std::memory_order_relaxed) && ArchB::Switches::Enabled(ArchB::Feature::WtFaultDirtyArm);
@@ -1207,7 +1211,7 @@ Counters& counters() {
             {"wt_fault_mismatches", &c->mismatches}, {"wt_fault_consumer_unchanged", &c->consumerUnchanged}, {"wt_fault_consumer_changed", &c->consumerChanged},
             {"wt_fault_consumer_fallback", &c->consumerFallback}, {"wt_fault_consumer_verified", &c->consumerVerified}, {"wt_fault_consumer_mismatches", &c->consumerMismatches},
             {"wt_fault_kept_dirty", &c->keptDirty}, {"wt_fault_arm_dirty_ns", &c->armDirtyNs}, {"wt_fault_dirty_walks", &c->dirtyWalks}, {"wt_fault_dirty_walk_ns", &c->dirtyWalkNs},
-            {"wt_fault_armed_walk_ns", &c->armedWalkNs}};
+            {"wt_fault_armed_walk_ns", &c->armedWalkNs}, {"wt_fault_log_appends", &c->logAppends}, {"wt_fault_log_lost", &c->logLost}, {"wt_fault_cold_rearmed", &c->coldRearmed}};
         for (const auto& [name, counter] : named) ArchB::Recorder::RegisterCounter(name, *counter);
         return c;
     }();
@@ -1243,6 +1247,9 @@ void publish() {
     c.mismatches.store(raw.verifyMismatches, std::memory_order_relaxed);
     c.keptDirty.store(raw.keptDirty, std::memory_order_relaxed);
     c.armDirtyNs.store(raw.armDirtyNs, std::memory_order_relaxed);
+    c.logAppends.store(raw.logAppends, std::memory_order_relaxed);
+    c.logLost.store(raw.logLost, std::memory_order_relaxed);
+    c.coldRearmed.store(raw.coldRearmed, std::memory_order_relaxed);
 }
 
 // The dirty pages of one walk, for VERIFY (filled under the tracker mutex).
@@ -1802,6 +1809,7 @@ struct WriteTracker {
     }
 
     void stamp(std::uint64_t block, std::uint64_t stampGeneration, StampKind kind) {
+        if (const auto observer = stampObserver.load(std::memory_order_acquire)) observer(blockBegin(block), blockBegin(block) + WriteBlockBytes, TrackerEvent::Stamp);
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
         auto& leaf = leafFor(block);
@@ -2551,6 +2559,7 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
             static_cast<void>(Gen::NoteState(Gen::Event::Refused, page, page + WritePageBytes, Gen::BlockState::Compared, Gen::Meta, generation));
         }
         tracker.refused[tracker.blockOf(page)] = generation;
+        if (const auto observer = stampObserver.load(std::memory_order_acquire)) observer(page, page + WritePageBytes, TrackerEvent::Stamp);
     });
 }
 #endif
@@ -3958,6 +3967,7 @@ void WtFaultFlip(bool presenter) {
         wc.dirtyWalkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
     }
     wtFault::publish();
+    if (const auto observer = armObserver.load(std::memory_order_acquire)) observer();
     // A per-frame line every APS5_WT_FAULT_REPORT_FLIPS flips (default 300).
     static const std::uint64_t every = [] {
         const char* text = std::getenv("APS5_WT_FAULT_REPORT_FLIPS");
@@ -4208,6 +4218,7 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
     if (!tracker.watched) return;
+    if (const auto observer = stampObserver.load(std::memory_order_acquire); observer != nullptr && bytes != 0) observer(address, address + bytes, TrackerEvent::Unwatch);
     // Write generations: excluded blocks read Unknown(excluded) until coverage is restored.
     if (bytes != 0 && Gen::Active()) static_cast<void>(Gen::NoteState(Gen::Event::Unwatch, address, address + bytes, Gen::BlockState::Excluded, Gen::Meta, 0, false));
 #ifdef _WIN32
@@ -5867,6 +5878,14 @@ void PrepareHostRead(std::uintptr_t address, std::size_t bytes) {
 
 void SetWriteProfileHook(void (*hook)(std::uint64_t, std::size_t, std::uint32_t, std::uint32_t)) {
     writeProfileHook.store(hook, std::memory_order_release);
+}
+
+void SetStampObserver(void (*observer)(std::uint64_t, std::uint64_t, TrackerEvent)) {
+    stampObserver.store(observer, std::memory_order_release);
+}
+
+void SetArmObserver(void (*observer)()) {
+    armObserver.store(observer, std::memory_order_release);
 }
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
