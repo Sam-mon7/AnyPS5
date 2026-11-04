@@ -179,6 +179,17 @@ public:
     std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset = nullptr);
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset = 0);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr);
+    // Stage 4.2b (APS5_ARCHB_PIPE_RESOLVE_SNAPSHOTS): ReusableDrawSnapshot's exact answer without the
+    // collect before it: the held entry ReusableDrawSnapshot would find, when every page of the range
+    // is armed by the WT_FAULT tracker no later than the last collect that found the entry current (no
+    // CPU store since: it would have faulted) and the range carries no tracker stamp after the entry's
+    // generation (the "unchanged since its generation" branch); nullptr otherwise (the caller collects
+    // and asks ReusableDrawSnapshot as before). Under the GPU mutex.
+    std::shared_ptr<Buffer> ArmedDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived = nullptr, VkDeviceSize* offset = nullptr);
+    static bool ArmedSnapshotsActive();
+    static bool ArmedSnapshotsVerify();
+    // Counts an armed answer the collect path disagreed with (_VERIFY).
+    static void NoteArmedSnapshotVerify(bool same);
     // APS5_ARCHB_FIX_SNAPSHOT_PAGE_REFRESH counters (cumulative, process-wide; for tests): refreshes on the
     // page path, refreshes that fell back to blocks (range not tracked), bytes compared, bytes the block
     // path compared (verify only), bytes copied, pages verified and verify mismatches.
@@ -1009,6 +1020,10 @@ private:
         std::list<DrawSnapshotKey>::iterator recent;
         std::shared_ptr<Buffer> buffer;
         std::uint32_t derived;
+        // Stage 4.2b: the newest collect generation at which the entry was found current (made,
+        // refreshed or exact): every page armed by the fault tracker no later than it has held no CPU
+        // store since (ArmedDrawSnapshot).
+        std::uint64_t verifiedAt = 0;
     };
     struct DrawSnapshotPool {
         std::list<DrawSnapshotKey> recency;

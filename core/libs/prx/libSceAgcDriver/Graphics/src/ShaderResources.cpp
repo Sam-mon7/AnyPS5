@@ -3918,6 +3918,12 @@ struct StampProofCounters {
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StampSkip::Count)> skips{};
     std::array<std::atomic<std::uint64_t>, 5> ineligible{};
     std::atomic<std::uint64_t> pendingScans{0};
+    // Proofs reaching revalidateFull by thread: the committer, another thread holding the GPU mutex,
+    // another thread without it (the memo needs the mutex); memo hits off the committer.
+    std::atomic<std::uint64_t> callsCommitter{0};
+    std::atomic<std::uint64_t> callsOtherLocked{0};
+    std::atomic<std::uint64_t> callsOtherUnlocked{0};
+    std::atomic<std::uint64_t> hitsOther{0};
 };
 
 StampProofCounters& stampProofCounters() {
@@ -3934,6 +3940,10 @@ StampProofCounters& stampProofCounters() {
         static constexpr std::array<const char*, 5> ineligibleNames{"pipe_proof_memo_ineligible_records", "pipe_proof_memo_ineligible_depth", "pipe_proof_memo_ineligible_partial", "pipe_proof_memo_ineligible_tracking", "pipe_proof_memo_ineligible_cache"};
         for (std::size_t i = 0; i < ineligibleNames.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(ineligibleNames[i], counters->ineligible[i]);
         AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_pending_scans", counters->pendingScans);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_calls_committer", counters->callsCommitter);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_calls_other_locked", counters->callsOtherLocked);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_calls_other_unlocked", counters->callsOtherUnlocked);
+        AgcDriver::ArchB::Recorder::RegisterCounter("pipe_proof_memo_hits_other", counters->hitsOther);
         return counters;
     }();
     return *made;
@@ -4009,6 +4019,7 @@ bool ShaderResources::stampProofHolds() {
     }
     if (!queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return refuse(StampRefusal::Stamped);
     counters.hits.fetch_add(1, std::memory_order_relaxed);
+    if (!GuestMemory::IsCommitterThread()) counters.hitsOther.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -4144,6 +4155,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool stampProofs = !epochProofs && stampProofsActive() && GuestMemory::GpuMutex().HeldByThisThread();
+    if (stampProofsActive()) {
+        auto& counters = stampProofCounters();
+        (GuestMemory::IsCommitterThread() ? counters.callsCommitter : GuestMemory::GpuMutex().HeldByThisThread() ? counters.callsOtherLocked : counters.callsOtherUnlocked).fetch_add(1, std::memory_order_relaxed);
+    }
     const auto stampGeneration = stampProofs ? GuestMemory::WriteGeneration() : 0;
     const auto stampSerials = stampProofs ? currentStampSerials() : ResourceEpochProof{};
     const auto stampImports = stampProofs ? HostImportsIdentity(context, false) : HostImportsProof{};
@@ -6998,6 +7013,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     d.uploads.fetch_add(1, std::memory_order_relaxed);
                     d.uploadBytes.fetch_add(bytes, std::memory_order_relaxed);
                     d.uploadNs.fetch_add(diagNs(uploadStart), std::memory_order_relaxed);
+                }
+            } else if (Recorder::ArmedSnapshotsActive() && (buffer = recorder.ArmedDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, &offset)) != nullptr) {
+                if (diag) bindingsDiag().reused.fetch_add(1, std::memory_order_relaxed);
+                if (Recorder::ArmedSnapshotsVerify()) {
+                    VkDeviceSize slowOffset = 0;
+                    const auto slow = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, GuestMemory::CollectWrites(begin, bytes), &slowOffset);
+                    Recorder::NoteArmedSnapshotVerify(slow == buffer && slowOffset == offset);
                 }
             } else {
                 auto phaseStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
