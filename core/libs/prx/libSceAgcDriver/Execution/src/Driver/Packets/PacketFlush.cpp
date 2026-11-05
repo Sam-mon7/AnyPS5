@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
+#include <atomic>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -63,6 +64,17 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
                     const auto bytes = awaitedSlots[index].shape.load(std::memory_order_relaxed) >> 32u;
                     if (bytes != 4 && bytes != 8) continue;
                     if (std::any_of(labels.begin(), labels.end(), [&](const DeferredLabel& label) { return address >= label.address ? address - label.address < label.size : label.address - address < bytes; })) {
+                        // _VERIFY=N: one candidate in N is left to the packet's lock as before (both paths stay exercised);
+                        // a candidate the try records must leave no label queued (checked after the record).
+                        static const std::uint64_t verifyPeriod = [] {
+                            const char* value = std::getenv("APS5_ARCHB_C_LABEL_AWAITED_EARLY_VERIFY");
+                            return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+                        }();
+                        static std::atomic<std::uint64_t> candidates{0};
+                        if (verifyPeriod != 0 && (candidates.fetch_add(1, std::memory_order_relaxed) + 1) % verifyPeriod == 0) {
+                            ArchB::Recorder::Count("c_label_awaited_early_verified");
+                            break;
+                        }
                         record = true;
                         recordAtLock = false;
                         ArchB::Recorder::Count("c_label_awaited_early");
@@ -120,6 +132,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     const auto localDevice = device.Load();
     if (record || recordAtLock) {
         recordDeferredLabels(localDevice.get(), queue);
+        if (record && selfLocking && queue != 0 && !deferredDue && !deferredLabels().labels.empty() && ArchB::Switches::Enabled(ArchB::Feature::CLabelAwaitedEarly)) ArchB::Recorder::Count("c_label_awaited_early_verify_mismatches");
         auto& labelThread = ArchB::LabelCensus::Thread();
         labelThread.syncNs = 0;
         labelThread.prewaitSkipped.clear();
